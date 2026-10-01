@@ -1,4 +1,4 @@
-﻿"""GK 节点集合。
+"""GK 节点集合。
 
 命名约定:
     gk_in_* / 引脚属性   未连线时引脚读哪个属性(见 gk_input_props)
@@ -1048,7 +1048,15 @@ class GKNodeCameraFollow(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_smooth", text="")
         row.prop(self, "gk_offset_y", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_camera", text="")
+        B.draw_target_picker(self, row, "gk_camera")
+
+    def draw_buttons_ext(self, context, layout):
+        layout.label(text="相机:留空 = 自动找场景里第一个相机(推荐)")
         B.draw_target_picker(self, layout, "gk_camera")
+        layout.label(text="跟随谁:留空 = 跟随脚本所在的那个节点")
+        B.draw_target_picker(self, layout, "gk_target")
 
 
 # ==========================================================================

@@ -149,13 +149,23 @@ AUTO_LABELS = {
 }
 
 
-def node_items_for(node):
-    """给某个节点生成"节点引用"下拉候选项(含"自身"与"自动")。"""
+def node_items_for(node, prop="gk_target"):
+    """给某个节点生成"节点引用"下拉候选项(含"自身"与"自动")。
+
+    相机类的引用(如『相机_跟随』的『相机』)语义和其他引用不同:
+    它指的是**场景里的相机对象**,而节点图里的节点都不是相机。
+    用户实测踩过:在下拉里选了『移动_按方向』,生成的代码去找一个叫
+    "移动_按方向" 的场景节点 —— 找不到,相机就一直不动。
+    所以这里给个说明文字,别让人以为"列表里随便挑一个就行"。
+    """
     tree = getattr(node, "id_data", None)
     items = list(node_candidates(tree))
-    current = getattr(node, "gk_target", None)
+    current = getattr(node, prop, None)
     if current in AUTO_LABELS:
         items.insert(1, (current, AUTO_LABELS[current], "不指定具体节点，用约定路径", "AUTO", 1))
+    if prop == "gk_camera":
+        items.insert(
+            0, ("", "自动(找场景里第一个相机)", "推荐:导出的场景里相机是自动接上的", "AUTO", 0))
     return items
 
 
@@ -165,7 +175,7 @@ def draw_target_picker(node, layout, prop="gk_target"):
     用文本框而不是 EnumProperty，是为了不依赖 Blender 的动态枚举回调;
     右侧的下拉菜单直接列出节点图里真实存在的节点，点一下即写入。
     """
-    items = node_items_for(node)
+    items = node_items_for(node, prop)
     current = getattr(node, prop, TARGET_SELF) or TARGET_SELF
 
     row = layout.row(align=True)

@@ -569,7 +569,12 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         lines.append('[node name="Colliders" type="Node3D" parent="."]')
         lines.append("")
         for obj, physics, built, shape_id, position in bodies:
-            body_type = getattr(physics, "body_type", None) or "StaticBody3D"
+            # 节点类型和脚本基类必须由**同一个函数**决定 ——
+            # 各算各的就会出现"节点是 CharacterBody3D、脚本却 extends X"
+            # 这类错配。而且直接读 physics.body_type 在没有物理设置时
+            # 会拿到 "auto" 这种非法类型(实测在 World.tscn 里生成过
+            # `type="auto"`,Godot 连场景都解析不了)。
+            body_type = _base_class_for(scene, obj, dimension)
             if getattr(physics, "is_trigger", False):
                 body_type = "Area3D" if is_3d else "Area2D"
             lines.append(f'[node name="{_sanitize_node_name(obj.name)}" '
@@ -1771,11 +1776,20 @@ def _base_class_for(scene, obj, dimension="3"):
 
     脚本的 `extends` 和场景里节点的 `type` 必须是同一个值 —— 否则 Godot
     直接拒绝加载脚本,游戏跑不起来。所以两边都走这一个函数。
+
+    返回的**一定是具体类型**,不会是 "auto":
+    `resolve_base_class` 在"物体没设物理、场景又选了自动"时会把 "auto"
+    原样返回,那会生成 `type="auto"` 这种非法节点 ——
+    实测在 World.tscn 里出现过(Godot 解析这个场景直接失败)。
     """
     from . import properties as props
 
     physics = getattr(obj, "gk_physics", None) if obj is not None else None
-    return props.resolve_base_class(scene, obj, physics, dimension)
+    resolved = props.resolve_base_class(scene, obj, physics, dimension)
+    if resolved and resolved != props.BASE_CLASS_AUTO:
+        return resolved
+    # "auto" 不是合法 Godot 类型,兜底成静态碰撞体(最保守的选择)
+    return "StaticBody3D" if str(dimension) != "2" else "StaticBody2D"
 
 
 def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
@@ -1883,17 +1897,28 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
     result["lights"] = len(glb_info.get("lights", ())) or (
         1 if any(obj.type == "LIGHT" for obj in scene.objects) else 0)
 
-    # ---- 4) 角色场景(可选)----
-    # 主场景已经指向 World 了,角色场景只作为"单独测试角色"用,
-    # 所以 set_as_main=False,不抢主场景。
+    # ---- 4) 角色场景 ----
+    #
+    # ── 为什么让角色场景当主场景 ────────────────────────────────────
+    # 包装场景(World.tscn)里,角色网格在 glb 实例内部、碰撞体在 Colliders/
+    # 下面 —— **分属两棵不同的子树**。移动 Colliders/Cube 只会动碰撞体,
+    # 画面里的角色纹丝不动(用户实测反馈:"跟没挂脚本一样")。
+    #
+    # 而且这个问题**没法在 World.tscn 里修**:Godot 不允许往 glb 实例内部
+    # 挂节点(实测报 "Parent path './World/Suzanne' has vanished")。
+    #
+    # 只有角色场景的结构是对的:
+    #     Hero [CharacterBody3D]
+    #       Collision / Model      ← 同父级,一起动
+    #
+    # 所以有脚本挂载目标时,把主场景指向角色场景。地面和道具还在
+    # World.tscn 里,想切回去在 Godot 里改一行主场景就行。
     if script_name and script_target is not None:
         bounds = object_bounds([script_target])
         try:
             # ── 角色必须有**自己的** glb ──────────────────────────────
             # 以前这里 instance 的是整个 World.glb,导致
             # "一移动角色,整个世界跟着跑"(地面、道具全飞了)。
-            # 而且 Godot 不允许往实例内部挂节点,碰撞体也就挂不到角色网格上
-            # (实测报 "Parent path './World/Suzanne' has vanished")。
             # 所以先把角色(含子级)单独导成一个 glb,再 instance 它。
             char_model = _sanitize_node_name(script_target.name) or "Character"
             char_path, char_ok, char_msg = export_subtree_glb(
@@ -1921,7 +1946,10 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 bounds=bounds,
                 dimension=dimension,
                 scene=scene,
-                set_as_main=False,
+                # 让角色场景当主场景:它是唯一"移动角色时画面会跟着动"的场景
+                # (见上面那段说明)。用户手动改过主场景时 set_main_scene
+                # 内部会尊重他的选择,不会硬抢。
+                set_as_main=True,
             )
             result["written"].append(scene_path)
             result["character_scene"] = scene_path

@@ -242,6 +242,17 @@ def main():
           "materials = " in text and '[node name="Environment"' in text,
           [ln for ln in text.splitlines() if "materials" in ln][:2])
 
+    # ---- 4a-2. 节点类型必须是合法的 Godot 类型 ----
+    #
+    # 回归:碰撞体的 type 曾经直接取 physics.body_type,而物体**没设过物理**
+    # 时那个值是 "auto" —— 生成出 `type="auto"`,Godot 解析这个场景直接失败。
+    # (实测在用户的 World.tscn 里出现过。)
+    declared_types = re.findall(r'\[node name="[^"]+" type="([^"]+)"', text)
+    print(f"    场景里声明的节点类型: {sorted(set(declared_types))}")
+    bad_types = [t for t in declared_types
+                 if t in ("auto", "", "None") or not t[0].isupper()]
+    check("没有非法的节点类型(如 auto)", not bad_types, str(bad_types))
+
     # ---- 4b. 相机不能重复 ----
     #
     # 相机由 glb 带进来(声明式的 Camera3D 节点**不该**再生成 ——
