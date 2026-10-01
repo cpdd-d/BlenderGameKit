@@ -17,6 +17,7 @@ import traceback
 from importlib import import_module
 
 import addon_utils
+import bmesh
 import bpy
 
 RESULTS = []
@@ -259,6 +260,43 @@ def main():
           "CollisionShape3D" in solo_text)
     check("模型是根节点的子级",
           '[node name="Model" parent="." instance=' in solo_text)
+
+    # ---- 9. 没有材质的网格必须被报出来 ----
+    #
+    # 回归:用户建了个 Cube 当角色、忘了给材质,导出的角色在 Godot 里
+    # **一片灰**,他以为渲染坏了。这不是渲染问题,是那个物体在 Blender 里
+    # 就没有材质 —— 而 .glb 里也就没有材质,Godot 用默认材质渲染。
+    # 不报出来的话用户完全想不到要去加材质。
+    print("-" * 70)
+    print("检查『没有材质』的检测")
+    no_mat = asset_export.meshes_without_material(bpy.context.scene)
+    print(f"    场景里没有材质的网格: {no_mat}")
+    check("有材质的网格不被误报", "TestCharacter" not in no_mat, str(no_mat))
+
+    # 专门造一个干净物体来验:先没材质 -> 该被报;加材质 -> 不该被报。
+    # (不用场景里现成的物体,因为它们可能本来就没有材质,
+    #  断言会分不清"检测对不对"和"场景本来就那样"。)
+    probe_mesh = bpy.data.meshes.new("MaterialProbeMesh")
+    probe = bpy.data.objects.new("MaterialProbe", probe_mesh)
+    bpy.context.scene.collection.objects.link(probe)
+    bm2 = bmesh.new()
+    bmesh.ops.create_cube(bm2, size=0.5)
+    bm2.to_mesh(probe_mesh)
+    bm2.free()
+
+    caught = asset_export.meshes_without_material(bpy.context.scene)
+    check("无材质的物体被报出来", "MaterialProbe" in caught, str(caught))
+
+    probe_mat = bpy.data.materials.new("ProbeMat")
+    probe_mat.use_nodes = True
+    probe_mesh.materials.append(probe_mat)
+    after = asset_export.meshes_without_material(bpy.context.scene)
+    check("加了材质后不再被报", "MaterialProbe" not in after, str(after))
+
+    # 清理
+    bpy.data.objects.remove(probe, do_unlink=True)
+    if probe_mesh.users == 0:
+        bpy.data.meshes.remove(probe_mesh)
 
     print("-" * 70)
     print(scene_text)

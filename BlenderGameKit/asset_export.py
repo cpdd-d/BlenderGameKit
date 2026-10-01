@@ -1771,6 +1771,35 @@ def build_model_nodes(export_dir, model_name, node_names, materials_map,
                          f'{material_file}")')
         lines.append("")
     return "\n".join(lines), used
+def meshes_without_material(scene):
+    """找出"会被导出但一个材质都没有"的网格物体名。
+
+    ── 为什么要专门查这个 ──────────────────────────────────────────
+    材质是**按物体上的材质槽**导出的:`scene_materials()` 只收集
+    `first_real_material(obj)` 拿得到东西的物体。一个材质槽都没有的网格
+    会被整个跳过 —— 于是 .glb 里它就是一个没有材质的网格,
+    Godot 用默认材质渲染,**看起来是一片灰**。
+
+    实测踩过:用户建了个 Cube 当角色,忘了给材质,导出的角色场景里
+    那个方块就是灰的,他以为"渲染坏了"。这不是渲染问题,
+    是那个物体在 Blender 里就没有材质。
+    """
+    out = []
+    if scene is None:
+        return out
+    for obj in scene.objects:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        if obj.get(PREVIEW_MARK):
+            continue
+        if not obj.data.materials:
+            out.append(obj.name)
+            continue
+        if first_real_material(obj) is None:
+            out.append(obj.name)
+    return out
+
+
 def _base_class_for(scene, obj, dimension="3"):
     """算出某个物体对应的脚本基类。
 
@@ -1957,6 +1986,19 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
             result["warnings"].append(f"角色场景生成失败: {exc}")
 
     result["directory"] = directory
+
+    # ---- 5) 没有材质的网格会渲染成灰模,提前说清楚 ----
+    # 这不是渲染坏了,是那个物体在 Blender 里就没有材质。
+    # 不说的话用户只会看到"一片灰",完全想不到要去加材质。
+    no_material = meshes_without_material(scene)
+    if no_material:
+        result["warnings"].append(
+            "这些网格没有材质,在 Godot 里会显示成灰模:"
+            + "、".join(no_material)
+            + "。在 Blender 里给它们指定一个材质(『材质属性』面板 → 新建),"
+              "再导出一次就有颜色了。"
+        )
+
     return result
 
 
