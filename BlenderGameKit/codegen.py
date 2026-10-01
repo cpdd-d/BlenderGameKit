@@ -916,18 +916,19 @@ def _expr_is_on_floor(ctx, node):
 
 @expr_node("GKNodeActionPressed")
 def _expr_action_pressed(ctx, node):
-    return f"Input.is_action_pressed({ctx.input_action(node, 'gk_action', 'ui_right')})"
+    return f"Input.is_action_pressed({ctx.input_action(node, 'gk_action', 'jump')})"
 
 
 @expr_node("GKNodeActionJustPressed")
 def _expr_action_just_pressed(ctx, node):
-    return f"Input.is_action_just_pressed({ctx.input_action(node, 'gk_action', 'ui_accept')})"
+    return f"Input.is_action_just_pressed({ctx.input_action(node, 'gk_action', 'jump')})"
 
 
 @expr_node("GKNodeGetAxis")
 def _expr_get_axis(ctx, node):
-    negative = ctx.input_action(node, "gk_negative", "ui_left")
-    positive = ctx.input_action(node, "gk_positive", "ui_right")
+    # 兜底同 _expr_get_vector:用 move_* 才会自动绑上键
+    negative = ctx.input_action(node, "gk_negative", "move_left")
+    positive = ctx.input_action(node, "gk_positive", "move_right")
     # 注意:Godot 的 Input.get_axis 不接受死区参数，死区只在 get_vector 里有效
     return f"Input.get_axis({negative}, {positive})"
 
@@ -935,10 +936,17 @@ def _expr_get_axis(ctx, node):
 @expr_node("GKNodeGetVector")
 def _expr_get_vector(ctx, node):
     deadzone = gd_number(getattr(node, "gk_deadzone", 0.2))
-    left = ctx.input_action(node, "gk_left", "ui_left")
-    right = ctx.input_action(node, "gk_right", "ui_right")
-    up = ctx.input_action(node, "gk_up", "ui_up")
-    down = ctx.input_action(node, "gk_down", "ui_down")
+    # ── 兜底动作名用 "move_*" 而不是 Godot 内置的 "ui_*"(踩过的坑)────
+    # `ui_left/right/up/down` 是 Godot 的**全局界面动作**,绑的是**方向键**,
+    # 不是 WASD。用户拿默认设置跑起来按 WASD 完全没反应,按方向键才行 ——
+    # 而"按 WASD 走路"是所有人的第一直觉,他只会得出"输入是坏的"这个结论。
+    #
+    # 用 "move_*" 的好处:导出时会连按键一起写进 project.godot
+    # (见 project.set_input_actions / DEFAULT_KEYS),WASD 自动就通了。
+    left = ctx.input_action(node, "gk_left", "move_left")
+    right = ctx.input_action(node, "gk_right", "move_right")
+    up = ctx.input_action(node, "gk_up", "move_up")
+    down = ctx.input_action(node, "gk_down", "move_down")
     base = f"Input.get_vector({left}, {right}, {up}, {down}, {deadzone})"
     if ctx.dim == 2:
         return base

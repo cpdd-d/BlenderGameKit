@@ -141,11 +141,14 @@ class TestCharacter(Base):
 
         self.assertIn("extends CharacterBody2D", code)
         self.assertIn("func _physics_process(delta: float) -> void:", code)
-        # 输入动作名集中成脚本顶部常量，方便改键
-        self.assertIn('const ACTION_UI_LEFT := "ui_left"', code)
+        # 输入动作名集中成脚本顶部常量，方便改键。
+        # 默认是 move_* 而**不是** Godot 内置的 ui_* ——
+        # ui_* 绑的是方向键,WASD 完全没反应(用户实测踩过)。
+        # move_* 导出时会连按键一起写进 project.godot(WASD 开箱即用)。
+        self.assertIn('const ACTION_MOVE_LEFT := "move_left"', code)
         self.assertIn('const ACTION_JUMP := "jump"', code)
-        self.assertIn("Input.get_vector(ACTION_UI_LEFT, ACTION_UI_RIGHT, "
-                      "ACTION_UI_UP, ACTION_UI_DOWN, 0.2)", code)
+        self.assertIn("Input.get_vector(ACTION_MOVE_LEFT, ACTION_MOVE_RIGHT, "
+                      "ACTION_MOVE_UP, ACTION_MOVE_DOWN, 0.2)", code)
         self.assertIn(".normalized()", code)
         self.assertIn(".move_and_slide()", code)
         self.assertIn("Input.is_action_just_pressed(ACTION_JUMP)", code)
@@ -1988,6 +1991,62 @@ class TestMoveSpeedDimension(Base):
         code, warns = gen(tree, V3)
         self.assertIn("6.0", code)
         self.assertEqual(warns, [], warns)
+
+
+class TestDefaultInputActions(Base):
+    """默认输入动作必须是 move_*(WASD),不能是 Godot 内置的 ui_*(方向键)。
+
+    用户实测踩过:拿默认设置跑起来按 WASD 完全没反应 ——
+    因为生成的是 `Input.get_vector("ui_left", ...)`,而 ui_* 是 Godot 的
+    **全局界面动作**,绑的是**方向键**。用户只会得出"输入是坏的"这个结论。
+    """
+
+    def test_default_actions_are_move_not_ui(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        mov = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        # 必须真的连上 —— 没被消费的节点会被当成死代码丢掉
+        gk_stub.connect(tree, ev, "执行", mov, "执行")
+        gk_stub.connect(tree, vec, "方向", mov, "方向")
+        code, _ = gen(tree, V3)
+        self.assertIn('"move_left"', code)
+        self.assertIn('"move_right"', code)
+        self.assertIn('"move_up"', code)
+        self.assertIn('"move_down"', code)
+        # 一个 ui_* 都不该出现
+        self.assertNotIn("ui_left", code)
+        self.assertNotIn("ui_right", code)
+
+    def test_jump_default_action(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        pressed = tree.new_node(NN.GKNodeActionJustPressed, "跳跃键")
+        branch = tree.new_node(NN.GKNodeBranch, "分支")
+        jump = tree.new_node(NN.GKNodeJump, "跳")
+        # ActionJustPressed 是表达式节点(只有"刚按下"输出,没有执行引脚),
+        # 所以要接到分支的『条件』上,再让分支去驱动跳
+        gk_stub.connect(tree, ev, "执行", branch, "执行")
+        gk_stub.connect(tree, pressed, "刚按下", branch, "条件")
+        gk_stub.connect(tree, branch, "是", jump, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('"jump"', code)
+
+    def test_project_godot_binds_wasd(self):
+        """默认动作名必须能被 project.godot 写出真实的 WASD 按键。
+
+        这是"开箱即用"的关键:光有动作名不够,还得有按键绑定,
+        否则 Godot 运行时报 The InputMap action "move_left" doesn't exist。
+        """
+        from BlenderGameKit import project as P
+
+        for action, key in (("move_left", 65), ("move_right", 68),
+                            ("move_up", 87), ("move_down", 83),
+                            ("jump", 32)):
+            self.assertEqual(P.DEFAULT_KEYS.get(action), key,
+                             f"{action} 的默认按键不对")
+            block = P._input_action_block(action)
+            self.assertIn(f'"physical_keycode":{key}', block)
 
 
 def nn_base_statement():

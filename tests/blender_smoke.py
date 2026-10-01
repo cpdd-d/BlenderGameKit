@@ -164,8 +164,9 @@ def main():
         check("生成代码含 _physics_process", "func _physics_process(delta: float) -> void:" in code)
         check("生成代码含 move_and_slide", "move_and_slide()" in code)
         check("生成代码含 get_vector", "Input.get_vector(ACTION_" in code)
-        check("输入动作已抽成常量", 'const ACTION_MOVE_LEFT := "move_left"' not in code
-              and 'const ACTION_UI_LEFT := "ui_left"' in code)
+        # 默认动作名是 move_*(WASD 开箱即用),不再是 Godot 内置的 ui_*(方向键)
+        check("输入动作已抽成常量", 'const ACTION_MOVE_LEFT := "move_left"' in code
+              and 'const ACTION_UI_LEFT := "ui_left"' not in code)
         check("跳跃力度暴露为 @export", "@export var jump_force: float = 520.0" in code)
         check("无告警", not warnings, str(warnings))
         print("-" * 70)
@@ -185,11 +186,17 @@ def main():
         settings["base_class"] = "CharacterBody2D"
         settings["write_scene"] = True
         result = exporter.export_tree(tree, settings, write_scene=True)
-        check("导出脚本文件", os.path.isfile(os.path.join(out_dir, result["script_name"])))
+        # 脚本落在 scripts/ 子目录里(项目结构:scripts/ scenes/ art/ …),
+        # 用 result["written"] 里记的真实路径,别自己拼 ——
+        # 以前这里拼的是 out_dir/<名字>,那个文件根本不存在,
+        # 读到的空内容自然和生成的代码不相等(误报)。
+        script_path = next((p for p in result["written"] if p.endswith(".gd")),
+                           os.path.join(out_dir, "scripts", result["script_name"]))
+        check("导出脚本文件", os.path.isfile(script_path), script_path)
         check("导出时无告警", not result["warnings"], str(result["warnings"]))
 
         # 读回来比对，确认磁盘内容与生成内容一致
-        with open(os.path.join(out_dir, result["script_name"]), encoding="utf-8") as handle:
+        with open(script_path, encoding="utf-8") as handle:
             written = handle.read()
         check("文件内容与生成内容一致", written == code)
         check("文件是 UTF-8 且含中文注释", "由 BlenderGameKit 自动生成" in written)

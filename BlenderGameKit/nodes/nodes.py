@@ -564,8 +564,11 @@ class GKNodeActionPressed(B.GKExpressionNode):
     bl_label = "输入_按键按住"
     bl_icon = "HAND"
     gk_category = "输入"
-    gk_doc = "动作按键是否按住(对应 Input.is_action_pressed)"
-    gk_prop_defs = (("gk_action", "string", "ui_right", "动作名", "Godot 输入映射里的动作"),)
+    gk_doc = ("动作按键是否按住(对应 Input.is_action_pressed)。"
+              "默认 move_right(导出时自动绑到 D)")
+    gk_prop_defs = (("gk_action", "string", "move_right", "动作名",
+                     "Godot 输入映射里的动作名。用 move_*/jump 这类名字"
+                     "导出时会自动绑好按键"),)
     gk_outputs = (S.pin(BOOL, "按住", False),)
 
     def draw_buttons(self, context, layout):
@@ -578,8 +581,13 @@ class GKNodeActionJustPressed(B.GKExpressionNode):
     bl_label = "输入_按键按下"
     bl_icon = "MOUSE_LMB"
     gk_category = "输入"
-    gk_doc = "动作键是否刚按下(本帧，对应 is_action_just_pressed)"
-    gk_prop_defs = (("gk_action", "string", "ui_accept", "动作名", "Godot 输入映射里的动作"),)
+    gk_doc = ("动作键是否刚按下(本帧，对应 is_action_just_pressed)。"
+              "默认 jump(导出时自动绑到空格)")
+    # 默认 jump 而不是 Godot 内置的 ui_accept —— 后者绑的是**回车/空格**,
+    # 但"跳跃用空格"更符合直觉,而且导出时会自动把空格绑上(见 DEFAULT_KEYS)
+    gk_prop_defs = (("gk_action", "string", "jump", "动作名",
+                     "Godot 输入映射里的动作名。用 move_*/jump 这类名字"
+                     "导出时会自动绑好按键"),)
     gk_outputs = (S.pin(BOOL, "刚按下", False),)
 
     def draw_buttons(self, context, layout):
@@ -592,10 +600,13 @@ class GKNodeGetAxis(B.GKExpressionNode):
     bl_label = "输入_轴"
     bl_icon = "ARROW_LEFTRIGHT"
     gk_category = "输入"
-    gk_doc = "取输入轴强度(-1 ~ 1)，用两个动作拼出一个轴"
+    gk_doc = ("取输入轴强度(-1 ~ 1)，用两个动作拼出一个轴。"
+              "默认 move_left / move_right(导出时自动绑到 A / D)")
     gk_prop_defs = (
-        ("gk_negative", "string", "ui_left", "负方向动作", "例如 ui_left"),
-        ("gk_positive", "string", "ui_right", "正方向动作", "例如 ui_right"),
+        ("gk_negative", "string", "move_left", "负方向动作",
+         "负方向的动作名。默认 move_left(自动绑到 A)"),
+        ("gk_positive", "string", "move_right", "正方向动作",
+         "正方向的动作名。默认 move_right(自动绑到 D)"),
         ("gk_deadzone", "float", 0.2, "死区", "小于该值视为 0"),
     )
     gk_outputs = (S.pin(FLOAT, "强度", 0.0),)
@@ -612,12 +623,21 @@ class GKNodeGetVector(B.GKExpressionNode):
     bl_label = "输入_方向向量"
     bl_icon = "ORIENTATION_GIMBAL"
     gk_category = "输入"
-    gk_doc = "取方向输入并合成向量(对应 Input.get_vector)"
+    gk_doc = ("取方向输入并合成向量(对应 Input.get_vector)。"
+              "默认动作 move_up/down/left/right 导出时会自动绑到 W/S/A/D —— "
+              "不用去 Godot 里手工配输入映射")
+    # ── 默认值必须是 move_*,不能是 Godot 内置的 ui_*(踩过的坑)────────
+    # `ui_left/right/up/down` 是 Godot 的**全局界面动作**,绑的是**方向键**,
+    # 不是 WASD。用户按 WASD 完全没反应,只会得出"输入坏了"的结论
+    # —— 而"WASD 走路"是所有人的第一直觉。
+    # 用 move_* 的话,导出时会把这四个动作连**按键**一起写进 project.godot
+    # (见 project.set_input_actions 的 DEFAULT_KEYS),开箱即用。
+    # 想换键位就改这里的动作名,或者在 Godot 的输入映射里改。
     gk_prop_defs = (
-        ("gk_left", "string", "ui_left", "左", ""),
-        ("gk_right", "string", "ui_right", "右", ""),
-        ("gk_up", "string", "ui_up", "上", ""),
-        ("gk_down", "string", "ui_down", "下", ""),
+        ("gk_left", "string", "move_left", "左", "动作名(导出时自动绑到 A)"),
+        ("gk_right", "string", "move_right", "右", "动作名(导出时自动绑到 D)"),
+        ("gk_up", "string", "move_up", "上", "动作名(导出时自动绑到 W)"),
+        ("gk_down", "string", "move_down", "下", "动作名(导出时自动绑到 S)"),
         ("gk_deadzone", "float", 0.2, "死区", ""),
     )
     gk_outputs = (S.pin(VECTOR, "方向", (0.0, 0.0, 0.0)),)
@@ -1917,7 +1937,8 @@ class GKNodeTouchButton(B.GKExpressionNode):
     gk_doc = ("触屏上某个输入动作是否按住。移动端的虚拟按键通常会映射成输入动作，"
               "所以和键盘共用同一套动作名")
     gk_prop_defs = (
-        ("gk_action", "string", "ui_accept", "动作名", "Godot 输入映射里的动作"),
+        ("gk_action", "string", "jump", "动作名",
+         "Godot 输入映射里的动作名。用 move_*/jump 这类名字导出时会自动绑好按键"),
     )
     gk_outputs = (S.pin(BOOL, "按住", False),)
 
