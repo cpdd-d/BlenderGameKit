@@ -189,7 +189,19 @@ void fragment() {
 	}
 
 	ALBEDO = base.rgb;
-	ALPHA = alpha;
+	// ── ALPHA 必须写 1.0,不能写 alpha ────────────────────────────────
+	// 这是一个 **cutout(抠图)** 材质,不是半透明材质:
+	//   像素要么整个丢掉(discard),要么完全不透明。
+	//
+	// 踩过的坑:以前这里写 `ALPHA = alpha`。Godot 只要看到 fragment 里
+	// 给 ALPHA 赋了值,就**把整个材质当透明物体**,丢进透明渲染队列。
+	// 透明物体不做深度写入、并且要按距离排序 ——
+	// 于是多个物体/多个面重叠时排序会来回跳变,画面表现就是
+	// **模型一闪一闪**(用户实测反馈:"左右移动时,模型会一闪一闪的")。
+	//
+	// 写死 1.0 之后材质留在不透明队列:正常写深度、不参与排序,
+	// 闪烁消失。alpha_cut 的抠图效果完全保留(靠上面的 discard)。
+	ALPHA = 1.0;
 	METALLIC = 0.0;
 	// Fully rough + zero specular disables the engine's own soft highlight so
 	// only our hard-edged cel highlight is visible. (There is no

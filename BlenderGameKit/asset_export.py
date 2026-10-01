@@ -123,7 +123,15 @@ extends Node
 
 func _ready() -> void:
 	_activate_camera()
-	_apply_materials()
+	# ── 材质必须等一帧再挂(踩过的坑)─────────────────────────────────
+	# 角色的网格现在藏在**嵌套的 glb 实例**里:
+	#     Cube [CharacterBody3D]
+	#       Model [instance Cube.glb]   <- 网格在这一层实例内部
+	# 在 _ready() 这个时刻,实例内部的节点**还没进树**,`find_child`
+	# 根本搜不到它 —— 实测报 "[GK] 没找到网格节点: Cube",
+	# 角色就只剩 glb 自带的默认材质(用户看到的还是"材质没生效")。
+	# 用 call_deferred 推到本帧末,那时整棵树都建好了。
+	_apply_materials.call_deferred()
 
 
 ## 把 Blender 里调好的材质挂到对应的网格上。
@@ -155,7 +163,20 @@ func _apply_materials() -> void:
 		var material: Material = load(res_path)
 		if material == null:
 			continue
-		var node := root.find_child(node_name, true, false)
+		# ── 找网格节点必须**先按类型找**(踩过的坑)──────────────────
+		# `find_child("Cube")` 返回的是**第一个**叫 Cube 的节点 ——
+		# 而场景里有两个同名节点:
+		#     Colliders/Cube [CharacterBody3D]   <- 先被找到,但它不是网格
+		#     Colliders/Cube/Model/Cube [MeshInstance3D]  <- 真正要挂材质的
+		# 于是 `if node is MeshInstance3D` 判false,材质挂不上,
+		# 用户看到的是"角色的材质一直没生效"。
+		# 所以先在所有 MeshInstance3D 里按名字找,找不到再退回 find_child。
+		var node: Node = null
+		for candidate in root.find_children(node_name, "MeshInstance3D", true, false):
+			node = candidate
+			break
+		if node == null:
+			node = root.find_child(node_name, true, false)
 		if node is MeshInstance3D:
 			(node as MeshInstance3D).material_override = material
 			applied += 1
@@ -332,7 +353,7 @@ def export_glb(export_dir, name, use_selection, objects):
     return _run_gltf_export(kwargs, path)
 
 
-def export_scene_glb(export_dir, name="World", scene=None):
+def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
     """把**整个 Blender 场景**导出成一个 .glb(保持层级与变换)。
 
     返回 (路径, 是否成功, 消息)。
@@ -363,9 +384,25 @@ def export_scene_glb(export_dir, name="World", scene=None):
     # 记住原来的选中状态,导出后恢复 —— 不要打乱用户的选择
     previous = [obj for obj in scene.objects if obj.select_get()]
 
+    # ── 要排除的物体(角色)────────────────────────────────────────────
+    # 角色的网格会单独导成一个 glb,再 instance 到角色节点下面。
+    # 如果 World.glb 里**也留着一份**,两份网格就会重叠在同一个位置 ——
+    # 深度冲突,画面表现是"模型一闪一闪的"(用户实测反馈)。
+    #
+    # exclude 里的物体**连同它们的子级**一起排除:角色的子物体已经被
+    # 角色 glb 带走了,这里再留一份同样会重叠。
+    excluded = set()
+    stack = [obj for obj in (exclude or ()) if obj is not None]
+    while stack:
+        obj = stack.pop()
+        if obj in excluded:
+            continue
+        excluded.add(obj)
+        stack.extend(obj.children)
+
     skipped = []
     for obj in scene.objects:
-        if obj.get(PREVIEW_MARK):
+        if obj.get(PREVIEW_MARK) or obj in excluded:
             skipped.append(obj.name)
             obj.select_set(False)
         else:
@@ -594,6 +631,17 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         entry = (materials_map or {}).get(obj_name)
         if entry:
             material_files[obj_name] = entry[1]
+
+    # 角色自己的 glb 是**单独**一个实例,它的网格不在 mesh_info 里,
+    # 所以要额外把角色的材质也列进映射表 —— 否则角色的卡通材质挂不上,
+    # 只剩 glb 自带的默认材质(用户看到的还是"角色材质没生效")。
+    # 键用 glb 里真实存在的网格节点名,因为运行时是按节点名找的。
+    if use_character_model:
+        char_meshes = glb_scene_nodes(export_dir, character_model).get("meshes", {})
+        for node_name in sorted(char_meshes):
+            entry = (materials_map or {}).get(node_name)
+            if entry:
+                material_files[node_name] = entry[1]
 
     # ---- 相机 / 灯光 ----
     #
@@ -1953,9 +2001,49 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
 
     is_3d = str(dimension) != "2"
 
-    # ---- 1) 整场景 glb ----
-    world_path, world_ok, world_message = export_scene_glb(directory, "World",
-                                                           scene=scene)
+    # ---- 0) 先找脚本挂载目标 ----
+    # 必须最先做:它决定"角色是谁",而角色的网格要从 World.glb 里排除掉
+    # (否则两份网格重叠 -> 深度冲突 -> 模型一闪一闪)。
+    script_target = None
+    for obj, physics, enabled in collect_physics(scene):
+        if enabled and physics is not None and \
+                getattr(physics, "script_target", False):
+            script_target = obj
+            break
+
+    # ── 没勾「脚本挂载目标」时必须说出来 ────────────────────────────
+    # 不勾的话导出的场景**一个脚本都不会挂** —— 用户按 F5 看到角色不动,
+    # 会以为插件坏了。实测踩过:导出看起来全成功(文件都写了、无报错),
+    # 但 .tscn 里根本没有 script = 那一行。
+    if script_name and script_target is None:
+        result["warnings"].append(
+            "脚本没有挂到任何节点上:请在物体的『游戏物理 (BlenderGameKit)』"
+            "面板里勾上『脚本挂载目标』(一般选角色身体那一个),再导出一次。"
+            "否则导出的场景里不会有脚本,角色不会动。"
+        )
+
+    # ---- 0b) 角色自己的 glb(必须在导出整场景**之前**)----
+    #
+    # 包装场景要把角色节点做成"自带网格"的(self-contained),
+    # 就得先有这个 glb 文件;而且导出整场景时要把它排除掉。
+    # 见 write_world_scene 文档里 character_model 那段说明。
+    char_model = None
+    if script_target is not None:
+        char_model = _sanitize_node_name(script_target.name) or "Character"
+        char_path, char_ok, char_msg = export_subtree_glb(
+            directory, char_model, [script_target], scene=scene)
+        if char_ok:
+            result["written"].append(char_path)
+        else:
+            result["warnings"].append(
+                f"角色单独导出失败({char_msg}),已退回整场景模型:"
+                f"这样角色移动时看不到自己的网格跟着动。")
+            char_model = None
+
+    # ---- 1) 整场景 glb(排除角色,避免两份网格重叠)----
+    world_path, world_ok, world_message = export_scene_glb(
+        directory, "World", scene=scene,
+        exclude=[script_target] if (script_target is not None and char_model) else None)
     if world_ok:
         result["written"].append(world_path)
     else:
@@ -1986,23 +2074,6 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
         materials_map = {}
 
     # ---- 3) 包装场景:整个场景 + 材质覆盖 + 碰撞体 + 相机灯光 ----
-    script_target = None
-    for obj, physics, enabled in collect_physics(scene):
-        if enabled and physics is not None and \
-                getattr(physics, "script_target", False):
-            script_target = obj
-            break
-
-    # ── 没勾「脚本挂载目标」时必须说出来 ────────────────────────────
-    # 不勾的话导出的场景**一个脚本都不会挂** —— 用户按 F5 看到角色不动,
-    # 会以为插件坏了。实测踩过:导出看起来全成功(文件都写了、无报错),
-    # 但 .tscn 里根本没有 script = 那一行。
-    if script_name and script_target is None:
-        result["warnings"].append(
-            "脚本没有挂到任何节点上:请在物体的『游戏物理 (BlenderGameKit)』"
-            "面板里勾上『脚本挂载目标』(一般选角色身体那一个),再导出一次。"
-            "否则导出的场景里不会有脚本,角色不会动。"
-        )
 
     # ---- 2b) 角色自己的 glb(必须在包装场景**之前**)----
     #
@@ -2047,25 +2118,9 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
     result["lights"] = len(glb_info.get("lights", ())) or (
         1 if any(obj.type == "LIGHT" for obj in scene.objects) else 0)
 
-    # ---- 4) 角色场景 ----
+    # ---- 4) 角色场景(单独调试角色用)----
     #
-    # ── 为什么让角色场景当主场景 ────────────────────────────────────
-    # 包装场景(World.tscn)里,角色网格在 glb 实例内部、碰撞体在 Colliders/
-    # 下面 —— **分属两棵不同的子树**。移动 Colliders/Cube 只会动碰撞体,
-    # 画面里的角色纹丝不动(用户实测反馈:"跟没挂脚本一样")。
-    #
-    # 而且这个问题**没法在 World.tscn 里修**:Godot 不允许往 glb 实例内部
-    # 挂节点(实测报 "Parent path './World/Suzanne' has vanished")。
-    #
-    # 只有角色场景的结构是对的:
-    #     Hero [CharacterBody3D]
-    #       Collision / Model      ← 同父级,一起动
-    #
-    # 所以有脚本挂载目标时,把主场景指向角色场景。地面和道具还在
-    # World.tscn 里,想切回去在 Godot 里改一行主场景就行。
-    # ---- 4b) 角色场景(单独调试角色用)----
-    #
-    # ── 主场景现在仍然是 World.tscn ─────────────────────────────────
+    # ── 主场景是 World.tscn ─────────────────────────────────────────
     # 用户的反馈很明确:"应该默认为平面为主场景,不然每次打开 Godot
     # 再设置项目主场景太烦人了"。
     #
@@ -2087,7 +2142,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 #  assigned to an object of type: 'Y')。
                 # 所以这里调的是同一个解析函数,不另外猜。
                 base_class=_base_class_for(scene, script_target, dimension),
-                # 上面 2b 已经导过了,这里直接复用,不重复导一遍
+                # 上面 0b) 已经导过了,这里直接复用,不重复导一遍
                 model_name=char_model or "World",
                 script_name=script_name,
                 bounds=bounds,
