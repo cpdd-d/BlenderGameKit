@@ -174,6 +174,7 @@ class GenContext:
         self.vars = {}             # 变量名 -> 类型
         self.var_order = []
         self.onready = {}          # 变量名 -> (节点访问表达式, GDScript 类型)
+        self._onready_by_path = {}  # 节点访问表达式 -> 变量名(避免重复声明同一个节点)
         self.exports = []          # @export 参数行 (名字, 类型, 初值, 注释)
         self.input_actions = {}    # 常量名 -> 输入动作名
         self.warnings = []
@@ -186,6 +187,14 @@ class GenContext:
         self._claimed = {}         # 节点名 -> 哪个事件函数已经"拥有"它
         self._current_event = ""   # 当前正在生成的事件标签(用于告警文案)
         self._expr_refs = {}       # "节点::输出名" -> 被引用次数(判断要不要抽临时变量)
+        # 需要在 _process 里每帧执行的"后台行为"。
+        # 相机震动这类效果不是一次性语句:它要跨帧衰减。
+        # 我们不生成 lambda(类型推断会炸)，而是把整段代码塞进 _process，
+        # 由 (变量名, 代码行列表) 描述。值为 None 表示只登记注释。
+        self.process_hooks = {}    # 钩子名 -> [代码行, ...]
+        # 只有真的用了"自动找相机"才生成 get_first_camera()，
+        # 避免给所有脚本都塞一个用不到的辅助函数。
+        self.need_camera_finder = False
 
     # ---- 生成段落 ----
     def new_section(self):
@@ -445,15 +454,27 @@ class GenContext:
         gd_type = S.gdscript_type(getattr(source, "bl_idname", ""))
         return gd_type in ("float", "int", "bool")
 
-    def add_onready(self, base, path):
+    def add_onready(self, base, path, hint=""):
         """登记一个 @onready 节点引用，返回变量名。
 
         类型按路径推断:声明成 Node 却调用 AnimationPlayer 的方法会被
         GDScript 的静态类型检查拒绝，所以这里必须用具体类型。
+
+        hint 是"调用方知道、但路径看不出来"的类型线索。典型场景:
+        节点名叫『主相机』，路径是 $主相机 —— 一个相机类型的关键词都没有，
+        光看路径只能猜出 Node，于是 `.make_current()` 会被静态类型拒绝。
+        带上 hint='cam' 就能正确推断成 Camera2D / Camera3D。
+
+        **同一个节点路径只声明一次**。否则同一台相机被 3 个节点引用时，
+        会生成 cam / cam_2 / cam_3 三个指向同一节点的变量：
+        能跑，但脚本开头一片重复，用户看不出它们其实是同一个东西。
         """
+        cached = self._onready_by_path.get(path)
+        if cached is not None:
+            return cached
         var = self.unique_name(base, "node")
-        if var not in self.onready:
-            self.onready[var] = (path, gd_node_type(path))
+        self.onready[var] = (path, gd_node_type(path, hint=hint, dim=self.dim))
+        self._onready_by_path[path] = var
         return var
 
     def add_action(self, action):
@@ -476,7 +497,7 @@ class GenContext:
         raw = getattr(node, prop, TARGET_SELF) or TARGET_SELF
         if raw == TARGET_SELF:
             return "self"
-        return self.add_onready(f"{hint}_{raw}", gd_node_path(raw))
+        return self.add_onready(f"{hint}_{raw}", gd_node_path(raw), hint=hint)
 
     def sprite_target(self, node, prop="gk_target"):
         """精灵类目标:自身时用 $Sprite2D 更符合 Godot 习惯。"""
@@ -561,8 +582,14 @@ NODE_TYPE_HINTS = (
 )
 
 
-def gd_node_type(raw):
-    """按节点路径猜 Godot 类型，猜不到就退回 Node。"""
+def gd_node_type(raw, hint="", dim=3):
+    """按节点路径猜 Godot 类型，猜不到就退回 Node。
+
+    hint 是调用方给的额外线索。相机节点最常踩这个坑:节点叫『主相机』，
+    路径里一个类型关键词都没有，只能猜出 Node，于是 make_current() 会被
+    GDScript 的静态类型检查拒绝。所以相机类节点允许"猜不出来时用 hint 兜底"，
+    并按项目维度选 Camera2D / Camera3D —— 选错了类型一样会编译失败。
+    """
     text = (raw or "").strip().rstrip("/")
     leaf = text.rsplit("/", 1)[-1] if text else ""
     if leaf.startswith("@"):
@@ -570,6 +597,8 @@ def gd_node_type(raw):
     for keyword, gd_type in NODE_TYPE_HINTS:
         if leaf == keyword or leaf.endswith(keyword):
             return gd_type
+    if hint == "cam":
+        return "Camera2D" if dim == 2 else "Camera3D"
     return "Node"
 
 
@@ -1021,6 +1050,151 @@ def _stmt_spawn(ctx, node, indent):
         ctx.add_line(indent + 1, f"get_tree().current_scene.add_child({inst})")
 
 
+# ==========================================================================
+# 显示 / 相机 / 时间
+# ==========================================================================
+# 只有这些基类带 `visible` 属性。往 Node 上写 `visible` 会让 GDScript
+# 直接报 "Identifier not declared"，所以必须提前拦下来给告警。
+_VISIBLE_BASES = {
+    "Node2D", "Node3D", "Control", "CanvasItem",
+    "Sprite2D", "Sprite3D", "AnimatedSprite2D", "AnimatedSprite3D",
+    "CharacterBody2D", "CharacterBody3D", "RigidBody2D", "RigidBody3D",
+    "StaticBody2D", "StaticBody3D", "Area2D", "Area3D",
+    "Label", "Button", "ProgressBar", "TextureRect", "NinePatchRect",
+    "TileMap", "TileMapLayer", "CollisionShape2D", "CollisionShape3D",
+}
+
+
+def _base_supports_visible(base_class):
+    text = str(base_class or "")
+    return text in _VISIBLE_BASES or text.endswith(("2D", "3D"))
+
+
+def _camera_expr(ctx, node, auto="first"):
+    """求值相机目标。
+
+    三种情况:
+      * 图里指定了某个节点 -> 用它的 @onready 变量
+      * 图里两个相机节点 -> 按路径引用
+      * 都没填 -> 不报警、不生成 @onready，而是在运行时**自动找第一个相机**。
+        对新手来说"我什么都没填但震动生效了"比"必须先在面板里选相机"友好得多。
+    """
+    raw = (getattr(node, "gk_target", "") or "").strip()
+    if raw and raw != TARGET_SELF:
+        return ctx.target_expr(node, hint="cam"), True
+    if auto == "first":
+        ctx.warn(f"『{node.bl_label}』没有指定相机，"
+                 f"已改成运行时自动找场景里第一个相机(Camera2D / Camera3D)")
+        return 'get_tree().get_first_node_in_group("gk_camera")', False
+    return "null", False
+
+
+@stmt_node("GKNodeSetVisible")
+def _stmt_set_visible(ctx, node, indent):
+    target = ctx.target_expr(node)
+    if target == "self" and not _base_supports_visible(ctx.base_class):
+        ctx.warn(f"『{node.bl_label}』的目标是自身，但脚本基类 {ctx.base_class} "
+                 f"没有 visible 属性(Godot 会报错)，已跳过这一句")
+        return
+    socket = ctx._socket(node, "可见")
+    if socket is not None and getattr(socket, "is_linked", False):
+        value = ctx.expr_of(socket)
+    else:
+        value = "true" if getattr(node, "gk_visible", True) else "false"
+    ctx.add_line(indent, f"{target}.visible = {value}")
+
+
+@stmt_node("GKNodeSetPaused")
+def _stmt_set_paused(ctx, node, indent):
+    mode = "PROCESS_MODE_DISABLED" if getattr(node, "gk_paused", True) else "PROCESS_MODE_INHERIT"
+    ctx.add_line(indent, f"{ctx.target_expr(node)}.process_mode = Node.{mode}")
+
+
+@stmt_node("GKNodeCameraSetCurrent")
+def _stmt_camera_set_current(ctx, node, indent):
+    camera, _auto = _camera_expr(ctx, node)
+    ctx.add_line(indent, f"{camera}.make_current()")
+
+
+@stmt_node("GKNodeCameraZoom")
+def _stmt_camera_zoom(ctx, node, indent):
+    camera, _auto = _camera_expr(ctx, node)
+    value = _tunable_number(ctx, node, "数值", "1.0", "camera_zoom")
+    temp = ctx.new_temp("cam")
+    # 2D 的 zoom 是"越大越近"的倍数，3D 的 fov 是垂直视场角(度)。
+    # 两者语义不同，所以按相机真实类型分派，而不是按项目维度猜。
+    ctx.add_line(indent, f"var {temp} = {camera}")
+    ctx.add_line(indent, f"if {temp} is Camera2D:")
+    ctx.add_line(indent + 1, f"{temp}.zoom = Vector2({value}, {value})")
+    ctx.add_line(indent, f"elif {temp} is Camera3D:")
+    ctx.add_line(indent + 1, f"{temp}.fov = {value}")
+
+
+@stmt_node("GKNodeCameraShake")
+def _stmt_camera_shake(ctx, node, indent):
+    """相机震动。
+
+    ── 为什么不是"一次性语句" ──────────────────────────────────────
+    震动要跨帧衰减，所以真正的每帧逻辑必须挂在 _process 里。
+    做法:这里只负责"装上"(记下相机 + 重置计时器)，
+    衰减逻辑登记进 ctx.process_hooks，由 generate() 保证 _process 存在。
+    """
+    camera, is_specific = _camera_expr(ctx, node)
+    strength = gd_number(getattr(node, "gk_strength", 8.0))
+    duration = gd_number(getattr(node, "gk_duration", 0.25))
+
+    cam_var = ctx.declare_var("_gk_shake_cam", "Node")
+    time_var = ctx.declare_var("_gk_shake_left", "float")
+    power_var = ctx.declare_var("_gk_shake_power", "float")
+    total_var = ctx.declare_var("_gk_shake_total", "float")
+
+    if is_specific:
+        ctx.add_line(indent, f"{cam_var} = {camera}")
+    else:
+        # 优先用放进 "gk_camera" 组的相机(用户显式指定)，
+        # 没有就退回到场景里第一个摄像机(新手不填也能用)。
+        ctx.add_line(indent, f'{cam_var} = get_tree().get_first_node_in_group("gk_camera")')
+        ctx.add_line(indent, f"if {cam_var} == null:")
+        ctx.add_line(indent + 1, f"{cam_var} = get_first_camera()")
+
+    ctx.add_line(indent, f"{power_var} = {strength}")
+    ctx.add_line(indent, f"{total_var} = maxf({duration}, 0.0001)")
+    ctx.add_line(indent, f"{time_var} = {total_var}")
+
+    # ---- 每帧衰减逻辑 ----
+    hook_key = "camera_shake"
+    if hook_key not in ctx.process_hooks:
+        lines = [
+            f"if {time_var} > 0.0:",
+            f"    {time_var} -= delta",
+            f"    var _decay: float = {time_var} / {total_var}",
+            f"    var _ox: float = randf_range(-{power_var}, {power_var}) * _decay",
+            f"    var _oy: float = randf_range(-{power_var}, {power_var}) * _decay",
+            f"    if {cam_var} is Camera2D:",
+            f"        ({cam_var} as Camera2D).offset = Vector2(_ox, _oy)",
+            f"    elif {cam_var} is Camera3D:",
+            f"        ({cam_var} as Camera3D).h_offset = _ox",
+            f"        ({cam_var} as Camera3D).v_offset = _oy",
+            f"elif {cam_var} != null:",
+            "    # 震动结束:偏移归零，否则相机会一直歪着",
+            f"    if {cam_var} is Camera2D:",
+            f"        ({cam_var} as Camera2D).offset = Vector2.ZERO",
+            f"    elif {cam_var} is Camera3D:",
+            f"        ({cam_var} as Camera3D).h_offset = 0.0",
+            f"        ({cam_var} as Camera3D).v_offset = 0.0",
+        ]
+        ctx.process_hooks[hook_key] = lines
+
+    # 自动找相机需要一个小工具函数
+    ctx.need_camera_finder = True
+
+
+@stmt_node("GKNodeSetTimeScale")
+def _stmt_set_time_scale(ctx, node, indent):
+    scale = _tunable_number(ctx, node, "倍速", "1.0", "time_scale")
+    ctx.add_line(indent, f"Engine.time_scale = {scale}")
+
+
 @stmt_node("GKNodeQueueFree")
 def _stmt_queue_free(ctx, node, indent):
     raw = getattr(node, "gk_target", TARGET_SELF)
@@ -1220,6 +1394,46 @@ class Generator:
             sections.append({
                 "signature": f"func {func_name}() -> void:",
                 "lines": list(lines.lines),
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 后台每帧行为(相机震动等) ----
+        # 挂在 _process 里;已经有 _process 就追加，没有就补一个。
+        if self.ctx.process_hooks:
+            target_section = None
+            for section in sections:
+                if section["signature"] == "func _process(delta: float) -> void:":
+                    target_section = section
+                    break
+            if target_section is None:
+                target_section = {
+                    "signature": "func _process(delta: float) -> void:",
+                    "lines": [],
+                    "empty_body": "    pass",
+                    "separator": True,
+                }
+                sections.append(target_section)
+            for hook_name, hook_lines in self.ctx.process_hooks.items():
+                target_section["lines"].append(f"    # ---- {hook_name} ----")
+                for text in hook_lines:
+                    # hook 行自带相对缩进，这里补上函数体的 4 空格
+                    target_section["lines"].append(("    " + text) if text else "")
+
+        # ---- 自动找相机的小工具 ----
+        if self.ctx.need_camera_finder:
+            sections.append({
+                "signature": "func get_first_camera() -> Node:",
+                "lines": [
+                    '    for child in get_tree().get_nodes_in_group("gk_camera"):',
+                    "        if child is Camera2D or child is Camera3D:",
+                    "            return child",
+                    '    for node in get_tree().root.find_children("*", "Camera2D", true, false):',
+                    "        return node",
+                    '    for node in get_tree().root.find_children("*", "Camera3D", true, false):',
+                    "        return node",
+                    "    return null",
+                ],
                 "empty_body": "    pass",
                 "separator": True,
             })

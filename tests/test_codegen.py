@@ -38,6 +38,8 @@ class Base(unittest.TestCase):
         """生成代码里不应出现中文标识符(注释与字符串字面量除外)。
 
         中文字符串是合法的(print("你好"))，但中文标识符会让 GDScript 编译失败。
+        注意 `$"主相机"` 是**带引号的节点路径**，属于字符串，同样合法 ——
+        这正是中文节点名唯一正确的写法。
         """
         offenders = []
         for number, line in enumerate(code.splitlines(), 1):
@@ -470,6 +472,200 @@ class TestNodeLibrary(unittest.TestCase):
             names = [spec["name"] for spec in cls.gk_inputs]
             self.assertEqual(len(names), len(set(names)),
                              f"{cls.bl_label} 有重名输入引脚: {names}")
+
+
+class TestDisplayNodes(Base):
+    """显示 / 相机 / 时间 三个新分类。"""
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_set_visible_true(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetVisible, "显示", gk_visible=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("self.visible = true", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_set_visible_false(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetVisible, "隐藏", gk_visible=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("self.visible = false", code)
+
+    def test_set_visible_warns_on_incompatible_base(self):
+        """往纯 Node 基类上写 visible 会被 Godot 拒绝，必须提前告警并跳过。
+
+        这是实测过的坑:
+            Identifier "visible" not declared in the current scope.
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetVisible, "隐藏", gk_visible=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, {"dimension": "3", "base_class": "Node"})
+        self.assertTrue(any("visible" in w for w in warnings), warnings)
+        self.assertNotIn("self.visible", code)
+
+    def test_set_paused_and_resume(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        pause = tree.new_node(NN.GKNodeSetPaused, "暂停", gk_paused=True)
+        resume = tree.new_node(NN.GKNodeSetPaused, "恢复", gk_paused=False)
+        gk_stub.connect(tree, event, "执行", pause, "执行")
+        gk_stub.connect(tree, pause, "完成", resume, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("self.process_mode = Node.PROCESS_MODE_DISABLED", code)
+        self.assertIn("self.process_mode = Node.PROCESS_MODE_INHERIT", code)
+        self.assert_indent_sane(code)
+
+    def test_camera_set_current(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头", gk_target="主相机")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".make_current()", code)
+        # 相机节点名里没有类型关键词，必须靠 hint 推断出 Camera2D，
+        # 否则声明成 Node 会被 GDScript 静态类型检查拒绝。
+        self.assertIn(": Camera2D = ", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_camera_zoom_dispatches_by_real_type(self):
+        """zoom 是 2D 概念、fov 是 3D 概念，必须按相机真实类型分派。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraZoom, "缩放", gk_target="主相机", gk_value=1.5)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("is Camera2D:", code)
+        self.assertIn("is Camera3D:", code)
+        self.assertIn(".zoom = Vector2(", code)
+        self.assertIn(".fov =", code)
+        self.assert_indent_sane(code)
+
+    def test_camera_shake_emits_process_hook(self):
+        """震动要跨帧衰减，所以必须真的生成 _process，而不是只写一句。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraShake, "受击抖动",
+                             gk_target="主相机", gk_strength=6.0, gk_duration=0.2)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+
+        # 触发语句:重置计时器(snake_case 会去掉前导下划线)
+        self.assertIn("gk_shake_left = gk_shake_total", code)
+        # 每帧衰减:必须有 _process
+        self.assertIn("func _process(delta: float) -> void:", code)
+        self.assertIn("randf_range(", code)
+        # 结束后必须归零，否则相机会一直歪着
+        self.assertIn(".offset = Vector2.ZERO", code)
+        self.assertIn(".h_offset = 0.0", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+        # 衰减逻辑必须在 _process 函数体内部。它在 `if gk_shake_left > 0.0:`
+        # 里面，所以缩进是 8(函数体 4 + 一层 if)。
+        lines = code.splitlines()
+        index = next(i for i, line in enumerate(lines) if line.startswith("func _process"))
+        decay = next(i for i, line in enumerate(lines) if "gk_shake_left -= delta" in line)
+        self.assertGreater(decay, index, "衰减逻辑必须在 _process 之后")
+        self.assertEqual(len(lines[decay]) - len(lines[decay].lstrip(" ")), 8,
+                         f"衰减逻辑缩进应为 8: {lines[decay]!r}")
+
+    def test_camera_shake_reuses_single_hook(self):
+        """两个震动节点不该生成两份衰减逻辑(否则会互相打架)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeCameraShake, "抖动1", gk_target="主相机")
+        second = tree.new_node(NN.GKNodeCameraShake, "抖动2", gk_target="主相机")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, _ = gen(tree, V2)
+        self.assertEqual(code.count("gk_shake_left -= delta"), 1, code)
+
+    def test_same_node_referenced_once(self):
+        """同一台相机被多个节点引用时，只应声明一个 @onready 变量。
+
+        否则脚本开头会出现 cam / cam_2 / cam_3 三个指向同一节点的变量:
+        能跑，但用户根本看不出它们是同一个东西。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头", gk_target="主相机")
+        second = tree.new_node(NN.GKNodeCameraZoom, "缩放", gk_target="主相机", gk_value=1.5)
+        third = tree.new_node(NN.GKNodeCameraShake, "抖动", gk_target="主相机")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        gk_stub.connect(tree, second, "完成", third, "执行")
+        code, _ = gen(tree, V2)
+        self.assertEqual(code.count("@onready"), 1, code)
+        # 三个节点都必须指向同一个变量，不能各用各的
+        self.assertEqual(code.count(".make_current()"), 1, code)
+        self.assertEqual(code.count(".zoom = Vector2("), 1, code)
+        self.assertEqual(code.count("gk_shake_cam = "), 1, code)
+
+    def test_camera_typed_by_dimension(self):
+        """相机类型必须跟着项目维度走，3D 项目里声明 Camera2D 同样编译不过。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头", gk_target="主相机")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code_2d, _ = gen(tree, {"dimension": "2", "base_class": "CharacterBody2D"})
+        self.assertIn(": Camera2D = ", code_2d)
+
+        tree3 = make_tree()
+        event3 = tree3.new_node(NN.GKNodeOnReady, "准备")
+        node3 = tree3.new_node(NN.GKNodeCameraSetCurrent, "切镜头", gk_target="主相机")
+        gk_stub.connect(tree3, event3, "执行", node3, "执行")
+        code_3d, _ = gen(tree3, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertIn(": Camera3D = ", code_3d)
+
+    def test_camera_auto_find_when_unset(self):
+        """没填相机时不该崩，而是自动找第一个相机并告警说明。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("自动找" in w for w in warnings), warnings)
+        self.assertIn('get_tree().get_first_node_in_group("gk_camera")', code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_no_camera_helper_when_unused(self):
+        """没用到相机就不该塞一个用不到的辅助函数。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("func get_first_camera", code)
+
+    def test_set_time_scale(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetTimeScale, "子弹时间", gk_scale=0.3)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Engine.time_scale = ", code)
+        self.assert_indent_sane(code)
+
+    def test_camera_zoom_uses_export_when_unlinked(self):
+        """未连线的数值应变成 @export，方便在 Godot 检查器里直接调手感。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraZoom, "缩放", gk_target="主相机", gk_value=2.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("@export var", code)
 
 
 def nn_base_statement():

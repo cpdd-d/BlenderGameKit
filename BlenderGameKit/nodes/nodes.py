@@ -883,6 +883,133 @@ class GKNodeConvert(B.GKExpressionNode):
 
 
 # ==========================================================================
+# 显示
+# ==========================================================================
+@N
+class GKNodeSetVisible(B.GKStatementNode):
+    bl_idname = "GKNodeSetVisible"
+    bl_label = "显示_设置可见"
+    bl_icon = "HIDE_OFF"
+    gk_category = "显示"
+    gk_doc = "显示或隐藏一个节点(2D / 3D 通用，对应 visible)"
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(BOOL, "可见", True), target_pin())
+    gk_input_props = {"可见": "gk_visible"}
+    gk_prop_defs = (
+        ("gk_visible", "bool", True, "可见", "未连线时用它决定显示还是隐藏"),
+        ("gk_target", "node", TARGET_SELF, "目标", "要显示 / 隐藏的节点"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_visible", text="", toggle=True,
+                 icon="HIDE_OFF" if getattr(self, "gk_visible", True) else "HIDE_ON")
+        B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodeSetPaused(B.GKStatementNode):
+    bl_idname = "GKNodeSetPaused"
+    bl_label = "显示_暂停节点"
+    bl_icon = "PAUSE"
+    gk_category = "显示"
+    gk_doc = "暂停 / 恢复一个节点的处理(对应 process_mode，不需要自己写计数逻辑)"
+    gk_inputs = (S.pin(FLOW, "执行"), target_pin())
+    gk_prop_defs = (
+        ("gk_paused", "bool", True, "暂停", "勾上=停止该节点的 _process / _physics_process"),
+        ("gk_target", "node", TARGET_SELF, "目标", "要暂停 / 恢复的节点"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_paused", text="", toggle=True,
+                 icon="PAUSE" if getattr(self, "gk_paused", True) else "PLAY")
+        B.draw_target_picker(self, layout)
+
+
+# ==========================================================================
+# 相机
+# ==========================================================================
+@N
+class GKNodeCameraSetCurrent(B.GKStatementNode):
+    bl_idname = "GKNodeCameraSetCurrent"
+    bl_label = "相机_切换"
+    bl_icon = "CAMERA_DATA"
+    gk_category = "相机"
+    gk_doc = "把某个相机设为当前相机(2D / 3D 通用)——做镜头切换、Boss 特写用"
+    gk_inputs = (S.pin(FLOW, "执行"), target_pin("相机"))
+    gk_prop_defs = (("gk_target", "node", "", "相机", "要激活的 Camera2D / Camera3D"),)
+
+    def draw_buttons(self, context, layout):
+        B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodeCameraZoom(B.GKStatementNode):
+    bl_idname = "GKNodeCameraZoom"
+    bl_label = "相机_缩放"
+    bl_icon = "ZOOM_IN"
+    gk_category = "相机"
+    gk_doc = "设置相机缩放:2D 用 zoom，3D 用视场角 fov(自动按相机类型选，不用管维度)"
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "数值", 1.0), target_pin("相机"))
+    gk_input_props = {"数值": "gk_value"}
+    gk_prop_defs = (
+        ("gk_value", "float", 1.0, "数值", "2D: zoom 越大画面越近；3D: 垂直视场角(度)"),
+        ("gk_target", "node", "", "相机", "留空则用 $Camera2D / $Camera3D"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_value", text="")
+        B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodeCameraShake(B.GKStatementNode):
+    bl_idname = "GKNodeCameraShake"
+    bl_label = "相机_震动"
+    bl_icon = "RNDCURVE"
+    gk_category = "相机"
+    gk_doc = ("让相机抖动一下(受击 / 爆炸反馈)。用相机的偏移量实现，"
+              "不会破坏相机原本的位置——所以可以和『跟随』同时用")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "强度", 8.0),
+        S.pin(FLOAT, "持续", 0.25),
+        target_pin("相机"),
+    )
+    gk_input_props = {"强度": "gk_strength", "持续": "gk_duration"}
+    gk_prop_defs = (
+        ("gk_strength", "float", 8.0, "强度", "最大偏移像素"),
+        ("gk_duration", "float", 0.25, "持续", "震动时长(秒)"),
+        ("gk_target", "node", "", "相机", "留空则用 $Camera2D / $Camera3D"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_strength", text="")
+        row.prop(self, "gk_duration", text="")
+        B.draw_target_picker(self, layout)
+
+
+# ==========================================================================
+# 时间
+# ==========================================================================
+@N
+class GKNodeSetTimeScale(B.GKStatementNode):
+    bl_idname = "GKNodeSetTimeScale"
+    bl_label = "时间_设置倍速"
+    bl_icon = "TIME"
+    gk_category = "时间"
+    gk_doc = ("设置全局时间倍速(对应 Engine.time_scale):0.3 = 子弹时间，"
+              "1.0 = 正常，0 = 完全暂停")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "倍速", 1.0))
+    gk_input_props = {"倍速": "gk_scale"}
+    gk_prop_defs = (("gk_scale", "float", 1.0, "倍速", "1.0 为正常速度"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_scale", text="")
+
+
+# ==========================================================================
 # 实用
 # ==========================================================================
 @N
@@ -903,4 +1030,5 @@ class GKNodeComment(B.GKEventNode):
 ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
-CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入", "运算", "实用")
+CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
+                  "运算", "显示", "相机", "时间", "实用")

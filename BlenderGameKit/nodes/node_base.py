@@ -90,6 +90,24 @@ def gd_string(text):
     return f'"{escaped}"'
 
 
+def _is_plain_node_path(text):
+    """路径的每一段是否都是合法的 GDScript 裸标识符。
+
+    `$玩家` 这种写法 Godot 直接报错(裸路径只接受 ASCII 标识符)，
+    必须退化成 `$"玩家"`。实测确认 `$"主相机"` 是合法语法。
+    """
+    if not text:
+        return False
+    for segment in text.split("/"):
+        if not segment or not segment.isascii():
+            return False
+        if not (segment[0].isalpha() or segment[0] == "_"):
+            return False
+        if not all(ch.isalnum() or ch == "_" for ch in segment):
+            return False
+    return True
+
+
 def gd_node_path(raw):
     """把节点的目标值转换成 GDScript 里的节点访问表达式。"""
     text = (raw or "").strip()
@@ -99,6 +117,9 @@ def gd_node_path(raw):
         return text
     if text.startswith("/root/"):
         return f'get_node("{text}")'
+    # 含中文(或其它非 ASCII)的节点名不能写成裸标识符，要用带引号的路径
+    if not _is_plain_node_path(text):
+        return f'$"{text}"'
     return f"${text}"
 
 
@@ -151,17 +172,6 @@ def draw_target_picker(node, layout, prop="gk_target"):
     op = row.operator("gk.pick_target", text="", icon="TRIA_DOWN")
     op.node_name = node.name
     op.prop_name = prop
-
-def gd_node_path(raw):
-    """把节点的目标值转换成 GDScript 里的节点访问表达式。"""
-    text = (raw or "").strip()
-    if not text or text == TARGET_SELF:
-        return "self"
-    if text.startswith("$") or text.startswith("get_node"):
-        return text
-    if text.startswith("/root/"):
-        return f'get_node("{text}")'
-    return f"${text}"
 
 
 # ==========================================================================
