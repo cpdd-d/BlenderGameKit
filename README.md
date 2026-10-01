@@ -107,7 +107,7 @@ docs/
 
 tests/
 ├── gk_stub.py                  离线 bpy 打桩(让 codegen 脱离 Blender 可测)
-├── test_codegen.py             101 个回归测试,秒级跑完,不需要 Blender
+├── test_codegen.py             107 个回归测试,秒级跑完,不需要 Blender
 ├── blender_smoke.py            35 项冒烟测试,在真实 Blender 里跑
 ├── blender_asset_export.py     20 项资产导出测试(真的导出 .glb 并检查)
 ├── blender_npr_preview.py      23 项 NPR 预览测试(含 A/B 渲染对比)
