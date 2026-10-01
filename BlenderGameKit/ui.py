@@ -1,0 +1,842 @@
+"""UI:侧栏面板、添加节点菜单、节点引用选择器。"""
+
+import os
+
+import bpy
+from bpy.props import IntProperty, StringProperty
+
+from . import codegen, exporter, gk_log, project
+from . import asset_export
+from . import operator_io as ops
+from . import properties as props
+from .nodes import nodes as node_lib
+from .nodes import node_base as NB
+
+
+# ==========================================================================
+# 节点树类型
+# ==========================================================================
+class GKGameLogicTree(bpy.types.NodeTree):
+    """游戏逻辑节点树:在节点编辑器里用中文节点写游戏逻辑，导出 GDScript。"""
+
+    bl_idname = "GKGameLogicTree"
+    bl_label = "游戏逻辑"
+    bl_icon = "NODETREE"
+    bl_description = "BlenderGameKit 的游戏逻辑节点树(导出为 Godot GDScript)"
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        """编辑器顶部那条工具栏。
+
+        这是"问你要不要打开 Godot"最合适的位置:切到游戏逻辑节点编辑器
+        就能看到,不弹窗打断,但足够醒目。
+        """
+        directory, _reason = project.resolve(context.scene)
+
+        if not bpy.data.filepath:
+            layout.label(text="先保存 .blend", icon="ERROR")
+            layout.operator("gk.create_project", text="建项目", icon="ADD")
+            return
+
+        if not directory:
+            layout.label(text="未绑定项目", icon="ERROR")
+            layout.operator("gk.create_project", text="建项目", icon="ADD")
+            return
+
+        if not project.is_project(directory):
+            layout.label(text="项目未创建", icon="INFO")
+            layout.operator("gk.create_project", text="创建 Godot 项目", icon="ADD")
+            return
+
+        # 项目就绪 —— 这里就是那个"问你要不要打开 Godot"的入口
+        layout.label(text=os.path.basename(directory), icon="FILE_FOLDER")
+        layout.operator("gk.open_godot", text="打开 Godot",
+                        icon="WINDOW").editor = True
+        layout.operator("gk.open_godot", text="运行",
+                        icon="PLAY").editor = False
+        layout.separator()
+        layout.operator("gk.export_script", text="导出脚本", icon="FILE_TICK")
+
+
+# ==========================================================================
+# 添加节点菜单
+# ==========================================================================
+def _menu_name(category):
+    return "GK_MT_NODES_" + str(abs(hash(category)) % 100000)
+
+
+class GK_OT_AddNodeMenu(bpy.types.Operator):
+    """占位算子:菜单项点击后由 GK_OT_AddNode 真正执行。"""
+
+    bl_idname = "gk.add_node_menu"
+    bl_label = "游戏逻辑"
+    bl_description = "添加游戏逻辑节点"
+
+    node_type: StringProperty(default="")
+    link_from: StringProperty(default="")
+
+    def execute(self, context):
+        return bpy.ops.gk.add_node(node_type=self.node_type, link_from=self.link_from)
+
+
+class GK_MT_AddNodeCategories(bpy.types.Menu):
+    bl_idname = "GK_MT_ADD_NODE"
+    bl_label = "添加游戏逻辑节点"
+
+    def draw(self, context):
+        layout = self.layout
+        link_from = ""
+        space = getattr(context, "space_data", None)
+        tree = props.current_tree(context)
+        if tree is not None and getattr(tree, "nodes", None) is not None:
+            active = getattr(tree.nodes, "active", None)
+            if active is not None:
+                link_from = active.name
+        if link_from:
+            layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
+            layout.separator()
+        for category, classes in props.node_menu_entries():
+            layout.menu(_menu_name(category), text=category)
+        layout.separator()
+        layout.operator("gk.auto_link", icon="LINKED")
+
+
+def _make_category_menu(category, classes):
+    """为一个分类动态生成菜单类。"""
+
+    def draw(self, context):
+        layout = self.layout
+        link_from = ""
+        tree = props.current_tree(context)
+        if tree is not None:
+            active = getattr(tree.nodes, "active", None)
+            if active is not None:
+                link_from = active.name
+        for cls in classes:
+            op = layout.operator("gk.add_node_menu", text=cls.bl_label)
+            op.node_type = cls.bl_idname
+            op.link_from = link_from
+            if getattr(cls, "gk_doc", ""):
+                # 菜单项的提示文字
+                pass
+
+    name = f"GK_MT_CAT_{abs(hash(category)) % 100000}"
+    return type(name, (bpy.types.Menu,), {
+        "bl_idname": _menu_name(category),
+        "bl_label": category,
+        "draw": draw,
+        "__doc__": f"添加『{category}』类游戏逻辑节点",
+    })
+
+
+CATEGORY_MENUS = []
+for _category, _classes in props.node_menu_entries():
+    CATEGORY_MENUS.append(_make_category_menu(_category, _classes))
+
+
+def _make_recent_menu():
+    """「最近使用」子菜单。
+
+    蓝图里高频操作是"反复加同一批节点"(事件、分支、设置变量),
+    每次都翻分类太慢。这个菜单按最近使用排序,最多 8 个。
+    """
+
+    def draw(self, context):
+        layout = self.layout
+        link_from = ""
+        tree = props.current_tree(context)
+        if tree is not None:
+            active = getattr(tree.nodes, "active", None)
+            if active is not None:
+                link_from = active.name
+
+        recent = _recent_classes()
+        if not recent:
+            layout.label(text="(还没用过任何节点)", icon="INFO")
+            return
+        for cls in recent:
+            op = layout.operator("gk.add_node_menu", text=cls.bl_label)
+            op.node_type = cls.bl_idname
+            op.link_from = link_from
+
+    return type("GK_MT_Recent", (bpy.types.Menu,), {
+        "bl_idname": _menu_name("最近使用"),
+        "bl_label": "最近使用",
+        "draw": draw,
+        "__doc__": "最近用过的游戏逻辑节点",
+    })
+
+
+class GK_OT_FindNode(bpy.types.Operator):
+    """搜索并添加节点(蓝图那种"打字就出来"的入口)。"""
+
+    bl_idname = "gk.find_node"
+    bl_label = "搜索游戏逻辑节点"
+    bl_description = ("输入关键字搜索 47 个节点。中文标签和英文类型名都能搜到")
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_type: StringProperty(name="节点类型", default="")
+
+    def execute(self, context):
+        # 通过搜索弹窗选中后,Blender 会把 bl_label 回填到 node_type;
+        # 这里再用它去查真正的 bl_idname。
+        if self.node_type:
+            for cls in node_lib.ALL_CLASSES:
+                if self.node_type in (cls.bl_idname, cls.bl_label):
+                    return bpy.ops.gk.add_node(node_type=cls.bl_idname)
+        return context.window_manager.invoke_search_popup(self)
+
+    def invoke(self, context, event):
+        if self.node_type:
+            return self.execute(context)
+        return context.window_manager.invoke_search_popup(self)
+
+    def draw(self, context):
+        # 搜索弹窗的每一行:显示中文标签,右边补上分类方便区分同名节点
+        for cls in node_lib.ALL_CLASSES:
+            op = self.layout.operator("gk.find_node", text=cls.bl_label)
+            op.node_type = cls.bl_idname
+
+
+# ==========================================================================
+# 节点引用选择器
+# ==========================================================================
+class GK_MT_TargetPicker(bpy.types.Menu):
+    bl_idname = "GK_MT_TARGET_PICKER"
+    bl_label = "选择节点引用"
+
+    node_name: StringProperty(default="")
+    prop_name: StringProperty(default="gk_target")
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        if node is None:
+            layout.label(text="节点已不存在", icon="ERROR")
+            return
+        for key, text, description, icon, index in NB.node_items_for(node):
+            op = layout.operator("gk.set_target", text=text, icon=icon)
+            op.node_name = self.node_name
+            op.prop_name = self.prop_name
+            op.value = key
+
+
+class GK_OT_SetTarget(bpy.types.Operator):
+    """设置某个节点的节点引用。"""
+
+    bl_idname = "gk.set_target"
+    bl_label = "设置节点引用"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(default="")
+    prop_name: StringProperty(default="gk_target")
+    value: StringProperty(default="")
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        if tree is None:
+            return {"CANCELLED"}
+        node = tree.nodes.get(self.node_name)
+        if node is None or not hasattr(node, self.prop_name):
+            self.report({"ERROR"}, "节点或属性不存在")
+            return {"CANCELLED"}
+        setattr(node, self.prop_name, self.value)
+        return {"FINISHED"}
+
+
+class GK_OT_PickTarget(bpy.types.Operator):
+    """打开节点引用下拉菜单(由节点的下拉按钮调用)。"""
+
+    bl_idname = "gk.pick_target"
+    bl_label = "选择节点引用"
+    bl_options = {"REGISTER"}
+
+    node_name: StringProperty(default="")
+    prop_name: StringProperty(default="gk_target")
+
+    def execute(self, context):
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.popup_menu(
+            _make_target_picker_draw(self.node_name, self.prop_name),
+            title="选择节点",
+            icon="NODE_SEL",
+        )
+        return {"FINISHED"}
+
+
+def _make_target_picker_draw(node_name, prop_name):
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        node = tree.nodes.get(node_name) if tree is not None else None
+        if node is None:
+            layout.label(text="节点已不存在", icon="ERROR")
+            return
+        for key, text, description, icon, index in NB.node_items_for(node):
+            op = layout.operator("gk.set_target", text=text, icon=icon)
+            op.node_name = node_name
+            op.prop_name = prop_name
+            op.value = key
+
+    return draw
+
+
+# ==========================================================================
+# 侧栏面板
+# ==========================================================================
+# ==========================================================================
+# 物体属性面板:碰撞与物理(参考 UPBGE 的做法)
+# ==========================================================================
+# 为什么放在物体属性里而不是侧栏的导出面板:
+#   碰撞形状、物理类型这些**属于物体本身**。选中谁就改谁,最直观;
+#   放在导出面板里就得"先选中物体,再跳到另一个面板填参数",两处来回跑。
+# 参考的就是 UPBGE —— 它在物体属性里加 Physics 面板,这个思路是对的。
+class GK_PT_ObjectPhysics(bpy.types.Panel):
+    bl_idname = "GK_PT_ObjectPhysics"
+    bl_label = "游戏物理 (BlenderGameKit)"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_category = "游戏物理"
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return obj is not None and hasattr(obj, "gk_physics")
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        physics = obj.gk_physics
+        settings = getattr(context.scene, "gk_settings", None)
+        dimension = getattr(settings, "dimension", "3") if settings else "3"
+        is_3d = str(dimension) != "2"
+
+        # ---- 物体类型 ----
+        box = layout.box()
+        box.label(text=f"物体: {obj.name}", icon="OBJECT_DATAMODE")
+        if obj.type != "MESH":
+            box.label(text="只有网格物体会被导出", icon="INFO")
+
+        col = box.column(align=True)
+        _draw_body_type(col, physics, is_3d)
+
+        # ---- 碰撞 ----
+        box = layout.box()
+        box.label(text="碰撞", icon="MESH_ICOSPHERE")
+        col = box.column(align=True)
+        col.prop(physics, "collision_shape", text="")
+
+        shape = physics.collision_shape
+        if shape == "auto":
+            # 显示会自动算成什么,免得用户猜
+            guess = auto_shape_for(obj, is_3d)
+            col.label(text=f"按尺寸会选: {SHAPE_LABELS.get(guess, guess)}",
+                      icon="CHECKMARK")
+        elif shape not in ("none",):
+            col.prop(physics, "shape_size")
+
+        if shape != "none":
+            row = col.row(align=True)
+            row.prop(physics, "collision_layer", text="")
+            row.prop(physics, "collision_mask", text="")
+            col.prop(physics, "is_trigger")
+
+        # ---- 物理属性 ----
+        body = physics.body_type
+        if "RigidBody" in body:
+            box = layout.box()
+            box.label(text="刚体", icon="PHYSICS")
+            col = box.column(align=True)
+            col.prop(physics, "mass")
+            col.prop(physics, "gravity_scale")
+
+        # ---- 脚本 ----
+        box = layout.box()
+        box.label(text="逻辑", icon="FILE_SCRIPT")
+        col = box.column(align=True)
+        col.prop(physics, "script_target")
+        if physics.script_target:
+            box.label(text="节点图导出的脚本会挂到这个物体上", icon="INFO")
+
+        # ---- 视口预览 ----
+        # 碰撞体在 Godot 里是运行时的东西,Blender 视口里本来看不见。
+        box = layout.box()
+        box.label(text="视口预览", icon="HIDE_OFF")
+
+        col = box.column(align=True)
+        # 只显示**活动物体**的碰撞盒 —— 多个叠在一起在视口里分不清谁是谁,
+        # 很容易改错尺寸(用户反馈过)。
+        col.label(text="碰撞体（只显示正在看的这个）:")
+        row = col.row(align=True)
+        row.operator("gk.show_collision", text="显示这一个",
+                     icon="SHADING_WIRE")
+        row.operator("gk.hide_collision", text="", icon="X")
+        # 一次性显示全部是给"排查有没有漏设"用的
+        col.operator("gk.show_collision", text="显示全部（排查用）"
+                     ).target_all = True
+        col.label(text="线框自动生成,不会导出", icon="INFO")
+
+
+def _draw_body_type(layout, physics, is_3d):
+    """物理类型下拉。按 2D/3D 过滤,免得给 3D 项目选到 2D 类型。
+
+    ⚠ 这个函数曾经被我误删过 —— 插入新面板时连带删掉了它,
+    结果 GK_PT_ObjectPhysics.draw 抛 NameError,
+    整个『游戏物理』面板直接不显示(用户报告:碰撞体/描边的按钮找不到了)。
+    Blender 对面板 draw 里抛的异常是**静默**的,界面只是少一块,
+    所以这种错误必须靠测试兜住 —— 见 tests/blender_panels.py。
+    """
+    layout.prop(physics, "body_type", text="")
+
+
+# 自动形状的显示名
+SHAPE_LABELS = {
+    "box": "盒子",
+    "sphere": "球",
+    "capsule": "胶囊",
+}
+
+
+def auto_shape_for(obj, is_3d=True):
+    """按物体尺寸猜一个合适的碰撞形状。
+
+    规则(和导出时用的是同一份逻辑,所以面板上显示的就是实际会生成的):
+      * 三边接近相等        -> 球
+      * 某一轴明显最长(人形) -> 胶囊
+      * 其余(扁平的墙/地板) -> 盒子
+    """
+    return asset_export.guess_collision_shape(obj, is_3d)
+
+
+class GK_PT_GodotLook(bpy.types.Panel):
+    """让 3D 视口看起来像 Godot 渲染出来的样子。
+
+    ── 为什么放在视口侧栏(N 面板)────────────────────────────────
+    这是"看画面"的东西:调开关的时候眼睛正盯着模型,
+    放在视口侧栏才不用来回切面板。
+    也刻意**不放进主面板** —— 那边是导出流程,混在一起会更乱。
+    """
+
+    bl_idname = "GK_PT_GodotLook"
+    bl_label = "Godot 观感 (BlenderGameKit)"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Godot"
+
+    def draw(self, context):
+        from . import godot_look
+
+        layout = self.layout
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            layout.label(text="没有场景", icon="ERROR")
+            return
+
+        active = godot_look.is_active(scene)
+        box = layout.box()
+        if active:
+            box.label(text="已开启:贴近 Godot", icon="CHECKMARK")
+        else:
+            box.label(text="当前是 Blender 默认观感", icon="INFO")
+
+        row = box.row(align=True)
+        row.scale_y = 1.5
+        row.operator("gk.match_godot_look", text="预览贴近 Godot",
+                     icon="WORLD")
+        row.operator("gk.restore_look", text="", icon="LOOP_BACK")
+
+        col = box.column(align=True)
+        for line in godot_look.describe():
+            col.label(text=line, icon="DOT" if line.startswith("·") else "NONE")
+
+        # ---- Godot 界面英文的对照表 ----
+        #
+        # Godot 里有一批英文改不了:节点类型名是引擎类名(任何语言都不翻译),
+        # 检查器的分组标题(Mesh / Transform / Script…)中文包也没覆盖。
+        # 所以给一份能查的表,而不是让他去猜。
+        box = layout.box()
+        box.label(text="看不懂 Godot 里的英文?", icon="QUESTION")
+        box.operator("gk.open_glossary", icon="TEXT")
+
+
+class GK_PT_Main(bpy.types.Panel):
+    bl_idname = "GK_PT_Main"
+    bl_label = "游戏逻辑 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏逻辑"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and getattr(space, "tree_type", "") == "GKGameLogicTree"
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+
+        # ---- 空节点树时,先教怎么开始 ----
+        # 47 个节点摆在那里但"该从哪开始"完全看不出来,这是新用户最大的坎。
+        # 与其写一堆说明文字,不如直接给一条能跑的链路让他照着改。
+        if tree is not None and len(tree.nodes) == 0:
+            box = layout.box()
+            box.label(text="这棵节点树还是空的", icon="INFO")
+            col = box.column(align=True)
+            col.label(text="怎么用:先放一个『事件』节点当入口,")
+            col.label(text="再用金色『执行』线串起后面要做的事。")
+            col.label(text="接完线后点『导出为 Godot 脚本』。")
+            row = box.row(align=True)
+            row.scale_y = 1.4
+            row.operator("gk.starter_graph", text="生成示例节点图", icon="ADD")
+            row.operator("gk.add_node_menu", text="", icon="NODETREE")
+            layout.separator()
+
+        # ---- 项目绑定(最上面,因为它是所有导出的落点)----
+        _draw_project_box(layout, context)
+
+        # ---- 导出脚本 ----
+        box = layout.box()
+        box.label(text="导出为 Godot 脚本", icon="EXPORT")
+        row = box.row(align=True)
+        row.scale_y = 1.4
+        row.operator("gk.export_script", icon="FILE_TICK")
+        row.operator("gk.preview_script", text="", icon="HIDE_OFF")
+
+        settings = getattr(context.scene, "gk_settings", None)
+        if settings is not None:
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(settings, "write_scene", toggle=True)
+            row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
+
+        # ---- 模型导出:把 Blender 的网格 / 材质 / 贴图一起带进 Godot ----
+        #
+        # 材质跟着模型一起导出:没设材质就自动给默认白色。
+        # 以前这里拆成"导出模型"和"导出材质"两个按钮,但用户实际
+        # 永远是两个一起点 —— 拆开只是多一步操作,所以合并成一个。
+        box = layout.box()
+        box.label(text="导出模型和材质", icon="MESH_DATA")
+        row = box.row(align=True)
+        row.scale_y = 1.4
+        row.operator("gk.export_assets", icon="EXPORT")
+        box.label(text="选中网格 = 只导选中的；不选 = 导出全部", icon="INFO")
+        box.label(text="没材质的物体会用默认白色材质", icon="INFO")
+        box.label(text="导出会带上卡通材质；描边等额外效果请在 Godot 里加",
+                  icon="INFO")
+
+        last = ops.LAST_EXPORT
+        if last:
+            sub = box.column(align=True)
+            sub.label(text=f"上次导出: {last.get('script_name', '')}"
+                           f"（{last.get('lines', 0)} 行）", icon="CHECKMARK")
+            for warning in last.get("warnings", [])[:4]:
+                sub.label(text=warning, icon="ERROR")
+
+        # ---- 节点树状态 ----
+        box = layout.box()
+        box.label(text="节点图", icon="NODETREE")
+        if tree is None:
+            box.label(text="当前没有游戏逻辑节点树", icon="INFO")
+            box.operator("node.new_node_tree", text="新建节点树", icon="ADD").type = "GKGameLogicTree"
+        else:
+            events, statements = props.event_summary(tree)
+            col = box.column(align=True)
+            col.label(text=f"节点总数:{len(tree.nodes)}")
+            col.label(text=f"事件:{events}    动作:{statements}")
+            if events == 0:
+                col.label(text="还没有事件节点，脚本不会执行任何逻辑", icon="ERROR")
+            box.operator("gk.add_node_menu", text="添加节点", icon="ADD")
+
+        # ---- 导出设置 ----
+        if settings is not None:
+            box = layout.box()
+            box.label(text="导出设置", icon="PREFERENCES")
+            col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(settings, "dimension", expand=True)
+            col.prop(settings, "base_class", text="")
+            col.prop(settings, "class_name", text="类名")
+            col.prop(settings, "node_name", text="节点名")
+            row = col.row(align=True)
+            row.prop(settings, "export_tunables", toggle=True)
+            row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
+
+        # ---- 日志 ----
+        if settings is not None and settings.show_log:
+            box = layout.box()
+            row = box.row()
+            row.label(text="日志", icon="TEXT")
+            row.prop(settings, "show_log", text="", icon="TRASH")
+            records = gk_log.records()[-8:]
+            if not records:
+                box.label(text="(还没有日志)")
+            for level, line in records:
+                icon = {"ERROR": "ERROR", "WARN": "ERROR"}.get(level, "INFO")
+                box.label(text=line[11:] if len(line) > 11 else line, icon=icon)
+
+
+def _draw_project_box(layout, context):
+    """画"项目"面板:这个 .blend 绑定的 Godot 项目。
+
+    设计意图:导出目录不该是插件设置里的一个路径 —— 那意味着每开一个
+    新 .blend 都要重新填。改成跟着 .blend 走之后,打开哪个文件就知道
+    该写哪,面板只需要把当前绑定显示清楚。
+
+    这里最容易让人困惑的是"打开 Godot 的按钮去哪了" —— 答案是
+    项目还没建出来时不显示它(没东西可打开)。所以未建状态下必须
+    把下一步说清楚,不能只放一个孤零零的按钮。
+    """
+    box = layout.box()
+    box.label(text="Godot 项目", icon="FILE_FOLDER")
+
+    if not bpy.data.filepath:
+        box.label(text="这个 .blend 还没保存", icon="ERROR")
+        box.label(text="先 Ctrl+S 存一次,项目会建在它旁边", icon="INFO")
+        row = box.row(align=True)
+        row.scale_y = 1.3
+        row.operator("gk.create_project", text="创建 Godot 项目", icon="ADD")
+        return
+
+    # adopt=True:如果 .blend 在别人的 Godot 项目里,顺手把缺的标准子目录补上。
+    # 不补的话所有导出都会失败,而"补空目录"是纯增量操作,不会覆盖东西。
+    directory, reason = project.resolve(context.scene, adopt=True)
+    status, icon = project.project_summary(directory)
+
+    box.label(text=f"对应文件: {os.path.basename(bpy.data.filepath)}",
+              icon="FILE_BLEND")
+
+    sub = box.column(align=True)
+    sub.label(text=directory or "(未绑定)", icon=icon)
+    sub.label(text=f"状态: {status}", icon="INFO")
+    sub.label(text=f"规则: {reason}", icon="INFO")
+
+    if not project.is_project(directory):
+        # ---- 还没建项目:把"下一步"讲清楚,别让人找按钮 ----
+        warn = box.box()
+        warn.label(text="项目还没建出来", icon="ERROR")
+        warn.label(text="建好之后这里才会出现『打开 Godot』")
+        row = warn.row(align=True)
+        row.scale_y = 1.4
+        row.operator("gk.create_project", text="创建 Godot 项目", icon="ADD")
+        row = box.row(align=True)
+        row.operator("gk.relink_project", text="换个位置", icon="FILE_FOLDER")
+        row.operator("gk.reset_settings", text="重置", icon="LOOP_BACK")
+    else:
+        # ---- 项目已就绪 ----
+        # 两个按钮是**不同**操作,必须能用文字区分开。
+        # 之前一个写"打开 Godot 测试"、另一个只有个图标,两个都长得像
+        # "打开编辑器" —— 难怪会点两次、开出两个窗口。
+        row = box.row(align=True)
+        row.scale_y = 1.5
+        # 两个按钮都**显式**写 editor,不依赖默认值 ——
+        # 属性一旦没传对就会跑错动作,显式写出来排除了这种可能。
+        row.operator("gk.open_godot", text="打开 Godot 编辑器",
+                     icon="WINDOW").editor = True
+        row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
+        row = box.row(align=True)
+        row.scale_y = 1.3
+        row.operator("gk.open_godot", text="直接运行游戏(F5)",
+                     icon="PLAY").editor = False
+        # 运行前自动导出:不勾的话点运行跑的还是上次导出的旧内容
+        prefs = project.preferences(context)
+        if prefs is None or getattr(prefs, "auto_export_on_run", True):
+            box.label(text="运行前会自动保存并导出", icon="INFO")
+        else:
+            box.label(text="运行前不会自动导出(改完记得手动导)", icon="ERROR")
+        row = box.row(align=True)
+        row.operator("gk.relink_project", text="改位置", icon="FILE_FOLDER")
+        row.operator("gk.reset_settings", text="重置", icon="LOOP_BACK")
+
+    # 2D / 3D 决定项目里生成什么,放这里合适
+    settings = getattr(context.scene, "gk_settings", None)
+    if settings is not None:
+        row = box.row(align=True)
+        row.prop(settings, "dimension", expand=True)
+
+        # ---- 基类对不上的警告 ----
+        #
+        # 脚本的 `extends` 和节点的 `type` 必须一致,否则 Godot 直接拒绝加载:
+        #     Script inherits from native type 'StaticBody3D',
+        #     so it can't be assigned to an object of type: 'Area3D'
+        # 然后整个场景加载失败,游戏跑不起来 —— 用户被一堆英文报错拦住,
+        # 根本想不到是 Blender 这边的一个下拉框引起的。
+        #
+        # 默认是"自动",不可能对不上;只有用户手动选了基类才可能冲突。
+        dimension = getattr(settings, "dimension", "3")
+        clashes = props.base_class_mismatches(context.scene, dimension)
+        if clashes:
+            warn = layout.box()
+            warn.label(text="脚本基类和节点类型对不上", icon="ERROR")
+            for name, chosen, actual in clashes[:4]:
+                warn.label(text=f"{name}: 脚本是 {chosen},节点会是 {actual}")
+            warn.label(text="Godot 会拒绝加载脚本,游戏跑不起来")
+            row = warn.row(align=True)
+            row.scale_y = 1.3
+            row.operator("gk.fix_base_class", text="改成『自动』修好",
+                         icon="CHECKMARK")
+
+
+def _draw_node_menu_contents(layout, context, with_search=True):
+    """节点菜单的内容。Shift+A 和右键菜单共用这一份。
+
+    做成公共函数是因为两个入口必须**完全一致** —— 分别写两份的话,
+    加个新分类很容易只加到一个入口里。
+    """
+    tree = props.current_tree(context)
+    link_from = ""
+    if tree is not None and getattr(tree, "nodes", None) is not None:
+        active = getattr(tree.nodes, "active", None)
+        if active is not None:
+            link_from = active.name
+
+    if with_search:
+        # 最上面放搜索 —— 这是蓝图里最常用的入口,
+        # 47 个节点靠翻分类找太慢,直接打字搜最快。
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
+
+    # 「最近使用」**始终显示**,哪怕还是空的。
+    # 一开始写成"空就不画",结果新用户第一次按 Shift+A 时菜单里没有这一项,
+    # 等他用过几个节点之后菜单**形状变了** —— 这会让肌肉记忆失效。
+    # 菜单结构应该稳定,空的时候由它的 draw 里显示"(还没用过任何节点)"。
+    layout.menu(_menu_name("最近使用"), text="最近使用")
+    layout.separator()
+
+    if link_from:
+        layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
+
+    for category, classes in props.node_menu_entries():
+        layout.menu(_menu_name(category), text=category)
+
+    layout.separator()
+    layout.operator("gk.auto_link", text="把选中的两个节点连起来", icon="LINKED")
+
+
+def _draw_add_menu(self, context):
+    """挂到 NODE_MT_add(Shift+A)。
+
+    用 prepend 而不是 append:**append 会把我们的菜单压到最底下** ——
+    实测在默认面板高度下正好被截断,表现就是"按了 Shift+A 什么都没有",
+    非常容易误判成功能没做。
+    prepend 让它排在最上面,一按就看得见。
+    """
+    space = getattr(context, "space_data", None)
+    if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
+        return
+    _draw_node_menu_contents(self.layout, context)
+
+
+def _draw_context_menu(self, context):
+    """挂到 NODE_MT_context_menu(节点上右键)。
+
+    蓝图里右键就是"加节点",这里也补上;放在最前面,
+    这样常用的加节点操作不用去翻 Blender 自带的那一长串。
+    """
+    space = getattr(context, "space_data", None)
+    if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
+        return
+    self.layout.separator()
+    self.layout.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
+    self.layout.menu(_menu_name("最近使用"), text="最近使用")
+    self.layout.menu(GK_MT_AddNodeCategories.bl_idname,
+                     text="添加游戏逻辑节点", icon="NODETREE")
+
+
+def on_register():
+    """注册后的自检与菜单挂钩。"""
+    # ---- 挂菜单 ----
+    for target_name, func in (
+        ("NODE_MT_add", _draw_add_menu),
+        ("NODE_MT_context_menu", _draw_context_menu),
+    ):
+        try:
+            target = getattr(bpy.types, target_name, None)
+            if target is None:
+                gk_log.warn(f"找不到 {target_name},跳过挂载")
+                continue
+            # 先摘掉再挂,避免重复注册时挂两次(菜单里出现两份)
+            try:
+                target.remove(func)
+            except Exception:
+                pass
+            target.prepend(func)
+        except Exception as exc:  # pragma: no cover
+            gk_log.error(f"挂载 {target_name} 失败: {exc}")
+
+    # ---- 自检:确认每个分类子菜单都真的注册上了 ----
+    # 动态生成的菜单类很容易因为一个小笔误(非法图标名、bl_idname 重复)
+    # 而**静默**注册失败，所以这里主动查一遍并报出来。
+    failed = [cls.__name__ for cls in CATEGORY_MENUS if not hasattr(cls, "bl_rna")]
+    if failed:
+        gk_log.error(f"分类菜单注册失败({len(failed)} 个): {', '.join(failed)}")
+    else:
+        gk_log.info(
+            f"BlenderGameKit 已加载:{len(node_lib.ALL_CLASSES)} 个节点、"
+            f"{len(CATEGORY_MENUS)} 个分类菜单可用"
+        )
+
+
+# ==========================================================================
+# 菜单内容(Shift+A 与右键共用)
+# ==========================================================================
+
+def _recent_classes(limit=8):
+    """最近用过的节点,按最近在前。"""
+    by_id = {cls.bl_idname: cls for cls in node_lib.ALL_CLASSES}
+    out = []
+    for idname in list(ops.RECENT_NODES):
+        cls = by_id.get(idname)
+        if cls is not None and cls not in out:
+            out.append(cls)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# "最近使用"菜单要在 _recent_classes 定义之后才能建(它的 draw 里要用),
+# 所以放在这里而不是文件开头。
+RECENT_MENU = _make_recent_menu()
+
+
+# 注册清单。这个元组必须在所有类都定义完之后才求值,
+# 所以放在文件末尾附近 —— 放中间的话后面定义的类会漏注册。
+GK_CLASSES = (
+    GKGameLogicTree,
+    GK_OT_AddNodeMenu,
+    GK_OT_FindNode,
+    GK_MT_AddNodeCategories,
+    RECENT_MENU,
+    GK_MT_TargetPicker,
+    GK_OT_SetTarget,
+    GK_OT_PickTarget,
+    GK_PT_Main,
+    GK_PT_ObjectPhysics,
+    GK_PT_GodotLook,
+) + tuple(CATEGORY_MENUS)
+
+
+def on_unregister():
+    # 摘掉菜单回调。不摘的话禁用插件后按 Shift+A / 右键
+    # 会去调用已经不存在的菜单类,报一串错。
+    for target_name, func in (
+        ("NODE_MT_add", _draw_add_menu),
+        ("NODE_MT_context_menu", _draw_context_menu),
+    ):
+        target = getattr(bpy.types, target_name, None)
+        if target is None:
+            continue
+        try:
+            target.remove(func)
+        except Exception:
+            pass
+    ops.LAST_EXPORT.clear()
+    ops.RECENT_NODES.clear()

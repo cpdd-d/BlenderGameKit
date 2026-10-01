@@ -1,0 +1,13 @@
+# Blender 扩展仓库配置
+#
+# 用法:Blender 里打开
+#   编辑 > 偏好设置 > 获取扩展 > 仓库下拉 > 添加远程仓库(或"从磁盘安装")
+# 然后把下面的 local_dir 指到本目录下的 _repo 文件夹。
+#
+# 也可以直接用命令行构建/安装:
+#   blender --command extension build --source-dir BlenderGameKit
+#   blender --command extension install-file -r user_default --enable <zip路径>
+
+[repo]
+name = "BlenderGameKit(本地)"
+local_dir = "D:/BlenderGameKit/_repo"

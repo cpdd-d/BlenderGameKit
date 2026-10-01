@@ -1,0 +1,19 @@
+; GDExtension 声明文件
+;
+; Godot 启动时会读这个文件，按当前平台/构建类型去找对应的动态库。
+; 改完 C++ 必须重新编译，并**重启 Godot 编辑器**才会加载新库。
+
+[configuration]
+
+entry_symbol = "gk_library_init"
+compatibility_minimum = "4.4"
+reloadable = true
+
+[libraries]
+
+windows.debug.x86_64 = "res://bin/gk_demo.windows.debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/gk_demo.windows.release.x86_64.dll"
+linux.debug.x86_64 = "res://bin/libgk_demo.linux.debug.x86_64.so"
+linux.release.x86_64 = "res://bin/libgk_demo.linux.release.x86_64.so"
+macos.debug = "res://bin/libgk_demo.macos.debug.framework"
+macos.release = "res://bin/libgk_demo.macos.release.framework"
