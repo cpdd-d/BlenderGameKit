@@ -678,12 +678,23 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
 
             lines.append(f'[node name="{_sanitize_node_name(obj.name)}" '
                          f'type="{body_type}" parent="Colliders"]')
-            # 位置必须写出来:碰撞体在这个世界坐标上,不写就全堆在原点,
-            # 完全对不上模型(实测踩过,Godot 里读回来全是 0)。
-            lines.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
-                         f"{_fmt(position[0])}, {_fmt(position[1])}, "
-                         f"{_fmt(position[2])})")
             if attach_model:
+                # ── 让"glb 说了算",节点保持单位变换(踩过的坑)──────────
+                # glTF 已经把物体的**完整世界变换**写进 glb 的根节点,
+                # 而且 Godot 的 glTF 导入是**跨坐标系**的(Y-up),不是简单的
+                # 轴置换 —— 自己再拼一份 Unity/Blender 风格的变换矩阵,
+                # 旋转和缩放会对不上(实测:网格被搬回物体原点,又和碰撞体
+                # 错开,画面就是重影)。
+                #
+                # 所以这里不自己造变换:节点留在原点,网格交给 glb 决定,
+                # 碰撞体则**按 glb 根节点的原点**摆 —— 网格在哪,碰撞体就在哪。
+                root = _glb_root_transform_values(export_dir, character_model)
+                if root:
+                    pos = root[9:12]
+                else:
+                    pos = list(position)
+                lines.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
+                             f"{_fmt(pos[0])}, {_fmt(pos[1])}, {_fmt(pos[2])})")
                 lines.append(f'script = ExtResource("{script_id}")')
                 lines.append("")
                 shape_type_name = "CollisionShape3D" if is_3d else "CollisionShape2D"
@@ -698,25 +709,20 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                     lines.append(f"collision_layer = {int(layer)}")
                     lines.append(f"collision_mask = {int(mask)}")
                 lines.append("")
+                # 网格不自带偏移:glb 根节点已经把它放在对的位置了,
+                # 这里再写变换就等于应用两次。
                 lines.append(f'[node name="Model" parent="Colliders/'
                              f'{_sanitize_node_name(obj.name)}" '
                              f'instance=ExtResource("1_character")]')
-                # ── Model 要抵消角色 glb 内部根节点的变换 ─────────────
-                # glTF 导出会把物体的**世界变换**写进 glb 的根节点。于是
-                # 角色 glb 里那个根节点的 translation 就是角色在 Blender 里
-                # 的位置;再 instance 到一个位于原点的 CharacterBody3D 下面,
-                # 网格就会**再偏移一次** —— 和碰撞体(按物体世界坐标生成)
-                # 错开,表现为重影 + 深度冲突闪烁(用户实测反馈)。
-                #
-                # 这里给它一个逆变换,把 glb 内部的偏移抵消掉:
-                # 网格落到"物体世界坐标"上,和碰撞体严丝合缝。
-                inverse = _glb_root_inverse_transform(
-                    export_dir, character_model, obj, is_3d)
-                if inverse:
-                    lines.append(f"transform = {inverse}")
                 lines.append("")
                 continue
 
+            # 非角色物体:碰撞体自己站在物体世界坐标上,节点留在原点。
+            # 位置必须写出来,不写就全堆在原点,完全对不上模型
+            # (实测踩过,Godot 里读回来全是 0)。
+            lines.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
+                         f"{_fmt(position[0])}, {_fmt(position[1])}, "
+                         f"{_fmt(position[2])})")
             if use_script and getattr(physics, "script_target", False):
                 lines.append(f'script = ExtResource("{script_id}")')
             lines.append("")
@@ -1971,6 +1977,58 @@ def meshes_without_material(scene):
         if first_real_material(obj) is None:
             out.append(obj.name)
     return out
+
+
+def _blender_world_to_godot_transform(obj):
+    """把 Blender 物体的世界变换转成 Godot 的 Transform3D 文本。
+
+    ── 为什么需要它(踩过的坑)────────────────────────────────────────
+    glTF 导出会把物体的**世界变换**写进 glb 的根节点,所以
+    "glb 内部的根变换" == "物体在 Blender 里的世界变换"。
+
+    正确的做法是让角色节点**带上这份世界变换**:
+      * 角色节点站在物体该在的位置、用该用的缩放
+      * 碰撞体按物体世界坐标生成 —— 两者自然对齐
+      * 网格的 Model 用一个**逆变换**抵消 glb 内部那份,净效果 = 物体世界变换
+
+    以前只把逆变换给了 Model,却让角色节点留在原点:
+    结果是网格被搬回了**物体原点**,而碰撞体还在物体世界坐标上 ——
+    两者错开,画面表现就是重影/错位。
+
+    轴向沿用 glTF 的 Y-up 约定:Godot(x, y, z) = Blender(x, z, -y)。
+    所以一个向量 v 的换算就是对各分量取 (v.x, v.z, -v.y)。
+    """
+    try:
+        world = obj.matrix_world
+        # Blender 的 matrix_world 是列主序存取的(m[row][col] 语义,列=基向量)
+        cols = []
+        for c in range(3):
+            v = (float(world[0][c]), float(world[1][c]), float(world[2][c]))
+            cols.append((v[0], v[2], -v[1]))       # -> Godot 轴向
+        t = world.translation
+        origin = (float(t.x), float(t.z), -float(t.y))
+    except Exception:
+        return ""
+    identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+    values = (cols[0][0], cols[0][1], cols[0][2],
+              cols[1][0], cols[1][1], cols[1][2],
+              cols[2][0], cols[2][1], cols[2][2],
+              origin[0], origin[1], origin[2])
+    if all(abs(values[i] - identity[i]) < 1e-9 for i in range(12)):
+        return ""
+    return "Transform3D(" + ", ".join(_fmt(v) for v in values) + ")"
+
+
+def _glb_root_transform_values(export_dir, model_name):
+    """读 glb 根节点的变换,返回 12 个数的列表(读不到返回 None)。"""
+    raw = glb_scene_nodes(export_dir, model_name).get("root_matrix")
+    if not raw:
+        return None
+    try:
+        m = [float(part.strip()) for part in str(raw).split(",")]
+    except ValueError:
+        return None
+    return m if len(m) == 12 else None
 
 
 def _glb_root_inverse_transform(export_dir, model_name, obj, is_3d=True):
