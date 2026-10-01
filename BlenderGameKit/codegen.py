@@ -2917,6 +2917,46 @@ class Generator:
 last_used_actions = []
 
 
+# 只有 CharacterBody 才有 move_and_slide / is_on_floor。
+# 把「移动_按方向」用在这些基类上会生成 `self.move_and_slide()`,
+# 而 Godot 加载脚本时报
+#     Parse Error: Function "move_and_slide()" not found in base self.
+# 注意:这个错误 `godot --check-only` **查不出来**(它不做成员级类型检查),
+# 只有脚本真的挂到场景上、被加载时才报。所以必须在导出前就提醒。
+_CHARACTER_BODIES = {"CharacterBody2D", "CharacterBody3D"}
+
+
+def _check_base_class_supports_graph(tree, options, warnings):
+    """基类和节点图是否匹配 —— 不匹配就给一条看得懂的告警。"""
+    base = str(options.get("base_class", "") or "")
+    if not base or base in _CHARACTER_BODIES:
+        return
+    needed = []
+    for node in getattr(tree, "nodes", ()) or ():
+        bl_idname = getattr(node, "bl_idname", "")
+        if bl_idname == "GKNodeMoveDirection":
+            needed.append("移动_按方向")
+        elif bl_idname == "GKNodeMoveAndSlide":
+            needed.append("移动_滑动")
+        elif bl_idname == "GKNodeJump":
+            needed.append("移动_跳跃")
+        elif bl_idname == "GKNodeIsOnFloor":
+            needed.append("取值_是否在地面")
+    if not needed:
+        return
+    unique = sorted(set(needed))
+    warnings.append(
+        f"脚本基类是 {base}，但节点图里用了 {'、'.join(unique)} —— "
+        f"这些节点生成的是 move_and_slide()，只有 CharacterBody2D / "
+        f"CharacterBody3D 才有这个方法。Godot 会在加载脚本时报 "
+        f"『Function \"move_and_slide()\" not found in base self』。\n"
+        f"改法(二选一)：\n"
+        f"  1) 选中要做角色的那个物体 → 『游戏物理』面板 → 类型改成 "
+        f"『3D 角色 CharacterBody3D』(2D 则 CharacterBody2D)；\n"
+        f"  2) 或者把侧栏『脚本基类』设成『自动(跟着物体走)』，让它跟着物体走。"
+    )
+
+
 def generate(tree, options=None):
     """生成 GDScript，返回 (代码, 告警列表)。"""
     if tree is None:
@@ -2924,6 +2964,7 @@ def generate(tree, options=None):
     generator = Generator(tree, options)
     code = generator.generate()
     warnings = list(generator.ctx.warnings)
+    _check_base_class_supports_graph(tree, options or {}, warnings)
     # 登记本次用到的输入动作，供导出流程写进 project.godot
     globals()["last_used_actions"] = list(generator.ctx.input_actions.values())
     return code, warnings

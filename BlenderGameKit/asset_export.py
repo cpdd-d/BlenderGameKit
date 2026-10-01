@@ -1889,6 +1889,24 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
     if script_name and script_target is not None:
         bounds = object_bounds([script_target])
         try:
+            # ── 角色必须有**自己的** glb ──────────────────────────────
+            # 以前这里 instance 的是整个 World.glb,导致
+            # "一移动角色,整个世界跟着跑"(地面、道具全飞了)。
+            # 而且 Godot 不允许往实例内部挂节点,碰撞体也就挂不到角色网格上
+            # (实测报 "Parent path './World/Suzanne' has vanished")。
+            # 所以先把角色(含子级)单独导成一个 glb,再 instance 它。
+            char_model = _sanitize_node_name(script_target.name) or "Character"
+            char_path, char_ok, char_msg = export_subtree_glb(
+                directory, char_model, [script_target], scene=scene)
+            if char_ok:
+                result["written"].append(char_path)
+            else:
+                # 单独导出失败时退回整场景 glb —— 至少还能看见东西,
+                # 只是角色会和世界一起动。用告警说清楚。
+                result["warnings"].append(
+                    f"角色单独导出失败({char_msg}),已退回整场景模型:"
+                    f"这样角色移动时整个世界会跟着动。")
+
             scene_path, _cam, _light = write_character_scene(
                 directory,
                 root_name=script_target.name,
@@ -1898,7 +1916,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 #  assigned to an object of type: 'Y')。
                 # 所以这里调的是同一个解析函数,不另外猜。
                 base_class=_base_class_for(scene, script_target, dimension),
-                model_name="World",
+                model_name=char_model if char_ok else "World",
                 script_name=script_name,
                 bounds=bounds,
                 dimension=dimension,
@@ -1906,10 +1924,82 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 set_as_main=False,
             )
             result["written"].append(scene_path)
+            result["character_scene"] = scene_path
         except OSError as exc:
             result["warnings"].append(f"角色场景生成失败: {exc}")
 
     result["directory"] = directory
+    return result
+
+
+_ROOT_GLB = None
+
+
+def export_subtree_glb(export_dir, name, roots, scene=None):
+    """把若干物体**及其全部子级**导出成一个独立的 .glb。
+
+    ── 为什么角色必须有自己的 glb ──────────────────────────────────
+    以前角色场景里 instance 的是整个 `World.glb`,于是它的节点树长这样:
+
+        Cube [CharacterBody3D]        ← 脚本在这里,移动它
+          Model [instance World.glb]  ← **整个世界**都塞在这里
+            Plane / Suzanne / Camera …
+
+    结果:一移动角色,**整个世界跟着跑**(地面、别的道具全飞了)。
+    而且因为 Godot 不允许往实例内部挂节点,也没法把碰撞体挂到角色网格上
+    (实测报 "Parent path './World/Suzanne' has vanished")。
+
+    正确做法:角色自己一个 glb,里面只有角色网格。
+
+    返回 (路径, 是否成功, 消息)。
+    """
+    import bpy
+
+    scene = scene or bpy.context.scene
+    if scene is None or not roots:
+        return None, False, "没有可导出的角色物体"
+
+    # 收集:根 + 全部后代网格
+    wanted = set()
+    stack = [obj for obj in roots if obj is not None]
+    while stack:
+        obj = stack.pop()
+        if obj in wanted:
+            continue
+        wanted.add(obj)
+        stack.extend(obj.children)
+
+    previous = [obj for obj in scene.objects if obj.select_get()]
+    for obj in scene.objects:
+        obj.select_set(obj in wanted and not obj.get(PREVIEW_MARK))
+
+    target_dir = os.path.join(export_dir, project.ART_DIR)
+    os.makedirs(target_dir, exist_ok=True)
+    path = os.path.join(target_dir, f"{name}.glb")
+
+    kwargs = {
+        "filepath": path,
+        "export_format": "GLB",
+        "use_selection": True,
+        "export_apply": False,
+        "export_yup": True,
+        "export_materials": "EXPORT",
+        "export_animations": True,
+        "export_skins": True,
+        "export_texcoords": True,
+        "export_normals": True,
+        # 相机灯光由 Environment 脚本 / 主场景负责,角色 glb 里不要
+        "export_cameras": False,
+        "export_lights": False,
+        "export_extras": True,
+    }
+    result = _run_gltf_export(kwargs, path)
+
+    try:
+        for obj in scene.objects:
+            obj.select_set(obj in previous)
+    except Exception:
+        pass
     return result
 
 
@@ -1918,13 +2008,16 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
                           set_as_main=True, model_dir=None):
     """生成把 模型 + 碰撞体 + 脚本 + 相机灯光 拼在一起的 .tscn。
 
+    ── 结构(这才是能让角色动起来的结构)─────────────────────────────
+        Cube [CharacterBody3D]        ← 脚本挂这里;移动它
+          Collision [CollisionShape3D]
+          Model [instance Cube.glb]   ← 只有角色网格
+
+    碰撞体和网格都是**根节点的子级**,所以根一动,两个一起动。
+
     为什么要带相机和灯光:以前只放模型,结果按 F5 看到的**是一片灰** ——
     没有相机就没有视点,没有灯光就全黑,再加上 Godot 默认的灰底,
     看起来就像"渲染坏了"。从 Blender 场景里把相机和灯光搬过来就没这个问题。
-
-    model_name 指哪个 .glb 来 instance。整场景导出成功时传 "World" ——
-    这样角色场景里也能看到**整个场景**(地面、道具都在),而不是只有角色
-    一个人悬在空中。实测踩过:不这么做的话画面里只有一个白球,地面没了。
 
     set_as_main=False 时不会改主场景 —— 整场景导出会先写 World 场景并设成主场景,
     之后再写角色场景时不能再抢,否则 F5 打开的就只剩角色了。
