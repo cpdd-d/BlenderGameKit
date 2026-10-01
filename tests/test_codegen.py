@@ -1513,6 +1513,117 @@ class TestScreenFilterNodes(Base):
         self.assertNotIn("_GK_FILTER_SHADER", code)
 
 
+    def test_all_prop_kinds_are_supported(self):
+        """每个 gk_prop_defs 里用到的类型都必须有真实的属性工厂。
+
+        ── 为什么需要这条测试 ──────────────────────────────────────────
+        materialize_props 对**不认识的类型**会静默退回成 StringProperty。
+        于是 'color' 和 'float_vector' 这两种没登记的类型，
+        在 Blender 里会让整类节点注册失败:
+            'gk_color' StringProperty could not register
+        而在离线测试里因为走的是 GKProp 桩，**完全看不出来** ——
+        必须靠这条断言把"类型拼错/漏登记"挡在提交之前。
+        """
+        from BlenderGameKit.nodes import node_base as NB
+
+        supported = set(NB._PROP_FACTORY) | {"enum"}
+        offenders = []
+        for cls in NN.ALL_CLASSES:
+            for entry in getattr(cls, "gk_prop_defs", ()) or ():
+                kind = entry[1]
+                if kind not in supported:
+                    offenders.append(f"{cls.bl_label}.{entry[0]} 用了未知类型 {kind!r}")
+        self.assertEqual(offenders, [], "未登记的属性类型:\n  " + "\n  ".join(offenders))
+
+    def test_all_nodes_register_in_blender_shape(self):
+        """每个节点类都要能被实例化并建出引脚(离线近似真实注册)。
+
+        真实注册失败在离线环境里看不见，所以这里至少保证"类本身是完整的":
+        有 bl_label、能建引脚、声明过的属性都能设值。
+        """
+        from BlenderGameKit.nodes import node_base as NB
+
+        for cls in NN.ALL_CLASSES:
+            self.assertTrue(getattr(cls, "bl_label", ""), f"{cls.__name__} 缺 bl_label")
+            # 抽象基类不注册，跳过
+            if cls.__name__.startswith("_"):
+                continue
+            node = cls()
+            builder = getattr(node, "build_sockets", None)
+            if callable(builder):
+                builder()
+            for entry in getattr(cls, "gk_prop_defs", ()) or ():
+                prop_name = entry[0]
+                self.assertTrue(hasattr(node, prop_name),
+                                f"{cls.bl_label} 缺属性 {prop_name}")
+
+    def test_every_declared_prop_type_has_a_real_factory(self):
+        """颜色与向量必须落到真属性类型上，不能只是"有个名字"。"""
+        from BlenderGameKit.nodes import node_base as NB
+
+        self.assertIn("color", NB._PROP_FACTORY)
+        self.assertIn("float_vector", NB._PROP_FACTORY)
+
+    def test_uses_of_color_and_vector_props(self):
+        """确实有用到这两种类型的节点，否则上面两条就是空转。"""
+        kinds = set()
+        for cls in NN.ALL_CLASSES:
+            for entry in getattr(cls, "gk_prop_defs", ()) or ():
+                kinds.add(entry[1])
+        self.assertIn("color", kinds)
+        self.assertIn("float_vector", kinds)
+
+
+    def test_no_bpy_prop_type_that_does_not_exist(self):
+        """不能引用不存在的 bpy.props 类型。
+
+        ── 这条测试为什么必须有 ────────────────────────────────────────
+        踩过的坑:bpy.props **没有** ColorProperty。写了它会让
+        `from bpy.props import (...)` 整段失败 -> _BPY 变 False ->
+        **全部 87 个节点**都注册不上(报 missing bl_rna attribute)，
+        而离线测试因为走 GKProp 桩，一点异常都看不出来。
+
+        这里静态扫描 node_base 源码里引用到的 bpy.props 名字，
+        对照一份"Blender 确实提供"的白名单。
+        """
+        import inspect
+
+        from BlenderGameKit.nodes import node_base as NB
+
+        # 这份白名单来自 Blender 4.5 的 bpy.props(实测 hasattr 确认过)
+        real_bpy_props = {
+            "BoolProperty", "BoolVectorProperty", "CollectionProperty",
+            "EnumProperty", "FloatProperty", "FloatVectorProperty",
+            "IntProperty", "IntVectorProperty", "PointerProperty",
+            "RemoveProperty", "StringProperty",
+        }
+        # 只看代码，不看注释与文档字符串:
+        # 注释里会写"不要用 ColorProperty"这种说明，不该被判成违规
+        source = inspect.getsource(NB)
+        code_only = "\n".join(
+            line.split("#", 1)[0] for line in source.splitlines()
+        )
+        code_only = re.sub(r'"""(?:.|\n)*?"""', "", code_only)
+        code_only = re.sub(r"'''(?:.|\n)*?'''", "", code_only)
+        used = set(re.findall(r"\b([A-Z]\w*Property)\b", code_only))
+        unknown = sorted(used - real_bpy_props)
+        self.assertEqual(unknown, [],
+                         "node_base 引用了 Blender 不存在的属性类型: " + ", ".join(unknown))
+
+    def test_color_uses_vector_property(self):
+        """颜色在 Blender 里就是 4 分量浮点向量，不是 ColorProperty。"""
+        import inspect
+
+        from BlenderGameKit.nodes import node_base as NB
+
+        self.assertIn("color", NB._PROP_FACTORY)
+        # 代码里不该出现 ColorProperty(注释里可以提，所以先去掉注释)
+        source = inspect.getsource(NB)
+        code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+        code_only = re.sub(r'"""(?:.|\n)*?"""', "", code_only)
+        self.assertNotIn("ColorProperty", code_only)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

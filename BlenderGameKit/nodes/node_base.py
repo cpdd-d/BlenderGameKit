@@ -25,6 +25,7 @@ try:
         BoolProperty,
         EnumProperty,
         FloatProperty,
+        FloatVectorProperty,
         IntProperty,
         StringProperty,
     )
@@ -213,6 +214,22 @@ if _BPY:
     def prop_enum(items, default="", name="", description="", **kw):
         return EnumProperty(items=items, default=default, name=name, description=description, **kw)
 
+    def prop_color(default=(1.0, 1.0, 1.0, 1.0), name="", description="", **kw):
+        # ── 为什么不是 ColorProperty ────────────────────────────────────
+        # Blender **没有** bpy.props.ColorProperty。写成它会让 from bpy.props
+        # import 整段失败，_BPY 变成 False，接着**所有**节点都注册不上
+        # (实测:87 个节点全挂，报 missing bl_rna attribute)。
+        # 颜色在 Blender 里就是"4 分量的浮点向量 + COLOR 语义"，
+        # 所以正确的做法是 FloatVectorProperty(size=4, subtype="COLOR")。
+        return FloatVectorProperty(name=name, description=description,
+                                   default=default, size=4, subtype="COLOR", **kw)
+
+    def prop_vector(default=(0.0, 0.0, 0.0), name="", description="", **kw):
+        # size=3 同时覆盖 2D 与 3D:2D 项目只读前两个分量，用同一个属性省事，
+        # 免得节点上出现两套"维度相关的"属性
+        return FloatVectorProperty(name=name, description=description,
+                                   default=default, size=3, subtype="XYZ", **kw)
+
 else:
 
     def prop_float(default=0.0, name="", description="", **kw):
@@ -225,6 +242,12 @@ else:
         return GKProp(default, name=name, description=description, **kw)
 
     def prop_text(default="", name="", description="", **kw):
+        return GKProp(default, name=name, description=description, **kw)
+
+    def prop_color(default=(1.0, 1.0, 1.0, 1.0), name="", description="", **kw):
+        return GKProp(default, name=name, description=description, **kw)
+
+    def prop_vector(default=(0.0, 0.0, 0.0), name="", description="", **kw):
         return GKProp(default, name=name, description=description, **kw)
 
     def prop_enum(items, default="", name="", description="", **kw):
@@ -242,6 +265,8 @@ _PROP_FACTORY = {
     "bool": prop_bool,
     "string": prop_text,
     "node": prop_node,
+    "color": prop_color,
+    "float_vector": prop_vector,
 }
 
 
