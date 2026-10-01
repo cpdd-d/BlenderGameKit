@@ -1979,44 +1979,22 @@ def meshes_without_material(scene):
     return out
 
 
-def _blender_world_to_godot_transform(obj):
-    """把 Blender 物体的世界变换转成 Godot 的 Transform3D 文本。
-
-    ── 为什么需要它(踩过的坑)────────────────────────────────────────
-    glTF 导出会把物体的**世界变换**写进 glb 的根节点,所以
-    "glb 内部的根变换" == "物体在 Blender 里的世界变换"。
-
-    正确的做法是让角色节点**带上这份世界变换**:
-      * 角色节点站在物体该在的位置、用该用的缩放
-      * 碰撞体按物体世界坐标生成 —— 两者自然对齐
-      * 网格的 Model 用一个**逆变换**抵消 glb 内部那份,净效果 = 物体世界变换
-
-    以前只把逆变换给了 Model,却让角色节点留在原点:
-    结果是网格被搬回了**物体原点**,而碰撞体还在物体世界坐标上 ——
-    两者错开,画面表现就是重影/错位。
-
-    轴向沿用 glTF 的 Y-up 约定:Godot(x, y, z) = Blender(x, z, -y)。
-    所以一个向量 v 的换算就是对各分量取 (v.x, v.z, -v.y)。
-    """
-    try:
-        world = obj.matrix_world
-        # Blender 的 matrix_world 是列主序存取的(m[row][col] 语义,列=基向量)
-        cols = []
-        for c in range(3):
-            v = (float(world[0][c]), float(world[1][c]), float(world[2][c]))
-            cols.append((v[0], v[2], -v[1]))       # -> Godot 轴向
-        t = world.translation
-        origin = (float(t.x), float(t.z), -float(t.y))
-    except Exception:
-        return ""
-    identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
-    values = (cols[0][0], cols[0][1], cols[0][2],
-              cols[1][0], cols[1][1], cols[1][2],
-              cols[2][0], cols[2][1], cols[2][2],
-              origin[0], origin[1], origin[2])
-    if all(abs(values[i] - identity[i]) < 1e-9 for i in range(12)):
-        return ""
-    return "Transform3D(" + ", ".join(_fmt(v) for v in values) + ")"
+# ── 已删除:_blender_world_to_godot_transform() ──────────────────────
+#
+# 曾经写过一个"把 Blender 物体的世界变换手写成 Godot Transform3D"的函数,
+# 按 Godot(x,y,z) = Blender(x, z, -y) 置换基向量。**这条路是错的,别再走。**
+#
+# 实测症状:带旋转/缩放时矩阵对不上 —— 缩放跑到别的轴上、原点也抵消不干净,
+# 角色网格因此和碰撞体错开,画面表现为重影。
+#
+# 原因是 **Godot 的 glTF 导入是跨坐标系的(Y-up),不是简单的轴置换**,
+# 靠自己拼矩阵必然会偏。
+#
+# 正确做法(现在用的):glTF 已经把手物体的完整世界变换写进 glb 根节点,
+# 而且 Godot 导入时自己会处理对坐标系 —— 所以**让 glb 说了算**:
+#   * 角色节点保持单位 basis,网格直接交给 glb
+#   * 碰撞体按 glb 根节点的原点摆(见 _glb_root_transform_values)
+# 用一个数据源决定两者位置,不让两条独立推算的路径去"对齐"。
 
 
 def _glb_root_transform_values(export_dir, model_name):
