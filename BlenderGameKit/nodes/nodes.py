@@ -1266,6 +1266,135 @@ class GKNodeScreenFade(B.GKStatementNode):
 
 
 # ==========================================================================
+# 界面
+# ==========================================================================
+@N
+class GKNodeUiText(B.GKStatementNode):
+    bl_idname = "GKNodeUiText"
+    bl_label = "界面_文本"
+    bl_icon = "FONT_DATA"
+    gk_category = "界面"
+    gk_doc = ("在屏幕上显示一行字(分数 / 提示 / 对话)。UI 层是自动建的，"
+              "不需要你在场景里摆控件；重复调用同一个节点是改文字，不会叠出新的一行")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "文字", "分数: 0"),
+        S.pin(FLOAT, "X", 20.0),
+        S.pin(FLOAT, "Y", 20.0),
+    )
+    gk_input_props = {"文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
+    gk_prop_defs = (
+        ("gk_text", "string", "分数: 0", "文字", "未连线时显示的内容"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标(左上角为原点)"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_size", "int", 24, "字号", "像素"),
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "文字颜色"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_text", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_x", text="X")
+        row.prop(self, "gk_y", text="Y")
+        row = layout.row(align=True)
+        row.prop(self, "gk_size", text="")
+        row.prop(self, "gk_color", text="")
+
+
+@N
+class GKNodeUiBar(B.GKStatementNode):
+    bl_idname = "GKNodeUiBar"
+    bl_label = "界面_进度条"
+    bl_icon = "COLOR"
+    gk_category = "界面"
+    gk_doc = "在屏幕上显示一条进度条(血条 / 蓝条 / 蓄力条)。数值会自动钳在 0~最大值"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "数值", 100.0),
+        S.pin(FLOAT, "X", 20.0),
+        S.pin(FLOAT, "Y", 60.0),
+    )
+    gk_input_props = {"数值": "gk_value", "X": "gk_x", "Y": "gk_y"}
+    gk_prop_defs = (
+        ("gk_value", "float", 100.0, "数值", "当前值"),
+        ("gk_max", "float", 100.0, "最大值", "满值"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标"),
+        ("gk_y", "float", 60.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 200.0, "宽", "像素"),
+        ("gk_height", "float", 16.0, "高", "像素"),
+        ("gk_color", "color", (0.85, 0.25, 0.25, 1.0), "颜色", "填充色"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_value", text="")
+        row.prop(self, "gk_max", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_x", text="X")
+        row.prop(self, "gk_y", text="Y")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="")
+        row.prop(self, "gk_height", text="")
+        layout.prop(self, "gk_color", text="")
+
+
+@N
+class GKNodeUiButton(B.GKStatementNode):
+    bl_idname = "GKNodeUiButton"
+    bl_label = "界面_按钮"
+    bl_icon = "PLAY"
+    gk_category = "界面"
+    gk_doc = ("在屏幕上放一个按钮，点击后沿『点击』出口继续。"
+              "按钮是持久的(不会点一下就消失)，重复调用只改文字")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "文字", "开始游戏"),
+        S.pin(FLOAT, "X", 100.0),
+        S.pin(FLOAT, "Y", 200.0),
+    )
+    gk_input_props = {"文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
+    gk_prop_defs = (
+        ("gk_text", "string", "开始游戏", "文字", "按钮上显示的字"),
+        ("gk_x", "float", 100.0, "X", "屏幕坐标"),
+        ("gk_y", "float", 200.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 160.0, "宽", "像素"),
+        ("gk_height", "float", 48.0, "高", "像素"),
+    )
+    # 出口故意不叫『完成』:emit_statement 会自动续接『完成』，
+    # 那样按钮还没点就会立刻往下跑。见 _stmt_ui_button 的说明。
+    gk_outputs = (S.pin(FLOW, "点击"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_text", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_x", text="X")
+        row.prop(self, "gk_y", text="Y")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="")
+        row.prop(self, "gk_height", text="")
+
+
+@N
+class GKNodeUiHide(B.GKStatementNode):
+    bl_idname = "GKNodeUiHide"
+    bl_label = "界面_隐藏控件"
+    bl_icon = "HIDE_ON"
+    gk_category = "界面"
+    gk_doc = "隐藏某个界面控件(比如捡到道具后让提示消失)。控件名就是创建它的节点名"
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "控件名", "提示"))
+    gk_input_props = {"控件名": "gk_widget"}
+    gk_prop_defs = (
+        ("gk_widget", "string", "提示", "控件名", "要隐藏的界面节点名"),
+        ("gk_visible", "bool", False, "显示", "勾上=显示，取消=隐藏"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="")
+        row.prop(self, "gk_visible", text="", toggle=True)
+
+
+# ==========================================================================
 # 实用
 # ==========================================================================
 @N
@@ -1287,4 +1416,4 @@ ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
 CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
-                  "运算", "显示", "相机", "音效", "存档", "屏幕效果", "时间", "实用")
+                  "运算", "显示", "相机", "音效", "存档", "界面", "屏幕效果", "时间", "实用")

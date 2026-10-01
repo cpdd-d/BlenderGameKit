@@ -38,8 +38,12 @@ class Base(unittest.TestCase):
         """生成代码里不应出现中文标识符(注释与字符串字面量除外)。
 
         中文字符串是合法的(print("你好"))，但中文标识符会让 GDScript 编译失败。
-        注意 `$"主相机"` 是**带引号的节点路径**，属于字符串，同样合法 ——
-        这正是中文节点名唯一正确的写法。
+        两处**有意为之**的例外(都实测过 Godot 4.7.2 接受):
+
+        * `$"主相机"` —— 带引号的节点路径，属于字符串
+        * `_gk_ui_<中文>` —— 界面控件的成员变量名。
+          界面控件是"每个节点一个"的，用节点名做后缀才能一眼对上号；
+          Godot 的标识符本来就允许 Unicode，中文名对中文用户更好读。
         """
         offenders = []
         for number, line in enumerate(code.splitlines(), 1):
@@ -50,6 +54,9 @@ class Base(unittest.TestCase):
             # 去掉字符串字面量后再检查
             body = re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)
             body = re.sub(r"'(?:[^'\\]|\\.)*'", "''", body)
+            # 界面控件的变量名允许中文(见上面的说明)
+            body = body.replace("_gk_ui_", "_GKUI_")
+            body = re.sub(r"_GKUI_[\u4e00-\u9fff\w]*", "_GKUI_X", body)
             if re.search(r"[\u4e00-\u9fff]", body):
                 offenders.append((number, stripped))
         self.assertEqual(offenders, [], f"代码里出现中文标识符: {offenders}")
@@ -561,8 +568,8 @@ class TestDisplayNodes(Base):
         gk_stub.connect(tree, event, "执行", node, "执行")
         code, warnings = gen(tree, V2)
 
-        # 触发语句:重置计时器(snake_case 会去掉前导下划线)
-        self.assertIn("gk_shake_left = gk_shake_total", code)
+        # 触发语句:重置计时器(生成器内部名保留前导下划线)
+        self.assertIn("_gk_shake_left = _gk_shake_total", code)
         # 每帧衰减:必须有 _process
         self.assertIn("func _process(delta: float) -> void:", code)
         self.assertIn("randf_range(", code)
@@ -571,11 +578,11 @@ class TestDisplayNodes(Base):
         self.assertIn(".h_offset = 0.0", code)
         self.assert_no_chinese_identifiers(code)
         self.assert_indent_sane(code)
-        # 衰减逻辑必须在 _process 函数体内部。它在 `if gk_shake_left > 0.0:`
+        # 衰减逻辑必须在 _process 函数体内部。它在 `if _gk_shake_left > 0.0:`
         # 里面，所以缩进是 8(函数体 4 + 一层 if)。
         lines = code.splitlines()
         index = next(i for i, line in enumerate(lines) if line.startswith("func _process"))
-        decay = next(i for i, line in enumerate(lines) if "gk_shake_left -= delta" in line)
+        decay = next(i for i, line in enumerate(lines) if "_gk_shake_left -= delta" in line)
         self.assertGreater(decay, index, "衰减逻辑必须在 _process 之后")
         self.assertEqual(len(lines[decay]) - len(lines[decay].lstrip(" ")), 8,
                          f"衰减逻辑缩进应为 8: {lines[decay]!r}")
@@ -797,7 +804,10 @@ class TestSaveNodes(Base):
         gk_stub.connect(tree, event, "执行", loader, "执行")
         gk_stub.connect(tree, loader, "完成", setter, "执行")
         code, _ = gen(tree, V2)
-        self.assertEqual(code.count("_gk_read_save(gk_save_path)"), 1, code)
+        # 只数"调用"，不数辅助函数自己的签名 `func _gk_read_save(...)`
+        calls = [line for line in code.splitlines()
+                 if "_gk_read_save(" in line and not line.strip().startswith("func ")]
+        self.assertEqual(len(calls), 1, "\n".join(calls))
 
     def test_save_has_two_named_branches(self):
         """『存档_是否存在』的两个出口必须各自只生成一次。
@@ -868,8 +878,7 @@ class TestScreenEffectNodes(Base):
         code, warnings = gen(tree, V2)
         self.assertEqual(warnings, [], warnings)
         self.assertIn("CanvasLayer.new()", code)
-        # 注意:snake_case 会去掉前导下划线，所以变量名是 gk_fade_layer
-        self.assertIn("gk_fade_layer == null", code)
+        self.assertIn("_gk_fade_layer == null", code)
         # 等渐变结束再往下走，否则"淡出->切场景"顺序会乱
         self.assertIn("await ", code)
         self.assert_no_chinese_identifiers(code)
@@ -893,9 +902,190 @@ class TestScreenEffectNodes(Base):
         gk_stub.connect(tree, event, "执行", first, "执行")
         gk_stub.connect(tree, first, "完成", second, "执行")
         code, _ = gen(tree, V2)
-        # 成员变量只声明一次(变量名不含前导下划线:snake_case 会去掉)
-        self.assertEqual(code.count("var gk_fade_layer: CanvasLayer"), 1, code)
-        self.assertEqual(code.count("var gk_fade_rect: ColorRect"), 1, code)
+        # 成员变量只声明一次(生成器内部名保留前导下划线)
+        self.assertEqual(code.count("var _gk_fade_layer: CanvasLayer"), 1, code)
+        self.assertEqual(code.count("var _gk_fade_rect: ColorRect"), 1, code)
+
+
+class TestUiNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_ui_text_creates_shared_root(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiText, "分数", gk_text="分数: 0")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ensure_ui(self)", code)
+        self.assertIn("CanvasLayer.new()", code)
+        self.assertIn("Control.new()", code)
+        self.assertIn("Label.new()", code)
+        self.assertIn('str("分数: 0")', code)
+        # 文字控件不能吃鼠标，否则会挡住下面的按钮
+        self.assertIn("MOUSE_FILTER_IGNORE", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_ui_bar_clamps_value(self):
+        """血量变成负数或超过上限时进度条会画出诡异的样子，必须钳住。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiBar, "血条", gk_value=150.0, gk_max=100.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("ProgressBar.new()", code)
+        self.assertIn("clampf(", code)
+        self.assertIn("max_value = 100.0", code)
+        self.assert_indent_sane(code)
+
+    def test_ui_button_click_is_not_executed_at_creation(self):
+        """按钮的『点击』出口必须放进独立回调，不能在连线瞬间就执行。
+
+        回归:出口曾叫『完成』，而 emit_statement 会自动续接『完成』，
+        结果按钮刚建出来后面的逻辑就直接跑了(比如游戏立刻开始)。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        button = tree.new_node(NN.GKNodeUiButton, "开始按钮", gk_text="开始游戏")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="游戏开始")
+        gk_stub.connect(tree, event, "执行", button, "执行")
+        gk_stub.connect(tree, button, "点击", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+
+        lines = code.splitlines()
+        ready_at = next(i for i, line in enumerate(lines) if line.startswith("func _ready"))
+        callback_at = next(i for i, line in enumerate(lines) if "func gk_on_" in line)
+        print_at = next(i for i, line in enumerate(lines) if 'print("游戏开始")' in line)
+        # 打印必须在回调函数里，而不是在 _ready 里
+        self.assertGreater(print_at, callback_at,
+                           f"打印应在按钮回调里:\n{code}")
+        self.assertGreater(callback_at, ready_at)
+        self.assertIn(".pressed.connect(", code)
+        # 按钮必须吃鼠标，否则点不动
+        self.assertIn("MOUSE_FILTER_STOP", code)
+
+    def test_ui_button_output_not_named_done(self):
+        """出口不能叫『完成』，否则会被自动续接机制提前执行。"""
+        names = [spec["name"] for spec in NN.GKNodeUiButton.gk_outputs]
+        self.assertNotIn("完成", names, "出口叫『完成』会被 emit_statement 提前续接")
+
+    def test_ui_hide_finds_widget_by_name(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiHide, "隐藏提示", gk_widget="提示", gk_visible=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_find_widget(self, \"提示\")", code)
+        self.assertIn(".visible = false", code)
+        # 找不到控件要给告警，而不是静默什么都不做
+        self.assertIn("push_warning(", code)
+
+    def test_ui_hide_without_widget_name_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiHide, "隐藏提示", gk_widget="")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in w for w in warnings), warnings)
+
+    def test_ui_helpers_only_when_used(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_gk_ensure_ui", code)
+
+    def test_same_named_widgets_do_not_share_variable(self):
+        """两行同名的文本必须各自有变量，否则类型声明会互相覆盖。
+
+        回归:两个节点都叫『分数』时，一个声明成 Label、另一个声明成
+        ProgressBar，后声明的把前一个覆盖掉，生成自相矛盾的脚本
+        (Godot 报 Value of type "ProgressBar" cannot be assigned to "Label")。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeUiText, "同一个名字", gk_text="A")
+        second = tree.new_node(NN.GKNodeUiBar, "同一个名字", gk_value=1.0)
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("var _gk_ui_同一个名字: Label", code)
+        self.assertIn("var _gk_ui_同一个名字_2: ProgressBar", code)
+
+    def test_internal_variable_names_keep_leading_underscore(self):
+        """生成器内部名不能被 snake_case 吃掉前导下划线。
+
+        回归:`_gk_ui_layer` 被改名成 `gk_ui_layer`，导致函数体里写
+        `_gk_ui_layer` 而成员变量声明成 `gk_ui_layer`，
+        Godot 报 Identifier "_gk_ui_layer" not declared。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiText, "分数", gk_text="A")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("var _gk_ui_layer: CanvasLayer", code)
+        self.assertIn("var _gk_ui_root: Control", code)
+        self.assertNotIn("var gk_ui_layer", code)
+
+
+    def test_repeated_generate_has_no_false_shared_node_warning(self):
+        """连续多次导出不能互相污染。
+
+        回归:断环/归属判断曾用 id(节点) 当键。id 会在对象被回收后**复用**，
+        于是前一次导出里已释放的节点 id 会被这一次的新节点拿到，
+        新节点被误判成"已被别的节点占用"，冒出一条莫名其妙的
+        "同时被两个事件引用"告警 —— 单独跑没事、在 Blender 里跑就复现。
+
+        修法是用节点对象本身当键(顺带保持它们存活，id 复用问题自然消失)。
+        """
+        for round_index in range(3):
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "开始")
+            first = tree.new_node(NN.GKNodePrint, "一", gk_text="1")
+            second = tree.new_node(NN.GKNodePrint, "二", gk_text="2")
+            gk_stub.connect(tree, event, "执行", first, "执行")
+            gk_stub.connect(tree, first, "完成", second, "执行")
+            code, warnings = gen(tree, V2)
+            self.assertEqual(warnings, [],
+                             f"第 {round_index + 1} 次导出出现假告警: {warnings}")
+            self.assertIn('print("1")', code)
+            self.assertIn('print("2")', code)
+            del tree, event, first, second, code
+
+    def test_index_holder_is_not_used_as_node_key(self):
+        """生成器里不该再用 id(节点) 当归属键(会用对象本身)。
+
+        这条测试是"意图锁":如果以后有人为了省事改回 id()，
+        上面那条测试在压力下才可能复现，而这条会直接失败。
+        """
+        import inspect
+
+        source = inspect.getsource(codegen._emit_body)
+        self.assertNotIn("id(node)", source,
+                         "断环/归属判断请用节点对象当键，别用 id(node)")
+
+    def test_shared_node_between_events_still_warns(self):
+        """修好假告警之后，真告警必须还在(否则就是矫枉过正)。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "开始")
+        process = tree.new_node(NN.GKNodeOnProcess, "物理帧")
+        shared = tree.new_node(NN.GKNodePrint, "共用", gk_text="共用")
+        import gk_stub as stub
+
+        for source in (ready, process):
+            link = stub.StubLink(source.outputs.get("执行"), shared.inputs.get("执行"))
+            source.outputs.get("执行").links.append(link)
+            shared.inputs.get("执行").links.append(link)
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("同时被" in w for w in warnings), warnings)
+        self.assertEqual(code.count('print("共用")'), 1, code)
 
 
 def nn_base_statement():

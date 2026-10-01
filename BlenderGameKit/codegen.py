@@ -181,6 +181,13 @@ class GenContext:
         self.read_vars = set()     # 只读未写的变量(仍然要声明)
         self.sink = _Statements()  # 当前正在写入的收集器
         self._export_names = {}
+        # 成员变量名的占用计数，用于给"不同节点但同名"的变量加序号
+        self._var_names = {}
+        # 成员变量 -> 拥有它的节点身份(id)，用于区分"同一节点复用"与"另一节点同名"
+        self._var_owner = {}
+        # 生成函数名(按钮回调等)的占用计数与归属
+        self._func_names = {}
+        self._func_owners = {}
         self._temp_seq = 0
         self._expr_cache = {}      # "节点::输出名" -> 表达式文本
         self._active = set()       # 沿执行流的递归栈，用于断环
@@ -197,6 +204,11 @@ class GenContext:
         self.need_camera_finder = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
         self.need_save_helpers = False
+        # 只有真的用了界面节点才生成 UI 容器辅助函数
+        self.need_ui_helpers = False
+        # 节点图自己"生出来"的函数(比如按钮的点击回调)。
+        # 它们不属于事件，需要在 generate() 里单独拼进最终脚本。
+        self.extra_sections = []
 
     # ---- 生成段落 ----
     def new_section(self):
@@ -230,7 +242,22 @@ class GenContext:
         return f"_{snake_case(prefix, 't')}{self._temp_seq}"
 
     def unique_name(self, base, scope="p"):
-        """在导出参数命名空间里取一个不冲突的名字。"""
+        """在导出参数命名空间里取一个不冲突的名字。
+
+        ── 为什么以下划线开头的名字原样保留 ────────────────────────────
+        snake_case 会把前导下划线吃掉(`_gk_ui_layer` -> `gk_ui_layer`)。
+        生成器内部用的变量名已经保证合法，被悄悄改名就会导致
+        "函数里写 `_gk_ui_layer`、成员变量却声明成 `gk_ui_layer`" —— 
+        实测就是这样炸出 `Identifier "_gk_ui_layer" not declared`。
+        所以内部名(前导下划线)一律不加工。
+        """
+        if base.startswith("_"):
+            name = base
+            if name not in self._export_names:
+                self._export_names[name] = 1
+                return name
+            self._export_names[name] += 1
+            return f"{name}_{self._export_names[name]}"
         name = snake_case(base, scope)
         if name not in self._export_names:
             self._export_names[name] = 1
@@ -238,14 +265,32 @@ class GenContext:
         self._export_names[name] += 1
         return f"{name}_{self._export_names[name]}"
 
-    def declare_var(self, name, gd_type=None, initial=None, export=False):
-        """声明一个成员变量，重复声明会合并类型信息。"""
-        clean = snake_case(name, "v")
-        if clean not in self.vars:
-            self.vars[clean] = gd_type
-            self.var_order.append(clean)
-        elif gd_type and self.vars[clean] in (None, "Variant"):
-            self.vars[clean] = gd_type
+    def declare_var(self, name, gd_type=None, initial=None, export=False, key=None):
+        """声明一个成员变量，并记录它属于哪个节点。
+
+        ── 为什么需要 key(节点的唯一身份) ─────────────────────────────
+        两个**不同**的节点可以同名(用户复制节点后没改名很常见)。
+        只靠名字无法区分"同一个节点又来引用一次"(应该复用)和
+        "另一个节点碰巧同名"(必须另开一个变量)，否则会生成
+            var _gk_ui_分数: Label
+            _gk_ui_分数 = ProgressBar.new()   # 类型对不上，Godot 直接报错
+        所以凡是"每个节点一个"的变量都要把 key 传进来。
+        """
+        clean = name if name.startswith("_") else snake_case(name, "v")
+        owner = self._var_owner.get(clean)
+        if clean in self.vars and (key is None or owner == key):
+            # 同一个节点再次引用 —— 复用
+            if gd_type and self.vars[clean] in (None, "Variant"):
+                self.vars[clean] = gd_type
+            return clean
+        # 首次声明，或该名字已被别的节点占用 -> 加序号另开一个
+        used = self._var_names.get(clean, 0)
+        self._var_names[clean] = used + 1
+        if used:
+            clean = f"{clean}_{used + 1}"
+        self.vars[clean] = gd_type
+        self._var_owner[clean] = key
+        self.var_order.append(clean)
         return clean
 
     def declare_export(self, base, gd_type, value_expr, comment=""):
@@ -260,6 +305,21 @@ class GenContext:
     def var_names(self):
         """成员变量名 -> 原始名字的映射(用中文方便阅读时保留注释)。"""
         return dict(self.vars)
+
+    def declare_func_name(self, base, key=None):
+        """给"每个节点一个"的生成函数取名字，同名自动加序号。
+
+        同一个节点重复调用会拿到同一个名字(靠 key 判断)，
+        不同节点即使 base 相同也会各自拿到 `_2` / `_3`。
+        """
+        owner = self._func_owners.get(base)
+        if owner is not None and key is not None and owner == key:
+            return base
+        used = self._func_names.get(base, 0)
+        self._func_names[base] = used + 1
+        name = base if not used else f"{base}_{used + 1}"
+        self._func_owners[name] = key
+        return name
 
     def add_line(self, indent, text=""):
         self.sink.add(indent, text)
@@ -849,12 +909,20 @@ def _emit_body(ctx, node, indent, output="完成"):
     """沿某个输出执行流继续走。"""
     if node is None:
         return
-    if node.name in ctx._active:
+    # ── 断环与归属判断用**节点对象本身**当键，不能用节点名，也不能用 id() ──
+    # 1) 不能用节点名:两个**不同**的节点可以同名(复制节点后懒得改名很常见)。
+    #    用名字判断时第二个同名节点会被当成"又回到了同一节点"，
+    #    被误判成执行流回路直接跳过 —— 实测表现为"血条节点整个没生成"。
+    # 2) 不能用 id():id 会在对象被回收后复用。一次导出里前后创建的两批节点
+    #    可能拿到同一个 id，于是新节点被误判成"已被别的节点占用"，
+    #    冒出一条莫名其妙的"同时被两个事件引用"告警(实测)。
+    #    用对象当键还能顺带把它们**保持存活**，id 复用问题自然消失。
+    if node in ctx._active:
         ctx.warn(f"检测到执行流回路，已在『{node.bl_label}』处断开(游戏里会无限循环)")
         return
     # Blender 的输入引脚只允许一条连线，所以同一个节点不可能真的被两个事件
     # 驱动。这里以"先到先得"为准并明确告警，而不是默默丢掉一段逻辑。
-    owner = ctx._claimed.get(node.name)
+    owner = ctx._claimed.get(node)
     if owner is not None and owner != ctx._current_event:
         ctx.warn(
             f"节点『{node.bl_label}』同时被『{owner}』与『{ctx._current_event}』引用，"
@@ -862,12 +930,12 @@ def _emit_body(ctx, node, indent, output="完成"):
             f"如果两个事件都要执行这段逻辑，请复制一份节点。"
         )
         return
-    ctx._claimed[node.name] = ctx._current_event
-    ctx._active.add(node.name)
+    ctx._claimed[node] = ctx._current_event
+    ctx._active.add(node)
     try:
         ctx.emit_statement(node, indent, output)
     finally:
-        ctx._active.discard(node.name)
+        ctx._active.discard(node)
 
 
 def _next_nodes(node, output="完成"):
@@ -1311,44 +1379,36 @@ def _save_dict(ctx):
 def _ensure_save_block(ctx, data, path, slot):
     """保证存档字典在本代码块内已从磁盘载入一次。
 
-    ── 为什么需要去重 ──────────────────────────────────────────────
-    每个存档节点都要"确保已载入"。如果每个都无脑吐一遍守卫代码，
-    连着 4 个存档节点就会生成 4 段一模一样的 `if not loaded:` 读盘。
-    这里记下"本代码块第一次遇到存档节点时的位置与缩进"，
-    第二次起就把守卫代码**插回那个位置**，而不是再加一段。
+    ── 为什么不靠"谁先谁后"标记 ────────────────────────────────────
+    最初用"显式载入时打个标记，后面的节点就别插守卫"的办法。
+    但它对顺序敏感:守卫只能插在**已经吐出的行**里，所以
+    "写 -> 载入 -> 写"这种顺序下第二个写仍然会插一段多余的读盘。
 
-    ── 为什么用 `path == ""` 而不是另加一个 bool ────────────────────
-    少一个成员变量，而且语义正好:"路径还是空 = 还没读过盘"。
+    改成直接扫描本函数已经生成的代码:只要里面已经有 `_gk_read_save(`，
+    就说明这个函数已经读过盘了，不需要再插守卫。
+    这跟顺序无关，也不会漏。
     """
     ctx.need_save_helpers = True
     sink = getattr(ctx, "sink", None)
-    record = getattr(ctx, "_save_guard_at", None)
-    if record is None:
-        record = {}
-        ctx._save_guard_at = record
+    lines = getattr(sink, "lines", None)
+    if not isinstance(lines, list):
+        # 拿不到收集器时退化成"就地守卫一次"。仍然正确，只是啰嗦一点。
+        slot_expr = gd_string(slot)
+        ctx.add_line(0, f"{path} = _gk_save_file({slot_expr})")
+        ctx.add_line(0, f'if {path} == "":')
+        ctx.add_line(1, f"{path} = _gk_save_file({slot_expr})")
+        ctx.add_line(1, f"{data} = _gk_read_save({path})")
+        return
 
-    key = id(sink)
-    if key in record:
+    if any("_gk_read_save(" in text for text in lines):
         return
 
     slot_expr = gd_string(slot)
-    lines = getattr(sink, "lines", None)
-    if isinstance(lines, list):
-        # 把守卫插回"块内第一个存档节点"的位置，缩进也就是对的
-        index = len(lines)
-        record[key] = True
-        lines.insert(index, f'    {path} = _gk_save_file({slot_expr})')
-        lines.insert(index + 1, f'    if {path} == "":')
-        lines.insert(index + 2, f"        {path} = _gk_save_file({slot_expr})")
-        lines.insert(index + 3, f"        {data} = _gk_read_save({path})")
-        return
-
-    # 兜底路径(拿不到收集器时):退化成每个节点各自守卫一次，仍然是正确的，
-    # 只是啰嗦一点。宁可啰嗦也不要生成错的代码。
-    ctx.add_line(0, f"{path} = _gk_save_file({slot_expr})")
-    ctx.add_line(0, f"if {path} == \"\":")
-    ctx.add_line(1, f"{path} = _gk_save_file({slot_expr})")
-    ctx.add_line(1, f"{data} = _gk_read_save({path})")
+    index = len(lines)
+    lines.insert(index, f"    {path} = _gk_save_file({slot_expr})")
+    lines.insert(index + 1, f'    if {path} == "":')
+    lines.insert(index + 2, f"        {path} = _gk_save_file({slot_expr})")
+    lines.insert(index + 3, f"        {data} = _gk_read_save({path})")
 
 
 @stmt_node("GKNodeSaveSet")
@@ -1395,17 +1455,10 @@ def _stmt_save_load(ctx, node, indent):
     path = ctx.declare_var("_gk_save_path", "String")
     slot = getattr(node, "gk_slot", "save1")
     ctx.need_save_helpers = True
-    # 显式载入:设好路径后直接读，后面块内的守卫看到 path 非空就不会重复读
+    # 设好路径后直接读。同块内后面的存档节点扫描到本行已有的 _gk_read_save(
+    # 就不会再插一段惰性守卫，所以不需要额外的抑制标记。
     ctx.add_line(indent, f"{path} = _gk_save_file({gd_string(slot)})")
     ctx.add_line(indent, f"{data} = _gk_read_save({path})")
-    # 占位登记，避免同块内其它存档节点再插一段惰性守卫
-    record = getattr(ctx, "_save_guard_at", None)
-    if record is None:
-        record = {}
-        ctx._save_guard_at = record
-    sink = getattr(ctx, "sink", None)
-    if sink is not None:
-        record[id(sink)] = True
 
 
 @stmt_node("GKNodeSaveHas")
@@ -1508,6 +1561,149 @@ def _stmt_screen_fade(ctx, node, indent):
         ctx.add_line(indent, f"{tween_var}.tween_interval({gd_number(hold)})")
     # 等渐变结束再走『完成』出口，这样"淡出 -> 切场景"的顺序才正确
     ctx.add_line(indent, f"await {tween_var}.finished")
+
+
+# ==========================================================================
+# 界面
+# ==========================================================================
+# ── 为什么 UI 节点都"运行时自己建"而不是要求用户先摆控件 ──────────────
+# 让用户为每一行字、每一条血条在场景树里手摆一个 Control，是"引擎在给
+# 用户添活"，而且摆完还要在节点图里选来选去。这里统一按需创建，
+# 同一个节点重复调用只是改内容，不会叠出新控件。
+def _ui_root(ctx, indent):
+    """取(必要时创建)UI 根容器。返回 (layer变量, root变量)。
+
+    Control 必须是 CanvasLayer 的子节点才能浮在游戏画面之上，
+    而且要铺满全屏、默认不吃鼠标事件(否则按钮以外的 UI 会挡住点击)。
+    """
+    layer = ctx.declare_var("_gk_ui_layer", "CanvasLayer")
+    root = ctx.declare_var("_gk_ui_root", "Control")
+    ctx.need_ui_helpers = True
+    ctx.add_line(indent, "_gk_ensure_ui(self)")
+    return layer, root
+
+
+@stmt_node("GKNodeUiText")
+def _stmt_ui_text(ctx, node, indent):
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Label", key=id(node))
+    text = ctx.input_string(node, "文字", "")
+    x = _tunable_number(ctx, node, "X", "20.0", "ui_x")
+    y = _tunable_number(ctx, node, "Y", "20.0", "ui_y")
+    size = int(getattr(node, "gk_size", 24) or 24)
+    color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = Label.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.add_theme_font_size_override(\"font_size\", {size})")
+    ctx.add_line(indent + 1, f"{widget}.add_theme_color_override(\"font_color\", "
+                             f"Color({gd_number(color[0])}, {gd_number(color[1])}, "
+                             f"{gd_number(color[2])}, {gd_number(color[3])}))")
+    # 文字控件默认不吃鼠标，否则会挡住下面的按钮
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
+    ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+    ctx.add_line(indent, f"{widget}.text = str({text})")
+
+
+@stmt_node("GKNodeUiBar")
+def _stmt_ui_bar(ctx, node, indent):
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "ProgressBar", key=id(node))
+    value = ctx.input_number(node, "数值", "100.0")
+    x = _tunable_number(ctx, node, "X", "20.0", "ui_x")
+    y = _tunable_number(ctx, node, "Y", "60.0", "ui_y")
+    max_value = gd_number(getattr(node, "gk_max", 100.0))
+    width = gd_number(getattr(node, "gk_width", 200.0))
+    height = gd_number(getattr(node, "gk_height", 16.0))
+    color = getattr(node, "gk_color", (0.85, 0.25, 0.25, 1.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = ProgressBar.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.max_value = {max_value}")
+    ctx.add_line(indent + 1, f"{widget}.show_percentage = false")
+    # ProgressBar 的填充色靠 theme override，不设就是系统默认灰
+    ctx.add_line(indent + 1, "var _fill := StyleBoxFlat.new()")
+    ctx.add_line(indent + 1, f"_fill.bg_color = Color({gd_number(color[0])}, "
+                             f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                             f"{gd_number(color[3])})")
+    ctx.add_line(indent + 1, f"{widget}.add_theme_stylebox_override(\"fill\", _fill)")
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
+    ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+    ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    # 钳到合法区间:血量变成 -1 或超过上限时进度条会画出诡异的样子
+    ctx.add_line(indent, f"{widget}.value = clampf({value}, 0.0, {max_value})")
+
+
+@stmt_node("GKNodeUiButton")
+def _stmt_ui_button(ctx, node, indent):
+    """按钮:点击后沿『点击』出口继续。
+
+    ── 为什么出口不叫『完成』 ──────────────────────────────────────
+    emit_statement() 会在 handler 跑完后自动沿『完成』出口继续执行。
+    按钮的语义是"点了才往下走"，如果叫『完成』，节点图一连线就会在
+    按钮创建的那一刻立刻执行后面的逻辑(比如直接开始游戏)。
+    所以出口叫『点击』，自动续接找不到『完成』就停住，
+    真正的续接由回调函数 _gk_on_<节点名> 负责。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Button", key=id(node))
+    # 回调函数名同样要防同名:两个按钮可以都叫『开始按钮』，
+    # 若共用 gk_on_button 就会有两个同名函数，Godot 直接报重复定义。
+    handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'button')}", key=id(node))
+    text = ctx.input_string(node, "文字", "")
+    x = _tunable_number(ctx, node, "X", "100.0", "ui_x")
+    y = _tunable_number(ctx, node, "Y", "200.0", "ui_y")
+    width = gd_number(getattr(node, "gk_width", 160.0))
+    height = gd_number(getattr(node, "gk_height", 48.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = Button.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    # 按钮必须吃鼠标事件，否则点不动
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    ctx.add_line(indent + 1, f"{widget}.pressed.connect({handler})")
+    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
+    ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+    ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    ctx.add_line(indent, f"{widget}.text = str({text})")
+
+    # 把『点击』出口的后续代码放进一个独立函数
+    lines = ctx.new_section()
+    ctx._active.clear()
+    prev_event = ctx._current_event
+    ctx._current_event = node.name
+    _chain(ctx, node, 1, "点击")
+    if len(lines) == 0:
+        lines.add(1, "pass")
+    ctx._current_event = prev_event
+    ctx.extra_sections.append({
+        "signature": f"func {handler}() -> void:",
+        "lines": list(lines.lines),
+        "empty_body": "    pass",
+        "separator": True,
+    })
+
+
+@stmt_node("GKNodeUiHide")
+def _stmt_ui_hide(ctx, node, indent):
+    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    visible = "true" if getattr(node, "gk_visible", False) else "false"
+    if not widget_name:
+        ctx.warn(f"『{node.bl_label}』没有填控件名，这一句被跳过了")
+        return
+    # 用 group 查而不是路径查:UI 控件是运行时挂在 CanvasLayer 下的，
+    # 路径会随场景变化，按名字找更稳。
+    var = ctx.new_temp("widget")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget(self, {gd_string(widget_name)})")
+    ctx.add_line(indent, f"if {var} != null:")
+    ctx.add_line(indent + 1, f"{var}.visible = {visible}")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.need_ui_helpers = True
 
 
 @stmt_node("GKNodeQueueFree")
@@ -1810,6 +2006,43 @@ class Generator:
                     # 用 remove_absolute:path 已经是完整的 user:// 路径，
                     # 再 DirAccess.open("user://") + get_file() 反而容易拼错
                     "    DirAccess.remove_absolute(path)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 节点图自己生出来的函数(按钮点击回调等) ----
+        sections.extend(self.ctx.extra_sections)
+
+        # ---- 界面容器辅助函数 ----
+        if self.ctx.need_ui_helpers:
+            sections.append({
+                "signature": "func _gk_ensure_ui(host: Node) -> void:",
+                "lines": [
+                    "    if _gk_ui_layer == null:",
+                    "        _gk_ui_layer = CanvasLayer.new()",
+                    "        _gk_ui_layer.name = \"GKUI\"",
+                    # layer 10 = 盖在游戏画面上，但低于屏幕闪白(layer 100)
+                    "        _gk_ui_layer.layer = 10",
+                    "        host.add_child(_gk_ui_layer)",
+                    "        _gk_ui_root = Control.new()",
+                    "        _gk_ui_root.name = \"Root\"",
+                    "        _gk_ui_root.set_anchors_preset(Control.PRESET_FULL_RECT)",
+                    "        _gk_ui_root.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_ui_layer.add_child(_gk_ui_root)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_find_widget(host: Node, widget_name: String) -> Control:",
+                "lines": [
+                    "    if _gk_ui_layer == null:",
+                    "        return null",
+                    "    var found := _gk_ui_layer.find_child(widget_name, true, false)",
+                    "    if found is Control:",
+                    "        return found",
+                    "    return null",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
