@@ -41,6 +41,20 @@ Step "1/3 regenerate demo"
     Select-String -Pattern "generated|lines|warning" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "generator failed"; exit 1 }
 
+# ---------- 1b. clear the save file ----------
+# The demo persists the best score to user://gk_best.json. If a previous run
+# left one behind, the "best score updates" check below becomes flaky
+# (we would read an old record instead of the one this run writes).
+# Godot maps user:// to %APPDATA%\Godot\app_userdata\<project name>.
+Step "1b/3 clear previous save"
+$userData = Join-Path $env:APPDATA "Godot\app_userdata"
+$removed = 0
+if (Test-Path $userData) {
+    Get-ChildItem $userData -Recurse -Filter "gk_*.json" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+}
+Write-Output ("removed {0} old save file(s)" -f $removed)
+
 # ---------- 2. inject checker ----------
 Step "2/3 inject checker"
 Copy-Item $scene $backup -Force

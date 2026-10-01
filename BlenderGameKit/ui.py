@@ -84,6 +84,14 @@ class GK_OT_AddNodeMenu(bpy.types.Operator):
 
 
 class GK_MT_AddNodeCategories(bpy.types.Menu):
+    """全部分类(Shift+A 里那个子菜单的内容)。
+
+    ── 为什么这里只有分类 ────────────────────────────────────────────
+    「搜索 / 常用 / 最近使用」都在**外层**菜单里(见 _draw_node_menu_contents)，
+    因为外层有两个入口:Shift+A 和右键。放在这里的话右键菜单
+    就看不到它们了。这里只负责"按分类列节点"。
+    """
+
     bl_idname = "GK_MT_ADD_NODE"
     bl_label = "添加游戏逻辑节点"
 
@@ -98,24 +106,9 @@ class GK_MT_AddNodeCategories(bpy.types.Menu):
         if link_from:
             layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
 
-        # ── 前三个入口是"高频路径"，放最上面 ──────────────────────────
-        # 新手第一次打开菜单不该面对 23 个分类。搜索框放第一位是因为
-        # 87 个节点里"翻分类"永远比"打两个字"慢(蓝图/UPBGE 都这么做)。
-        layout.operator("gk.find_node", text="搜索节点…  (Ctrl+F)", icon="VIEWZOOM")
-        layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
-        recent = _recent_classes()
-        if recent:
-            layout.menu(_menu_name("最近使用"), text="最近使用", icon="FILE_REFRESH")
-        layout.separator()
-
-        # ── 全部分类(大类自带二级子菜单) ─────────────────────────────
+        # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
         for category, subs in props.node_menu_tree():
-            if subs is None:
-                layout.menu(_menu_name(category), text=category)
-            else:
-                layout.menu(_menu_name(category), text=category)
-        layout.separator()
-        layout.operator("gk.auto_link", icon="LINKED")
+            layout.menu(_menu_name(category), text=category)
 
 
 def _make_category_menu(category, classes, subcategories=None):
@@ -772,11 +765,19 @@ def _draw_project_box(layout, context):
                          icon="CHECKMARK")
 
 
-def _draw_node_menu_contents(layout, context, with_search=True):
+def _draw_node_menu_contents(layout, context, nested=False):
     """节点菜单的内容。Shift+A 和右键菜单共用这一份。
 
-    做成公共函数是因为两个入口必须**完全一致** —— 分别写两份的话,
+    做成公共函数是因为两个入口必须**完全一致** —— 分别写两份的话，
     加个新分类很容易只加到一个入口里。
+
+    ── nested 两种形态 ───────────────────────────────────────────────
+    flat(默认):直接铺开「搜索 / 常用 / 最近 / 全部分类 / 自动连线」。
+      右键菜单用这个 —— 一按就到，不用再点一层。
+
+    nested:把这些内容收进一个『添加游戏逻辑节点』子菜单里。
+      Shift+A 用这个:Blender 自带的『添加』菜单也在同一个菜单里，
+      不收起来的话一屏里会出现两套并列的"加节点"，看起来就像重复了。
     """
     tree = props.current_tree(context)
     link_from = ""
@@ -785,24 +786,34 @@ def _draw_node_menu_contents(layout, context, with_search=True):
         if active is not None:
             link_from = active.name
 
-    if with_search:
-        # 最上面放搜索 —— 这是蓝图里最常用的入口,
-        # 47 个节点靠翻分类找太慢,直接打字搜最快。
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
+    if nested:
+        layout.menu(GK_MT_AddNodeCategories.bl_idname,
+                    text="添加游戏逻辑节点", icon="NODETREE")
+        layout.operator("gk.auto_link", text="把选中的两个节点连起来", icon="LINKED")
+        return
+
+    # ── flat 形态 ──────────────────────────────────────────────────
+    # 最上面放搜索 —— 蓝图里最常用的入口。89 个节点靠翻分类找太慢,
+    # 直接打字搜最快。
+    row = layout.row(align=True)
+    row.scale_y = 1.3
+    row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
+
+    # 「常用」放第二:新手第一次打开不用翻分类就能起步
+    layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
 
     # 「最近使用」**始终显示**,哪怕还是空的。
     # 一开始写成"空就不画",结果新用户第一次按 Shift+A 时菜单里没有这一项,
     # 等他用过几个节点之后菜单**形状变了** —— 这会让肌肉记忆失效。
     # 菜单结构应该稳定,空的时候由它的 draw 里显示"(还没用过任何节点)"。
-    layout.menu(_menu_name("最近使用"), text="最近使用")
+    layout.menu(_menu_name("最近使用"), text="最近使用", icon="FILE_REFRESH")
     layout.separator()
 
     if link_from:
         layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
 
-    for category, classes in props.node_menu_entries():
+    # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
+    for category, subs in props.node_menu_tree():
         layout.menu(_menu_name(category), text=category)
 
     layout.separator()
@@ -812,31 +823,33 @@ def _draw_node_menu_contents(layout, context, with_search=True):
 def _draw_add_menu(self, context):
     """挂到 NODE_MT_add(Shift+A)。
 
+    ── 为什么只放一个入口 ──────────────────────────────────────────
     用 prepend 而不是 append:**append 会把我们的菜单压到最底下** ——
     实测在默认面板高度下正好被截断,表现就是"按了 Shift+A 什么都没有",
-    非常容易误判成功能没做。
-    prepend 让它排在最上面,一按就看得见。
+    非常容易误判成功能没做。prepend 让它排在最上面,一按就看得见。
+
+    但 Shift+A 里**同时还有 Blender 自带的『添加』**,直接铺开就会出现
+    两套并列的"加节点"(用户实测反馈:看起来重复了)。
+    所以这里只放一个入口,内容收进子菜单。
+    右键菜单那边是 flat 形态 —— 一按就到,不用点两层。
     """
     space = getattr(context, "space_data", None)
     if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
         return
-    _draw_node_menu_contents(self.layout, context)
+    _draw_node_menu_contents(self.layout, context, nested=True)
 
 
 def _draw_context_menu(self, context):
     """挂到 NODE_MT_context_menu(节点上右键)。
 
-    蓝图里右键就是"加节点",这里也补上;放在最前面,
-    这样常用的加节点操作不用去翻 Blender 自带的那一长串。
+    蓝图里右键就是"加节点",这里给**完整平铺菜单** —— 不用再点进子菜单。
+    放在最前面,这样常用的加节点操作不用去翻 Blender 自带的那一长串。
     """
     space = getattr(context, "space_data", None)
     if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
         return
     self.layout.separator()
-    self.layout.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
-    self.layout.menu(_menu_name("最近使用"), text="最近使用")
-    self.layout.menu(GK_MT_AddNodeCategories.bl_idname,
-                     text="添加游戏逻辑节点", icon="NODETREE")
+    _draw_node_menu_contents(self.layout, context, nested=False)
 
 
 def on_register():

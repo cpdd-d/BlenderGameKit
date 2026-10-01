@@ -1848,6 +1848,17 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
             script_target = obj
             break
 
+    # ── 没勾「脚本挂载目标」时必须说出来 ────────────────────────────
+    # 不勾的话导出的场景**一个脚本都不会挂** —— 用户按 F5 看到角色不动,
+    # 会以为插件坏了。实测踩过:导出看起来全成功(文件都写了、无报错),
+    # 但 .tscn 里根本没有 script = 那一行。
+    if script_name and script_target is None:
+        result["warnings"].append(
+            "脚本没有挂到任何节点上:请在物体的『游戏物理 (BlenderGameKit)』"
+            "面板里勾上『脚本挂载目标』(一般选角色身体那一个),再导出一次。"
+            "否则导出的场景里不会有脚本,角色不会动。"
+        )
+
     try:
         world_scene, body_count = write_world_scene(
             directory, "World",

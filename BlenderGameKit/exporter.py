@@ -120,7 +120,13 @@ def default_settings():
 
 
 def generate_code(tree, settings=None):
-    """只生成代码，不落盘。返回 (代码, 告警列表, 文件名)。"""
+    """生成代码，返回 (代码, 告警列表, 文件名, 用到的输入动作列表)。
+
+    输入动作要一起返回:生成的脚本里引用 "move_left" / "jump" 这些动作名,
+    但 Godot 的 project.godot 里如果没登记它们,运行时会刷一屏
+        ERROR: The InputMap action "move_left" doesn't exist.
+    而且按键完全没反应。所以调用方要拿这份清单去写 [input] 段。
+    """
     if tree is None:
         raise codegen.CodegenAbort("请先在节点编辑器里选择一棵『游戏逻辑』节点树")
     options = dict(settings or {})
@@ -129,7 +135,8 @@ def generate_code(tree, settings=None):
     options.setdefault("export_tunables", True)
     code, warnings = codegen.generate(tree, options)
     file_name = safe_file_name(getattr(tree, "name", ""), "game_logic") + ".gd"
-    return code, warnings, file_name
+    actions = list(getattr(codegen, "last_used_actions", []) or [])
+    return code, warnings, file_name, actions
 
 
 def write_text(path, text):
@@ -223,12 +230,21 @@ def export_tree(tree, settings=None, write_scene=None):
     """导出节点树，返回一个结果字典(给 UI 用)。"""
     settings = dict(settings or default_settings())
     started = time.time()
-    code, warnings, script_name = generate_code(tree, settings)
+    code, warnings, script_name, actions = generate_code(tree, settings)
     directory = settings.get("output_dir") or DEFAULT_OUTPUT_DIR
     # 脚本写进 scripts/ 子目录 —— 项目根目录只放 project.godot,
     # 这样"公用的文件夹"结构清晰:脚本、场景、模型、材质各归各位。
     script_path = write_text(
         os.path.join(directory, project.SCRIPTS_DIR, script_name), code)
+
+    # 把用到的输入动作写进 project.godot。
+    # 不做这一步的话,Godot 里按键完全没反应,而且只刷一行
+    # ERROR: The InputMap action "move_left" doesn't exist.
+    # 用户根本想不到"要去输入映射里手工加动作"。
+    if actions:
+        count = project.set_input_actions(directory, actions)
+        if count:
+            gk_log.info(f"已把 {count} 个输入动作写进 project.godot")
 
     written = [script_path]
     should_write_scene = settings.get("write_scene") if write_scene is None else write_scene

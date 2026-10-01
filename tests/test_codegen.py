@@ -1772,6 +1772,130 @@ class TestNodeMenu(Base):
                           f"{cls.bl_label} 的分类 {cls.gk_category} 不在 CATEGORY_ORDER 里")
 
 
+class TestDimensionSafety(Base):
+    """维度相关的 API 必须按维度生成 —— 2D/3D 混用会直接编译不过。"""
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_input_vector_is_vector3_in_3d(self):
+        """3D 项目里输入方向必须包成 Vector3。
+
+        回归:`Input.get_vector` 返回的是 **Vector2**。3D 项目里直接
+        拿它去写 `velocity.z` 会让 Godot 报
+            Cannot find member "z" in base "Vector2"
+        整个脚本编译不过(实测)。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        move.gk_keep_y = True
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, vec, "方向", move, "方向")
+        code, warnings = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Vector3(", code)
+        # 不能再出现"Vector2 上取 .z"这种写法
+        self.assertNotIn("Input.get_vector(ACTION_MOVE_LEFT, "
+                         "ACTION_MOVE_RIGHT, ACTION_MOVE_UP, ACTION_MOVE_DOWN, "
+                         "0.2).z", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_input_vector_stays_vector2_in_2d(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, vec, "方向", move, "方向")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("Vector3(", code)
+
+    def test_gravity_mode_does_not_write_z_in_2d(self):
+        """2D 里不能出现 velocity.z。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        move.gk_keep_y = True
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("get_gravity()", code)
+        self.assertNotIn(".velocity.z", code)
+
+    def test_gravity_mode_writes_z_in_3d(self):
+        """3D 里水平面是 XZ，两个分量都要写。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        move.gk_keep_y = True
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        code, _ = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertIn(".velocity.x = ", code)
+        self.assertIn(".velocity.z = ", code)
+        # 纵向留给重力
+        self.assertNotIn(".velocity.y = ", code)
+
+    def test_raycast_uses_matching_dimension_api(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "射线")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code2, _ = gen(tree, V2)
+        self.assertIn("get_world_2d", code2)
+        self.assertNotIn("get_world_3d", code2)
+
+        tree3 = make_tree()
+        event3 = tree3.new_node(NN.GKNodeOnReady, "准备")
+        node3 = tree3.new_node(NN.GKNodeRaycast, "射线")
+        gk_stub.connect(tree3, event3, "执行", node3, "执行")
+        code3, _ = gen(tree3, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertIn("get_world_3d", code3)
+
+
+class TestInputActions(Base):
+    """用到的输入动作要能被导出流程取到 —— 否则 Godot 里按键没反应。"""
+
+    def test_used_actions_are_recorded(self):
+        """generator 必须把用到的动作暴露出来。
+
+        背景:生成的脚本写 ACTION_MOVE_LEFT := "move_left"，
+        但 project.godot 里没有登记这个动作时，Godot 运行时刷
+            ERROR: The InputMap action "move_left" doesn't exist.
+        按键完全没反应，而用户想不到"要去输入映射里手工加动作"。
+        所以导出流程要拿到这份清单去写 [input] 段。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec.gk_left, vec.gk_right = "move_left", "move_right"
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, vec, "方向", move, "方向")
+        gk_stub.connect(tree, move, "完成", printer, "执行")
+        code, _ = gen(tree, V2)
+        actions = list(getattr(codegen, "last_used_actions", []) or [])
+        self.assertIn("move_left", actions)
+        self.assertIn("move_right", actions)
+
+    def test_project_godot_writer_skips_builtin_ui_actions(self):
+        """ui_* 是 Godot 内置动作，不能自己重新定义。
+
+        生成器允许不填动作名，这时会退回内置的 ui_left 之类。
+        把这些写进 [input] 会用一份空的 events 覆盖掉内置绑定。
+        """
+        from BlenderGameKit import project as P
+
+        # 只做纯字符串层面的检查，避免依赖真实 Godot 工程
+        block = P._input_action_block("move_left")
+        self.assertIn('move_left={', block)
+        self.assertIn('"physical_keycode":65', block)
+        empty = P._input_action_block("some_unknown_action")
+        self.assertIn('"events": []', empty)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

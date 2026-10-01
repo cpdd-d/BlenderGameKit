@@ -746,7 +746,7 @@ class GK_OT_Preview(bpy.types.Operator):
             return {"CANCELLED"}
         settings = exporter.build_settings(context.scene)
         try:
-            code, warnings, name = exporter.generate_code(tree, settings)
+            code, warnings, name, _actions = exporter.generate_code(tree, settings)
         except codegen.CodegenAbort as exc:
             _report(self, "ERROR", str(exc))
             return {"CANCELLED"}

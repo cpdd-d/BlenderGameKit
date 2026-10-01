@@ -939,7 +939,21 @@ def _expr_get_vector(ctx, node):
     right = ctx.input_action(node, "gk_right", "ui_right")
     up = ctx.input_action(node, "gk_up", "ui_up")
     down = ctx.input_action(node, "gk_down", "ui_down")
-    return f"Input.get_vector({left}, {right}, {up}, {down}, {deadzone})"
+    base = f"Input.get_vector({left}, {right}, {up}, {down}, {deadzone})"
+    if ctx.dim == 2:
+        return base
+    # ── 3D 项目的方向必须包成 Vector3 ────────────────────────────────
+    # `Input.get_vector` 返回的是 **Vector2**。3D 项目里直接拿它去写
+    # `velocity.z` 会让 Godot 报
+    #     Cannot find member "z" in base "Vector2"
+    # 于是整个脚本编译不过(实测)。平面移动的意图在 3D 里就是 XZ 平面:
+    # get_vector 的 x 对应世界 X,y 对应世界 Z。
+    #
+    # 先存进一个临时变量再包 Vector3:直接内联会把同一个
+    # `Input.get_vector(...)` 写两遍，生成的代码又长又难读。
+    temp = ctx.new_temp("move")
+    ctx.add_line(ctx._expr_indent, f"var {temp} := {base}")
+    return f"Vector3({temp}.x, 0.0, {temp}.y)"
 
 
 # 多输出表达式的节点:按输出引脚分别求值
@@ -1102,10 +1116,11 @@ def _stmt_move_direction(ctx, node, indent):
         #    重力刚加上去就被抹掉。
         ctx.add_line(indent, f"{target}.velocity += {target}.get_gravity() * "
                              f"get_physics_process_delta_time()")
-        if ctx.dim == 2:
-            ctx.add_line(indent, f"{target}.velocity.x = {temp}.x * {speed}")
-        else:
-            ctx.add_line(indent, f"{target}.velocity.x = {temp}.x * {speed}")
+        # 只改水平分量。3D 里水平是 X 与 Z，纵向 Y 留给重力；
+        # 2D 里水平只有 X。这里按维度取分量，不能盲目写 .z ——
+        # 上游如果是 Vector2(比如 Input.get_vector)会编译不过。
+        ctx.add_line(indent, f"{target}.velocity.x = {temp}.x * {speed}")
+        if ctx.dim != 2:
             ctx.add_line(indent, f"{target}.velocity.z = {temp}.z * {speed}")
     else:
         ctx.add_line(indent, f"{target}.velocity = {temp} * {speed}")
@@ -2893,6 +2908,15 @@ class Generator:
 # ==========================================================================
 # 对外接口
 # ==========================================================================
+# 上一次 generate() 用到的输入动作名。
+# 生成的脚本里引用 "move_left" / "jump" 这些动作,而 Godot 的
+# project.godot 必须登记它们,否则运行时刷
+#     ERROR: The InputMap action "move_left" doesn't exist.
+# 调用方(导出流程)拿这份清单去写 [input] 段。
+# 用模块级变量是因为 generate() 的返回值已经被多处依赖,不想改签名。
+last_used_actions = []
+
+
 def generate(tree, options=None):
     """生成 GDScript，返回 (代码, 告警列表)。"""
     if tree is None:
@@ -2900,6 +2924,8 @@ def generate(tree, options=None):
     generator = Generator(tree, options)
     code = generator.generate()
     warnings = list(generator.ctx.warnings)
+    # 登记本次用到的输入动作，供导出流程写进 project.godot
+    globals()["last_used_actions"] = list(generator.ctx.input_actions.values())
     return code, warnings
 
 
