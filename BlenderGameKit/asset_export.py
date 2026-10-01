@@ -701,6 +701,19 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 lines.append(f'[node name="Model" parent="Colliders/'
                              f'{_sanitize_node_name(obj.name)}" '
                              f'instance=ExtResource("1_character")]')
+                # ── Model 要抵消角色 glb 内部根节点的变换 ─────────────
+                # glTF 导出会把物体的**世界变换**写进 glb 的根节点。于是
+                # 角色 glb 里那个根节点的 translation 就是角色在 Blender 里
+                # 的位置;再 instance 到一个位于原点的 CharacterBody3D 下面,
+                # 网格就会**再偏移一次** —— 和碰撞体(按物体世界坐标生成)
+                # 错开,表现为重影 + 深度冲突闪烁(用户实测反馈)。
+                #
+                # 这里给它一个逆变换,把 glb 内部的偏移抵消掉:
+                # 网格落到"物体世界坐标"上,和碰撞体严丝合缝。
+                inverse = _glb_root_inverse_transform(
+                    export_dir, character_model, obj, is_3d)
+                if inverse:
+                    lines.append(f"transform = {inverse}")
                 lines.append("")
                 continue
 
@@ -1755,7 +1768,7 @@ def glb_scene_nodes(export_dir, model_name="World"):
     而且 .tscn 里就能看到完整的对象树。
     """
     result = {"meshes": {}, "cameras": [], "lights": [], "nodes": [],
-              "materials": {}}
+              "materials": {}, "root_matrix": None}
     path = os.path.join(export_dir or "", project.ART_DIR, f"{model_name}.glb")
     if not os.path.isfile(path):
         return result
@@ -1811,6 +1824,16 @@ def glb_scene_nodes(export_dir, model_name="World"):
         if node.get("extensions", {}).get("KHR_lights_punctual"):
             result["lights"].append(name)
         result["nodes"].append(name)
+
+    # glb 的根节点变换(第一个 scene 的第一个 node)。
+    # 角色 glb 里它带着"角色在 Blender 里的世界变换",instance 到原点的
+    # 角色节点下面会**再偏移一次**,所以调用方要拿它算逆变换抵消掉。
+    scenes = payload.get("scenes", [])
+    nodes_all = payload.get("nodes", [])
+    if scenes:
+        roots = scenes[0].get("nodes") or []
+        if roots and roots[0] < len(nodes_all):
+            result["root_matrix"] = _glb_node_matrix(payload, nodes_all[roots[0]])
     return result
 
 
@@ -1948,6 +1971,65 @@ def meshes_without_material(scene):
         if first_real_material(obj) is None:
             out.append(obj.name)
     return out
+
+
+def _glb_root_inverse_transform(export_dir, model_name, obj, is_3d=True):
+    """算出抵消角色 glb 内部根节点变换的 Transform3D 文本(没有偏移时返回 "")。
+
+    ── 为什么需要它(踩过的坑)────────────────────────────────────────
+    glTF 导出会把物体的**世界变换**写进 glb 的根节点。于是角色 glb 的根
+    节点带着"角色在 Blender 里的位置",把它 instance 到一个位于原点的
+    CharacterBody3D 下面,网格就会**再偏移一次** ——
+    和碰撞体(按物体世界坐标生成)错开,表现是
+    **重影 + 深度冲突闪烁**(用户实测:"模型一闪一闪的")。
+
+    给它一个逆变换就能把这份内部偏移抵消掉:网格正好落在物体世界坐标上,
+    和碰撞体严丝合缝。
+    """
+    info = glb_scene_nodes(export_dir, model_name)
+    raw = info.get("root_matrix")
+    if not raw:
+        return ""
+    # _glb_node_matrix 返回的是 "a, b, c, ..." 这样的文本(12 个数)
+    try:
+        m = [float(part.strip()) for part in str(raw).split(",")]
+    except ValueError:
+        return ""
+    if len(m) != 12:
+        return ""
+    identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    if all(abs(m[i] - identity[i]) < 1e-9 for i in range(12)):
+        return ""
+    # 12 个数按 Godot 的列优先顺序:前 9 个是基向量,后 3 个是平移
+    a = [[m[0], m[3], m[6]],
+         [m[1], m[4], m[7]],
+         [m[2], m[5], m[8]]]
+    t = [m[9], m[10], m[11]]
+
+    det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+           - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+           + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+    if abs(det) < 1e-12:
+        return ""
+    inv = [
+        [(a[1][1] * a[2][2] - a[1][2] * a[2][1]) / det,
+         (a[0][2] * a[2][1] - a[0][1] * a[2][2]) / det,
+         (a[0][1] * a[1][2] - a[0][2] * a[1][1]) / det],
+        [(a[1][2] * a[2][0] - a[1][0] * a[2][2]) / det,
+         (a[0][0] * a[2][2] - a[0][2] * a[2][0]) / det,
+         (a[0][2] * a[1][0] - a[0][0] * a[1][2]) / det],
+        [(a[1][0] * a[2][1] - a[1][1] * a[2][0]) / det,
+         (a[0][1] * a[2][0] - a[0][0] * a[2][1]) / det,
+         (a[0][0] * a[1][1] - a[0][1] * a[1][0]) / det],
+    ]
+    # 逆平移 = -inv3x3 * t
+    it = [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])
+          for r in range(3)]
+    values = [inv[0][0], inv[1][0], inv[2][0],
+              inv[0][1], inv[1][1], inv[2][1],
+              inv[0][2], inv[1][2], inv[2][2],
+              it[0], it[1], it[2]]
+    return "Transform3D(" + ", ".join(_fmt(v) for v in values) + ")"
 
 
 def _base_class_for(scene, obj, dimension="3"):
