@@ -1054,15 +1054,30 @@ def _vector_ctor(dim):
     return "Vector2" if dim == 2 else "Vector3"
 
 
-def _tunable_number(ctx, node, socket_name, fallback, base_name):
+def _tunable_number(ctx, node, socket_name, fallback, base_name,
+                    clamp_max=None, clamp_hint=""):
     """未连线的数值输入 -> 生成 @export 参数，可在 Godot 检查器里直接调。
 
     连线了就说明这个值由图算出来，不该暴露成外部参数。
+
+    clamp_max: 超过这个值就夹住，并给一条告警。
+    用于"单位在不同维度下含义不同"的参数 —— 见 _stmt_move_direction。
     """
     if ctx.export_tunables:
         socket = ctx._socket(node, socket_name)
         if socket is None or not getattr(socket, "is_linked", False):
             literal = ctx.input_number(node, socket_name, fallback)
+            if clamp_max is not None:
+                try:
+                    value = float(literal)
+                except (TypeError, ValueError):
+                    value = None
+                if value is not None and value > clamp_max:
+                    label = getattr(node, "label", "") or node.bl_label
+                    ctx.warn(
+                        f"『{label}』的『{socket_name}』是 {value:g},"
+                        f"已按 {clamp_max:g} 生成。{clamp_hint}")
+                    literal = f"{clamp_max:g}"
             label = getattr(node, "label", "") or node.bl_label
             return ctx.declare_export(base_name, "float", literal, f"{label} · {socket_name}")
     return ctx.input_number(node, socket_name, fallback)
@@ -1102,7 +1117,23 @@ def _stmt_move_direction(ctx, node, indent):
     target = ctx.target_expr(node)
     # 方向先归一化:否则"手柄斜推"会比"直推"快 1.41 倍(独立游戏常见 bug)
     direction = ctx.input_vector(node, "方向")
-    speed = _tunable_number(ctx, node, "速度", "300.0", "move_speed")
+    # ── 默认速度必须按维度给 ────────────────────────────────────────
+    # 节点属性上写的 300 是给 **2D** 的(像素/秒),在 2D 里是正常手感。
+    # 但 3D 的世界单位是**米**:300 米/秒 = 一帧跑 5 米 ——
+    # 实测:角色 1.25 秒冲出 125 米,画面里瞬间消失,
+    # 用户看到的是"按键完全没反应"(其实动得飞快,早出画面了)。
+    # 所以 3D 下超过 50 就夹到 6 米/秒(正常走路速度),并告警说明。
+    if ctx.dim == 2:
+        default_speed = "300.0"
+        speed = _tunable_number(ctx, node, "速度", default_speed, "move_speed")
+    else:
+        default_speed = "6.0"
+        speed = _tunable_number(
+            ctx, node, "速度", default_speed, "move_speed",
+            clamp_max=50.0,
+            clamp_hint=("『速度』在 2D 里单位是像素/秒,在 3D 里是**米/秒**,"
+                        "同一个数值在 3D 里会快几百倍(角色一眨眼就飞出画面)。"
+                        "3D 一般用 3~10。"))
     temp = ctx.new_temp("dir")
     ctx.add_line(indent, f"var {temp} := ({direction}).normalized()")
     if getattr(node, "gk_keep_y", False):

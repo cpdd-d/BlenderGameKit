@@ -1795,7 +1795,9 @@ class TestDimensionSafety(Base):
         gk_stub.connect(tree, event, "执行", move, "执行")
         gk_stub.connect(tree, vec, "方向", move, "方向")
         code, warnings = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
-        self.assertEqual(warnings, [], warnings)
+        # 会带一条"3D 速度被夹住"的告警 —— 节点默认值 300 是给 2D 的,
+        # 3D 里 300 米/秒 一眨眼就飞出画面。断言里放行这条。
+        self.assertTrue(all("速度" in w for w in warnings), warnings)
         self.assertIn("Vector3(", code)
         # 不能再出现"Vector2 上取 .z"这种写法
         self.assertNotIn("Input.get_vector(ACTION_MOVE_LEFT, "
@@ -1943,6 +1945,49 @@ class TestCameraFollowDim(Base):
             code, _ = gen(self._tree(distance), V3)
             self.assert_no_chinese_identifiers(code)
             self.assert_indent_sane(code)
+
+
+class TestMoveSpeedDimension(Base):
+    """『移动_按方向』的速度在 2D / 3D 里单位不同,不能直接用同一个数。
+
+    300 在 2D 里是 300 像素/秒(正常),在 3D 里是 300 **米**/秒 ——
+    实测角色 1.25 秒冲出 125 米,画面里瞬间消失,用户以为"按键没反应"。
+    """
+
+    def _tree(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=300.0)
+        move.gk_keep_y = True
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        gk_stub.connect(tree, ev, "执行", move, "执行")
+        gk_stub.connect(tree, vec, "方向", move, "方向")
+        return tree
+
+    def test_2d_speed_untouched(self):
+        """2D 的 300 是正常手感,一个字都不能改。"""
+        code, warns = gen(self._tree(), V2)
+        self.assertIn("300.0", code)
+        self.assertEqual(warns, [], warns)
+
+    def test_3d_speed_is_clamped(self):
+        """3D 下 300 必须被夹到能用范围,并给出告警。"""
+        code, warns = gen(self._tree(), V3)
+        self.assertIn("= 50", code)
+        self.assertNotIn("300.0", code)
+        self.assertTrue(any("速度" in w for w in warns), warns)
+
+    def test_3d_reasonable_speed_kept(self):
+        """3D 下本来就合理的速度(6 米/秒)不该被改,也不该告警。"""
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=6.0)
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        gk_stub.connect(tree, ev, "执行", move, "执行")
+        gk_stub.connect(tree, vec, "方向", move, "方向")
+        code, warns = gen(tree, V3)
+        self.assertIn("6.0", code)
+        self.assertEqual(warns, [], warns)
 
 
 def nn_base_statement():

@@ -29,10 +29,27 @@ from . import project
 from .nodes.node_base import gd_node_path, snake_case
 
 # 导出的 .tscn 里，脚本与模型各自的 res:// 路径
+#
+# `{env_resource}` 是 Environment 脚本的 ext_resource 行。
+# ── 为什么单独拿一个占位符出来(踩过的坑)──────────────────────────
+# 以前这一行是"env_files 非空才加"。但 `build_environment_nodes` 只在
+# **需要生成相机/灯节点**时才写 gk_environment.gd;相机和灯都已经在 glb 里
+# 的时候它不写文件(文件就在磁盘上,不用重写),于是 env_files 是空的 ——
+# 那一行就不加了,可 Environment 节点又确实生成了。
+# 结果:节点引用了不存在的 ExtResource,Godot 直接报
+#     Parse Error: Can't load resource ... env_script
+# 用户实测就是这个:"地面有材质,为什么没渲染上" —— 因为挂材质的
+# Environment 脚本根本没能加载。
+ENV_RESOURCE_LINE = (
+    '[ext_resource type="Script" '
+    'path="res://{scripts_dir}/gk_environment.gd" id="env_script"]'
+)
+
 SCENE_TEMPLATE = """[gd_scene load_steps={steps} format=3]
 
 [ext_resource type="Script" path="{script_path}" id="1_script"]
 [ext_resource type="PackedScene" path="{model_path}" id="2_model"]
+{env_resource}
 {sub_resources}
 [node name="{root_name}" type="{base_class}"]
 script = ExtResource("1_script")
@@ -782,6 +799,8 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         return "".join(parts), files, name
 
     # ---- 情况 2:glb 里没有,得自己补 ----
+    camera_name = ""
+    fov_for_env = 0.0
     for obj in scene.objects:
         if obj.type != "CAMERA" or obj.hide_get():
             continue
@@ -791,8 +810,10 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
             fov = float(obj.data.angle_x) * _DEG
         except Exception:
             pass
+        camera_name = _sanitize_node_name(obj.name)
+        fov_for_env = fov
         parts.append(ENVIRONMENT_CAMERA.format(
-            name=_sanitize_node_name(obj.name),
+            name=camera_name,
             basis=_camera_basis_text(obj),
             cx=_fmt(position[0]), cy=_fmt(position[1]), cz=_fmt(position[2]),
             fov=fov))
@@ -812,7 +833,33 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
                 energy=max(0.2, min(energy * 1.2, 4.0))))
             break
 
-    return "".join(parts), files, ""
+    # ── Environment 节点(踩过的坑)───────────────────────────────────
+    # 以前这条分支**没有**加 Environment 节点 —— 只补了相机和灯就返回了。
+    # 于是角色场景里没有任何东西去挂卡通材质:
+    #     * 情况 1(相机灯都在 glb 里)会生成 Environment
+    #     * 情况 2(自己补相机灯)不生成  ← 用户踩的就是这个
+    # 而角色 glb 是刻意不带相机灯光的(见 export_subtree_glb),
+    # 所以角色场景**永远**走情况 2 → 卡通材质永远挂不上。
+    # 用户看到的就是"地面有材质,为什么没渲染上"。
+    #
+    # 判据是"有活要干",不是"有相机/灯":只要**有材质要挂**,
+    # 就必须生成 Environment —— 哪怕场景里一个相机一盏灯都没有
+    # (用户可能自己在 Godot 里加,但材质还是得有人挂)。
+    material_table = _material_table(material_files)
+    if parts or material_table:
+        fields = dict(
+            camera_name=camera_name, fov=_fmt(fov_for_env),
+            materials=material_table,
+        )
+        if not parts:
+            # 纯为了挂材质而生成:没有相机可指,名字留空让脚本兜底去找
+            fields["camera_name"] = ""
+            fields["fov"] = _fmt(0.0)
+        parts.append(ENVIRONMENT_NODE.format(**fields))
+        files[os.path.join(project.SCRIPTS_DIR, "gk_environment.gd")] = \
+            ENVIRONMENT_SCRIPT.format(**fields)
+
+    return "".join(parts), files, camera_name
 
 
 def _material_table(material_files):
@@ -1975,6 +2022,9 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 bounds=bounds,
                 dimension=dimension,
                 scene=scene,
+                # 材质映射要带过去 —— 不带的话角色场景里没有 materials=,
+                # gk_environment.gd 就挂不上卡通材质(踩过)
+                materials_map=materials_map,
                 # 让角色场景当主场景:它是唯一"移动角色时画面会跟着动"的场景
                 # (见上面那段说明)。用户手动改过主场景时 set_main_scene
                 # 内部会尊重他的选择,不会硬抢。
@@ -2075,7 +2125,7 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
 
 def write_character_scene(export_dir, root_name, base_class, model_name, script_name,
                           bounds, dimension="3", with_collision=True, scene=None,
-                          set_as_main=True, model_dir=None):
+                          set_as_main=True, model_dir=None, materials_map=None):
     """生成把 模型 + 碰撞体 + 脚本 + 相机灯光 拼在一起的 .tscn。
 
     ── 结构(这才是能让角色动起来的结构)─────────────────────────────
@@ -2109,17 +2159,50 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
     # 相机 / 灯光的处理和包装场景一致:glb 里已经有就不再生成
     # (见 build_environment_nodes 的说明)。角色场景 instance 的也是
     # 那个 glb,所以它同样带着相机和灯。
-    glb_info = glb_object_names(export_dir, model_name)
+    glb_info = glb_scene_nodes(export_dir, model_name)
+
+    # ── 材质映射必须一起带过来(踩过的坑)───────────────────────────
+    # 以前这里**没传** material_files,于是角色场景里的 Environment 节点
+    # 不会写 materials= 那一行,`gk_environment.gd` 也就挂不上卡通材质 ——
+    # 角色只剩 glb 自带的 StandardMaterial3D,看起来"材质没生效"
+    # (用户实测:"地面有材质,为什么没渲染上")。
+    #
+    # 键用 **glb 里的网格节点名** —— 因为 `_apply_materials` 是在 Godot
+    # 运行时按节点名 find_child 找的。Blender 的物体名在导出时会被
+    # sanitize,两者可能不一致,所以优先用 glb 里真实存在的节点名。
+    material_files = {}
+    for node_name in sorted(glb_info.get("meshes", {})):
+        entry = (materials_map or {}).get(node_name)
+        if entry:
+            material_files[node_name] = entry[1]
+    if not material_files:
+        # glb 里没解析出网格名(或名字对不上)时,退回用 Blender 物体名当键。
+        # 单网格角色(最常见)的两种情况名字通常一致。
+        for obj_name in sorted(materials_map or {}):
+            material_files[obj_name] = materials_map[obj_name][1]
+
     environment, env_files, _camera_name = build_environment_nodes(
-        scene, not dimension_2d, skip=glb_info, scene_name=model_name)
+        scene, not dimension_2d, skip=glb_info, scene_name=model_name,
+        material_files=material_files)
     camera_count = len(glb_info.get("cameras", ()))
     light_count = len(glb_info.get("lights", ()))
 
-    steps = 1 + (1 if sub_resources else 0) + 2
+    # Environment 脚本的 ext_resource 行 —— 只要有 Environment 节点就必须有它。
+    # 注意判据是 **environment 文本非空**,不是 env_files 非空:
+    # build_environment_nodes 在"相机灯都在 glb 里"时不重写脚本文件,
+    # 但脚本本身早就在磁盘上了。以前拿 env_files 当判据,导致节点引用了
+    # 一个没声明的 ExtResource,Godot 直接报
+    #     Parse Error: Can't load resource ... env_script
+    env_resource = ""
+    if environment.strip():
+        env_resource = ENV_RESOURCE_LINE.format(scripts_dir=project.SCRIPTS_DIR)
+
+    steps = 1 + (1 if sub_resources else 0) + 2 + (1 if env_resource else 0)
     text = SCENE_TEMPLATE.format(
         steps=steps,
         script_path=f"res://{project.SCRIPTS_DIR}/{script_name}",
         model_path=f"res://{model_dir or project.ART_DIR}/{model_name}.glb",
+        env_resource=env_resource,
         sub_resources=sub_resources,
         root_name=root_name or "Character",
         base_class=base_class,

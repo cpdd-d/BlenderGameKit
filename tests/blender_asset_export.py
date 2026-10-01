@@ -217,6 +217,51 @@ def main():
     check("导出目录有 project.godot",
           project is not None and os.path.isfile(project), str(project))
 
+    # ---- 10. 角色场景必须有 Environment 节点 ----
+    #
+    # 回归(用户实测"材质没生效"的真正原因):
+    # `build_environment_nodes` 有两条分支 ——
+    #   情况 1:相机灯都在 glb 里 -> 生成 Environment 节点
+    #   情况 2:自己补相机灯     -> **只补相机灯,不生成 Environment**
+    # 而角色 glb 是刻意不带相机灯光的(export_subtree_glb 里
+    # export_cameras/lights=False),所以角色场景**永远**走情况 2 →
+    # 卡通材质永远挂不上,用户看到的还是 glb 自带的默认材质。
+    #
+    # 另外 ext_resource 的判据也错过:以前拿 env_files 非空当判据,
+    # 但情况 1 不重写脚本文件,于是节点引用了没声明的 ExtResource。
+    print("-" * 70)
+    print("检查角色场景的 Environment 节点")
+    char_scene, _c2, _l2 = asset_export.write_character_scene(
+        out_dir,
+        root_name="EnvHero",
+        base_class="CharacterBody3D",
+        model_name="SoloHero",
+        script_name=script_name,
+        bounds=bounds,
+        dimension="3",
+        scene=bpy.context.scene,
+        set_as_main=False,
+        materials_map={"SoloHero": ("HeroMat", "HeroMat.tres")},
+    )
+    with open(char_scene, encoding="utf-8") as handle:
+        char_text = handle.read()
+    print(char_text)
+
+    check("角色场景有 Environment 节点",
+          '[node name="Environment"' in char_text,
+          [ln for ln in char_text.splitlines() if "Environment" in ln])
+    check("Environment 节点引用了 env_script",
+          'ExtResource("env_script")' in char_text)
+    # 引用了 ExtResource 就必须有对应的 ext_resource 声明,
+    # 否则 Godot 报 "Can't load resource ... env_script"
+    if 'ExtResource("env_script")' in char_text:
+        check("env_script 有对应的 ext_resource 声明",
+              'id="env_script"' in char_text,
+              [ln for ln in char_text.splitlines() if "env_script" in ln])
+    check("Environment 里带上了材质映射",
+          "materials = " in char_text and "HeroMat" in char_text,
+          [ln for ln in char_text.splitlines() if "materials" in ln])
+
     # ---- 8. 角色必须导出成**自己的** glb ----
     #
     # 回归:以前角色场景 instance 的是整个 World.glb,导致
