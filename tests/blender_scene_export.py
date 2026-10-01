@@ -226,6 +226,61 @@ def main():
           'path="res://art/World.glb"' in text,
           [ln for ln in text.splitlines() if "glb" in ln][:1])
 
+    # ---- 4a-3. 角色节点必须**自带网格**(用户实测的那个 bug)----
+    #
+    # 回归:以前脚本挂载目标只是个带碰撞体的 CharacterBody3D,角色的
+    # **网格在世界 glb 实例里**(另一棵子树)。移动它只动碰撞体,
+    # 画面里的角色纹丝不动 —— 用户原话:"摄像机动了但那个角色正方体
+    # 没跟着动"。而 Godot 不允许往 glb 实例内部挂节点,所以只能反过来:
+    # 让角色节点自带一份自己的网格(instance 角色自己的 glb)。
+    print("-" * 74)
+    print("检查角色节点是否自带网格")
+    # 先真的导出一次角色 glb,这样下面才测得到完整流程
+    char_glb_path, char_ok, char_msg = asset_export.export_subtree_glb(
+        directory, "SoloHero", [body], scene=bpy.context.scene)
+    check("角色单独导出成功", char_ok, char_msg)
+    # 「脚本挂载目标」必须真的勾上 —— 这是真实使用时的前提条件,
+    # 也是决定哪个物体长出 Model 子节点的依据
+    if getattr(body, "gk_physics", None) is not None:
+        body.gk_physics.enabled = True
+        body.gk_physics.script_target = True
+    char_glb = os.path.join(directory, "art", "SoloHero.glb")
+    if os.path.isfile(char_glb):
+        # 场景名必须对应一个真实存在的 .glb(write_world_scene 会去解析它),
+        # 所以复用上面已经导好的 World.glb,换个场景文件名而已
+        world2, _bc = asset_export.write_world_scene(
+            directory, "World", scene=bpy.context.scene, dimension="3",
+            script_name="hero.gd", script_target_name=body.name,
+            character_model="SoloHero")
+        check("带了角色 glb 时 write_world_scene 有返回", world2 is not None, str(world2))
+        if world2 is None:
+            return 1
+        with open(world2, encoding="utf-8") as handle:
+            nested = handle.read()
+        print(nested)
+        check("角色节点的 Model 是它的子级",
+              re.search(r'\[node name="Model" parent="[^"]*%s" instance=' % re.escape(body.name),
+                        nested) is not None,
+              [ln for ln in nested.splitlines() if "Model" in ln])
+        check("角色节点的 Collision 是它的子级",
+              re.search(r'\[node name="Collision" type="CollisionShape3D" '
+                        r'parent="[^"]*%s"\]' % re.escape(body.name),
+                        nested) is not None,
+              [ln for ln in nested.splitlines() if "Collision" in ln][:3])
+        check("角色 glb 被声明为 ext_resource",
+              'id="1_character"' in nested,
+              [ln for ln in nested.splitlines() if "1_character" in ln])
+        # 没有 character_model 时不能凭空多出 Model 子节点
+        world3, _bc = asset_export.write_world_scene(
+            directory, "World", scene=bpy.context.scene, dimension="3",
+            script_name="hero.gd", script_target_name=body.name,
+            character_model=None)
+        with open(world3, encoding="utf-8") as handle:
+            plain = handle.read()
+        check("没给角色 glb 时不生成 Model 子节点",
+              'name="Model"' not in plain,
+              [ln for ln in plain.splitlines() if "Model" in ln])
+
     # 架构说明:试过两种"在 .tscn 里挂材质"的写法,**都不生效**:
     #   1) 给 glb 实例的内部子节点写 material_override ->
     #      Godot 报 `Parent path './World' ... has vanished`,覆盖被丢弃

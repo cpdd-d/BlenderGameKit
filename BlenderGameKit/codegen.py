@@ -1406,13 +1406,24 @@ def _stmt_camera_follow(ctx, node, indent):
     "我角色不见了"来源。做成一个节点，而不是让人自己写脚本。
     """
     raw_cam = (getattr(node, "gk_camera", "") or "").strip()
+    # ── 相机引用不能生成 `$名字`(踩过的坑)─────────────────────────
+    # 以前填了相机名就生成 `@onready var cam_x: Camera3D = $MyCam` ——
+    # 那是个**相对本节点的路径**。名字对不上时 Godot 加载脚本直接失败,
+    # 报 "Node not found: MyCam (relative to /root/Cube)",
+    # 整个脚本连 _process 都跑不起来(用户实测正是这个现象)。
+    #
+    # 而节点引用下拉里列的是**节点图里的节点**,场景里几乎不可能有同名
+    # 物体 —— 用户"怎么选都没影响"的观感就是这么来的。
+    #
+    # 改成按**名字在场景里搜**,搜不到就退回"场景里第一个相机":
+    # 填错只是退回自动模式,不会把脚本搞崩。
     if raw_cam and raw_cam != TARGET_SELF:
-        camera = ctx.target_expr(node, "gk_camera", hint="cam")
+        camera = f"_gk_find_camera_named(self, {gd_string(raw_cam)})"
     else:
         # 交给一个纯查询函数:这个节点每帧都在跑，而相机可能还没进场景。
         # 用函数而不是内联代码，是为了把 null 情况收在一处处理。
         camera = "_gk_find_camera(self)"
-        ctx.need_camera_finder = True
+    ctx.need_camera_finder = True
 
     raw_target = (getattr(node, "gk_target", TARGET_SELF) or TARGET_SELF).strip()
     target = "self" if raw_target == TARGET_SELF else ctx.target_expr(
@@ -2649,6 +2660,22 @@ class Generator:
 
         # ---- 自动找相机的小工具 ----
         if self.ctx.need_camera_finder:
+            sections.append({
+                "signature": "func _gk_find_camera_named(host: Node, wanted: String) -> Node:",
+                "lines": [
+                    "    if wanted.is_empty():",
+                    "        return null",
+                    # 先按名字找(用户在节点里填的那个名字)
+                    '    for found in host.get_tree().root.find_children(wanted, "Camera3D", true, false):',
+                    "        return found",
+                    '    for found in host.get_tree().root.find_children(wanted, "Camera2D", true, false):',
+                    "        return found",
+                    # 名字对不上就退回自动模式 —— 填错不该让游戏跑不起来
+                    "    return _gk_find_camera(host)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
             sections.append({
                 "signature": "func _gk_find_camera(host: Node) -> Node:",
                 "lines": [

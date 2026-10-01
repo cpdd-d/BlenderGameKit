@@ -2049,6 +2049,72 @@ class TestDefaultInputActions(Base):
             self.assertIn(f'"physical_keycode":{key}', block)
 
 
+class TestCameraReference(Base):
+    """『相机_跟随』的相机引用不能生成脆弱的 `$名字` 路径。
+
+    踩过的坑:填了相机名就生成 `@onready var cam_x: Camera3D = $MyCam` ——
+    那是**相对本节点**的路径。名字对不上时 Godot **加载脚本直接失败**,
+    报 "Node not found: MyCam (relative to /root/Cube)",
+    整个脚本连 _process 都跑不起来(用户实测正是这个现象)。
+    而节点引用下拉里列的是**节点图里的节点**,场景里几乎不可能有同名物体,
+    所以"怎么选都没影响(或直接崩)"的观感就是这么来的。
+    """
+
+    def _tree(self, camera=""):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        follow = tree.new_node(NN.GKNodeCameraFollow, "相机跟随")
+        follow.gk_camera = camera
+        gk_stub.connect(tree, ev, "执行", follow, "执行")
+        return tree
+
+    def test_empty_camera_uses_auto_finder(self):
+        code, _ = gen(self._tree(), V3)
+        self.assertIn("_gk_find_camera(self)", code)
+
+    def test_named_camera_searches_at_runtime(self):
+        code, _ = gen(self._tree("MyCam"), V3)
+        # 必须按名字在场景里搜,而不是写死一个相对路径
+        self.assertIn('_gk_find_camera_named(self, "MyCam")', code)
+        self.assertNotIn("$MyCam", code)
+        # 不能为它生成 @onready 引用(那正是会崩的写法)
+        self.assertNotIn("@onready var cam_mycam", code)
+
+    def test_named_camera_falls_back_when_missing(self):
+        """名字对不上时必须退回自动模式 —— 填错不该让游戏跑不起来。"""
+        code, _ = gen(self._tree("不存在的相机"), V3)
+        self.assertIn("_gk_find_camera(host)", code)
+        # 兜底函数里要有"找不到就返回第一个相机"的逻辑
+        self.assertIn('find_children("*", "Camera3D"', code)
+
+    def test_camera_code_is_valid_gdscript_shape(self):
+        code, _ = gen(self._tree("MyCam"), V3)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+
+class TestFollowTarget(Base):
+    """『跟随谁』必须真的影响生成的代码。"""
+
+    def test_target_self_is_literal_self(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        follow = tree.new_node(NN.GKNodeCameraFollow, "相机跟随")
+        gk_stub.connect(tree, ev, "执行", follow, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("_gk_follow_look = self", code)
+
+    def test_target_other_generates_node_ref(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        follow = tree.new_node(NN.GKNodeCameraFollow, "相机跟随")
+        follow.gk_target = "Other"
+        gk_stub.connect(tree, ev, "执行", follow, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("node_other", code)
+        self.assertNotIn("_gk_follow_look = self", code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

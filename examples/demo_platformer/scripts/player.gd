@@ -112,6 +112,16 @@ func restart_game() -> void:
     get_tree().call_deferred("reload_current_scene")
 
 
+func _gk_find_camera_named(host: Node, wanted: String) -> Node:
+    if wanted.is_empty():
+        return null
+    for found in host.get_tree().root.find_children(wanted, "Camera3D", true, false):
+        return found
+    for found in host.get_tree().root.find_children(wanted, "Camera2D", true, false):
+        return found
+    return _gk_find_camera(host)
+
+
 func _gk_find_camera(host: Node) -> Node:
     for child in host.get_tree().get_nodes_in_group("gk_camera"):
         if child is Camera2D or child is Camera3D:

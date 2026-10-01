@@ -433,7 +433,7 @@ def _run_gltf_export(kwargs, path):
 
 def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
-                      materials_map=None):
+                      materials_map=None, character_model=None):
     """生成主场景:模型 + 卡通材质 + 碰撞体 + 相机灯光。返回 (路径, 碰撞体数量)。
 
     结构(3D):
@@ -469,6 +469,25 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
        实测 StandardMaterial3D 和 ShaderMaterial 都能成功显示。
 
     materials_map: {对象名: (材质资源名, materials/ 下的文件名)}
+
+    character_model: 角色自己的 glb 名(不含 .glb)。给了的话,脚本挂载目标
+        会在场景里生成一个**自带网格**的节点:
+
+            Hero [CharacterBody3D]        ← 脚本挂这里;移动它
+              Collision [CollisionShape3D]
+              Model [instance Hero.glb]   ← 角色网格,跟着一起动
+
+        ── 为什么必须这样(用户实测反馈)────────────────────────────
+        以前只有 `Colliders/Cube [CharacterBody3D]` + 一个碰撞体,
+        角色的**网格在世界 glb 实例里**(另一棵子树)。移动 Colliders/Cube
+        只动了碰撞体,画面里的角色纹丝不动 ——
+        用户原话:"摄像机动了但那个角色正方体没跟着动"。
+        而 Godot **不允许**往 glb 实例内部挂节点,所以没法把碰撞体
+        挂到 `World/Cube` 下面去。
+
+        正确做法就是反过来:让角色节点自带一份自己的网格。
+        实测验证过:移动根节点 -> 网格世界坐标跟着变(位移 6.0),
+        地面保持不动。
     """
     path = os.path.join(export_dir, project.SCENES_DIR, f"{scene_name}.tscn")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -492,6 +511,14 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         ext_lines.append(f'[ext_resource type="Script" '
                          f'path="res://{project.SCRIPTS_DIR}/{script_name}" '
                          f'id="{script_id}"]')
+
+    # 角色自己的 glb(让角色节点自带网格,见上面 character_model 的说明)
+    use_character_model = bool(character_model) and os.path.isfile(
+        os.path.join(export_dir, project.ART_DIR, f"{character_model}.glb"))
+    if use_character_model:
+        ext_lines.append(f'[ext_resource type="PackedScene" '
+                         f'path="res://{project.ART_DIR}/{character_model}.glb" '
+                         f'id="1_character"]')
 
     # ---- 碰撞体 ----
     bodies = []
@@ -594,6 +621,13 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             body_type = _base_class_for(scene, obj, dimension)
             if getattr(physics, "is_trigger", False):
                 body_type = "Area3D" if is_3d else "Area2D"
+
+            # 脚本挂载目标且角色 glb 存在时,**给它挂上自己的网格**。
+            # 见 write_world_scene 文档里 character_model 那段说明 ——
+            # 不这么做的话,移动这个节点只动碰撞体,画面里的角色不动。
+            attach_model = (use_script and use_character_model
+                            and getattr(physics, "script_target", False))
+
             lines.append(f'[node name="{_sanitize_node_name(obj.name)}" '
                          f'type="{body_type}" parent="Colliders"]')
             # 位置必须写出来:碰撞体在这个世界坐标上,不写就全堆在原点,
@@ -601,6 +635,27 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             lines.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
                          f"{_fmt(position[0])}, {_fmt(position[1])}, "
                          f"{_fmt(position[2])})")
+            if attach_model:
+                lines.append(f'script = ExtResource("{script_id}")')
+                lines.append("")
+                shape_type_name = "CollisionShape3D" if is_3d else "CollisionShape2D"
+                lines.append(f'[node name="Collision" type="{shape_type_name}" '
+                             f'parent="Colliders/{_sanitize_node_name(obj.name)}"]')
+                lines.append(f'shape = SubResource("{shape_id}")')
+                # 碰撞层/掩码也要带上 —— 走 continue 的话就不会再经过
+                # 下面那段通用代码了,漏掉这里等于把这些设置丢掉
+                layer = built["layer"]
+                mask = built["mask"]
+                if layer != "1" or mask != "1":
+                    lines.append(f"collision_layer = {int(layer)}")
+                    lines.append(f"collision_mask = {int(mask)}")
+                lines.append("")
+                lines.append(f'[node name="Model" parent="Colliders/'
+                             f'{_sanitize_node_name(obj.name)}" '
+                             f'instance=ExtResource("1_character")]')
+                lines.append("")
+                continue
+
             if use_script and getattr(physics, "script_target", False):
                 lines.append(f'script = ExtResource("{script_id}")')
             lines.append("")
@@ -1949,6 +2004,24 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
             "否则导出的场景里不会有脚本,角色不会动。"
         )
 
+    # ---- 2b) 角色自己的 glb(必须在包装场景**之前**)----
+    #
+    # 包装场景要把角色节点做成"自带网格"的(self-contained),
+    # 就得在写 .tscn 之前先有这个 glb 文件。
+    # 见 write_world_scene 文档里 character_model 那段说明。
+    char_model = None
+    if script_target is not None:
+        char_model = _sanitize_node_name(script_target.name) or "Character"
+        char_path, char_ok, char_msg = export_subtree_glb(
+            directory, char_model, [script_target], scene=scene)
+        if char_ok:
+            result["written"].append(char_path)
+        else:
+            result["warnings"].append(
+                f"角色单独导出失败({char_msg}),已退回整场景模型:"
+                f"这样角色移动时看不到自己的网格跟着动。")
+            char_model = None
+
     try:
         world_scene, body_count = write_world_scene(
             directory, "World",
@@ -1956,6 +2029,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
             script_name=script_name if script_target else None,
             script_target_name=script_target.name if script_target else None,
             materials_map=materials_map,
+            character_model=char_model,
         )
         result["written"].append(world_scene)
         result["bodies"] = body_count
@@ -1989,25 +2063,21 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
     #
     # 所以有脚本挂载目标时,把主场景指向角色场景。地面和道具还在
     # World.tscn 里,想切回去在 Godot 里改一行主场景就行。
+    # ---- 4b) 角色场景(单独调试角色用)----
+    #
+    # ── 主场景现在仍然是 World.tscn ─────────────────────────────────
+    # 用户的反馈很明确:"应该默认为平面为主场景,不然每次打开 Godot
+    # 再设置项目主场景太烦人了"。
+    #
+    # 以前把主场景指向角色场景,是因为 World.tscn 里移动角色时画面不动
+    # (角色网格在世界 glb 里,和碰撞体分属两棵子树)。现在 World.tscn 里
+    # 角色节点**自带网格**了(见 character_model),这个问题不存在了,
+    # 所以主场景回到 World —— 打开就能看到地面和整个场景。
+    #
+    # 角色场景保留:它的用途是"只调试角色一个人",不再抢主场景。
     if script_name and script_target is not None:
         bounds = object_bounds([script_target])
         try:
-            # ── 角色必须有**自己的** glb ──────────────────────────────
-            # 以前这里 instance 的是整个 World.glb,导致
-            # "一移动角色,整个世界跟着跑"(地面、道具全飞了)。
-            # 所以先把角色(含子级)单独导成一个 glb,再 instance 它。
-            char_model = _sanitize_node_name(script_target.name) or "Character"
-            char_path, char_ok, char_msg = export_subtree_glb(
-                directory, char_model, [script_target], scene=scene)
-            if char_ok:
-                result["written"].append(char_path)
-            else:
-                # 单独导出失败时退回整场景 glb —— 至少还能看见东西,
-                # 只是角色会和世界一起动。用告警说清楚。
-                result["warnings"].append(
-                    f"角色单独导出失败({char_msg}),已退回整场景模型:"
-                    f"这样角色移动时整个世界会跟着动。")
-
             scene_path, _cam, _light = write_character_scene(
                 directory,
                 root_name=script_target.name,
@@ -2017,7 +2087,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 #  assigned to an object of type: 'Y')。
                 # 所以这里调的是同一个解析函数,不另外猜。
                 base_class=_base_class_for(scene, script_target, dimension),
-                model_name=char_model if char_ok else "World",
+                # 上面 2b 已经导过了,这里直接复用,不重复导一遍
+                model_name=char_model or "World",
                 script_name=script_name,
                 bounds=bounds,
                 dimension=dimension,
@@ -2025,10 +2096,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 # 材质映射要带过去 —— 不带的话角色场景里没有 materials=,
                 # gk_environment.gd 就挂不上卡通材质(踩过)
                 materials_map=materials_map,
-                # 让角色场景当主场景:它是唯一"移动角色时画面会跟着动"的场景
-                # (见上面那段说明)。用户手动改过主场景时 set_main_scene
-                # 内部会尊重他的选择,不会硬抢。
-                set_as_main=True,
+                # 不再抢主场景:World.tscn 现在也是"移动角色时画面会跟着动"的
+                set_as_main=False,
             )
             result["written"].append(scene_path)
             result["character_scene"] = scene_path
