@@ -14,7 +14,7 @@
 from . import node_base as B
 from .node_base import finalize, gd_node_path, gd_string, snake_case, target_pin, TARGET_SELF
 from .. import gk_sockets as S
-from ..gk_sockets import ANY, BOOL, FLOAT, FLOW, INT, OBJECT, TEXT, VECTOR
+from ..gk_sockets import ANY, BOOL, COLOR, FLOAT, FLOW, INT, OBJECT, TEXT, VECTOR
 
 CLASSES = []
 
@@ -1010,6 +1010,262 @@ class GKNodeSetTimeScale(B.GKStatementNode):
 
 
 # ==========================================================================
+# 音效
+# ==========================================================================
+@N
+class GKNodePlaySound(B.GKStatementNode):
+    bl_idname = "GKNodePlaySound"
+    bl_label = "音效_播放"
+    bl_icon = "SOUND"
+    gk_category = "音效"
+    gk_doc = ("播放一次音效(跳跃 / 受击 / 拾取)。播放器是运行时自动建的，"
+              "播完自动销毁，不需要你在场景里摆节点")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "音频路径", "res://art/jump.wav"),
+        S.pin(FLOAT, "音量", 0.0),
+        S.pin(FLOAT, "音高", 1.0),
+    )
+    gk_input_props = {
+        "音频路径": "gk_path",
+        "音量": "gk_volume",
+        "音高": "gk_pitch",
+    }
+    gk_prop_defs = (
+        ("gk_path", "string", "res://art/jump.wav", "音频路径", "res:// 开头的音频文件"),
+        ("gk_volume", "float", 0.0, "音量", "分贝，0 为原始音量，-6 约减半"),
+        ("gk_pitch", "float", 1.0, "音高", "1.0 原速，>1 更尖更快"),
+        ("gk_2d", "bool", True, "2D 音效", "勾上=按距离衰减(3D 项目取消勾选)"),
+        ("gk_target", "node", "", "挂到", "留空则挂到当前脚本所在节点"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_path", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_volume", text="")
+        row.prop(self, "gk_pitch", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_2d", text="2D", toggle=True)
+        B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodePlayMusic(B.GKStatementNode):
+    bl_idname = "GKNodePlayMusic"
+    bl_label = "音效_音乐"
+    bl_icon = "PLAY_SOUND"
+    gk_category = "音效"
+    gk_doc = "播放背景音乐(BGM)。重复调用会切换曲目并做淡入淡出，不会叠着播"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "音频路径", "res://art/bgm.ogg"),
+        S.pin(FLOAT, "音量", -6.0),
+    )
+    gk_input_props = {"音频路径": "gk_path", "音量": "gk_volume"}
+    gk_prop_defs = (
+        ("gk_path", "string", "res://art/bgm.ogg", "音频路径", "res:// 开头的音频文件"),
+        ("gk_volume", "float", -6.0, "音量", "分贝，0 为原始音量"),
+        ("gk_fade", "float", 0.5, "淡入秒数", "0 表示直接开始"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_path", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_volume", text="")
+        row.prop(self, "gk_fade", text="")
+
+
+@N
+class GKNodeStopSound(B.GKStatementNode):
+    bl_idname = "GKNodeStopSound"
+    bl_label = "音效_停止音乐"
+    bl_icon = "MUTE_IPO_OFF"
+    gk_category = "音效"
+    gk_doc = "停止背景音乐(可做淡出)。音效是一次性的，播完自己就没了，不用手动停"
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "淡出秒数", 0.5))
+    gk_input_props = {"淡出秒数": "gk_fade"}
+    gk_prop_defs = (("gk_fade", "float", 0.5, "淡出秒数", "0 表示立刻停"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_fade", text="")
+
+
+# ==========================================================================
+# 存档
+# ==========================================================================
+@N
+class GKNodeSaveSet(B.GKStatementNode):
+    bl_idname = "GKNodeSaveSet"
+    bl_label = "存档_写入"
+    bl_icon = "IMPORT"
+    gk_category = "存档"
+    gk_doc = ("往存档里写一个值(血量 / 关卡 / 金币)。只改内存，"
+              "要真正落盘请接『存档_保存』")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "键名", "hp"),
+        S.pin(ANY, "值", 3),
+    )
+    gk_input_props = {"键名": "gk_key"}
+    gk_prop_defs = (("gk_key", "string", "hp", "键名", "存档里这一项的键"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_key", text="")
+
+
+@N
+class GKNodeSaveGet(B.GKStatementNode):
+    bl_idname = "GKNodeSaveGet"
+    bl_label = "存档_读取到变量"
+    bl_icon = "EXPORT"
+    gk_category = "存档"
+    gk_doc = ("把存档里的值读进一个脚本变量，然后用『变量_读取』节点取用。"
+              "键不存在时用『默认值』")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "键名", "hp"),
+    )
+    gk_input_props = {"键名": "gk_key"}
+    gk_prop_defs = (
+        ("gk_key", "string", "hp", "键名", "存档里这一项的键"),
+        ("gk_var", "string", "hp", "写入变量", "读出来的值放进哪个脚本变量"),
+        ("gk_default", "float", 0.0, "默认值", "键不存在时用它"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_key", text="")
+        row.prop(self, "gk_var", text="")
+        layout.prop(self, "gk_default", text="")
+
+
+@N
+class GKNodeSaveWrite(B.GKStatementNode):
+    bl_idname = "GKNodeSaveWrite"
+    bl_label = "存档_保存"
+    bl_icon = "FILE_TICK"
+    gk_category = "存档"
+    gk_doc = "把内存里的存档数据写进磁盘文件(user:// 目录下)"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_slot", "string", "save1", "存档槽", "不同槽位互不影响，做多存档用"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_slot", text="")
+
+
+@N
+class GKNodeSaveLoad(B.GKStatementNode):
+    bl_idname = "GKNodeSaveLoad"
+    bl_label = "存档_载入"
+    bl_icon = "FILE_FOLDER"
+    gk_category = "存档"
+    gk_doc = "从磁盘把存档读进内存。文件不存在时不会出错，只是读到空存档"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_slot", "string", "save1", "存档槽", "要和『存档_保存』用同一个槽位"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_slot", text="")
+
+
+@N
+class GKNodeSaveHas(B.GKStatementNode):
+    bl_idname = "GKNodeSaveHas"
+    bl_label = "存档_是否存在"
+    bl_icon = "QUESTION"
+    gk_category = "存档"
+    gk_doc = "判断某个槽位有没有存档文件(做『继续游戏』按钮的可用状态)"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_slot", "string", "save1", "存档槽", "要检查的槽位"),
+    )
+    # 出口故意不叫『完成』:见 codegen 里 _stmt_save_has 的说明 ——
+    # emit_statement 会自动续接『完成』，那样 else 分支会跑两遍。
+    gk_outputs = (S.pin(FLOW, "有档"), S.pin(FLOW, "没档"))
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_slot", text="")
+
+
+@N
+class GKNodeSaveDelete(B.GKStatementNode):
+    bl_idname = "GKNodeSaveDelete"
+    bl_label = "存档_删除"
+    bl_icon = "TRASH"
+    gk_category = "存档"
+    gk_doc = "删除某个槽位的存档文件(删档 / 重新开始)"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_slot", "string", "save1", "存档槽", "要删除的槽位"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_slot", text="")
+
+
+# ==========================================================================
+# 屏幕效果
+# ==========================================================================
+@N
+class GKNodeScreenFlash(B.GKStatementNode):
+    bl_idname = "GKNodeScreenFlash"
+    bl_label = "屏幕_闪白"
+    bl_icon = "IMAGE_ZDEPTH"
+    gk_category = "屏幕效果"
+    gk_doc = ("整屏闪一下(受击 / 爆炸 / 治疗)。用 ColorRect + Tween 做，"
+              "不占渲染管线，也不需要着色器")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(COLOR, "颜色", (1.0, 1.0, 1.0, 1.0)),
+        S.pin(FLOAT, "时长", 0.3),
+    )
+    gk_input_props = {"时长": "gk_time"}
+    gk_prop_defs = (
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "闪光颜色"),
+        ("gk_time", "float", 0.3, "时长", "淡出到透明所需秒数"),
+        ("gk_alpha", "float", 0.6, "起始透明度", "1 为全不透明"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_time", text="")
+        row.prop(self, "gk_alpha", text="")
+
+
+@N
+class GKNodeScreenFade(B.GKStatementNode):
+    bl_idname = "GKNodeScreenFade"
+    bl_label = "屏幕_渐变遮罩"
+    bl_icon = "IMAGE_ALPHA"
+    gk_category = "屏幕效果"
+    gk_doc = ("整屏渐变到某个颜色(黑场转场 / 淡入开场)。"
+              "『到不透明』用于转场，『到透明』用于淡回游戏")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "时长", 1.0),
+    )
+    gk_input_props = {"时长": "gk_time"}
+    gk_prop_defs = (
+        ("gk_color", "color", (0.0, 0.0, 0.0, 1.0), "颜色", "遮罩颜色，默认黑"),
+        ("gk_time", "float", 1.0, "时长", "渐变秒数"),
+        ("gk_to_opaque", "bool", True, "渐变到不透明", "取消勾选=淡回透明"),
+        ("gk_hold", "float", 0.0, "保持秒数", "转场时全黑停留多久(0 = 一直留着)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_time", text="")
+        row.prop(self, "gk_hold", text="")
+        layout.prop(self, "gk_to_opaque", text="渐变到不透明", toggle=True)
+
+
+# ==========================================================================
 # 实用
 # ==========================================================================
 @N
@@ -1031,4 +1287,4 @@ ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
 CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
-                  "运算", "显示", "相机", "时间", "实用")
+                  "运算", "显示", "相机", "音效", "存档", "屏幕效果", "时间", "实用")

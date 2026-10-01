@@ -668,6 +668,236 @@ class TestDisplayNodes(Base):
         self.assertIn("@export var", code)
 
 
+class TestAudioNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_play_sound_creates_player_at_runtime(self):
+        """音效不该要求用户先在场景里摆播放器。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodePlaySound, "音效", gk_path="res://art/jump.wav",
+                             gk_volume=-3.0, gk_pitch=1.2, gk_2d=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("AudioStreamPlayer2D.new()", code)
+        self.assertIn('load("res://art/jump.wav")', code)
+        self.assertIn(".volume_db = ", code)
+        self.assertIn(".pitch_scale = ", code)
+        # 播完自己删，否则每个音效都会在场景树里堆一个节点
+        self.assertIn(".finished.connect(", code)
+        self.assertIn(".queue_free)", code)
+        # 文件缺失时必须给出可读告警，而不是静默什么都不做
+        self.assertIn("push_warning(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_play_sound_3d_switch(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodePlaySound, "音效", gk_path="res://a.wav", gk_2d=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertIn("AudioStreamPlayer.new()", code)
+        self.assertNotIn("AudioStreamPlayer2D.new()", code)
+
+    def test_music_does_not_stack(self):
+        """重复调用播放音乐不该叠着播 —— 必须先处理旧的播放器。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodePlayMusic, "音乐", gk_path="res://bgm.ogg",
+                             gk_volume=-6.0, gk_fade=0.5)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("AudioStreamPlayer.new()", code)
+        # 同一首正在播时不要打断
+        self.assertIn(".playing:", code)
+        self.assertIn("queue_free()", code)
+        # 有淡入时分贝应从 -80 起
+        self.assertIn("-80.0", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_stop_music(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeStopSound, "停音乐", gk_fade=0.5)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".stop", code)
+        self.assert_indent_sane(code)
+
+
+class TestSaveNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_save_helpers_only_when_used(self):
+        """没用到存档节点就不该生成那几个读写文件的函数。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_gk_read_save", code)
+        self.assertNotIn("func _gk_save_file", code)
+
+    def test_save_write_generates_helpers(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveWrite, "保存", gk_slot="save1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        for func in ("_gk_save_file", "_gk_read_save", "_gk_write_save", "_gk_delete_save"):
+            self.assertIn(f"func {func}", code)
+        self.assertIn('"user://gk_" + slot + ".json"', code)
+        self.assertIn("FileAccess.open(", code)
+        self.assertIn("JSON.stringify(", code)
+        self.assertIn("JSON.parse_string(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_save_slot_names_the_file(self):
+        """不同槽位必须落到不同文件，否则多存档会互相覆盖。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeSaveWrite, "存档1", gk_slot="slotA")
+        second = tree.new_node(NN.GKNodeSaveWrite, "存档2", gk_slot="slotB")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn('_gk_save_file("slotA")', code)
+        self.assertIn('_gk_save_file("slotB")', code)
+
+    def test_lazy_load_guard_emitted_once_per_block(self):
+        """同一段代码里连续两个存档节点，只该有一段惰性读盘守卫。
+
+        以前每个存档节点都吐一遍守卫，4 个节点就是 4 段一模一样的读盘。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        setter = tree.new_node(NN.GKNodeSaveSet, "写", gk_key="hp")
+        getter = tree.new_node(NN.GKNodeSaveGet, "读", gk_key="hp", gk_var="hp")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        gk_stub.connect(tree, setter, "完成", getter, "执行")
+        code, _ = gen(tree, V2)
+        self.assertLessEqual(code.count("_gk_read_save(gk_save_path)"), 2,
+                             f"惰性读盘守卫重复了:\n{code}")
+
+    def test_explicit_load_does_not_double_read(self):
+        """显式『存档_载入』之后不该再自动读一遍盘。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        loader = tree.new_node(NN.GKNodeSaveLoad, "载入", gk_slot="save1")
+        setter = tree.new_node(NN.GKNodeSaveSet, "写", gk_key="hp", gk_slot="save1")
+        gk_stub.connect(tree, event, "执行", loader, "执行")
+        gk_stub.connect(tree, loader, "完成", setter, "执行")
+        code, _ = gen(tree, V2)
+        self.assertEqual(code.count("_gk_read_save(gk_save_path)"), 1, code)
+
+    def test_save_has_two_named_branches(self):
+        """『存档_是否存在』的两个出口必须各自只生成一次。
+
+        回归:出口曾叫『完成』，而 emit_statement 会自动续接『完成』，
+        导致 else 分支被生成两遍(实测『没存档』打印两次)。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveHas, "有档吗", gk_slot="save1")
+        yes = tree.new_node(NN.GKNodePrint, "有档", gk_text="有存档")
+        no = tree.new_node(NN.GKNodePrint, "无档", gk_text="没存档")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        gk_stub.connect(tree, node, "有档", yes, "执行")
+        gk_stub.connect(tree, node, "没档", no, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_save_exists(", code)
+        self.assertIn("if ", code)
+        self.assertIn("else:", code)
+        self.assertEqual(code.count('print("有存档")'), 1, code)
+        self.assertEqual(code.count('print("没存档")'), 1, code)
+        self.assert_indent_sane(code)
+
+    def test_save_has_shares_name_with_branch_convention(self):
+        """两个出口不能叫『完成』，否则会被自动续接机制重复执行。"""
+        names = [spec["name"] for spec in NN.GKNodeSaveHas.gk_outputs]
+        self.assertNotIn("完成", names, "出口叫『完成』会被 emit_statement 重复续接")
+
+    def test_save_delete_clears_memory(self):
+        """删档必须同时清掉内存里那份，否则删了还能读到旧数据。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveDelete, "删档", gk_slot="save1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("_gk_delete_save(", code)
+        self.assertIn(".clear()", code)
+        self.assertIn("remove_absolute", code)
+
+
+class TestScreenEffectNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_screen_flash(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScreenFlash, "闪白", gk_time=0.3, gk_alpha=0.6)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("ColorRect.new()", code)
+        self.assertIn("MOUSE_FILTER_IGNORE", code)
+        self.assertIn("PRESET_FULL_RECT", code)
+        # 只淡 alpha，不能用 tween_property(rect,"color",...) 那样会连 RGB 一起改
+        self.assertIn('"color:a"', code)
+        self.assertIn(".queue_free)", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_screen_fade_creates_persistent_layer(self):
+        """转场遮罩必须是持久层，才能做"淡出 -> 换场景 -> 淡入"。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScreenFade, "黑场", gk_time=1.0, gk_to_opaque=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("CanvasLayer.new()", code)
+        # 注意:snake_case 会去掉前导下划线，所以变量名是 gk_fade_layer
+        self.assertIn("gk_fade_layer == null", code)
+        # 等渐变结束再往下走，否则"淡出->切场景"顺序会乱
+        self.assertIn("await ", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_screen_fade_out_hides_overlay(self):
+        """淡回透明后要把遮罩收起来，不能一直盖着。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScreenFade, "淡回", gk_time=1.0, gk_to_opaque=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn(".visible = false", code)
+
+    def test_two_fades_share_one_layer(self):
+        """两次渐变应复用同一个遮罩层，而不是各建一个。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeScreenFade, "黑场", gk_time=1.0, gk_to_opaque=True)
+        second = tree.new_node(NN.GKNodeScreenFade, "淡回", gk_time=1.0, gk_to_opaque=False)
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, _ = gen(tree, V2)
+        # 成员变量只声明一次(变量名不含前导下划线:snake_case 会去掉)
+        self.assertEqual(code.count("var gk_fade_layer: CanvasLayer"), 1, code)
+        self.assertEqual(code.count("var gk_fade_rect: ColorRect"), 1, code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

@@ -195,6 +195,8 @@ class GenContext:
         # 只有真的用了"自动找相机"才生成 get_first_camera()，
         # 避免给所有脚本都塞一个用不到的辅助函数。
         self.need_camera_finder = False
+        # 只有真的用了存档节点才生成那几个读写文件的辅助函数
+        self.need_save_helpers = False
 
     # ---- 生成段落 ----
     def new_section(self):
@@ -1195,6 +1197,319 @@ def _stmt_set_time_scale(ctx, node, indent):
     ctx.add_line(indent, f"Engine.time_scale = {scale}")
 
 
+# ==========================================================================
+# 音效
+# ==========================================================================
+def _audio_player_type(node):
+    """2D 还是普通音频播放器。3D 项目里用户会取消勾选『2D 音效』。"""
+    return "AudioStreamPlayer2D" if getattr(node, "gk_2d", True) else "AudioStreamPlayer"
+
+
+def _audio_host(ctx, node):
+    """音效挂到哪个节点上。默认挂当前脚本所在节点。"""
+    raw = (getattr(node, "gk_target", "") or "").strip()
+    if raw and raw != TARGET_SELF:
+        return ctx.target_expr(node, hint="audio")
+    return "self"
+
+
+@stmt_node("GKNodePlaySound")
+def _stmt_play_sound(ctx, node, indent):
+    """一次性音效:运行时建播放器、播完自己删。
+
+    ── 为什么不要求用户先摆好 AudioStreamPlayer ─────────────────---─
+    让用户为每个音效在场景里摆一个播放器节点，是"引擎在给用户添活"。
+    这里按需建、播完销毁，节点图里写一条就够了。
+    """
+    path = ctx.input_string(node, "音频路径", "")
+    volume = _tunable_number(ctx, node, "音量", "0.0", "sfx_volume")
+    pitch = _tunable_number(ctx, node, "音高", "1.0", "sfx_pitch")
+    player_type = _audio_player_type(node)
+    host = _audio_host(ctx, node)
+
+    stream_var = ctx.new_temp("sfx_stream")
+    player_var = ctx.new_temp("sfx")
+    # 音频文件缺失时给出可读的报错，而不是让 load() 静默返回 null 后再炸在别处
+    ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
+    ctx.add_line(indent, f"if {stream_var} != null:")
+    ctx.add_line(indent + 1, f"var {player_var} := {player_type}.new()")
+    ctx.add_line(indent + 1, f"{player_var}.stream = {stream_var}")
+    ctx.add_line(indent + 1, f"{player_var}.volume_db = {volume}")
+    ctx.add_line(indent + 1, f"{player_var}.pitch_scale = {pitch}")
+    ctx.add_line(indent + 1, f"{player_var}.max_polyphony = 4")
+    ctx.add_line(indent + 1, f"{host}.add_child({player_var})")
+    ctx.add_line(indent + 1, f"{player_var}.play()")
+    # 播完自己删:用 finished 信号，比"算时长"可靠(流长度不一定拿得到)
+    ctx.add_line(indent + 1, f"{player_var}.finished.connect({player_var}.queue_free)")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("找不到音频文件: " + str({path}))')
+
+
+@stmt_node("GKNodePlayMusic")
+def _stmt_play_music(ctx, node, indent):
+    """背景音乐:只保留一个播放器，切曲目时先停旧的。"""
+    path = ctx.input_string(node, "音频路径", "")
+    volume = gd_number(getattr(node, "gk_volume", -6.0))
+    fade = gd_number(getattr(node, "gk_fade", 0.5))
+
+    music_var = ctx.declare_var("_gk_music", "AudioStreamPlayer")
+    stream_var = ctx.new_temp("bgm_stream")
+
+    ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
+    ctx.add_line(indent, f"if {stream_var} != null:")
+    # 重复播放同一首时不要打断(主菜单返回游戏很常见)
+    ctx.add_line(indent + 1, f"if {music_var} != null and {music_var}.stream == {stream_var} and {music_var}.playing:")
+    ctx.add_line(indent + 2, "pass")
+    ctx.add_line(indent + 1, "else:")
+    ctx.add_line(indent + 2, f"if {music_var} != null:")
+    ctx.add_line(indent + 3, f"{music_var}.queue_free()")
+    ctx.add_line(indent + 2, f"{music_var} = AudioStreamPlayer.new()")
+    ctx.add_line(indent + 2, f"{music_var}.stream = {stream_var}")
+    ctx.add_line(indent + 2, f"{music_var}.bus = \"Master\"")
+    ctx.add_line(indent + 2, f"self.add_child({music_var})")
+    ctx.add_line(indent + 2, f"{music_var}.play()")
+    if float(getattr(node, "gk_fade", 0.5) or 0.0) > 0.0:
+        ctx.add_line(indent + 2, f"{music_var}.volume_db = -80.0")
+        fade_var = ctx.new_temp("fade")
+        ctx.add_line(indent + 2, f"var {fade_var} := create_tween()")
+        ctx.add_line(indent + 2,
+                     f"{fade_var}.tween_property({music_var}, \"volume_db\", {volume}, {fade})")
+    else:
+        ctx.add_line(indent + 2, f"{music_var}.volume_db = {volume}")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("找不到音乐文件: " + str({path}))')
+
+
+@stmt_node("GKNodeStopSound")
+def _stmt_stop_sound(ctx, node, indent):
+    fade = gd_number(getattr(node, "gk_fade", 0.5))
+    music_var = ctx.declare_var("_gk_music", "AudioStreamPlayer")
+    ctx.add_line(indent, f"if {music_var} != null:")
+    if float(getattr(node, "gk_fade", 0.5) or 0.0) > 0.0:
+        fade_var = ctx.new_temp("fade")
+        ctx.add_line(indent + 1, f"var {fade_var} := create_tween()")
+        ctx.add_line(indent + 1, f"{fade_var}.tween_property({music_var}, \"volume_db\", -80.0, {fade})")
+        ctx.add_line(indent + 1, f"{fade_var}.tween_callback({music_var}.stop)")
+    else:
+        ctx.add_line(indent + 1, f"{music_var}.stop()")
+
+
+# ==========================================================================
+# 存档
+# ==========================================================================
+# 为什么用"内存字典 + 显式保存"而不是每次写入都落盘:
+#   落盘是磁盘 IO，在 _process 里每帧调用会卡帧。分开之后
+#   "存档_写入"是廉价的，"存档_保存"才是真正写文件的那一次。
+_SAVE_DATA_VAR = "_gk_save_data"
+
+
+def _save_dict(ctx):
+    """声明(不初始化)存档字典成员变量。"""
+    return ctx.declare_var(_SAVE_DATA_VAR, "Dictionary")
+
+
+def _ensure_save_block(ctx, data, path, slot):
+    """保证存档字典在本代码块内已从磁盘载入一次。
+
+    ── 为什么需要去重 ──────────────────────────────────────────────
+    每个存档节点都要"确保已载入"。如果每个都无脑吐一遍守卫代码，
+    连着 4 个存档节点就会生成 4 段一模一样的 `if not loaded:` 读盘。
+    这里记下"本代码块第一次遇到存档节点时的位置与缩进"，
+    第二次起就把守卫代码**插回那个位置**，而不是再加一段。
+
+    ── 为什么用 `path == ""` 而不是另加一个 bool ────────────────────
+    少一个成员变量，而且语义正好:"路径还是空 = 还没读过盘"。
+    """
+    ctx.need_save_helpers = True
+    sink = getattr(ctx, "sink", None)
+    record = getattr(ctx, "_save_guard_at", None)
+    if record is None:
+        record = {}
+        ctx._save_guard_at = record
+
+    key = id(sink)
+    if key in record:
+        return
+
+    slot_expr = gd_string(slot)
+    lines = getattr(sink, "lines", None)
+    if isinstance(lines, list):
+        # 把守卫插回"块内第一个存档节点"的位置，缩进也就是对的
+        index = len(lines)
+        record[key] = True
+        lines.insert(index, f'    {path} = _gk_save_file({slot_expr})')
+        lines.insert(index + 1, f'    if {path} == "":')
+        lines.insert(index + 2, f"        {path} = _gk_save_file({slot_expr})")
+        lines.insert(index + 3, f"        {data} = _gk_read_save({path})")
+        return
+
+    # 兜底路径(拿不到收集器时):退化成每个节点各自守卫一次，仍然是正确的，
+    # 只是啰嗦一点。宁可啰嗦也不要生成错的代码。
+    ctx.add_line(0, f"{path} = _gk_save_file({slot_expr})")
+    ctx.add_line(0, f"if {path} == \"\":")
+    ctx.add_line(1, f"{path} = _gk_save_file({slot_expr})")
+    ctx.add_line(1, f"{data} = _gk_read_save({path})")
+
+
+@stmt_node("GKNodeSaveSet")
+def _stmt_save_set(ctx, node, indent):
+    data = _save_dict(ctx)
+    path = ctx.declare_var("_gk_save_path", "String")
+    slot = getattr(node, "gk_slot", "save1")
+    key = ctx.input_string(node, "键名", "")
+    socket = ctx._socket(node, "值")
+    if socket is not None and getattr(socket, "is_linked", False):
+        value = ctx.expr_of(socket)
+    else:
+        value = gd_literal(node.input_value(ctx, "值", 0))
+    ctx.add_line(indent, f"{data}[{key}] = {value}")
+    _ensure_save_block(ctx, data, path, slot)
+
+
+@stmt_node("GKNodeSaveGet")
+def _stmt_save_get(ctx, node, indent):
+    data = _save_dict(ctx)
+    path = ctx.declare_var("_gk_save_path", "String")
+    slot = getattr(node, "gk_slot", "save1")
+    key = ctx.input_string(node, "键名", "")
+    var_name = ctx.declare_var(getattr(node, "gk_var", "value"), "Variant")
+    default = gd_literal(node.input_value(ctx, "默认值", 0.0))
+    ctx.add_line(indent, f"{var_name} = {data}.get({key}, {default})")
+    ctx.read_vars.add(var_name)
+    _ensure_save_block(ctx, data, path, slot)
+
+
+@stmt_node("GKNodeSaveWrite")
+def _stmt_save_write(ctx, node, indent):
+    data = _save_dict(ctx)
+    path = ctx.declare_var("_gk_save_path", "String")
+    slot = getattr(node, "gk_slot", "save1")
+    ctx.add_line(indent, f"{path} = _gk_save_file({gd_string(slot)})")
+    ctx.add_line(indent, f"_gk_write_save({path}, {data})")
+    _ensure_save_block(ctx, data, path, slot)
+
+
+@stmt_node("GKNodeSaveLoad")
+def _stmt_save_load(ctx, node, indent):
+    data = _save_dict(ctx)
+    path = ctx.declare_var("_gk_save_path", "String")
+    slot = getattr(node, "gk_slot", "save1")
+    ctx.need_save_helpers = True
+    # 显式载入:设好路径后直接读，后面块内的守卫看到 path 非空就不会重复读
+    ctx.add_line(indent, f"{path} = _gk_save_file({gd_string(slot)})")
+    ctx.add_line(indent, f"{data} = _gk_read_save({path})")
+    # 占位登记，避免同块内其它存档节点再插一段惰性守卫
+    record = getattr(ctx, "_save_guard_at", None)
+    if record is None:
+        record = {}
+        ctx._save_guard_at = record
+    sink = getattr(ctx, "sink", None)
+    if sink is not None:
+        record[id(sink)] = True
+
+
+@stmt_node("GKNodeSaveHas")
+def _stmt_save_has(ctx, node, indent):
+    """『存档_是否存在』:两个执行出口(有档 / 没档)。
+
+    ── 为什么出口不叫『完成』 ──────────────────────────────────────
+    emit_statement() 在 handler 跑完后会**自动**沿名为『完成』的出口继续。
+    如果这里留一个『完成』出口，它就会把我的 else 分支再执行一遍
+    (实测:『没存档』被打印两次)。所以两个出口都起具体名字，
+    自动续接找不到『完成』自然就停住，分支完全由本函数接管。
+    """
+    slot = getattr(node, "gk_slot", "save1")
+    ctx.need_save_helpers = True
+    ctx.add_line(indent, f"if _gk_save_exists({gd_string(slot)}):")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "有档")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    has_else = any(True for _ in _next_nodes(node, "没档"))
+    if has_else:
+        ctx.add_line(indent, "else:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 1, "没档")
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 1, "pass")
+
+
+@stmt_node("GKNodeSaveDelete")
+def _stmt_save_delete(ctx, node, indent):
+    slot = getattr(node, "gk_slot", "save1")
+    data = _save_dict(ctx)
+    ctx.need_save_helpers = True
+    ctx.add_line(indent, f"_gk_delete_save({gd_string(slot)})")
+    # 删档后内存里那份也要清掉，否则"删了档还能读到旧数据"
+    ctx.add_line(indent, f"{data}.clear()")
+
+
+# ==========================================================================
+# 屏幕效果
+# ==========================================================================
+@stmt_node("GKNodeScreenFlash")
+def _stmt_screen_flash(ctx, node, indent):
+    color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+    alpha = float(getattr(node, "gk_alpha", 0.6) or 0.6)
+    duration = _tunable_number(ctx, node, "时长", "0.3", "flash_time")
+
+    rect_var = ctx.new_temp("flash")
+    tween_var = ctx.new_temp("flash_tween")
+    ctx.add_line(indent, f"var {rect_var} := ColorRect.new()")
+    ctx.add_line(indent, f"{rect_var}.color = Color({gd_number(color[0])}, {gd_number(color[1])}, "
+                         f"{gd_number(color[2])}, {gd_number(alpha)})")
+    # 不挡鼠标，否则闪光期间点不动 UI
+    ctx.add_line(indent, f"{rect_var}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent, f"{rect_var}.set_anchors_preset(Control.PRESET_FULL_RECT)")
+    # 盖在 UI 之上(UI 一般在 layer 0~10)
+    ctx.add_line(indent, f"{rect_var}.z_index = 100")
+    ctx.add_line(indent, f"add_child({rect_var})")
+    ctx.add_line(indent, f"var {tween_var} := create_tween()")
+    # 只淡 alpha:`color:a` 是子属性路径，改它不影响 RGB
+    ctx.add_line(indent, f"{tween_var}.tween_property({rect_var}, \"color:a\", 0.0, {duration})")
+    ctx.add_line(indent, f"{tween_var}.tween_callback({rect_var}.queue_free)")
+
+
+@stmt_node("GKNodeScreenFade")
+def _stmt_screen_fade(ctx, node, indent):
+    color = getattr(node, "gk_color", (0.0, 0.0, 0.0, 1.0))
+    duration = _tunable_number(ctx, node, "时长", "1.0", "fade_time")
+    to_opaque = bool(getattr(node, "gk_to_opaque", True))
+    hold = float(getattr(node, "gk_hold", 0.0) or 0.0)
+
+    # 用一个持久的遮罩层，才能做"淡出 -> 换场景 -> 淡入"
+    layer_var = ctx.declare_var("_gk_fade_layer", "CanvasLayer")
+    rect_var = ctx.declare_var("_gk_fade_rect", "ColorRect")
+
+    ctx.add_line(indent, f"if {layer_var} == null:")
+    ctx.add_line(indent + 1, f"{layer_var} = CanvasLayer.new()")
+    ctx.add_line(indent + 1, f"{layer_var}.layer = 100")
+    ctx.add_line(indent + 1, f"add_child({layer_var})")
+    ctx.add_line(indent + 1, f"{rect_var} = ColorRect.new()")
+    ctx.add_line(indent + 1, f"{rect_var}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{rect_var}.set_anchors_preset(Control.PRESET_FULL_RECT)")
+    ctx.add_line(indent + 1, f"{layer_var}.add_child({rect_var})")
+
+    r, g, b = color[0], color[1], color[2]
+    start_alpha = 0.0 if to_opaque else 1.0
+    end_alpha = 1.0 if to_opaque else 0.0
+    ctx.add_line(indent, f"{rect_var}.color = Color({gd_number(r)}, {gd_number(g)}, "
+                         f"{gd_number(b)}, {gd_number(start_alpha)})")
+    ctx.add_line(indent, f"{rect_var}.visible = true")
+
+    tween_var = ctx.new_temp("fade")
+    ctx.add_line(indent, f"var {tween_var} := create_tween()")
+    ctx.add_line(indent, f"{tween_var}.tween_property({rect_var}, \"color:a\", "
+                         f"{gd_number(end_alpha)}, {duration})")
+    if not to_opaque:
+        # 淡回透明后把遮罩收起来，否则它会一直盖着(虽然透明，仍会吃掉性能)
+        ctx.add_line(indent, f"{tween_var}.tween_callback(func(): {rect_var}.visible = false)")
+    if hold > 0.0:
+        ctx.add_line(indent, f"{tween_var}.tween_interval({gd_number(hold)})")
+    # 等渐变结束再走『完成』出口，这样"淡出 -> 切场景"的顺序才正确
+    ctx.add_line(indent, f"await {tween_var}.finished")
+
+
 @stmt_node("GKNodeQueueFree")
 def _stmt_queue_free(ctx, node, indent):
     raw = getattr(node, "gk_target", TARGET_SELF)
@@ -1433,6 +1748,68 @@ class Generator:
                     '    for node in get_tree().root.find_children("*", "Camera3D", true, false):',
                     "        return node",
                     "    return null",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 存档读写辅助函数 ----
+        if self.ctx.need_save_helpers:
+            sections.append({
+                "signature": "func _gk_save_file(slot: String) -> String:",
+                "lines": [
+                    '    return "user://gk_" + slot + ".json"',
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_save_exists(slot: String) -> bool:",
+                "lines": [
+                    "    return FileAccess.file_exists(_gk_save_file(slot))",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_read_save(path: String) -> Dictionary:",
+                "lines": [
+                    "    if not FileAccess.file_exists(path):",
+                    "        return {}",
+                    "    var file := FileAccess.open(path, FileAccess.READ)",
+                    "    if file == null:",
+                    '        push_warning("存档打不开: " + path)',
+                    "        return {}",
+                    "    var text := file.get_as_text()",
+                    "    file.close()",
+                    "    var parsed: Variant = JSON.parse_string(text)",
+                    "    if parsed is Dictionary:",
+                    "        return parsed",
+                    '    push_warning("存档内容不是合法 JSON: " + path)',
+                    "    return {}",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_write_save(path: String, data: Dictionary) -> void:",
+                "lines": [
+                    "    var file := FileAccess.open(path, FileAccess.WRITE)",
+                    "    if file == null:",
+                    '        push_warning("存档写不进去: " + path)',
+                    "        return",
+                    "    file.store_string(JSON.stringify(data))",
+                    "    file.close()",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_delete_save(slot: String) -> void:",
+                "lines": [
+                    "    var path := _gk_save_file(slot)",
+                    "    if not FileAccess.file_exists(path):",
+                    "        return",
+                    # 用 remove_absolute:path 已经是完整的 user:// 路径，
+                    # 再 DirAccess.open("user://") + get_file() 反而容易拼错
+                    "    DirAccess.remove_absolute(path)",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
