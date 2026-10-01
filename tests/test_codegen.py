@@ -1325,6 +1325,194 @@ class TestContainerNodes(Base):
         self.assertTrue(any("变量名" in w for w in warnings), warnings)
 
 
+class TestGamepadNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_joy_axis_applies_deadzone(self):
+        """死区必须自己处理。
+
+        Input.get_joy_axis 不做死区，摇杆回中不准的手柄会一直输出
+        0.05 之类的值，角色就自己走路。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeJoyAxis, "摇杆", gk_axis="JOY_AXIS_LEFT_X",
+                             gk_deadzone=0.2)
+        # 必须真的**用到**这个输出，节点才会被生成(表达式是按需求值的)
+        vec = tree.new_node(NN.GKNodeVectorMake, "包成向量")
+        length = tree.new_node(NN.GKNodeVectorLength, "取长度")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        gk_stub.connect(tree, node, "强度", vec, "X")
+        gk_stub.connect(tree, vec, "向量", length, "向量")
+        gk_stub.connect(tree, length, "长度", printer, "内容")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("JoyAxis.JOY_AXIS_LEFT_X", code)
+        self.assertIn("func _gk_joy_axis(", code)
+        self.assertIn("Input.get_joy_axis(", code)
+        self.assertIn("absf(raw) < deadzone", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_joy_vector_uses_both_axes(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeJoyVector, "左摇杆", gk_stick="LEFT")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, node, "方向", move, "方向")
+        code, _ = gen(tree, V2)
+        self.assertIn("JOY_AXIS_LEFT_X", code)
+        self.assertIn("JOY_AXIS_LEFT_Y", code)
+        self.assertIn("Vector2(", code)
+
+    def test_joy_vector_right_stick(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeJoyVector, "右摇杆", gk_stick="RIGHT")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, node, "方向", move, "方向")
+        code, _ = gen(tree, V2)
+        self.assertIn("JOY_AXIS_RIGHT_X", code)
+        self.assertNotIn("JOY_AXIS_LEFT_X", code)
+
+    def test_joy_button_held_and_just_pressed(self):
+        """刚按下必须靠"记住上一帧"实现(Godot 没有手柄按键的 just_pressed)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        held = tree.new_node(NN.GKNodeJoyButton, "按住", gk_button="JOY_BUTTON_B")
+        down = tree.new_node(NN.GKNodeJoyButtonDown, "刚按下", gk_button="JOY_BUTTON_A")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        branch = tree.new_node(NN.GKNodeBranch, "跳出吗")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, down, "刚按下", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.is_joy_button_pressed(", code)
+        self.assertIn("JoyButton.JOY_BUTTON_A", code)
+        # 记住上一帧
+        self.assertIn("and not ", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_joy_vibrate_stops_itself(self):
+        """震动必须自己停，不能一直震。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeJoyVibrate, "震动", gk_time=0.2)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.start_joy_vibration(", code)
+        self.assertIn("Input.stop_joy_vibration(", code)
+        self.assertIn("create_timer(", code)
+        self.assert_indent_sane(code)
+
+
+class TestTouchNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_touch_drag_resets_every_frame(self):
+        """拖动累积值必须每帧清零。
+
+        回归:不清零的话手指不动时它也会一直保持上一次的偏移，
+        角色就永远朝那个方向走。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        drag = tree.new_node(NN.GKNodeTouchDrag, "拖动")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, drag, "方向", move, "方向")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 必须有 _input 接事件
+        self.assertIn("func _input(event: InputEvent) -> void:", code)
+        self.assertIn("InputEventScreenDrag", code)
+        # 必须有每帧清零
+        self.assertIn("_gk_touch_drag = Vector2.ZERO", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_touch_drag_clears_on_release(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        drag = tree.new_node(NN.GKNodeTouchDrag, "拖动", gk_reset=True)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, drag, "方向", move, "方向")
+        code, _ = gen(tree, V2)
+        self.assertIn("InputEventScreenTouch", code)
+        self.assertIn(".pressed", code)
+
+    def test_touch_button_uses_action(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeTouchButton, "触屏跳", gk_action="jump")
+        branch = tree.new_node(NN.GKNodeBranch, "跳吗")
+        printer = tree.new_node(NN.GKNodePrint, "跳")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, node, "按住", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.is_action_pressed(", code)
+        self.assertIn("ACTION_JUMP", code)
+
+
+class TestScreenFilterNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_screen_filter_builds_shader_material(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScreenFilter, "受击红", gk_amount=0.6,
+                             gk_softness=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("const _GK_FILTER_SHADER :=", code)
+        self.assertIn("shader_type canvas_item;", code)
+        self.assertIn("SCREEN_TEXTURE", code)
+        self.assertIn("ShaderMaterial.new()", code)
+        self.assertIn("set_shader_parameter(\"amount\"", code)
+        self.assertIn("set_shader_parameter(\"tint\"", code)
+        self.assertIn("func _gk_ensure_filter(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_screen_filter_sits_below_flash(self):
+        """滤镜层(90)要盖住界面(10)但低于闪白/转场(100)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScreenFilter, "受击红")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("layer = 90", code)
+
+    def test_screen_filter_softness_uses_tween(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScreenFilter, "受击红", gk_amount=0.8,
+                             gk_softness=0.3)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("tween_method(", code)
+
+    def test_shader_const_only_when_used(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_GK_FILTER_SHADER", code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

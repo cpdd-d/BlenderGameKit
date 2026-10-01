@@ -14,7 +14,7 @@
 from . import node_base as B
 from .node_base import finalize, gd_node_path, gd_string, snake_case, target_pin, TARGET_SELF
 from .. import gk_sockets as S
-from ..gk_sockets import ANY, BOOL, COLOR, FLOAT, FLOW, INT, OBJECT, TEXT, VECTOR
+from ..gk_sockets import ANY, BOOL, COLOR, FLOAT, FLOW, INT, OBJECT, TEXT, VECTOR, VECTOR2
 
 CLASSES = []
 
@@ -1693,6 +1693,219 @@ class GKNodeDictHas(B.GKStatementNode):
 
 
 # ==========================================================================
+# 手柄
+# ==========================================================================
+_JOY_AXES = (
+    ("JOY_AXIS_LEFT_X", "左摇杆 左右", ""),
+    ("JOY_AXIS_LEFT_Y", "左摇杆 上下", ""),
+    ("JOY_AXIS_RIGHT_X", "右摇杆 左右", ""),
+    ("JOY_AXIS_RIGHT_Y", "右摇杆 上下", ""),
+    ("JOY_AXIS_TRIGGER_LEFT", "左扳机", ""),
+    ("JOY_AXIS_TRIGGER_RIGHT", "右扳机", ""),
+)
+
+_JOY_BUTTONS = (
+    ("JOY_BUTTON_A", "A(×)", ""),
+    ("JOY_BUTTON_B", "B(○)", ""),
+    ("JOY_BUTTON_X", "X(□)", ""),
+    ("JOY_BUTTON_Y", "Y(△)", ""),
+    ("JOY_BUTTON_LEFT_SHOULDER", "左肩键 LB", ""),
+    ("JOY_BUTTON_RIGHT_SHOULDER", "右肩键 RB", ""),
+    ("JOY_BUTTON_BACK", "返回 / Select", ""),
+    ("JOY_BUTTON_START", "开始 / Start", ""),
+    ("JOY_BUTTON_DPAD_UP", "十字键 上", ""),
+    ("JOY_BUTTON_DPAD_DOWN", "十字键 下", ""),
+    ("JOY_BUTTON_DPAD_LEFT", "十字键 左", ""),
+    ("JOY_BUTTON_DPAD_RIGHT", "十字键 右", ""),
+)
+
+
+@N
+class GKNodeJoyAxis(B.GKExpressionNode):
+    bl_idname = "GKNodeJoyAxis"
+    bl_label = "手柄_摇杆轴"
+    bl_icon = "DRIVER"
+    gk_category = "手柄"
+    gk_doc = "读手柄某个轴/扳机的强度(-1 ~ 1)。自带死区，不会因为摇杆回中不准而漂移"
+    gk_prop_defs = (
+        ("gk_axis", "enum", "JOY_AXIS_LEFT_X", "轴", "", _JOY_AXES),
+        ("gk_deadzone", "float", 0.2, "死区", "小于这个值算 0"),
+        ("gk_device", "int", 0, "手柄编号", "0 表示第一个手柄"),
+    )
+    gk_outputs = (S.pin(FLOAT, "强度", 0.0),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_axis", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_deadzone", text="")
+        row.prop(self, "gk_device", text="")
+
+
+@N
+class GKNodeJoyVector(B.GKExpressionNode):
+    bl_idname = "GKNodeJoyVector"
+    bl_label = "手柄_摇杆方向"
+    bl_icon = "ORIENTATION_GIMBAL"
+    gk_category = "手柄"
+    gk_doc = ("把一根摇杆读成一个方向向量，可以直接接到『移动_按方向』上。"
+              "建议配合『逻辑_比较』判断长度是否大于 0")
+    gk_prop_defs = (
+        ("gk_stick", "enum", "LEFT", "摇杆", "", (
+            ("LEFT", "左摇杆", ""),
+            ("RIGHT", "右摇杆", ""),
+        )),
+        ("gk_deadzone", "float", 0.2, "死区", "小于这个值算 0"),
+        ("gk_device", "int", 0, "手柄编号", "0 表示第一个手柄"),
+    )
+    gk_outputs = (S.pin(VECTOR2, "方向", (0.0, 0.0)),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_stick", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_deadzone", text="")
+        row.prop(self, "gk_device", text="")
+
+
+@N
+class GKNodeJoyButton(B.GKExpressionNode):
+    bl_idname = "GKNodeJoyButton"
+    bl_label = "手柄_按键按住"
+    bl_icon = "HAND"
+    gk_category = "手柄"
+    gk_doc = "手柄按键是否按住"
+    gk_prop_defs = (
+        ("gk_button", "enum", "JOY_BUTTON_A", "按键", "", _JOY_BUTTONS),
+        ("gk_device", "int", 0, "手柄编号", "0 表示第一个手柄"),
+    )
+    gk_outputs = (S.pin(BOOL, "按住", False),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_button", text="")
+        row.prop(self, "gk_device", text="")
+
+
+@N
+class GKNodeJoyButtonDown(B.GKExpressionNode):
+    bl_idname = "GKNodeJoyButtonDown"
+    bl_label = "手柄_按键按下"
+    bl_icon = "HAND"
+    gk_category = "手柄"
+    gk_doc = "手柄按键是否刚按下(本帧)。做跳跃 / 攻击用这个，避免按住连发"
+    gk_prop_defs = (
+        ("gk_button", "enum", "JOY_BUTTON_A", "按键", "", _JOY_BUTTONS),
+        ("gk_device", "int", 0, "手柄编号", "0 表示第一个手柄"),
+    )
+    gk_outputs = (S.pin(BOOL, "刚按下", False),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_button", text="")
+        row.prop(self, "gk_device", text="")
+
+
+@N
+class GKNodeJoyVibrate(B.GKStatementNode):
+    bl_idname = "GKNodeJoyVibrate"
+    bl_label = "手柄_震动"
+    bl_icon = "RNDCURVE"
+    gk_category = "手柄"
+    gk_doc = "手柄震动一下(受击 / 爆炸反馈)。用场景树计时器自动停，不需要自己收尾"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "强弱", 0.6),
+        S.pin(FLOAT, "时长", 0.2),
+    )
+    gk_input_props = {"强弱": "gk_weak", "时长": "gk_time"}
+    gk_prop_defs = (
+        ("gk_weak", "float", 0.6, "弱马达", "0~1"),
+        ("gk_strong", "float", 0.6, "强马达", "0~1"),
+        ("gk_time", "float", 0.2, "时长", "秒"),
+        ("gk_device", "int", 0, "手柄编号", "0 表示第一个手柄"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_weak", text="")
+        row.prop(self, "gk_strong", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_time", text="")
+        row.prop(self, "gk_device", text="")
+
+
+# ==========================================================================
+# 触屏
+# ==========================================================================
+@N
+class GKNodeTouchButton(B.GKExpressionNode):
+    bl_idname = "GKNodeTouchButton"
+    bl_label = "触屏_按键按住"
+    bl_icon = "HAND"
+    gk_category = "触屏"
+    gk_doc = ("触屏上某个输入动作是否按住。移动端的虚拟按键通常会映射成输入动作，"
+              "所以和键盘共用同一套动作名")
+    gk_prop_defs = (
+        ("gk_action", "string", "ui_accept", "动作名", "Godot 输入映射里的动作"),
+    )
+    gk_outputs = (S.pin(BOOL, "按住", False),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_action", text="")
+
+
+@N
+class GKNodeTouchDrag(B.GKExpressionNode):
+    bl_idname = "GKNodeTouchDrag"
+    bl_label = "触屏_拖动方向"
+    bl_icon = "ORIENTATION_GIMBAL"
+    gk_category = "触屏"
+    gk_doc = ("手指这次拖动产生的方向向量(松开手指归零)。做虚拟摇杆用。"
+              "配合『输入_方向向量』那种判定逻辑即可驱动移动")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_scale", "float", 0.02, "灵敏度", "像素转成向量的比例"),
+        ("gk_clamp", "float", 1.0, "最大长度", "向量长度上限"),
+        ("gk_reset", "bool", True, "松手归零", "手指松开后是否把向量清零"),
+    )
+    gk_outputs = (S.pin(VECTOR2, "方向", (0.0, 0.0)),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_scale", text="")
+        row.prop(self, "gk_clamp", text="")
+        layout.prop(self, "gk_reset", text="松手归零", toggle=True)
+
+
+# ==========================================================================
+# 屏幕效果
+# ==========================================================================
+@N
+class GKNodeScreenFilter(B.GKStatementNode):
+    bl_idname = "GKNodeScreenFilter"
+    bl_label = "屏幕_滤镜"
+    bl_icon = "SHADERFX"
+    gk_category = "屏幕效果"
+    gk_doc = ("给整个画面蒙一层颜色(受击变红 / 中毒变绿 / 回忆泛黄)。"
+              "用全屏着色器材质实现，强度可平滑过渡")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "强度", 0.5),
+    )
+    gk_input_props = {"强度": "gk_amount"}
+    gk_prop_defs = (
+        ("gk_amount", "float", 0.5, "强度", "0 = 原画面，1 = 完全染色"),
+        ("gk_color", "color", (1.0, 0.15, 0.15, 1.0), "颜色", "叠加的颜色"),
+        ("gk_softness", "float", 0.0, "过渡秒数", "0 表示立刻生效"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_amount", text="")
+        row.prop(self, "gk_softness", text="")
+
+
+# ==========================================================================
 # 实用
 # ==========================================================================
 @N
@@ -1714,5 +1927,5 @@ ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
 CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
-                  "运算", "显示", "相机", "音效", "存档", "界面", "屏幕效果",
-                  "射线", "定时", "列表", "字典", "时间", "实用")
+                  "手柄", "触屏", "运算", "显示", "相机", "音效", "存档", "界面",
+                  "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用")

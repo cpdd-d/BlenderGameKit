@@ -209,6 +209,13 @@ class GenContext:
         self.need_save_helpers = False
         # 只有真的用了界面节点才生成 UI 容器辅助函数
         self.need_ui_helpers = False
+        # 只有真的用了手柄节点才生成摇杆死区辅助函数
+        self.need_joy_helpers = False
+        # 只有真的用了屏幕滤镜才生成全屏材质辅助函数
+        self.need_screen_filter = False
+        # 触屏拖动需要往 _input 里挂事件累积逻辑
+        self.need_touch_drag = False
+        self._input_handlers = []   # [(函数名, 松手是否清零)]
         # 节点图自己"生出来"的函数(比如按钮的点击回调)。
         # 它们不属于事件，需要在 generate() 里单独拼进最终脚本。
         self.extra_sections = []
@@ -355,6 +362,17 @@ class GenContext:
         name = base if not used else f"{base}_{used + 1}"
         self._func_owners[name] = key
         return name
+
+    def register_input_handler(self, func_name, reset=False):
+        """登记一个要挂进 _input(event) 的回调。
+
+        触屏拖动这类输入没有"当前值"这种属性，只能靠事件累积，
+        所以必须有地方接事件。这里登记后由 generate() 统一拼一个 _input。
+        """
+        entry = (func_name, bool(reset))
+        if entry not in self._input_handlers:
+            self._input_handlers.append(entry)
+        return func_name
 
     def add_line(self, indent, text=""):
         # 记住最近一次写入的缩进:纯表达式处理器(射线检测等)需要知道
@@ -2072,6 +2090,168 @@ def _stmt_dict_has(ctx, node, indent):
             ctx.add_line(indent + 1, "pass")
 
 
+# ==========================================================================
+# 手柄
+# ==========================================================================
+_JOY_DEADZONE_FN = "_gk_joy_axis"
+
+
+@expr_node("GKNodeJoyAxis")
+def _expr_joy_axis(ctx, node):
+    ctx.need_joy_helpers = True
+    axis = getattr(node, "gk_axis", "JOY_AXIS_LEFT_X") or "JOY_AXIS_LEFT_X"
+    device = int(getattr(node, "gk_device", 0) or 0)
+    deadzone = gd_number(getattr(node, "gk_deadzone", 0.2))
+    # 死区不能靠 Input.get_joy_axis 自己处理:它不做死区，
+    # 摇杆回中不准的手柄会一直输出 0.05 之类的值，角色就自己走路
+    return f"{_JOY_DEADZONE_FN}({device}, JoyAxis.{axis}, {deadzone})"
+
+
+@expr_node("GKNodeJoyVector")
+def _expr_joy_vector(ctx, node):
+    ctx.need_joy_helpers = True
+    stick = getattr(node, "gk_stick", "LEFT") or "LEFT"
+    device = int(getattr(node, "gk_device", 0) or 0)
+    deadzone = gd_number(getattr(node, "gk_deadzone", 0.2))
+    x_axis = "JOY_AXIS_RIGHT_X" if stick == "RIGHT" else "JOY_AXIS_LEFT_X"
+    y_axis = "JOY_AXIS_RIGHT_Y" if stick == "RIGHT" else "JOY_AXIS_LEFT_Y"
+    x = f"{_JOY_DEADZONE_FN}({device}, JoyAxis.{x_axis}, {deadzone})"
+    y = f"{_JOY_DEADZONE_FN}({device}, JoyAxis.{y_axis}, {deadzone})"
+    # 注意:Godot 的摇杆 Y 轴向上为负，和屏幕坐标一致，所以直接用
+    return f"Vector2({x}, {y})"
+
+
+def _joy_button_expr(node):
+    button = getattr(node, "gk_button", "JOY_BUTTON_A") or "JOY_BUTTON_A"
+    device = int(getattr(node, "gk_device", 0) or 0)
+    return device, f"JoyButton.{button}"
+
+
+@expr_node("GKNodeJoyButton")
+def _expr_joy_button(ctx, node):
+    device, button = _joy_button_expr(node)
+    return f"Input.is_joy_button_pressed({device}, {button})"
+
+
+@expr_node("GKNodeJoyButtonDown")
+def _expr_joy_button_down(ctx, node):
+    """刚按下:用 Input.is_action_just_pressed 的思路，但手柄按键没有对应动作名，
+    所以自己记"上一帧是否按住"。"""
+    device, button = _joy_button_expr(node)
+    now_var = ctx.declare_var(f"gk_joy_now_{snake_case(node.name, 'btn')}", "bool",
+                              key=id(node))
+    prev_var = ctx.declare_var(f"gk_joy_prev_{snake_case(node.name, 'btn')}", "bool",
+                               key=id(node))
+    result_var = ctx.declare_var(f"gk_joy_down_{snake_case(node.name, 'btn')}", "bool",
+                                 key=id(node))
+    ctx.read_vars.update({now_var, prev_var, result_var})
+    indent = ctx._expr_indent
+    ctx.add_line(indent, f"{now_var} = Input.is_joy_button_pressed({device}, {button})")
+    ctx.add_line(indent, f"{result_var} = {now_var} and not {prev_var}")
+    ctx.add_line(indent, f"{prev_var} = {now_var}")
+    return result_var
+
+
+@stmt_node("GKNodeJoyVibrate")
+def _stmt_joy_vibrate(ctx, node, indent):
+    weak = gd_number(getattr(node, "gk_weak", 0.6))
+    strong = gd_number(getattr(node, "gk_strong", 0.6))
+    duration = _tunable_number(ctx, node, "时长", "0.2", "rumble_time")
+    device = int(getattr(node, "gk_device", 0) or 0)
+    ctx.add_line(indent, f"Input.start_joy_vibration({device}, {weak}, {strong}, {duration})")
+    # 到点自动停:不依赖玩家再点一次，也不会一直震
+    ctx.add_line(indent, f"get_tree().create_timer({duration}).timeout.connect("
+                         f"func(): Input.stop_joy_vibration({device}))")
+
+
+# ==========================================================================
+# 触屏
+# ==========================================================================
+@expr_node("GKNodeTouchButton")
+def _expr_touch_button(ctx, node):
+    action = ctx.input_action(node, "gk_action", "ui_accept")
+    return f"Input.is_action_pressed({action})"
+
+
+@expr_node("GKNodeTouchDrag")
+def _expr_touch_drag(ctx, node):
+    """手指这次拖动方向:本帧内累积的位移。
+
+    ── 为什么要每帧清零 ────────────────────────────────────────────
+    Godot 把触摸拖动作为 InputEventScreenDrag 事件推给脚本，没有"当前拖动
+    向量"这种现成属性，只能自己累积。但累积值如果不清零，手指不动时它也会
+    一直保持上一次的偏移，角色就永远朝那个方向走。所以:
+      1. _input 里把本帧的位移累加进去
+      2. 每帧结束时清零(在 _process 末尾)
+    这样读到的就是"这一帧手指移动了多少"，语义和摇杆一致。
+    """
+    ctx.need_touch_drag = True
+    vec_var = ctx.declare_var("_gk_touch_drag", "Vector2", key=None)
+    ctx.read_vars.add(vec_var)
+    scale = gd_number(getattr(node, "gk_scale", 0.02))
+    limit = gd_number(getattr(node, "gk_clamp", 1.0))
+    reset = bool(getattr(node, "gk_reset", True))
+    handler = ctx.declare_func_name(f"gk_on_touch_{snake_case(node.name, 'drag')}",
+                                    key=id(node))
+    ctx.register_input_handler(handler, reset=reset)
+
+    # 每帧用完就清零。放在 process_hooks 里，会追加到 _process 末尾，
+    # 保证"本帧已经读过它"之后才清。
+    hook_key = "touch_drag_reset"
+    if hook_key not in ctx.process_hooks:
+        ctx.process_hooks[hook_key] = [f"{vec_var} = Vector2.ZERO"]
+
+    return f"{vec_var}.limit_length({limit}) * {scale}"
+
+
+# ==========================================================================
+# 屏幕效果
+# ==========================================================================
+# 全屏滤镜着色器。用 SCREEN_TEXTURE / SCREEN_UV 读当前画面再染色 ——
+# 这是 Godot 4 画布着色器里读屏的标准做法(实测编译通过)。
+_GD_FILTER_SHADER = """shader_type canvas_item;
+uniform float amount : hint_range(0.0, 1.0) = 0.0;
+uniform vec4 tint : source_color = vec4(1.0, 1.0, 1.0, 1.0);
+void fragment() {
+    vec4 screen = texture(SCREEN_TEXTURE, SCREEN_UV);
+    COLOR = vec4(mix(screen.rgb, tint.rgb, amount), screen.a);
+}
+"""
+_FILTER_SHADER_CONST = "_GK_FILTER_SHADER"
+
+
+def _screen_filter_mat(ctx):
+    """取(必要时创建)全屏滤镜的材质。返回 (材质变量, 根变量, 矩形变量)。"""
+    layer = ctx.declare_var("_gk_filter_layer", "CanvasLayer")
+    rect = ctx.declare_var("_gk_filter_rect", "ColorRect")
+    mat = ctx.declare_var("_gk_filter_mat", "ShaderMaterial")
+    ctx.need_screen_filter = True
+    return mat, layer, rect
+
+
+@stmt_node("GKNodeScreenFilter")
+def _stmt_screen_filter(ctx, node, indent):
+    mat, layer, rect = _screen_filter_mat(ctx)
+    amount = _tunable_number(ctx, node, "强度", "0.0", "filter_amount")
+    color = getattr(node, "gk_color", (1.0, 0.15, 0.15, 1.0))
+    softness = float(getattr(node, "gk_softness", 0.0) or 0.0)
+
+    # 第一次用到时把全屏遮罩建起来(着色器源码作为常量放在脚本开头)
+    ctx.add_line(indent, "_gk_ensure_filter(self)")
+    ctx.add_line(indent, f"{mat}.set_shader_parameter(\"tint\", "
+                         f"Color({gd_number(color[0])}, {gd_number(color[1])}, "
+                         f"{gd_number(color[2])}, {gd_number(color[3])}))")
+    if softness > 0.0:
+        tween_var = ctx.new_temp("filter")
+        ctx.add_line(indent, f"var {tween_var} := create_tween()")
+        ctx.add_line(indent, f"{tween_var}.tween_method(func(v): "
+                             f"{mat}.set_shader_parameter(\"amount\", v), "
+                             f"float({mat}.get_shader_parameter(\"amount\")), "
+                             f"{amount}, {gd_number(softness)})")
+    else:
+        ctx.add_line(indent, f"{mat}.set_shader_parameter(\"amount\", {amount})")
+
+
 @stmt_node("GKNodeQueueFree")
 def _stmt_queue_free(ctx, node, indent):
     raw = getattr(node, "gk_target", TARGET_SELF)
@@ -2297,6 +2477,24 @@ class Generator:
                     # hook 行自带相对缩进，这里补上函数体的 4 空格
                     target_section["lines"].append(("    " + text) if text else "")
 
+        # ---- 触屏拖动:需要往 _input(event) 里挂事件累积 ----
+        if self.ctx._input_handlers:
+            target_section = None
+            for section in sections:
+                if section["signature"].startswith("func _input("):
+                    target_section = section
+                    break
+            if target_section is None:
+                target_section = {
+                    "signature": "func _input(event: InputEvent) -> void:",
+                    "lines": [],
+                    "empty_body": "    pass",
+                    "separator": True,
+                }
+                sections.append(target_section)
+            for func_name, reset in self.ctx._input_handlers:
+                target_section["lines"].append(f"    {func_name}(event)")
+
         # ---- 自动找相机的小工具 ----
         if self.ctx.need_camera_finder:
             sections.append({
@@ -2414,6 +2612,68 @@ class Generator:
                 "separator": True,
             })
 
+        # ---- 手柄摇杆死区 ----
+        if self.ctx.need_joy_helpers:
+            sections.append({
+                "signature": "func _gk_joy_axis(device: int, axis: int, deadzone: float) -> float:",
+                "lines": [
+                    "    var raw := Input.get_joy_axis(device, axis)",
+                    "    if absf(raw) < deadzone:",
+                    "        return 0.0",
+                    # 死区外重新映射到 0~1，否则推杆起点会"跳"一下
+                    "    return clampf(remap(absf(raw), deadzone, 1.0, 0.0, 1.0), 0.0, 1.0) * signf(raw)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 屏幕滤镜 ----
+        if self.ctx.need_screen_filter:
+            sections.append({
+                "signature": "func _gk_ensure_filter(host: Node) -> void:",
+                "lines": [
+                    "    if _gk_filter_layer != null:",
+                    "        return",
+                    "    _gk_filter_layer = CanvasLayer.new()",
+                    "    _gk_filter_layer.name = \"GKFilter\"",
+                    # layer 90:盖住游戏和普通界面(10)，但低于闪白/转场(100)
+                    "    _gk_filter_layer.layer = 90",
+                    "    host.add_child(_gk_filter_layer)",
+                    "    _gk_filter_rect = ColorRect.new()",
+                    "    _gk_filter_rect.set_anchors_preset(Control.PRESET_FULL_RECT)",
+                    "    _gk_filter_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "    var sh := Shader.new()",
+                    "    sh.code = _GK_FILTER_SHADER",
+                    "    _gk_filter_mat = ShaderMaterial.new()",
+                    "    _gk_filter_mat.shader = sh",
+                    "    _gk_filter_mat.set_shader_parameter(\"amount\", 0.0)",
+                    "    _gk_filter_mat.set_shader_parameter(\"tint\", Color(1, 1, 1, 1))",
+                    "    _gk_filter_rect.material = _gk_filter_mat",
+                    "    _gk_filter_layer.add_child(_gk_filter_rect)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 触屏拖动的事件处理 ----
+        for func_name, reset in self.ctx._input_handlers:
+            lines = [
+                "    if event is InputEventScreenDrag:",
+                "        _gk_touch_drag += (event as InputEventScreenDrag).relative",
+            ]
+            if reset:
+                lines += [
+                    "    elif event is InputEventScreenTouch:",
+                    "        if not (event as InputEventScreenTouch).pressed:",
+                    "            _gk_touch_drag = Vector2.ZERO",
+                ]
+            sections.append({
+                "signature": f"func {func_name}(event: InputEvent) -> void:",
+                "lines": lines,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
         return self._assemble(sections)
 
     # ---- 事件收集 ----
@@ -2498,6 +2758,14 @@ class Generator:
             out.append("# ---- 信号 ----")
             for name in ctx.signals:
                 out.append(f"signal {name}")
+            out.append("")
+
+        # 屏幕滤镜的着色器源码作为常量放在脚本开头。
+        # 用三引号多行字符串:GDScript 支持 """..."""，着色器代码里的
+        # 换行和引号都能原样保留，不必逐行拼接转义。
+        if ctx.need_screen_filter and _GD_FILTER_SHADER not in out:
+            out.append("# ---- 全屏滤镜着色器(由『屏幕_滤镜』节点使用)----")
+            out.append(f'const {_FILTER_SHADER_CONST} := """{_GD_FILTER_SHADER}"""')
             out.append("")
 
         if ctx.input_actions:
