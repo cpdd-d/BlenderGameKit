@@ -23,6 +23,7 @@ from BlenderGameKit import codegen  # noqa: E402
 from BlenderGameKit.nodes import nodes as NN  # noqa: E402
 
 V2 = dict(dimension="2", base_class="CharacterBody2D")
+V3 = dict(dimension="3", base_class="CharacterBody3D")
 
 
 def make_tree():
@@ -1894,6 +1895,54 @@ class TestInputActions(Base):
         self.assertIn('"physical_keycode":65', block)
         empty = P._input_action_block("some_unknown_action")
         self.assertIn('"events": []', empty)
+
+
+class TestCameraFollowDim(Base):
+    """3D 的相机跟随不能"贴脸",否则相机进了模型内部,画面一片色块。"""
+
+    def _tree(self, distance=0.0):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        follow = tree.new_node(NN.GKNodeCameraFollow, "相机跟随")
+        follow.gk_smooth = 0.12
+        follow.gk_offset_y = 0.36
+        follow.gk_distance = distance
+        gk_stub.connect(tree, ev, "执行", follow, "执行")
+        return tree
+
+    def test_2d_camera_keeps_original_behaviour(self):
+        """2D 必须和以前一模一样 —— 平台示例已经验过手感,不能动。"""
+        code, warns = gen(self._tree(), V2)
+        self.assertEqual(warns, [], warns)
+        # 2D:直接跟到目标位置(同一平面),不引入 delta
+        self.assertIn("Vector2(", code)
+        self.assertNotIn("_gk_follow_delta", code)
+        self.assertNotIn("Vector3(", code)
+
+    def test_3d_camera_preserves_initial_offset(self):
+        """3D 默认:保持相机一开始相对角色的位置。
+
+        踩过的坑:3D 里把相机直接放到角色位置,相机就进了模型内部,
+        画面上只剩一片模型的背面(用户看到的是"一片色块")。
+        """
+        code, warns = gen(self._tree(), V3)
+        self.assertEqual(warns, [], warns)
+        self.assertIn("_gk_follow_delta", code)
+        self.assertIn("_gk_follow_setup", code)
+        # delta 必须**只算一次**(第一帧),否则相机会跟着目标一起漂
+        self.assertIn("if not _gk_follow_setup:", code)
+
+    def test_3d_camera_distance_mode(self):
+        """给了距离就固定站在角色身后。"""
+        code, _ = gen(self._tree(distance=6.0), V3)
+        self.assertIn("6.0", code)
+        self.assertNotIn("_gk_follow_delta", code)
+
+    def test_camera_code_has_no_chinese_identifiers(self):
+        for distance in (0.0, 6.0):
+            code, _ = gen(self._tree(distance), V3)
+            self.assert_no_chinese_identifiers(code)
+            self.assert_indent_sane(code)
 
 
 def nn_base_statement():

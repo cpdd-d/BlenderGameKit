@@ -460,6 +460,17 @@ def open_in_godot(directory, context=None, editor=True):
                                            scene.replace("res://", ""))):
             return False, (f"主场景 {scene} 指向的文件不存在。"
                            f"请重新导出一次场景")
+
+        # ── 运行前必须让 Godot 重新导入一次资源 ──────────────────────
+        # 踩过的坑:点『直接运行游戏』时,Godot **不会**做资源导入 ——
+        # 它直接拿 .godot/imported/ 里的缓存开跑。而我们刚重新导出的
+        # .glb / .png 对它是"新文件",缓存是旧的 ——
+        # 于是用户看到的还是上一次的模型和材质,
+        # 必须先手动打开一次 Godot 编辑器才会变。
+        #
+        # `--import` 正是为此设计的:启动编辑器 -> 等导入完成 -> 退出。
+        # 所以运行游戏之前先跑一遍它,再启动游戏。
+        ensure_imported(executable, directory)
     try:
         if sys.platform.startswith("win"):
             # Windows 上不给 Godot 分配控制台窗口
@@ -472,6 +483,53 @@ def open_in_godot(directory, context=None, editor=True):
         return False, f"启动 Godot 失败: {exc}"
     action = "打开编辑器" if editor else "运行游戏"
     return True, f"已用 Godot {action}: {os.path.basename(directory)}"
+
+
+def ensure_imported(executable, directory, timeout=90):
+    """跑一遍 Godot 的资源导入,让新导出的 .glb / .png 进缓存。
+
+    返回 (是否跑完, 说明)。
+
+    ── 为什么必须有这一步 ──────────────────────────────────────────
+    Godot 4 把导入结果放在 `.godot/imported/` 里。**用 `--path <dir>` 直接
+    运行游戏时它不会重新导入** —— 直接拿旧缓存跑。我们每次导出都会重写
+    `art/*.glb`,对 Godot 来说那是"文件变了但缓存还是旧的"。
+
+    用户的症状很典型:"点了『直接运行游戏』,看到的还是改之前的样子,
+    非得先打开一次 Godot 编辑器才生效"。原因就是编辑器会触发文件系统扫描,
+    而直接运行不会。
+
+    `godot --headless --path <dir> --import` 就是官方给这个场景准备的:
+    启动编辑器 -> 等资源导完 -> 退出。
+
+    ── 为什么失败也不拦着 ──────────────────────────────────────────
+    导入失败的原因很多(缓存锁住、项目还没建好…),而用户点的是"运行游戏"。
+    为了导入失败就不让他跑,比看到旧资源更让人恼火。
+    所以这里只尽力而为:失败就返回 False,调用方继续跑游戏。
+    """
+    if not executable or not directory:
+        return False, "缺少 Godot 可执行文件或项目目录"
+
+    args = [executable, "--headless", "--path", directory, "--import"]
+    try:
+        if sys.platform.startswith("win"):
+            creation = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+            completed = subprocess.run(args, creationflags=creation,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL,
+                                       timeout=timeout, check=False)
+        else:
+            completed = subprocess.run(args, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL,
+                                       timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return False, f"资源导入超时({timeout} 秒),已跳过"
+    except OSError as exc:
+        return False, f"资源导入启动失败: {exc}"
+
+    # 退出码不可靠(实测有时是 -1),所以不拿它判成败 ——
+    # 只要进程正常结束就当导入跑过一遍了。
+    return True, "已刷新 Godot 资源缓存"
 
 
 def project_title(directory):

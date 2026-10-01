@@ -1042,6 +1042,9 @@ class GKNodeCameraFollow(B.GKStatementNode):
         ("gk_camera", "node", "", "相机", "留空则自动找场景里第一个相机"),
         ("gk_offset_x", "float", 0.0, "偏移 X", "瞄准角色上方/下方时的偏移"),
         ("gk_offset_y", "float", 0.0, "偏移 Y", ""),
+        ("gk_distance", "float", 0.0, "3D 距离",
+         "3D 专用:留 0 = 保持相机一开始相对角色的位置(推荐,"
+         "在 Blender 里摆好相机角度即可);填了就固定站在角色身后这个距离"),
     )
 
     def draw_buttons(self, context, layout):

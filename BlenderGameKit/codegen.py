@@ -1392,13 +1392,34 @@ def _stmt_camera_follow(ctx, node, indent):
     ctx.add_line(indent + 1, f"{cam_var} = {camera}")
     ctx.add_line(indent, f"{look_var} = {target}")
     ctx.add_line(indent, f"if {cam_var} != null and {look_var} != null:")
+
     if ctx.dim == 2:
+        # 2D:相机就在同一平面上，直接跟到目标位置(+偏移)
         target_vec = (f"{vec_ctor}({look_var}.global_position.x + {offset_x}, "
                       f"{look_var}.global_position.y + {offset_y})")
     else:
-        target_vec = (f"{vec_ctor}({look_var}.global_position.x + {offset_x}, "
-                      f"{look_var}.global_position.y + {offset_y}, "
-                      f"{look_var}.global_position.z)")
+        # ── 3D 的相机必须**保持一段距离**，不能贴到角色身上 ──────────
+        # 踩过的坑:3D 里把相机直接放到角色位置，相机就进了模型内部 ——
+        # 画面上只剩一片模型的背面(用户看到的是"一片色块")。
+        # 正确做法是记下"相机相对角色的偏移"，然后保持这个偏移跟随:
+        # 相机在哪儿一开始由你在 Blender 里摆好，跟随过程中不改变视角。
+        dist = getattr(node, "gk_distance", 0.0) or 0.0
+        if dist:
+            # 用户指定了距离:相机站在角色背后 dist 处、抬高 offset_y
+            target_vec = (f"{look_var}.global_position "
+                          f"+ {vec_ctor}({offset_x}, {offset_y}, {gd_number(dist)})")
+        else:
+            # 没指定距离:沿用"一开始的相对位置"，只跟着目标平移。
+            # 这样"相机在 Blender 里摆在哪儿"就决定了看角色的角度。
+            setup_var = ctx.declare_var("_gk_follow_setup", "bool")
+            delta_var = ctx.declare_var("_gk_follow_delta", vec_ctor)
+            ctx.add_line(indent + 1, f"if not {setup_var}:")
+            ctx.add_line(indent + 2, f"{setup_var} = true")
+            ctx.add_line(indent + 2, f"{delta_var} = {cam_var}.global_position "
+                                     f"- {look_var}.global_position")
+            target_vec = (f"{look_var}.global_position + {delta_var} "
+                          f"+ {vec_ctor}({offset_x}, {offset_y}, 0.0)")
+
     if smooth > 0.0:
         # lerp 而不是直接赋值:硬跟随会让画面"抖"，角色一动整个背景平移，
         # 看久了晕。0.1 左右既跟得上又有缓冲。
