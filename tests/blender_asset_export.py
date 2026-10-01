@@ -216,6 +216,50 @@ def main():
     check("导出目录有 project.godot",
           project is not None and os.path.isfile(project), str(project))
 
+    # ---- 8. 角色必须导出成**自己的** glb ----
+    #
+    # 回归:以前角色场景 instance 的是整个 World.glb,导致
+    #   * 一移动角色,整个世界跟着跑(地面、道具全飞了)
+    #   * Godot 不允许往实例内部挂节点,碰撞体也就挂不到角色网格上
+    #     (实测报 "Parent path './World/Suzanne' has vanished")
+    # 正确做法:角色(含子级)单独一个 glb,角色场景 instance 它。
+    print("-" * 70)
+    print("检查角色单独导出")
+    hero_path, hero_ok, hero_msg = asset_export.export_subtree_glb(
+        out_dir, "SoloHero", list(meshes), scene=bpy.context.scene)
+    check("角色单独导出成功", hero_ok, hero_msg)
+    check("角色 glb 落在 art/ 下",
+          bool(hero_path) and os.path.basename(os.path.dirname(hero_path)) == "art",
+          str(hero_path))
+    check("角色 glb 不是空文件",
+          bool(hero_path) and os.path.getsize(hero_path) > 100,
+          f"{os.path.getsize(hero_path) if hero_path else 0} 字节")
+
+    solo_scene, _c, _l = asset_export.write_character_scene(
+        out_dir,
+        root_name="SoloHero",
+        base_class="CharacterBody3D",
+        model_name="SoloHero",
+        script_name=script_name,
+        bounds=bounds,
+        dimension="3",
+        scene=bpy.context.scene,
+        set_as_main=False,
+    )
+    with open(solo_scene, encoding="utf-8") as handle:
+        solo_text = handle.read()
+    check("角色场景 instance 角色自己的 glb",
+          'path="res://art/SoloHero.glb"' in solo_text)
+    # 这条是关键:不能把整个世界塞到角色下面
+    check("角色场景没有把整个 World 塞进来",
+          "World.glb" not in solo_text,
+          [ln for ln in solo_text.splitlines() if "glb" in ln])
+    # 碰撞体和模型必须是根的子级(同父级才会一起动)
+    check("碰撞体是根节点的子级", 'parent="."' in solo_text and
+          "CollisionShape3D" in solo_text)
+    check("模型是根节点的子级",
+          '[node name="Model" parent="." instance=' in solo_text)
+
     print("-" * 70)
     print(scene_text)
     print("-" * 70)
