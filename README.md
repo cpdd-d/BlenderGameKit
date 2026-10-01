@@ -1,4 +1,4 @@
-# BlenderGameKit
+﻿# BlenderGameKit
 
 **在 Blender 里做完游戏,只在测试时打开 Godot。**
 
@@ -19,7 +19,7 @@
 
 | 你的痛点 | BlenderGameKit 的做法 |
 |---|---|
-| UPBGE 逻辑砖太简陋、没汉化 | 87 个中文节点，含分支 / 序列 / 循环 / 等待 / 信号 / 状态机 / 相机 / 存档 / 音效 / 界面 |
+| UPBGE 逻辑砖太简陋、没汉化 | 89 个中文节点，含分支 / 序列 / 循环 / 等待 / 信号 / 状态机 / 相机 / 存档 / 音效 / 界面 |
 | Godot 界面简陋、不熟悉、没有可视化脚本 | 逻辑在**你熟悉的 Blender 节点编辑器**里画，Godot 只负责运行 |
 | UE5 太臃肿、配置要求高 | 生成的是纯 GDScript，Godot 本体只有几十 MB |
 | Unity 国内版不好用 | 完全不依赖 Unity |
@@ -67,10 +67,11 @@
 
 ---
 
-## 三条最重要的文档
+## 四条最重要的文档
 
 | 你想知道 | 看这个 |
 |---|---|
+| **节点怎么连、三条必经规则、从零到能跑角色的顺序** | [docs/节点怎么连.md](docs/节点怎么连.md) |
 | **项目怎么组织、模型贴图怎么进 Godot、脚本怎么挂、C++ 怎么写** | [docs/Blender与Godot互通.md](docs/Blender与Godot互通.md) |
 | **卡通着色怎么调、参数什么意思** | [docs/渲染-NPR卡通着色.md](docs/渲染-NPR卡通着色.md) |
 | 安装、上手、节点清单、踩过的坑 | 就是本文件 |
@@ -99,7 +100,7 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 │   └── gk_toon_2d.gdshader     2D 精灵:伪造光照 / 边缘高光 / 受击闪白
 └── nodes/
     ├── node_base.py            节点基类、声明式属性、桩环境支持
-    └── nodes.py                ★ 87 个节点的定义
+    └── nodes.py                ★ 89 个节点的定义
 
 docs/
 ├── Blender与Godot互通.md       资产管线 + 脚本搭载 + C++ GDExtension
@@ -107,7 +108,7 @@ docs/
 
 tests/
 ├── gk_stub.py                  离线 bpy 打桩(让 codegen 脱离 Blender 可测)
-├── test_codegen.py             107 个回归测试,秒级跑完,不需要 Blender
+├── test_codegen.py             119 个回归测试,秒级跑完,不需要 Blender
 ├── blender_smoke.py            35 项冒烟测试,在真实 Blender 里跑
 ├── blender_asset_export.py     20 项资产导出测试(真的导出 .glb 并检查)
 ├── blender_npr_preview.py      23 项 NPR 预览测试(含 A/B 渲染对比)
@@ -135,6 +136,7 @@ scripts/
 └── make_render_demo.py         生成 NPR 渲染示例工程(并可出图)
 
 examples/
+├── demo_platformer/            ★ 可玩的 2D 平台跳跃示例(相机跟随/金币/HUD/存档)
 ├── demo_2d/                    可直接用 Godot 打开的 2D 横版示例
 ├── demo_render/                NPR 渲染示例(含渲染结果 preview.png)
 └── gdextension_cpp/            C++ GDExtension 骨架(GKCharacter)
@@ -223,7 +225,7 @@ func _physics_process(delta: float) -> void:
 
 ---
 
-## 节点一览(87 个)
+## 节点一览(89 个)
 
 | 分类 | 节点 |
 |---|---|
@@ -231,7 +233,7 @@ func _physics_process(delta: float) -> void:
 | **流程** | 如果_否则、只执行一次、序列、循环_次数、等待_秒、打印_输出 |
 | **移动** | 移动_设置速度、移动_滑动、移动_按方向、移动_跳跃、移动_施加冲量、移动_设置朝向、移动_水平翻转 |
 | **动画** | 动画_播放、动画_切换状态 |
-| **实例** | 实例_生成、实例_销毁、取值_获取节点、取值_是否在地面 |
+| **实例** | 实例_生成、实例_销毁、实例_重载场景、取值_获取节点、取值_是否在地面 |
 | **变量** | 变量_设置、变量_读取 |
 | **信号** | 信号_发出、信号_连接 |
 | **输入** | 输入_按键按住、输入_按键按下、输入_轴、输入_方向向量 |
@@ -239,7 +241,7 @@ func _physics_process(delta: float) -> void:
 | **触屏** | 触屏_按键按住、触屏_拖动方向 |
 | **运算** | 常量_数值、常量_文本、常量_布尔、常量_向量、数学_运算、逻辑_比较、逻辑_布尔运算、数学_随机整数、向量_合并、向量_拆分、向量_长度、向量_归一化、转换_类型 |
 | **显示** | 显示_设置可见、显示_暂停节点 |
-| **相机** | 相机_切换、相机_缩放、相机_震动 |
+| **相机** | 相机_切换、相机_缩放、相机_震动、相机_跟随 |
 | **音效** | 音效_播放、音效_音乐、音效_停止音乐 |
 | **存档** | 存档_写入、存档_读取到变量、存档_保存、存档_载入、存档_是否存在、存档_删除 |
 | **界面** | 界面_文本、界面_进度条、界面_按钮、界面_隐藏控件 |
@@ -336,6 +338,12 @@ func _physics_process(delta: float) -> void:
 ## 运行示例工程
 
 ```powershell
+# ★ 2D 平台跳跃示例(推荐先看这个) —— 有相机跟随、金币、HUD、存档
+python scripts\make_platformer_demo.py
+# 用 Godot 打开 examples\demo_platformer，按 F5
+# 想确认它真的能玩(会下落、吃金币加分、落盘):
+powershell -File scripts\platformer_verify.ps1
+
 # 2D 横版示例(方向键移动、空格跳跃、J 攻击)
 python scripts\make_demo.py
 # 用 Godot 打开 examples\demo_2d，按 F5
@@ -346,6 +354,24 @@ python scripts\make_render_demo.py
 # 或者直接出图，不需要打开编辑器:
 godot --path examples\demo_render --resolution 640x640
 ```
+
+### 为什么推荐先看 `demo_platformer`
+
+它会**自己验证自己**。`platformer_verify.ps1` 会在 Godot 里真跑这个示例，
+逐项检查 7 件事:
+
+| 检查 | 说明 |
+|---|---|
+| 角色被地面接住 | 证明**重力真的生效了**(`on_floor=true`) |
+| 相机存在 | 证明 `相机_跟随` 接上了 |
+| 吃金币加分 | 分数 0 -> 10 |
+| 刷新最高分 | `best_score` 变成 10 |
+| 金币被消耗 | 场景里金币 5 -> 4 |
+| HUD 文字更新 | 界面上那行字真的变了 |
+| 最高分落盘 | `user://gk_best.json` 真的写出来了 |
+
+这七项覆盖了"节点图 -> GDScript -> Godot 真跑起来"的完整链路。
+**编译通过不等于能玩**，这个脚本查的是后者。
 
 NPR demo 的渲染结果：
 

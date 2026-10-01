@@ -1624,6 +1624,154 @@ class TestScreenFilterNodes(Base):
         self.assertNotIn("ColorProperty", code_only)
 
 
+class TestGravityAndCamera(Base):
+    """演示"能玩起来"必须成立的两件事:重力 + 相机。"""
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_move_without_gravity_mode_overwrites_velocity(self):
+        """不勾重力模式时保持旧行为(整条赋值)，避免升级后手感突变。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=200.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn(".velocity = ", code)
+        self.assertNotIn("get_gravity()", code)
+
+    def test_gravity_mode_applies_gravity(self):
+        """勾上重力模式必须真的施加重力。
+
+        回归:Godot 4 的 CharacterBody2D **不会自动施加重力**，
+        它只按你设的 velocity 移动。不自己累加的话角色 velocity 恒为
+        (0,0)、is_on_floor 恒为 false —— 实测截图里角色就浮在半空，
+        看起来像"脚本完全没生效"。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=200.0)
+        node.gk_keep_y = True
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("get_gravity()", code)
+        self.assertIn("get_physics_process_delta_time()", code)
+        # 必须只改水平分量，纵向留给重力
+        self.assertIn(".velocity.x = ", code)
+        self.assertNotIn(".velocity = ", code.replace(".velocity.x = ", "")
+                         .replace(".velocity.y = ", "").replace(".velocity.z = ", ""))
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_gravity_mode_3d_keeps_x_and_z(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        node.gk_keep_y = True
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertIn("get_gravity()", code)
+        self.assertIn(".velocity.x = ", code)
+        self.assertIn(".velocity.z = ", code)
+        self.assertNotIn(".velocity.y = ", code)
+
+    def test_camera_follow_auto_finds_camera(self):
+        """相机留空时自动找，并且不告警刷屏(这个节点每帧都在跑)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        node = tree.new_node(NN.GKNodeCameraFollow, "跟随")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_find_camera(", code)
+        self.assertIn("_gk_find_camera(self)", code)
+        self.assertIn(".global_position = ", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_camera_follow_smooth_uses_lerp(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        node = tree.new_node(NN.GKNodeCameraFollow, "跟随", gk_smooth=0.15)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn(".lerp(", code)
+        self.assertIn("0.15", code)
+
+    def test_camera_follow_zero_smooth_is_hard_snap(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        node = tree.new_node(NN.GKNodeCameraFollow, "跟随", gk_smooth=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn(".lerp(", code)
+
+    def test_reload_scene_is_deferred(self):
+        """重载场景必须延到帧末。
+
+        这个节点常从按钮 / 计时器回调里调用，在信号回调中间直接换掉场景树，
+        Godot 会报 "Parent node is busy setting up children"。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeReloadScene, "重开")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("call_deferred", code)
+        self.assertIn("reload_current_scene", code)
+
+
+class TestNodeMenu(Base):
+    """节点菜单:87 个节点必须能找得到。"""
+
+    def test_common_nodes_all_exist(self):
+        """『常用』短名单里的 idname 必须都是真节点(写错了会静默少几个)。"""
+        from BlenderGameKit.nodes import nodes as NN
+
+        by_id = {cls.bl_idname for cls in NN.ALL_CLASSES}
+        missing = [n for n in NN.COMMON_NODES if n not in by_id]
+        self.assertEqual(missing, [], f"COMMON_NODES 里有不存在的节点: {missing}")
+
+    def test_common_menu_is_not_empty_and_reasonable(self):
+        from BlenderGameKit.nodes import nodes as NN
+
+        self.assertGreaterEqual(len(NN.COMMON_NODES), 10)
+        self.assertLessEqual(len(NN.COMMON_NODES), 24,
+                             "『常用』太多就失去意义了，它应该一眼看完")
+
+    def test_subcategory_covers_whole_category(self):
+        """二级子菜单加起来必须等于大类总数 —— 漏一个节点用户就找不到它。"""
+        from BlenderGameKit.nodes import nodes as NN
+
+        for category, order in NN.SUBCATEGORY_ORDER.items():
+            members = [c for c in NN.ALL_CLASSES if c.gk_category == category]
+            assigned = [c for c in members if c.bl_idname in NN.SUBCATEGORY_OF]
+            self.assertEqual(len(assigned), len(members),
+                             f"『{category}』有 {len(members) - len(assigned)} 个节点"
+                             f"没登记二级分类，菜单里会找不到")
+
+    def test_subcategory_names_are_declared(self):
+        """SUBCATEGORY_OF 用到的子分类名必须在 SUBCATEGORY_ORDER 里出现过。"""
+        from BlenderGameKit.nodes import nodes as NN
+
+        allowed = set()
+        for order in NN.SUBCATEGORY_ORDER.values():
+            allowed.update(order)
+        used = set(NN.SUBCATEGORY_OF.values())
+        unknown = sorted(used - allowed)
+        self.assertEqual(unknown, [], f"这些子分类名没在 SUBCATEGORY_ORDER 里声明: {unknown}")
+
+    def test_every_category_in_order(self):
+        """每个节点的分类都必须在 CATEGORY_ORDER 里，否则菜单顺序会乱。"""
+        from BlenderGameKit.nodes import nodes as NN
+
+        for cls in NN.ALL_CLASSES:
+            self.assertIn(cls.gk_category, NN.CATEGORY_ORDER,
+                          f"{cls.bl_label} 的分类 {cls.gk_category} 不在 CATEGORY_ORDER 里")
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

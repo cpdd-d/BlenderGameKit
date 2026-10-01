@@ -1,4 +1,4 @@
-"""GK 节点集合。
+﻿"""GK 节点集合。
 
 命名约定:
     gk_in_* / 引脚属性   未连线时引脚读哪个属性(见 gk_input_props)
@@ -233,7 +233,8 @@ class GKNodeMoveDirection(B.GKStatementNode):
     bl_label = "移动_按方向"
     bl_icon = "ORIENTATION_GLOBAL"
     gk_category = "移动"
-    gk_doc = "沿指定方向以指定速度移动(方向向量会自动归一化)"
+    gk_doc = ("沿指定方向移动。**平台跳跃 / 有重力的游戏务必勾上『重力模式』**："
+              "Godot 4 的 CharacterBody 不会自动施加重力，不勾角色会浮在原地不动")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         target_pin(),
@@ -246,12 +247,26 @@ class GKNodeMoveDirection(B.GKStatementNode):
         ("gk_dir_x", "float", 0.0, "方向 X", ""),
         ("gk_dir_y", "float", 0.0, "方向 Y", ""),
         ("gk_speed", "float", 300.0, "速度", "未连线时的速度"),
+        # ── 为什么需要这个开关 ────────────────────────────────────────
+        # Godot 4 的 CharacterBody2D/3D **不会自动施加重力**，它只按你设的
+        # velocity 移动。所以平台跳跃游戏必须自己累加重力，否则角色
+        # 会永远浮在原地(实测:velocity 恒为 (0,0)、is_on_floor 恒 false，
+        # 看起来就像"脚本没生效")。
+        #
+        # 打开这个开关会同时做两件事:
+        #   1) 每帧累加 get_gravity()
+        #   2) 只改水平速度，纵向留给重力
+        # 俯视角游戏(不需要重力)保持关闭即可。
+        # 默认关:保持既有工程行为不变，避免"升级后手感突然变了"。
+        ("gk_keep_y", "bool", False, "重力模式",
+         "平台跳跃 / 有重力的游戏请勾上:自动施加重力，且只改水平速度"),
     )
 
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         B.draw_target_picker(self, row)
         row.prop(self, "gk_speed", text="")
+        layout.prop(self, "gk_keep_y", text="重力模式(平台游戏勾上)", toggle=True)
 
     def draw_buttons_ext(self, context, layout):
         row = layout.row(align=True)
@@ -422,6 +437,22 @@ class GKNodeQueueFree(B.GKStatementNode):
 
     def draw_buttons(self, context, layout):
         B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodeReloadScene(B.GKStatementNode):
+    bl_idname = "GKNodeReloadScene"
+    bl_label = "实例_重载场景"
+    bl_icon = "FILE_REFRESH"
+    gk_category = "实例"
+    gk_doc = "重新加载当前场景(重开一局 / 复活后重置关卡)"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_slot", "string", "1", "存档槽", "留空则重载当前场景;填了则读取该存档槽"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_slot", text="")
 
 
 @N
@@ -988,6 +1019,36 @@ class GKNodeCameraShake(B.GKStatementNode):
         row.prop(self, "gk_strength", text="")
         row.prop(self, "gk_duration", text="")
         B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodeCameraFollow(B.GKStatementNode):
+    bl_idname = "GKNodeCameraFollow"
+    bl_label = "相机_跟随"
+    bl_icon = "CON_FOLLOWPATH"
+    gk_category = "相机"
+    gk_doc = ("让相机跟随某个节点(2D / 3D 通用)。"
+              "平台跳跃游戏一定要放这个 —— 不放的话角色一跑远就出画面了")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "平滑", 0.12),
+        target_pin("跟随谁"),
+    )
+    gk_input_props = {"平滑": "gk_smooth"}
+    gk_prop_defs = (
+        ("gk_smooth", "float", 0.12, "平滑",
+         "0 = 硬跟随(相机与角色完全同步)；越大越拖，0.1~0.2 手感较好"),
+        ("gk_target", "node", TARGET_SELF, "跟随谁", "要跟随的节点，默认自身"),
+        ("gk_camera", "node", "", "相机", "留空则自动找场景里第一个相机"),
+        ("gk_offset_x", "float", 0.0, "偏移 X", "瞄准角色上方/下方时的偏移"),
+        ("gk_offset_y", "float", 0.0, "偏移 Y", ""),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_smooth", text="")
+        row.prop(self, "gk_offset_y", text="")
+        B.draw_target_picker(self, layout, "gk_camera")
 
 
 # ==========================================================================
@@ -1929,3 +1990,58 @@ ALL_CLASSES = tuple(CLASSES)
 CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "音效", "存档", "界面",
                   "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用")
+
+# ── 二级子分类 ──────────────────────────────────────────────────────────
+# 87 个节点如果只按一级分类铺开，最大的「运算」有 13 项，
+# 「事件/流程/移动」也不少，翻起来还是累。
+# 这张表给**大类**再切一层，菜单变成两级:
+#     运算 ▸ 常量 / 数学 / 向量 / 逻辑 / 转换
+# 没列在这里的分类保持一级(节点本来就少，再套一层反而多点一次)。
+SUBCATEGORY_ORDER = {
+    "运算": ("常量", "数学", "向量", "逻辑", "转换"),
+}
+
+# 节点 bl_idname -> 二级分类名。只给上面列了 SUBCATEGORY_ORDER 的分类登记。
+SUBCATEGORY_OF = {
+    # 常量
+    "GKNodeConstFloat": "常量",
+    "GKNodeConstText": "常量",
+    "GKNodeConstBool": "常量",
+    "GKNodeConstVector": "常量",
+    # 数学
+    "GKNodeMath": "数学",
+    "GKNodeRandomRange": "数学",
+    # 向量
+    "GKNodeVectorMake": "向量",
+    "GKNodeVectorSplit": "向量",
+    "GKNodeVectorLength": "向量",
+    "GKNodeVectorNormalize": "向量",
+    # 逻辑
+    "GKNodeCompare": "逻辑",
+    "GKNodeLogic": "逻辑",
+    # 转换
+    "GKNodeConvert": "转换",
+}
+
+# 「常用」短名单:新手最需要的前 12 个，直接放菜单最上层。
+# 目的是让第一次打开菜单的人不用翻 23 个分类就能起步。
+COMMON_NODES = (
+    "GKNodeOnReady",
+    "GKNodeOnProcess",
+    "GKNodeOnPhysicsProcess",
+    "GKNodeOnInput",
+    "GKNodeBranch",
+    "GKNodeSequence",
+    "GKNodeDoOnce",
+    "GKNodeForLoop",
+    "GKNodePrint",
+    "GKNodeWait",
+    "GKNodeSetVar",
+    "GKNodeGetVar",
+    "GKNodeMoveDirection",
+    "GKNodeMoveAndSlide",
+    "GKNodeJump",
+    "GKNodeActionJustPressed",
+    "GKNodeGetVector",
+    "GKNodeComment",
+)

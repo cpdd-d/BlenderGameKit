@@ -358,6 +358,45 @@ def node_menu_entries():
     return ordered
 
 
+def node_menu_tree():
+    """两级菜单结构: 分类 -> None(直接列) 或 分类 -> [(子分类, [节点]), ...]。
+
+    87 个节点只按一级分类铺开时，最大的「运算」有 13 项，翻起来很累。
+    这里对**大类**再切一层，菜单变成:
+        运算 ▸ 常量 / 数学 / 向量 / 逻辑 / 转换
+    小分类保持一级 —— 本来就三五个节点，再套一层是让用户多点一次。
+    """
+    result = []
+    for category, classes in node_menu_entries():
+        order = node_lib.SUBCATEGORY_ORDER.get(category)
+        if not order:
+            result.append((category, None))
+            continue
+        buckets = {}
+        for cls in classes:
+            sub = node_lib.SUBCATEGORY_OF.get(cls.bl_idname, "其它")
+            buckets.setdefault(sub, []).append(cls)
+        subs = []
+        for sub in order:
+            if sub in buckets:
+                subs.append((sub, buckets.pop(sub)))
+        for sub, items in buckets.items():     # 没登记进顺序表的兜底
+            subs.append((sub, items))
+        result.append((category, subs))
+    return result
+
+
+def common_node_classes():
+    """「常用」短名单里的节点类，顺序按 COMMON_NODES 走。"""
+    by_id = {cls.bl_idname: cls for cls in node_lib.ALL_CLASSES}
+    out = []
+    for bl_idname in node_lib.COMMON_NODES:
+        cls = by_id.get(bl_idname)
+        if cls is not None:
+            out.append(cls)
+    return out
+
+
 def node_count(tree):
     if tree is None:
         return 0

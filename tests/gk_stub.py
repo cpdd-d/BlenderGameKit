@@ -169,8 +169,30 @@ def build_bpy_module():
         setattr(bpy_types, name, type(name, (NodeSocket,), {}))
 
     bpy.props = types.ModuleType("bpy.props")
-    for func_name in ("FloatProperty", "IntProperty", "BoolProperty", "StringProperty", "EnumProperty"):
-        setattr(bpy.props, func_name, lambda *a, **kw: StubProp(**kw))
+
+    def _make_prop_factory(func_name):
+        # 用工厂函数而不是直接 lambda,否则所有类型会共享同一个闭包变量,
+        # 桩出来的属性分不清自己是哪种类型(经典 late-binding 陷阱)。
+        def factory(*args, **kwargs):
+            prop = StubProp(**kwargs)
+            prop.stub_kind = func_name
+            return prop
+        factory.__name__ = func_name
+        return factory
+
+    # 这份清单要和 node_base 实际用到的类型保持一致 ——
+    # 少一个就会让 properties.py 的 import 失败,离线测试直接崩在导入期。
+    for func_name in (
+        "FloatProperty",
+        "IntProperty",
+        "BoolProperty",
+        "StringProperty",
+        "EnumProperty",
+        "FloatVectorProperty",
+        "PointerProperty",
+        "CollectionProperty",
+    ):
+        setattr(bpy.props, func_name, _make_prop_factory(func_name))
 
     bpy.utils = types.ModuleType("bpy.utils")
 

@@ -128,6 +128,9 @@ def build_graph():
     input_dir.gk_left = "move_left"
     input_dir.gk_right = "move_right"
     move = tree.new_node(NN.GKNodeMoveDirection, "方向移动", gk_speed=240.0)
+    # 平台跳跃必须有重力:Godot 4 的 CharacterBody2D 不会自动施加重力，
+    # 不勾这个开关角色会浮在原地不动(看起来就像"脚本没生效")。
+    move.gk_keep_y = True
     flip = tree.new_node(NN.GKNodeFlip, "翻转贴图", gk_mode="AUTO")
     gk_stub.connect(tree, physics, "执行", move, "执行")
     gk_stub.connect(tree, input_dir, "方向", move, "方向")

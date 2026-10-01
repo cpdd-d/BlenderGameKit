@@ -1091,7 +1091,24 @@ def _stmt_move_direction(ctx, node, indent):
     speed = _tunable_number(ctx, node, "速度", "300.0", "move_speed")
     temp = ctx.new_temp("dir")
     ctx.add_line(indent, f"var {temp} := ({direction}).normalized()")
-    ctx.add_line(indent, f"{target}.velocity = {temp} * {speed}")
+    if getattr(node, "gk_keep_y", False):
+        # ── 有重力时必须做两件事 ────────────────────────────────────
+        # 1) Godot 4 的 CharacterBody2D/3D **不会自动施加重力** ——
+        #    它只是"按你设的 velocity 移动"。不自己累加重力，
+        #    角色就永远浮在原地(实测:velocity 恒为 (0,0)、
+        #    is_on_floor() 恒为 false，画面看起来就像"没反应")。
+        # 2) 所以只能写水平分量，纵向留给重力累加。
+        #    `velocity = dir * speed` 会把 velocity.y 一起清成 0，
+        #    重力刚加上去就被抹掉。
+        ctx.add_line(indent, f"{target}.velocity += {target}.get_gravity() * "
+                             f"get_physics_process_delta_time()")
+        if ctx.dim == 2:
+            ctx.add_line(indent, f"{target}.velocity.x = {temp}.x * {speed}")
+        else:
+            ctx.add_line(indent, f"{target}.velocity.x = {temp}.x * {speed}")
+            ctx.add_line(indent, f"{target}.velocity.z = {temp}.z * {speed}")
+    else:
+        ctx.add_line(indent, f"{target}.velocity = {temp} * {speed}")
     ctx.add_line(indent, f"{target}.move_and_slide()")
 
 
@@ -1291,7 +1308,7 @@ def _stmt_camera_shake(ctx, node, indent):
         # 没有就退回到场景里第一个摄像机(新手不填也能用)。
         ctx.add_line(indent, f'{cam_var} = get_tree().get_first_node_in_group("gk_camera")')
         ctx.add_line(indent, f"if {cam_var} == null:")
-        ctx.add_line(indent + 1, f"{cam_var} = get_first_camera()")
+        ctx.add_line(indent + 1, f"{cam_var} = _gk_find_camera(self)")
 
     ctx.add_line(indent, f"{power_var} = {strength}")
     ctx.add_line(indent, f"{total_var} = maxf({duration}, 0.0001)")
@@ -1323,6 +1340,58 @@ def _stmt_camera_shake(ctx, node, indent):
 
     # 自动找相机需要一个小工具函数
     ctx.need_camera_finder = True
+
+
+@stmt_node("GKNodeCameraFollow")
+def _stmt_camera_follow(ctx, node, indent):
+    """相机跟随。
+
+    ── 为什么这件事必须由生成器负责 ────────────────────────────────
+    Godot 的 Camera2D / Camera3D 本身**不跟随**任何东西:它站在哪就拍哪。
+    平台跳跃游戏不放跟随，角色一跑远就出画面 —— 这是新手最常见的
+    "我角色不见了"来源。做成一个节点，而不是让人自己写脚本。
+    """
+    raw_cam = (getattr(node, "gk_camera", "") or "").strip()
+    if raw_cam and raw_cam != TARGET_SELF:
+        camera = ctx.target_expr(node, "gk_camera", hint="cam")
+    else:
+        # 交给一个纯查询函数:这个节点每帧都在跑，而相机可能还没进场景。
+        # 用函数而不是内联代码，是为了把 null 情况收在一处处理。
+        camera = "_gk_find_camera(self)"
+        ctx.need_camera_finder = True
+
+    raw_target = (getattr(node, "gk_target", TARGET_SELF) or TARGET_SELF).strip()
+    target = "self" if raw_target == TARGET_SELF else ctx.target_expr(
+        node, "gk_target", hint="node")
+
+    smooth = float(getattr(node, "gk_smooth", 0.12) or 0.0)
+    offset_x = gd_number(getattr(node, "gk_offset_x", 0.0))
+    offset_y = gd_number(getattr(node, "gk_offset_y", 0.0))
+    vec_ctor = "Vector2" if ctx.dim == 2 else "Vector3"
+
+    cam_var = ctx.declare_var("_gk_follow_cam", "Node")
+    look_var = ctx.declare_var("_gk_follow_look", "Node")
+
+    # 每帧重新找:只在第一帧找的话，切场景后相机会换，跟随就断了
+    ctx.add_line(indent, f"if {cam_var} == null:")
+    ctx.add_line(indent + 1, f"{cam_var} = {camera}")
+    ctx.add_line(indent, f"{look_var} = {target}")
+    ctx.add_line(indent, f"if {cam_var} != null and {look_var} != null:")
+    if ctx.dim == 2:
+        target_vec = (f"{vec_ctor}({look_var}.global_position.x + {offset_x}, "
+                      f"{look_var}.global_position.y + {offset_y})")
+    else:
+        target_vec = (f"{vec_ctor}({look_var}.global_position.x + {offset_x}, "
+                      f"{look_var}.global_position.y + {offset_y}, "
+                      f"{look_var}.global_position.z)")
+    if smooth > 0.0:
+        # lerp 而不是直接赋值:硬跟随会让画面"抖"，角色一动整个背景平移，
+        # 看久了晕。0.1 左右既跟得上又有缓冲。
+        ctx.add_line(indent + 1, f"{cam_var}.global_position = "
+                                 f"{cam_var}.global_position.lerp({target_vec}, "
+                                 f"{gd_number(smooth)})")
+    else:
+        ctx.add_line(indent + 1, f"{cam_var}.global_position = {target_vec}")
 
 
 @stmt_node("GKNodeSetTimeScale")
@@ -2252,6 +2321,14 @@ def _stmt_screen_filter(ctx, node, indent):
         ctx.add_line(indent, f"{mat}.set_shader_parameter(\"amount\", {amount})")
 
 
+@stmt_node("GKNodeReloadScene")
+def _stmt_reload_scene(ctx, node, indent):
+    # 把 reload 推迟到帧末:这个节点常常是"按钮回调 / 计时器回调"里调的，
+    # 在信号回调中间直接把场景树换掉，Godot 会报
+    # "Parent node is busy setting up children"。
+    ctx.add_line(indent, "get_tree().call_deferred(\"reload_current_scene\")")
+
+
 @stmt_node("GKNodeQueueFree")
 def _stmt_queue_free(ctx, node, indent):
     raw = getattr(node, "gk_target", TARGET_SELF)
@@ -2498,15 +2575,17 @@ class Generator:
         # ---- 自动找相机的小工具 ----
         if self.ctx.need_camera_finder:
             sections.append({
-                "signature": "func get_first_camera() -> Node:",
+                "signature": "func _gk_find_camera(host: Node) -> Node:",
                 "lines": [
-                    '    for child in get_tree().get_nodes_in_group("gk_camera"):',
+                    # 优先用放进 "gk_camera" 组的相机(用户显式指定)，
+                    # 其次退回到场景里第一个相机(新手不填也能用)
+                    '    for child in host.get_tree().get_nodes_in_group("gk_camera"):',
                     "        if child is Camera2D or child is Camera3D:",
                     "            return child",
-                    '    for node in get_tree().root.find_children("*", "Camera2D", true, false):',
-                    "        return node",
-                    '    for node in get_tree().root.find_children("*", "Camera3D", true, false):',
-                    "        return node",
+                    '    for found in host.get_tree().root.find_children("*", "Camera2D", true, false):',
+                    "        return found",
+                    '    for found in host.get_tree().root.find_children("*", "Camera3D", true, false):',
+                    "        return found",
                     "    return null",
                 ],
                 "empty_body": "    pass",

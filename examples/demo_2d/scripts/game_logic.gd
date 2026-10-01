@@ -35,7 +35,8 @@ func _ready() -> void:
 func _physics_process(delta: float) -> void:
     var _unused_delta := delta
     var _dir1 := (Input.get_vector(ACTION_MOVE_LEFT, ACTION_MOVE_RIGHT, ACTION_MOVE_UP, ACTION_MOVE_DOWN, 0.2)).normalized()
-    self.velocity = _dir1 * move_speed
+    self.velocity += self.get_gravity() * get_physics_process_delta_time()
+    self.velocity.x = _dir1.x * move_speed
     self.move_and_slide()
     if self.velocity.x < 0.0:
         self.scale.x = -abs(self.scale.x)

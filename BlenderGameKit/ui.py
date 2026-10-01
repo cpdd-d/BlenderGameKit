@@ -89,24 +89,74 @@ class GK_MT_AddNodeCategories(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
-        link_from = ""
-        space = getattr(context, "space_data", None)
         tree = props.current_tree(context)
+        link_from = ""
         if tree is not None and getattr(tree, "nodes", None) is not None:
             active = getattr(tree.nodes, "active", None)
             if active is not None:
                 link_from = active.name
         if link_from:
             layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
-            layout.separator()
-        for category, classes in props.node_menu_entries():
-            layout.menu(_menu_name(category), text=category)
+
+        # ── 前三个入口是"高频路径"，放最上面 ──────────────────────────
+        # 新手第一次打开菜单不该面对 23 个分类。搜索框放第一位是因为
+        # 87 个节点里"翻分类"永远比"打两个字"慢(蓝图/UPBGE 都这么做)。
+        layout.operator("gk.find_node", text="搜索节点…  (Ctrl+F)", icon="VIEWZOOM")
+        layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
+        recent = _recent_classes()
+        if recent:
+            layout.menu(_menu_name("最近使用"), text="最近使用", icon="FILE_REFRESH")
+        layout.separator()
+
+        # ── 全部分类(大类自带二级子菜单) ─────────────────────────────
+        for category, subs in props.node_menu_tree():
+            if subs is None:
+                layout.menu(_menu_name(category), text=category)
+            else:
+                layout.menu(_menu_name(category), text=category)
         layout.separator()
         layout.operator("gk.auto_link", icon="LINKED")
 
 
-def _make_category_menu(category, classes):
-    """为一个分类动态生成菜单类。"""
+def _make_category_menu(category, classes, subcategories=None):
+    """为一个分类动态生成菜单类。
+
+    subcategories 不为 None 时，这个分类会先列出二级子菜单
+    (比如『运算』-> 常量 / 数学 / 向量 / 逻辑 / 转换)。
+    """
+
+    def _add(menu_layout, cls, link_from):
+        op = menu_layout.operator("gk.add_node_menu", text=cls.bl_label)
+        op.node_type = cls.bl_idname
+        op.link_from = link_from
+
+    def draw(self, context):
+        layout = self.layout
+        link_from = ""
+        tree = props.current_tree(context)
+        if tree is not None:
+            active = getattr(tree.nodes, "active", None)
+            if active is not None:
+                link_from = active.name
+        if subcategories:
+            for sub_name, sub_classes in subcategories:
+                # 子菜单类在 CATEGORY_MENUS 里单独注册，这里只要挂上去
+                layout.menu(_menu_name(f"{category}/{sub_name}"), text=sub_name)
+        else:
+            for cls in classes:
+                _add(layout, cls, link_from)
+
+    name = f"GK_MT_CAT_{abs(hash(category)) % 100000}"
+    return type(name, (bpy.types.Menu,), {
+        "bl_idname": _menu_name(category),
+        "bl_label": category,
+        "draw": draw,
+        "__doc__": f"添加『{category}』类游戏逻辑节点",
+    })
+
+
+def _make_subcategory_menu(category, sub_name, classes):
+    """二级子菜单(比如 『运算 / 向量』)。"""
 
     def draw(self, context):
         layout = self.layout
@@ -120,22 +170,51 @@ def _make_category_menu(category, classes):
             op = layout.operator("gk.add_node_menu", text=cls.bl_label)
             op.node_type = cls.bl_idname
             op.link_from = link_from
-            if getattr(cls, "gk_doc", ""):
-                # 菜单项的提示文字
-                pass
 
-    name = f"GK_MT_CAT_{abs(hash(category)) % 100000}"
+    key = f"{category}/{sub_name}"
+    name = f"GK_MT_SUB_{abs(hash(key)) % 100000}"
     return type(name, (bpy.types.Menu,), {
-        "bl_idname": _menu_name(category),
-        "bl_label": category,
+        "bl_idname": _menu_name(key),
+        "bl_label": sub_name,
         "draw": draw,
-        "__doc__": f"添加『{category}』类游戏逻辑节点",
+        "__doc__": f"添加『{category} / {sub_name}』类节点",
+    })
+
+
+def _make_common_menu():
+    """「常用」子菜单:新手起步最需要的十几个节点。"""
+
+    def draw(self, context):
+        layout = self.layout
+        link_from = ""
+        tree = props.current_tree(context)
+        if tree is not None:
+            active = getattr(tree.nodes, "active", None)
+            if active is not None:
+                link_from = active.name
+        for cls in props.common_node_classes():
+            op = layout.operator("gk.add_node_menu", text=cls.bl_label)
+            op.node_type = cls.bl_idname
+            op.link_from = link_from
+
+    return type("GK_MT_Common", (bpy.types.Menu,), {
+        "bl_idname": _menu_name("常用"),
+        "bl_label": "常用",
+        "draw": draw,
+        "__doc__": "新手起步最常用的节点",
     })
 
 
 CATEGORY_MENUS = []
-for _category, _classes in props.node_menu_entries():
-    CATEGORY_MENUS.append(_make_category_menu(_category, _classes))
+for _category, _subs in props.node_menu_tree():
+    if _subs is None:
+        _classes = next(classes for cat, classes in props.node_menu_entries()
+                        if cat == _category)
+        CATEGORY_MENUS.append(_make_category_menu(_category, _classes))
+    else:
+        CATEGORY_MENUS.append(_make_category_menu(_category, None, subcategories=_subs))
+        for _sub_name, _sub_classes in _subs:
+            CATEGORY_MENUS.append(_make_subcategory_menu(_category, _sub_name, _sub_classes))
 
 
 def _make_recent_menu():
@@ -176,7 +255,8 @@ class GK_OT_FindNode(bpy.types.Operator):
 
     bl_idname = "gk.find_node"
     bl_label = "搜索游戏逻辑节点"
-    bl_description = ("输入关键字搜索 47 个节点。中文标签和英文类型名都能搜到")
+    bl_description = ("输入关键字搜索全部节点。中文标签、分类名、英文类型名都能搜到，"
+                      "比如输入『存储存』或『ray』")
     bl_options = {"REGISTER", "UNDO"}
 
     node_type: StringProperty(name="节点类型", default="")
@@ -196,10 +276,18 @@ class GK_OT_FindNode(bpy.types.Operator):
         return context.window_manager.invoke_search_popup(self)
 
     def draw(self, context):
-        # 搜索弹窗的每一行:显示中文标签,右边补上分类方便区分同名节点
-        for cls in node_lib.ALL_CLASSES:
-            op = self.layout.operator("gk.find_node", text=cls.bl_label)
-            op.node_type = cls.bl_idname
+        """搜索弹窗的每一行。
+
+        ── 为什么写成「分类 · 节点名」而不是只写节点名 ──────────────────
+        87 个节点里有不少同名前缀(存档_写入 / 字典_写入 / 变量_设置…),
+        只显示节点名的话搜出来一排"写入"根本分不清。
+        带上分类之后既能区分，又能靠"输入分类名"来过滤
+        (比如只打『存档』就只剩存档那几个)。
+        """
+        for category, classes in props.node_menu_entries():
+            for cls in classes:
+                op = self.layout.operator("gk.find_node", text=f"{category} · {cls.bl_label}")
+                op.node_type = cls.bl_idname
 
 
 # ==========================================================================
@@ -805,6 +893,7 @@ def _recent_classes(limit=8):
 # "最近使用"菜单要在 _recent_classes 定义之后才能建(它的 draw 里要用),
 # 所以放在这里而不是文件开头。
 RECENT_MENU = _make_recent_menu()
+COMMON_MENU = _make_common_menu()
 
 
 # 注册清单。这个元组必须在所有类都定义完之后才求值,
@@ -814,6 +903,7 @@ GK_CLASSES = (
     GK_OT_AddNodeMenu,
     GK_OT_FindNode,
     GK_MT_AddNodeCategories,
+    COMMON_MENU,
     RECENT_MENU,
     GK_MT_TargetPicker,
     GK_OT_SetTarget,
