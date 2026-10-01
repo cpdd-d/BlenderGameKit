@@ -1395,6 +1395,304 @@ class GKNodeUiHide(B.GKStatementNode):
 
 
 # ==========================================================================
+# 射线
+# ==========================================================================
+@N
+class GKNodeRaycast(B.GKStatementNode):
+    bl_idname = "GKNodeRaycast"
+    bl_label = "射线_检测"
+    bl_icon = "RESTRICT_SELECT_OFF"
+    gk_category = "射线"
+    gk_doc = ("从一个点沿某个方向打一条射线，看打到什么(开枪命中 / 视线判定 / "
+              "地面检测)。打到东西走『命中』，没打到走『没打中』")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(VECTOR, "方向", (1.0, 0.0, 0.0)),
+        S.pin(FLOAT, "距离", 200.0),
+    )
+    gk_input_props = {"方向": "gk_direction", "距离": "gk_distance"}
+    gk_prop_defs = (
+        ("gk_direction", "float_vector", (1.0, 0.0, 0.0), "方向", "单位向量，会自动归一化"),
+        ("gk_distance", "float", 200.0, "距离", "射线长度(像素 / 米)"),
+        ("gk_offset", "float_vector", (0.0, 0.0, 0.0), "起点偏移", "相对自身位置的偏移"),
+        ("gk_layer", "int", 1, "碰撞层", "只检测这些层(位掩码，1 表示第 1 层)"),
+    )
+    # 出口不叫『完成』:见 codegen 里 _stmt_raycast 的说明 ——
+    # 叫『完成』会被 emit_statement 自动续接，分支就废了。
+    gk_outputs = (
+        S.pin(FLOW, "命中"),
+        S.pin(FLOW, "没打中"),
+        S.pin(OBJECT, "打到的东西", None),
+        S.pin(VECTOR, "命中点", (0.0, 0.0, 0.0)),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_distance", text="")
+        row.prop(self, "gk_layer", text="")
+        layout.prop(self, "gk_direction", text="")
+
+
+@N
+class GKNodeRaycastCheck(B.GKExpressionNode):
+    bl_idname = "GKNodeRaycastCheck"
+    bl_label = "射线_有东西吗"
+    bl_icon = "QUESTION"
+    gk_category = "射线"
+    gk_doc = ("往某个方向看一眼有没有东西(视线判定 / 撞墙检测)，"
+              "结果接到『如果_否则』的条件上")
+    gk_inputs = (
+        S.pin(VECTOR, "方向", (1.0, 0.0, 0.0)),
+        S.pin(FLOAT, "距离", 200.0),
+    )
+    gk_input_props = {"方向": "gk_direction", "距离": "gk_distance"}
+    gk_prop_defs = (
+        ("gk_direction", "float_vector", (1.0, 0.0, 0.0), "方向", "单位向量，会自动归一化"),
+        ("gk_distance", "float", 200.0, "距离", "射线长度"),
+        ("gk_layer", "int", 1, "碰撞层", "只检测这些层"),
+    )
+    # 纯表达式:取值时把射线"就地"射出去。
+    # GDScript 的表达式在被使用的作用域里求值，所以生成的多行代码
+    # 正好落在需要这个布尔值的位置(比如 if 的条件上)。
+    #
+    # gk_no_cache:射线每次求值都必须**重新射**。生成器默认会缓存表达式文本，
+    # 缓存之后第二次求值只会复用第一次的结果，射线就永远停在那里了。
+    gk_no_cache = True
+    gk_outputs = (S.pin(BOOL, "有东西", False),)
+
+
+# ==========================================================================
+# 定时
+# ==========================================================================
+@N
+class GKNodeEverySeconds(B.GKStatementNode):
+    bl_idname = "GKNodeEverySeconds"
+    bl_label = "定时_每隔几秒"
+    bl_icon = "TIME"
+    gk_category = "定时"
+    gk_doc = ("每隔 N 秒执行一次(刷怪 / 回血 / 自动存档)。"
+              "用独立计时器,不会被帧率影响")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "间隔", 1.0),
+    )
+    gk_input_props = {"间隔": "gk_interval"}
+    gk_prop_defs = (
+        ("gk_interval", "float", 1.0, "间隔", "秒"),
+        ("gk_start_now", "bool", False, "立即开始", "勾上=不等第一个间隔就先执行一次"),
+    )
+    # 出口不叫『完成』:要等计时器到点才走，见 _stmt_every_seconds 的说明。
+    gk_outputs = (S.pin(FLOW, "到点了"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_interval", text="")
+        row.prop(self, "gk_start_now", text="", toggle=True)
+
+
+@N
+class GKNodeTweenValue(B.GKStatementNode):
+    bl_idname = "GKNodeTweenValue"
+    bl_label = "定时_缓动数值"
+    bl_icon = "IPO_EASE_IN_OUT"
+    gk_category = "定时"
+    gk_doc = ("把一个脚本变量在指定时间内平滑地变到目标值(血条缓动 / 镜头推近 / "
+              "UI 滑入)。对应 Godot 的 Tween")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "目标值", 100.0),
+        S.pin(FLOAT, "时长", 0.5),
+    )
+    gk_input_props = {"目标值": "gk_to", "时长": "gk_time"}
+    gk_prop_defs = (
+        ("gk_var", "string", "value", "变量名", "要在 Blender 侧声明过的脚本变量"),
+        ("gk_to", "float", 100.0, "目标值", "缓动到多少"),
+        ("gk_time", "float", 0.5, "时长", "秒"),
+        ("gk_trans", "enum", "TRANS_LINEAR", "曲线", "速度曲线", (
+            ("TRANS_LINEAR", "匀速", ""),
+            ("TRANS_SINE", "正弦(平滑)", ""),
+            ("TRANS_CUBIC", "三次(先慢后快)", ""),
+            ("TRANS_BACK", "回弹(冲过头再回来)", ""),
+            ("TRANS_BOUNCE", "弹跳", ""),
+            ("TRANS_ELASTIC", "橡皮筋", ""),
+        )),
+        ("gk_ease", "enum", "EASE_IN_OUT", "缓动方式", "", (
+            ("EASE_IN", "慢进", ""),
+            ("EASE_OUT", "慢出", ""),
+            ("EASE_IN_OUT", "两头慢", ""),
+        )),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="")
+        row.prop(self, "gk_to", text="")
+        row.prop(self, "gk_time", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_trans", text="")
+        row.prop(self, "gk_ease", text="")
+
+
+# ==========================================================================
+# 列表
+# ==========================================================================
+@N
+class GKNodeListNew(B.GKStatementNode):
+    bl_idname = "GKNodeListNew"
+    bl_label = "列表_新建"
+    bl_icon = "OUTLINER_OB_GROUP_INSTANCE"
+    gk_category = "列表"
+    gk_doc = "新建一个空列表(背包 / 刷怪表 / 任务清单)"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (("gk_var", "string", "items", "变量名", "列表变量名"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_var", text="")
+
+
+@N
+class GKNodeListAdd(B.GKStatementNode):
+    bl_idname = "GKNodeListAdd"
+    bl_label = "列表_添加"
+    bl_icon = "ADD"
+    gk_category = "列表"
+    gk_doc = "往列表末尾加一个东西(捡到道具 / 记录敌人)"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(ANY, "值", 0),
+    )
+    gk_prop_defs = (("gk_var", "string", "items", "变量名", "列表变量名"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_var", text="")
+
+
+@N
+class GKNodeListRemove(B.GKStatementNode):
+    bl_idname = "GKNodeListRemove"
+    bl_label = "列表_移除"
+    bl_icon = "REMOVE"
+    gk_category = "列表"
+    gk_doc = "从列表里删掉一个值(用掉道具 / 敌人死亡)"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(ANY, "值", 0),
+    )
+    gk_prop_defs = (("gk_var", "string", "items", "变量名", "列表变量名"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_var", text="")
+
+
+@N
+class GKNodeListGet(B.GKStatementNode):
+    bl_idname = "GKNodeListGet"
+    bl_label = "列表_取第几个到变量"
+    bl_icon = "FULLSCREEN_ENTER"
+    gk_category = "列表"
+    gk_doc = "把列表里第 N 个取进一个脚本变量。下标从 0 开始；越界时会用『默认值』"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(INT, "下标", 0),
+    )
+    gk_input_props = {"下标": "gk_index"}
+    gk_prop_defs = (
+        ("gk_var", "string", "items", "列表变量名", "从哪个列表取"),
+        ("gk_index", "int", 0, "下标", "从 0 开始"),
+        ("gk_target_var", "string", "item", "写入变量", "取出来的值放进哪个脚本变量"),
+        ("gk_default", "float", 0.0, "默认值", "越界时用它"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="")
+        row.prop(self, "gk_index", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_target_var", text="")
+        row.prop(self, "gk_default", text="")
+
+
+# ==========================================================================
+# 字典
+# ==========================================================================
+@N
+class GKNodeDictSet(B.GKStatementNode):
+    bl_idname = "GKNodeDictSet"
+    bl_label = "字典_写入"
+    bl_icon = "KEYINGSET"
+    gk_category = "字典"
+    gk_doc = "往字典里写一个键值对(按名字存数据,比列表好查)"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "键", "hp"),
+        S.pin(ANY, "值", 3),
+    )
+    gk_input_props = {"键": "gk_key"}
+    gk_prop_defs = (
+        ("gk_var", "string", "stats", "字典变量名", "往哪个字典写"),
+        ("gk_key", "string", "hp", "键", "键名"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="")
+        row.prop(self, "gk_key", text="")
+
+
+@N
+class GKNodeDictGet(B.GKStatementNode):
+    bl_idname = "GKNodeDictGet"
+    bl_label = "字典_读取到变量"
+    bl_icon = "EXPORT"
+    gk_category = "字典"
+    gk_doc = "按键从字典取值放进脚本变量。键不存在时用『默认值』"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "键", "hp"),
+    )
+    gk_input_props = {"键": "gk_key"}
+    gk_prop_defs = (
+        ("gk_var", "string", "stats", "字典变量名", "从哪个字典读"),
+        ("gk_key", "string", "hp", "键", "键名"),
+        ("gk_target_var", "string", "value", "写入变量", "取出来的值放进哪个脚本变量"),
+        ("gk_default", "float", 0.0, "默认值", "键不存在时用它"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="")
+        row.prop(self, "gk_key", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_target_var", text="")
+        row.prop(self, "gk_default", text="")
+
+
+@N
+class GKNodeDictHas(B.GKStatementNode):
+    bl_idname = "GKNodeDictHas"
+    bl_label = "字典_有键吗"
+    bl_icon = "QUESTION"
+    gk_category = "字典"
+    gk_doc = "判断字典里有没有某个键"
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "键", "hp"),
+    )
+    gk_input_props = {"键": "gk_key"}
+    gk_prop_defs = (
+        ("gk_var", "string", "stats", "字典变量名", "查哪个字典"),
+        ("gk_key", "string", "hp", "键", "键名"),
+    )
+    gk_outputs = (S.pin(FLOW, "有"), S.pin(FLOW, "没有"))
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="")
+        row.prop(self, "gk_key", text="")
+
+
+# ==========================================================================
 # 实用
 # ==========================================================================
 @N
@@ -1416,4 +1714,5 @@ ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
 CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
-                  "运算", "显示", "相机", "音效", "存档", "界面", "屏幕效果", "时间", "实用")
+                  "运算", "显示", "相机", "音效", "存档", "界面", "屏幕效果",
+                  "射线", "定时", "列表", "字典", "时间", "实用")

@@ -1088,6 +1088,243 @@ class TestUiNodes(Base):
         self.assertEqual(code.count('print("共用")'), 1, code)
 
 
+class TestRaycastNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_raycast_2d_uses_2d_api(self):
+        """2D 项目必须用 2D 的射线 API。
+
+        Node2D 上不存在 get_world_3d()，写错在**编译期**就被拒绝
+        (实测 Function not found)，所以是按维度生成两套而不是运行时判断。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "射线", gk_distance=200.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("get_world_2d()", code)
+        self.assertIn("PhysicsRayQueryParameters2D.create(", code)
+        self.assertIn("PhysicsDirectSpaceState2D", code)
+        self.assertNotIn("get_world_3d", code)
+        self.assertNotIn("Vector3", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_raycast_3d_uses_3d_api(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeRaycast, "射线", gk_distance=10.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        self.assertIn("get_world_3d()", code)
+        self.assertIn("PhysicsRayQueryParameters3D.create(", code)
+        self.assertIn("global_transform.origin", code)
+        self.assertNotIn("get_world_2d", code)
+
+    def test_raycast_has_two_named_branches(self):
+        """命中 / 没打中 两个出口都必须各生成一次。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "射线")
+        hit = tree.new_node(NN.GKNodePrint, "中", gk_text="命中")
+        miss = tree.new_node(NN.GKNodePrint, "没", gk_text="未命中")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        gk_stub.connect(tree, node, "命中", hit, "执行")
+        gk_stub.connect(tree, node, "没打中", miss, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count('print("命中")'), 1, code)
+        self.assertEqual(code.count('print("未命中")'), 1, code)
+        self.assertIn("else:", code)
+
+    def test_raycast_direction_is_normalized(self):
+        """方向必须先归一化，否则距离参数会随输入长度变化。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "射线")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn(".normalized()", code)
+
+    def test_raycast_outputs_not_named_done(self):
+        names = [spec["name"] for spec in NN.GKNodeRaycast.gk_outputs]
+        self.assertNotIn("完成", names, "出口叫『完成』会被 emit_statement 提前续接")
+
+    def test_raycast_check_is_pure_expression(self):
+        """『射线_有东西吗』是表达式:生成的多行代码要落在使用它的作用域里。
+
+        回归:以前硬编码缩进 0，代码被写到类体里，
+        Godot 报 Unexpected identifier "_query13" in class body。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        branch = tree.new_node(NN.GKNodeBranch, "有墙吗")
+        check = tree.new_node(NN.GKNodeRaycastCheck, "看前方", gk_distance=120.0)
+        blocked = tree.new_node(NN.GKNodePrint, "挡住", gk_text="前面有东西")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, check, "有东西", branch, "条件")
+        gk_stub.connect(tree, branch, "是", blocked, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        lines = code.splitlines()
+        proc_at = next(i for i, line in enumerate(lines) if line.startswith("func _process"))
+        space_at = next(i for i, line in enumerate(lines) if "direct_space_state" in line)
+        self.assertGreater(space_at, proc_at, "射线代码必须在 _process 里面")
+        # 必须缩进 4(函数体一层)，不能顶格写到类体
+        self.assertEqual(len(lines[space_at]) - len(lines[space_at].lstrip(" ")), 4,
+                         f"射线代码缩进应为 4: {lines[space_at]!r}")
+        self.assertIn("if not ", code)
+
+    def test_raycast_check_not_cached(self):
+        """射线每次求值都要重新射，不能被表达式缓存复用。"""
+        self.assertTrue(getattr(NN.GKNodeRaycastCheck, "gk_no_cache", False),
+                        "射线节点必须标记 gk_no_cache，否则第二次求值不会重新射")
+
+
+class TestTimerNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_every_seconds_uses_repeating_timer(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeEverySeconds, "刷怪", gk_interval=2.0)
+        printer = tree.new_node(NN.GKNodePrint, "刷", gk_text="刷一只")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        gk_stub.connect(tree, node, "到点了", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Timer.new()", code)
+        # one_shot = false 才是"每隔 N 秒"，true 就变成"N 秒后一次"
+        self.assertIn("one_shot = false", code)
+        self.assertIn(".timeout.connect(", code)
+        # 触发的逻辑必须在回调函数里，不能建好计时器就立刻执行
+        lines = code.splitlines()
+        cb_at = next(i for i, line in enumerate(lines) if line.startswith("func gk_on_"))
+        print_at = next(i for i, line in enumerate(lines) if 'print("刷一只")' in line)
+        self.assertGreater(print_at, cb_at, f"打印应在计时器回调里:\n{code}")
+
+    def test_every_seconds_output_not_named_done(self):
+        names = [spec["name"] for spec in NN.GKNodeEverySeconds.gk_outputs]
+        self.assertNotIn("完成", names, "出口叫『完成』会立刻执行而不是等计时器")
+
+    def test_tween_value(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeTweenValue, "缓动", gk_var="hp_value",
+                             gk_to=0.0, gk_time=0.4, gk_trans="TRANS_CUBIC",
+                             gk_ease="EASE_OUT")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("create_tween()", code)
+        self.assertIn("Tween.TRANS_CUBIC", code)
+        self.assertIn("Tween.EASE_OUT", code)
+        self.assertIn('tween_property(self, "hp_value"', code)
+        self.assertIn("var hp_value: float", code)
+        self.assert_indent_sane(code)
+
+    def test_tween_without_var_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeTweenValue, "缓动", gk_var="")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("变量名" in w for w in warnings), warnings)
+
+
+class TestContainerNodes(Base):
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_list_nodes_share_one_variable(self):
+        """同一个变量名就是同一个容器。
+
+        回归:以前每个节点各占一个名字，『列表_新建』和『列表_添加』都写
+        `bag` 却生成 `bag` / `bag_2` 两个互不相干的数组，逻辑完全是错的。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        new_node = tree.new_node(NN.GKNodeListNew, "新建", gk_var="bag")
+        add_node = tree.new_node(NN.GKNodeListAdd, "加", gk_var="bag")
+        gk_stub.connect(tree, event, "执行", new_node, "执行")
+        gk_stub.connect(tree, new_node, "完成", add_node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("var bag: Array"), 1, code)
+        self.assertNotIn("bag_2", code, code)
+        self.assertIn("bag = []", code)
+        self.assertIn("bag.append(", code)
+
+    def test_dict_nodes_share_one_variable(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        setter = tree.new_node(NN.GKNodeDictSet, "写", gk_var="stats", gk_key="hp")
+        getter = tree.new_node(NN.GKNodeDictGet, "读", gk_var="stats", gk_key="hp",
+                              gk_target_var="hp")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        gk_stub.connect(tree, setter, "完成", getter, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("var stats: Dictionary"), 1, code)
+        self.assertNotIn("stats_2", code, code)
+        self.assertIn('stats["hp"] = ', code)
+        self.assertIn('stats.get("hp", ', code)
+
+    def test_conflicting_types_warn(self):
+        """同一个名字被当成列表又当成字典时必须告警，而不是生成矛盾脚本。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeListNew, "当列表", gk_var="thing")
+        second = tree.new_node(NN.GKNodeDictSet, "当字典", gk_var="thing", gk_key="k")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("同时被当成" in w for w in warnings), warnings)
+
+    def test_list_get_is_bounds_checked(self):
+        """越界必须兜住:直接 items[99] 在 Godot 里会报错并中断当前帧。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeListGet, "取", gk_var="bag", gk_index=5,
+                             gk_target_var="item", gk_default=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".size()", code)
+        self.assertIn("else:", code)
+        self.assertIn("var item: Variant", code)
+
+    def test_dict_has_two_branches(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeDictHas, "查", gk_var="stats", gk_key="mp")
+        yes = tree.new_node(NN.GKNodePrint, "有", gk_text="有")
+        no = tree.new_node(NN.GKNodePrint, "没", gk_text="没有")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        gk_stub.connect(tree, node, "有", yes, "执行")
+        gk_stub.connect(tree, node, "没有", no, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('.has("mp")', code)
+        self.assertEqual(code.count('print("有")'), 1, code)
+        self.assertEqual(code.count('print("没有")'), 1, code)
+
+    def test_dict_has_outputs_not_named_done(self):
+        names = [spec["name"] for spec in NN.GKNodeDictHas.gk_outputs]
+        self.assertNotIn("完成", names)
+
+    def test_container_without_var_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeListAdd, "加", gk_var="")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("变量名" in w for w in warnings), warnings)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

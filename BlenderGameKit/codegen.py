@@ -188,6 +188,9 @@ class GenContext:
         # 生成函数名(按钮回调等)的占用计数与归属
         self._func_names = {}
         self._func_owners = {}
+        # 当前写入缩进 / 表达式处理器可用的缩进(见 add_line 与 emit_expression)
+        self._current_indent = 1
+        self._expr_indent = 1
         self._temp_seq = 0
         self._expr_cache = {}      # "节点::输出名" -> 表达式文本
         self._active = set()       # 沿执行流的递归栈，用于断环
@@ -228,6 +231,21 @@ class GenContext:
         handler(self, node, indent)
         _chain(self, node, indent, output)
 
+    def emit_expression(self, socket):
+        """求值一个输出引脚。
+
+        记录当前缩进供**表达式处理器**使用:有些表达式必须先"执行"几行代码
+        才能得出值(比如射线检测)。那些行必须落在使用它的那个作用域里，
+        否则会被写到类体里 —— 实测就是这样炸出
+        `Unexpected identifier "_query13" in class body`。
+        """
+        prev = self._expr_indent
+        self._expr_indent = self._current_indent
+        try:
+            return self.expr_of(socket)
+        finally:
+            self._expr_indent = prev
+
     def emit_event_outputs(self, node, indent):
         """事件节点:沿它的"执行"输出往下走。"""
         _chain(self, node, indent, "执行")
@@ -266,19 +284,36 @@ class GenContext:
         return f"{name}_{self._export_names[name]}"
 
     def declare_var(self, name, gd_type=None, initial=None, export=False, key=None):
-        """声明一个成员变量，并记录它属于哪个节点。
+        """声明一个成员变量。
 
-        ── 为什么需要 key(节点的唯一身份) ─────────────────────────────
-        两个**不同**的节点可以同名(用户复制节点后没改名很常见)。
-        只靠名字无法区分"同一个节点又来引用一次"(应该复用)和
-        "另一个节点碰巧同名"(必须另开一个变量)，否则会生成
-            var _gk_ui_分数: Label
-            _gk_ui_分数 = ProgressBar.new()   # 类型对不上，Godot 直接报错
-        所以凡是"每个节点一个"的变量都要把 key 传进来。
+        ── 两种调用方式，对应两种语义 ──────────────────────────────────
+        * **按名字共享**(不传 key):同一个变量名就是同一个变量。
+          列表 / 字典这类节点天生如此 —— 『列表_新建』和『列表_添加』都写
+          `bag`,那就是同一个背包。以前每个节点各占一个名字，结果生成出
+          `bag` / `bag_2` / `bag_3` 四个互不相干的数组，逻辑完全是错的。
+        * **按节点独占**(传 key):每个节点一个变量，同名的不同节点自动加序号。
+          界面控件属于这种 —— 两个都叫『分数』的文本是两个不同的控件。
+
+        名字相同但类型冲突时(比如一个节点当列表、另一个当字典)保留第一个
+        类型并告警，而不是生成自相矛盾的脚本。
         """
         clean = name if name.startswith("_") else snake_case(name, "v")
+        if key is None:
+            if clean in self.vars:
+                existing = self.vars.get(clean)
+                if gd_type and existing not in (None, "Variant", gd_type):
+                    self.warn(f"变量『{clean}』同时被当成 {existing} 和 {gd_type} 使用，"
+                              f"已保留 {existing}。请改用不同的变量名。")
+                elif gd_type and existing in (None, "Variant"):
+                    self.vars[clean] = gd_type
+                return clean
+            self.vars[clean] = gd_type
+            self._var_owner[clean] = None
+            self.var_order.append(clean)
+            return clean
+
         owner = self._var_owner.get(clean)
-        if clean in self.vars and (key is None or owner == key):
+        if clean in self.vars and owner == key:
             # 同一个节点再次引用 —— 复用
             if gd_type and self.vars[clean] in (None, "Variant"):
                 self.vars[clean] = gd_type
@@ -322,6 +357,9 @@ class GenContext:
         return name
 
     def add_line(self, indent, text=""):
+        # 记住最近一次写入的缩进:纯表达式处理器(射线检测等)需要知道
+        # "现在写到第几层了"，才能把必须执行的几行插到正确的作用域里。
+        self._current_indent = indent
         self.sink.add(indent, text)
 
     # ---- 表达式 ----
@@ -379,25 +417,34 @@ class GenContext:
 
         output_name 用于多输出节点(如 向量拆分 的 X/Y/Z)，同一节点的不同
         输出会分别缓存。
+
+        缓存键用**节点身份**而不是节点名:两个不同节点可以同名，
+        用名字做键会把它们的结果串在一起。
         """
         if node is None:
             return "null"
-        key = f"{node.name}::{output_name or ''}"
-        cached = self._expr_cache.get(key)
-        if cached is not None:
-            return cached
+        # 会"产生副作用"的表达式节点(射线检测要先射出去)不能缓存:
+        # 缓存之后第二次求值只会复用第一次的表达式，射线就不再重新射了。
+        cacheable = not getattr(type(node), "gk_no_cache", False)
+        key = f"{id(node)}::{output_name or ''}"
+        if cacheable:
+            cached = self._expr_cache.get(key)
+            if cached is not None:
+                return cached
 
         # 多输出节点优先按输出引脚定位
         special = None
         if output_name:
             special = expression_for_output(self, node, output_name)
             if special is not None:
-                self._expr_cache[key] = special
+                if cacheable:
+                    self._expr_cache[key] = special
                 return special
 
         handler = EXPR_HANDLERS.get(node.bl_idname)
         # 先登记成占位，避免自引用导致死循环
-        self._expr_cache[key] = "null"
+        if cacheable:
+            self._expr_cache[key] = "null"
         if handler is None:
             self.warn(f"节点『{node.bl_label}』不能作为取值使用，已按 null 处理")
             result = "null"
@@ -408,7 +455,8 @@ class GenContext:
                 self.warn(f"节点『{node.bl_label}』求值失败: {exc}")
                 result = "null"
         result = result if isinstance(result, str) else gd_literal(result)
-        self._expr_cache[key] = result
+        if cacheable:
+            self._expr_cache[key] = result
         return result
 
     # ---- 输入动作 ----
@@ -1704,6 +1752,324 @@ def _stmt_ui_hide(ctx, node, indent):
     ctx.add_line(indent, "else:")
     ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
     ctx.need_ui_helpers = True
+
+
+# ==========================================================================
+# 射线
+# ==========================================================================
+def _ray_origin_and_space(ctx, node, indent):
+    """生成射线的查询空间，返回 (space变量, params类型, 起点表达式, 维度前缀)。
+
+    2D / 3D 的 API 名字不同，而且基类上不存在的方法**在编译期**就会被拒绝
+    (实测 `Node2D` 上写 get_world_3d() 直接报 Function not found)，
+    所以这里按项目维度生成对应的一套，而不是运行时判断。
+    """
+    if ctx.dim == 2:
+        space_type = "PhysicsDirectSpaceState2D"
+        params_type = "PhysicsRayQueryParameters2D"
+        world_call = "get_world_2d"
+        origin = "global_position"
+    else:
+        space_type = "PhysicsDirectSpaceState3D"
+        params_type = "PhysicsRayQueryParameters3D"
+        world_call = "get_world_3d"
+        # Node3D 用 global_transform.origin:它在非物理节点上也存在
+        origin = "global_transform.origin"
+    space = ctx.new_temp("space")
+    ctx.add_line(indent, f"var {space}: {space_type} = {world_call}().direct_space_state")
+    return space, params_type, origin
+
+
+def _emit_ray_branch(ctx, node, indent, hit_var, origin_expr, params_type, space):
+    """把射线射出去，结果写进 hit_var。"""
+    direction = ctx.input_vector(node, "方向")
+    distance = ctx.input_number(node, "距离", "200.0")
+    offset = getattr(node, "gk_offset", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+    layer = int(getattr(node, "gk_layer", 1) or 1)
+
+    vector_ctor = "Vector2" if ctx.dim == 2 else "Vector3"
+    offset_expr = f"{vector_ctor}({gd_number(offset[0])}, {gd_number(offset[1])}" + (
+        "" if ctx.dim == 2 else f", {gd_number(offset[2])}") + ")"
+
+    dir_var = ctx.new_temp("dir")
+    from_var = ctx.new_temp("from")
+    to_var = ctx.new_temp("to")
+    query_var = ctx.new_temp("query")
+
+    ctx.add_line(indent, f"var {dir_var} := ({direction}).normalized()")
+    ctx.add_line(indent, f"var {from_var} := {origin_expr} + {offset_expr}")
+    ctx.add_line(indent, f"var {to_var} := {from_var} + {dir_var} * {distance}")
+    ctx.add_line(indent, f"var {query_var} := {params_type}.create({from_var}, {to_var})")
+    ctx.add_line(indent, f"{query_var}.collision_mask = {layer}")
+    ctx.add_line(indent, f"var {hit_var}: Dictionary = {space}.intersect_ray({query_var})")
+    return hit_var
+
+
+@stmt_node("GKNodeRaycast")
+def _stmt_raycast(ctx, node, indent):
+    """射线检测:命中 / 没打中 两个出口。
+
+    ── 为什么出口不叫『完成』 ──────────────────────────────────────
+    和按钮、存档判断同理:emit_statement 会自动沿『完成』续接，
+    那样无论有没有打到东西后面的逻辑都会跑，分支就废了。
+    """
+    space, params_type, origin = _ray_origin_and_space(ctx, node, indent)
+    hit_var = ctx.new_temp("hit")
+    _emit_ray_branch(ctx, node, indent, hit_var, origin, params_type, space)
+
+    # 打到的东西 / 命中点存进成员变量，下游可直接引用
+    target_var = ctx.declare_var(f"gk_ray_{snake_case(node.name, 'hit')}", "Variant",
+                                 key=id(node))
+    point_var = ctx.declare_var(f"gk_ray_point_{snake_case(node.name, 'hit')}", "Variant",
+                                key=id(node))
+    ctx.read_vars.add(target_var)
+    ctx.read_vars.add(point_var)
+
+    ctx.add_line(indent, f"if not {hit_var}.is_empty():")
+    ctx.add_line(indent + 1, f"{target_var} = {hit_var}[\"collider\"]")
+    ctx.add_line(indent + 1, f"{point_var} = {hit_var}[\"position\"]")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "命中")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    has_else = any(True for _ in _next_nodes(node, "没打中"))
+    if has_else:
+        ctx.add_line(indent, "else:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 1, "没打中")
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 1, "pass")
+
+
+@expr_node("GKNodeRaycastCheck")
+def _expr_raycast_check(ctx, node):
+    """纯表达式:求值时把射线就地射出去，返回布尔表达式。
+
+    ── 为什么可以"在表达式里写语句" ──────────────────────────────────
+    GDScript 的表达式是在**被使用的作用域**里求值的。这里通过 ctx.add_line
+    生成的几行代码，会正好落在需要这个布尔值的地方(比如 `if <条件>:` 之前)，
+    所以变量一定在作用域内、也一定在使用前就绪。
+    """
+    if ctx.dim == 2:
+        space_type = "PhysicsDirectSpaceState2D"
+        params_type = "PhysicsRayQueryParameters2D"
+        world_call = "get_world_2d"
+        origin = "global_position"
+    else:
+        space_type = "PhysicsDirectSpaceState3D"
+        params_type = "PhysicsRayQueryParameters3D"
+        world_call = "get_world_3d"
+        origin = "global_transform.origin"
+
+    direction = ctx.input_vector(node, "方向")
+    distance = ctx.input_number(node, "距离", "200.0")
+    offset = getattr(node, "gk_offset", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+    layer = int(getattr(node, "gk_layer", 1) or 1)
+    vector_ctor = "Vector2" if ctx.dim == 2 else "Vector3"
+    parts = [gd_number(offset[0]), gd_number(offset[1])]
+    if ctx.dim != 2:
+        parts.append(gd_number(offset[2]))
+
+    space = ctx.new_temp("space")
+    dir_var = ctx.new_temp("dir")
+    from_var = ctx.new_temp("from")
+    to_var = ctx.new_temp("to")
+    query_var = ctx.new_temp("query")
+    hit_var = ctx.new_temp("hit")
+
+    ctx.add_line(ctx._expr_indent, f"var {space}: {space_type} = {world_call}().direct_space_state")
+    ctx.add_line(ctx._expr_indent, f"var {dir_var} := ({direction}).normalized()")
+    ctx.add_line(ctx._expr_indent, f"var {from_var} := {origin} + {vector_ctor}({', '.join(parts)})")
+    ctx.add_line(ctx._expr_indent, f"var {to_var} := {from_var} + {dir_var} * {distance}")
+    ctx.add_line(ctx._expr_indent, f"var {query_var} := {params_type}.create({from_var}, {to_var})")
+    ctx.add_line(ctx._expr_indent, f"{query_var}.collision_mask = {layer}")
+    ctx.add_line(ctx._expr_indent, f"var {hit_var}: Dictionary = {space}.intersect_ray({query_var})")
+    return f"not {hit_var}.is_empty()"
+
+
+# ==========================================================================
+# 定时
+# ==========================================================================
+@stmt_node("GKNodeEverySeconds")
+def _stmt_every_seconds(ctx, node, indent):
+    """每隔 N 秒触发一次。
+
+    ── 为什么出口不叫『完成』 ──────────────────────────────────────
+    按钮同理:叫『完成』会在建好计时器的瞬间就往下执行，
+    而不是"等时间到了再执行"。所以出口叫『到点了』，
+    真正的续接逻辑放进 timeout 回调。
+    """
+    interval = _tunable_number(ctx, node, "间隔", "1.0", "interval")
+    timer_var = ctx.declare_var(f"gk_timer_{snake_case(node.name, 'every')}", "Timer",
+                                key=id(node))
+    handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'every')}", key=id(node))
+    autostart = "true" if getattr(node, "gk_start_now", False) else "false"
+
+    ctx.add_line(indent, f"if {timer_var} == null:")
+    ctx.add_line(indent + 1, f"{timer_var} = Timer.new()")
+    ctx.add_line(indent + 1, f"{timer_var}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{timer_var}.wait_time = {interval}")
+    # one_shot = false 才是"每隔 N 秒"而不是"N 秒后一次"
+    ctx.add_line(indent + 1, f"{timer_var}.one_shot = false")
+    ctx.add_line(indent + 1, f"{timer_var}.autostart = {autostart}")
+    ctx.add_line(indent + 1, f"{timer_var}.timeout.connect({handler})")
+    ctx.add_line(indent + 1, "self.add_child(" + timer_var + ")")
+
+    lines = ctx.new_section()
+    ctx._active.clear()
+    prev_event = ctx._current_event
+    ctx._current_event = node.name
+    _chain(ctx, node, 1, "到点了")
+    if len(lines) == 0:
+        lines.add(1, "pass")
+    ctx._current_event = prev_event
+    ctx.extra_sections.append({
+        "signature": f"func {handler}() -> void:",
+        "lines": list(lines.lines),
+        "empty_body": "    pass",
+        "separator": True,
+    })
+
+
+@stmt_node("GKNodeTweenValue")
+def _stmt_tween_value(ctx, node, indent):
+    raw_var = (getattr(node, "gk_var", "") or "").strip()
+    if not raw_var:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    var_name = ctx.declare_var(raw_var, "float")
+    ctx.read_vars.add(var_name)
+    to_value = _tunable_number(ctx, node, "目标值", "0.0", "tween_to")
+    duration = _tunable_number(ctx, node, "时长", "0.5", "tween_time")
+    trans = getattr(node, "gk_trans", "TRANS_LINEAR") or "TRANS_LINEAR"
+    ease = getattr(node, "gk_ease", "EASE_IN_OUT") or "EASE_IN_OUT"
+
+    tween_var = ctx.new_temp("tween")
+    ctx.add_line(indent, f"var {tween_var} := create_tween()")
+    ctx.add_line(indent, f"{tween_var}.set_trans(Tween.{trans})")
+    ctx.add_line(indent, f"{tween_var}.set_ease(Tween.{ease})")
+    # 用 "变量名" 字符串做属性路径:tween_property 需要 NodePath 形式，
+    # 对脚本成员变量来说就是变量名字符串本身。
+    ctx.add_line(indent, f"{tween_var}.tween_property(self, {gd_string(var_name)}, "
+                         f"{to_value}, {duration})")
+
+
+# ==========================================================================
+# 列表 / 字典
+# ==========================================================================
+def _list_var(ctx, node, gd_type="Array"):
+    """列表 / 字典的目标变量:按名字共享(同一个名字就是同一个容器)。"""
+    raw = (getattr(node, "gk_var", "") or "").strip()
+    if not raw:
+        return None
+    return ctx.declare_var(raw, gd_type)
+
+
+def _any_value_expr(ctx, node, socket_name="值"):
+    """取一个"任意值"输入:连线了用上游表达式，否则用字面量。"""
+    socket = ctx._socket(node, socket_name)
+    if socket is not None and getattr(socket, "is_linked", False):
+        return ctx.expr_of(socket)
+    return gd_literal(node.input_value(ctx, socket_name, 0))
+
+
+@stmt_node("GKNodeListNew")
+def _stmt_list_new(ctx, node, indent):
+    var = _list_var(ctx, node)
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    # 赋成空数组而不是 clear():这样"新建"是真的重新开始，语义更直白
+    ctx.add_line(indent, f"{var} = []")
+
+
+@stmt_node("GKNodeListAdd")
+def _stmt_list_add(ctx, node, indent):
+    var = _list_var(ctx, node)
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    ctx.add_line(indent, f"{var}.append({_any_value_expr(ctx, node)})")
+
+
+@stmt_node("GKNodeListRemove")
+def _stmt_list_remove(ctx, node, indent):
+    var = _list_var(ctx, node)
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    ctx.add_line(indent, f"{var}.erase({_any_value_expr(ctx, node)})")
+
+
+@stmt_node("GKNodeListGet")
+def _stmt_list_get(ctx, node, indent):
+    var = _list_var(ctx, node)
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    target_name = (getattr(node, "gk_target_var", "") or "").strip()
+    if not target_name:
+        ctx.warn(f"『{node.bl_label}』没有填『写入变量』，这一句被跳过了")
+        return
+    target = ctx.declare_var(target_name, "Variant")
+    ctx.read_vars.add(target)
+    index = ctx.input_number(node, "下标", "0")
+    default = gd_literal(node.input_value(ctx, "默认值", 0.0))
+    index_var = ctx.new_temp("idx")
+    ctx.add_line(indent, f"var {index_var} := int({index})")
+    # 越界必须给默认值:直接 items[99] 在 Godot 里会报错并中断这一帧
+    ctx.add_line(indent, f"if {index_var} >= 0 and {index_var} < {var}.size():")
+    ctx.add_line(indent + 1, f"{target} = {var}[{index_var}]")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f"{target} = {default}")
+
+
+@stmt_node("GKNodeDictSet")
+def _stmt_dict_set(ctx, node, indent):
+    var = _list_var(ctx, node, "Dictionary")
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    key = ctx.input_string(node, "键", "")
+    ctx.add_line(indent, f"{var}[{key}] = {_any_value_expr(ctx, node)}")
+
+
+@stmt_node("GKNodeDictGet")
+def _stmt_dict_get(ctx, node, indent):
+    var = _list_var(ctx, node, "Dictionary")
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    target_name = (getattr(node, "gk_target_var", "") or "").strip()
+    if not target_name:
+        ctx.warn(f"『{node.bl_label}』没有填『写入变量』，这一句被跳过了")
+        return
+    target = ctx.declare_var(target_name, "Variant")
+    ctx.read_vars.add(target)
+    key = ctx.input_string(node, "键", "")
+    default = gd_literal(node.input_value(ctx, "默认值", 0.0))
+    ctx.add_line(indent, f"{target} = {var}.get({key}, {default})")
+
+
+@stmt_node("GKNodeDictHas")
+def _stmt_dict_has(ctx, node, indent):
+    var = _list_var(ctx, node, "Dictionary")
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        return
+    key = ctx.input_string(node, "键", "")
+    ctx.add_line(indent, f"if {var}.has({key}):")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "有")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    has_else = any(True for _ in _next_nodes(node, "没有"))
+    if has_else:
+        ctx.add_line(indent, "else:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 1, "没有")
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 1, "pass")
 
 
 @stmt_node("GKNodeQueueFree")
