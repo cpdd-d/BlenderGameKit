@@ -1649,10 +1649,13 @@ def _stmt_anim_tree_ref(ctx, node, indent):
         ctx.anim_trees.append({
             "node": node, "chain": chain, "var": var_name,
             "player": player_temp,
+            "debug": bool(getattr(node, "gk_debug_print", False)),
         })
         ctx.need_anim_tree_process = True
         return
-    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp)
+    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp,
+                            debug_print=bool(getattr(
+                                node, "gk_debug_print", False)))
 
 
 def _find_animation_tree(name):
@@ -1827,7 +1830,8 @@ def _state_label(state):
     return name or getattr(state, "bl_label", "?")
 
 
-def _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp):
+def _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp,
+                            debug_print=False):
     """沿链生成"这条转移的条件为真就切过去"。
 
     每段的形态:
@@ -1865,6 +1869,11 @@ def _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp):
         ctx.add_line(indent, f'if {var_name} == {gd_string(start_name)} '
                              f'and {condition}:')
         ctx.add_line(indent + 1, f'{var_name} = {gd_string(end_name)}')
+        # 调试打印(节点上的『打印状态变化』勾了才生成)
+        if debug_print:
+            ctx.add_line(indent + 1,
+                         f'print("[GK] 动画状态: %s -> %s" % '
+                         f'[{gd_string(start_name)}, {var_name}])')
         ctx.add_line(indent + 1, f"if {player_temp} != null and "
                                  f"{player_temp}.has_animation({gd_string(end_name)}):")
         ctx.add_line(indent + 2,
@@ -1939,10 +1948,13 @@ def _stmt_anim_tree_ref(ctx, node, indent):
         ctx.anim_trees.append({
             "node": node, "chain": chain, "var": var_name,
             "player": player_temp,
+            "debug": bool(getattr(node, "gk_debug_print", False)),
         })
         ctx.need_anim_tree_process = True
         return
-    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp)
+    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp,
+                            debug_print=bool(getattr(
+                                node, "gk_debug_print", False)))
 
 
 def _find_animation_tree(name):
@@ -3773,7 +3785,8 @@ class Generator:
                 self.ctx._current_event = machine["node"].name
                 _emit_chain_transitions(self.ctx, machine["node"], 1,
                                         machine["chain"], machine["var"],
-                                        machine["player"])
+                                        machine["player"],
+                                        machine.get("debug", False))
             sections.append({
                 "signature": "func _physics_process(_delta: float) -> void:",
                 "lines": list(lines.lines),

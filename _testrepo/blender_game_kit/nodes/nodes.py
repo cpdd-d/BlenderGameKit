@@ -994,6 +994,13 @@ class GKNodeAnimStateMachineRef(B.GKStatementNode):
          "每个物理帧判一次 / 只在开始时判一次",
          (("EVERY_FRAME", "每帧检查", "动作连贯,适合走跑切换"),
           ("ON_ENTER", "只在开始时判", "省性能,适合一次性判定"))),
+        # ── 调试开关(用户要的"打印节点")────────────────────────────
+        # 与其再加一个『调试_打印状态』节点串在链上(会把链路图搞复杂),
+        # 不如在这里加个勾选框 —— 状态切换本来就只有**一处**生成点,
+        # 在这儿加打印最省事。
+        ("gk_debug_print", "bool", False, "打印状态变化",
+         "勾上后每次切换状态都往 Godot 输出面板打一行,"
+         "用来确认状态机到底有没有在跑"),
     )
 
     def draw_buttons(self, context, layout):
@@ -1002,6 +1009,7 @@ class GKNodeAnimStateMachineRef(B.GKStatementNode):
         picker = row.operator("gk.pick_anim_tree", text="", icon="VIEWZOOM")
         picker.node_name = self.name
         layout.prop(self, "gk_check_mode", text="")
+        layout.prop(self, "gk_debug_print", text="打印状态变化")
 
 # 用户要求:"做动画状态机取代手拼分支网" —— 这也是 UPBGE 那套最大的缺陷
 # (它一次只能播一个动画,没有状态机)。

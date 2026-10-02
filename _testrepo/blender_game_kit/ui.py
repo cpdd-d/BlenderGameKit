@@ -2,6 +2,8 @@
 
 import os
 
+import sys
+
 import bpy
 from bpy.props import IntProperty, StringProperty
 
@@ -1151,6 +1153,9 @@ def _draw_add_menu(self, context):
     # 同一个错误在三个地方犯过:`properties.current_tree()`、
     # 菜单分类过滤、还有这里。教训:**凡是判断"是不是我们的树",
     # 一律走 `props.current_tree_type(context)`,不要自己写字符串比较。**
+    # 上一版模块留下的回调别画(见 _LIVE_MODULE 那段说明)
+    if _is_stale(sys.modules.get(__name__)):
+        return
     if props.current_tree_type(context) is None:
         return
     _draw_node_menu_contents(self.layout, context, nested=True)
@@ -1162,6 +1167,9 @@ def _draw_context_menu(self, context):
     蓝图里右键就是"加节点",这里给**完整平铺菜单** —— 不用再点进子菜单。
     放在最前面,这样常用的加节点操作不用去翻 Blender 自带的那一长串。
     """
+    # 上一版模块留下的回调别画(见 _LIVE_MODULE 那段说明)
+    if _is_stale(sys.modules.get(__name__)):
+        return
     # 同 _draw_add_menu:两类树都要认(见那里的说明)
     if props.current_tree_type(context) is None:
         return
@@ -1169,45 +1177,41 @@ def _draw_context_menu(self, context):
     _draw_node_menu_contents(self.layout, context, nested=False)
 
 
-def _strip_our_draw_callbacks(target, keep):
-    """把 target 上属于本插件的绘制回调全部摘掉(除了 keep)。
+# ── 菜单重复:最终采用的修法(用户报了四次)────────────────────
+# 前三次的诊断都不对,记在这里免得以后再走弯路:
+#   1) 以为 `remove` 一次不够 -> 改成循环摘
+#   2) 还是重复
+#   3) 以为"重载后函数对象变了所以摘不掉" -> 改成按名字遍历
+#   4) **实测**才发现:Blender 4.5 的菜单用
+#      `_GenericUI._dyn_ui_initialize` 把 draw 回调存在**闭包**里 ——
+#      菜单类 `__dict__` 里只有 `__module__ / bl_label / draw / bl_rna`,
+#      既拿不到回调列表,`remove()` 也摘不掉。
+#
+# 所以"摘干净再挂"这条路根本走不通。
+#
+# ── 换个方向:让**过期的回调自己闭嘴** ──────────────────────────
+# 重载模块后,菜单里那个**旧模块的**回调还在,它和新回调画出
+# 一模一样的内容 -> 菜单两份。既然摘不掉,就让它在画之前自问
+# "我还是当前这一版吗",不是就直接 return。
+#
+# 怎么判断"当前这一版":用**模块对象自己**当版本号。
+# 重载会换掉 `sys.modules[...]` 里的模块对象,旧回调手里的那个
+# 就不再是 `sys.modules` 里的那一个了 —— 精确且零成本。
+_LIVE_MODULE = None
 
-    ── 为什么要按名字找,而不是 `remove(func)`(踩了三轮的坑)──────
-    用户反复报"右键功能重复",到第三次才查出真正的原因:
 
-    **Blender 重载插件时会重新 import 模块,函数对象是新的。**
-    `target.remove(新函数)` 摘不掉菜单里注册着的**旧函数** ——
-    它俩虽然代码一样,但是**不同的对象**。于是每重载一次就多叠一份,
-    用户看到的右键菜单变成了三份。
+def _bind_live_module():
+    """register 时调用:记住"当前这一版的模块对象"。"""
+    global _LIVE_MODULE
+    import sys as _sys
+    _LIVE_MODULE = _sys.modules.get(__name__)
 
-    所以不能靠"摘自己"，得**遍历菜单上现有的回调**,
-    把名字对得上的一律摘掉。
 
-    `keep` 是这次要挂上去的那个(先摘掉,后面 prepend 回去)。
-    """
-    for attr in ("_draw_funcs", "draw_funcs", "_dyn_ui_initialize"):
-        handlers = getattr(target, attr, None)
-        if handlers is None:
-            continue
-        try:
-            items = list(handlers)
-        except TypeError:
-            continue
-        for item in items:
-            func = getattr(item, "__func__", item)
-            module = getattr(func, "__module__", "") or ""
-            name = getattr(func, "__name__", "") or ""
-            if name not in ("_draw_add_menu", "_draw_context_menu"):
-                continue
-            # 只摘本插件的(模块名里带 blender_game_kit)
-            if "blender_game_kit" not in module and item is not keep:
-                continue
-            if item is keep:
-                continue
-            try:
-                target.remove(item)
-            except Exception:
-                pass
+def _is_stale(owner_module):
+    """这个回调是不是上一版模块留下的?(是就别画)"""
+    if _LIVE_MODULE is None or owner_module is None:
+        return False
+    return owner_module is not _LIVE_MODULE
 
 
 def on_register():
@@ -1231,8 +1235,9 @@ def on_register():
             if target is None:
                 gk_log.warn(f"找不到 {target_name},跳过挂载")
                 continue
-            _strip_our_draw_callbacks(target, func)
-            # 保险:再试着直接摘一次(覆盖"名字对不上但对象就是它"的情况)
+            # 先记下"当前这一版",再挂 —— 旧版本的回调醒来后会
+            # 发现自己不是当前版本,自己闭嘴(见 _LIVE_MODULE 那段)
+            _bind_live_module()
             try:
                 target.remove(func)
             except Exception:
