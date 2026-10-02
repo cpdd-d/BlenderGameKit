@@ -3389,6 +3389,47 @@ def _check_base_class_supports_graph(tree, options, warnings):
     )
 
 
+def _check_animation_targets(tree, warnings):
+    """检查动画节点选的动作和它要播的物体对不对得上。
+
+    ── 回答用户的问题:"如果应用动画物体错误了会怎么样" ─────────────
+    **以前是静默失败** —— Godot 里 AnimationPlayer 找不到那个动画,
+    只在控制台打一条警告,画面看不出问题,用户不知道哪错了。
+
+    现在**导出时**就报出来。判据见 nodes.check_action_target。
+    """
+    try:
+        from .nodes import nodes as _nodes
+    except Exception:
+        return
+    checker = getattr(_nodes, "check_action_target", None)
+    if checker is None:
+        return
+    try:
+        import bpy
+        objects = getattr(getattr(bpy, "data", None), "objects", None)
+    except Exception:
+        objects = None
+    if objects is None:
+        # 离线测试环境:没有真 bpy,跳过这项检查
+        return
+
+    for node in getattr(tree, "nodes", ()) or ():
+        if node.bl_idname != "GKNodePlayAnim":
+            continue
+        # 节点上『动画播放器』填了就用它;留空 = 自动查找,
+        # 那种情况没法在导出时确定目标,跳过(运行时才找得到)。
+        target_name = str(getattr(node, "gk_player", "") or "")
+        if not target_name:
+            continue
+        obj = objects.get(target_name)
+        if obj is None:
+            continue
+        message = checker(node, obj)
+        if message:
+            warnings.append(message)
+
+
 def generate(tree, options=None):
     """生成 GDScript，返回 (代码, 告警列表)。"""
     if tree is None:
@@ -3397,6 +3438,7 @@ def generate(tree, options=None):
     code = generator.generate()
     warnings = list(generator.ctx.warnings)
     _check_base_class_supports_graph(tree, options or {}, warnings)
+    _check_animation_targets(tree, warnings)
     # 登记本次用到的输入动作，供导出流程写进 project.godot
     globals()["last_used_actions"] = list(generator.ctx.input_actions.values())
     return code, warnings

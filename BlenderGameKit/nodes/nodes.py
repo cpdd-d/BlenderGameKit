@@ -162,6 +162,49 @@ def discover_actions(obj=None):
     return entries
 
 
+def check_action_target(node, obj):
+    """检查"这个动作挂在这个物体上对不对"。返回一条警告文本或 None。
+
+    ── 回答用户的问题:"如果应用动画物体错误了会怎么样" ─────────────
+    **以前是静默失败** —— 导出的脚本在 Godot 里跑,AnimationPlayer
+    找不到那个动画名,只在控制台打一条警告,画面看不出问题,
+    用户根本不知道哪里错了。
+
+    现在导出时就能发现。判据:
+      * `id_root` 是 `KEY`(形态键动画)-> 必须挂在网格上
+      * `id_root` 是 `OBJECT` -> 挂在骨架或物体上
+      * 动作的 slot 名字里如果有别的物体名 -> 大概率选错了
+
+    返回 None 表示没问题。
+    """
+    action = getattr(node, "gk_anim_action", None)
+    if action is None or obj is None:
+        return None
+
+    obj_type = str(getattr(obj, "type", ""))
+    root = str(getattr(action, "id_root", "") or "")
+    allowed = _ACTION_ROOT_TYPES.get(root)
+
+    if allowed and obj_type not in allowed:
+        want = "/".join(allowed)
+        return (f"节点『{node.bl_label}』选的动画『{action.name}』是 "
+                f"{_ACTION_KIND_LABEL.get(root, root)} 动画,"
+                f"应该挂在 {want} 上,但现在挂的是 "
+                f"{obj.name}({obj_type})—— 播放时会找不到动画")
+
+    # slot 名字里出现了**别的**物体名 -> 多半是选串了
+    own_name = str(getattr(obj, "name", ""))
+    for slot_name in _action_slot_names(action):
+        if own_name and own_name in slot_name:
+            return None      # 明确属于这个物体,没问题
+    others = [n for n in _action_slot_names(action) if n and n != "Key"]
+    if others and own_name and own_name not in others[0]:
+        return (f"节点『{node.bl_label}』选的动画『{action.name}』"
+                f"看起来是属于『{others[0]}』的,不是『{own_name}』"
+                f"—— 确认一下是不是选错了")
+    return None
+
+
 def action_enum_items(_self=None, _context=None):
     """动态枚举回调:列出场景里所有动作。
 
@@ -612,7 +655,7 @@ class GKNodePlayAnim(B.GKStatementNode):
         # 一直播不出来。空值会让导出的脚本报"动画不存在,可用的是…",
         # 比一个看起来合理但永远错的名字好。
         ("gk_anim_name", "string", "", "动画名",
-         "点右边『选…』从列表挑;带 ★ 的是当前物体自己的动画"),
+         "不用管它 —— 上面选了『动作』就会自动同步成动作名"),
         # ── 原生动作选择器(用户要的"自动列出它的动作")────────────────
         # 这是**正解**:`PointerProperty(type=Action)` 拿到的是 Blender
         # 原生的数据块选择器(带放大镜、能搜、能浏览全部动作)。
@@ -627,13 +670,27 @@ class GKNodePlayAnim(B.GKStatementNode):
     )
 
     def draw_buttons(self, context, layout):
-        # 原生选择器画一行 —— 这是主入口
+        # ── 主入口:原生动作选择器 ──────────────────────────────────
+        # 用户反馈"再在下面的那个 idle 是不是多余了,这个又不能改什么,
+        # 为啥不去掉" —— 对,那个文本框以前顶着个假默认值 `idle`,
+        # 看着能改其实改了也没用(上面选了动作就以动作为准)。
+        #
+        # 现在:**选了动作就只显示动作名(只读),不显示文本框**。
+        # 只有"没选动作"时才给你一个手填的框 —— 那时它才有意义。
         layout.prop(self, "gk_anim_action", text="")
-        row = layout.row(align=True)
-        row.prop(self, "gk_anim_name", text="", icon="SORTALPHA")
-        picker = row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
-        picker.node_name = self.name
-        row.prop(self, "gk_speed", text="")
+        if self.gk_anim_action is not None:
+            # 选了动作 -> 只**显示**名字,不再给一个能改但改了没用的框
+            layout.label(text=f"动画名:{self.gk_anim_action.name}",
+                         icon="CHECKMARK")
+        else:
+            # 没选动作 -> 给手填框 + 『选…』按钮。
+            # 按钮那个列表会**按归属排序**(属于当前物体的带 ★ 排前面),
+            # 比原生选择器更好找 —— 原生选择器只能列全部。
+            row = layout.row(align=True)
+            row.prop(self, "gk_anim_name", text="", icon="SORTALPHA")
+            picker = row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
+            picker.node_name = self.name
+        layout.prop(self, "gk_speed", text="播放速度")
 
     def draw_buttons_ext(self, context, layout):
         layout.label(text="动画播放器:留空 = 自动查找(推荐)")
