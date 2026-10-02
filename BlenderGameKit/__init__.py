@@ -44,7 +44,11 @@ _SUBMODULES = (
     "ui",
 )
 
-_CLASS_REGISTRY = []
+_CLASS_REGISTRY = globals().get("_CLASS_REGISTRY") or []
+# 注意:`importlib.reload()` 是**原地**重新执行本文件(模块对象与 __dict__
+# 都复用)。上面若写成无条件 `= []`,重载后上一版的类清单就丢了 ——
+# `register()` 里的"先注销"会空转,旧类留在 Blender 里,
+# 菜单回调也跟着一份份叠加。所以复用旧列表。
 
 
 def _reload_submodules():

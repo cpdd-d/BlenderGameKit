@@ -1593,12 +1593,28 @@ def _stmt_anim_tree_ref(ctx, node, indent):
         wired_cond = bool(cond is not None
                           and getattr(cond, "is_linked", False))
         has_up = bool(up is not None and getattr(up, "is_linked", False))
-        if wired_cond and not has_up:
-            ctx.warn(
-                f"转场『{getattr(node_in_tree, 'name', '?')}』接了条件,"
-                f"但『上游』没接 —— 它不知道『从哪个状态切过去』,"
-                f"所以这条规则不会生效。"
-                f"请把**上一个状态的『转到』**接到这个转场的『上游』")
+        if not has_up:
+            # 上游没接。分两种:
+            #   (a) 它的『转到』指回了某个**状态** -> **线接反了**
+            #       (用户实测踩过:把"转场 -> 状态"接了,
+            #        正确方向是"状态 -> 转场")
+            #   (b) 什么都没接 -> 就是漏了
+            back, _n = _next_of(node_in_tree, "转到")
+            back_label = (getattr(back, "bl_label", None)
+                          if back is not None else None)
+            if back_label == "动画_状态":
+                ctx.warn(
+                    f"转场『{getattr(node_in_tree, 'name', '?')}』的线"
+                    f"**接反了**:现在是它指向状态,但方向应该是"
+                    f"『上一个状态的『转到』 -> 这个转场的『上游』』。"
+                    f"请把这两根线对调,转场的『转到』去接"
+                    f"**下一个状态的『进入』**")
+            elif wired_cond:
+                ctx.warn(
+                    f"转场『{getattr(node_in_tree, 'name', '?')}』接了条件,"
+                    f"但『上游』没接 —— 它不知道『从哪个状态切过去』,"
+                    f"所以这条规则不会生效。"
+                    f"请把**上一个状态的『转到』**接到这个转场的『上游』")
 
     chain, chain_warnings = _walk_state_chain(entry)
     # ── 只对"真的孤立"的状态告警(踩过的坑)────────────────────────

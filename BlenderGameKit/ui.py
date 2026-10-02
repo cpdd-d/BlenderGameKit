@@ -2,8 +2,6 @@
 
 import os
 
-import sys
-
 import bpy
 from bpy.props import IntProperty, StringProperty
 
@@ -1153,9 +1151,6 @@ def _draw_add_menu(self, context):
     # 同一个错误在三个地方犯过:`properties.current_tree()`、
     # 菜单分类过滤、还有这里。教训:**凡是判断"是不是我们的树",
     # 一律走 `props.current_tree_type(context)`,不要自己写字符串比较。**
-    # 上一版模块留下的回调别画(见 _LIVE_MODULE 那段说明)
-    if _is_stale(sys.modules.get(__name__)):
-        return
     if props.current_tree_type(context) is None:
         return
     _draw_node_menu_contents(self.layout, context, nested=True)
@@ -1167,9 +1162,6 @@ def _draw_context_menu(self, context):
     蓝图里右键就是"加节点",这里给**完整平铺菜单** —— 不用再点进子菜单。
     放在最前面,这样常用的加节点操作不用去翻 Blender 自带的那一长串。
     """
-    # 上一版模块留下的回调别画(见 _LIVE_MODULE 那段说明)
-    if _is_stale(sys.modules.get(__name__)):
-        return
     # 同 _draw_add_menu:两类树都要认(见那里的说明)
     if props.current_tree_type(context) is None:
         return
@@ -1177,72 +1169,73 @@ def _draw_context_menu(self, context):
     _draw_node_menu_contents(self.layout, context, nested=False)
 
 
-# ── 菜单重复:最终采用的修法(用户报了四次)────────────────────
-# 前三次的诊断都不对,记在这里免得以后再走弯路:
-#   1) 以为 `remove` 一次不够 -> 改成循环摘
-#   2) 还是重复
-#   3) 以为"重载后函数对象变了所以摘不掉" -> 改成按名字遍历
-#   4) **实测**才发现:Blender 4.5 的菜单用
-#      `_GenericUI._dyn_ui_initialize` 把 draw 回调存在**闭包**里 ——
-#      菜单类 `__dict__` 里只有 `__module__ / bl_label / draw / bl_rna`,
-#      既拿不到回调列表,`remove()` 也摘不掉。
+# ── 菜单重复:根因与修法(用户报了多次)─────────────────────────
+# 现象:右键 / Shift+A 的整块内容出现两份、三份，而且越重载越多。
 #
-# 所以"摘干净再挂"这条路根本走不通。
+# 真根因(已在 Blender 4.5.5 上跑无头脚本实测复现):
+#   1) 插件重载时 `importlib.reload()` 是**原地重新执行**模块 ——
+#      模块对象(及其 `__dict__`)还是同一个，只是函数对象全换成了新的。
+#   2) 旧的那份 draw 回调仍挂在 Blender 的菜单类上；上一版想靠
+#      "比较模块对象判断过期" 让它闭嘴 —— 但模块对象根本没换，
+#      这个判断永远是 False，于是旧回调照画不误。
+#   3) `register()` 里又拿**新函数对象**去 `remove()`，与旧函数不是
+#      同一个对象，摘不掉；接着 `prepend()` -> 每个版本留一份。
 #
-# ── 换个方向:让**过期的回调自己闭嘴** ──────────────────────────
-# 重载模块后,菜单里那个**旧模块的**回调还在,它和新回调画出
-# 一模一样的内容 -> 菜单两份。既然摘不掉,就让它在画之前自问
-# "我还是当前这一版吗",不是就直接 return。
+# 修法:给本插件挂上的回调打一个**函数属性标记**；重挂之前，遍历菜单类
+#   上的 draw 回调列表，把带标记的**全部**摘掉(不管它是哪一版模块留下的)，
+#   再挂当前这一份。
 #
-# 怎么判断"当前这一版":用**模块对象自己**当版本号。
-# 重载会换掉 `sys.modules[...]` 里的模块对象,旧回调手里的那个
-# 就不再是 `sys.modules` 里的那一个了 —— 精确且零成本。
-_LIVE_MODULE = None
+#   回调列表存在 `cls.draw._draw_funcs`(见 Blender 的
+#   `bpy_types._GenericUI._dyn_ui_initialize` / `append` / `prepend` / `remove`)。
+#   它挂在**菜单类对象**上，而菜单类是 Blender 自己的、跨插件重载不会丢 ——
+#   所以历史遗留的旧函数都能被找到并 `remove` 掉(remove 本身是好用的，
+#   之前"摘不掉"的判断是错的)。
+_GK_MENU_HOOK = "_gk_menu_hook"
 
 
-def _bind_live_module():
-    """register 时调用:记住"当前这一版的模块对象"。"""
-    global _LIVE_MODULE
-    import sys as _sys
-    _LIVE_MODULE = _sys.modules.get(__name__)
+def _menu_draw_funcs(target):
+    """取菜单类上的 draw 回调列表(必要时触发 Blender 的初始化)。"""
+    funcs = getattr(target.draw, "_draw_funcs", None)
+    if funcs is None:
+        try:
+            funcs = target._dyn_ui_initialize()
+        except Exception:
+            funcs = None
+    return funcs
 
 
-def _is_stale(owner_module):
-    """这个回调是不是上一版模块留下的?(是就别画)"""
-    if _LIVE_MODULE is None or owner_module is None:
-        return False
-    return owner_module is not _LIVE_MODULE
+def _purge_gk_hooks(target):
+    """摘掉**所有**本插件挂过的 draw 回调(含以前重载遗留的旧函数)。"""
+    funcs = _menu_draw_funcs(target)
+    if not funcs:
+        return
+    for old in [f for f in funcs if getattr(f, _GK_MENU_HOOK, False)]:
+        try:
+            target.remove(old)
+        except Exception:
+            pass
+
+
+def _install_gk_hook(target, func):
+    """先清掉历次遗留的同名回调，再挂当前这一份 —— 保证菜单只出现一次。"""
+    _purge_gk_hooks(target)
+    setattr(func, _GK_MENU_HOOK, True)
+    target.prepend(func)
 
 
 def on_register():
     """注册后的自检与菜单挂钩。"""
-    # ---- 挂菜单 ----
-    #
-    # ── 三轮才查清的重复问题(务必看这段)──────────────────────────
-    # 1) 用户第一次报"右键功能重复" -> 以为 remove 一次不够,改成循环摘
-    # 2) 用户第二次报还是重复     -> 还是不对
-    # 3) 查出真根因:**Blender 重载插件时模块被重新 import,
-    #    函数对象是新的**,`remove(新函数)` 摘不掉菜单里的旧函数。
-    #
-    # 所以改成按**名字**遍历现有回调,把属于本插件的一律摘掉,
-    # 再挂上当前的这一份。
+    # ---- 挂菜单:先按标记清掉历次遗留,再挂当前这一份(见上方说明)----
     for target_name, func in (
         ("NODE_MT_add", _draw_add_menu),
         ("NODE_MT_context_menu", _draw_context_menu),
     ):
+        target = getattr(bpy.types, target_name, None)
+        if target is None:
+            gk_log.warn(f"找不到 {target_name},跳过挂载")
+            continue
         try:
-            target = getattr(bpy.types, target_name, None)
-            if target is None:
-                gk_log.warn(f"找不到 {target_name},跳过挂载")
-                continue
-            # 先记下"当前这一版",再挂 —— 旧版本的回调醒来后会
-            # 发现自己不是当前版本,自己闭嘴(见 _LIVE_MODULE 那段)
-            _bind_live_module()
-            try:
-                target.remove(func)
-            except Exception:
-                pass
-            target.prepend(func)
+            _install_gk_hook(target, func)
         except Exception as exc:  # pragma: no cover
             gk_log.error(f"挂载 {target_name} 失败: {exc}")
 
@@ -1305,18 +1298,12 @@ GK_CLASSES = (
 
 
 def on_unregister():
-    # 摘掉菜单回调。不摘的话禁用插件后按 Shift+A / 右键
-    # 会去调用已经不存在的菜单类,报一串错。
-    for target_name, func in (
-        ("NODE_MT_add", _draw_add_menu),
-        ("NODE_MT_context_menu", _draw_context_menu),
-    ):
+    # 摘掉菜单回调。按标记摘 —— 这样连以前重载遗留的旧函数也一起清掉,
+    # 禁用插件后不会留野回调。
+    for target_name in ("NODE_MT_add", "NODE_MT_context_menu"):
         target = getattr(bpy.types, target_name, None)
         if target is None:
             continue
-        try:
-            target.remove(func)
-        except Exception:
-            pass
+        _purge_gk_hooks(target)
     ops.LAST_EXPORT.clear()
     ops.RECENT_NODES.clear()
