@@ -47,13 +47,12 @@ ENV_RESOURCE_LINE = (
 
 SCENE_TEMPLATE = """[gd_scene load_steps={steps} format=3]
 
-[ext_resource type="Script" path="{script_path}" id="1_script"]
+{script_resource}
 [ext_resource type="PackedScene" path="{model_path}" id="2_model"]
 {env_resource}
 {sub_resources}
 [node name="{root_name}" type="{base_class}"]
-script = ExtResource("1_script")
-{collision}
+{script_line}{collision}
 [node name="Model" parent="." instance=ExtResource("2_model")]
 {environment}
 """
@@ -965,17 +964,29 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                     pos = list(position)
                 lines.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
                              f"{_fmt(pos[0])}, {_fmt(pos[1])}, {_fmt(pos[2])})")
-                # ── 脚本**不能挂两遍**(踩过的坑)──────────────────────
-                # 角色场景(胡桃_mesh.tscn)自己已经把脚本挂在根节点上了,
-                # 而下面那个 `Model` 子节点**实例化的就是那个角色场景**。
-                # 如果这里再写一次 `script = ...`,运行时就跑两遍 ——
-                # 用户实测:控制台把 "你好,世界" 打印了**两次**。
+                # ── 脚本**必须挂在这里**(血泪教训,别删)────────────────
+                # 角色场景(胡桃_mesh.tscn)的根节点上也挂着同一个脚本,
+                # 看起来像"挂了两遍",所以曾经把这一行删掉过 ——
+                # **结果游戏逻辑整个不跑了**。
                 #
-                # 更麻烦的是:两个实例都会跑移动逻辑、都会读输入,
-                # 角色会以双倍速度移动,而且互相打架。
+                # 实测(Godot 4.7):
+                #     /root/World/Colliders/胡桃-海灯节_mesh  script=<null>
+                # 因为 **Godot 实例化一个场景时,不会把被实例化场景根节点的
+                # `script` 属性带过来**。那个脚本的 `_ready()` 确实会执行
+                # (所以动画能播),但**这个节点本身**上没有脚本 ——
+                # 于是 `_physics_process` 不跑、节点自己的成员函数都调不到。
                 #
-                # 所以实例化角色场景时**不再重复挂脚本** ——
-                # 实例会把角色场景根节点的脚本一起带进来。
+                # 所以两边都得挂:
+                #   * 角色场景根节点   -> 单独打开角色场景时能跑
+                #   * World 场景这个节点 -> 在 World 里跑的是**这个**实例
+                #
+                # 代价是那个脚本的 `_ready()` 会执行两次(一次来自被实例化的
+                # 角色场景,一次来自这个节点)。用户看到过"打印两遍"。
+                # 这确实是重复,但**删掉任何一份都会坏**,所以保留,
+                # 并在生成物里说明。要彻底解决得让角色场景不再挂脚本
+                # (那样角色场景单独打开就不能跑了)——
+                # 取舍见 docs/蓝图化总清单.md。
+                lines.append(f'script = ExtResource("{script_id}")')
                 lines.append("")
                 shape_type_name = "CollisionShape3D" if is_3d else "CollisionShape2D"
                 lines.append(f'[node name="Collision" type="{shape_type_name}" '
@@ -3009,8 +3020,22 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
         env_resource = ENV_RESOURCE_LINE.format(scripts_dir=project.SCRIPTS_DIR)
 
     steps = 1 + (1 if sub_resources else 0) + 2 + (1 if env_resource else 0)
+    # ── 角色场景**根节点不挂脚本**(踩过两轮的坑,这次想清楚了)──────
+    # 世界场景里的角色节点会 `instance` 这个角色场景,而那个节点
+    # **自己**也挂着同一个脚本(必须挂 —— Godot 实例化场景时
+    # **不继承**根节点的 `script` 属性,实测 `script=<null>`)。
+    #
+    # 两份都挂的后果:`_ready()` 执行两遍 —— 用户实测打印两次,
+    # 而且移动逻辑跑两遍(角色双倍速)。
+    #
+    # 取舍:角色场景在这个工作流里是**子场景**(被 World 实例化),
+    # 不是给人按 F5 直接跑的。所以把逻辑留在 World 那个节点上,
+    # 角色场景只负责"几何 + 蒙皮 + 碰撞体"。
+    # (单独打开角色场景不会跑逻辑,这是**故意**的。)
     text = SCENE_TEMPLATE.format(
         steps=steps,
+        script_resource="",
+        script_line="",
         script_path=f"res://{project.SCRIPTS_DIR}/{script_name}",
         model_path=f"res://{model_dir or project.ART_DIR}/{model_name}.glb",
         env_resource=env_resource,

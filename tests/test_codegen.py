@@ -2399,6 +2399,119 @@ class TestDynamicPins(Base):
         self.assert_no_chinese_identifiers(code)
 
 
+class TestAnimationNameSources(Base):
+    """动画名的来源与默认值。
+
+    用户踩过的坑:节点里动画名默认是 `idle`,而他的模型里叫
+    `骨骼动作` / `形态键动作` —— 不动那个默认值就永远播不出来,
+    只能靠运行时警告去猜正确名字。
+
+    所以:
+      * 默认值改成**空**(不假装有个叫 idle 的动画)
+      * 提供一个能从列表里挑的入口(动作归属分析)
+    """
+
+    def test_play_anim_default_name_is_empty(self):
+        node = make_tree().new_node(NN.GKNodePlayAnim, "播放")
+        self.assertEqual(node.gk_anim_name, "",
+                         "默认值必须是空,不能是 idle 这种假名字")
+
+    def test_empty_name_picks_first_animation(self):
+        """名字留空 = "随便播一个",不能生成 has_animation("")。
+
+        以前默认值是 `idle`,用户不动它就永远播不出来。
+        改成空之后如果直接生成 `has_animation("")`,那是**永远 false**
+        加一条空警告 —— 用户照样一头雾水。
+        所以留空改走 `_gk_first_animation()`,模型只有一个动画时开箱即用。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_first_animation(", code)
+        self.assertIn("func _gk_first_animation(", code)
+        # 绝不能出现空的动画名
+        self.assertNotIn('has_animation("")', code)
+
+    def test_filled_name_is_used_verbatim(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="骨骼动作")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('"骨骼动作"', code)
+        self.assertNotIn("_gk_first_animation(", code)
+
+    def test_discover_actions_without_bpy_is_safe(self):
+        """离线(没有真 bpy)时动作发现要安全返回空,不能抛异常。"""
+        entries = NN.discover_actions(None)
+        self.assertIsInstance(entries, list)
+
+    def test_action_slot_names_tolerates_missing_slots(self):
+        """老版本 Blender / 桩对象没有 slots 时不能崩。"""
+        class FakeAction:
+            name = "x"
+
+        self.assertEqual(NN._action_slot_names(FakeAction()), [])
+
+    def test_action_belongs_to_uses_slot_name(self):
+        """slot 名字里含物体名 -> 判定为属于它(最强依据)。"""
+        class FakeSlot:
+            name_display = "胡桃-海灯节_arm"
+
+        class FakeAction:
+            name = "骨骼动作"
+            id_root = "OBJECT"
+            slots = (FakeSlot(),)
+
+        class FakeObj:
+            name = "胡桃-海灯节_arm"
+            type = "ARMATURE"
+
+        self.assertTrue(NN.action_belongs_to(FakeAction(), FakeObj()))
+
+    def test_action_belongs_to_falls_back_to_root_type(self):
+        class FakeAction:
+            name = "形态键动作"
+            id_root = "KEY"
+
+        class FakeMesh:
+            name = "随便"
+            type = "MESH"
+
+        class FakeArmature:
+            name = "随便"
+            type = "ARMATURE"
+
+        # KEY 类动作该挂网格,不该挂骨架
+        self.assertTrue(NN.action_belongs_to(FakeAction(), FakeMesh()))
+        self.assertFalse(NN.action_belongs_to(FakeAction(), FakeArmature()))
+
+    def test_actions_on_object_collects_shape_keys(self):
+        """形态键动画挂在 mesh data 的 shape_keys 上,不在物体自己的
+        animation_data 里 —— 漏掉这条用户的『形态键动作』就搜不到。"""
+        sentinel = object()
+
+        class FakeShapeAnim:
+            action = sentinel
+
+        class FakeShapeKeys:
+            animation_data = FakeShapeAnim()
+
+        class FakeData:
+            shape_keys = FakeShapeKeys()
+
+        class FakeObj:
+            name = "m"
+            type = "MESH"
+            animation_data = None
+            data = FakeData()
+
+        self.assertIn(sentinel, NN.actions_on_object(FakeObj()))
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

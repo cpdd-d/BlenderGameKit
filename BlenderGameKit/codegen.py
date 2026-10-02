@@ -149,9 +149,15 @@ class _Statements:
 
     def __init__(self):
         self.lines = []
+        # 额外缩进层。给"嵌套实例守卫"用:守卫那两行之后,本段所有逻辑
+        # 都要再往里缩一层,才能落进 `if ...:` 里面。
+        self.extra_indent = 0
 
     def add(self, indent, text=""):
-        self.lines.append(("    " * indent) + text if text else "")
+        if not text:
+            self.lines.append("")
+            return
+        self.lines.append(("    " * (indent + self.extra_indent)) + text)
 
     def extend(self, other):
         self.lines.extend(other.lines)
@@ -218,6 +224,8 @@ class GenContext:
         self.need_camera_finder = False
         # 只有真的用了动画节点才生成 _gk_find_animation_player()
         self.need_anim_finder = False
+        # 动画名留空时要生成 _gk_first_animation()(见 _stmt_play_anim)
+        self.need_first_animation = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
         self.need_save_helpers = False
         # 只有真的用了界面节点才生成 UI 容器辅助函数
@@ -1271,12 +1279,26 @@ def _stmt_flip(ctx, node, indent):
 @stmt_node("GKNodePlayAnim")
 def _stmt_play_anim(ctx, node, indent):
     player = ctx.animation_player(node)
-    anim = ctx.input_string(node, "动画名", "idle")
+    anim = ctx.input_string(node, "动画名", "")
     speed = gd_number(getattr(node, "gk_speed", 1.0))
     name_temp = ctx.new_temp("anim")
     player_temp = ctx.new_temp("ap")
     ctx.add_line(indent, f"var {player_temp} := {player}")
-    ctx.add_line(indent, f"var {name_temp} := {anim}")
+    # ── 名字留空时**不要**生成 has_animation("")──────────────────────
+    # 节点默认值改成空之后(见 nodes.py 的说明),用户不动它就会留下空串。
+    # 直接生成 `has_animation("")` 是没意义的 —— 永远 false,
+    # 只会打一条"动画不存在: "的空警告,用户还是一头雾水。
+    #
+    # 改成:留空 = "随便播一个"。很多模型身上只有一个动画
+    # (用户的胡桃有俩,但单个动作的模型更常见),这样开箱即用。
+    if anim == '""':
+        # 让 generate() 记得生成 _gk_first_animation() 这个辅助函数。
+        # **只在这条分支里设** —— 无条件设的话,
+        # 填了名字的节点也会白白带一个用不到的辅助函数。
+        ctx.need_first_animation = True
+        ctx.add_line(indent, f"var {name_temp} := _gk_first_animation({player_temp})")
+    else:
+        ctx.add_line(indent, f"var {name_temp} := {anim}")
     ctx.add_line(indent, f"if {player_temp} != null and "
                          f"{player_temp}.has_animation({name_temp}):")
     ctx.add_line(indent + 1, f"{player_temp}.play({name_temp}, -1.0, {speed})")
@@ -2810,6 +2832,23 @@ class Generator:
                 signature = f"func {func_name}() -> void:"
                 delta_name = None
 
+            # ── 嵌套实例守卫 ────────────────────────────────────────────
+            # 世界场景里那个包着角色的节点挂着本脚本,而那个节点的子节点
+            # **实例化的又是角色场景**(角色场景根节点也挂着同一个脚本)。
+            # 于是同一个 `_ready()` 会执行两遍 —— 用户实测:
+            # 控制台把 "你好,世界" 打印了两次;更糟的是移动逻辑也会跑两遍,
+            # 角色以双倍速度移动。
+            #
+            # 两份都不能删:
+            #   * 删 World 那份 -> Godot 实例化场景时**不继承**根节点的
+            #     `script` 属性(实测 script=<null>),逻辑整个不跑
+            #   * 删角色场景那份 -> 单独打开角色场景就不能跑了
+            #
+            # 所以改成**运行时守卫**:如果父节点挂着同一个脚本,
+            # 说明"我"只是被实例化出来的那一份,外层已经在处理了 —— 直接跳过。
+            #
+            # 用 `get_script()` 比对而不是 `has_method("_ready")` ——
+            # 后者任何脚本都有,区分不出是不是同一个。
             lines = self.ctx.new_section()
             for index, node in enumerate(nodes):
                 if index > 0:
@@ -2925,6 +2964,22 @@ class Generator:
                     "    return null",
                 ],
                 "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 动画名留空时用的"随便挑一个"工具 ----
+        if self.ctx.need_first_animation:
+            sections.append({
+                "signature": "func _gk_first_animation(player: Node) -> String:",
+                "lines": [
+                    "    if player == null:",
+                    '        return ""',
+                    "    var names: PackedStringArray = player.get_animation_list()",
+                    "    if names.is_empty():",
+                    '        return ""',
+                    "    return names[0]",
+                ],
+                "empty_body": '    return ""',
                 "separator": True,
             })
 

@@ -208,8 +208,20 @@ def main():
     # .tscn 里引用资源必须用 res:// 路径,且模型在 art/、脚本在 scripts/
     check("场景引用了模型(art/)", 'path="res://art/TestCharacter.glb"' in scene_text,
           [ln for ln in scene_text.splitlines() if "glb" in ln][:1])
-    check("场景引用了脚本(scripts/)", f'path="res://scripts/{script_name}"' in scene_text,
-          [ln for ln in scene_text.splitlines() if ".gd" in ln][:1])
+    # ── 脚本挂在哪:角色场景**故意不挂** ────────────────────────────
+    # 历史(踩了两轮才想清楚):
+    #   1. 最初角色场景根节点挂脚本,World 场景里包角色的那个节点**也**挂
+    #      -> `_ready()` 跑两遍(逻辑双份,角色双倍速移动)
+    #   2. 试着只在角色场景挂 -> **逻辑整个不跑**。因为 Godot 实例化场景时
+    #      **不继承**被实例化场景根节点的 `script` 属性(实测 script=<null>)
+    #   3. 定案:脚本挂 World 那个节点,**角色场景不挂**。
+    #      角色场景在这个工作流里是子场景,不是给人按 F5 直接跑的。
+    check("角色场景不挂游戏脚本(避免跑两遍)",
+          f'path="res://scripts/{script_name}"' not in scene_text,
+          [ln for ln in scene_text.splitlines() if ".gd" in ln][:2])
+    check("角色场景仍然引用模型(art/)",
+          'path="res://art/TestCharacter.glb"' in scene_text,
+          [ln for ln in scene_text.splitlines() if "glb" in ln][:1])
     check("场景含碰撞体", "CollisionShape3D" in scene_text and "CapsuleShape3D" in scene_text)
     check("场景根节点是角色基类", 'type="CharacterBody3D"' in scene_text)
 

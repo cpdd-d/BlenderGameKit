@@ -14,6 +14,165 @@
 from . import node_base as B
 from .node_base import finalize, gd_node_path, gd_string, snake_case, target_pin, TARGET_SELF
 from .. import gk_sockets as S
+
+
+# ==========================================================================
+# 动作(Action)归属识别 —— "动画名下拉"的地基
+# ==========================================================================
+# 背景:用户踩过这个坑 —— 节点里动画名是默认的 `idle`,
+# 而模型里的动作叫 `骨骼动作` / `形态键动作`,于是播不了。
+#
+# ── 为什么不能简单地把 bpy.data.actions 全列出来 ──────────────────
+# `bpy.data.actions` 是**全局**的,不区分属于哪个角色。
+# 场景里有两个角色时,动作会混在一个列表里,选错是迟早的事。
+#
+# ── 实测出来的归属依据(用户的胡桃模型)────────────────────────────
+#
+#     动作             id_root     slots
+#     骨骼动作         OBJECT      ['胡桃-海灯节_arm']   <- 槽名就是骨架名
+#     形态键动作       KEY         ['Key']
+#
+# Blender 4.4+ 的 slotted action 会把**绑定的物体名**记在 slot 上,
+# 这是最可靠的归属依据。拿不到 slot 时退回名字匹配 + 类型判断。
+# ==========================================================================
+
+# id_root -> 这类动作该挂在什么类型的物体上
+_ACTION_ROOT_TYPES = {
+    "OBJECT": ("ARMATURE", "OBJECT", "MESH"),
+    "KEY": ("MESH",),
+}
+
+# 用户可读的类别名(画在下拉列表里,帮他分辨)
+_ACTION_KIND_LABEL = {
+    "OBJECT": "骨骼/物体",
+    "KEY": "形态键",
+    "MATERIAL": "材质",
+    "NODETREE": "节点",
+    "PARTICLE": "粒子",
+}
+
+
+def _action_slot_names(action):
+    """取一个 Action 的 slot 名字列表(拿不到就返回空)。"""
+    slots = getattr(action, "slots", None)
+    if not slots:
+        return []
+    out = []
+    for slot in slots:
+        name = getattr(slot, "name_display", None) or getattr(slot, "name", "")
+        if name:
+            out.append(str(name))
+    return out
+
+
+def action_belongs_to(action, obj):
+    """这个动作是不是"可能属于"这个物体。用于给下拉列表排序/标注。
+
+    判据按可靠性排序:
+      1. slot 名字里含物体名(最强 —— Blender 自己就是这么记的)
+      2. 动作的 id_root 和物体类型对得上
+    """
+    if action is None or obj is None:
+        return False
+    obj_name = str(getattr(obj, "name", ""))
+    for slot_name in _action_slot_names(action):
+        if obj_name and obj_name in slot_name:
+            return True
+    root = str(getattr(action, "id_root", "") or "")
+    allowed = _ACTION_ROOT_TYPES.get(root, ())
+    return str(getattr(obj, "type", "")) in allowed
+
+
+def actions_on_object(obj):
+    """**确凿**挂在这个物体上的动作(当前激活的 + NLA 里的 + 形态键的)。
+
+    这是"一定对"的那一批,优先列给用户。
+    """
+    found = []
+    if obj is None:
+        return found
+
+    def _add(action):
+        if action is not None and action not in found:
+            found.append(action)
+
+    anim = getattr(obj, "animation_data", None)
+    if anim is not None:
+        _add(getattr(anim, "action", None))
+        for track in getattr(anim, "nla_tracks", ()) or ():
+            for strip in getattr(track, "strips", ()) or ():
+                _add(getattr(strip, "action", None))
+
+    # 形态键动画挂在 mesh data 的 shape_keys 上,不在物体自己的
+    # animation_data 里 —— 漏掉这里用户的"形态键动作"就搜不到。
+    data = getattr(obj, "data", None)
+    shape_keys = getattr(data, "shape_keys", None)
+    if shape_keys is not None:
+        key_anim = getattr(shape_keys, "animation_data", None)
+        if key_anim is not None:
+            _add(getattr(key_anim, "action", None))
+    return found
+
+
+def discover_actions(obj=None):
+    """给下拉列表用的动作清单:(标识, 显示名, 说明) 三元组序列。
+
+    obj 给了的话,把"属于它"的动作排在前面并标上 ★。
+
+    ── 标识为什么用 `名字` 而不是别的 ──────────────────────────────
+    导出的 GDScript 里最终要的是**动画名**(Godot 的
+    `AnimationPlayer.has_animation("骨骼动作")`)。所以这里直接用
+    Action 的名字当枚举标识,节点上选什么、生成什么,一一对应,
+    中间不做任何转换 —— 少一层映射就少一类 bug。
+    """
+    try:
+        import bpy
+    except Exception:
+        return []
+
+    # ── 测试桩里的 bpy 是个空壳(没有 .data)────────────────────────
+    # 直接用 bpy.data.actions 会 AttributeError。离线测试跑的就是这条路,
+    # 所以这里必须先确认 .data 真的存在 —— 否则"动作发现"会让整个
+    # 离线测试台崩掉,而它本该只是拿不到数据而已。
+    data = getattr(bpy, "data", None)
+    if data is None:
+        return []
+    all_actions = getattr(data, "actions", None)
+    if all_actions is None:
+        return []
+
+    owned = []
+    if obj is not None:
+        owned = [a.name for a in actions_on_object(obj)]
+
+    entries = []
+    for action in all_actions:
+        name = str(action.name)
+        root = str(getattr(action, "id_root", "") or "")
+        kind = _ACTION_KIND_LABEL.get(root, root or "?")
+        slot_names = _action_slot_names(action)
+        owned_mark = "★ " if name in owned else ""
+        detail = f"{kind}"
+        if slot_names:
+            detail += f" · {slot_names[0]}"
+        entries.append((name, f"{owned_mark}{name}  ({detail})", name))
+
+    # 属于当前物体的排前面(下拉列表长的时候,第一屏就能看到对的)
+    entries.sort(key=lambda item: (0 if item[0] in owned else 1, item[1]))
+    return entries
+
+
+def action_enum_items(_self=None, _context=None):
+    """动态枚举回调:列出场景里所有动作。
+
+    没绑定到具体物体 —— Blender 的 EnumProperty 回调拿不到节点实例,
+    所以这里列**全部**,靠标签上的 ★ 和"(类型 · 归属)"帮用户分辨。
+    导出时还会再校验一次(见 gk_anim_name 的检查)。
+    """
+    entries = discover_actions(None)
+    if not entries:
+        return [("", "(这个文件里还没有任何动画)", "")]
+    return entries
 from ..gk_sockets import ANY, BOOL, COLOR, FLOAT, FLOW, INT, OBJECT, TEXT, VECTOR, VECTOR2
 
 CLASSES = []
@@ -439,13 +598,28 @@ class GKNodePlayAnim(B.GKStatementNode):
         # AnimationPlayer 在 Model/ 下面,路径必然找不到,脚本直接崩。
         ("gk_player", "node", "", "动画播放器",
          "留空 = 自动查找(推荐);也可以填场景里的节点名"),
-        ("gk_anim_name", "string", "idle", "动画名", "未连线时的动画片段名"),
+        # ── 动画名:文本框 + 『选…』按钮,不是下拉 ─────────────────────
+        # 想做成 EnumProperty 下拉,但 Blender 不允许:
+        #     TypeError: EnumProperty(...): 'default' can only be an
+        #                integer when 'items' is a function
+        # 动态 items 的枚举**默认值只能是整数下标**,而我们这里要的是
+        # 动作名字符串,两边对不上。
+        #
+        # 所以改成:文本框(名字能直接看到) + 『选…』按钮弹列表。
+        # 按钮弹出的列表由动作归属分析生成,属于当前物体的排在前面并带 ★。
+        #
+        # 默认值留空 —— 以前默认 `idle` 是个**假名字**,用户不动它就会
+        # 一直播不出来。空值会让导出的脚本报"动画不存在,可用的是…",
+        # 比一个看起来合理但永远错的名字好。
+        ("gk_anim_name", "string", "", "动画名",
+         "点右边『选…』从列表挑;带 ★ 的是当前物体自己的动画"),
         ("gk_speed", "float", 1.0, "播放速度", "1.0 为原速"),
     )
 
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         row.prop(self, "gk_anim_name", text="")
+        row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
         row.prop(self, "gk_speed", text="")
 
     def draw_buttons_ext(self, context, layout):

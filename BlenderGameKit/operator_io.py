@@ -767,6 +767,61 @@ class GK_OT_Preview(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_PickAnimName(bpy.types.Operator):
+    """从列表里挑一个动画名填进节点。
+
+    为什么不是 EnumProperty 下拉:Blender 不允许动态 items 的枚举配
+    字符串默认值(`'default' can only be an integer when 'items' is a
+    function`)。所以做成"文本框 + 选…按钮"。
+
+    列表由 `nodes.action_ownership` 的动作归属分析生成:
+    **属于当前物体**的动作带 ★ 排在最前面。
+    """
+
+    bl_idname = "gk.pick_anim_name"
+    bl_label = "选择动画"
+    bl_description = "从当前文件的所有动画里挑一个(带 ★ 的是这个物体自己的)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    choice: StringProperty(name="动画名", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        return context.window_manager.invoke_search_popup(self)
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or not hasattr(node, "gk_anim_name"):
+            return {"CANCELLED"}
+        node.gk_anim_name = self.choice
+        self.report({"INFO"}, f"动画名 -> {self.choice}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        """搜索弹窗的每一行。
+
+        沿用 `gk.find_node` 那套"分类 · 名字"的写法 ——
+        动作多的时候只写名字分不清。
+        """
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        # 节点的『动画播放器』属性指向哪个物体,就拿它分析归属。
+        # 拿不到就列全部(至少比手打强)。
+        target = None
+        player = getattr(node, "gk_player", "") if node is not None else ""
+        if player:
+            target = bpy.data.objects.get(player)
+        for ident, label, _desc in node_lib.discover_actions(target):
+            op = self.layout.operator("gk.pick_anim_name", text=label)
+            op.node_name = self.node_name
+            op.choice = ident
+
+
 class GK_OT_ExportAssets(bpy.types.Operator):
     """把 Blender 的模型和材质一起导出到 Godot,并装配成"模型+碰撞体+脚本"的场景。
 
@@ -1275,6 +1330,8 @@ GK_CLASSES = (
     GK_OT_AddNode,
     GK_OT_StarterGraph,
     GK_OT_AutoLink,
+    # 动画名选择器(动作归属分析,带 ★ 的排前面)
+    GK_OT_PickAnimName,
     # 碰撞体可视化(像 UPBGE 那样能在视口里看到碰撞范围)
     GK_OT_ShowCollision,
     GK_OT_HideCollision,
