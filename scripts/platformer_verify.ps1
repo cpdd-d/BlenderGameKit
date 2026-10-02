@@ -130,7 +130,11 @@ Set-Content $scene -Value $text -Encoding utf8 -NoNewline
 
 # ---------- 3. run ----------
 Step "3/3 run in Godot"
-$runLog = & $Godot --path $demo 2>&1 | Out-String
+# --headless: an automated check must not pop a game window in the user's face.
+# The checks below are all gameplay/state (gravity, score, HUD text, save file),
+# none of them need a rendered frame -- so headless verifies the same things
+# without hijacking the screen every time the suite runs.
+$runLog = & $Godot --headless --path $demo 2>&1 | Out-String
 # Set GK_VERIFY_DEBUG=1 to dump the raw engine output (handy when the checker
 # itself fails to parse -- Godot then prints nothing matching the filters below).
 if ($env:GK_VERIFY_DEBUG) {
