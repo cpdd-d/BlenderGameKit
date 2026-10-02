@@ -338,6 +338,56 @@ def main():
     after = asset_export.meshes_without_material(bpy.context.scene)
     check("加了材质后不再被报", "MaterialProbe" not in after, str(after))
 
+    # ── .tres 里不能有任何 `#` 注释(血的教训)──────────────────────
+    # 曾经把说明性注释插进 TOON_MATERIAL_TEMPLATE 的 shader_parameter
+    # 中间,结果 Godot 对**每一个材质**报
+    #     Parse Error: Unexpected identifier 'rim_color'.
+    #     Failed loading resource: res://materials/material.tres
+    # `.tres` 是资源格式不是脚本,解析器只认 `[段]` 和 `键 = 值`,
+    # 见到 `#` 直接判语法错误 —— 所有材质加载失败,模型变回白模。
+    # 这里逐行检查生成的 .tres,把这条钉死。
+    tres_files = []
+    materials_dir = os.path.join(out_dir, "materials")
+    if os.path.isdir(materials_dir):
+        for name in sorted(os.listdir(materials_dir)):
+            if name.endswith(".tres"):
+                tres_files.append(os.path.join(materials_dir, name))
+    check(".tres 材质文件已生成", len(tres_files) > 0, str(len(tres_files)))
+
+    bad_lines = []
+    for path in tres_files:
+        with open(path, encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                stripped = line.strip()
+                # `[` 开头的段头、空行、`键 = 值` 之外都算可疑
+                if not stripped or stripped.startswith("["):
+                    continue
+                if "#" in stripped or ";" in stripped:
+                    bad_lines.append(f"{os.path.basename(path)}:{number} {stripped}")
+    check(".tres 里没有 # 注释(会让整个材质加载失败)",
+          not bad_lines, "; ".join(bad_lines[:3]))
+
+    # 每一条 shader_parameter 都必须是合法的 `键 = 值`
+    malformed = []
+    for path in tres_files:
+        with open(path, encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("["):
+                    continue
+                if "=" not in stripped:
+                    malformed.append(f"{os.path.basename(path)}:{number} {stripped}")
+    check(".tres 每行都是 键 = 值", not malformed, "; ".join(malformed[:3]))
+
+    # rim / 高光默认必须是 0(否则加法项会把贴图盖成白模)
+    if tres_files:
+        with open(tres_files[0], encoding="utf-8") as handle:
+            body = handle.read()
+        check("rim_amount 默认 0",
+              "shader_parameter/rim_amount = 0.0" in body)
+        check("specular_amount 默认 0",
+              "shader_parameter/specular_amount = 0.0" in body)
+
     # 清理
     bpy.data.objects.remove(probe, do_unlink=True)
     if probe_mesh.users == 0:

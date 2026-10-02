@@ -302,8 +302,6 @@ shader_parameter/albedo_color = Color({r:.4f}, {g:.4f}, {b:.4f}, 1)
 shader_parameter/use_albedo_texture = {use_texture:.1f}
 shader_parameter/albedo_strength = 1.0
 shader_parameter/albedo_texture = {albedo_ref}
-# 曝光归一化:灯的 light_energy 会带着能量乘进 DIFFUSE_LIGHT,
-# 不除的话 light_energy=4.0 会把整个模型冲成白的(踩过,见 gk_toon.gdshader)
 shader_parameter/toon_exposure = 0.35
 shader_parameter/light_map_mix = 0.0
 shader_parameter/shadow_step = 0.1
@@ -312,29 +310,46 @@ shader_parameter/three_tone = 0.0
 shader_parameter/lit_tint = Color(1, 0.976, 0.914, 1)
 shader_parameter/shadow_tint = Color(0.706, 0.627, 0.902, 1)
 shader_parameter/shadow_strength = 1.0
-# ── rim / 高光默认**关闭**(踩过的坑,这是"模型变白"的真凶)─────────
-# 这两个都是 **EMISSION 加法项**:
-#     EMISSION += rim_color.rgb * rim * rim_amount
-#     EMISSION += vec3(spot * specular_amount)
-# 加法项不参与任何明暗衰减,直接叠在 albedo 上。实测(用户那个
-# 33 材质槽的 MMD 模型,太阳灯 light_energy=4.0):
-#
-#     rim=0.4  specular=0.2  -> 整个角色一层没有细节的白壳
-#     rim=0.08 specular=0.05 -> 仍然偏白偏灰
-#     rim=0.0  specular=0.0  -> 肤色/红衣/黑发全部正确显示(决定性实验:
-#                               所有 tint 保持原样,只关这两项)
-#
-# 所以默认关掉,想要边缘光/高光的用户自己在 Godot 里调上去。
-#
-# 另外实测发现:`toon_exposure` 和 `shadow_tint` 改了以后**画面字节
-# 完全相同** —— 说明 `light()` 里的卡通色阶这一段在当前 Godot 4.7 下
-# 基本没参与最终着色(至少对这个模型是这样)。真正决定观感的是
-# ALBEDO + EMISSION 加法项。这条还没查透,先记在这里。
 shader_parameter/specular_amount = 0.0
 shader_parameter/rim_amount = 0.0
 shader_parameter/backlight_amount = 0.0
 shader_parameter/emission_amount = 0.0
 """
+
+# ============================================================================
+# TOON_MATERIAL_TEMPLATE 的参数为什么是这些值 —— **注释不能写进 .tres 里面**
+# ============================================================================
+#
+# ── 血的教训:.tres 里不能有任何 `#` 注释 ────────────────────────────────
+# 曾经把下面这些说明直接写进上面的模板里(插在 shader_parameter 中间),
+# 结果 Godot 对**每一个材质**报:
+#
+#     Parse Error: Unexpected identifier 'rim_color'.
+#     Failed loading resource: res://materials/material.tres
+#
+# `.tres` 是**资源格式**,不是脚本 —— 解析器只认 `[段]` 和 `键 = 值`,
+# 见到 `#` 就当语法错误,整个材质文件加载失败。后果就是模型又变回白模。
+# 所以:注释写在这里(Python 里),不要写进模板字符串。
+#
+# ── rim_amount / specular_amount 为什么默认 0 ──────────────────────────
+# 这两个是 **EMISSION 加法项**:
+#     EMISSION += rim_color.rgb * rim * rim_amount
+#     EMISSION += vec3(spot * specular_amount)
+# 加法项不参与任何明暗衰减,直接叠在 albedo 上。实测(33 材质槽的
+# MMD 模型,太阳灯 light_energy = 4.0):
+#     rim=0.4  specular=0.2  -> 一层没有细节的白壳
+#     rim=0.08 specular=0.05 -> 仍然偏白偏灰
+#     rim=0.0  specular=0.0  -> 肤色/红衣/黑发全部正确显示
+# 想要边缘光/高光的用户自己在 Godot 里调上去。
+#
+# ── toon_exposure ─────────────────────────────────────────────────────
+# 把灯的 energy 归一化回可视范围(不除的话 light_energy=4.0 会把模型冲白)。
+#
+# ── 还没查透的一条 ────────────────────────────────────────────────────
+# 实测发现 `toon_exposure` 和 `shadow_tint` 改了以后渲染出的 PNG
+# **字节完全相同** —— 说明 `light()` 里的卡通色阶那段在当前 Godot 4.7 下
+# 基本没参与最终着色(至少对这个模型是这样)。真正决定观感的是
+# ALBEDO + EMISSION 加法项。见 docs/待办清单.md。
 
 
 def safe_name(text, fallback="model"):
