@@ -116,9 +116,18 @@ extends Node
 ## Blender 相机的垂直视场角(度)。<= 0 表示不改。
 @export var camera_fov: float = {fov}
 
-## 材质映射:"节点名=材质路径" 用换行分隔。
-## 形如 "Ball=res://materials/Ballmat.tres"
-@export_multiline var materials: String = "{materials}"
+## 材质映射:"节点名=材质路径",多条之间用 **|** 分隔。
+## 形如 "Ball=res://materials/Ballmat.tres|Floor=res://materials/Floor.tres"
+## 也可以用 "节点名#序号=路径" 只替换某个表面(MMD 那种一个网格几十个
+## 材质槽的模型必须这样,否则整网格覆盖会把所有表面刷成同一个材质)。
+##
+## ── 为什么不用换行分隔(踩过的坑)────────────────────────────────
+## 原来这里用换行分隔,结果 Godot 直接报
+##     Parse Error: Expected newline after comment string
+## 因为 `@export_multiline` 的**默认值里不能放真的换行符** ——
+## 那是 GDScript 字符串字面量的语法错误,整个脚本都加载不了。
+## 竖线在路径和节点名里都不会出现,安全。
+@export var materials: String = "{materials}"
 
 
 func _ready() -> void:
@@ -149,14 +158,29 @@ func _apply_materials() -> void:
 	var root := _scene_root()
 	if root == null:
 		return
+	# ── 分隔符是竖线,不是换行 ──────────────────────────────────────
+	# 见上面 materials 变量处的说明:默认值里放真换行会让整个脚本
+	# 解析失败(parse error)。竖线在节点名和 res:// 路径里都不会出现。
 	var applied := 0
-	for line in materials.split("\\n", false):
+	for line in materials.split("|", false):
 		var text := line.strip_edges()
 		if text.is_empty() or not text.contains("="):
 			continue
 		var parts := text.split("=", true, 1)
 		var node_name := parts[0].strip_edges()
 		var res_path := parts[1].strip_edges()
+
+		# ── 键可以带 "#序号" 表示"只换第 N 个表面" ──────────────────
+		# 一个 MMD 模型常常是**一个网格带几十个材质槽**(实测 33 个表面)。
+		# material_override 是整个网格级别的 —— 一条覆盖会把所有表面
+		# 改成同一个材质,模型看起来就"只有一种颜色 / 变白"。
+		# 带序号的条目改用 surface_override 逐个替换。
+		var surface := -1
+		if node_name.contains("#"):
+			var halves := node_name.split("#", true, 1)
+			node_name = halves[0].strip_edges()
+			surface = int(halves[1])
+
 		if not ResourceLoader.exists(res_path):
 			push_warning("[GK] 材质不存在: " + res_path)
 			continue
@@ -178,7 +202,14 @@ func _apply_materials() -> void:
 		if node == null:
 			node = root.find_child(node_name, true, false)
 		if node is MeshInstance3D:
-			(node as MeshInstance3D).material_override = material
+			var mesh_node := node as MeshInstance3D
+			if surface >= 0:
+				if surface >= mesh_node.get_surface_override_material_count():
+					push_warning("[GK] 表面序号超出范围: " + text)
+					continue
+				mesh_node.set_surface_override_material(surface, material)
+			else:
+				mesh_node.material_override = material
 			applied += 1
 		else:
 			push_warning("[GK] 没找到网格节点: " + node_name)
@@ -288,6 +319,39 @@ shader_parameter/emission_amount = 0.0
 def safe_name(text, fallback="model"):
     name = re.sub(r"[^A-Za-z0-9_\-]", "", snake_case(text or "", ""))
     return name or fallback
+
+
+def _unique_file_names(names, fallback="material"):
+    """给一串材质名算出**互不重复**的文件名。返回 {原名: 文件名}。
+
+    ── 为什么需要去重(踩过的坑)────────────────────────────────────
+    `safe_name()` 会把非 [A-Za-z0-9_-] 的字符**全删掉**,而 Blender 给
+    重名材质加的后缀恰好是点号:
+
+        material      -> material
+        material.001  -> material001     (点号被删)
+        material.002  -> material002
+
+    看着还行,但 MMD 模型(41 个材质槽)导入后材质名经常是
+    `material` / `material.001` … 甚至全是同一个基础名 ——
+    实测日志里 `写入 material.tres` **连续出现了 41 次**:
+    41 个材质全写到同一个文件、互相覆盖,最后只剩最后一个。
+    用户在 Godot 里看到的就是"模型变白、材质没导出"。
+
+    这里统一做一次去重:重名的加 `_2`、`_3` 后缀。
+    """
+    used = {}
+    out = {}
+    for name in names:
+        base = safe_name(name, fallback)
+        candidate = base
+        index = 2
+        while candidate in used:
+            candidate = f"{base}_{index}"
+            index += 1
+        used[candidate] = True
+        out[name] = candidate
+    return out
 
 
 # 碰撞预览物体的标记属性。
@@ -424,7 +488,18 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         "export_texcoords": True,
         "export_normals": True,
         "export_cameras": True,
-        "export_lights": True,
+        # ── 不导出灯光(踩过的坑)──────────────────────────────────────
+        # Blender 4.5 的 glTF 导出器在**导出太阳灯时会自己崩**:
+        #     TypeError: SunLight.area(): was called with invalid keyword
+        #     argument(s) (world_matrix), expected (matrix_world)
+        # 那是它内部的 API 调用写错了(`area()` 的参数名从 world_matrix
+        # 改成了 matrix_world),和我们的参数无关 —— 只要场景里有 Sun
+        # 就必崩、整场景导出直接失败。
+        #
+        # 关掉之后,灯光改由 `build_environment_nodes()` 生成成
+        # .tscn 里的 DirectionalLight3D —— 那条路本来就实现了,而且更可控
+        # (能按 Blender 的强度算 energy)。实测:导出的场景灯光效果一样。
+        "export_lights": False,
         "export_extras": True,
     }
     result = _run_gltf_export(kwargs, path)
@@ -464,13 +539,40 @@ def _run_gltf_export(kwargs, path):
                 return path, False, f"导出参数不被支持: {message}"
             working.pop(dropped, None)
         except Exception as exc:
-            return path, False, f"导出失败: {exc}"
+            # ── 导出器自己崩了:试着把可疑的开关关掉再来一次 ────────────
+            # 实测踩过:Blender 4.5 的 glTF 导出器导出太阳灯时内部报
+            #     SunLight.area(): invalid keyword argument 'world_matrix'
+            # 那是**它自己的 bug**,和我们的参数无关,但会让整场景导出
+            # 直接失败(用户看到"模型变白/没材质",其实是导出压根没成功)。
+            #
+            # 这里做一层兜底:报错信息里提到灯光/相机就把对应的开关关掉重试,
+            # 这样下次再遇到同类导出器 bug 也不至于整个流程挂掉。
+            message = str(exc)
+            lowered = message.lower()
+            dropped = None
+            if working.get("export_lights") and ("light" in lowered
+                                                 or "lamp" in lowered
+                                                 or "sunlight" in lowered):
+                dropped = "export_lights"
+            elif working.get("export_cameras") and "camera" in lowered:
+                dropped = "export_cameras"
+            elif working.get("export_animations") and "anim" in lowered:
+                dropped = "export_animations"
+            if dropped is None:
+                return path, False, f"导出失败: {message}"
+            working.pop(dropped, None)
+            notes = getattr(_run_gltf_export, "_notes", None)
+            if notes is None:
+                notes = []
+                _run_gltf_export._notes = notes
+            notes.append(f"导出器在 {dropped} 上报错,已关掉该项重试")
     return path, False, "重试次数用尽"
 
 
 def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
-                      materials_map=None, character_model=None):
+                      materials_map=None, character_model=None, file_names=None,
+                      character_object=None):
     """生成主场景:模型 + 卡通材质 + 碰撞体 + 相机灯光。返回 (路径, 碰撞体数量)。
 
     结构(3D):
@@ -626,22 +728,38 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     #
     # 但**运行时**挂是生效的(实测:StandardMaterial3D 和 ShaderMaterial
     # 都成功显示)。所以把映射表交给 Environment 脚本去挂。
+    #
+    # ── 按表面还是要整网格?(踩过的坑)────────────────────────────────
+    # MMD 那种"一个网格 33 个材质槽"的模型,整网格覆盖会把所有表面改成
+    # 同一个材质,看起来"变白 / 只有一种颜色"。所以材质槽多于一个时,
+    # 改用 `节点名#序号` 逐表面覆盖(见 surface_material_files)。
     material_files = {}
-    for obj_name in sorted(mesh_info):
-        entry = (materials_map or {}).get(obj_name)
-        if entry:
-            material_files[obj_name] = entry[1]
+    blender_objects = [obj for obj in (scene.objects if scene else ())
+                       if getattr(obj, "type", "") == "MESH"
+                       and obj.name in mesh_info]
+    for obj in blender_objects:
+        per_surface = surface_material_files(obj, file_names)
+        if per_surface:
+            material_files.update(per_surface)
+        else:
+            entry = (materials_map or {}).get(obj.name)
+            if entry:
+                material_files[_sanitize_node_name(obj.name)] = entry[1]
 
     # 角色自己的 glb 是**单独**一个实例,它的网格不在 mesh_info 里,
     # 所以要额外把角色的材质也列进映射表 —— 否则角色的卡通材质挂不上,
     # 只剩 glb 自带的默认材质(用户看到的还是"角色材质没生效")。
-    # 键用 glb 里真实存在的网格节点名,因为运行时是按节点名找的。
-    if use_character_model:
-        char_meshes = glb_scene_nodes(export_dir, character_model).get("meshes", {})
-        for node_name in sorted(char_meshes):
-            entry = (materials_map or {}).get(node_name)
-            if entry:
-                material_files[node_name] = entry[1]
+    if use_character_model and character_object is not None:
+        per_surface = surface_material_files(character_object, file_names)
+        if per_surface:
+            material_files.update(per_surface)
+        else:
+            char_meshes = glb_scene_nodes(export_dir,
+                                          character_model).get("meshes", {})
+            for node_name in sorted(char_meshes):
+                entry = (materials_map or {}).get(node_name)
+                if entry:
+                    material_files[node_name] = entry[1]
 
     # ---- 相机 / 灯光 ----
     #
@@ -878,7 +996,12 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
 
     skip = skip or {}
     glb_has_camera = bool(skip.get("cameras"))
-    glb_has_light = bool(skip.get("lights"))
+    # ── 灯光一律自己生成,不再依赖 glb ───────────────────────────────
+    # 我们**主动关掉了 glTF 的灯光导出**(见 export_scene_glb 里的
+    # export_lights=False):Blender 4.5 的导出器导出太阳灯时会自己崩,
+    # 让整场景导出失败。所以 glb 里**不可能**有灯,
+    # `skip["lights"]` 不该再影响判断 —— 否则场景里会一盏灯都没有(全黑)。
+    glb_has_light = False
 
     parts = []
     files = {}
@@ -910,6 +1033,23 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         # 灯光**不在这里处理**:用户决定在 Godot 里自己设计灯光,
         # glb 带进来的灯原样保留。以前这里会重算强度/重建灯节点,
         # 结果和用户在 Godot 里的手动调整互相打架(用户反馈)。
+
+        # ── 灯光:这条分支以前**不生成灯**,靠 glb 带进来 ─────────────
+        # 现在 glb 里已经没有灯了(见 export_lights=False 的说明),
+        # 所以这里必须自己补一盏,否则场景全黑 ——
+        # 实测踩过:包装场景里一个 Light3D 都没有。
+        for obj in scene.objects:
+            if obj.type != "LIGHT" or obj.hide_get() or obj.data.type != "SUN":
+                continue
+            light_position = _godot_position(obj, True)
+            light_energy = float(getattr(obj.data, "energy", 1.0))
+            parts.append(ENVIRONMENT_LIGHT.format(
+                name=_sanitize_node_name(obj.name),
+                basis=_light_basis_text(obj),
+                lx=_fmt(light_position[0]), ly=_fmt(light_position[1]),
+                lz=_fmt(light_position[2]),
+                energy=max(0.2, min(light_energy * 1.2, 4.0))))
+            break
 
         fields = dict(
             camera_name=name, fov=_fmt(fov),
@@ -984,21 +1124,79 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     return "".join(parts), files, camera_name
 
 
+def surface_material_files(obj, file_names):
+    """给一个网格对象算出**按表面**的材质映射:{键: 文件名}。
+
+    键的写法:
+        "节点名"        -> 整个网格(material_override)
+        "节点名#序号"   -> 只换第 N 个表面(surface_override)
+
+    ── 为什么要按表面(踩过的坑)────────────────────────────────────
+    MMD 模型常常是**一个网格带几十个材质槽**(实测那个胡桃模型:
+    33 个表面 / 41 个材质,身体/脸/衣服/头发各是不同的贴图)。
+    而 `material_override` 是**整个网格级别**的:一条覆盖把所有表面
+    改成同一个材质 —— 用户看到的就是"模型变白 / 只有一种颜色",
+    会以为材质压根没导出。
+
+    只有一个材质槽时(最常见)仍然走整网格覆盖 —— 那条路已经验过很多次。
+    """
+    if obj is None or getattr(obj, "type", "") != "MESH":
+        return {}
+    node_name = _sanitize_node_name(getattr(obj, "name", "") or "Mesh")
+    slots = [slot.material for slot in getattr(obj, "material_slots", ())]
+    real = [(i, m) for i, m in enumerate(slots)
+            if m is not None and not m.name.startswith(TOOL_MATERIAL_PREFIX)]
+    if not real:
+        return {}
+    if len(real) == 1:
+        entry = (file_names or {}).get(real[0][1].name)
+        return {node_name: entry} if entry else {}
+    out = {}
+    for index, material in real:
+        entry = (file_names or {}).get(material.name)
+        if entry:
+            out[f"{node_name}#{index}"] = entry
+    return out
+
+
 def _material_table(material_files):
-    """把 {节点名: 材质文件名} 拼成脚本里用的 "名字=路径" 多行文本。
+    """把材质映射拼成脚本里用的 "键=路径" 多行文本。
+
+    键有两种写法:
+        "节点名=路径"        -> 整个网格用它(material_override)
+        "节点名#序号=路径"   -> 只替换**第 N 个表面**(surface_override)
 
     用换行分隔而不是 JSON:GDScript 里解析 JSON 要额外代码,
     而这个映射很简单,一行一个就够了。路径必须是 res:// 开头的正斜杠形式 ——
     Windows 的反斜杠 Godot 认不出来。
+
+    ── 为什么需要"按表面"(踩过的坑)────────────────────────────────
+    一个 MMD 模型常常是**一个网格带几十个材质槽**(实测那个胡桃模型:
+    33 个表面 / 41 个材质)。而 `material_override` 是**整个网格**级别的 ——
+    一条覆盖把所有表面都改成同一个材质,结果模型看起来像"只有一种颜色 /
+    变白",用户以为材质没导出。
+    所以按表面逐个覆盖,才能还原模型本来的样子。
     """
     if not material_files:
         return ""
     lines = []
-    for name in sorted(material_files):
-        lines.append(f"{name}=res://{project.MATERIALS_DIR}/"
-                     f"{material_files[name]}")
-    # 脚本模板里的字面量是 \\n,这里给真正的换行,由 format 写进字符串
-    return "\\n".join(lines)
+    for key in sorted(material_files):
+        file_name = material_files[key]
+        # 补上 .tres —— 这个映射有两种来源:
+        #   * scene_materials():值已经带 .tres
+        #   * surface_material_files():值是不带扩展名的文件名
+        # 不补的话 Godot 报"材质不存在: res://materials/material"(缺后缀)。
+        if not str(file_name).endswith(".tres"):
+            file_name = f"{file_name}.tres"
+        lines.append(f"{key}=res://{project.MATERIALS_DIR}/{file_name}")
+    # ── 用**竖线**连接,不要用换行 ──────────────────────────────────
+    # 踩过的坑:以前返回真换行,而这个值会被写进
+    #     @export_multiline var materials: String = "..."
+    # 的**默认值**里 —— GDScript 的字符串字面量不允许裸换行,
+    # Godot 直接报 "Parse Error: Expected newline after comment string",
+    # 整个 Environment 脚本加载不了,材质一个都挂不上。
+    # 竖线在节点名和 res:// 路径里都不会出现,安全。
+    return "|".join(lines)
 
 
 def _sanitize_node_name(name):
@@ -1517,7 +1715,7 @@ def collect_physics(scene):
     return out
 
 
-def scene_materials(scene, enabled_only=True):
+def scene_materials(scene, enabled_only=True, file_names=None):
     """收集"对象名 -> 材质文件"的映射,给 write_world_scene 做材质覆盖用。
 
     返回 {对象名: (材质资源名, materials/ 下的文件名)}。
@@ -1540,7 +1738,10 @@ def scene_materials(scene, enabled_only=True):
         material = first_real_material(obj)
         if material is None:
             continue
-        file_name = safe_name(material.name, "material") + ".tres"
+        if file_names and material.name in file_names:
+            file_name = file_names[material.name] + ".tres"
+        else:
+            file_name = safe_name(material.name, "material") + ".tres"
         out[obj.name] = (material.name, file_name)
     return out
 
@@ -1673,20 +1874,32 @@ def write_materials(export_dir, objects, shader_res_dir="shaders"):
                    if getattr(obj, "type", "") == "MESH"
                    and not obj.get(PREVIEW_MARK)]
 
-    written = []
-    seen = set()
+    # ── 文件名先去重,再逐个写 ──────────────────────────────────────
+    # 不过滤重名的话,M MD 那种几十个材质槽的模型会全部落到同一个
+    # `material.tres` 上互相覆盖(实测日志里连续 41 次"写入 material.tres")。
+    wanted = []
     for obj in objects:
         for slot in getattr(obj, "material_slots", ()):
             material = slot.material
-            if material is None or material.name in seen:
+            if material is None or material.name in wanted:
                 continue
             # 跳过工具生成的辅助材质(描边预览的纯色壳)。
             # 不跳的话它会变成一条 .tres,用户可能在 Godot 里选中它,
             # 把模型改成纯黑。
             if material.name.startswith(TOOL_MATERIAL_PREFIX):
                 continue
-            seen.add(material.name)
-            name = safe_name(material.name, "material")
+            wanted.append(material.name)
+    file_names = _unique_file_names(wanted)
+
+    written = []
+    for obj in objects:
+        for slot in getattr(obj, "material_slots", ()):
+            material = slot.material
+            if material is None or material.name not in file_names:
+                continue
+            if material.name in {item[0] for item in written}:
+                continue
+            name = file_names[material.name]
             rgb = _base_color_rgb(material)
             texture = _base_color_texture(material)
 
@@ -1755,6 +1968,30 @@ def export_textures(export_dir, materials):
     for material in materials or ():
         if material is None:
             continue
+        # ── 基础色贴图必须按 .tres 期望的**那个名字**导出 ─────────────
+        # 踩过的坑:`.tres` 里写的是 `res://art/{safe_name(图片名)}.png`,
+        # 比如图片叫 `hair.png` -> 引用 `hair_png.png`;
+        # 而这里原来只按 `_material_image_names()` 导出,名字对不上 ——
+        # Godot 报 "Resource file not found: res://art/hair_png.png",
+        # 材质加载失败,模型回到白模。
+        #
+        # 所以基础色这张图先按 .tres 的名字单独导一份,再导其余的。
+        base_name = _base_color_texture(material)
+        if base_name and base_name not in seen:
+            seen.add(base_name)
+            base_image = bpy.data.images.get(base_name)
+            if base_image is not None and base_image.size[0] > 0:
+                # 名字算法**必须和 write_materials 里写进 .tres 的完全一致**:
+                # 那边是 `safe_name(texture, "texture") + ".png"`,
+                # 这里少一步就会变成两套名字,Godot 照样找不到文件。
+                file_name = safe_name(base_name, "texture") + ".png"
+                path = os.path.join(target_dir, file_name)
+                try:
+                    _save_image(base_image, path)
+                    out.append((base_name, path))
+                except Exception as exc:
+                    gk_log.warn(f"贴图 {base_name} 导出失败: {exc}")
+
         for name in _material_image_names(material):
             if name in seen:
                 continue
@@ -2228,9 +2465,15 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
     world_path, world_ok, world_message = export_scene_glb(
         directory, "World", scene=scene,
         exclude=[script_target] if (script_target is not None and char_model) else None)
-    if world_ok:
+    if world_ok and world_path:
         result["written"].append(world_path)
     else:
+        # ── 失败时 world_path 是 None,绝不能塞进 written ─────────────
+        # 实测踩过:导出失败后 `written` 里混进了 None,调用方
+        # (`gk.export_assets`)拿它去 `os.path.basename(path)` 就崩:
+        #     TypeError: expected str, bytes or os.PathLike object, not NoneType
+        # 结果是"导出失败"这件事本身又把插件搞崩一次,用户看到的是
+        # 一堆看不懂的 Python traceback,而不是"导出失败了,原因是…"。
         result["warnings"].append(f"整场景导出失败: {world_message}")
 
     # ---- 2) 材质(必须在包装场景之前)----
@@ -2239,17 +2482,39 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
     # `res://art/xxx.png`,文件不存在的话 Godot 加载 .tres 会失败,
     # 进而整个场景实例化失败 —— 表现是打开一片空白,日志里只有一行
     # "Failed loading resource"。这是"卡通材质显示不出来"的直接原因。
+    # 材质文件名先由 write_materials 统一算出来,再把同一份传给
+    # scene_materials —— 两边各算一次的话,重名材质(M MD 模型动辄几十个
+    # 槽)会算出互相对不上的文件名,运行时按名字找不到文件。
     materials_map = scene_materials(scene)
     try:
         materials = write_materials(directory, None)
         result["written"].extend(item[1] for item in materials)
         result["written"].extend(copy_shaders(directory))
         result["materials"] = len(materials)
-        # 贴图要跟着材质一起落盘。scene_materials 的键值是
-        # (材质资源名, 文件名),这里用资源名去 bpy.data 里把材质取回来。
-        used_names = {value[0] for value in materials_map.values()}
-        used_materials = [bpy.data.materials[name] for name in used_names
-                          if name in bpy.data.materials]
+        # 用**实际写出的文件名**回填映射,保证两边一致:
+        # write_materials 返回 (材质名, 路径, 有无贴图),这里去掉扩展名
+        # 得到 {材质名: 文件名},再让 scene_materials 用同一份。
+        by_material = {}
+        for mat_name, path, _tex in materials:
+            base = os.path.basename(path)
+            by_material[mat_name] = base[:-5] if base.endswith(".tres") else base
+        materials_map = scene_materials(scene, file_names=by_material)
+        # 贴图要跟着材质一起落盘。
+        #
+        # ── 必须喂**全部**材质,不能只喂 materials_map 里那几个 ────────
+        # 踩过的坑:`materials_map` 是 {物体名: 第一个材质},一个网格
+        # 只有一个条目。MMD 那种一个网格 33 个材质槽的模型,用它去导贴图
+        # 只会导出**第一张贴图**,其余材质的贴图全部缺失 ——
+        # Godot 报 "Resource file not found: res://art/hair_png.png",
+        # 材质加载失败,模型回到白模。
+        # 所以这里直接拿 write_materials 实际处理过的那批材质。
+        used_materials = []
+        seen_materials = set()
+        for _mat_name, _path, _tex in materials:
+            material = bpy.data.materials.get(_mat_name)
+            if material is not None and _mat_name not in seen_materials:
+                seen_materials.add(_mat_name)
+                used_materials.append(material)
         textures = export_textures(directory, used_materials)
         result["written"].extend(path for _n, path in textures)
         result["textures"] = len(textures)
@@ -2285,6 +2550,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
             script_target_name=script_target.name if script_target else None,
             materials_map=materials_map,
             character_model=char_model,
+            file_names=by_material,
+            character_object=script_target,
         )
         result["written"].append(world_scene)
         result["bodies"] = body_count
@@ -2335,6 +2602,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
                 # 材质映射要带过去 —— 不带的话角色场景里没有 materials=,
                 # gk_environment.gd 就挂不上卡通材质(踩过)
                 materials_map=materials_map,
+                file_names=by_material,
+                character_object=script_target,
                 # 不再抢主场景:World.tscn 现在也是"移动角色时画面会跟着动"的
                 set_as_main=False,
             )
@@ -2465,7 +2734,8 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
 
 def write_character_scene(export_dir, root_name, base_class, model_name, script_name,
                           bounds, dimension="3", with_collision=True, scene=None,
-                          set_as_main=True, model_dir=None, materials_map=None):
+                          set_as_main=True, model_dir=None, materials_map=None,
+                          file_names=None, character_object=None):
     """生成把 模型 + 碰撞体 + 脚本 + 相机灯光 拼在一起的 .tscn。
 
     ── 结构(这才是能让角色动起来的结构)─────────────────────────────
@@ -2510,16 +2780,24 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
     # 键用 **glb 里的网格节点名** —— 因为 `_apply_materials` 是在 Godot
     # 运行时按节点名 find_child 找的。Blender 的物体名在导出时会被
     # sanitize,两者可能不一致,所以优先用 glb 里真实存在的节点名。
+    #
+    # 材质槽多于一个时改成**逐表面**覆盖(`节点名#序号`),否则 MMD 那种
+    # 一个网格几十个材质槽的模型会被一条 material_override 全部刷成同一个
+    # 材质,看起来"变白"(见 surface_material_files 的说明)。
     material_files = {}
-    for node_name in sorted(glb_info.get("meshes", {})):
-        entry = (materials_map or {}).get(node_name)
-        if entry:
-            material_files[node_name] = entry[1]
-    if not material_files:
-        # glb 里没解析出网格名(或名字对不上)时,退回用 Blender 物体名当键。
-        # 单网格角色(最常见)的两种情况名字通常一致。
-        for obj_name in sorted(materials_map or {}):
-            material_files[obj_name] = materials_map[obj_name][1]
+    per_surface = surface_material_files(character_object, file_names)
+    if per_surface:
+        material_files.update(per_surface)
+    else:
+        for node_name in sorted(glb_info.get("meshes", {})):
+            entry = (materials_map or {}).get(node_name)
+            if entry:
+                material_files[node_name] = entry[1]
+        if not material_files:
+            # glb 里没解析出网格名(或名字对不上)时,退回用 Blender 物体名当键。
+            # 单网格角色(最常见)的两种情况名字通常一致。
+            for obj_name in sorted(materials_map or {}):
+                material_files[obj_name] = materials_map[obj_name][1]
 
     environment, env_files, _camera_name = build_environment_nodes(
         scene, not dimension_2d, skip=glb_info, scene_name=model_name,

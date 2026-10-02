@@ -829,7 +829,11 @@ class GK_OT_ExportAssets(bpy.types.Operator):
                 f"{outcome['lights']} 盏灯"
                 f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}）")
         for path in written:
-            gk_log.info(f"写入 {os.path.basename(path)}")
+            # 防御:written 里理论上不该有 None,但一旦混进来,
+            # `os.path.basename(None)` 会崩,而且崩在"报告结果"这一步 ——
+            # 用户看到的是一堆 traceback 而不是真正的错误原因(实测踩过)。
+            if path:
+                gk_log.info(f"写入 {os.path.basename(str(path))}")
         return {"FINISHED"}
 
 

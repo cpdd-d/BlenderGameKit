@@ -48,11 +48,15 @@ func _physics_process(delta: float) -> void:
 
 
 func on_attack_pressed() -> void:
+    var _ap3 := _gk_find_animation_player(self)
     var _anim2 := "attack"
-    if _gk_find_animation_player(self).has_animation(_anim2):
-        _gk_find_animation_player(self).play(_anim2, -1.0, 1.0)
+    if _ap3 != null and _ap3.has_animation(_anim2):
+        _ap3.play(_anim2, -1.0, 1.0)
     else:
-        push_warning("动画不存在: %s" % _anim2)
+        if _ap3 == null:
+            push_warning("[GK] 没找到 AnimationPlayer,播不了动画: %s" % _anim2)
+        else:
+            push_warning("[GK] 动画不存在: %s。这个模型里可用的动画有: %s" % [_anim2, _ap3.get_animation_list()])
     state = "attack"
 
 

@@ -1274,11 +1274,26 @@ def _stmt_play_anim(ctx, node, indent):
     anim = ctx.input_string(node, "动画名", "idle")
     speed = gd_number(getattr(node, "gk_speed", 1.0))
     name_temp = ctx.new_temp("anim")
+    player_temp = ctx.new_temp("ap")
+    ctx.add_line(indent, f"var {player_temp} := {player}")
     ctx.add_line(indent, f"var {name_temp} := {anim}")
-    ctx.add_line(indent, f"if {player}.has_animation({name_temp}):")
-    ctx.add_line(indent + 1, f"{player}.play({name_temp}, -1.0, {speed})")
+    ctx.add_line(indent, f"if {player_temp} != null and "
+                         f"{player_temp}.has_animation({name_temp}):")
+    ctx.add_line(indent + 1, f"{player_temp}.play({name_temp}, -1.0, {speed})")
     ctx.add_line(indent, "else:")
-    ctx.add_line(indent + 1, f'push_warning("动画不存在: %s" % {name_temp})')
+    # ── 名字填错时,把**可用的动画名**打出来 ────────────────────────
+    # 实测踩过:用户从 MMD 导入的模型,Blender 里的动作叫『骨骼动作』,
+    # 而节点里默认填的是 "idle" —— 只报一句"动画不存在: idle",
+    # 用户根本不知道正确的名字是什么,只能来回猜。
+    # 现在直接把 AnimationPlayer 里真实存在的名字列出来。
+    ctx.add_line(indent + 1, f"if {player_temp} == null:")
+    ctx.add_line(indent + 2,
+                 'push_warning("[GK] 没找到 AnimationPlayer,播不了动画: %s" % '
+                 f"{name_temp})")
+    ctx.add_line(indent + 1, "else:")
+    ctx.add_line(indent + 2,
+                 'push_warning("[GK] 动画不存在: %s。这个模型里可用的动画有: %s" % '
+                 f"[{name_temp}, {player_temp}.get_animation_list()])")
 
 
 @stmt_node("GKNodeSetState")

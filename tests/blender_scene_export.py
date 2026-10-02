@@ -168,8 +168,18 @@ def main():
 
     node_names = [n.get("name", "") for n in gltf.get("nodes", [])]
     print(f"    glb 里的节点: {node_names}")
-    for want in ("CharacterRoot", "Body", "Box", "KeyLight", "ShotCam"):
+    for want in ("CharacterRoot", "Body", "Box", "ShotCam"):
         check(f"glb 含对象 {want}", want in node_names, str(node_names))
+    # ── 灯光**故意不进 glb** ────────────────────────────────────────
+    # 实测踩过:Blender 4.5 的 glTF 导出器导出太阳灯时**自己崩**:
+    #     TypeError: SunLight.area(): invalid keyword argument 'world_matrix'
+    # 那是它内部的 API 调用写错了参数名,和我们无关 —— 但会让整场景导出
+    # 直接失败(用户看到"模型变白/没材质",其实是导出压根没成功)。
+    # 所以关掉 export_lights,灯改由 build_environment_nodes() 生成成
+    # .tscn 里的 DirectionalLight3D。下面不再检查 glb 里有灯,
+    # 而是检查包装场景里**有灯节点**(见后面的检查)。
+    check("glb 里没有灯(灯改由 .tscn 生成)", "KeyLight" not in node_names,
+          str(node_names))
 
     check("glb 有网格", len(gltf.get("meshes", [])) >= 2,
           str(len(gltf.get("meshes", []))))
@@ -319,6 +329,13 @@ def main():
           str(camera_nodes))
     check("有 Environment 节点负责设主相机", '[node name="Environment"' in text)
     check("Environment 引用了脚本", 'ExtResource("env_script")' in text)
+
+    # 灯光必须出现在包装场景里(glb 不再带灯,见上面的说明)——
+    # 从 Blender 场景的太阳灯生成一个 DirectionalLight3D。
+    check("包装场景里有灯光节点",
+          "DirectionalLight3D" in text or "OmniLight3D" in text
+          or "SpotLight3D" in text,
+          [ln for ln in text.splitlines() if "Light3D" in ln][:3])
     env_script = os.path.join(directory, "scripts", "gk_environment.gd")
     check("Environment 脚本写出来了", os.path.isfile(env_script), env_script)
     if os.path.isfile(env_script):
