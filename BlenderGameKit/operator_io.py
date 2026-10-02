@@ -177,6 +177,18 @@ def _on_load_post(_dummy):
         restore_export(scene)
     except Exception:
         pass
+    # ── 引脚改名迁移必须在这里做(踩过的坑)──────────────────────────
+    # Blender 加载 .blend 的顺序是"**先注册插件、再读文件**" ——
+    # 注册时 `bpy.data.node_groups` 还是空的,那时候迁移什么也找不到。
+    # (实测:注册时返回 0,改到 load_post 之后返回 1 并真的改掉了。)
+    try:
+        from .nodes import nodes as _node_lib
+        moved = _node_lib.migrate_pin_names()
+        if moved:
+            print(f"[BlenderGameKit] 已更新 {moved} 个节点的引脚名"
+                  f"(旧文件升级,保存一次即可固化)")
+    except Exception:
+        pass
     # 顺手把材质参数的中文显示名补齐。
     #
     # 必须**在这里**做,不能只在插件注册时做:注册发生在打开文件**之前**,

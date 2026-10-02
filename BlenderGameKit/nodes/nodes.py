@@ -2860,6 +2860,58 @@ class GKNodeComment(B.GKEventNode):
         layout.prop(self, "gk_text", text="")
 
 
+# ==========================================================================
+# 引脚改名迁移
+# ==========================================================================
+# ── 为什么必须做(实测踩过)──────────────────────────────────────
+# `build_sockets()` 只在节点 **init()** 时跑一次。所以改了
+# `gk_inputs` 里的引脚名之后,**已经存在于 .blend 里的节点不会更新** ——
+# 文件里那个节点的 `inputs` 还是旧名字。
+#
+# 表现极其隐蔽:
+#     * 类的 gk_inputs 显示『上游』
+#     * 文件里的节点 inputs 却是 ['进入', '条件']
+#     * 用户按新名字连线连不上
+#     * 导出时链路是空的,`_physics_process` 一片空白,**没有告警**
+#
+# 所以注册时主动扫一遍并把旧名字换掉 —— 顺便**恢复被改名丢掉的连线**
+# (Blender 在 socket 名字变了之后会把原来的 link 丢掉)。
+PIN_RENAMES = {
+    "GKNodeAnimTransition": {"进入": "上游"},
+}
+
+
+def migrate_pin_names():
+    """把所有 GK 节点树里过期的引脚名换成新的。返回改了几个节点。"""
+    try:
+        import bpy
+    except Exception:
+        return 0
+    changed = 0
+    for tree in getattr(getattr(bpy, "data", None), "node_groups", ()) or ():
+        if getattr(tree, "bl_idname", "") not in ("GKGameLogicTree",
+                                                  "GKAnimationTree"):
+            continue
+        for node in getattr(tree, "nodes", ()) or ():
+            mapping = PIN_RENAMES.get(getattr(node, "bl_idname", ""))
+            if not mapping:
+                continue
+            stale = [s.name for s in getattr(node, "inputs", ()) or ()
+                     if s.name in mapping and s.name not in
+                     [spec.get("name") for spec in (node.gk_inputs or ())]]
+            if not stale:
+                continue
+            rebuild = getattr(node, "rebuild_sockets", None)
+            if rebuild is None:
+                continue
+            try:
+                rebuild()
+                changed += 1
+            except Exception:
+                pass
+    return changed
+
+
 ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序

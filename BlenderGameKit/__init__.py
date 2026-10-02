@@ -110,6 +110,10 @@ def register():
             _CLASS_REGISTRY.append(cls)
         except Exception as exc:  # pragma: no cover - 只在 Blender 内触发
             print(f"[BlenderGameKit] 注册失败 {getattr(cls, '__name__', cls)}: {exc}")
+    # 引脚改名迁移**不在这里做** —— 注册时 `bpy.data` 还是空的
+    # (Blender 先注册插件再读 .blend)。挪到了 `load_post`,
+    # 见 operator_io._on_load_post。
+
     # 场景级设置
     #
     # ── 无条件重新挂载(踩过的坑)────────────────────────────────────
