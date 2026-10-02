@@ -98,8 +98,20 @@ def register():
         except Exception as exc:  # pragma: no cover - 只在 Blender 内触发
             print(f"[BlenderGameKit] 注册失败 {getattr(cls, '__name__', cls)}: {exc}")
     # 场景级设置
+    #
+    # ── 无条件重新挂载(踩过的坑)────────────────────────────────────
+    # 以前是"已经有 gk_settings 就跳过" —— 但**旧版本存下来的
+    # 设置对象可能属于另一个包路径**。实测用户的文件里挂着
+    #     bl_ext.gk_test.blender_game_kit.properties.GKSceneSettings
+    # 而当前加载的是 `bl_ext.user_default...`,两个是不同的类。
+    # 于是新加的属性(比如 `force_hidden_objects`)**根本不存在**,
+    # 读它永远是默认值,用户在面板里也看不到这一项。
+    #
+    # PointerProperty 重新赋值是安全的(数据按名字存取),
+    # 所以这里**每次注册都重新挂**,让类定义永远跟当前代码一致。
     try:
-        bpy.types.Scene.gk_settings = bpy.props.PointerProperty(type=_scene_settings_type())
+        bpy.types.Scene.gk_settings = bpy.props.PointerProperty(
+            type=_scene_settings_type())
     except Exception as exc:  # pragma: no cover
         print(f"[BlenderGameKit] 场景设置挂载失败: {exc}")
 

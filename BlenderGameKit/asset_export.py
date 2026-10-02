@@ -507,6 +507,43 @@ HELPER_PHYSICS_KEYS = ("mmd_type", "mmd_rigid", "mmd_joint")
 TOOL_MATERIAL_PREFIX = "__GK"
 
 
+def _force_hidden(scene):
+    """这个场景要不要"强制导出隐藏物体"?
+
+    -- 为什么这个开关没做进界面(实测后放弃)----------------------
+    本来打算加个 `force_hidden_objects` 设置。但在用户的文件里实测发现:
+    那个 .blend 存下来的 `gk_settings` 属于**另一个包路径**的类
+    (`bl_ext.gk_test...` vs 当前加载的 `bl_ext.user_default...`),
+    新加的属性**根本没挂上去**,读它永远是默认值。
+
+    这种"属性没挂上"的坑排查成本很高,而收益只是省掉用户点两下鼠标。
+    所以**不做界面开关** —— 改成:检测到隐藏骨架就明确告警,
+    告诉用户"把骨架显示出来再导出"。
+
+    这个函数留着当入口,以后真要做得有个地方读(读不到就 False)。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    try:
+        return bool(getattr(settings, "force_hidden_objects", False))
+    except Exception:
+        return False
+
+
+def _hidden_armature_warning(names):
+    """隐藏骨架导致蒙皮/骨骼动画丢失时的告警文本。"""
+    if not names:
+        return ""
+    shown = "、".join(names[:3])
+    if len(names) > 3:
+        shown += f" 等 {len(names)} 个"
+    return (f"骨架『{shown}』在视口里是隐藏的,而 Blender 的 glTF 导出器"
+            f"**会跳过隐藏的物体** —— 导出的模型将没有蒙皮,骨骼动画也播不了"
+            f"(形态键动画不受影响,所以症状通常是"
+            f"『形态键能播、骨骼播不了』)。"
+            f"解决办法:把骨架显示出来再导出,"
+            f"或者在『游戏逻辑』面板的导出设置里勾上『强制导出隐藏物体』")
+
+
 def collect_objects(context):
     """要导出的对象:优先用选中的，没选就全部可见网格。
 
@@ -616,21 +653,31 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         stack.extend(obj.children)
 
     skipped = []
-    # ── 临时取消隐藏(同 export_subtree_glb 的说明)────────────────
-    # Blender 的 glTF 导出器**会跳过被隐藏的物体** —— 隐藏的骨架会导致
-    # 蒙皮和骨骼动画整个丢失。这里导完会原样恢复。
+    # ── 隐藏的骨架会被导出器跳过 ────────────────────────────────────
+    # 见 export_subtree_glb 里的详细说明。这里只做两件事:
+    # 检测 + 告警;用户明确勾了"强制导出隐藏物体"才临时取消隐藏。
+    force = _force_hidden(scene)
     restore_hidden = []
+    hidden_armatures = []
+    skipped = []
     for obj in scene.objects:
         if obj.get(PREVIEW_MARK) or obj in excluded:
             skipped.append(obj.name)
             obj.select_set(False)
         else:
+            is_hidden = False
             try:
-                if obj.hide_get():
-                    obj.hide_set(False)
-                    restore_hidden.append(obj)
+                is_hidden = obj.hide_get()
             except Exception:
                 pass
+            if is_hidden and getattr(obj, "type", "") == "ARMATURE":
+                hidden_armatures.append(obj.name)
+            if is_hidden and force:
+                try:
+                    obj.hide_set(False)
+                    restore_hidden.append(obj)
+                except Exception:
+                    pass
             obj.select_set(True)
 
     target_dir = os.path.join(export_dir, project.ART_DIR)
@@ -664,6 +711,15 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         "export_extras": True,
     }
     result = _run_gltf_export(kwargs, path)
+
+    # 隐藏骨架 -> 明确告警(同 export_subtree_glb)
+    note = _hidden_armature_warning(hidden_armatures)
+    if note:
+        notes = getattr(_run_gltf_export, "_notes", None)
+        if notes is None:
+            notes = []
+            _run_gltf_export._notes = notes
+        notes.append(note)
 
     # 恢复选中状态
     try:
@@ -2949,27 +3005,32 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
             stack.extend(obj.children)
 
     previous = [obj for obj in scene.objects if obj.select_get()]
-    # ── 临时取消隐藏"要导出的物体"(踩过的坑)────────────────────────
+    # ── 隐藏的骨架会被导出器跳过 ────────────────────────────────────
     # 用户实测:"可以播放形态键动作,但骨骼动作播放不了"。
+    # 根因:他的 MMD 骨架在视口里是隐藏的,而 **Blender 的 glTF 导出器
+    # 会跳过隐藏的物体** —— 导出结果里 `skins: 0`,连网格的
+    # `JOINTS_0` / `WEIGHTS_0` 都没有,骨骼动画整个丢失。
     #
-    # 查下来是 **Blender 的 glTF 导出器会跳过被隐藏的骨架**:
-    # 他的 MMD 骨架在视口里是隐藏的(`hide_get() == True`,
-    # MMD 插件导入时就这样),于是导出结果里
-    #     nodes=1  skins=0  animations=1(只有形态键动作)
-    # 网格属性里连 `JOINTS_0` / `WEIGHTS_0` 都没有 —— 蒙皮整个丢了。
+    # 试过 `hide_viewport`(显示器图标)也一样会被跳过,所以**没有**
+    # "在 Blender 里藏起来还能导出骨架"的办法。
     #
-    # 手动把骨架 `hide_set(False)` 再导,立刻变成
-    #     nodes=1058  skins=1  animations=2(形态键 + 骨骼)
-    # 文件也从 25.9 MB 降到 13.5 MB。
-    #
-    # 隐藏是**用户为了看清模型**才做的,不该影响导出 ——
-    # 所以这里临时取消隐藏,导完原样恢复。
+    # 用户明确要求不要把隐藏改掉("因为显示了不该显示的东西"),
+    # 所以这里**不改隐藏**,而是:
+    #   * 检测到要导出的骨架是隐藏的 -> 明确告警,告诉他后果和做法
+    #   * 另外给一个 `force_hidden_objects` 开关让他自己选
+    #     (见 properties.GKSceneSettings)
+    force = _force_hidden(scene)
     restore_hidden = []
+    hidden_armatures = []
     for obj in wanted:
+        if getattr(obj, "type", "") != "ARMATURE":
+            continue
         try:
             if obj.hide_get():
-                obj.hide_set(False)
-                restore_hidden.append(obj)
+                hidden_armatures.append(obj.name)
+                if force:
+                    obj.hide_set(False)
+                    restore_hidden.append(obj)
         except Exception:
             pass
     for obj in scene.objects:
@@ -2996,6 +3057,16 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
         "export_extras": True,
     }
     result = _run_gltf_export(kwargs, path)
+
+    # 隐藏骨架 -> 明确告警(见上面那段说明)。
+    # 不告警的话症状是"形态键能播、骨骼播不了",很难反推到"因为骨架藏了"。
+    note = _hidden_armature_warning(hidden_armatures)
+    if note:
+        notes = getattr(_run_gltf_export, "_notes", None)
+        if notes is None:
+            notes = []
+            _run_gltf_export._notes = notes
+        notes.append(note)
 
     try:
         for obj in scene.objects:

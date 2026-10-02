@@ -1,22 +1,24 @@
-"""回归测试:隐藏的骨架也要被导出(蒙皮 + 骨骼动画不能丢)。
+"""回归测试:隐藏骨架导致蒙皮丢失,且必须**明确告警 + 不动用户隐藏**。
 
 用户实测:"可以播放形态键动作,但骨骼动作播放不了"。
+根因是他的 MMD 骨架在视口里是隐藏的,而 **Blender 的 glTF 导出器
+会跳过隐藏的物体** —— 导出结果 `skins: 0`,骨骼动画整个丢失。
 
-根因:他的 MMD 骨架在视口里是**隐藏的**(`hide_get() == True`),
-而 Blender 的 glTF 导出器**会跳过被隐藏的物体** —— 于是:
+试过 `hide_viewport`(显示器图标)也一样被跳过,所以**没有**
+"在 Blender 里藏起来还能导出骨架"的办法。
 
-    导出结果: nodes=1  skins=0  animations=1(只有形态键)
-    网格属性: 连 JOINTS_0 / WEIGHTS_0 都没有
+用户明确要求不要擅自改他的隐藏状态,所以现在的行为是:
 
-手动 `hide_set(False)` 后立刻变成:
-    nodes=1058  skins=1  animations=2(形态键 + 骨骼)
+    检测到要导出的骨架是隐藏的 -> 明确告警(告诉他后果和做法)
+    不擅自改隐藏(导完还是隐藏的)
 
-这个脚本在**真 Blender** 里跑(要用到 glTF 导出器,离线 stub 测不了)。
-用法:
-    blender -b <某个有骨架的.blend> --python tests/blender_hidden_armature.py
+要在**真 Blender** 里跑(需要真实 glTF 导出器):
+    blender -b <有骨架的.blend> --python tests/blender_hidden_armature.py
 """
 
+import json
 import os
+import struct
 import sys
 import tempfile
 
@@ -29,49 +31,11 @@ RESULTS = []
 
 def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
-    mark = "OK  " if ok else "FAIL"
-    print(f"  [{mark}] {name}" + (f"  ({detail})" if detail else ""))
+    print(f"  [{'OK  ' if ok else 'FAIL'}] {name}"
+          + (f"  ({detail})" if detail else ""))
 
 
-def main():
-    from BlenderGameKit import asset_export as ae
-
-    scene = bpy.context.scene
-    armature = next((o for o in scene.objects if o.type == "ARMATURE"), None)
-    mesh = None
-    for obj in scene.objects:
-        if obj.type != "MESH":
-            continue
-        for mod in obj.modifiers:
-            if mod.type == "ARMATURE" and mod.object is armature:
-                mesh = obj
-                break
-        if mesh is not None:
-            break
-
-    if armature is None or mesh is None:
-        print("这个 .blend 里没有『网格 + 骨架』的组合,跳过")
-        print("HIDDEN_ARMATURE_RESULT=SKIP")
-        return
-
-    print(f"骨架 = {armature.name} | 网格 = {mesh.name}")
-
-    # 关键:**把骨架藏起来**,再导出
-    armature.hide_set(True)
-    check("骨架已隐藏", armature.hide_get() is True)
-
-    out = os.path.join(tempfile.gettempdir(), "gk_hidden_arm_test")
-    os.makedirs(out, exist_ok=True)
-    path, ok, msg = ae.export_subtree_glb(out, "HiddenArm", [mesh], scene=scene)
-    check("导出成功", ok, msg)
-    if not ok:
-        print("HIDDEN_ARMATURE_RESULT=FAIL")
-        return
-
-    # 读 glb 的 JSON 块
-    import json
-    import struct
-
+def read_glb(path):
     with open(path, "rb") as handle:
         data = handle.read()
     _magic, _version, length = struct.unpack("<III", data[:12])
@@ -83,26 +47,72 @@ def main():
         if chunk_type == 0x4E4F534A:
             gltf = json.loads(body.decode("utf-8"))
         offset += 8 + chunk_len
+    joints = any("JOINTS_0" in prim.get("attributes", {})
+                 for mesh_def in gltf.get("meshes", [])
+                 for prim in mesh_def.get("primitives", []))
+    return {
+        "nodes": len(gltf.get("nodes", [])),
+        "skins": len(gltf.get("skins", [])),
+        "anims": [a.get("name") for a in gltf.get("animations", [])],
+        "joints": joints,
+    }
 
-    skin_count = len(gltf.get("skins", []))
-    anim_names = [a.get("name") for a in gltf.get("animations", [])]
-    has_joints = any(
-        "JOINTS_0" in prim.get("attributes", {})
-        for mesh_def in gltf.get("meshes", [])
-        for prim in mesh_def.get("primitives", []))
 
-    check("有蒙皮(skins >= 1)", skin_count >= 1, f"skins={skin_count}")
-    check("网格带 JOINTS_0", has_joints)
-    check("导出了动画", len(anim_names) >= 1, f"动画={anim_names}")
+def main():
+    from BlenderGameKit import asset_export as ae
 
-    # 隐藏要恢复回去
-    check("导出后骨架仍是隐藏的", armature.hide_get() is True)
+    scene = bpy.context.scene
+    armature = next((o for o in scene.objects if o.type == "ARMATURE"), None)
+    mesh = None
+    for obj in scene.objects:
+        if obj.type != "MESH":
+            continue
+        if any(m.type == "ARMATURE" and m.object is armature
+               for m in obj.modifiers):
+            mesh = obj
+            break
 
-    # 骨骼动画在不在?(名字里带"骨骼"或通道数很大)
-    bone_anim = [a for a in gltf.get("animations", [])
-                 if len(a.get("channels", [])) > 10]
-    check("有骨骼动画(通道数 > 10)", bool(bone_anim),
-          f"{[a.get('name') for a in bone_anim]}")
+    if armature is None or mesh is None:
+        print("这个 .blend 里没有『网格 + 骨架』的组合,跳过")
+        print("HIDDEN_ARMATURE_RESULT=SKIP")
+        return
+
+    print(f"骨架 = {armature.name} | 网格 = {mesh.name}")
+    out = os.path.join(tempfile.gettempdir(), "gk_hidden_arm_test")
+    os.makedirs(out, exist_ok=True)
+
+    # ── 骨架显示 -> 正常导出(这是"应该能播"的基准)───────────────
+    armature.hide_set(False)
+    if hasattr(ae._run_gltf_export, "_notes"):
+        ae._run_gltf_export._notes = []
+    path, ok, msg = ae.export_subtree_glb(out, "ShownArm", [mesh], scene=scene)
+    check("骨架显示时:导出成功", ok, msg)
+    good = read_glb(path)
+    check("骨架显示时:有蒙皮", good["skins"] >= 1, f"skins={good['skins']}")
+    check("骨架显示时:网格带 JOINTS_0", good["joints"])
+    check("骨架显示时:骨骼动画导出了", len(good["anims"]) >= 2,
+          f"{good['anims']}")
+    check("骨架显示时:**没有**隐藏告警",
+          not any("隐藏" in n
+                  for n in (getattr(ae._run_gltf_export, "_notes", []) or [])))
+
+    # ── 骨架隐藏 -> 尊重隐藏,但必须告警 ───────────────────────────
+    armature.hide_set(True)
+    if hasattr(ae._run_gltf_export, "_notes"):
+        ae._run_gltf_export._notes = []
+    path2, ok2, msg2 = ae.export_subtree_glb(out, "HiddenArm", [mesh],
+                                             scene=scene)
+    check("骨架隐藏时:导出仍然成功", ok2, msg2)
+    bad = read_glb(path2)
+    check("骨架隐藏时:骨架确实没导出去", bad["skins"] == 0,
+          f"skins={bad['skins']}")
+    notes = getattr(ae._run_gltf_export, "_notes", []) or []
+    warning = " ".join(notes)
+    check("骨架隐藏时:给出了明确告警",
+          ("隐藏" in warning and "骨架" in warning), warning[:50] + "...")
+    check("骨架隐藏时:告警里给了做法",
+          "显示出来" in warning or "强制" in warning)
+    check("骨架隐藏时:**没擅自改**用户的隐藏", armature.hide_get() is True)
 
     failed = [n for n, ok, _d in RESULTS if not ok]
     if failed:
