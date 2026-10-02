@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "blender_game_kit"
+version = "0.1.0"
+name = "BlenderGameKit"
+tagline = "在 Blender 里用中文节点图做游戏逻辑，导出 Godot 4 GDScript"
+maintainer = "BlenderGameKit"
+type = "add-on"
+
+website = "https://example.invalid/blender-game-kit"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = ["Game Engine", "Development", "Node"]
+
+# 纯 Python 插件，没有需要编译的依赖

@@ -1530,13 +1530,19 @@ def _stmt_anim_tree_ref(ctx, node, indent):
         "String")
     player_temp = ctx.new_temp("ap")
     ctx.add_line(indent, f"var {player_temp} := {player}")
+    def _name_of(state):
+        fn = getattr(state, "resolved_state_name", None)
+        if fn is not None:
+            return fn()
+        return str(getattr(state, "gk_state_name", "") or "")
+
     default_name = ""
     for item in states:
         if bool(getattr(item, "gk_is_default", False)):
-            default_name = str(getattr(item, "gk_state_name", "") or "")
+            default_name = _name_of(item)
             break
     if not default_name:
-        default_name = str(getattr(states[0], "gk_state_name", "") or "")
+        default_name = _name_of(states[0])
     ctx.add_line(indent, f"if {var_name}.is_empty():")
     ctx.add_line(indent + 1, f"{var_name} = {gd_string(default_name)}")
 
@@ -1595,7 +1601,10 @@ def _emit_tree_transitions(ctx, node, indent, states, var_name, player_temp):
     所以不需要 `transition_pin_name`,直接读那个叫『条件』的引脚。
     """
     for item in states:
-        state_name = str(getattr(item, "gk_state_name", "") or "")
+        # 状态名可能来自**选中的动作**或手填的字符串 —— 见 resolved_state_name
+        resolver = getattr(item, "resolved_state_name", None)
+        state_name = (resolver() if resolver is not None
+                      else str(getattr(item, "gk_state_name", "") or ""))
         if not state_name:
             continue
         # 条件有两种来源(接引脚 / 节点上直接选输入)—— 见 GKNodeAnimState。

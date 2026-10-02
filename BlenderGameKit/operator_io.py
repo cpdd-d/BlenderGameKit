@@ -855,6 +855,47 @@ class GK_OT_PickAnimName(bpy.types.Operator):
             op.choice = ident
 
 
+class GK_OT_PickAnimTree(bpy.types.Operator):
+    """从列表里挑一张动画树填进节点。
+
+    和 `gk.pick_anim_name` 同一套做法(见那里的说明)——
+    手打树名打错了导出时只会说"找不到动画树",不如直接选。
+    """
+
+    bl_idname = "gk.pick_anim_tree"
+    bl_label = "选择动画树"
+    bl_description = "从文件里的动画树中挑一张(标签里带状态数量)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    choice: StringProperty(name="树名", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or not hasattr(node, "gk_tree_name"):
+            self.report({"WARNING"}, "没找到目标节点")
+            return {"CANCELLED"}
+        # choice 用的就是树名(空 = 自动)
+        node.gk_tree_name = self.choice
+        self.report({"INFO"}, f"动画树 -> {self.choice or '自动'}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        for ident, label, _desc in node_lib.animation_tree_items():
+            op = self.layout.operator("gk.pick_anim_tree", text=label)
+            op.node_name = self.node_name
+            op.choice = ident
+
+
 class GK_OT_ExportAssets(bpy.types.Operator):
     """把 Blender 的模型和材质一起导出到 Godot,并装配成"模型+碰撞体+脚本"的场景。
 
@@ -1365,6 +1406,7 @@ GK_CLASSES = (
     GK_OT_AutoLink,
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
     GK_OT_PickAnimName,
+    GK_OT_PickAnimTree,
     # 碰撞体可视化(像 UPBGE 那样能在视口里看到碰撞范围)
     GK_OT_ShowCollision,
     GK_OT_HideCollision,

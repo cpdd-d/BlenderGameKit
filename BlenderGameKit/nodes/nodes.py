@@ -789,7 +789,21 @@ class GKNodeAnimState(B.GKStatementNode):
     )
     gk_outputs = ()
     gk_prop_defs = (
-        ("gk_state_name", "string", "idle", "状态名", "就是动画名"),
+        # ── 状态名 = 动画名,用**动作数据块**选,不用手打 ──────────────
+        # 用户原话:"状态idle/run/jump等的应该可以预设成一个个节点卡片,
+        # 而不是自己输入(如果自己输入错误,又产生不必要的麻烦)"
+        #
+        # 说得对:手打"run"打成"rnu"不会有任何提示,要到 Godot 运行时
+        # 才发现。改成和『动画_播放』一样的**原生动作选择器**,
+        # 从文件里真实的动作里挑 —— 选错了根本选不出来。
+        #
+        # 和下面 `gk_state_name` 的分工:
+        #   gk_anim_action 有值 -> 用它的 name(首选)
+        #   否则               -> 用手填的 gk_state_name(兜底/跨文件引用)
+        ("gk_anim_action", "action", None, "状态动画",
+         "从文件里所有动作中选一个(原生选择器,能搜索)"),
+        ("gk_state_name", "string", "idle", "状态名(手填兜底)",
+         "没选『状态动画』时才用它"),
         # ── 复合条件:不用额外拉表达式节点 ──────────────────────────
         # 用户要"利用 blender 的优点和虚幻蓝图的优点结合" ——
         # 蓝图里最常见的条件就是"某个键按住/松开",为了这个去拉
@@ -809,8 +823,28 @@ class GKNodeAnimState(B.GKStatementNode):
          "勾上 = 进游戏时的默认状态(整个树里只该勾一个)"),
     )
 
+    def resolved_state_name(self):
+        """这个状态到底叫什么 —— 优先用选中的**动作**,否则用手填的。
+
+        两种来源都支持是为了两件事:
+          * 选了动作 -> 名字一定对(动画不存在根本选不出来)
+          * 没选     -> 还能手填(比如动画是运行时才加载的)
+        """
+        action = getattr(self, "gk_anim_action", None)
+        if action is not None:
+            name = str(getattr(action, "name", "") or "")
+            if name:
+                return name
+        return str(getattr(self, "gk_state_name", "") or "")
+
     def draw_buttons(self, context, layout):
-        layout.prop(self, "gk_state_name", text="")
+        # 主入口:原生动作选择器(和『动画_播放』一致)
+        layout.prop(self, "gk_anim_action", text="")
+        if self.gk_anim_action is not None:
+            layout.label(text=f"状态:{self.gk_anim_action.name}",
+                         icon="CHECKMARK")
+        else:
+            layout.prop(self, "gk_state_name", text="", icon="SORTALPHA")
         layout.prop(self, "gk_cond_source", text="")
         # 选了"自己写"才提示去接引脚;选了输入就直接给动作名输入框
         if str(getattr(self, "gk_cond_source", "PIN")) == "PIN":
@@ -883,6 +917,39 @@ class GKNodeAnimLocomotion(B.GKExpressionNode):
         row.prop(self, "gk_fast_threshold", text="跑")
 
 
+def animation_tree_items():
+    """『树名』下拉的选项:文件里所有动画树。
+
+    ── 为什么改成下拉(用户问的)──────────────────────────────────
+    用户原话:"下面的树名又是怎么填(一般都是两个就可以了吧,
+    哪个物体的哪个属性,或者说像蓝图一样可以自己添加全局变量连接点!)"
+
+    **问得对,那个手填字段确实是多余的。** 手打树名一旦打错,
+    导出时只会说"找不到动画树",用户还得回去对名字。
+    改成把所有动画树列出来直接选 —— 而且顺便把每张树有几个状态
+    写在标签里,一眼能看出该选哪张。
+    """
+    try:
+        import bpy
+    except Exception:
+        return []
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return []
+    entries = []
+    for group in groups:
+        if getattr(group, "bl_idname", "") != "GKAnimationTree":
+            continue
+        name = str(getattr(group, "name", ""))
+        count = len([n for n in getattr(group, "nodes", ()) or ()
+                     if getattr(n, "bl_idname", "") == "GKNodeAnimState"])
+        entries.append((name, f"{name}  ({count} 个状态)", name))
+    # 「自动」放最前面 —— 只有一张树时用户根本不用想
+    entries.sort(key=lambda item: item[0])
+    return [("", "自动(用第一张动画树)", "文件里只有一张时选这个就行")] + entries
+
+
 @N
 class GKNodeAnimStateMachineRef(B.GKStatementNode):
     bl_idname = "GKNodeAnimStateMachineRef"
@@ -901,8 +968,16 @@ class GKNodeAnimStateMachineRef(B.GKStatementNode):
     gk_input_props = {"树名": "gk_tree_name", "动画播放器": "gk_player"}
     gk_outputs = (S.pin(FLOW, "完成"),)
     gk_prop_defs = (
+        # ── 树名:文本框 + 『选…』按钮(和『动画_播放』同一套)──────────
+        # 想做成下拉,但 Blender 不允许动态 items 的枚举配字符串默认值
+        # (`'default' can only be an integer when 'items' is a function`)。
+        # 所以沿用那个已经验证过的做法:文本框 + 按钮弹列表。
+        #
+        # 留空 = 用文件里第一张动画树。**只有一张树时根本不用管它** ——
+        # 这就是用户问的"一般都是两个就可以了吧"的答案:
+        # 是的,大多数情况留空就行。
         ("gk_tree_name", "string", "", "树名",
-         "留空 = 用文件里第一张动画树"),
+         "留空 = 用文件里第一张动画树(只有一张时不用管)"),
         ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
         ("gk_state_var", "string", "anim_state", "状态变量名",
          "当前状态存在哪个成员变量里"),
@@ -913,7 +988,10 @@ class GKNodeAnimStateMachineRef(B.GKStatementNode):
     )
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "gk_tree_name", text="", icon="NODETREE")
+        row = layout.row(align=True)
+        row.prop(self, "gk_tree_name", text="", icon="NODETREE")
+        picker = row.operator("gk.pick_anim_tree", text="", icon="VIEWZOOM")
+        picker.node_name = self.name
         layout.prop(self, "gk_check_mode", text="")
 
 # 用户要求:"做动画状态机取代手拼分支网" —— 这也是 UPBGE 那套最大的缺陷
