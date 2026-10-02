@@ -613,16 +613,24 @@ class GKNodePlayAnim(B.GKStatementNode):
         # 比一个看起来合理但永远错的名字好。
         ("gk_anim_name", "string", "", "动画名",
          "点右边『选…』从列表挑;带 ★ 的是当前物体自己的动画"),
+        # ── 原生动作选择器(用户要的"自动列出它的动作")────────────────
+        # 这是**正解**:`PointerProperty(type=Action)` 拿到的是 Blender
+        # 原生的数据块选择器(带放大镜、能搜、能浏览全部动作)。
+        # 之前试的 EnumProperty 动态下拉被 Blender 挡了
+        # (动态 items 的默认值只能是整数,而我们要字符串),
+        # 『选…』按钮又需要用户手点一下。见 node_base.prop_action 的说明。
+        #
+        # 填了这个就**优先用它**,下面的文本框退化成"手填兜底"。
+        ("gk_anim_action", "action", None, "动作",
+         "从文件里所有动作中选一个(原生选择器,能搜索)"),
         ("gk_speed", "float", 1.0, "播放速度", "1.0 为原速"),
     )
 
     def draw_buttons(self, context, layout):
+        # 原生选择器画一行 —— 这是主入口
+        layout.prop(self, "gk_anim_action", text="")
         row = layout.row(align=True)
-        row.prop(self, "gk_anim_name", text="")
-        # ── 必须显式告诉算子"操作的是哪个节点" ──────────────────────
-        # `row.operator(...)` 只负责画按钮,**不会**自动把当前节点传过去。
-        # 算子里的 `draw()` 靠 `node_name` 反查节点、分析动作归属,
-        # 不传的话它拿不到节点,列表里就只有光秃秃的动作名(没有 ★)。
+        row.prop(self, "gk_anim_name", text="", icon="SORTALPHA")
         picker = row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
         picker.node_name = self.name
         row.prop(self, "gk_speed", text="")

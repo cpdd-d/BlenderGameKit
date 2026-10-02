@@ -27,6 +27,7 @@ try:
         FloatProperty,
         FloatVectorProperty,
         IntProperty,
+        PointerProperty,
         StringProperty,
     )
     _BPY = True
@@ -269,6 +270,62 @@ def prop_node(default="", name="", description="", **kw):
     return prop_text(default, name=name, description=description, **kw)
 
 
+def _bpy_has_action():
+    """当前环境里有没有真的 `bpy.types.Action`。
+
+    ── 为什么要探一下(踩过的坑)──────────────────────────────────
+    离线测试桩会注册一个**假的** bpy,`_BPY` 也是 True,但它的
+    `bpy.types` 里没有 `Action` —— 直接用会:
+        AttributeError: module 'bpy.types' has no attribute 'Action'
+    那会让**整张节点表**注册不上。所以这里探一次,没有就退回文本属性。
+    """
+    if not _BPY or bpy is None:
+        return False
+    try:
+        return hasattr(bpy.types, "Action")
+    except Exception:
+        return False
+
+
+def _action_poll(self, value):
+    """PointerProperty 的 poll:只允许指向 Action。
+
+    没有 poll 的话 Blender 会把所有 ID 类型都列出来(物体、材质、网格…),
+    用户在选择器里能选到一堆跟动画无关的东西。
+    """
+    try:
+        return isinstance(value, bpy.types.Action)
+    except Exception:
+        return False
+
+
+def prop_action(default=None, name="", description="", **kw):
+    """指向一个 **Action 数据块**的属性 —— 拿到 Blender 原生动作选择器。
+
+    ── 为什么不自己做下拉(绕了一圈才找到这个)──────────────────────
+    用户要求"选物体之后自动列出它的动作",我先后试过三条路:
+
+      1. `EnumProperty` + 动态 items 回调  -> **Blender 不允许**:
+         `'default' can only be an integer when 'items' is a function`
+         动态 items 的默认值只能是整数下标,而我们要的是动作名字符串。
+      2. 文本框 + 『选…』按钮弹搜索列表 -> 能用,但用户仍然要**手点一下**
+         ("还是需要自己填才会出现")。
+      3. **`PointerProperty(type=bpy.types.Action)`** -> ✅ 就是它。
+
+    第 3 条才是正解:UPBGE 那个截图里的"动作"栏其实就是 **Blender 原生的
+    数据块选择器**(带放大镜、能搜索、能新建、能浏览全部)。用指针属性
+    直接把这个原生控件拿到手,不用自己造。
+
+    存的是数据块引用而不是名字,导出时取 `action.name` ——
+    顺带免疫"用户改了动作名、节点里的字符串忘了改"这类问题。
+    """
+    if not _bpy_has_action():
+        # 离线测试 / 桩环境:退回普通属性占位符
+        return GKProp(default, name=name, description=description, **kw)
+    return PointerProperty(type=bpy.types.Action, poll=_action_poll,
+                           name=name, description=description, **kw)
+
+
 _PROP_FACTORY = {
     "float": prop_float,
     "int": prop_int,
@@ -277,6 +334,7 @@ _PROP_FACTORY = {
     "node": prop_node,
     "color": prop_color,
     "float_vector": prop_vector,
+    "action": prop_action,
 }
 
 

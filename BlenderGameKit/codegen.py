@@ -1276,10 +1276,30 @@ def _stmt_flip(ctx, node, indent):
     ctx.add_line(indent + 1, f"{target}.scale.x = abs({target}.scale.x)")
 
 
+def _animation_name_of(ctx, node):
+    """这个动画节点要播的名字(已经转成 GDScript 字符串字面量)。
+
+    优先级:
+      1. **引脚连线**(上游给了个动态名字)—— 最高,说明是运行时决定的
+      2. **原生动作指针** `gk_anim_action` —— 用户在 Blender 里选的数据块
+      3. 文本框 `gk_anim_name` —— 手填兜底
+      4. 都没有 -> `""`,由调用方转成"随便播一个"
+    """
+    socket = ctx._socket(node, "动画名")
+    if socket is not None and getattr(socket, "is_linked", False):
+        return ctx.expr_of(socket)
+    action = getattr(node, "gk_anim_action", None)
+    if action is not None:
+        name = str(getattr(action, "name", "") or "")
+        if name:
+            return gd_string(name)
+    return ctx.input_string(node, "动画名", "")
+
+
 @stmt_node("GKNodePlayAnim")
 def _stmt_play_anim(ctx, node, indent):
     player = ctx.animation_player(node)
-    anim = ctx.input_string(node, "动画名", "")
+    anim = _animation_name_of(ctx, node)
     speed = gd_number(getattr(node, "gk_speed", 1.0))
     name_temp = ctx.new_temp("anim")
     player_temp = ctx.new_temp("ap")

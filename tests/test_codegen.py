@@ -2512,6 +2512,58 @@ class TestAnimationNameSources(Base):
         self.assertIn(sentinel, NN.actions_on_object(FakeObj()))
 
 
+    def test_native_action_pointer_takes_priority(self):
+        """原生动作指针(gk_anim_action)要优先于手填文本框。
+
+        这是**正解**:`PointerProperty(type=Action)` 拿到 Blender 原生
+        数据块选择器(带搜索)。之前试的 EnumProperty 动态下拉被 Blender
+        挡了(动态 items 默认值只能是整数),『选…』按钮又要用户手点。
+        """
+        class FakeAction:
+            name = "骨骼动作"
+
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="手填的")
+        play.gk_anim_action = FakeAction()
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('"骨骼动作"', code)
+        self.assertNotIn("手填的", code)
+
+    def test_text_field_used_when_no_pointer(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="手填的")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('"手填的"', code)
+
+    def test_pin_wins_over_pointer(self):
+        """引脚连线(运行时名字)优先级最高,盖过数据块指针。"""
+        class FakeAction:
+            name = "骨骼动作"
+
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放")
+        play.gk_anim_action = FakeAction()
+        text = tree.new_node(NN.GKNodeConstText, "名字", gk_value="动态名")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        gk_stub.connect(tree, text, "值", play, "动画名")
+        code, _ = gen(tree, V3)
+        self.assertIn("动态名", code)
+        self.assertNotIn('"骨骼动作"', code)
+
+    def test_prop_action_falls_back_without_bpy_action(self):
+        """桩环境没有 bpy.types.Action -> 退回普通属性占位符,不能崩。
+
+        探不到就崩的话,**整张节点表**都注册不上(实测踩过)。
+        """
+        desc = (NN.GKNodePlayAnim.__annotations__ or {}).get("gk_anim_action")
+        self.assertIsNotNone(desc, "gk_anim_action 没声明")
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode
