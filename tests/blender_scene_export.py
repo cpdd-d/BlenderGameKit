@@ -343,11 +343,24 @@ def main():
         check("脚本里写的是 Blender 的相机名",
               'camera_name: String = "ShotCam"' in env_text,
               [ln for ln in env_text.splitlines() if "camera_name" in ln][:1])
-        # 灯光**不再由脚本修正**:用户决定在 Godot 里自己设计灯光,
-        # glb 带进来的灯原样保留(按用户要求去掉了亮度换算)。
-        check("脚本不再碰灯光",
-              "light_energy" not in env_text and "sun_strength" not in env_text,
-              [ln for ln in env_text.splitlines() if "light" in ln.lower()][:2])
+        # ── 灯光:脚本**不再重建/改强度**,但会读它来驱动卡通着色 ──────
+        # 历史:
+        #   1. 最早脚本会重算灯光强度、重建灯节点 —— 结果和用户在 Godot 里
+        #      手动调的互相打架,按用户要求去掉了。
+        #   2. 后来卡通 shader 改成 `unshaded`(自己算光照),色阶终于生效,
+        #      但副作用是**角色感觉不到场景里的灯**。用户反馈
+        #      "还是需要灯光影响角色的"。
+        #   3. 所以现在脚本**只读**场景里的 DirectionalLight3D,
+        #      把方向和颜色同步给 shader 的 uniform ——
+        #      **不改灯的任何属性**,只喂给 shader。
+        check("脚本不重建灯、不改灯强度",
+              "add_child(DirectionalLight3D" not in env_text
+              and "light_energy =" not in env_text,
+              [ln for ln in env_text.splitlines() if "light_energy" in ln][:2])
+        check("脚本会把场景灯同步给卡通 shader",
+              "follow_scene_light" in env_text
+              and "set_shader_parameter(\"light_dir\"" in env_text,
+              [ln for ln in env_text.splitlines() if "light_dir" in ln][:2])
 
     # ---- 4c. 相机朝向:导出后 Godot 里的前方向必须和 Blender 一致 ----
     #

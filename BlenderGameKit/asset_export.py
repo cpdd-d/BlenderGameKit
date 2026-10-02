@@ -129,6 +129,24 @@ extends Node
 ## 竖线在路径和节点名里都不会出现,安全。
 @export var materials: String = "{materials}"
 
+## ── 让卡通着色跟随场景灯光(默认开)────────────────────────────────
+## 背景:gk_toon.gdshader 是 `unshaded` 的 —— Godot 不做任何光照,
+## 明暗全部由 shader 用 `light_dir` / `light_color` 自己算。
+## 好处是色阶不会被环境光冲淡,但代价是**角色感觉不到场景里的灯**。
+##
+## 用户反馈:"还是需要灯光影响角色的"。所以这里每个物理帧把场景里
+## 第一盏 DirectionalLight3D 的方向/颜色/亮度同步给所有卡通材质。
+##
+## 结果:色阶仍然是 shader 算的(硬边、冷色阴影都在),
+## 但**方向跟着场景灯走** —— 转太阳,角色身上的阴影跟着转。
+@export var follow_scene_light: bool = true
+
+## 想指定用哪盏灯就填它的名字;留空 = 用场景里找到的第一盏平行光。
+@export var light_name: String = ""
+
+## 收集到的卡通材质(供 _update_light 用)。
+var _gk_materials: Array = []
+
 
 func _ready() -> void:
 	_activate_camera()
@@ -215,6 +233,65 @@ func _apply_materials() -> void:
 			push_warning("[GK] 没找到网格节点: " + node_name)
 	if applied > 0:
 		print("[GK] 已挂 ", applied, " 个卡通材质")
+	# 收一份引用,给 _update_light 用(它每个物理帧把场景灯同步进 shader)
+	_collect_materials()
+
+
+func _collect_materials() -> void:
+	_gk_materials.clear()
+	var root := _scene_root()
+	if root == null:
+		return
+	for node in root.find_children("*", "MeshInstance3D", true, false):
+		var mesh_node := node as MeshInstance3D
+		if mesh_node == null:
+			continue
+		if mesh_node.material_override is ShaderMaterial:
+			_gk_materials.append(mesh_node.material_override)
+		for i in range(mesh_node.get_surface_override_material_count()):
+			var sm := mesh_node.get_surface_override_material(i) as ShaderMaterial
+			if sm != null and not _gk_materials.has(sm):
+				_gk_materials.append(sm)
+
+
+## 场景灯光 -> 卡通材质。见 follow_scene_light 的说明。
+func _update_light(delta: float) -> void:
+	if not follow_scene_light or _gk_materials.is_empty():
+		return
+	var light := _find_directional_light()
+	if light == null:
+		return
+	# 平行光的 -Z 轴就是它照射的方向;取反得到"光从哪来"。
+	var dir: Vector3 = -light.global_transform.basis.z.normalized()
+	var energy: float = light.light_energy
+	var col: Color = light.light_color
+	for mat in _gk_materials:
+		var sm := mat as ShaderMaterial
+		if sm == null:
+			continue
+		sm.set_shader_parameter("light_dir", dir)
+		sm.set_shader_parameter("light_color", col)
+		# 场景灯的 energy 直接当亮度。1.0 是基准,免得默认灯太暗。
+		sm.set_shader_parameter("light_energy", clampf(energy, 0.0, 4.0))
+
+
+func _find_directional_light() -> DirectionalLight3D:
+	var root := _scene_root()
+	if root == null:
+		return null
+	if not light_name.is_empty():
+		var named := root.find_child(light_name, true, false)
+		if named is DirectionalLight3D:
+			return named as DirectionalLight3D
+	for node in root.find_children("*", "DirectionalLight3D", true, false):
+		return node as DirectionalLight3D
+	return null
+
+
+## 用物理帧而不是渲染帧:角色移动在 _physics_process 里,
+## 光照跟着一起更新才不会出现"身体动了阴影还停在上一帧"的晃动。
+func _physics_process(delta: float) -> void:
+	_update_light(delta)
 
 
 func _activate_camera() -> void:
