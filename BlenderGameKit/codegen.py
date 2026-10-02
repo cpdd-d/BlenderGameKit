@@ -1509,10 +1509,17 @@ def _emit_tree_transitions(ctx, node, indent, states, var_name, player_temp):
         state_name = str(getattr(item, "gk_state_name", "") or "")
         if not state_name:
             continue
-        socket = item.inputs.get("条件")
-        if socket is None or not getattr(socket, "is_linked", False):
-            continue          # 没接条件 = 不会被主动切过去(可能是起始状态)
-        condition = ctx.expr_of(socket)
+        # 条件有两种来源(接引脚 / 节点上直接选输入)—— 见 GKNodeAnimState。
+        condition = None
+        getter = getattr(item, "condition_expr", None)
+        if getter is not None:
+            condition = getter(ctx)
+        else:   # 兜底:老节点没有 condition_expr
+            socket = item.inputs.get("条件")
+            if socket is not None and getattr(socket, "is_linked", False):
+                condition = ctx.expr_of(socket)
+        if not condition:
+            continue          # 没条件 = 不会被主动切过去(可能就是起始状态)
         ctx.add_line(indent, f'if {var_name} != {gd_string(state_name)} '
                              f'and {condition}:')
         ctx.add_line(indent + 1, f'{var_name} = {gd_string(state_name)}')

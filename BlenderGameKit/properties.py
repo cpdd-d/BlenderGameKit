@@ -336,11 +336,31 @@ def make_node_picker(prop_name):
     return refresh
 
 
-def current_tree(context):
-    """取当前正在编辑的 GK 节点树，没有就返回 None。"""
+def current_tree_type(context):
+    """当前节点编辑器在编辑哪一类树 —— "GKGameLogicTree" / "GKAnimationTree"。
+
+    取不到就返回 None。菜单按这个过滤(见 node_menu_entries)。
+    """
     space = getattr(context, "space_data", None)
-    if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
+    kind = getattr(space, "tree_type", "") if space is not None else ""
+    if kind in ("GKGameLogicTree", "GKAnimationTree"):
+        return kind
+    return None
+
+
+def current_tree(context):
+    """取当前正在编辑的 GK 节点树，没有就返回 None。
+
+    ── 为什么两种树都认(踩过的坑)────────────────────────────────
+    以前这里写死 `tree_type != "GKGameLogicTree"` 就返回 None ——
+    于是打开**动画树**时所有面板都以为"没有树",
+    用户看到的是空面板(实测:"游戏动画那里什么都没有")。
+    现在两类树都返回,由调用方按需再用 `current_tree_type()` 区分。
+    """
+    kind = current_tree_type(context)
+    if kind is None:
         return None
+    space = getattr(context, "space_data", None)
     return getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
 
 
@@ -358,16 +378,40 @@ def node_menu_entries():
     return ordered
 
 
-def node_menu_tree():
+def node_menu_entries(tree_type=None):
+    """按分类整理所有节点，供"添加节点"菜单使用。
+
+    tree_type 给了的话**只列出属于那种树的节点** ——
+    在动画树里不该看到玩法节点,反过来也一样。
+    不筛的话用户会点到一个必然报错的菜单项(实测踩过)。
+    """
+    grouped = {}
+    for cls in node_lib.ALL_CLASSES:
+        if tree_type is not None:
+            if getattr(cls, "gk_tree_type", "GKGameLogicTree") != tree_type:
+                continue
+        grouped.setdefault(cls.gk_category, []).append(cls)
+    ordered = []
+    for category in node_lib.CATEGORY_ORDER:
+        if category in grouped:
+            ordered.append((category, grouped.pop(category)))
+    for category, items in grouped.items():
+        ordered.append((category, items))
+    return ordered
+
+
+def node_menu_tree(tree_type=None):
     """两级菜单结构: 分类 -> None(直接列) 或 分类 -> [(子分类, [节点]), ...]。
 
     87 个节点只按一级分类铺开时，最大的「运算」有 13 项，翻起来很累。
     这里对**大类**再切一层，菜单变成:
         运算 ▸ 常量 / 数学 / 向量 / 逻辑 / 转换
     小分类保持一级 —— 本来就三五个节点，再套一层是让用户多点一次。
+
+    tree_type 透传给 node_menu_entries,用来按节点树类型过滤。
     """
     result = []
-    for category, classes in node_menu_entries():
+    for category, classes in node_menu_entries(tree_type):
         order = node_lib.SUBCATEGORY_ORDER.get(category)
         if not order:
             result.append((category, None))

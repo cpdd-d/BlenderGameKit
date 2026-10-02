@@ -226,6 +226,27 @@ class GK_OT_AddNode(bpy.types.Operator):
             _report(self, "ERROR", f"未知节点类型: {self.node_type}")
             return {"CANCELLED"}
 
+        # ── 节点只能放进**自己那类树**(踩过的坑)────────────────────
+        # 用户实测:在「游戏逻辑」图里加『动画状态』节点,Blender 只丢出
+        #     RuntimeError: 无法将 'GKNodeAnimState' 类型的节点添加到
+        #     节点树 '骨骼_动画_游戏逻辑' 中
+        # —— 这是 `poll()` 挡下来了,但**用户看不懂该去哪**。
+        #
+        # 所以在这里先拦一道,给一句人话:告诉他该去哪种树。
+        wanted = getattr(cls, "gk_tree_type", "GKGameLogicTree")
+        actual = getattr(tree, "bl_idname", "")
+        if wanted != actual:
+            where = ("动画树(『游戏动画』)" if wanted == "GKAnimationTree"
+                     else "游戏逻辑树")
+            _report(self, "ERROR",
+                    f"『{cls.bl_label}』是{where}里的节点,"
+                    f"不能放进当前的图。"
+                    + ("侧栏『游戏逻辑』面板 -> 『动画系统』-> "
+                       "点『打开/新建动画树』"
+                       if wanted == "GKAnimationTree" else
+                       "请切到游戏逻辑图"))
+            return {"CANCELLED"}
+
         location = context.space_data.cursor_location if context.space_data else (0.0, 0.0)
         node = tree.nodes.new(cls.bl_idname)
         node.location = location

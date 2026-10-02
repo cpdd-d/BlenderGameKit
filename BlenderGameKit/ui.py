@@ -149,6 +149,68 @@ def _node_space(context):
     return None
 
 
+class GK_PT_AnimTree(bpy.types.Panel):
+    """动画树专属面板。
+
+    ── 为什么必须有一个(踩过的坑)────────────────────────────────
+    以前只有 `GK_PT_Main`,它的 poll 写死 `tree_type == "GKGameLogicTree"`
+    —— 于是切到动画树时**整个侧栏是空的**(用户实测:
+    "游戏动画那里什么都没有")。人会以为这功能坏了。
+    """
+
+    bl_idname = "GK_PT_AnimTree"
+    bl_label = "游戏动画 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏动画"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and getattr(space, "tree_type", "") == "GKAnimationTree"
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+
+        if tree is not None and len(tree.nodes) == 0:
+            box = layout.box()
+            box.label(text="这张动画树还是空的", icon="INFO")
+            col = box.column(align=True)
+            col.label(text="1. 加一个『动画状态』节点")
+            col.label(text="2. 填状态名(= 动画名)")
+            col.label(text="3. 选条件来源:")
+            col.label(text="     『选输入』= 直接挑按键,不用拉线")
+            col.label(text="     『自己写』= 接条件引脚")
+            box.operator("gk.add_node_menu", text="添加节点",
+                         icon="ADD").node_type = "GKNodeAnimState"
+
+        if tree is not None:
+            states = [n for n in tree.nodes
+                      if getattr(n, "bl_idname", "") == "GKNodeAnimState"]
+            box = layout.box()
+            box.label(text=f"{tree.name} —— {len(states)} 个状态",
+                      icon="NODETREE")
+            default = [s for s in states if getattr(s, "gk_is_default", False)]
+            for state in sorted(states,
+                                key=lambda s: int(getattr(s, "gk_priority", 0) or 0)):
+                row = box.row(align=True)
+                mark = "★ " if state in default else "   "
+                source = str(getattr(state, "gk_cond_source", "PIN"))
+                if source == "PIN":
+                    hint = "(接引脚)"
+                else:
+                    hint = f"({getattr(state, 'gk_cond_action', '')})"
+                row.label(text=f"{mark}{state.gk_state_name}  {hint}",
+                          icon="POSE_HLT")
+                row.label(text=f"优先 {getattr(state, 'gk_priority', 0)}")
+            if not default and states:
+                box.label(text="还没勾『起始状态』,会用第一个", icon="ERROR")
+
+        layout.operator("gk.add_node_menu", text="添加节点", icon="ADD")
+        layout.operator("gk.export_script", text="导出脚本", icon="FILE_TICK")
+
+
 # ==========================================================================
 # 添加节点菜单
 # ==========================================================================
@@ -194,7 +256,7 @@ class GK_MT_AddNodeCategories(bpy.types.Menu):
             layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
 
         # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
-        for category, subs in props.node_menu_tree():
+        for category, subs in props.node_menu_tree(props.current_tree_type(context)):
             layout.menu(_menu_name(category), text=category)
 
 
@@ -286,9 +348,12 @@ def _make_common_menu():
 
 
 CATEGORY_MENUS = []
-for _category, _subs in props.node_menu_tree():
+# 注意:这里是**模块级**代码,没有 context —— 不能按当前树类型过滤。
+# 菜单建成"全部节点",真正的过滤在各自的 `draw()` 里按
+# `props.current_tree_type(context)` 做。见 GK_MT_AddNodeCategories。
+for _category, _subs in props.node_menu_tree(None):
     if _subs is None:
-        _classes = next(classes for cat, classes in props.node_menu_entries()
+        _classes = next(classes for cat, classes in props.node_menu_entries(None)
                         if cat == _category)
         CATEGORY_MENUS.append(_make_category_menu(_category, _classes))
     else:
@@ -364,7 +429,7 @@ class GK_OT_FindNode(bpy.types.Operator):
         带上分类之后既能区分，又能靠"输入分类名"来过滤
         (比如只打『存档』就只剩存档那几个)。
         """
-        for category, classes in props.node_menu_entries():
+        for category, classes in props.node_menu_entries(props.current_tree_type(context)):
             for cls in classes:
                 op = self.layout.operator("gk.find_node", text=f"{category} · {cls.bl_label}")
                 op.node_type = cls.bl_idname
@@ -926,7 +991,7 @@ def _draw_node_menu_contents(layout, context, nested=False):
         layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
 
     # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
-    for category, subs in props.node_menu_tree():
+    for category, subs in props.node_menu_tree(props.current_tree_type(context)):
         layout.menu(_menu_name(category), text=category)
 
     layout.separator()
@@ -1028,6 +1093,7 @@ GK_CLASSES = (
     GKGameLogicTree,
     GKAnimationTree,
     GK_OT_OpenAnimTree,
+    GK_PT_AnimTree,
     GK_OT_AddNodeMenu,
     GK_OT_FindNode,
     GK_MT_AddNodeCategories,

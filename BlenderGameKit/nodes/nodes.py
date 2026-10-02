@@ -715,6 +715,29 @@ class GKNodePlayAnim(B.GKStatementNode):
         B.draw_target_picker(self, layout, "gk_player")
 
 
+@N
+class GKNodeAnimParam(B.GKStatementNode):
+    bl_idname = "GKNodeAnimParam"
+    bl_label = "动画_设混合参数"
+    bl_icon = "DRIVER"
+    gk_category = "动画"
+    gk_doc = ("给整个模型的形态键统一设一个值。"
+              "做口型/表情时有用:播放说话动画的同时,"
+              "用这个节点把嘴形参数推到 0~1")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "值", 1.0))
+    gk_input_props = {"值": "gk_value"}
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_value", "float", 1.0, "值", "0~1"),
+        ("gk_shape_index", "int", 0, "形态键序号", "第几个形态键(从 0 数)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_value", text="")
+        row.prop(self, "gk_shape_index", text="序号")
+
+
 # ==========================================================================
 # 动画系统节点 —— 属于**独立的动画树**(GKAnimationTree)
 # ==========================================================================
@@ -757,8 +780,9 @@ class GKNodeAnimState(B.GKStatementNode):
     gk_category = "动画系统"
     gk_tree_type = "GKAnimationTree"
     gk_doc = ("一个动画状态。状态名就是动画名。"
-              "把条件接到右边那个布尔引脚上 —— 条件为真就切到这个状态;"
-              "都没接或都为假时停在当前状态。"
+              "切换条件有两种写法 —— "
+              "『自己写』:把条件接到右边那个布尔引脚上(想多复杂都行);"
+              "『选输入』:直接在节点上选一个输入动作,不用另外拉表达式节点。"
               "『优先级』小的先判(同时为真时用它决定谁赢)")
     gk_inputs = (
         S.pin(BOOL, "条件", False),
@@ -766,6 +790,20 @@ class GKNodeAnimState(B.GKStatementNode):
     gk_outputs = ()
     gk_prop_defs = (
         ("gk_state_name", "string", "idle", "状态名", "就是动画名"),
+        # ── 复合条件:不用额外拉表达式节点 ──────────────────────────
+        # 用户要"利用 blender 的优点和虚幻蓝图的优点结合" ——
+        # 蓝图里最常见的条件就是"某个键按住/松开",为了这个去拉
+        # 一个『输入_按住』节点再连线,状态一多整张图就全是线。
+        # 所以让状态节点**自己**能选:条件来源 = 选输入时,
+        # 直接在节点上挑动作 + 挑判断方式。
+        ("gk_cond_source", "enum", "PIN", "条件来源",
+         "『自己写』= 用右边的条件引脚;『选输入』= 在下面直接挑",
+         (("PIN", "自己写(接引脚)", "想多复杂都行:速度、距离、组合条件"),
+          ("ACTION_PRESSED", "选输入:按住", "按键按住期间为真"),
+          ("ACTION_JUST", "选输入:刚按下", "按键刚按下那一帧为真"),
+          ("ACTION_RELEASED", "选输入:松开", "按键松开期间为真"))),
+        ("gk_cond_action", "string", "move_right", "输入动作",
+         "只有『条件来源』选了输入类才用得上"),
         ("gk_priority", "int", 0, "优先级", "数字小的先判;同时为真时它赢"),
         ("gk_is_default", "bool", False, "起始状态",
          "勾上 = 进游戏时的默认状态(整个树里只该勾一个)"),
@@ -773,9 +811,36 @@ class GKNodeAnimState(B.GKStatementNode):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_state_name", text="")
+        layout.prop(self, "gk_cond_source", text="")
+        # 选了"自己写"才提示去接引脚;选了输入就直接给动作名输入框
+        if str(getattr(self, "gk_cond_source", "PIN")) == "PIN":
+            layout.label(text="条件 -> 接右边引脚", icon="LINKED")
+        else:
+            layout.prop(self, "gk_cond_action", text="")
         row = layout.row(align=True)
         row.prop(self, "gk_priority", text="优先")
         row.prop(self, "gk_is_default", text="起始")
+
+    def condition_expr(self, ctx):
+        """这个状态的条件表达式;没有条件就返回 None。
+
+        两种来源都支持,见上面 gk_cond_source 的说明。
+        """
+        source = str(getattr(self, "gk_cond_source", "PIN"))
+        if source == "PIN":
+            socket = self.inputs.get("条件")
+            if socket is None or not getattr(socket, "is_linked", False):
+                return None
+            return ctx.expr_of(socket)
+        action = str(getattr(self, "gk_cond_action", "move_right") or "")
+        if not action:
+            return None
+        const = ctx.add_action(action)
+        return {
+            "ACTION_PRESSED": f"Input.is_action_pressed({const})",
+            "ACTION_JUST": f"Input.is_action_just_pressed({const})",
+            "ACTION_RELEASED": f"Input.is_action_just_released({const})",
+        }.get(source)
 
 
 @N
