@@ -2310,6 +2310,95 @@ class TestAnimationNodes(Base):
         self.assert_indent_sane(code)
 
 
+class TestDynamicPins(Base):
+    """动态引脚(蓝图式可调分支数)。
+
+    背景:用户要"像虚幻蓝图那样可以自定义添加连接节点数"。
+    实测过:改数量属性后引脚**不会自动刷新**,得重新加载文件才出现 ——
+    那不是蓝图该有的手感。所以 node_base 给带 count/cases/steps 字样的
+    属性自动挂了 update 回调,改一次重建一次。
+    """
+
+    def test_switch_output_count_follows_property(self):
+        node = make_tree().new_node(NN.GKNodeSwitch, "多路分支")
+        node.gk_case_count = 4
+        node.build_sockets()
+        self.assertEqual([s.name for s in node.outputs],
+                         ["0", "1", "2", "3", "默认"])
+
+    def test_switch_is_clamped(self):
+        node = make_tree().new_node(NN.GKNodeSwitch, "多路分支")
+        # 上限 12:再多也只给 12 条分支 + 一条"默认"
+        node.gk_case_count = 999
+        node.build_sockets()
+        self.assertEqual(len(node.outputs), 13)
+        self.assertEqual(node.outputs[-1].name, "默认")
+        # 下限 1。注意**测试桩不执行 bpy 的 min= 约束**,
+        # 所以这里直接给 1(而不是 0),三个环境(桩/Blender/生成器)
+        # 的行为才一致。
+        node.gk_case_count = 1
+        node.build_sockets()
+        self.assertEqual([s.name for s in node.outputs], ["0", "默认"])
+
+    def _build_switch(self, case_count, wire):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeSwitch, "多路分支")
+        switch.gk_case_count = case_count
+        switch.build_sockets()
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        for socket_name, text in wire.items():
+            printer = tree.new_node(NN.GKNodePrint, "打印" + socket_name)
+            printer.gk_text = text
+            gk_stub.connect(tree, switch, socket_name, printer, "执行")
+        return gen(tree, V3)
+
+    def test_switch_generates_match(self):
+        code, warnings = self._build_switch(
+            3, {"0": "走零", "2": "走二", "默认": "兜底"})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("match ", code)
+        self.assertIn("走零", code)
+        self.assertIn("走二", code)
+        self.assertIn("兜底", code)
+        self.assertIn("_:\n", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_switch_empty_branches_get_pass(self):
+        """match 的分支体不能为空,没连线必须补 pass —— 否则语法错误。"""
+        code, _ = self._build_switch(3, {"默认": "兜底"})
+        body = code[code.index("match "):]
+        self.assertIn("pass", body)
+        # 三个空分支 + 默认不空 -> 至少 3 个 pass
+        self.assertGreaterEqual(body.count("pass"), 3)
+
+    def test_switch_only_default_is_valid(self):
+        code, _ = self._build_switch(1, {"默认": "只有默认"})
+        self.assertIn("match ", code)
+        self.assertIn("pass", code)
+        self.assert_indent_sane(code)
+
+    def test_pin_count_props_get_update_callback(self):
+        """带 count/cases/steps 字样的属性必须挂上重建回调。
+
+        没挂的话用户在 Blender 里改数字看不到新引脚(实测踩过)。
+        """
+        for cls, prop in ((NN.GKNodeSwitch, "gk_case_count"),
+                          (NN.GKNodeSequence, "gk_step_count")):
+            descriptor = (cls.__annotations__ or {}).get(prop)
+            self.assertIsNotNone(descriptor, f"{cls.__name__}.{prop} 没声明")
+            # Blender 的 Property 有 update;桩环境是 GKProp,拿 kwargs 看
+            has_update = getattr(descriptor, "update", None) is not None
+            if not has_update:
+                has_update = "update" in getattr(descriptor, "kwargs", {})
+            self.assertTrue(has_update, f"{cls.__name__}.{prop} 没有 update 回调")
+
+    def test_no_chinese_identifiers_in_switch_names(self):
+        code, _ = self._build_switch(5, {"3": "三"})
+        self.assert_no_chinese_identifiers(code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

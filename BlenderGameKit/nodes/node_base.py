@@ -280,6 +280,46 @@ _PROP_FACTORY = {
 }
 
 
+def _on_pin_count_changed(node, _context=None):
+    """动态引脚节点的"数量"属性变了 -> 立刻重建引脚。
+
+    ── 为什么需要这个(蓝图的体感就在这里)──────────────────────────
+    节点刚写出来时,`序列` 的出口数量只能靠 `build_sockets()` 手动刷新 ——
+    用户把"出口数量"从 3 调到 5,**节点上看不到第 4、5 个出口**,
+    得重新加载文件才出现。那不是蓝图该有的手感:
+    蓝图里改数字,引脚**立刻**长出来。
+
+    所以给这些属性挂上 Blender 的 `update` 回调,改一次重建一次。
+    找不到 `build_sockets` 的节点会被静默跳过(普通节点不受影响)。
+    """
+    builder = getattr(node, "build_sockets", None)
+    if builder is None:
+        return
+    try:
+        builder()
+    except Exception:
+        # 重建失败不能让整个属性编辑崩掉 —— 引脚保持原样,用户还能撤销。
+        pass
+    # 通知节点树重绘,否则引脚要等下一次鼠标移动才画出来
+    tree = getattr(node, "id_data", None)
+    updater = getattr(tree, "update", None)
+    if updater is not None:
+        try:
+            updater()
+        except Exception:
+            pass
+
+
+# 这些属性一变就重建引脚(蓝图式动态引脚)。
+# 值是**属性名前缀**:只要属性名里含这些词,就自动挂上重建回调。
+PIN_COUNT_HINTS = ("count", "steps", "cases", "branches", "出口", "分支")
+
+
+def _wants_pin_rebuild(prop_name):
+    lowered = prop_name.lower()
+    return any(hint in lowered for hint in PIN_COUNT_HINTS)
+
+
 def materialize_props(cls):
     """把 gk_prop_defs 转成真实(Blender 可识别)的属性声明。"""
     prop_map = {}
@@ -290,6 +330,8 @@ def materialize_props(cls):
         default = entry[2] if len(entry) > 2 else None
         label = entry[3] if len(entry) > 3 else ""
         desc = entry[4] if len(entry) > 4 else ""
+        # 声明里可以带第六项:额外 kwargs(比如 min/max/update)
+        extra = dict(entry[6]) if len(entry) > 6 and isinstance(entry[6], dict) else {}
         if kind == "enum":
             items = entry[5] if len(entry) > 5 else ()
             descriptor = prop_enum(
@@ -299,7 +341,10 @@ def materialize_props(cls):
                 description=desc,
             )
         else:
-            descriptor = _PROP_FACTORY.get(kind, prop_text)(default, name=label, description=desc)
+            if _wants_pin_rebuild(prop_name) and "update" not in extra:
+                extra["update"] = _on_pin_count_changed
+            descriptor = _PROP_FACTORY.get(kind, prop_text)(
+                default, name=label, description=desc, **extra)
         annotations[prop_name] = descriptor
         setattr(cls, prop_name, default)
         prop_map[prop_name] = entry

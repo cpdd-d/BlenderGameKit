@@ -2666,6 +2666,64 @@ def _stmt_sequence(ctx, node, indent):
         _chain(ctx, node, indent, socket.name)
 
 
+@stmt_node("GKNodeSwitch")
+def _stmt_switch(ctx, node, indent):
+    """多路分支:按一个整数走不同出口。
+
+    生成的 GDScript 用 `match`:
+
+        var _sw1 := 2
+        match _sw1:
+            0:
+                <出口 0 的链>
+            1:
+                <出口 1 的链>
+            _:
+                <默认的链>
+
+    ── 两个容易出错的地方 ──────────────────────────────────────────
+    1. `match` 的每个分支体**不能为空** —— 没连线时要补 `pass`,
+       否则 GDScript 直接语法错误。
+    2. 出口名就是匹配的整数值,最后一条固定叫『默认』(生成成 `_`)。
+       所以这里必须把"默认"和数字分开处理,不能一视同仁地 int()。
+    """
+    value = ctx.input_number(node, "值", "0")
+    temp = ctx.new_temp("sw")
+    ctx.add_line(indent, f"var {temp} := int({value})")
+    ctx.add_line(indent, f"match {temp}:")
+
+    # 出口顺序就是 build_sockets 建的顺序(0..n-1,然后"默认")
+    default_socket = None
+    branches = []
+    for socket in node.outputs:
+        if socket.name == "默认":
+            default_socket = socket
+        else:
+            branches.append(socket)
+
+    for socket in branches:
+        try:
+            case_value = int(socket.name)
+        except (TypeError, ValueError):
+            continue
+        ctx.add_line(indent + 1, f"{case_value}:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 2, socket.name)
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 2, "pass")
+
+    if default_socket is not None:
+        ctx.add_line(indent + 1, "_:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 2, "默认")
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 2, "pass")
+    elif not branches:
+        # 一个出口都没有(理论上不会,防御一下)
+        ctx.add_line(indent + 1, "_:")
+        ctx.add_line(indent + 2, "pass")
+
+
 @stmt_node("GKNodeForLoop")
 def _stmt_for_loop(ctx, node, indent):
     count = ctx.input_number(node, "次数", "3")

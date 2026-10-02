@@ -158,6 +158,52 @@ class GKNodeSequence(B.GKStatementNode):
 
 
 @N
+class GKNodeSwitch(B.GKStatementNode):
+    bl_idname = "GKNodeSwitch"
+    bl_label = "多路分支"
+    bl_icon = "SORT_ASC"
+    gk_category = "流程"
+    gk_doc = ("按一个整数走不同出口。出口数量可调(1~12),"
+              "改数字引脚会立刻长出来 —— 这就是蓝图那种'自定义分支数'的节点。"
+              "值不匹配任何一条时走『默认』")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(INT, "值", 0))
+    # 出口在 build_sockets 里按 gk_case_count 动态生成,这里只是默认值
+    gk_outputs = (S.pin(FLOW, "0"), S.pin(FLOW, "1"),
+                  S.pin(FLOW, "默认"))
+    gk_prop_defs = (
+        # 属性名里带 "count" -> node_base 会自动给它挂上"重建引脚"的回调
+        ("gk_case_count", "int", 2, "出口数量", "1~12 条分支",
+         None, {"min": 1, "max": 12}),
+    )
+
+    def build_sockets(self):
+        """按 gk_case_count 重建出口。
+
+        出口名就是**要匹配的整数值**,最后一条固定叫『默认』。
+        用名字当匹配值(而不是另开一堆属性)是为了:
+          * 用户在节点上直接看到"这条出口对应哪个值"
+          * 增减出口时不用同步维护另一个数组属性
+        """
+        count = max(1, min(12, int(getattr(self, "gk_case_count", 2) or 2)))
+        self.inputs.clear()
+        for spec in self.gk_inputs:
+            socket = self.inputs.new(spec["kind"][0], spec["name"])
+            if spec["default"] is not None:
+                try:
+                    socket.default_value = spec["default"]
+                except Exception:
+                    pass
+        self.outputs.clear()
+        for index in range(count):
+            self.outputs.new(S.FLOW[0], str(index))
+        self.outputs.new(S.FLOW[0], "默认")
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_case_count", text="分支数")
+
+
+@N
 class GKNodeForLoop(B.GKStatementNode):
     bl_idname = "GKNodeForLoop"
     bl_label = "循环_次数"
