@@ -775,10 +775,22 @@ _ANIM_TREE_HINT = (
 @N
 class GKNodeAnimState(B.GKStatementNode):
     bl_idname = "GKNodeAnimState"
-    bl_label = "动画状态"
+    bl_label = "动画状态(旧)"
     bl_icon = "POSE_HLT"
     gk_category = "动画系统"
     gk_tree_type = "GKAnimationTree"
+    # ── 从菜单里**隐藏**(用户选了"统一成一种卡片")────────────────
+    # 用户原话:"选择B" —— B 是"砍掉『动画状态』,只留『动画_切状态』,
+    # 条件全靠拉线,更蓝图"。
+    #
+    # 但**没有删除**:已经用过它的动画树还得能打开 ——
+    # 删了那些图会报"无法将 'GKNodeAnimState' 类型的节点添加/加载",
+    # 用户会以为文件坏了。所以只是不出现在"添加节点"菜单里。
+    # codegen 仍然认识它(见 codegen._anim_tree_states)。
+    gk_hidden = True
+    gk_doc = ("【旧版,已隐藏】把条件和目标写在状态自己身上。"
+              "现在统一用『动画_切状态』卡片 —— 条件从逻辑判断拉线进来,"
+              "和蓝图一致。这个节点只为兼容已有的图而保留")
     gk_doc = ("一个动画状态。状态名就是动画名。"
               "切换条件有两种写法 —— "
               "『自己写』:把条件接到右边那个布尔引脚上(想多复杂都行);"
@@ -973,6 +985,8 @@ class GKNodeAnimTransition(B.GKStatementNode):
         ("gk_to_state", "string", "", "目标状态(手填兜底)",
          "没选『目标动画』时才用它"),
         ("gk_priority", "int", 0, "优先级", "数字小的先判"),
+        ("gk_is_default", "bool", False, "起始状态",
+         "勾上 = 进游戏时的默认状态(整个树里只该勾一个)"),
     )
 
     def resolved_state_name(self):
@@ -990,7 +1004,9 @@ class GKNodeAnimTransition(B.GKStatementNode):
             layout.label(text=f"-> {self.gk_to_action.name}", icon="FORWARD")
         else:
             layout.prop(self, "gk_to_state", text="", icon="FORWARD")
-        layout.prop(self, "gk_priority", text="优先")
+        row = layout.row(align=True)
+        row.prop(self, "gk_priority", text="优先")
+        row.prop(self, "gk_is_default", text="起始")
 
 
 @N

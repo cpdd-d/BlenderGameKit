@@ -244,35 +244,33 @@ class GK_PT_AnimTree(bpy.types.Panel):
             box = layout.box()
             box.label(text="这张动画树还是空的", icon="INFO")
             col = box.column(align=True)
-            col.label(text="1. 加一个『动画状态』节点")
-            col.label(text="2. 填状态名(= 动画名)")
-            col.label(text="3. 选条件来源:")
-            col.label(text="     『选输入』= 直接挑按键,不用拉线")
-            col.label(text="     『自己写』= 接条件引脚")
+            col.label(text="1. 加一个『动画_切状态』卡片")
+            col.label(text="2. 选『目标动画』(从文件里的动作挑)")
+            col.label(text="3. 把一个判断接到它的『条件』引脚")
+            col.label(text="     例:『动画判断_移动状态』的『在移动』")
+            col.label(text="4. 勾上『起始』的那个就是进游戏时的状态")
             box.operator("gk.add_node_menu", text="添加节点",
-                         icon="ADD").node_type = "GKNodeAnimState"
+                         icon="ADD").node_type = "GKNodeAnimTransition"
 
         if tree is not None:
-            states = [n for n in tree.nodes
-                      if getattr(n, "bl_idname", "") == "GKNodeAnimState"]
+            cards = [n for n in tree.nodes
+                     if getattr(n, "bl_idname", "") in ("GKNodeAnimTransition",
+                                                        "GKNodeAnimState")]
             box = layout.box()
-            box.label(text=f"{tree.name} —— {len(states)} 个状态",
+            box.label(text=f"{tree.name} —— {len(cards)} 张卡片",
                       icon="NODETREE")
-            default = [s for s in states if getattr(s, "gk_is_default", False)]
-            for state in sorted(states,
-                                key=lambda s: int(getattr(s, "gk_priority", 0) or 0)):
+            default = [c for c in cards if getattr(c, "gk_is_default", False)]
+            for card in sorted(cards,
+                               key=lambda c: int(getattr(c, "gk_priority", 0) or 0)):
                 row = box.row(align=True)
-                mark = "★ " if state in default else "   "
-                source = str(getattr(state, "gk_cond_source", "PIN"))
-                if source == "PIN":
-                    hint = "(接引脚)"
-                else:
-                    hint = f"({getattr(state, 'gk_cond_action', '')})"
-                row.label(text=f"{mark}{state.gk_state_name}  {hint}",
-                          icon="POSE_HLT")
-                row.label(text=f"优先 {getattr(state, 'gk_priority', 0)}")
-            if not default and states:
-                box.label(text="还没勾『起始状态』,会用第一个", icon="ERROR")
+                mark = "★ " if card in default else "   "
+                resolver = getattr(card, "resolved_state_name", None)
+                name = (resolver() if resolver is not None
+                        else getattr(card, "gk_state_name", "?")) or "(没设目标)"
+                row.label(text=f"{mark}{name}", icon="FORWARD")
+                row.label(text=f"优先 {getattr(card, 'gk_priority', 0)}")
+            if not default and cards:
+                box.label(text="还没勾『起始』,会用第一张", icon="ERROR")
 
         layout.operator("gk.add_node_menu", text="添加节点", icon="ADD")
         layout.operator("gk.export_script", text="导出脚本", icon="FILE_TICK")
@@ -352,8 +350,22 @@ def _make_category_menu(category, classes, subcategories=None):
                 # 子菜单类在 CATEGORY_MENUS 里单独注册，这里只要挂上去
                 layout.menu(_menu_name(f"{category}/{sub_name}"), text=sub_name)
         else:
+            # ── 这里再过滤一次(兜底)────────────────────────────────
+            # 外层菜单已经按树类型筛过分类了,但 `current_tree_type()`
+            # 在某些上下文拿不到时会回退成"列全部分类" ——
+            # 那时这个分类里可能全是别的树的节点,点下去只会报错。
+            # 在 draw 里(此时一定有 context)按当前树类型再筛一遍。
+            kind = props.current_tree_type(context)
+            shown = 0
             for cls in classes:
+                if kind is not None:
+                    if getattr(cls, "gk_tree_type", "GKGameLogicTree") != kind:
+                        continue
                 _add(layout, cls, link_from)
+                shown += 1
+            if shown == 0:
+                layout.label(text="(这个分类下没有适合当前节点图的节点)",
+                             icon="INFO")
 
     name = f"GK_MT_CAT_{abs(hash(category)) % 100000}"
     return type(name, (bpy.types.Menu,), {
@@ -1058,7 +1070,19 @@ def _draw_node_menu_contents(layout, context, nested=False):
         layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
 
     # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
-    for category, subs in props.node_menu_tree(props.current_tree_type(context)):
+    #
+    # ── 兜底:一个分类都没有时列**全部**(踩过的坑)──────────────────
+    # 菜单按节点树类型过滤。但 `current_tree_type()` 在某些上下文里
+    # 会返回 None(拿不到 space_data),那时过滤结果就是**空菜单** ——
+    # 用户实测"shift+A那里没有东西"。
+    #
+    # 宁可多列几个分类(点错了会有人话报错,见 gk.add_node 的检查),
+    # 也不能给一个空菜单 —— 空菜单让人以为功能坏了。
+    kind = props.current_tree_type(context)
+    entries = props.node_menu_tree(kind)
+    if not entries:
+        entries = props.node_menu_tree(None)
+    for category, subs in entries:
         layout.menu(_menu_name(category), text=category)
 
     layout.separator()

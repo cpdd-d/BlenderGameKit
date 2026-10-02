@@ -387,6 +387,10 @@ def node_menu_entries(tree_type=None):
     """
     grouped = {}
     for cls in node_lib.ALL_CLASSES:
+        # 隐藏的节点不出现在"添加节点"菜单里,但仍然能加载/生成代码。
+        # 用来做"旧版保留但不推荐"——删掉的话已有的图会打不开。
+        if getattr(cls, "gk_hidden", False):
+            continue
         if tree_type is not None:
             if getattr(cls, "gk_tree_type", "GKGameLogicTree") != tree_type:
                 continue

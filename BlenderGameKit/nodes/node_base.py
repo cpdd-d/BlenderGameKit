@@ -458,6 +458,8 @@ if _USE_BPY_BASE:
         gk_prop_defs = ()       # (属性名, 类型, 默认值, 标签, 说明[, 枚举项])
         gk_is_event = False
         gk_data_only = False
+        # 从"添加节点"菜单里隐藏 —— 旧版节点保留兼容用(见 node_menu_entries)
+        gk_hidden = False
         # 这个节点属于哪种节点树。默认游戏逻辑树;
         # 动画系统节点设成 "GKAnimationTree" —— 两套节点不该互相污染菜单。
         gk_tree_type = "GKGameLogicTree"
@@ -572,6 +574,8 @@ else:
         gk_prop_defs = ()
         gk_is_event = False
         gk_data_only = False
+        # 从"添加节点"菜单里隐藏 —— 旧版节点保留兼容用(见 node_menu_entries)
+        gk_hidden = False
 
         def __init__(self):
             self.name = type(self).bl_label
