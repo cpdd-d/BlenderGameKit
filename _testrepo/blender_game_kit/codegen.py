@@ -199,6 +199,9 @@ class GenContext:
         self._current_indent = 1
         self._expr_indent = 1
         self._temp_seq = 0
+        # 跨函数共享的成员变量(见 member_temp)
+        self._member_seq = 0
+        self.member_vars = []
         self._expr_cache = {}      # "节点::输出名" -> 表达式文本
         self._active = set()       # 沿执行流的递归栈，用于断环
         self._claimed = {}         # 节点名 -> 哪个事件函数已经"拥有"它
@@ -300,6 +303,28 @@ class GenContext:
     def new_temp(self, prefix="t"):
         self._temp_seq += 1
         return f"_{snake_case(prefix, 't')}{self._temp_seq}"
+
+    def member_temp(self, prefix="m"):
+        """取一个**成员变量**名。
+
+        -- 为什么需要(踩过的坑)------------------------------------
+        生成的代码会跨函数引用同一个值:比如 _ready() 里播动画、
+        _physics_process() 里判状态,两处都要用**同一个**
+        AnimationPlayer 引用。
+
+        用 
+ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
+        _physics_process() 里就是
+            Identifier "_ap1" not declared in the current scope
+        实测炸了 3 条这种错误。
+
+        所以需要跨函数共享的引用一律用这个,声明成成员变量
+        (由 _assemble 挂到类的顶部,见 member_vars)。
+        """
+        name = f"_{snake_case(prefix, 'm')}{self._member_seq}"
+        self._member_seq += 1
+        self.member_vars.append(name)
+        return name
 
     def unique_name(self, base, scope="p"):
         """在导出参数命名空间里取一个不冲突的名字。
@@ -1149,6 +1174,21 @@ def _tunable_number(ctx, node, socket_name, fallback, base_name,
     if ctx.export_tunables:
         socket = ctx._socket(node, socket_name)
         if socket is None or not getattr(socket, "is_linked", False):
+            # -- 同一个节点的同一个输入只声明一次(踩过的坑)------------
+            # 多输出表达式节点(移动状态)按输出引脚求值,一个节点会被
+            # 调用 8 次,每次都声明一遍 @export ->
+            #     @export var move_threshold: float = 0.1
+            #     @export var run_threshold: float = 3.0
+            #     @export var move_threshold_2: float = 0.1   <- 重复
+            #     @export var run_threshold_2: float = 3.0    <- 重复
+            # 用户在检查器里改第一个,实际生效的可能是后面那个。
+            cache = getattr(ctx, "_tunable_cache", None)
+            if cache is None:
+                cache = {}
+                ctx._tunable_cache = cache
+            key = (id(node), socket_name)
+            if key in cache:
+                return cache[key]
             literal = ctx.input_number(node, socket_name, fallback)
             if clamp_max is not None:
                 try:
@@ -1162,7 +1202,10 @@ def _tunable_number(ctx, node, socket_name, fallback, base_name,
                         f"已按 {clamp_max:g} 生成。{clamp_hint}")
                     literal = f"{clamp_max:g}"
             label = getattr(node, "label", "") or node.bl_label
-            return ctx.declare_export(base_name, "float", literal, f"{label} · {socket_name}")
+            result = ctx.declare_export(base_name, "float", literal,
+                                        f"{label} · {socket_name}")
+            cache[key] = result
+            return result
     return ctx.input_number(node, socket_name, fallback)
 
 
@@ -1450,62 +1493,46 @@ def _stmt_play_anim(ctx, node, indent):
 def _expr_anim_locomotion(ctx, node):
     """移动相关的一组布尔判断,一次给全。
 
-    ── 为什么要有这个节点 ──────────────────────────────────────────
+    -- 为什么要这个节点 --------------------------------------------
     动画切换里 90% 的条件就是那几个:"到地面了吗""在动吗""在往下掉吗"。
-    没有这个节点的话,用户要为每一个条件单独拉一个表达式节点再接引脚,
-    状态一多整张图全是线 —— 那正是用户抱怨的"密密麻麻"。
+    没有它的话用户要为每个条件单独拉一个表达式节点再接引脚,
+    状态一多整张图全是线。
 
-    ── 每一项是怎么算的(取值都是 Godot 内置属性)────────────────
-      * 在地面 = `is_on_floor()` —— CharacterBody3D 提供
-      * 在移动 = 水平速度长度超过阈值
-      * 已离地 = `not is_on_floor()`
-      * 在上升 / 在下落 = 竖直速度的正负
-      * 速度快 = 超过"跑"的阈值
+    -- 为什么**不生成中间变量**(踩过的坑)--------------------------
+    第一版为了不重复算速度,生成了 4 行中间变量。结果导出的代码报:
+        Identifier "_lk2_speed" not declared in the current scope
+    因为表达式是在 _ready() 的**局部作用域**里求值的,而这些表达式
+    被 _physics_process 里的状态判断引用 —— 跨函数了。
 
-    水平速度只取 X/Z(3D)或 X(2D)—— 竖直分量不算"移动",
-    否则跳起来时会被判成"在移动",走跑切换就乱了。
+    而且按输出引脚求值会被调用 8 次,每次都要一个不同的临时名,
+    8 组变量散在代码里也很难看。
+
+    所以改成**全部内联**:每个输出就是一个纯表达式,不落地成变量。
+    代价是速度会被算多次,但 Vector2(...).length() 是纳秒级操作,
+    每帧几次完全无所谓 —— 换来的是生成的代码干净、且不会作用域串味。
     """
     target = ctx.target_expr(node)
-    # -- 中间变量只算一次(踩过的坑)----------------------------------
-    # expression_for_output 是按**输出引脚**分别调用的,所以这个函数
-    # 一个节点会被调 8 次(8 个输出各一次)。不做缓存的话,
-    # 4 行中间变量会被重复生成 8 遍 —— 生成的代码又长又白跑。
-    # 这里按节点身份记一份结果,重复调用直接复用。
-    cache = getattr(ctx, "_anim_loco_cache", None)
-    if cache is None:
-        cache = {}
-        ctx._anim_loco_cache = cache
-    key = id(node)
-    if key in cache:
-        return cache[key]
     # 未连线的数值 -> @export 参数,方便在 Godot 检查器里调手感
     slow = _tunable_number(ctx, node, "速度阈值", "0.1", "move_threshold")
     fast = _tunable_number(ctx, node, "跑的速度阈值", "3.0", "run_threshold")
-    temp = ctx.new_temp("lk")
     if ctx.dim == 2:
-        speed_expr = f"Vector2({target}.velocity.x, 0.0).length()"
+        speed = f"Vector2({target}.velocity.x, 0.0).length()"
     else:
-        speed_expr = f"Vector2({target}.velocity.x, {target}.velocity.z).length()"
-    ctx.add_line(ctx._expr_indent, f"var {temp}_speed: float = {speed_expr}")
-    ctx.add_line(ctx._expr_indent,
-                 f"var {temp}_ground: bool = {target}.is_on_floor()")
-    ctx.add_line(ctx._expr_indent,
-                 f"var {temp}_moving: bool = {temp}_speed > {slow}")
-    ctx.add_line(ctx._expr_indent,
-                 f"var {temp}_up: bool = {target}.velocity.y > 0.0")
-    # 返回值是个字典,key 就是输出引脚名 —— 上层按引脚名取
-    result = {
-        "在地面": f"({temp}_ground)",
-        "在移动": f"({temp}_moving)",
-        "地面且移动": f"({temp}_ground and {temp}_moving)",
-        "已离地": f"(not {temp}_ground)",
-        "在上升": f"({temp}_up)",
-        "在下落": f"(not {temp}_up)",
-        "速度快": f"({temp}_speed > {fast})",
-        "速度慢": f"({temp}_speed <= {fast})",
+        speed = (f"Vector2({target}.velocity.x, "
+                 f"{target}.velocity.z).length()")
+    ground = f"{target}.is_on_floor()"
+    moving = f"({speed} > {slow})"
+    up = f"({target}.velocity.y > 0.0)"
+    return {
+        "在地面": f"({ground})",
+        "在移动": f"({moving})",
+        "地面且移动": f"(({ground}) and {moving})",
+        "已离地": f"(not ({ground}))",
+        "在上升": f"({up})",
+        "在下落": f"(not {up})",
+        "速度快": f"({speed} > {fast})",
+        "速度慢": f"({speed} <= {fast})",
     }
-    cache[key] = result
-    return result
 
 
 @stmt_node("GKNodeAnimStateMachineRef")
@@ -1528,8 +1555,21 @@ def _stmt_anim_tree_ref(ctx, node, indent):
     var_name = ctx.declare_var(
         snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
         "String")
-    player_temp = ctx.new_temp("ap")
-    ctx.add_line(indent, f"var {player_temp} := {player}")
+    # -- 播放器引用必须是**成员变量**,不能是局部变量(踩过的坑)------
+    # 状态判断跑在 _physics_process 里,而 _ready 里也用它。
+    # 用 new_temp()(局部变量)会炸:
+    #     Identifier "_ap1" not declared in the current scope
+    # 实测用户导出后报了这个错。
+    #
+    # 而且只在 _ready 里赋值一次就够了(它不会变),
+    # 所以赋值语句只在 _ready 那次执行时生成,避免每个物理帧都查一遍。
+    player_temp = ctx.member_temp("ap")
+    if not getattr(ctx, "_anim_player_assigned", False):
+        ctx._anim_player_assigned = True
+        # 用 `=` 不用 `:=`:成员变量已经在类顶部声明过 `var _ap0 = null`,
+        # 再写 `var _ap0 := ...` 就是**同一作用域里重复声明**,
+        # Godot 会报 "There is already a variable named ..."。
+        ctx.add_line(indent, f"{player_temp} = {player}")
     def _name_of(state):
         fn = getattr(state, "resolved_state_name", None)
         if fn is not None:
@@ -3747,6 +3787,17 @@ class Generator:
             out.append("# ---- 信号 ----")
             for name in ctx.signals:
                 out.append(f"signal {name}")
+            out.append("")
+
+        # -- 跨函数共享的成员变量 ----------------------------------
+        # 见 member_temp 的说明:这些值在 _ready() 里赋值、
+        # 在 _physics_process() 里用,必须是成员变量。
+        # 先声明成 null,_ready() 里再赋真值 -- 这样即使某个函数
+        # 先被调用也只是拿到 null,而不是"标识符未声明"的编译错误。
+        if ctx.member_vars:
+            out.append("# ---- 跨函数共享的引用(在 _ready 里赋值) ----")
+            for name in ctx.member_vars:
+                out.append(f"var {name} = null")
             out.append("")
 
         # 屏幕滤镜的着色器源码作为常量放在脚本开头。

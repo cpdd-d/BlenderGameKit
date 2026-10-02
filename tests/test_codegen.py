@@ -2814,19 +2814,27 @@ class TestAnimLocomotion(Base):
         否则跳起来时会被判成"在移动",走跑切换就乱了。
         """
         code, _ = self._build(["在移动"])
-        line = next(ln for ln in code.splitlines() if "_speed: float" in ln)
+        self.assertIn("velocity.x", code)
+        self.assertIn("velocity.z", code)
+        # 速度表达式里**不能**出现 velocity.y(竖直分量另有用途)
+        line = next(ln for ln in code.splitlines() if ">" in ln
+                    and "velocity" in ln)
         self.assertIn("velocity.x", line)
-        self.assertIn("velocity.z", line)
         self.assertNotIn("velocity.y", line)
 
-    def test_intermediate_vars_generated_once(self):
-        """8 个输出共用那 4 行中间变量,不能每个输出重算一遍。
+    def test_expressions_are_inlined_not_locals(self):
+        """不许生成 `var _lk...` 局部变量。
 
-        `expression_for_output` 是按输出引脚分别调用的,
-        不缓存的话同样的 4 行会被生成 8 遍。
+        踩过的坑:第一版生成了 4 行中间变量,结果导出的代码报
+            Identifier "_lk2_speed" not declared in the current scope
+        —— 表达式在 `_ready()` 的局部作用域里求值,却被
+        `_physics_process` 里的状态判断引用,跨函数了。
+
+        现在全部内联,所以生成结果里**一个 `_lk` 局部变量都不该有**。
         """
         code, _ = self._build(["在地面", "在移动", "已离地", "在下落"])
-        self.assertEqual(code.count("is_on_floor()"), 1)
+        self.assertNotIn("_lk", code, "不该再有 _lk 中间变量")
+        self.assertNotIn("var _lk", code)
 
     def test_2d_uses_vector2_x_only(self):
         tree = make_tree()
@@ -2840,6 +2848,85 @@ class TestAnimLocomotion(Base):
         code, _ = gen(tree, V2)
         self.assertIn("velocity.x, 0.0", code)
         self.assertNotIn("velocity.z", code)
+
+
+class TestAnimTreeScope(Base):
+    """动画树生成的代码**跨函数**时不能有作用域错误。
+
+    用户实测导出后 Godot 报:
+        Function "is_on_floor()" not found in base self.
+        Identifier "_ap1" not declared in the current scope.   (x2)
+
+    根因:`_ready()` 里声明的**局部**变量被 `_physics_process()` 引用。
+    """
+
+    def _build(self, base_class="CharacterBody3D"):
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        card = anim.new_node(NN.GKNodeAnimTransition, "切")
+        card.gk_to_state = "跑步"
+        card.gk_is_default = True
+        gk_stub.connect(anim, loco, "地面且移动", card, "条件")
+
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[anim]))
+        try:
+            return gen(tree, {"dimension": "3", "base_class": base_class})
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def test_player_is_a_member_not_a_local(self):
+        """播放器引用必须是**成员变量**。
+
+        局部变量在 `_physics_process` 里就是
+        `Identifier "_ap1" not declared in the current scope`。
+        """
+        code, _ = self._build()
+        self.assertIn("var _ap0 = null", code, "成员变量没声明")
+        # `_ready` 里是**赋值**,不能再写 `var`(同作用域重复声明)
+        self.assertNotIn("var _ap0 :=", code)
+        self.assertIn("_ap0 = _gk_find_animation_player(self)", code)
+
+    def test_no_local_intermediate_vars_from_locomotion(self):
+        """移动状态不许生成局部中间变量 —— 它们会被跨函数引用。"""
+        code, _ = self._build()
+        self.assertNotIn("_lk", code)
+
+    def test_tunables_declared_once_per_node(self):
+        """同一个节点的同一个输入只能声明一个 @export。
+
+        多输出节点按引脚求值会被调用 8 次,不缓存就会生成
+        `move_threshold` / `move_threshold_2` 两份 ——
+        用户在检查器里改第一个,生效的却是第二个。
+        """
+        code, _ = self._build()
+        self.assertIn("move_threshold", code)
+        self.assertNotIn("move_threshold_2", code)
+        self.assertNotIn("run_threshold_2", code)
+
+    def test_locomotion_inlined_uses_target_method(self):
+        """`is_on_floor()` 是 CharacterBody3D 的方法 —— 目标节点得对。"""
+        code, _ = self._build()
+        self.assertIn("self.is_on_floor()", code)
+
+
+def bpy_module():
+    import bpy
+    return bpy
 
 
 def nn_base_statement():
