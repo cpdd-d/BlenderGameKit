@@ -789,14 +789,26 @@ class GK_OT_PickAnimName(bpy.types.Operator):
     def invoke(self, context, event):
         if self.choice:
             return self.execute(context)
-        return context.window_manager.invoke_search_popup(self)
+        context.window_manager.invoke_search_popup(self)
+        # ── 必须显式返回一个集合(踩过的坑)──────────────────────────
+        # 用户报:
+        #     RuntimeError: class GK_OT_pick_anim_name, function invoke:
+        #     incompatible return value, Function.result expected a set,
+        #     not a NoneType
+        # 因为 `invoke_search_popup()` 自己**返回 None** ——
+        # 直接把它的返回值当结果返回,Blender 就不认了。
+        # 搜索弹窗是**异步**的:这里只负责把它弹出来,用户点选之后
+        # 会再走一次 execute()。所以这里返回 RUNNING_MODAL。
+        return {"RUNNING_MODAL"}
 
     def execute(self, context):
         if not self.choice:
+            # 同样不能返回 None —— 任何路径都必须给出集合
             return {"CANCELLED"}
         tree = props.current_tree(context)
         node = tree.nodes.get(self.node_name) if tree else None
         if node is None or not hasattr(node, "gk_anim_name"):
+            self.report({"WARNING"}, "没找到目标节点,动画名没写进去")
             return {"CANCELLED"}
         node.gk_anim_name = self.choice
         self.report({"INFO"}, f"动画名 -> {self.choice}")

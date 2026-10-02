@@ -619,7 +619,12 @@ class GKNodePlayAnim(B.GKStatementNode):
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         row.prop(self, "gk_anim_name", text="")
-        row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
+        # ── 必须显式告诉算子"操作的是哪个节点" ──────────────────────
+        # `row.operator(...)` 只负责画按钮,**不会**自动把当前节点传过去。
+        # 算子里的 `draw()` 靠 `node_name` 反查节点、分析动作归属,
+        # 不传的话它拿不到节点,列表里就只有光秃秃的动作名(没有 ★)。
+        picker = row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
+        picker.node_name = self.name
         row.prop(self, "gk_speed", text="")
 
     def draw_buttons_ext(self, context, layout):
