@@ -844,6 +844,46 @@ class GKNodeAnimState(B.GKStatementNode):
 
 
 @N
+class GKNodeAnimLocomotion(B.GKExpressionNode):
+    bl_idname = "GKNodeAnimLocomotion"
+    bl_label = "动画判断_移动状态"
+    bl_icon = "ORIENTATION_GLOBAL"
+    gk_category = "动画系统"
+    gk_tree_type = "GKAnimationTree"
+    gk_doc = (
+        "把动画切换最常用的判断一次给你 —— 不用为每个条件单独拉节点。"
+        "输出全是布尔,直接接到状态节点的『条件』引脚:"
+        "『在地面』『在移动』『在地面且在移动』『已离地』『在上升』"
+        "『在下落』『速度快』『速度慢』。"
+        "『速度阈值』用来区分走和跑")
+    gk_inputs = (
+        target_pin("角色"),
+    )
+    gk_prop_defs = (
+        ("gk_target", "node", TARGET_SELF, "角色", "要判断的节点"),
+        ("gk_speed_threshold", "float", 0.1, "速度阈值",
+         "『在移动』和『速度快』用的门槛"),
+        ("gk_fast_threshold", "float", 3.0, "跑的速度阈值",
+         "『速度快』用的门槛(比上面那个高)"),
+    )
+    gk_outputs = (
+        S.pin(BOOL, "在地面", False),
+        S.pin(BOOL, "在移动", False),
+        S.pin(BOOL, "地面且移动", False),
+        S.pin(BOOL, "已离地", False),
+        S.pin(BOOL, "在上升", False),
+        S.pin(BOOL, "在下落", False),
+        S.pin(BOOL, "速度快", False),
+        S.pin(BOOL, "速度慢", False),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_speed_threshold", text="移动")
+        row.prop(self, "gk_fast_threshold", text="跑")
+
+
+@N
 class GKNodeAnimStateMachineRef(B.GKStatementNode):
     bl_idname = "GKNodeAnimStateMachineRef"
     bl_label = "动画_状态机"
@@ -901,18 +941,19 @@ class GKNodeAnimStateMachineRef(B.GKStatementNode):
 @N
 class GKNodeAnimStateMachine(B.GKStatementNode):
     bl_idname = "GKNodeAnimStateMachine"
-    bl_label = "动画_状态机"
+    # ── 标签必须和新的引用节点区分开(踩过的坑)────────────────────
+    # 两个节点的标签都叫『动画_状态机』,菜单里**看起来一模一样**,
+    # 用户截图问"这怎么有两个动画状态机"。
+    # 这个是把状态表塞进单节点的旧版,用户已经明确否掉了
+    # ("这也太简陋了吧...后面就密密麻麻的"),所以标上『旧』。
+    bl_label = "动画_状态表(旧)"
     bl_icon = "AUTOMERGE_ON"
-    gk_category = "动画"
-    gk_doc = (
-        "把 idle / run / jump / attack 这些状态的切换收进一个节点,"
-        "不用手拼一堆分支。"
-        "『状态表』一行一条规则,格式:`起始状态 -> 目标状态`;"
-        "节点上会**自动长出一条对应的布尔引脚**,接一个条件上去 —— "
-        "条件为真时就切过去。"
-        "例:`idle -> run` 会生成一个叫『idle→run』的引脚。"
-        "『每帧检查』勾上时每个物理帧都判一次条件,否则只在有输入时判"
-    )
+    # 挪到单独的『动画(旧)』分类,和新的动画树节点彻底分开,
+    # 免得用户在『动画』里又选错。
+    gk_category = "动画(旧)"
+    gk_doc = ("【旧版,建议改用『动画_状态机』+ 独立动画树】"
+              "把状态表直接写在节点里。东西一多节点就糊成一团,"
+              "所以新方案改成了独立的动画树。留着是为了兼容已经用了它的图")
     gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "起始状态", "idle"))
     gk_outputs = (S.pin(FLOW, "完成"),)
     gk_prop_defs = (
@@ -2729,7 +2770,7 @@ ALL_CLASSES = tuple(CLASSES)
 # "添加节点"菜单里的分类排列顺序
 CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "动画系统", "实例", "变量", "信号", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "音效", "存档", "界面",
-                  "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用")
+                  "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用", "动画(旧)")
 
 # ── 二级子分类 ──────────────────────────────────────────────────────────
 # 87 个节点如果只按一级分类铺开，最大的「运算」有 13 项，

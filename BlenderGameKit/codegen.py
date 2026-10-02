@@ -1013,13 +1013,40 @@ def _expr_get_vector(ctx, node):
 
 
 # 多输出表达式的节点:按输出引脚分别求值
+#
+# 两种写法:
+#   * 简单映射:输出名 -> 后缀(挂在 `base` 表达式后面)
+#   * 自定义函数:自己生成代码并返回 {输出名: 表达式}
+#     —— 需要先算中间变量的节点用它(比如"移动状态"要一次算速度、
+#       离地、上升,三个输出共用那几个变量,分开算会重复生成三遍)
 MULTI_OUTPUT = {
     "GKNodeVectorSplit": {"X": ".x", "Y": ".y", "Z": ".z"},
 }
 
+# bl_idname -> 函数(ctx, node) -> {输出引脚名: 表达式} 或 None
+MULTI_OUTPUT_FUNCS = {}
+
+
+def multi_output(bl_idname):
+    """注册一个"自定义多输出"表达式节点。"""
+    def wrapper(func):
+        MULTI_OUTPUT_FUNCS[bl_idname] = func
+        return func
+    return wrapper
+
 
 def expression_for_output(ctx, node, output_name):
-    """带多输出的表达式节点(向量拆分)。"""
+    """带多输出的表达式节点。
+
+    先看有没有**自定义函数**(能生成中间变量、一次算多个输出),
+    再退回简单映射。
+    """
+    custom = MULTI_OUTPUT_FUNCS.get(node.bl_idname)
+    if custom is not None:
+        result = custom(ctx, node)
+        if isinstance(result, dict):
+            return result.get(output_name)
+        return None
     mapping = MULTI_OUTPUT.get(node.bl_idname)
     if not mapping or output_name not in mapping:
         return None
@@ -1417,6 +1444,68 @@ def _stmt_play_anim(ctx, node, indent):
     ctx.add_line(indent + 2,
                  'push_warning("[GK] 动画不存在: %s。这个模型里可用的动画有: %s" % '
                  f"[{name_temp}, {player_temp}.get_animation_list()])")
+
+
+@multi_output("GKNodeAnimLocomotion")
+def _expr_anim_locomotion(ctx, node):
+    """移动相关的一组布尔判断,一次给全。
+
+    ── 为什么要有这个节点 ──────────────────────────────────────────
+    动画切换里 90% 的条件就是那几个:"到地面了吗""在动吗""在往下掉吗"。
+    没有这个节点的话,用户要为每一个条件单独拉一个表达式节点再接引脚,
+    状态一多整张图全是线 —— 那正是用户抱怨的"密密麻麻"。
+
+    ── 每一项是怎么算的(取值都是 Godot 内置属性)────────────────
+      * 在地面 = `is_on_floor()` —— CharacterBody3D 提供
+      * 在移动 = 水平速度长度超过阈值
+      * 已离地 = `not is_on_floor()`
+      * 在上升 / 在下落 = 竖直速度的正负
+      * 速度快 = 超过"跑"的阈值
+
+    水平速度只取 X/Z(3D)或 X(2D)—— 竖直分量不算"移动",
+    否则跳起来时会被判成"在移动",走跑切换就乱了。
+    """
+    target = ctx.target_expr(node)
+    # -- 中间变量只算一次(踩过的坑)----------------------------------
+    # expression_for_output 是按**输出引脚**分别调用的,所以这个函数
+    # 一个节点会被调 8 次(8 个输出各一次)。不做缓存的话,
+    # 4 行中间变量会被重复生成 8 遍 —— 生成的代码又长又白跑。
+    # 这里按节点身份记一份结果,重复调用直接复用。
+    cache = getattr(ctx, "_anim_loco_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._anim_loco_cache = cache
+    key = id(node)
+    if key in cache:
+        return cache[key]
+    # 未连线的数值 -> @export 参数,方便在 Godot 检查器里调手感
+    slow = _tunable_number(ctx, node, "速度阈值", "0.1", "move_threshold")
+    fast = _tunable_number(ctx, node, "跑的速度阈值", "3.0", "run_threshold")
+    temp = ctx.new_temp("lk")
+    if ctx.dim == 2:
+        speed_expr = f"Vector2({target}.velocity.x, 0.0).length()"
+    else:
+        speed_expr = f"Vector2({target}.velocity.x, {target}.velocity.z).length()"
+    ctx.add_line(ctx._expr_indent, f"var {temp}_speed: float = {speed_expr}")
+    ctx.add_line(ctx._expr_indent,
+                 f"var {temp}_ground: bool = {target}.is_on_floor()")
+    ctx.add_line(ctx._expr_indent,
+                 f"var {temp}_moving: bool = {temp}_speed > {slow}")
+    ctx.add_line(ctx._expr_indent,
+                 f"var {temp}_up: bool = {target}.velocity.y > 0.0")
+    # 返回值是个字典,key 就是输出引脚名 —— 上层按引脚名取
+    result = {
+        "在地面": f"({temp}_ground)",
+        "在移动": f"({temp}_moving)",
+        "地面且移动": f"({temp}_ground and {temp}_moving)",
+        "已离地": f"(not {temp}_ground)",
+        "在上升": f"({temp}_up)",
+        "在下落": f"(not {temp}_up)",
+        "速度快": f"({temp}_speed > {fast})",
+        "速度慢": f"({temp}_speed <= {fast})",
+    }
+    cache[key] = result
+    return result
 
 
 @stmt_node("GKNodeAnimStateMachineRef")

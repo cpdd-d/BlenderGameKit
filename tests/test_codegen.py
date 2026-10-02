@@ -2768,6 +2768,79 @@ class TestAnimationStateMachine(Base):
         self.assertEqual(code.count("var anim_state: String"), 1)
 
 
+class TestAnimLocomotion(Base):
+    """『动画判断_移动状态』—— 一次给出动画切换最常用的几个判断。
+
+    用户要的是"从静止到运动的判断连接点(在地面?在移动?在离开地面?
+    在空中,在下落,在上升?…)"。没有这个节点的话,每个条件都要单独拉
+    一个表达式节点再接引脚 —— 状态一多整张图全是线。
+    """
+
+    def _build(self, outputs):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        # 序列默认 3 个出口,输出多于 3 个时要先把出口数调上去
+        seq = tree.new_node(NN.GKNodeSequence, "序列")
+        seq.gk_step_count = max(3, len(outputs))
+        seq.build_sockets()
+        loco = tree.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        gk_stub.connect(tree, event, "执行", seq, "执行")
+        for index, name in enumerate(outputs):
+            branch = tree.new_node(NN.GKNodeBranch, "分支" + name)
+            gk_stub.connect(tree, loco, name, branch, "条件")
+            gk_stub.connect(tree, seq, str(index + 1), branch, "执行")
+        return gen(tree, V3)
+
+    def test_node_declares_all_outputs(self):
+        node = make_tree().new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        names = [s.name for s in node.outputs]
+        for want in ("在地面", "在移动", "地面且移动", "已离地",
+                     "在上升", "在下落", "速度快", "速度慢"):
+            self.assertIn(want, names)
+
+    def test_generates_floor_and_velocity_checks(self):
+        code, warnings = self._build(["在下落", "地面且移动"])
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("is_on_floor()", code)
+        self.assertIn("velocity.x", code)
+        self.assertIn("velocity.z", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_horizontal_speed_excludes_vertical(self):
+        """水平速度不能算上竖直分量。
+
+        否则跳起来时会被判成"在移动",走跑切换就乱了。
+        """
+        code, _ = self._build(["在移动"])
+        line = next(ln for ln in code.splitlines() if "_speed: float" in ln)
+        self.assertIn("velocity.x", line)
+        self.assertIn("velocity.z", line)
+        self.assertNotIn("velocity.y", line)
+
+    def test_intermediate_vars_generated_once(self):
+        """8 个输出共用那 4 行中间变量,不能每个输出重算一遍。
+
+        `expression_for_output` 是按输出引脚分别调用的,
+        不缓存的话同样的 4 行会被生成 8 遍。
+        """
+        code, _ = self._build(["在地面", "在移动", "已离地", "在下落"])
+        self.assertEqual(code.count("is_on_floor()"), 1)
+
+    def test_2d_uses_vector2_x_only(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        seq = tree.new_node(NN.GKNodeSequence, "序列")
+        loco = tree.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        branch = tree.new_node(NN.GKNodeBranch, "分支")
+        gk_stub.connect(tree, event, "执行", seq, "执行")
+        gk_stub.connect(tree, loco, "在移动", branch, "条件")
+        gk_stub.connect(tree, seq, "1", branch, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("velocity.x, 0.0", code)
+        self.assertNotIn("velocity.z", code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode
