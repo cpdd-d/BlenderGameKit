@@ -63,26 +63,51 @@ $checkerBody = @'
 extends Node2D
 
 var _frame := 0
-var _moved := false
+var _landed := false
+var _landed_frame := 0
 
 func _process(_delta: float) -> void:
 	_frame += 1
-	if _frame == 60 and not _moved:
-		_moved = true
-		var player := get_tree().get_first_node_in_group("player")
-		var coin := get_tree().get_first_node_in_group("coin")
-		if player == null or coin == null:
-			print("CHECK=FAILED no player or coin")
+	# ---- Wait until the character ACTUALLY lands (not a fixed frame count) ----
+	# This used to sample at frame 60. The number of frames needed to fall onto
+	# the ground varies with physics tick rate, gravity and platform height, so a
+	# hard-coded frame is fragile: measured y=537 vs the expected ~573, two frames
+	# short of landing, and the whole check failed for no real reason.
+	# Polling until landed (with a timeout) is accurate and frame-rate proof.
+	var player := get_tree().get_first_node_in_group("player")
+	if player == null:
+		if _frame > 300:
+			print("CHECK=FAILED no player")
 			get_tree().quit()
-			return
-		print("LANDED y=", player.global_position.y, " on_floor=", player.is_on_floor())
-		var cam := get_viewport().get_camera_2d()
-		print("CAMERA ", cam.global_position if cam != null else "null")
-		print("BEFORE score=", player.score, " best=", player.best_score)
-		player.global_position = coin.global_position
 		return
-	if _frame == 120:
-		var player := get_tree().get_first_node_in_group("player")
+
+	# Phase 1: not landed yet -- check every frame until it touches the ground.
+	if not _landed:
+		if player.is_on_floor():
+			_landed = true
+			_landed_frame = _frame
+			var coin := get_tree().get_first_node_in_group("coin")
+			if coin == null:
+				print("CHECK=FAILED no coin")
+				get_tree().quit()
+				return
+			print("LANDED y=", player.global_position.y, " on_floor=", player.is_on_floor(), " at_frame=", _frame)
+			var cam := get_viewport().get_camera_2d()
+			print("CAMERA ", cam.global_position if cam != null else "null")
+			print("BEFORE score=", player.score, " best=", player.best_score)
+			# Move the player onto the coin so the pickup actually happens.
+			player.global_position = coin.global_position
+			return
+		if _frame > 300:
+			print("LANDED y=", player.global_position.y, " on_floor=", player.is_on_floor(), " TIMEOUT at_frame=", _frame)
+			print("CHECK=FAILED never landed")
+			get_tree().quit()
+		return
+
+	# Phase 2: landed -- run 60 more frames from the landing moment, then report.
+	# Do NOT use an absolute frame number here (`_frame == 120`): the landing
+	# moment varies, and an absolute number would miss this step as well.
+	if _frame - _landed_frame >= 60:
 		var left := get_tree().get_nodes_in_group("coin").size()
 		var hud := player.get_node_or_null("GKUI/Root/\u5206\u6570")
 		print("AFTER score=", player.score, " best=", player.best_score)
@@ -106,13 +131,22 @@ Set-Content $scene -Value $text -Encoding utf8 -NoNewline
 # ---------- 3. run ----------
 Step "3/3 run in Godot"
 $runLog = & $Godot --path $demo 2>&1 | Out-String
+# Set GK_VERIFY_DEBUG=1 to dump the raw engine output (handy when the checker
+# itself fails to parse -- Godot then prints nothing matching the filters below).
+if ($env:GK_VERIFY_DEBUG) {
+    Write-Output "---- RAW LOG (first 40 lines) ----"
+    ($runLog -split "`n") | Select-Object -First 40 | ForEach-Object { Write-Output $_ }
+    Write-Output "---- RAW LOG END ----"
+}
 ($runLog -split "`n") |
     Where-Object { $_ -match "LANDED|CAMERA|BEFORE|AFTER|COINS_LEFT|HUD=|SAVE_EXISTS|CHECK=" } |
     ForEach-Object { Write-Output $_.Trim() }
 
 # ---------- restore ----------
 Move-Item $backup $scene -Force
-Remove-Item $checker -Force -ErrorAction SilentlyContinue
+if (-not $env:GK_VERIFY_KEEP) {
+    Remove-Item $checker -Force -ErrorAction SilentlyContinue
+}
 Remove-Item (Join-Path $demo "_gk_check.gd.uid") -Force -ErrorAction SilentlyContinue
 
 # ---------- verdict ----------

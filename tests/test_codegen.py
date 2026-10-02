@@ -2115,6 +2115,44 @@ class TestFollowTarget(Base):
         self.assertNotIn("_gk_follow_look = self", code)
 
 
+class TestCameraFollowClock(Base):
+    """相机跟随必须和角色在**同一个时钟**里更新。
+
+    用户实测:把『每秒物理周期数』从 60 改成和刷新率一样,画面抖动就消失了。
+
+    原因:角色移动在 _physics_process(固定步长),相机跟随原来在 _process
+    (跟渲染帧率)。两个时钟不同步时就会差拍,表现为画面一直抖/闪。
+    相机跟着角色走,就必须和角色在同一个时钟里更新。
+    """
+
+    def _tree(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
+        follow = tree.new_node(NN.GKNodeCameraFollow, "相机跟随")
+        gk_stub.connect(tree, ev, "执行", follow, "执行")
+        return tree
+
+    def test_follow_runs_in_physics_process(self):
+        code, _ = gen(self._tree(), V3)
+        physics_at = code.find("func _physics_process(")
+        self.assertGreater(physics_at, 0, "没有生成 _physics_process")
+        assign_at = code.find("_gk_follow_cam = _gk_find_camera")
+        self.assertGreater(assign_at, physics_at,
+                           "相机跟随没有挂在 _physics_process 里")
+
+    def test_2d_follow_also_physics(self):
+        """2D 平台跳跃也一样 —— 两个时钟不同步同样会抖。"""
+        code, _ = gen(self._tree(), V2)
+        physics_at = code.find("func _physics_process(")
+        assign_at = code.find("_gk_follow_cam = _gk_find_camera")
+        self.assertGreater(assign_at, physics_at)
+
+    def test_follow_code_is_valid_shape(self):
+        code, _ = gen(self._tree(), V3)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

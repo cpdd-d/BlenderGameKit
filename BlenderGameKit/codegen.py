@@ -202,6 +202,17 @@ class GenContext:
         # 我们不生成 lambda(类型推断会炸)，而是把整段代码塞进 _process，
         # 由 (变量名, 代码行列表) 描述。值为 None 表示只登记注释。
         self.process_hooks = {}    # 钩子名 -> [代码行, ...]
+        # 物理帧钩子,和 process_hooks 同样的写法,但挂到 _physics_process。
+        #
+        # ── 为什么需要它(用户实测反馈)──────────────────────────────
+        # 角色移动在 _physics_process 里(固定步长),相机跟随原来在
+        # _process 里(跟渲染帧率)。**两个时钟不同步**时相机就会抖:
+        # 用户把『每秒物理周期数』从 60 改成和刷新率一样,闪烁就没了 ——
+        # 正是这个原因。
+        #
+        # 相机跟着角色走,就必须和角色在**同一个时钟**里更新,
+        # 否则两个节拍一差拍,画面就开始抖。
+        self.physics_hooks = {}    # 钩子名 -> [代码行, ...]
         # 只有真的用了"自动找相机"才生成 get_first_camera()，
         # 避免给所有脚本都塞一个用不到的辅助函数。
         self.need_camera_finder = False
@@ -1437,12 +1448,6 @@ def _stmt_camera_follow(ctx, node, indent):
     cam_var = ctx.declare_var("_gk_follow_cam", "Node")
     look_var = ctx.declare_var("_gk_follow_look", "Node")
 
-    # 每帧重新找:只在第一帧找的话，切场景后相机会换，跟随就断了
-    ctx.add_line(indent, f"if {cam_var} == null:")
-    ctx.add_line(indent + 1, f"{cam_var} = {camera}")
-    ctx.add_line(indent, f"{look_var} = {target}")
-    ctx.add_line(indent, f"if {cam_var} != null and {look_var} != null:")
-
     if ctx.dim == 2:
         # 2D:相机就在同一平面上，直接跟到目标位置(+偏移)
         target_vec = (f"{vec_ctor}({look_var}.global_position.x + {offset_x}, "
@@ -1461,23 +1466,38 @@ def _stmt_camera_follow(ctx, node, indent):
         else:
             # 没指定距离:沿用"一开始的相对位置"，只跟着目标平移。
             # 这样"相机在 Blender 里摆在哪儿"就决定了看角色的角度。
-            setup_var = ctx.declare_var("_gk_follow_setup", "bool")
-            delta_var = ctx.declare_var("_gk_follow_delta", vec_ctor)
-            ctx.add_line(indent + 1, f"if not {setup_var}:")
-            ctx.add_line(indent + 2, f"{setup_var} = true")
-            ctx.add_line(indent + 2, f"{delta_var} = {cam_var}.global_position "
-                                     f"- {look_var}.global_position")
-            target_vec = (f"{look_var}.global_position + {delta_var} "
+            target_vec = (f"{look_var}.global_position + _gk_follow_delta "
                           f"+ {vec_ctor}({offset_x}, {offset_y}, 0.0)")
 
+    # ── 跟随逻辑挂到**物理帧**,不挂在 _process(踩过的坑)────────────
+    # 角色移动在 _physics_process 里(固定步长),相机跟随原来在 _process
+    # (跟渲染帧率)—— 两个时钟不同步时相机就会抖。
+    # 用户实测:把『每秒物理周期数』从 60 改成和刷新率一样,闪烁就没了,
+    # 正是这个原因。相机跟着角色走,就必须和角色在**同一个时钟**里更新。
+    #
+    # 顺带一个好处:事件里连没连执行流都不影响 —— 只要图里有『相机_跟随』
+    # 节点,相机就会跟着走。以前必须把它接在『每当_每帧』后面才行。
+    hook_lines = []
+    hook_lines.append(f"if {cam_var} == null:")
+    hook_lines.append(f"    {cam_var} = {camera}")
+    hook_lines.append(f"{look_var} = {target}")
+    hook_lines.append(f"if {cam_var} != null and {look_var} != null:")
+    if ctx.dim != 2 and not (getattr(node, "gk_distance", 0.0) or 0.0):
+        setup_var = ctx.declare_var("_gk_follow_setup", "bool")
+        delta_var = ctx.declare_var("_gk_follow_delta", vec_ctor)
+        hook_lines.append(f"    if not {setup_var}:")
+        hook_lines.append(f"        {setup_var} = true")
+        hook_lines.append(f"        {delta_var} = {cam_var}.global_position "
+                          f"- {look_var}.global_position")
     if smooth > 0.0:
-        # lerp 而不是直接赋值:硬跟随会让画面"抖"，角色一动整个背景平移，
-        # 看久了晕。0.1 左右既跟得上又有缓冲。
-        ctx.add_line(indent + 1, f"{cam_var}.global_position = "
-                                 f"{cam_var}.global_position.lerp({target_vec}, "
-                                 f"{gd_number(smooth)})")
+        hook_lines.append(f"    {cam_var}.global_position = "
+                          f"{cam_var}.global_position.lerp({target_vec}, "
+                          f"{gd_number(smooth)})")
     else:
-        ctx.add_line(indent + 1, f"{cam_var}.global_position = {target_vec}")
+        hook_lines.append(f"    {cam_var}.global_position = {target_vec}")
+    ctx.physics_hooks.setdefault("camera_follow", []).extend(hook_lines)
+    # 事件体里留一行提示,让人知道逻辑在下面的物理帧里
+    ctx.add_line(indent, "# 相机跟随的逻辑在 _physics_process 里(和角色同一个时钟)")
 
 
 @stmt_node("GKNodeSetTimeScale")
@@ -2638,6 +2658,28 @@ class Generator:
                 target_section["lines"].append(f"    # ---- {hook_name} ----")
                 for text in hook_lines:
                     # hook 行自带相对缩进，这里补上函数体的 4 空格
+                    target_section["lines"].append(("    " + text) if text else "")
+
+        # ---- 物理帧行为(相机跟随) ----
+        # 和上面 process_hooks 同样的处理,只是挂到 _physics_process。
+        # 相机必须和角色在**同一个时钟**里更新,否则两个节拍一差拍画面就抖。
+        if self.ctx.physics_hooks:
+            target_section = None
+            for section in sections:
+                if section["signature"] == "func _physics_process(delta: float) -> void:":
+                    target_section = section
+                    break
+            if target_section is None:
+                target_section = {
+                    "signature": "func _physics_process(delta: float) -> void:",
+                    "lines": [],
+                    "empty_body": "    pass",
+                    "separator": True,
+                }
+                sections.append(target_section)
+            for hook_name, hook_lines in self.ctx.physics_hooks.items():
+                target_section["lines"].append(f"    # ---- {hook_name} ----")
+                for text in hook_lines:
                     target_section["lines"].append(("    " + text) if text else "")
 
         # ---- 触屏拖动:需要往 _input(event) 里挂事件累积 ----

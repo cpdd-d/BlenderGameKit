@@ -88,11 +88,7 @@ func _ready() -> void:
 
 func _process(delta: float) -> void:
     var _unused_delta := delta
-    if _gk_follow_cam == null:
-        _gk_follow_cam = _gk_find_camera(self)
-    _gk_follow_look = self
-    if _gk_follow_cam != null and _gk_follow_look != null:
-        _gk_follow_cam.global_position = _gk_follow_cam.global_position.lerp(Vector2(_gk_follow_look.global_position.x + 0.0, _gk_follow_look.global_position.y + 0.0), 0.12)
+    # 相机跟随的逻辑在 _physics_process 里(和角色同一个时钟)
 
 func _physics_process(delta: float) -> void:
     var _unused_delta := delta
@@ -106,6 +102,12 @@ func _physics_process(delta: float) -> void:
         self.scale.x = abs(self.scale.x)
     if (self.is_on_floor() and Input.is_action_just_pressed(ACTION_JUMP)):
         self.velocity.y = -jump_force
+    # ---- camera_follow ----
+    if _gk_follow_cam == null:
+        _gk_follow_cam = _gk_find_camera(self)
+    _gk_follow_look = self
+    if _gk_follow_cam != null and _gk_follow_look != null:
+        _gk_follow_cam.global_position = _gk_follow_cam.global_position.lerp(Vector2(_gk_follow_look.global_position.x + 0.0, _gk_follow_look.global_position.y + 0.0), 0.12)
 
 
 func restart_game() -> void:
