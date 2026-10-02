@@ -17,9 +17,6 @@ const ACTION_MOVE_UP := "move_up"
 const ACTION_MOVE_DOWN := "move_down"
 const ACTION_JUMP := "jump"
 
-# ---- 场景节点引用 ----
-@onready var anim_player: AnimationPlayer = $AnimationPlayer
-
 # ---- 可在检查器里调的参数 ----
 @export var move_speed: float = 240.0  # 移动_按方向 · 速度
 @export var jump_force: float = 520.0  # 移动_跳跃 · 强度
@@ -52,8 +49,22 @@ func _physics_process(delta: float) -> void:
 
 func on_attack_pressed() -> void:
     var _anim2 := "attack"
-    if anim_player.has_animation(_anim2):
-        anim_player.play(_anim2, -1.0, 1.0)
+    if _gk_find_animation_player(self).has_animation(_anim2):
+        _gk_find_animation_player(self).play(_anim2, -1.0, 1.0)
     else:
         push_warning("动画不存在: %s" % _anim2)
     state = "attack"
+
+
+func _gk_find_animation_player(host: Node) -> Node:
+    if host is AnimationPlayer:
+        return host
+    var direct := host.get_node_or_null("AnimationPlayer")
+    if direct is AnimationPlayer:
+        return direct
+    for found in host.find_children("*", "AnimationPlayer", true, false):
+        return found
+    if host.get_tree() != null:
+        for found in host.get_tree().root.find_children("*", "AnimationPlayer", true, false):
+            return found
+    return null

@@ -2401,15 +2401,33 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
     if scene is None or not roots:
         return None, False, "没有可导出的角色物体"
 
-    # 收集:根 + 全部后代网格
+    # 收集:根 + 全部后代 + **蒙皮用的骨架**
+    #
+    # ── 为什么必须带上骨架(实测踩过)────────────────────────────────
+    # 骨架在 Blender 里通常是网格的**兄弟**(两者同级,网格挂一个
+    # Armature 修改器指过去),而不是网格的子级。只收"根 + 后代"的话,
+    # 骨架会被漏掉 —— 导出的角色 glb 里 `skins: 0`、`animations: []`,
+    # 动画全留在了世界 glb 里,角色身上根本播不了。
+    #
+    # 实测症状:Body.glb 里 animations=[] / skins=0,而 World.glb 里
+    # animations=['RigAction'] / skins=1 —— 骨骼和角色分家了。
     wanted = set()
     stack = [obj for obj in roots if obj is not None]
+    seen = set()
     while stack:
         obj = stack.pop()
-        if obj in wanted:
+        if obj in seen:
             continue
+        seen.add(obj)
         wanted.add(obj)
         stack.extend(obj.children)
+        # 蒙皮骨架:网格身上的 Armature 修改器指向谁,就把谁拉进来
+        for mod in getattr(obj, "modifiers", ()) or ():
+            if getattr(mod, "type", "") == "ARMATURE" and getattr(mod, "object", None):
+                stack.append(mod.object)
+        # 骨架本身也要算:如果入口物体就是个骨架
+        if getattr(obj, "type", "") == "ARMATURE":
+            stack.extend(obj.children)
 
     previous = [obj for obj in scene.objects if obj.select_get()]
     for obj in scene.objects:

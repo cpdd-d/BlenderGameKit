@@ -216,6 +216,8 @@ class GenContext:
         # 只有真的用了"自动找相机"才生成 get_first_camera()，
         # 避免给所有脚本都塞一个用不到的辅助函数。
         self.need_camera_finder = False
+        # 只有真的用了动画节点才生成 _gk_find_animation_player()
+        self.need_anim_finder = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
         self.need_save_helpers = False
         # 只有真的用了界面节点才生成 UI 容器辅助函数
@@ -648,7 +650,20 @@ class GenContext:
     def animation_player(self, node):
         raw = (getattr(node, "gk_player", "") or "").strip()
         if not raw or raw == TARGET_SELF:
-            return self.add_onready("anim_player", "$AnimationPlayer")
+            # ── 不能写成 `$AnimationPlayer`(踩过的坑)──────────────────
+            # glTF 导入时,AnimationPlayer 会被放在**模型实例内部**:
+            #     Hero [CharacterBody3D]        <- 脚本在这里
+            #       Model [Node3D]
+            #         Rig / Skeleton3D / 网格
+            #         AnimationPlayer           <- 动画在这儿,深了一层
+            # 实测:写 `$AnimationPlayer` 会报
+            #     Node not found: AnimationPlayer (relative to /root/Hero)
+            # 整个脚本连 _ready 都跑不起来。
+            #
+            # 和相机一样,交给一个**运行时查找**函数:填错只是退回自动模式,
+            # 不会把脚本搞崩。
+            self.need_anim_finder = True
+            return "_gk_find_animation_player(self)"
         return self.target_expr(node, "gk_player", hint="anim")
 
     # ---- 内部 ----
@@ -1271,6 +1286,94 @@ def _stmt_set_state(ctx, node, indent):
     var_name = ctx.declare_var(getattr(node, "gk_var", "state"), "String")
     state = ctx.input_string(node, "状态", "idle")
     ctx.add_line(indent, f"{var_name} = {state}")
+
+
+# ==========================================================================
+# 动画:其余常用操作
+# ==========================================================================
+@expr_node("GKNodeAnimPlaying")
+def _expr_anim_playing(ctx, node):
+    """某个动画片段是否正在播放。
+
+    Godot 的 AnimationPlayer 只有 `is_playing()`(当前有没有在播)和
+    `current_animation`(当前播的是谁),没有"某个片段是否在播"。
+    所以这里组合判断:留空动画名 = 只看 is_playing;
+    填了名字 = 还要当前播的就是它。
+    """
+    player = ctx.animation_player(node)
+    name = (getattr(node, "gk_anim_name", "") or "").strip()
+    temp = ctx.new_temp("ap")
+    ctx.add_line(ctx._expr_indent, f"var {temp} := {player}")
+    if not name:
+        return f"({temp} != null and {temp}.is_playing())"
+    return (f"({temp} != null and {temp}.is_playing() "
+            f"and {temp}.current_animation == {gd_string(name)})")
+
+
+@stmt_node("GKNodeAnimPause")
+def _stmt_anim_pause(ctx, node, indent):
+    """暂停 / 继续当前动画。
+
+    ── API 是实测出来的,不是猜的(踩过的坑)────────────────────────
+    Godot 4.7 的 `AnimationPlayer` **没有 `paused` 属性** ——
+    写了会报 "Invalid assignment of property 'paused'"。
+    真实可用的是:
+        pause()                 暂停(停在当前位置)
+        play(name)              从当前位置继续(不再传名字就得重播)
+        active / set_active()   开关整个播放器
+
+    所以这里:
+      * 暂停 -> `pause()`(位置保持不变)
+      * 继续 -> 用 `current_animation` 重新 `play()`,从当前位置接着放
+        (不能用 stop(),那会回到静止姿势)
+    """
+    player = ctx.animation_player(node)
+    temp = ctx.new_temp("ap")
+    pos_var = ctx.declare_var("_gk_anim_pause_pos", "float")
+    ctx.add_line(indent, f"var {temp} := {player}")
+    ctx.add_line(indent, f"if {temp} != null:")
+    if getattr(node, "gk_paused", True):
+        # 记下当前位置 —— 恢复时要 seek 回来
+        ctx.add_line(indent + 1, f"{pos_var} = {temp}.current_animation_position")
+        ctx.add_line(indent + 1, f"{temp}.pause()")
+    else:
+        # 恢复:`play()` 会把动画**从头开始**,所以要用 seek 回到暂停时的位置。
+        # (实测:只调 play() 不 seek,动画会跳回开头)
+        ctx.add_line(indent + 1, f"if not {temp}.current_animation.is_empty():")
+        ctx.add_line(indent + 2, f"{temp}.play({temp}.current_animation)")
+        ctx.add_line(indent + 2, f"{temp}.seek({pos_var}, true)")
+
+
+@stmt_node("GKNodeAnimStop")
+def _stmt_anim_stop(ctx, node, indent):
+    player = ctx.animation_player(node)
+    temp = ctx.new_temp("ap")
+    ctx.add_line(indent, f"var {temp} := {player}")
+    ctx.add_line(indent, f"if {temp} != null:")
+    ctx.add_line(indent + 1, f"{temp}.stop()")
+
+
+@stmt_node("GKNodeAnimSetSpeed")
+def _stmt_anim_set_speed(ctx, node, indent):
+    player = ctx.animation_player(node)
+    speed = _tunable_number(ctx, node, "速度", "1.0", "anim_speed")
+    temp = ctx.new_temp("ap")
+    ctx.add_line(indent, f"var {temp} := {player}")
+    ctx.add_line(indent, f"if {temp} != null:")
+    ctx.add_line(indent + 1, f"{temp}.speed_scale = {speed}")
+
+
+@expr_node("GKNodeAnimLength")
+def _expr_anim_length(ctx, node):
+    """动画片段时长(秒)。名字不存在时返回 0,不是崩溃。"""
+    player = ctx.animation_player(node)
+    name = ctx.input_string(node, "动画名", "idle")
+    ap_temp = ctx.new_temp("ap")
+    name_temp = ctx.new_temp("anim")
+    ctx.add_line(ctx._expr_indent, f"var {ap_temp} := {player}")
+    ctx.add_line(ctx._expr_indent, f"var {name_temp} := {name}")
+    return (f"(0.0 if ({ap_temp} == null or not {ap_temp}.has_animation({name_temp})) "
+            f"else {ap_temp}.get_animation({name_temp}).length)")
 
 
 @stmt_node("GKNodeSpawn")
@@ -2726,6 +2829,31 @@ class Generator:
                 sections.append(target_section)
             for func_name, reset in self.ctx._input_handlers:
                 target_section["lines"].append(f"    {func_name}(event)")
+
+        # ---- 自动找动画播放器的小工具 ----
+        # glTF 导入时 AnimationPlayer 藏在模型实例内部(见 animation_player
+        # 的说明),所以不能写死路径,得运行时找。
+        if self.ctx.need_anim_finder:
+            sections.append({
+                "signature": "func _gk_find_animation_player(host: Node) -> Node:",
+                "lines": [
+                    # 先看自己身上有没有(把 AnimationPlayer 直接放在脚本节点下也能用)
+                    "    if host is AnimationPlayer:",
+                    "        return host",
+                    '    var direct := host.get_node_or_null("AnimationPlayer")',
+                    "    if direct is AnimationPlayer:",
+                    "        return direct",
+                    # 再全场景递归找:glTF 的 AnimationPlayer 在 Model/ 下面
+                    '    for found in host.find_children("*", "AnimationPlayer", true, false):',
+                    "        return found",
+                    "    if host.get_tree() != null:",
+                    '        for found in host.get_tree().root.find_children("*", "AnimationPlayer", true, false):',
+                    "            return found",
+                    "    return null",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
 
         # ---- 自动找相机的小工具 ----
         if self.ctx.need_camera_finder:

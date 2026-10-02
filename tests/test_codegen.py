@@ -363,13 +363,21 @@ class TestTargets(Base):
         self.assertIn("$Player", code)
 
     def test_animation_player_default(self):
+        """留空时用**运行时查找**,不能写死 `$AnimationPlayer`。
+
+        实测踩过:glTF 导入时 AnimationPlayer 藏在模型实例内部
+        (Hero/Model/AnimationPlayer),而脚本挂在 Hero 上 ——
+        `$AnimationPlayer` 是相对脚本节点的路径,必然找不到,
+        Godot 报 "Node not found: AnimationPlayer" 后整个脚本都不跑。
+        """
         tree = make_tree()
         event = tree.new_node(NN.GKNodeOnReady, "启动")
         play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="run", gk_player="")
         gk_stub.connect(tree, event, "执行", play, "执行")
         code, warnings = gen(tree, V2)
         self.assertEqual(warnings, [], warnings)
-        self.assertIn("$AnimationPlayer", code)
+        self.assertIn("_gk_find_animation_player(self)", code)
+        self.assertNotIn("$AnimationPlayer", code)
         self.assertIn("has_animation(", code)
         self.assertIn('"run"', code)
 
@@ -2204,6 +2212,102 @@ class TestMoveAxes(Base):
         code, _ = gen(self._tree(axis_h="Z", axis_v="Y", sign="POS"), V2)
         self.assertNotIn("velocity.z", code)
         self.assertIn("velocity.x", code)
+
+
+class TestAnimationNodes(Base):
+    """动画节点的生成代码。
+
+    实测(建骨架 -> 导出 -> Godot 真跑)确认的几件事:
+      * glTF 导入时 AnimationPlayer 在**模型实例内部**
+        (Hero/Model/AnimationPlayer),所以不能写 `$AnimationPlayer`
+      * Godot 4.7 的 AnimationPlayer **没有 paused 属性**
+      * `pause()` 之后再 `play(同名)` 能从暂停处继续
+    """
+
+    def _ready_chain(self, nodes):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnReady, "准备")
+        prev = ev
+        prev_pin = "执行"
+        for cls, attrs in nodes:
+            n = tree.new_node(cls, cls.bl_label)
+            for k, v in attrs.items():
+                setattr(n, k, v)
+            gk_stub.connect(tree, prev, prev_pin, n, "执行")
+            prev = n
+            prev_pin = "完成"
+        return tree
+
+    def test_anim_finder_is_generated(self):
+        tree = self._ready_chain([(NN.GKNodePlayAnim, {"gk_anim_name": "run"})])
+        code, _ = gen(tree, V3)
+        self.assertIn("func _gk_find_animation_player(host: Node) -> Node:", code)
+        self.assertNotIn("$AnimationPlayer", code)
+
+    def test_play_guards_against_missing_clip(self):
+        tree = self._ready_chain([(NN.GKNodePlayAnim, {"gk_anim_name": "run"})])
+        code, _ = gen(tree, V3)
+        self.assertIn("has_animation(", code)
+        self.assertIn(".play(", code)
+
+    def test_pause_uses_pause_not_paused_property(self):
+        """Godot 4.7 的 AnimationPlayer 没有 paused 属性,写它会报错。"""
+        tree = self._ready_chain([(NN.GKNodeAnimPause, {"gk_paused": True})])
+        code, _ = gen(tree, V3)
+        self.assertIn(".pause()", code)
+        self.assertNotIn(".paused = ", code)
+
+    def test_resume_plays_and_seeks_back(self):
+        """恢复要用 play + seek —— play() 会把动画从头放。"""
+        tree = self._ready_chain([(NN.GKNodeAnimPause, {"gk_paused": False})])
+        code, _ = gen(tree, V3)
+        self.assertIn(".play(", code)
+        self.assertIn(".seek(", code)
+
+    def test_stop(self):
+        tree = self._ready_chain([(NN.GKNodeAnimStop, {})])
+        code, _ = gen(tree, V3)
+        self.assertIn(".stop()", code)
+
+    def test_set_speed(self):
+        tree = self._ready_chain([(NN.GKNodeAnimSetSpeed, {"gk_speed": 2.0})])
+        code, _ = gen(tree, V3)
+        self.assertIn("speed_scale", code)
+
+    def test_anim_playing_query(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnReady, "准备")
+        query = tree.new_node(NN.GKNodeAnimPlaying, "是否在播")
+        query.gk_anim_name = "idle"
+        branch = tree.new_node(NN.GKNodeBranch, "分支")
+        gk_stub.connect(tree, query, "在播", branch, "条件")
+        gk_stub.connect(tree, ev, "执行", branch, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("is_playing()", code)
+        self.assertIn('current_animation == "idle"', code)
+
+    def test_anim_length_is_safe(self):
+        """时长查询:动画不存在时返回 0,不能崩。"""
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnReady, "准备")
+        length = tree.new_node(NN.GKNodeAnimLength, "时长")
+        length.gk_anim_name = "run"
+        branch = tree.new_node(NN.GKNodeBranch, "分支")
+        gk_stub.connect(tree, length, "秒", branch, "条件")
+        gk_stub.connect(tree, ev, "执行", branch, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("has_animation(", code)
+        self.assertIn(".length", code)
+
+    def test_animation_nodes_have_no_chinese_identifiers(self):
+        tree = self._ready_chain([
+            (NN.GKNodePlayAnim, {"gk_anim_name": "run"}),
+            (NN.GKNodeAnimSetSpeed, {"gk_speed": 1.5}),
+            (NN.GKNodeAnimStop, {}),
+        ])
+        code, _ = gen(tree, V3)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
 
 
 def nn_base_statement():

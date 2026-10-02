@@ -378,7 +378,9 @@ class GKNodePlayAnim(B.GKStatementNode):
     bl_label = "动画_播放"
     bl_icon = "PLAY"
     gk_category = "动画"
-    gk_doc = "播放 AnimationPlayer 里的动画片段"
+    gk_doc = ("播放动画片段(对应 AnimationPlayer.play)。"
+              "『动画播放器』留空 = 自动找:glTF 导入时 AnimationPlayer 藏在"
+              "模型实例内部,自动找会自动把它挖出来,不用你填路径")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "动画名", "idle"),
@@ -386,7 +388,11 @@ class GKNodePlayAnim(B.GKStatementNode):
     )
     gk_input_props = {"动画名": "gk_anim_name", "动画播放器": "gk_player"}
     gk_prop_defs = (
-        ("gk_player", "node", "AnimationPlayer", "动画播放器", "留空则用 $AnimationPlayer"),
+        # 默认必须是**空**(=自动查找)。以前默认写的是字面量 "AnimationPlayer",
+        # 于是生成 `$AnimationPlayer` —— 那是个相对路径,而 glTF 导入时
+        # AnimationPlayer 在 Model/ 下面,路径必然找不到,脚本直接崩。
+        ("gk_player", "node", "", "动画播放器",
+         "留空 = 自动查找(推荐);也可以填场景里的节点名"),
         ("gk_anim_name", "string", "idle", "动画名", "未连线时的动画片段名"),
         ("gk_speed", "float", 1.0, "播放速度", "1.0 为原速"),
     )
@@ -397,8 +403,102 @@ class GKNodePlayAnim(B.GKStatementNode):
         row.prop(self, "gk_speed", text="")
 
     def draw_buttons_ext(self, context, layout):
-        layout.label(text="动画播放器 @onready 引用:")
+        layout.label(text="动画播放器:留空 = 自动查找(推荐)")
         B.draw_target_picker(self, layout, "gk_player")
+
+
+# ── 动画的其余常用操作 ──────────────────────────────────────────────
+# 用户原话:"怎么测试骨骼和动画,这两个比较重要"。
+# 实测(建了带骨架的角色,导出到 Godot 真跑)确认整条链路是通的:
+#     Body.glb 里 animations=['RigAction'] skins=1
+#     Godot 导入后 Hero/Model/AnimationPlayer,骨骼数=2,播放位置在推进,
+#     骨骼旋转逐帧变化 —— 动画真的在驱动骨骼。
+# 但当时节点图里只有『播放』和『切换状态』两个节点,做个游戏根本不够用,
+# 所以把最常用的几个补齐。
+@N
+class GKNodeAnimPlaying(B.GKExpressionNode):
+    bl_idname = "GKNodeAnimPlaying"
+    bl_label = "动画_是否在播"
+    bl_icon = "TIME"
+    gk_category = "动画"
+    gk_doc = ("某个动画片段是否正在播放(对应 AnimationPlayer.is_playing 组合"
+              "current_animation)。留空动画名 = 只要有动画在播就算真")
+    gk_prop_defs = (
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        ("gk_anim_name", "string", "", "动画名", "留空 = 任意动画"),
+    )
+    gk_outputs = (S.pin(BOOL, "在播", False),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_anim_name", text="")
+
+
+@N
+class GKNodeAnimPause(B.GKStatementNode):
+    bl_idname = "GKNodeAnimPause"
+    bl_label = "动画_暂停/继续"
+    bl_icon = "PAUSE"
+    gk_category = "动画"
+    gk_doc = ("暂停或继续当前动画。暂停用 AnimationPlayer.pause()"
+              "(停在当前位置,姿势保持不动);继续会从当前位置接着播。"
+              "注:Godot 4.7 的 AnimationPlayer **没有 paused 属性**,"
+              "所以这里用的是 pause() / play()")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        ("gk_paused", "bool", True, "暂停", "勾上=暂停,取消=继续"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+
+@N
+class GKNodeAnimStop(B.GKStatementNode):
+    bl_idname = "GKNodeAnimStop"
+    bl_label = "动画_停止"
+    bl_icon = "CANCEL"
+    gk_category = "动画"
+    gk_doc = "停止播放(对应 AnimationPlayer.stop),角色会回到静止姿势"
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),)
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+
+@N
+class GKNodeAnimSetSpeed(B.GKStatementNode):
+    bl_idname = "GKNodeAnimSetSpeed"
+    bl_label = "动画_设播放速度"
+    bl_icon = "DRIVER"
+    gk_category = "动画"
+    gk_doc = ("改当前动画的播放速度(对应 AnimationPlayer.speed_scale)。"
+              "0.5 = 慢动作,2.0 = 快放")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "速度", 1.0))
+    gk_input_props = {"速度": "gk_speed"}
+    gk_prop_defs = (
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        ("gk_speed", "float", 1.0, "速度", "1.0 为原速"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_speed", text="")
+
+
+@N
+class GKNodeAnimLength(B.GKExpressionNode):
+    bl_idname = "GKNodeAnimLength"
+    bl_label = "动画_时长"
+    bl_icon = "FULLSCREEN_ENTER"
+    gk_category = "动画"
+    gk_doc = ("某个动画片段有多长(秒)。做连招/计时的时候要先知道它多久。"
+              "动画名不存在时返回 0")
+    gk_prop_defs = (
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        ("gk_anim_name", "string", "idle", "动画名", ""),
+    )
+    gk_outputs = (S.pin(FLOAT, "秒", 0.0),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_anim_name", text="")
 
 
 @N
