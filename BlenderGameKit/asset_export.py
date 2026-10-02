@@ -616,12 +616,22 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         stack.extend(obj.children)
 
     skipped = []
+    # ── 临时取消隐藏(同 export_subtree_glb 的说明)────────────────
+    # Blender 的 glTF 导出器**会跳过被隐藏的物体** —— 隐藏的骨架会导致
+    # 蒙皮和骨骼动画整个丢失。这里导完会原样恢复。
+    restore_hidden = []
     for obj in scene.objects:
         if obj.get(PREVIEW_MARK) or obj in excluded:
             skipped.append(obj.name)
             obj.select_set(False)
         else:
-            obj.select_set(not obj.hide_get())
+            try:
+                if obj.hide_get():
+                    obj.hide_set(False)
+                    restore_hidden.append(obj)
+            except Exception:
+                pass
+            obj.select_set(True)
 
     target_dir = os.path.join(export_dir, project.ART_DIR)
     os.makedirs(target_dir, exist_ok=True)
@@ -661,6 +671,12 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
             obj.select_set(obj in previous)
     except Exception:
         pass
+    # 把临时取消的隐藏恢复回去(见上面 restore_hidden 的说明)
+    for obj in restore_hidden:
+        try:
+            obj.hide_set(True)
+        except Exception:
+            pass
 
     if result[1] and skipped:
         return result[0], True, (f"已导出 {os.path.basename(path)}"
@@ -2887,6 +2903,36 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
     wanted = set()
     stack = [obj for obj in roots if obj is not None]
     seen = set()
+    # ── 还要往上收**父级**(踩过的坑)──────────────────────────────────
+    # 用户实测:"可以播放形态键动作,但骨骼动作播放不了"。
+    # 导出后的 glb 里 `skins: 0`,只有一个 mesh 节点,骨架根本不在。
+    #
+    # 他的层级是:
+    #     胡桃-海灯节_arm [ARMATURE]        <- 骨架是**父级**
+    #       胡桃-海灯节_mesh [MESH]         <- 挂载目标是它
+    #
+    # 而这里只做 `stack.extend(obj.children)` —— **只往下走**。
+    # 从 mesh 出发永远收不到它的父级骨架,于是:
+    #   * 没有骨架 -> `skins: 0`,网格失去蒙皮
+    #   * 骨架上的动作(骨骼动作)**导不出去**
+    #   * 形态键动作长在 mesh 自己身上,所以它能播 —— 正好对上症状
+    #
+    # 所以两个方向都要走:向上收父级,向下收子级。
+    up_stack = [obj for obj in roots if obj is not None]
+    seen_up = set()
+    while up_stack:
+        obj = up_stack.pop()
+        if obj in seen_up:
+            continue
+        seen_up.add(obj)
+        wanted.add(obj)
+        parent = getattr(obj, "parent", None)
+        if parent is not None:
+            up_stack.append(parent)
+        # 骨架的**子级**也要收:网格可能不是直接的挂载目标
+        if getattr(obj, "type", "") == "ARMATURE":
+            stack.append(obj)
+
     while stack:
         obj = stack.pop()
         if obj in seen:
@@ -2903,6 +2949,29 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
             stack.extend(obj.children)
 
     previous = [obj for obj in scene.objects if obj.select_get()]
+    # ── 临时取消隐藏"要导出的物体"(踩过的坑)────────────────────────
+    # 用户实测:"可以播放形态键动作,但骨骼动作播放不了"。
+    #
+    # 查下来是 **Blender 的 glTF 导出器会跳过被隐藏的骨架**:
+    # 他的 MMD 骨架在视口里是隐藏的(`hide_get() == True`,
+    # MMD 插件导入时就这样),于是导出结果里
+    #     nodes=1  skins=0  animations=1(只有形态键动作)
+    # 网格属性里连 `JOINTS_0` / `WEIGHTS_0` 都没有 —— 蒙皮整个丢了。
+    #
+    # 手动把骨架 `hide_set(False)` 再导,立刻变成
+    #     nodes=1058  skins=1  animations=2(形态键 + 骨骼)
+    # 文件也从 25.9 MB 降到 13.5 MB。
+    #
+    # 隐藏是**用户为了看清模型**才做的,不该影响导出 ——
+    # 所以这里临时取消隐藏,导完原样恢复。
+    restore_hidden = []
+    for obj in wanted:
+        try:
+            if obj.hide_get():
+                obj.hide_set(False)
+                restore_hidden.append(obj)
+        except Exception:
+            pass
     for obj in scene.objects:
         obj.select_set(obj in wanted and not obj.get(PREVIEW_MARK))
 
@@ -2933,6 +3002,12 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
             obj.select_set(obj in previous)
     except Exception:
         pass
+    # 把临时取消的隐藏恢复回去
+    for obj in restore_hidden:
+        try:
+            obj.hide_set(True)
+        except Exception:
+            pass
     return result
 
 
