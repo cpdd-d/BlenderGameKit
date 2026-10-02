@@ -3174,6 +3174,36 @@ class TestAnimChain(Base):
                         warnings)
 
 
+    def test_animation_nodes_are_visible_in_menu(self):
+        """动画树那三个节点都必须出现在"添加节点"菜单里。
+
+        实测踩过:『动画_状态』因为残留的 `gk_hidden = True` 被菜单
+        静默过滤掉,用户在建状态机时**根本找不到状态节点**。
+        这种"改造节点时忘了清掉上一版标记"的错很难靠肉眼发现,
+        所以用测试钉住。
+        """
+        for bl_idname in ("GKNodeAnimState",
+                          "GKNodeAnimTransition",
+                          "GKNodeAnimLocomotion"):
+            cls = next((c for c in NN.ALL_CLASSES
+                        if c.bl_idname == bl_idname), None)
+            self.assertIsNotNone(cls, f"{bl_idname} 没注册")
+            self.assertFalse(getattr(cls, "gk_hidden", False),
+                             f"{cls.bl_label} 被隐藏了,菜单里看不到")
+
+    def test_animation_menu_lists_all_three(self):
+        """菜单查询也要把三个节点都列出来(不只是类属性对)。"""
+        from BlenderGameKit import properties as props
+        listed = set()
+        for _cat, classes in props.node_menu_entries("GKAnimationTree"):
+            for cls in classes:
+                listed.add(cls.bl_idname)
+        for bl_idname in ("GKNodeAnimState",
+                          "GKNodeAnimTransition",
+                          "GKNodeAnimLocomotion"):
+            self.assertIn(bl_idname, listed, f"{bl_idname} 没进菜单")
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

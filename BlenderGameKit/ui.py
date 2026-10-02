@@ -1172,6 +1172,18 @@ def _draw_context_menu(self, context):
 def on_register():
     """注册后的自检与菜单挂钩。"""
     # ---- 挂菜单 ----
+    #
+    # ── 为什么要"先全部摘干净再挂"(用户实测踩过)──────────────────
+    # 用户截图里右键菜单**出现了两份**:
+    #     搜索节点… / 最近使用 / 动画系统 / 把选中的两个节点连起来
+    #     搜索节点… / 最近使用 / …                    <- 又来一遍
+    #
+    # 原来的写法是 `target.remove(func)` 一次 + `prepend` 一次。
+    # 问题是 `remove` 只摘**一个**引用 —— 如果之前因为
+    # "注册-注销-再注册"或者 Blender 的插件重载累积了多份,
+    # 摘一次剩下的一份还在,再加一份就变成两份/三份。
+    #
+    # 所以改成:**循环摘到摘不动为止**,再挂。
     for target_name, func in (
         ("NODE_MT_add", _draw_add_menu),
         ("NODE_MT_context_menu", _draw_context_menu),
@@ -1181,11 +1193,12 @@ def on_register():
             if target is None:
                 gk_log.warn(f"找不到 {target_name},跳过挂载")
                 continue
-            # 先摘掉再挂,避免重复注册时挂两次(菜单里出现两份)
-            try:
-                target.remove(func)
-            except Exception:
-                pass
+            # 摘到摘不动为止(见上面说明)
+            for _ in range(8):
+                try:
+                    target.remove(func)
+                except Exception:
+                    break
             target.prepend(func)
         except Exception as exc:  # pragma: no cover
             gk_log.error(f"挂载 {target_name} 失败: {exc}")
