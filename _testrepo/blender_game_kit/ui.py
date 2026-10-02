@@ -402,6 +402,27 @@ def _make_subcategory_menu(category, sub_name, classes):
     })
 
 
+def _menu_has_entries(menu_name, context, classes_getter):
+    """这个子菜单在当前树里会不会有内容?
+
+    用来决定**画不画**它。动画树里「常用 / 最近使用」原来是两张空菜单
+    ——它们的候选全是玩法节点,一张都不适用(实测:动画树的右键菜单里
+    这两项点开是空的)。空菜单比没有菜单更让人困惑。
+    """
+    kind = props.current_tree_type(context)
+    try:
+        classes = classes_getter()
+    except Exception:
+        return False
+    for cls in classes:
+        if getattr(cls, "gk_hidden", False):
+            continue
+        if kind is None or getattr(cls, "gk_tree_type",
+                                   "GKGameLogicTree") == kind:
+            return True
+    return False
+
+
 def _make_common_menu():
     """「常用」子菜单:新手起步最需要的十几个节点。"""
 
@@ -414,6 +435,14 @@ def _make_common_menu():
             if active is not None:
                 link_from = active.name
         for cls in props.common_node_classes():
+            # 同 _make_category_menu:按当前树类型过滤,
+            # 不然动画树里点开会是一串必然报错的玩法节点
+            kind = props.current_tree_type(context)
+            if kind is not None and getattr(
+                    cls, "gk_tree_type", "GKGameLogicTree") != kind:
+                continue
+            if getattr(cls, "gk_hidden", False):
+                continue
             op = layout.operator("gk.add_node_menu", text=cls.bl_label)
             op.node_type = cls.bl_idname
             op.link_from = link_from
@@ -1056,8 +1085,11 @@ def _draw_node_menu_contents(layout, context, nested=False):
     row.scale_y = 1.3
     row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
 
-    # 「常用」放第二:新手第一次打开不用翻分类就能起步
-    layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
+    # 「常用」放第二:新手第一次打开不用翻分类就能起步。
+    # 但**当前树里一个常用节点都没有时不画** —— 动画树里它就是空的
+    # (实测:点开是空白菜单,比没有这一项更让人困惑)。
+    if _menu_has_entries("常用", context, props.common_node_classes):
+        layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
 
     # 「最近使用」**始终显示**,哪怕还是空的。
     # 一开始写成"空就不画",结果新用户第一次按 Shift+A 时菜单里没有这一项,
@@ -1102,8 +1134,15 @@ def _draw_add_menu(self, context):
     所以这里只放一个入口,内容收进子菜单。
     右键菜单那边是 flat 形态 —— 一按就到,不用点两层。
     """
-    space = getattr(context, "space_data", None)
-    if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
+    # ── 别写死只认逻辑树(踩过三次的坑)────────────────────────────
+    # 这里以前是 `tree_type != "GKGameLogicTree": return` ——
+    # 于是**动画树里按 Shift+A 整个菜单是空的**(用户实测:
+    # "shift+A那里没有东西")。
+    #
+    # 同一个错误在三个地方犯过:`properties.current_tree()`、
+    # 菜单分类过滤、还有这里。教训:**凡是判断"是不是我们的树",
+    # 一律走 `props.current_tree_type(context)`,不要自己写字符串比较。**
+    if props.current_tree_type(context) is None:
         return
     _draw_node_menu_contents(self.layout, context, nested=True)
 
@@ -1114,8 +1153,8 @@ def _draw_context_menu(self, context):
     蓝图里右键就是"加节点",这里给**完整平铺菜单** —— 不用再点进子菜单。
     放在最前面,这样常用的加节点操作不用去翻 Blender 自带的那一长串。
     """
-    space = getattr(context, "space_data", None)
-    if space is None or getattr(space, "tree_type", "") != "GKGameLogicTree":
+    # 同 _draw_add_menu:两类树都要认(见那里的说明)
+    if props.current_tree_type(context) is None:
         return
     self.layout.separator()
     _draw_node_menu_contents(self.layout, context, nested=False)
