@@ -93,10 +93,20 @@ uniform float use_albedo_texture : hint_range(0.0, 1.0) = 0.0;
 uniform float albedo_strength : hint_range(0.0, 2.0) = 1.0;
 
 group_uniforms light_source;
-// Direction the light comes FROM, in view space (camera space).
-// Default is upper-left-front, the classic anime key light.
-// View space means the shading follows the camera, which is normal for a
-// character-focused cel look and keeps the face readable from any angle.
+// (旧的"视图空间"说明已删除 —— 那样做会让阴影跟着相机转,是错的。
+//  完整说明见下面 light_dir 那一段。)
+// Direction the light comes FROM, in **world space**.
+//
+// ── 为什么必须是世界空间(踩过的坑)────────────────────────────────
+// 一开始这里写的是"视图空间",直接用 fragment() 里现成的 NORMAL/VIEW
+// 去点乘。省事,但**阴影会跟着相机转** —— 用户原话:
+//   "这阴影上有点错误,不像二次元的效果,感觉它是跟着摄像机与视图角度
+//    变化而变化"
+// 完全正确。二次元的阴影是"画"在角色身上的,光和角色是**世界**里的
+// 固定关系,相机转到哪阴影都该在同一个位置。
+// 所以这里收到世界空间,在 fragment() 里把法线也转回世界空间再点乘。
+//
+// 默认值 = 左上前方(经典动画主光)。
 uniform vec3 light_dir = vec3(-0.35, 0.75, 0.55);
 uniform vec4 light_color : source_color = vec4(1.0, 0.98, 0.95, 1.0);
 // Overall brightness. 1.0 is "as authored"; lower it to sit a character into
@@ -181,15 +191,26 @@ void fragment() {
 	// ------------------------------------------------------------------
 	// Cel shading, computed entirely by us (the shader is `unshaded`).
 	//
-	// NORMAL and VIEW arrive in view space, so light_dir is view space too.
+	// ── 一定要在世界空间里点乘(踩过的坑)─────────────────────────
+	// Godot 给 fragment() 的 NORMAL 和 VIEW 都是**视图空间**的。
+	// 一开始图省事直接 `dot(NORMAL, light_dir)`,结果**阴影跟着相机转**:
+	// 转一下视角,脸上的阴影线就跑到别的地方去了。
+	// 但二次元的阴影是"画"在角色身上的 —— 光和角色在世界里的关系是
+	// 固定的,相机转到哪阴影都该在原地。
+	//
+	// 所以:用 INV_VIEW_MATRIX 把法线转回**世界空间**,
+	// 再和世界空间的 light_dir 点乘。
+	//
+	// 高光(镜面)和边缘光仍然用视图空间 —— 那两个**本来**就该随视角变化
+	// (高光跟着相机走是物理正确的,边缘光就是轮廓光)。
 	// ------------------------------------------------------------------
-	vec3 n = normalize(NORMAL);
-	vec3 v = normalize(VIEW);
-	vec3 l = normalize(light_dir);
+	mat3 to_world = mat3(INV_VIEW_MATRIX);
+	vec3 n_world = normalize(to_world * NORMAL);
+	vec3 l_world = normalize(light_dir);
 
 	// A plain dot keeps the terminator crisp, which is the whole point of a
 	// cel look. (A half-lambert wrap would smear it out.)
-	float raw = dot(n, l);
+	float raw = dot(n_world, l_world);
 
 	float lit_factor = gk_band(raw, shadow_step, shadow_smooth);
 	vec3 ramp = gk_ramp(raw);
@@ -232,17 +253,21 @@ void fragment() {
 	SPECULAR = 0.0;
 
 	// --- cel highlight: a hard-edged spot instead of a soft falloff ---------
-	// Fixed half-vector so the highlight stays "drawn on" the surface instead
-	// of swimming as the light moves.
+	// 高光**故意**留在视图空间:高光本来就该跟着相机走(物理上就是
+	// 视线与光线的半程向量),这跟阴影"必须固定在世界里"不矛盾。
 	if (specular_amount > 0.001) {
-		vec3 half_vec = normalize(v + l);
-		float spot = gk_band(dot(n, half_vec), 1.0 - specular_size, specular_smooth);
+		vec3 n_view = normalize(NORMAL);
+		vec3 view_dir = normalize(VIEW);
+		vec3 light_view = normalize(mat3(VIEW_MATRIX) * l_world);
+		vec3 half_vec = normalize(view_dir + light_view);
+		float spot = gk_band(dot(n_view, half_vec), 1.0 - specular_size, specular_smooth);
 		EMISSION += specular_color.rgb * spot * specular_amount;
 	}
 
 	// --- rim light ---------------------------------------------------------
+	// 边缘光同样是**视图空间**(它就是"轮廓"光,随视角变化才是对的)。
 	if (rim_amount > 0.001) {
-		float nv = dot(n, v);
+		float nv = dot(normalize(NORMAL), normalize(VIEW));
 		float rim = 1.0 - smoothstep(rim_width, 1.0, nv);
 		rim = clamp(rim + rim_front * (1.0 - nv), 0.0, 1.0);
 		EMISSION += rim_color.rgb * rim * rim_amount;
