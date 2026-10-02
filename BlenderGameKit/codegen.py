@@ -235,6 +235,9 @@ class GenContext:
         # 动画状态机(『每帧检查』模式)- 整段逻辑挂进 _physics_process
         self.anim_state_machines = []
         self.need_anim_state_process = False
+        # 动画树(独立那张图)驱动的状态机 —— 同样挂 _physics_process
+        self.anim_trees = []
+        self.need_anim_tree_process = False
         # 动画名留空时要生成 _gk_first_animation()(见 _stmt_play_anim)
         self.need_first_animation = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
@@ -1414,6 +1417,113 @@ def _stmt_play_anim(ctx, node, indent):
     ctx.add_line(indent + 2,
                  'push_warning("[GK] 动画不存在: %s。这个模型里可用的动画有: %s" % '
                  f"[{name_temp}, {player_temp}.get_animation_list()])")
+
+
+@stmt_node("GKNodeAnimStateMachineRef")
+def _stmt_anim_tree_ref(ctx, node, indent):
+    """驱动一张**动画树** —— 玩法图和动画图分开放。
+
+    见 nodes.py 里 GKNodeAnimState 那段的说明(用户要求照虚幻 5 的
+    Animation Blueprint 那样拆开,别都堆在一个节点里)。
+    """
+    tree = _find_animation_tree(getattr(node, "gk_tree_name", ""))
+    states = _anim_tree_states(tree) if tree is not None else []
+    if not states:
+        ctx.warn(f"节点『{node.bl_label}』找不到动画树"
+                 f"{'『' + node.gk_tree_name + '』' if node.gk_tree_name else ''}"
+                 f"。先在『游戏动画』面板里建一张,并在里面放几个"
+                 f"『动画状态』节点")
+        return
+
+    player = ctx.animation_player(node)
+    var_name = ctx.declare_var(
+        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
+        "String")
+    player_temp = ctx.new_temp("ap")
+    ctx.add_line(indent, f"var {player_temp} := {player}")
+    default_name = ""
+    for item in states:
+        if bool(getattr(item, "gk_is_default", False)):
+            default_name = str(getattr(item, "gk_state_name", "") or "")
+            break
+    if not default_name:
+        default_name = str(getattr(states[0], "gk_state_name", "") or "")
+    ctx.add_line(indent, f"if {var_name}.is_empty():")
+    ctx.add_line(indent + 1, f"{var_name} = {gd_string(default_name)}")
+
+    if str(getattr(node, "gk_check_mode", "EVERY_FRAME")) == "EVERY_FRAME":
+        # 交给 generate() 统一发射到 _physics_process —— 跟移动同步判定,
+        # 避免"人走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
+        ctx.anim_trees.append({
+            "node": node, "states": states, "var": var_name,
+            "player": player_temp,
+        })
+        ctx.need_anim_tree_process = True
+        return
+    _emit_tree_transitions(ctx, node, indent, states, var_name, player_temp)
+
+
+def _find_animation_tree(name):
+    """按名字找一张动画树;名字为空就用文件里第一张。"""
+    try:
+        import bpy
+    except Exception:
+        return None
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return None
+    wanted = str(name or "")
+    first = None
+    for group in groups:
+        if getattr(group, "bl_idname", "") != "GKAnimationTree":
+            continue
+        if first is None:
+            first = group
+        if wanted and str(getattr(group, "name", "")) == wanted:
+            return group
+    return first if not wanted else None
+
+
+def _anim_tree_states(tree):
+    """取出动画树里的状态节点,按**优先级**排好(小的先判)。"""
+    if tree is None:
+        return []
+    found = []
+    for item in getattr(tree, "nodes", ()) or ():
+        if getattr(item, "bl_idname", "") != "GKNodeAnimState":
+            continue
+        found.append(item)
+    found.sort(key=lambda n: (int(getattr(n, "gk_priority", 0) or 0),
+                              getattr(n, "location", (0.0, 0.0))[1]))
+    return found
+
+
+def _emit_tree_transitions(ctx, node, indent, states, var_name, player_temp):
+    """生成"哪条条件先为真就去哪个状态"的判断链。
+
+    和转移表那版不同:这里条件来自**状态节点的引脚**,
+    所以不需要 `transition_pin_name`,直接读那个叫『条件』的引脚。
+    """
+    for item in states:
+        state_name = str(getattr(item, "gk_state_name", "") or "")
+        if not state_name:
+            continue
+        socket = item.inputs.get("条件")
+        if socket is None or not getattr(socket, "is_linked", False):
+            continue          # 没接条件 = 不会被主动切过去(可能是起始状态)
+        condition = ctx.expr_of(socket)
+        ctx.add_line(indent, f'if {var_name} != {gd_string(state_name)} '
+                             f'and {condition}:')
+        ctx.add_line(indent + 1, f'{var_name} = {gd_string(state_name)}')
+        ctx.add_line(indent + 1, f"if {player_temp} != null and "
+                                 f"{player_temp}.has_animation({gd_string(state_name)}):")
+        ctx.add_line(indent + 2,
+                     f"{player_temp}.play({gd_string(state_name)}, -1.0, 1.0)")
+        ctx.add_line(indent + 1, "else:")
+        ctx.add_line(indent + 2,
+                     f'push_warning("[GK] 状态『{state_name}』没有对应的动画: %s" % '
+                     f"{gd_string(state_name)})")
 
 
 @stmt_node("GKNodeAnimStateMachine")
@@ -3151,7 +3261,7 @@ class Generator:
         # ---- 动画状态机(『每帧检查』模式)的 _physics_process ----
         # 状态切换要跟移动同步判定 —— 放在渲染帧里会出现
         # "人已经走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
-        if self.ctx.need_anim_state_process:
+        if self.ctx.need_anim_state_process or self.ctx.need_anim_tree_process:
             lines = self.ctx.new_section()
             for machine in self.ctx.anim_state_machines:
                 self.ctx._active.clear()
@@ -3159,6 +3269,12 @@ class Generator:
                 _emit_state_transitions(self.ctx, machine["node"], 1,
                                         machine["rules"], machine["var"],
                                         machine["player"])
+            for entry in self.ctx.anim_trees:
+                self.ctx._active.clear()
+                self.ctx._current_event = entry["node"].name
+                _emit_tree_transitions(self.ctx, entry["node"], 1,
+                                       entry["states"], entry["var"],
+                                       entry["player"])
             sections.append({
                 "signature": "func _physics_process(_delta: float) -> void:",
                 "lines": list(lines.lines),

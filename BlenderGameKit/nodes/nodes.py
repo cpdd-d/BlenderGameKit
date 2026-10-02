@@ -716,8 +716,101 @@ class GKNodePlayAnim(B.GKStatementNode):
 
 
 # ==========================================================================
-# 动画状态机
+# 动画系统节点 —— 属于**独立的动画树**(GKAnimationTree)
 # ==========================================================================
+# 用户原话:"这个可以按照虚幻5蓝图的来做,或者建立一个动作系统,像虚幻5
+# 那样,然后就像 upbge 的逻辑砖调用,而不是直接在这来进行,不然,
+# 后面就密密麻麻的(这也是 upbge 的缺点,虚幻5的分开得还好)"
+#
+# 他说得对。第一版把状态机整个塞进一个节点(状态表多行文本 + 一堆动态
+# 引脚),那就是 UPBGE 的老毛病 —— 东西一多节点就糊成一团。
+#
+# 改成照虚幻 5 的 **Animation Blueprint** 那样:
+#
+#     游戏逻辑树(写玩法)          动画树(写动作,独立一张图)
+#     ┌──────────────┐            ┌──────────────────────┐
+#     │ 每当_准备     │            │ [状态: idle]          │
+#     │   动画_状态机 ├──引用─────>│ [状态: run]  条件引脚… │
+#     └──────────────┘            │ [状态: jump]          │
+#                                 └──────────────────────┘
+#
+# 玩法那边只留**一个**引用节点,动作全在另一张图里,两边都清爽。
+#
+# ── 条件怎么表达 ────────────────────────────────────────────────
+# 每个状态节点上有：
+#   * 一个布尔**条件引脚** —— 接表达式节点,为真时切到它
+#   * 一个『优先级』整数 —— 同时为真时谁赢(数字小的先判)
+#   * 一个『目标』布尔 —— 勾上表示这是**起始状态**
+# 转移图就是"哪条条件先为真去哪",不需要单独画线。
+_ANIM_TREE_HINT = (
+    "这个节点属于**动画树**(不是游戏逻辑树)。"
+    "在节点编辑器左上角把类型切到『游戏动画』,或者点『游戏动画』面板里的"
+    "『打开动画树』"
+)
+
+
+@N
+class GKNodeAnimState(B.GKStatementNode):
+    bl_idname = "GKNodeAnimState"
+    bl_label = "动画状态"
+    bl_icon = "POSE_HLT"
+    gk_category = "动画系统"
+    gk_tree_type = "GKAnimationTree"
+    gk_doc = ("一个动画状态。状态名就是动画名。"
+              "把条件接到右边那个布尔引脚上 —— 条件为真就切到这个状态;"
+              "都没接或都为假时停在当前状态。"
+              "『优先级』小的先判(同时为真时用它决定谁赢)")
+    gk_inputs = (
+        S.pin(BOOL, "条件", False),
+    )
+    gk_outputs = ()
+    gk_prop_defs = (
+        ("gk_state_name", "string", "idle", "状态名", "就是动画名"),
+        ("gk_priority", "int", 0, "优先级", "数字小的先判;同时为真时它赢"),
+        ("gk_is_default", "bool", False, "起始状态",
+         "勾上 = 进游戏时的默认状态(整个树里只该勾一个)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_state_name", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_priority", text="优先")
+        row.prop(self, "gk_is_default", text="起始")
+
+
+@N
+class GKNodeAnimStateMachineRef(B.GKStatementNode):
+    bl_idname = "GKNodeAnimStateMachineRef"
+    bl_label = "动画_状态机"
+    bl_icon = "AUTOMERGE_ON"
+    gk_category = "动画"
+    gk_doc = ("驱动一张**动画树**(在『游戏动画』面板里建)。"
+              "动作的切换规则全写在动画树里,这里只负责启动它 —— "
+              "玩法图和动画图分开放,两张图都不会糊成一团。"
+              "『树名』留空 = 用文件里第一张动画树")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "树名", ""),
+        target_pin("动画播放器"),
+    )
+    gk_input_props = {"树名": "gk_tree_name", "动画播放器": "gk_player"}
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_tree_name", "string", "", "树名",
+         "留空 = 用文件里第一张动画树"),
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        ("gk_state_var", "string", "anim_state", "状态变量名",
+         "当前状态存在哪个成员变量里"),
+        ("gk_check_mode", "enum", "EVERY_FRAME", "检查时机",
+         "每个物理帧判一次 / 只在开始时判一次",
+         (("EVERY_FRAME", "每帧检查", "动作连贯,适合走跑切换"),
+          ("ON_ENTER", "只在开始时判", "省性能,适合一次性判定"))),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_tree_name", text="", icon="NODETREE")
+        layout.prop(self, "gk_check_mode", text="")
+
 # 用户要求:"做动画状态机取代手拼分支网" —— 这也是 UPBGE 那套最大的缺陷
 # (它一次只能播一个动画,没有状态机)。
 #
@@ -2569,7 +2662,7 @@ class GKNodeComment(B.GKEventNode):
 ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
-CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "实例", "变量", "信号", "输入",
+CATEGORY_ORDER = ("事件", "流程", "移动", "动画", "动画系统", "实例", "变量", "信号", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "音效", "存档", "界面",
                   "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用")
 

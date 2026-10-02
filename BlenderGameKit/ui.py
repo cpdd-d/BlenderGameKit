@@ -63,6 +63,93 @@ class GKGameLogicTree(bpy.types.NodeTree):
 
 
 # ==========================================================================
+# 动画树 —— 独立的第二张节点图(照虚幻 5 的 Animation Blueprint)
+# ==========================================================================
+# 用户原话:"这个可以按照虚幻5蓝图的来做,或者建立一个动作系统,像虚幻5
+# 那样,然后就像 upbge 的逻辑砖调用,而不是直接在这来进行,不然,
+# 后面就密密麻麻的(这也是 upbge 的缺点,虚幻5的分开得还好)"
+#
+# 说得对。第一版把状态表塞进一个节点,那就是 UPBGE 的老毛病。
+# 现在拆成两张图:
+#
+#     游戏逻辑树(玩法)              动画树(动作)
+#     ┌───────────────┐             ┌──────────────────────┐
+#     │ 每当_准备      │             │ [动画状态: idle] 起始  │
+#     │  动画_状态机  ─┼── 驱动 ────>│ [动画状态: run]  条件─┤
+#     └───────────────┘             │ [动画状态: jump] 条件─┤
+#                                   └──────────────────────┘
+#
+# 玩法图里只留**一个**引用节点,动作规则全在动画树里。
+class GKAnimationTree(bpy.types.NodeTree):
+    """游戏动画节点树:状态和切换规则画在这里,由游戏逻辑里的
+    『动画_状态机』节点驱动。"""
+
+    bl_idname = "GKAnimationTree"
+    bl_label = "游戏动画"
+    bl_icon = "ARMATURE_DATA"
+    bl_description = ("BlenderGameKit 的动画系统节点树 —— "
+                      "动画状态和切换条件写在这里,别和玩法挤在一张图上")
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        layout.label(text="动画状态 + 切换条件", icon="INFO")
+
+
+class GK_OT_OpenAnimTree(bpy.types.Operator):
+    """打开动画树;没有就新建一张。
+
+    为什么要一个按钮:动画树是**另一张节点图**,
+    新手不知道要去节点编辑器的下拉框里切类型 ——
+    用户原话就是"在游戏逻辑下边建立游戏动画系统节点"。
+    """
+
+    bl_idname = "gk.open_anim_tree"
+    bl_label = "打开/新建动画树"
+    bl_description = "切到动画树编辑器(没有就新建一张并放好起始状态)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        trees = [g for g in bpy.data.node_groups
+                 if getattr(g, "bl_idname", "") == "GKAnimationTree"]
+        tree = trees[0] if trees else None
+        if tree is None:
+            tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
+            # 新建时放一个起始状态,免得用户面对一张空图不知道从哪下手
+            state = tree.nodes.new("GKNodeAnimState")
+            state.gk_state_name = "idle"
+            state.gk_is_default = True
+            state.location = (0.0, 0.0)
+            self.report({"INFO"}, f"已新建动画树『{tree.name}』")
+
+        # 把节点编辑器的树切过去
+        space = _node_space(context)
+        if space is not None:
+            space.tree_type = "GKAnimationTree"
+            space.node_tree = tree
+        else:
+            self.report({"WARNING"},
+                        "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+def _node_space(context):
+    """找到当前可用的节点编辑器区域(拿不到就返回 None)。"""
+    window = getattr(context, "window", None)
+    screen = getattr(window, "screen", None) if window else None
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") != "NODE_EDITOR":
+            continue
+        for space in getattr(area, "spaces", ()) or ():
+            return space
+    return None
+
+
+# ==========================================================================
 # 添加节点菜单
 # ==========================================================================
 def _menu_name(category):
@@ -646,6 +733,22 @@ class GK_PT_Main(bpy.types.Panel):
                 col.label(text="还没有事件节点，脚本不会执行任何逻辑", icon="ERROR")
             box.operator("gk.add_node_menu", text="添加节点", icon="ADD")
 
+        # ---- 动画系统(独立那张树)----
+        box = layout.box()
+        box.label(text="动画系统(单独一张图)", icon="ARMATURE_DATA")
+        anim_trees = [g for g in bpy.data.node_groups
+                      if getattr(g, "bl_idname", "") == "GKAnimationTree"]
+        if anim_trees:
+            for tree in anim_trees:
+                count = len([n for n in tree.nodes
+                             if getattr(n, "bl_idname", "") == "GKNodeAnimState"])
+                box.label(text=f"{tree.name}  ({count} 个状态)",
+                          icon="NODETREE")
+        else:
+            box.label(text="还没有动画树", icon="INFO")
+        box.operator("gk.open_anim_tree", text="打开/新建动画树",
+                     icon="FILE_NEW")
+
         # ---- 导出设置 ----
         if settings is not None:
             box = layout.box()
@@ -923,6 +1026,8 @@ COMMON_MENU = _make_common_menu()
 # 所以放在文件末尾附近 —— 放中间的话后面定义的类会漏注册。
 GK_CLASSES = (
     GKGameLogicTree,
+    GKAnimationTree,
+    GK_OT_OpenAnimTree,
     GK_OT_AddNodeMenu,
     GK_OT_FindNode,
     GK_MT_AddNodeCategories,

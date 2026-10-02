@@ -465,11 +465,20 @@ class TestNodeLibrary(unittest.TestCase):
                           f"{cls.bl_label} 的分类 {cls.gk_category} 不在 CATEGORY_ORDER 里")
 
     def test_statement_nodes_have_flow_in(self):
-        """语句节点必须有一个执行输入引脚。"""
+        """语句节点必须有一个执行输入引脚。
+
+        例外:`GKNodeAnimState`(动画状态)—— 它是**动画树**里的节点,
+        不是执行流的一环。它只有"条件"输入,靠条件为真被激活,
+        没有也不需要执行引脚。
+        """
         from BlenderGameKit import gk_sockets as S
         from BlenderGameKit.nodes import node_base as NB
+        # 动画树里的状态节点不参与执行流,单独列出来
+        no_flow = {"GKNodeAnimState"}
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
+                continue
+            if cls.bl_idname in no_flow:
                 continue
             inputs = [spec for spec in cls.gk_inputs if spec["kind"] is S.FLOW]
             self.assertTrue(inputs, f"{cls.bl_label} 缺少执行输入引脚")
