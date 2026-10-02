@@ -30,6 +30,25 @@ uniform sampler2D albedo_texture : source_color, hint_default_white, filter_line
 uniform float use_albedo_texture : hint_range(0.0, 1.0) = 0.0;
 uniform float albedo_strength : hint_range(0.0, 2.0) = 1.0;
 
+group_uniforms exposure;
+// ---------------------------------------------------------------------------
+// Exposure normalisation. **This is what stopped the model from looking white.**
+//
+// The bug: `light()` ends with
+//     DIFFUSE_LIGHT += ramp * ALBEDO * LIGHT_COLOR * shadow_strength;
+// and `LIGHT_COLOR` already carries the light's *energy*. The exported scene
+// writes DirectionalLight3D.light_energy = 4.0 (converted from Blender), so a
+// lit surface received ramp(1.0) * albedo * 4.0 -> 3.9, which is far past
+// white. The texture was loading and sampling perfectly the whole time -- the
+// colours were simply blown out, so the character read as a featureless white
+// mannequin. Verified by neutralising lit_tint/shadow_tint: the texture
+// appeared instantly.
+//
+// This divides the light contribution back into range so a default export
+// renders close to how Blender looked. Raise it if a project wants a brighter,
+// more stylised look.
+uniform float toon_exposure : hint_range(0.05, 2.0) = 0.35;
+
 group_uniforms shadow_bands;
 // Per-object shadow mask from UV2 (the second UV set exported from Blender).
 uniform sampler2D light_map : hint_default_white, filter_linear_mipmap;
@@ -278,12 +297,15 @@ void light() {
 	// 不论 albedo_color 设成什么,渲染出来都是白/粉。
 	// 实测:球材质设成红色,渲染却是白色,排查了很久。
 	// ALBEDO 在 light() 里可直接读(Godot 会为此生成对应的 varying)。
-	DIFFUSE_LIGHT += ramp * ALBEDO * LIGHT_COLOR * shadow_strength;
+	// toon_exposure 把灯的 energy 归一化回可视范围 ——
+	// 不除的话 light_energy=4.0 会让整个模型过曝成白色(踩过,
+	// 见文件顶部 exposure 那段的说明)。
+	DIFFUSE_LIGHT += ramp * ALBEDO * LIGHT_COLOR * shadow_strength * toon_exposure;
 
 	// --- backlight fringe --------------------------------------------------
 	if (backlight_amount > 0.001) {
 		float back = dot(normal, -light_dir);
 		float fringe = gk_band(back, 0.35, shadow_smooth * 4.0);
-		DIFFUSE_LIGHT += backlight_color.rgb * fringe * backlight_amount * LIGHT_COLOR;
+		DIFFUSE_LIGHT += backlight_color.rgb * fringe * backlight_amount * LIGHT_COLOR * toon_exposure;
 	}
 }
