@@ -88,6 +88,19 @@ def _iter_classes():
 def register():
     import bpy
 
+    # ── 先把上一次的注销干净(踩过的坑)──────────────────────────────
+    # `_reload_submodules()` 会**重新 import** 模块,函数对象是新的 ——
+    # 之后再也拿不到上一版挂在菜单(NODE_MT_add / NODE_MT_context_menu)
+    # 上的旧回调,于是重载几次菜单就叠几份。
+    # 用户实测:右键菜单出现了三份。
+    #
+    # 所以顺序必须是"先注销(此时旧模块还拿得到)、再重载"。
+    if _CLASS_REGISTRY:
+        try:
+            unregister()
+        except Exception as exc:  # pragma: no cover
+            print(f"[BlenderGameKit] 注销上一次失败(继续): {exc}")
+
     _reload_submodules()
     _CLASS_REGISTRY.clear()
 

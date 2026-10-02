@@ -1580,6 +1580,26 @@ def _stmt_anim_tree_ref(ctx, node, indent):
                  f"。先在『游戏动画』面板里建一张动画树,放一个『动画_状态』"
                  f"(它的『进入』不接线 = 起始状态),再用『动画_转场』连下去")
         return
+    # ── 检查"接了条件但没接上游"的转场(用户实测踩过)──────────────
+    # 用户的图:上游状态的『转到』接到了转场的『条件』上,
+    # 转场的『上游』空着 —— 于是链路是空的、整台状态机一条转移都没有。
+    # 光看节点挺像那么回事(线也连了、条件也选了),但**导出后毫无效果**。
+    # 这种"差一根线"的错必须明确报出来。
+    for node_in_tree in (getattr(tree, "nodes", ()) or ()):
+        if getattr(node_in_tree, "bl_idname", "") != "GKNodeAnimTransition":
+            continue
+        up = node_in_tree.inputs.get("上游")
+        cond = node_in_tree.inputs.get("条件")
+        wired_cond = bool(cond is not None
+                          and getattr(cond, "is_linked", False))
+        has_up = bool(up is not None and getattr(up, "is_linked", False))
+        if wired_cond and not has_up:
+            ctx.warn(
+                f"转场『{getattr(node_in_tree, 'name', '?')}』接了条件,"
+                f"但『上游』没接 —— 它不知道『从哪个状态切过去』,"
+                f"所以这条规则不会生效。"
+                f"请把**上一个状态的『转到』**接到这个转场的『上游』")
+
     chain, chain_warnings = _walk_state_chain(entry)
     # ── 只对"真的孤立"的状态告警(踩过的坑)────────────────────────
     # 环(idle <-> run)里两个状态都"没有外来入边",按入口判定都算候选 ——

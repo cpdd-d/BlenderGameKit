@@ -876,7 +876,7 @@ class GKNodeAnimState(B.GKStatementNode):
                          icon="CHECKMARK")
         else:
             layout.prop(self, "gk_state_name", text="", icon="SORTALPHA")
-        layout.label(text="转到 -> 接一个『动画_转场』", icon="FORWARD")
+        layout.label(text="转到 -> 接『动画_转场』的『上游』", icon="FORWARD")
 
 
 @N
@@ -900,7 +900,14 @@ class GKNodeAnimTransition(B.GKStatementNode):
     # 两者必须分开:一条转移既要知道"从哪来"(流),
     # 又要知道"什么条件下切"(布尔)。合成一个引脚会互相覆盖。
     gk_inputs = (
-        S.pin(FLOW, "进入"),
+        # -- 引脚名要能一眼看出该接哪(用户实测踩过)----------------
+        # 原来这个引脚叫『进入』,和状态节点的『进入』**同名** ——
+        # 用户截图里就是把上游状态的『转到』接到了转场的
+        # 『条件』上,而这个『进入』空着,于是链路是空的、
+        # 整个状态机没有一条转移(实测诊断出来的)。
+        #
+        # 改叫『上游』,并说清接上一个状态的『转到』。
+        S.pin(FLOW, "上游"),
         S.pin(BOOL, "条件", False),
     )
     gk_outputs = (
@@ -944,11 +951,12 @@ class GKNodeAnimTransition(B.GKStatementNode):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_cond_source", text="")
+        layout.label(text="上游 <- 接上一个状态的『转到』", icon="LOOP_BACK")
         if str(getattr(self, "gk_cond_source", "PIN")) == "PIN":
-            layout.label(text="条件 -> 接左边", icon="LINKED")
+            layout.label(text="条件 <- 接判断节点的输出", icon="LINKED")
         else:
             layout.prop(self, "gk_cond_action", text="")
-        layout.label(text="转到 -> 接下一个状态", icon="FORWARD")
+        layout.label(text="转到 -> 接下一个状态的『进入』", icon="FORWARD")
 
 
 @N

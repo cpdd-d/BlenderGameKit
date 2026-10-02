@@ -2878,7 +2878,7 @@ class TestAnimTreeScope(Base):
         # 它就是"上游状态指过来"的那个连接点。条件另外接在『条件』上。
         # 链路:状态 --转到--> 转场『进入』;转场『条件』接判断;
         # 转场『转到』---> 下一个状态的『进入』
-        gk_stub.connect(anim, idle, "转到", transition, "进入")
+        gk_stub.connect(anim, idle, "转到", transition, "上游")
         gk_stub.connect(anim, transition, "转到", run, "进入")
         gk_stub.connect(anim, loco, "地面且移动", transition, "条件")
 
@@ -3022,7 +3022,7 @@ class TestAnimChain(Base):
                     states[name] = node
         for index, (start, cond, end) in enumerate(links):
             transition = anim.new_node(NN.GKNodeAnimTransition, f"T{index}")
-            gk_stub.connect(anim, states[start], "转到", transition, "进入")
+            gk_stub.connect(anim, states[start], "转到", transition, "上游")
             gk_stub.connect(anim, transition, "转到", states[end], "进入")
             if cond:
                 gk_stub.connect(anim, loco, cond, transition, "条件")
@@ -3062,7 +3062,10 @@ class TestAnimChain(Base):
         """
         node = make_tree().new_node(NN.GKNodeAnimTransition, "转场")
         names = [s.name for s in node.inputs]
-        self.assertIn("进入", names)
+        # 上游流和布尔条件必须是**两个**引脚。
+        # 引脚名叫『上游』不叫『进入』—— 用户实测里就是因为两个节点
+        # 的引脚同名(都叫『进入』)而接错,链路空掉、状态机没转移。
+        self.assertIn("上游", names)
         self.assertIn("条件", names)
         self.assertIn("转到", [s.name for s in node.outputs])
 
@@ -3138,7 +3141,7 @@ class TestAnimChain(Base):
         def bad(anim, states, loco):
             wrong = anim.new_node(NN.GKNodeAnimLocomotion, "不是状态")
             t2 = anim.new_node(NN.GKNodeAnimTransition, "T坏")
-            gk_stub.connect(anim, states["run"], "转到", t2, "进入")
+            gk_stub.connect(anim, states["run"], "转到", t2, "上游")
             # 连到 loco 的**输入**引脚上(stub 允许,真实 Blender 里
             # 类型不匹配连不上;这里模拟"用户连错了"的最坏情况)
             gk_stub.connect(anim, t2, "转到", wrong, "角色")

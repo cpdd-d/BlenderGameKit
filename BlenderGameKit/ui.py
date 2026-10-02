@@ -1169,21 +1169,59 @@ def _draw_context_menu(self, context):
     _draw_node_menu_contents(self.layout, context, nested=False)
 
 
+def _strip_our_draw_callbacks(target, keep):
+    """把 target 上属于本插件的绘制回调全部摘掉(除了 keep)。
+
+    ── 为什么要按名字找,而不是 `remove(func)`(踩了三轮的坑)──────
+    用户反复报"右键功能重复",到第三次才查出真正的原因:
+
+    **Blender 重载插件时会重新 import 模块,函数对象是新的。**
+    `target.remove(新函数)` 摘不掉菜单里注册着的**旧函数** ——
+    它俩虽然代码一样,但是**不同的对象**。于是每重载一次就多叠一份,
+    用户看到的右键菜单变成了三份。
+
+    所以不能靠"摘自己"，得**遍历菜单上现有的回调**,
+    把名字对得上的一律摘掉。
+
+    `keep` 是这次要挂上去的那个(先摘掉,后面 prepend 回去)。
+    """
+    for attr in ("_draw_funcs", "draw_funcs", "_dyn_ui_initialize"):
+        handlers = getattr(target, attr, None)
+        if handlers is None:
+            continue
+        try:
+            items = list(handlers)
+        except TypeError:
+            continue
+        for item in items:
+            func = getattr(item, "__func__", item)
+            module = getattr(func, "__module__", "") or ""
+            name = getattr(func, "__name__", "") or ""
+            if name not in ("_draw_add_menu", "_draw_context_menu"):
+                continue
+            # 只摘本插件的(模块名里带 blender_game_kit)
+            if "blender_game_kit" not in module and item is not keep:
+                continue
+            if item is keep:
+                continue
+            try:
+                target.remove(item)
+            except Exception:
+                pass
+
+
 def on_register():
     """注册后的自检与菜单挂钩。"""
     # ---- 挂菜单 ----
     #
-    # ── 为什么要"先全部摘干净再挂"(用户实测踩过)──────────────────
-    # 用户截图里右键菜单**出现了两份**:
-    #     搜索节点… / 最近使用 / 动画系统 / 把选中的两个节点连起来
-    #     搜索节点… / 最近使用 / …                    <- 又来一遍
+    # ── 三轮才查清的重复问题(务必看这段)──────────────────────────
+    # 1) 用户第一次报"右键功能重复" -> 以为 remove 一次不够,改成循环摘
+    # 2) 用户第二次报还是重复     -> 还是不对
+    # 3) 查出真根因:**Blender 重载插件时模块被重新 import,
+    #    函数对象是新的**,`remove(新函数)` 摘不掉菜单里的旧函数。
     #
-    # 原来的写法是 `target.remove(func)` 一次 + `prepend` 一次。
-    # 问题是 `remove` 只摘**一个**引用 —— 如果之前因为
-    # "注册-注销-再注册"或者 Blender 的插件重载累积了多份,
-    # 摘一次剩下的一份还在,再加一份就变成两份/三份。
-    #
-    # 所以改成:**循环摘到摘不动为止**,再挂。
+    # 所以改成按**名字**遍历现有回调,把属于本插件的一律摘掉,
+    # 再挂上当前的这一份。
     for target_name, func in (
         ("NODE_MT_add", _draw_add_menu),
         ("NODE_MT_context_menu", _draw_context_menu),
@@ -1193,12 +1231,12 @@ def on_register():
             if target is None:
                 gk_log.warn(f"找不到 {target_name},跳过挂载")
                 continue
-            # 摘到摘不动为止(见上面说明)
-            for _ in range(8):
-                try:
-                    target.remove(func)
-                except Exception:
-                    break
+            _strip_our_draw_callbacks(target, func)
+            # 保险:再试着直接摘一次(覆盖"名字对不上但对象就是它"的情况)
+            try:
+                target.remove(func)
+            except Exception:
+                pass
             target.prepend(func)
         except Exception as exc:  # pragma: no cover
             gk_log.error(f"挂载 {target_name} 失败: {exc}")
