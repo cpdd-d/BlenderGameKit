@@ -208,28 +208,39 @@ void fragment() {
 	vec3 n_world = normalize(to_world * NORMAL);
 	vec3 l_world = normalize(light_dir);
 
-	// A plain dot keeps the terminator crisp, which is the whole point of a
-	// cel look. (A half-lambert wrap would smear it out.)
-	float raw = dot(n_world, l_world);
-
-	float lit_factor = gk_band(raw, shadow_step, shadow_smooth);
-	vec3 ramp = gk_ramp(raw);
-
-	// Anime shadows are a TINT, not a darkening: shadowed areas keep
-	// `ambient` of the texture colour, pulled toward shadow_tint. Lit areas
-	// get the full banded ramp. Mixing the two by lit_factor keeps the
-	// transition exactly as hard as shadow_smooth says -- no ambient wash
-	// leaking over the band edge.
-	vec3 shadow_col = base.rgb * shadow_tint.rgb;
-	vec3 lit_col = base.rgb * ramp * light_color.rgb * light_energy;
+	// ── 场景里没有灯时:只画环境色,不画色阶 ──────────────────────
+	// gk_environment.gd 在"灯全关了"时会把 light_dir 写成零向量。
+	// 不特判的话 normalize(零向量) 会出 NaN,整块面片变成黑块或花屏。
+	// 语义上这也对:没有光就没有明暗分界,只剩环境色。
+	//
+	// 注意:**不能用 return** —— Godot 的 fragment() 不允许提前返回
+	// (实测报 "'return' 在 'fragment' 处理器函数中的使用不正确")。
+	// 所以用 if/else 把两条路分开。
 	float shadow_keep = clamp(ambient, 0.0, 1.0);
-	vec3 cel = mix(shadow_col * shadow_keep, lit_col, lit_factor);
+	if (dot(light_dir, light_dir) < 1e-6) {
+		ALBEDO = max(base.rgb * shadow_tint.rgb * shadow_keep, base.rgb * 0.15);
+	} else {
+		// A plain dot keeps the terminator crisp, which is the whole point of
+		// a cel look. (A half-lambert wrap would smear it out.)
+		float raw = dot(n_world, l_world);
 
-	// Floor: never let a texel go completely black. Fully shadowed anime
-	// characters are still readable, not silhouettes.
-	cel = max(cel, base.rgb * shadow_tint.rgb * shadow_keep * 0.85);
+		float lit_factor = gk_band(raw, shadow_step, shadow_smooth);
+		vec3 ramp = gk_ramp(raw);
 
-	ALBEDO = cel;
+		// Anime shadows are a TINT, not a darkening: shadowed areas keep
+		// `ambient` of the texture colour, pulled toward shadow_tint. Lit
+		// areas get the full banded ramp. Mixing the two by lit_factor keeps
+		// the transition exactly as hard as shadow_smooth says -- no ambient
+		// wash leaking over the band edge.
+		vec3 shadow_col = base.rgb * shadow_tint.rgb;
+		vec3 lit_col = base.rgb * ramp * light_color.rgb * light_energy;
+		vec3 cel = mix(shadow_col * shadow_keep, lit_col, lit_factor);
+
+		// Floor: never let a texel go completely black. Fully shadowed anime
+		// characters are still readable, not silhouettes.
+		cel = max(cel, base.rgb * shadow_tint.rgb * shadow_keep * 0.85);
+		ALBEDO = cel;
+	}
 	// ── 绝对不要在这里写 ALPHA ────────────────────────────────────────
 	// 这是"四维穿透"的最后一块拼图。
 	//

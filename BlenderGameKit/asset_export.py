@@ -260,6 +260,13 @@ func _update_light(delta: float) -> void:
 		return
 	var light := _find_directional_light()
 	if light == null:
+		# 场景里没有**亮着**的平行光 -> 告诉 shader "没光",
+		# 它会退化成只画环境色(见 gk_toon.gdshader 里的零向量特判)。
+		# 不这么做的话,灯关了角色还是亮的(实测踩过)。
+		for mat in _gk_materials:
+			var sm_off := mat as ShaderMaterial
+			if sm_off != null:
+				sm_off.set_shader_parameter("light_dir", Vector3.ZERO)
 		return
 	# 平行光的 -Z 轴就是它照射的方向;取反得到"光从哪来"。
 	var dir: Vector3 = -light.global_transform.basis.z.normalized()
@@ -281,11 +288,31 @@ func _find_directional_light() -> DirectionalLight3D:
 		return null
 	if not light_name.is_empty():
 		var named := root.find_child(light_name, true, false)
-		if named is DirectionalLight3D:
+		if named is DirectionalLight3D and _light_is_on(named):
 			return named as DirectionalLight3D
 	for node in root.find_children("*", "DirectionalLight3D", true, false):
-		return node as DirectionalLight3D
+		if _light_is_on(node):
+			return node as DirectionalLight3D
 	return null
+
+
+## 这盏灯**现在是否在发光**。
+##
+## ── 为什么必须判断(踩过的坑)────────────────────────────────────
+## 原来只按类型找灯 —— 用户把灯隐藏/关掉之后,脚本**照样**把它的方向
+## 和颜色往 shader 里灌,于是"灯全关了角色还是亮的"。
+## 用户原话:"godot 里关闭与隐藏灯光,但显示与渲染还是残留一些光照"。
+##
+## 我们自己算光照,就得自己尊重灯的开关 —— Godot 不会替我们判断。
+func _light_is_on(node: Node) -> bool:
+	var light := node as Light3D
+	if light == null:
+		return false
+	if not light.visible:
+		return false
+	if light.light_energy <= 0.0:
+		return false
+	return true
 
 
 ## 用物理帧而不是渲染帧:角色移动在 _physics_process 里,
