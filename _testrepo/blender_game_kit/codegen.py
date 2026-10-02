@@ -1581,14 +1581,21 @@ def _find_animation_tree(name):
 
 
 def _anim_tree_states(tree):
-    """取出动画树里的状态节点,按**优先级**排好(小的先判)。"""
+    """取出动画树里的**切换卡片**,按优先级排好(小的先判)。
+
+    支持两种节点:
+      * GKNodeAnimState      -- 状态卡片(条件写在状态自己身上)
+      * GKNodeAnimTransition -- 切换卡片(从逻辑判断拉线过来)
+    两者语义一样("条件为真就切到目标状态"),所以这里合并处理。
+    后者正是用户要的"右边有输出连接点、能从逻辑判断拉线"那种。
+    """
     if tree is None:
         return []
     found = []
     for item in getattr(tree, "nodes", ()) or ():
-        if getattr(item, "bl_idname", "") != "GKNodeAnimState":
-            continue
-        found.append(item)
+        if getattr(item, "bl_idname", "") in ("GKNodeAnimState",
+                                              "GKNodeAnimTransition"):
+            found.append(item)
     found.sort(key=lambda n: (int(getattr(n, "gk_priority", 0) or 0),
                               getattr(n, "location", (0.0, 0.0))[1]))
     return found

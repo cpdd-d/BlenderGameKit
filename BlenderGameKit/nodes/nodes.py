@@ -951,6 +951,49 @@ def animation_tree_items():
 
 
 @N
+class GKNodeAnimTransition(B.GKStatementNode):
+    bl_idname = "GKNodeAnimTransition"
+    bl_label = "动画_切状态"
+    bl_icon = "TRACKING_FORWARDS_SINGLE"
+    gk_category = "动画系统"
+    gk_tree_type = "GKAnimationTree"
+    gk_doc = (
+        "一张**切换卡片**。条件引脚接逻辑判断(『动画判断_移动状态』"
+        "之类),条件为真时切到『目标状态』。"
+        "这就是那个『从逻辑判断拉线来决定切哪个动画』的连接点。"
+        "多张卡片按『优先级』依次判断,数字小的先判"
+    )
+    gk_inputs = (
+        S.pin(BOOL, "条件", False),
+    )
+    gk_outputs = ()
+    gk_prop_defs = (
+        ("gk_to_action", "action", None, "目标动画",
+         "切到哪个动画(从文件里的动作里选)"),
+        ("gk_to_state", "string", "", "目标状态(手填兜底)",
+         "没选『目标动画』时才用它"),
+        ("gk_priority", "int", 0, "优先级", "数字小的先判"),
+    )
+
+    def resolved_state_name(self):
+        """目标状态名 —— 优先用选中的动作,否则用手填的。"""
+        action = getattr(self, "gk_to_action", None)
+        if action is not None:
+            name = str(getattr(action, "name", "") or "")
+            if name:
+                return name
+        return str(getattr(self, "gk_to_state", "") or "")
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_to_action", text="")
+        if self.gk_to_action is not None:
+            layout.label(text=f"-> {self.gk_to_action.name}", icon="FORWARD")
+        else:
+            layout.prop(self, "gk_to_state", text="", icon="FORWARD")
+        layout.prop(self, "gk_priority", text="优先")
+
+
+@N
 class GKNodeAnimStateMachineRef(B.GKStatementNode):
     bl_idname = "GKNodeAnimStateMachineRef"
     bl_label = "动画_状态机"

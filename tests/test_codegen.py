@@ -473,8 +473,9 @@ class TestNodeLibrary(unittest.TestCase):
         """
         from BlenderGameKit import gk_sockets as S
         from BlenderGameKit.nodes import node_base as NB
-        # 动画树里的状态节点不参与执行流,单独列出来
-        no_flow = {"GKNodeAnimState"}
+        # 动画树里的卡片节点不参与执行流,单独列出来
+        # (`GKNodeAnimTransition` 同 `GKNodeAnimState`:靠条件为真被激活)
+        no_flow = {"GKNodeAnimState", "GKNodeAnimTransition"}
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
                 continue

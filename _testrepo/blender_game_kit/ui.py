@@ -62,6 +62,85 @@ class GKGameLogicTree(bpy.types.NodeTree):
         layout.operator("gk.export_script", text="导出脚本", icon="FILE_TICK")
 
 
+def _node_space(context):
+    """找到当前可用的节点编辑器区域(拿不到就返回 None)。"""
+    window = getattr(context, "window", None)
+    screen = getattr(window, "screen", None) if window else None
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") != "NODE_EDITOR":
+            continue
+        for space in getattr(area, "spaces", ()) or ():
+            return space
+    return None
+
+
+# 每种树类型**上次用的是哪张** —— 供 GK_OT_SwitchTree 恢复。
+_LAST_TREE = {}
+
+
+class GK_OT_SwitchTree(bpy.types.Operator):
+    """切到另一种节点图,并**恢复上次用的那张**。
+
+    ── 为什么需要(用户实测的问题)──────────────────────────────
+    用户原话:"切换视图后,它没有保持上一步的设计界面,变成未创建的状态,
+    但点击新建旁边的下三角后就可以看到了,这每次切换重置都比较麻烦"
+
+    根因:Blender 自己的类型下拉切换 `tree_type` 时会把
+    `space.node_tree` 清掉 —— 它不知道"这一类树里你上次看的是哪张",
+    因为 `node_tree` 只有**一个**槽位,切类型时它就不匹配了。
+
+    Blender 没提供"切换后自动选回上次那张"的钩子,所以给一个自己的
+    切换入口:记住每种类型上次用的树,切过去时恢复。
+    """
+
+    bl_idname = "gk.switch_tree"
+    bl_label = "切换节点图"
+    bl_description = "在游戏逻辑图和动画树之间切换(会恢复上次看的那张)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target: StringProperty(name="目标类型", default="GKGameLogicTree")
+
+    def execute(self, context):
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"}, "请先打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+
+        # 离开之前先记下当前这张,回来时才能恢复
+        current_kind = getattr(space, "tree_type", "")
+        current = (getattr(space, "edit_tree", None)
+                   or getattr(space, "node_tree", None))
+        if current is not None and current_kind in ("GKGameLogicTree",
+                                                    "GKAnimationTree"):
+            _LAST_TREE[current_kind] = current
+
+        wanted = self.target
+        tree = _LAST_TREE.get(wanted)
+        # 记着的那张可能已经被删了 —— 校验一下还在不在
+        if tree is not None and tree.name not in bpy.data.node_groups:
+            tree = None
+        if tree is None:
+            for group in bpy.data.node_groups:
+                if getattr(group, "bl_idname", "") == wanted:
+                    tree = group
+                    break
+        if tree is None:
+            if wanted == "GKAnimationTree":
+                # 顺手放个起始状态,免得面对空图不知道从哪下手
+                tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
+                state = tree.nodes.new("GKNodeAnimState")
+                state.gk_state_name = "idle"
+                state.gk_is_default = True
+            else:
+                tree = bpy.data.node_groups.new("游戏逻辑", "GKGameLogicTree")
+            self.report({"INFO"}, f"已新建『{tree.name}』")
+
+        space.tree_type = wanted
+        space.node_tree = tree
+        _LAST_TREE[wanted] = tree
+        return {"FINISHED"}
+
+
 # ==========================================================================
 # 动画树 —— 独立的第二张节点图(照虚幻 5 的 Animation Blueprint)
 # ==========================================================================
@@ -135,18 +214,6 @@ class GK_OT_OpenAnimTree(bpy.types.Operator):
                         "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
             return {"CANCELLED"}
         return {"FINISHED"}
-
-
-def _node_space(context):
-    """找到当前可用的节点编辑器区域(拿不到就返回 None)。"""
-    window = getattr(context, "window", None)
-    screen = getattr(window, "screen", None) if window else None
-    for area in getattr(screen, "areas", ()) or ():
-        if getattr(area, "type", "") != "NODE_EDITOR":
-            continue
-        for space in getattr(area, "spaces", ()) or ():
-            return space
-    return None
 
 
 class GK_PT_AnimTree(bpy.types.Panel):
@@ -1093,6 +1160,7 @@ GK_CLASSES = (
     GKGameLogicTree,
     GKAnimationTree,
     GK_OT_OpenAnimTree,
+    GK_OT_SwitchTree,
     GK_PT_AnimTree,
     GK_OT_AddNodeMenu,
     GK_OT_FindNode,
