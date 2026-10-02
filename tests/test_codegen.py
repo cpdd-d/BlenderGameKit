@@ -2659,6 +2659,106 @@ class TestAnimationEvents(Base):
         self.assertIn("!= _name", code)
 
 
+class TestAnimationStateMachine(Base):
+    """动画状态机 —— 取代手拼分支网。
+
+    用户要求"做动画状态机",这也是 UPBGE 那套最大的缺陷
+    (它一次只能播一个动画,没有状态机)。
+    """
+
+    def test_parse_transitions(self):
+        self.assertEqual(NN.parse_transitions("idle -> run\nrun -> idle"),
+                         [("idle", "run"), ("run", "idle")])
+
+    def test_parse_accepts_full_width_arrow(self):
+        self.assertEqual(NN.parse_transitions("idle→run"), [("idle", "run")])
+
+    def test_parse_ignores_blank_and_comments(self):
+        text = "  idle -> run  \n\n# 注释\nrun->idle\n"
+        self.assertEqual(NN.parse_transitions(text),
+                         [("idle", "run"), ("run", "idle")])
+
+    def test_parse_tolerates_half_typed_rule(self):
+        """用户正在打字时的半截规则不该让整个节点崩掉。"""
+        self.assertEqual(NN.parse_transitions("idle ->"), [])
+        self.assertEqual(NN.parse_transitions(""), [])
+        self.assertEqual(NN.parse_transitions(None), [])
+
+    def test_transitions_create_bool_pins(self):
+        node = make_tree().new_node(NN.GKNodeAnimStateMachine, "状态机")
+        node.gk_transitions = "idle -> run\nrun -> jump"
+        node.build_sockets()
+        names = [s.name for s in node.inputs]
+        self.assertIn("idle→run", names)
+        self.assertIn("run→jump", names)
+
+    def test_duplicate_rules_make_one_pin(self):
+        node = make_tree().new_node(NN.GKNodeAnimStateMachine, "状态机")
+        node.gk_transitions = "idle -> run\nidle -> run"
+        node.build_sockets()
+        names = [s.name for s in node.inputs]
+        self.assertEqual(names.count("idle→run"), 1)
+
+    def _build(self, transitions, condition=None, mode="EVERY_FRAME"):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        machine = tree.new_node(NN.GKNodeAnimStateMachine, "状态机")
+        machine.gk_transitions = transitions
+        machine.gk_check_mode = mode
+        machine.build_sockets()
+        gk_stub.connect(tree, event, "执行", machine, "执行")
+        if condition is not None:
+            cond = tree.new_node(NN.GKNodeActionPressed, "输入")
+            cond.gk_action = condition
+            first = NN.parse_transitions(transitions)[0]
+            gk_stub.connect(tree, cond, "按住", machine,
+                            NN.transition_pin_name(*first))
+        return gen(tree, V3)
+
+    def test_every_frame_goes_to_physics_process(self):
+        """『每帧检查』要挂 _physics_process —— 跟移动同步判定。
+
+        放渲染帧里会出现"人已经走出去了状态还没切"的一帧延迟
+        (和相机跟随同一个道理)。
+        """
+        code, warnings = self._build("idle -> run", condition="move_right")
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _physics_process(", code)
+        self.assertIn('anim_state == "idle"', code)
+        self.assertIn('anim_state = "run"', code)
+        self.assertIn('.play("run"', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_on_enter_mode_does_not_need_physics_process(self):
+        code, _ = self._build("idle -> run", condition="move_right",
+                              mode="ON_ENTER")
+        self.assertNotIn("func _physics_process(", code)
+
+    def test_empty_table_warns(self):
+        _code, warnings = self._build("")
+        self.assertTrue(any("状态表是空的" in w for w in warnings), warnings)
+
+    def test_unwired_rule_warns(self):
+        """规则没接条件 -> 永远不会触发,必须明确告诉用户。"""
+        _code, warnings = self._build("idle -> run\nrun -> idle")
+        self.assertTrue(any("没有接条件" in w for w in warnings), warnings)
+
+    def test_state_name_is_also_the_animation_name(self):
+        """状态名直接当动画名用 —— 少一层映射就少一类 bug。"""
+        code, _ = self._build("idle -> attack", condition="attack")
+        self.assertIn('has_animation("attack")', code)
+        self.assertIn('.play("attack"', code)
+
+    def test_missing_animation_warns_at_runtime(self):
+        code, _ = self._build("idle -> attack", condition="attack")
+        self.assertIn("没有对应的动画", code)
+
+    def test_state_var_is_declared_once(self):
+        code, _ = self._build("idle -> run", condition="move_right")
+        self.assertEqual(code.count("var anim_state: String"), 1)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

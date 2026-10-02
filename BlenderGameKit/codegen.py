@@ -25,6 +25,7 @@
 from . import gk_sockets as S
 from .nodes import node_base as B
 from .nodes.node_base import TARGET_SELF, gd_node_path, gd_string, snake_case
+from .nodes.nodes import parse_transitions, transition_pin_name
 
 # 事件节点 bl_idname -> (函数名, 是否需要 delta, 排序属性)
 EVENT_KINDS = {
@@ -231,6 +232,9 @@ class GenContext:
         self.need_anim_running = False
         # 每次播放登记一条:{player, name, func, node, output, kind, signal}
         self.anim_events = []
+        # 动画状态机(『每帧检查』模式)- 整段逻辑挂进 _physics_process
+        self.anim_state_machines = []
+        self.need_anim_state_process = False
         # 动画名留空时要生成 _gk_first_animation()(见 _stmt_play_anim)
         self.need_first_animation = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
@@ -1410,6 +1414,89 @@ def _stmt_play_anim(ctx, node, indent):
     ctx.add_line(indent + 2,
                  'push_warning("[GK] 动画不存在: %s。这个模型里可用的动画有: %s" % '
                  f"[{name_temp}, {player_temp}.get_animation_list()])")
+
+
+@stmt_node("GKNodeAnimStateMachine")
+def _stmt_anim_state_machine(ctx, node, indent):
+    """动画状态机 —— 取代手拼分支网。
+
+    ── 生成思路 ────────────────────────────────────────────────────
+    不做"每个状态一个函数"那种展开(GDScript 里会很啰嗦),
+    而是生成一段**紧凑的 if 链**:按状态表顺序逐条判断,
+
+        if anim_state == "idle" and <条件引脚>:
+            anim_state = "run"
+            <切动画>
+
+    这么做的理由:
+      * 生成结果短、可读 —— 用户能直接看出哪条规则在生效
+      * 状态表是**有序**的,优先级就是书写顺序(第一条命中的赢),
+        这和 UPBGE / 蓝图里"从上往下第一个为真的分支"直觉一致
+      * 不需要为每个状态生成函数,省掉一堆样板
+
+    ── 检查时机 ────────────────────────────────────────────────────
+    『每帧检查』-> 整段挂在 `_physics_process` 里
+    『只在进入时判』-> 只在本次执行时判一次
+    """
+    rules = parse_transitions(getattr(node, "gk_transitions", ""))
+    if not rules:
+        ctx.warn(f"节点『{node.bl_label}』的状态表是空的,什么都不会发生。"
+                 f"写一行像 `idle -> run` 这样的规则")
+        return
+
+    player = ctx.animation_player(node)
+    var_name = ctx.declare_var(
+        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
+        "String")
+    player_temp = ctx.new_temp("ap")
+    ctx.add_line(indent, f"var {player_temp} := {player}")
+    # 首次执行时把状态设成"起始状态"
+    start_state = ctx.input_string(node, "起始状态", "idle")
+    ctx.add_line(indent, f"if {var_name}.is_empty():")
+    ctx.add_line(indent + 1, f"{var_name} = {start_state}")
+
+    every_frame = str(getattr(node, "gk_check_mode", "EVERY_FRAME")) == "EVERY_FRAME"
+    if every_frame:
+        # 整段逻辑要放进 _physics_process —— 由 ctx 收集,generate() 统一发射
+        ctx.anim_state_machines.append({
+            "node": node, "rules": rules, "var": var_name,
+            "player": player_temp,
+        })
+        ctx.need_anim_state_process = True
+        return
+
+    # 只在进入时判:直接在这里展开一次
+    _emit_state_transitions(ctx, node, indent, rules, var_name, player_temp)
+
+
+def _emit_state_transitions(ctx, node, indent, rules, var_name, player_temp):
+    """生成转移判断的 if 链。见 _stmt_anim_state_machine 的说明。"""
+    for start, end in rules:
+        pin_name = transition_pin_name(start, end)
+        socket = ctx._socket(node, pin_name)
+        if socket is None:
+            # 状态表改了但引脚还没重建 —— 提示用户点一下节点
+            ctx.warn(f"节点『{node.bl_label}』的规则 `{start} -> {end}` "
+                     f"还没有对应的引脚。在节点上把状态表重新编辑一次"
+                     f"(或重新加载文件)就会长出来")
+            continue
+        if not getattr(socket, "is_linked", False):
+            # 没接条件 -> 这条规则永远不会触发,明确告诉用户
+            ctx.warn(f"节点『{node.bl_label}』的规则 `{start} -> {end}` "
+                     f"没有接条件,不会生效")
+            continue
+        condition = ctx.expr_of(socket)
+        ctx.add_line(indent, f'if {var_name} == {gd_string(start)} and {condition}:')
+        ctx.add_line(indent + 1, f'{var_name} = {gd_string(end)}')
+        # 切状态 = 播目标状态的动画(状态名就是动画名)
+        ctx.add_line(indent + 1, f"if {player_temp} != null and "
+                                 f"{player_temp}.has_animation({gd_string(end)}):")
+        ctx.add_line(indent + 2,
+                     f"{player_temp}.play({gd_string(end)}, -1.0, 1.0)")
+        ctx.add_line(indent + 1, "else:")
+        ctx.add_line(indent + 2,
+                     f'push_warning("[GK] 状态『{end}』没有对应的动画: %s" % '
+                     f"{gd_string(end)})")
 
 
 @stmt_node("GKNodeSetState")
@@ -3061,8 +3148,24 @@ class Generator:
                 "separator": True,
             })
 
+        # ---- 动画状态机(『每帧检查』模式)的 _physics_process ----
+        # 状态切换要跟移动同步判定 —— 放在渲染帧里会出现
+        # "人已经走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
+        if self.ctx.need_anim_state_process:
+            lines = self.ctx.new_section()
+            for machine in self.ctx.anim_state_machines:
+                self.ctx._active.clear()
+                self.ctx._current_event = machine["node"].name
+                _emit_state_transitions(self.ctx, machine["node"], 1,
+                                        machine["rules"], machine["var"],
+                                        machine["player"])
+            sections.append({
+                "signature": "func _physics_process(_delta: float) -> void:",
+                "lines": list(lines.lines),
+                "empty_body": "    pass",
+            })
+
         # ---- "每帧"动画事件出口需要的那段 _process 代码 ----
-        # Godot **没有**"动画正在播"的信号,只能每帧查一次
         # `is_playing()` + `current_animation`。
         #
         # **必须放在事件循环之后** —— `need_anim_running` 是在生成

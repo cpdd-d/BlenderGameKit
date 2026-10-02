@@ -715,6 +715,132 @@ class GKNodePlayAnim(B.GKStatementNode):
         B.draw_target_picker(self, layout, "gk_player")
 
 
+# ==========================================================================
+# 动画状态机
+# ==========================================================================
+# 用户要求:"做动画状态机取代手拼分支网" —— 这也是 UPBGE 那套最大的缺陷
+# (它一次只能播一个动画,没有状态机)。
+#
+# ── 为什么转移表用**多行文本**而不是可编辑列表 ────────────────────
+# 理想的 UI 是像检查器那样的可增删列表,那需要 `CollectionProperty`
+# + 一个 `PropertyGroup` 类 + 一个 UIList。试下来的两个硬障碍:
+#
+#   1. `PropertyGroup` 必须自己注册成 Blender 类,而节点类是由
+#      `finalize()` 统一登记的 —— 两者注册时机和通道不一样,
+#      混在一起很容易"节点注册成功但属性组没注册",报一堆难懂的错。
+#   2. 在节点体里画可增删列表要用 `UILayout.template_list`,而它需要一个
+#      **PointerProperty 指向自身**才能定位列表容器 —— 节点类型上挂
+#      PointerProperty 在 Blender 里是受限的。
+#
+# 所以改用多行文本。一行一条规则,格式故意做得极简:
+#
+#     idle -> run        当『有输入』为真时,idle 切到 run
+#     run -> idle        条件是节点上的布尔引脚
+#
+# 好处:**看得出全部规则、能复制粘贴、能整块注释掉、diff 干净**。
+# 代价:没有下拉选择状态名 —— 但状态名本来就是用户自己的字符串,
+# 手打反而更自由(而且打错了导出时会报"目标状态没有对应的动画")。
+@N
+class GKNodeAnimStateMachine(B.GKStatementNode):
+    bl_idname = "GKNodeAnimStateMachine"
+    bl_label = "动画_状态机"
+    bl_icon = "AUTOMERGE_ON"
+    gk_category = "动画"
+    gk_doc = (
+        "把 idle / run / jump / attack 这些状态的切换收进一个节点,"
+        "不用手拼一堆分支。"
+        "『状态表』一行一条规则,格式:`起始状态 -> 目标状态`;"
+        "节点上会**自动长出一条对应的布尔引脚**,接一个条件上去 —— "
+        "条件为真时就切过去。"
+        "例:`idle -> run` 会生成一个叫『idle→run』的引脚。"
+        "『每帧检查』勾上时每个物理帧都判一次条件,否则只在有输入时判"
+    )
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "起始状态", "idle"))
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_states", "string", "idle\nrun", "状态列表",
+         "这个角色有哪些状态,一行一个(只是给『选…』按钮和导出的常量用)"),
+        ("gk_transitions", "string", "idle -> run\nrun -> idle", "状态表",
+         "一行一条规则,格式:`起始状态 -> 目标状态`"),
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        ("gk_check_mode", "enum", "EVERY_FRAME", "检查时机",
+         "每个物理帧判一次 / 只在切换后判一次",
+         (("EVERY_FRAME", "每帧检查", "动作连贯,适合走跑切换"),
+          ("ON_ENTER", "只在进入时判", "省性能,适合一次性判定"))),
+        ("gk_state_var", "string", "anim_state", "状态变量名",
+         "当前状态存在哪个成员变量里"),
+    )
+
+    def build_sockets(self):
+        """按状态表动态生成条件引脚。
+
+        每条规则一个布尔输入引脚,名字就是 `起始→目标`。
+        """
+        self.inputs.clear()
+        for spec in self.gk_inputs:
+            socket = self.inputs.new(spec["kind"][0], spec["name"])
+            if spec["default"] is not None:
+                try:
+                    socket.default_value = spec["default"]
+                except Exception:
+                    pass
+        self.outputs.clear()
+        for spec in self.gk_outputs:
+            socket = self.outputs.new(spec["kind"][0], spec["name"])
+            if spec["default"] is not None:
+                try:
+                    socket.default_value = spec["default"]
+                except Exception:
+                    pass
+        for rule in parse_transitions(getattr(self, "gk_transitions", "")):
+            pin_name = transition_pin_name(rule[0], rule[1])
+            if self.inputs.get(pin_name) is not None:
+                continue      # 重复规则只建一个引脚
+            socket = self.inputs.new(S.BOOL[0], pin_name)
+            try:
+                socket.default_value = False
+            except Exception:
+                pass
+
+    def draw_buttons(self, context, layout):
+        col = layout.column(align=True)
+        col.label(text="状态表(一行:`起始 -> 目标`)")
+        col.prop(self, "gk_transitions", text="")
+        col.prop(self, "gk_check_mode", text="")
+        rules = parse_transitions(getattr(self, "gk_transitions", ""))
+        if rules:
+            col.label(text=f"已生成 {len(rules)} 条转移", icon="INFO")
+        else:
+            col.label(text="还没有规则", icon="ERROR")
+
+
+def parse_transitions(text):
+    """把状态表文本解析成 [(起始, 目标), ...]。
+
+    宽容处理:支持 `->` 和 `→`,忽略空行和 `#` 开头的注释行。
+    解析不出来就跳过那一行,不抛异常 —— 用户正在打字时半截规则
+    (只有 `idle ->`)不该让整个节点构建失败。
+    """
+    rules = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for arrow in ("->", "→"):
+            if arrow in line:
+                left, _sep, right = line.partition(arrow)
+                start, end = left.strip(), right.strip()
+                if start and end:
+                    rules.append((start, end))
+                break
+    return rules
+
+
+def transition_pin_name(start, end):
+    """转移规则对应的引脚名。用箭头连接,用户一眼能对上。"""
+    return f"{start}→{end}"
+
+
 # ── 动画的其余常用操作 ──────────────────────────────────────────────
 # 用户原话:"怎么测试骨骼和动画,这两个比较重要"。
 # 实测(建了带骨架的角色,导出到 Godot 真跑)确认整条链路是通的:
