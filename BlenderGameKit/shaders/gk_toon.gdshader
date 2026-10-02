@@ -209,7 +209,24 @@ void fragment() {
 	cel = max(cel, base.rgb * shadow_tint.rgb * shadow_keep * 0.85);
 
 	ALBEDO = cel;
-	ALPHA = 1.0;
+	// ── 绝对不要在这里写 ALPHA ────────────────────────────────────────
+	// 这是"四维穿透"的最后一块拼图。
+	//
+	// Godot 只要在 fragment() 里看到对 `ALPHA` 的**赋值**,就会给这个
+	// shader 生成 alpha varying,并把它归到**透明**管线 ——
+	// 于是不写深度、按距离排序,后面的面片画到前面去。
+	// 实测:写 `ALPHA = 1.0` 也照样进透明队列
+	// (值是多少不重要,**写过**才重要)。
+	//
+	// 我们的 shader 是**抠图(cutout)**:像素要么被 discard 丢掉,
+	// 要么完全不透明 —— 根本不需要 alpha 通道。
+	// 不写 ALPHA,Godot 就当它是普通不透明材质,正常写深度。
+	// 配合 `render_mode depth_draw_opaque` 双保险。
+	//
+	// 踩过的历史:以前这里写 `ALPHA = alpha`(真半透明),
+	// 用户报"左右移动时模型一闪一闪" —— 那是透明排序抖动。
+	// 改成 `ALPHA = 1.0` 治好了闪烁,但**没治穿透**;
+	// 直到现在完全不写 ALPHA 才对。
 	METALLIC = 0.0;
 	ROUGHNESS = 1.0;
 	SPECULAR = 0.0;
