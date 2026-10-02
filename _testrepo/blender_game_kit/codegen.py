@@ -202,6 +202,9 @@ class GenContext:
         # 跨函数共享的成员变量(见 member_temp)
         self._member_seq = 0
         self.member_vars = []
+        # 生成的代码**用到了哪些类才有的成员** -> 基类需求
+        # (见 require_base_class / check_base_class)
+        self.base_class_requirements = {}
         self._expr_cache = {}      # "节点::输出名" -> 表达式文本
         self._active = set()       # 沿执行流的递归栈，用于断环
         self._claimed = {}         # 节点名 -> 哪个事件函数已经"拥有"它
@@ -303,6 +306,24 @@ class GenContext:
     def new_temp(self, prefix="t"):
         self._temp_seq += 1
         return f"_{snake_case(prefix, 't')}{self._temp_seq}"
+
+    def require_base_class(self, name, why=""):
+        """声明"生成的代码用到了 X 类才有的成员"。
+
+        -- 为什么需要(踩过的坑)------------------------------------
+        用户实测导出后 Godot 报:
+            Function "is_on_floor()" not found in base self.
+
+        根因是**两边对不上**:生成的脚本 `extends StaticBody3D`
+        (因为他那个物体的物理类型是"静态物体"),但动画状态机生成的
+        代码调用了 `is_on_floor()` / `velocity` -- 那是
+        `CharacterBody3D` 才有的。
+
+        这种错**不该让用户自己去查**。生成器最清楚它用到了什么,
+        所以在这里登记需求,导出时由 `check_base_class()` 统一校验:
+        对不上就换掉,并明确告诉用户为什么。
+        """
+        self.base_class_requirements.setdefault(name, why)
 
     def member_temp(self, prefix="m"):
         """取一个**成员变量**名。
@@ -1511,6 +1532,15 @@ def _expr_anim_locomotion(ctx, node):
     代价是速度会被算多次,但 Vector2(...).length() 是纳秒级操作,
     每帧几次完全无所谓 —— 换来的是生成的代码干净、且不会作用域串味。
     """
+    # -- 声明基类需求(踩过的坑)----------------------------------
+    # 这个节点用 `is_on_floor()` 和 `velocity` -- **只有 CharacterBody
+    # 才有**。用户实测:物体是静态的 -> 脚本 `extends StaticBody3D`
+    # -> Godot 报 `Function "is_on_floor()" not found in base self.`
+    #
+    # 登记下来,导出时统一校验并纠正(见 check_base_class)。
+    ctx.require_base_class(
+        "CharacterBody2D" if ctx.dim == 2 else "CharacterBody3D",
+        "『动画判断_移动状态』要用 is_on_floor() / velocity")
     target = ctx.target_expr(node)
     # 未连线的数值 -> @export 参数,方便在 Godot 检查器里调手感
     slow = _tunable_number(ctx, node, "速度阈值", "0.1", "move_threshold")
@@ -3942,6 +3972,61 @@ def _check_animation_targets(tree, warnings):
         message = checker(node, obj)
         if message:
             warnings.append(message)
+
+
+def required_base_class(tree, options=None):
+    """扫一遍节点图,返回 (需要的基类, 为什么) —— 不需要就 (None, "")。
+
+    ── 为什么要在生成**之前**扫 ────────────────────────────────────
+    基类会写进生成的 `extends X` 那一行。等生成完再发现"这个基类
+    没有 is_on_floor()"就晚了 —— 得整个重生成。
+    所以先静态扫一遍节点类型,提前把基类定下来。
+
+    目前只有动画树的『动画判断_移动状态』会提需求(它用
+    `is_on_floor()` / `velocity`,只有 CharacterBody 有)。
+    以后有别的节点提需求,在 `_BASE_CLASS_NEEDS` 里加一条就行。
+    """
+    if tree is None:
+        return None, ""
+    dim = str((options or {}).get("dimension", "3"))
+    # 动画树不在游戏逻辑图里,得单独找出来一起扫
+    trees = [tree]
+    try:
+        import bpy
+        for group in getattr(getattr(bpy, "data", None), "node_groups", ()) or ():
+            if getattr(group, "bl_idname", "") == "GKAnimationTree":
+                trees.append(group)
+    except Exception:
+        pass
+
+    for candidate in trees:
+        for node in getattr(candidate, "nodes", ()) or ():
+            need = _BASE_CLASS_NEEDS.get(getattr(node, "bl_idname", ""))
+            if need is None:
+                continue
+            if callable(need):
+                result = need(dim)
+            else:
+                result = need
+            if result:
+                return result, (f"节点『{getattr(node, 'bl_label', '?')}』"
+                                f"用到了它才有的成员")
+    return None, ""
+
+
+# 节点类型 -> 需要什么基类(或一个根据维度返回基类的函数)
+_BASE_CLASS_NEEDS = {
+    # is_on_floor() / velocity 只有 CharacterBody 有
+    "GKNodeAnimLocomotion": lambda dim: ("CharacterBody2D" if dim == "2"
+                                         else "CharacterBody3D"),
+    # 移动/跳跃这些也是 CharacterBody 的活
+    "GKNodeMoveAndSlide": lambda dim: ("CharacterBody2D" if dim == "2"
+                                       else "CharacterBody3D"),
+    "GKNodeMoveDirection": lambda dim: ("CharacterBody2D" if dim == "2"
+                                        else "CharacterBody3D"),
+    "GKNodeJump": lambda dim: ("CharacterBody2D" if dim == "2"
+                               else "CharacterBody3D"),
+}
 
 
 def generate(tree, options=None):

@@ -133,10 +133,46 @@ def generate_code(tree, settings=None):
     options.setdefault("dimension", "3")
     options.setdefault("base_class", "CharacterBody3D")
     options.setdefault("export_tunables", True)
+
+    # ── 基类可能被"会用到什么"推翻(踩过的坑)────────────────────────
+    # 用户实测:物体是静态的 -> 基类算成 StaticBody3D ->
+    # 但动画状态机生成的代码调用了 `is_on_floor()` / `velocity`,
+    # 那是 CharacterBody 才有的 -> Godot 报
+    #     Function "is_on_fleoor()" not found in base self.
+    #
+    # 这种错不该让用户自己去查物理类型。做法:先**扫一遍节点图**
+    # 看会用到哪些基类能力,当前基类给不了就换掉,并把原因告诉用户。
+    wanted, why = codegen.required_base_class(tree, options)
+    chosen = str(options.get("base_class") or "")
+    if wanted and not _class_provides(chosen, wanted):
+        options["base_class"] = wanted
+        warnings_extra = (
+            f"基类已从『{chosen}』改为『{wanted}』:{why}。"
+            f"如果想保留原来的基类,请把物体的物理类型改成对应的种类")
+    else:
+        warnings_extra = ""
+
     code, warnings = codegen.generate(tree, options)
+    if warnings_extra:
+        warnings.insert(0, warnings_extra)
     file_name = safe_file_name(getattr(tree, "name", ""), "game_logic") + ".gd"
     actions = list(getattr(codegen, "last_used_actions", []) or [])
     return code, warnings, file_name, actions
+
+
+# 哪些基类"已经提供了"某个类的能力 —— 用来避免无谓的替换。
+# 只需要覆盖实际会出现的组合:CharacterBody 是终极需求,其它都比它弱。
+_PROVIDES = {
+    "CharacterBody3D": {"CharacterBody3D"},
+    "CharacterBody2D": {"CharacterBody2D"},
+}
+
+
+def _class_provides(have, want):
+    """`have` 这个基类是否已经满足 `want` 的需求?"""
+    if have == want:
+        return True
+    return want in _PROVIDES.get(have, set())
 
 
 def write_text(path, text):
