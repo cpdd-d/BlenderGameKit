@@ -395,17 +395,29 @@ def _unique_file_names(names, fallback="material"):
 # 靠名字判断会误删。导出时也靠它来排除预览线框。
 PREVIEW_MARK = "gk_collision_preview"
 
+# 工具生成的辅助物理体带这些自定义属性(目前只认 MMD 的刚体/关节)。
+# 它们既不该当碰撞体,也不该当几何导出 —— 见 is_helper_physics。
+HELPER_PHYSICS_KEYS = ("mmd_type", "mmd_rigid", "mmd_joint")
+
 # 工具生成的辅助材质都以此为前缀(描边预览材质等)。
 # 导出时要跳过它们 —— 否则用户会看到自己的模型在 Godot 里变成纯黑壳。
 TOOL_MATERIAL_PREFIX = "__GK"
 
 
 def collect_objects(context):
-    """要导出的对象:优先用选中的，没选就全部可见网格。"""
-    selected = [obj for obj in context.selected_objects if obj.type == "MESH"]
+    """要导出的对象:优先用选中的，没选就全部可见网格。
+
+    **排除辅助物理体**(MMD 那种一骨头一个的刚体小球)——
+    它们既不该当碰撞体也不该当几何。不排除的话用户的胡桃模型会多出
+    848 个 34 顶点的小方块,godot 里一片蓝框,glb 也白白大一圈。
+    """
+    selected = [obj for obj in context.selected_objects
+                if obj.type == "MESH" and not is_helper_physics(obj)]
     if selected:
         return selected, "selected"
-    visible = [obj for obj in context.scene.objects if obj.type == "MESH" and not obj.hide_get()]
+    visible = [obj for obj in context.scene.objects
+               if obj.type == "MESH" and not obj.hide_get()
+               and not is_helper_physics(obj)]
     return visible, "visible"
 
 
@@ -1734,16 +1746,46 @@ def build_collision(obj, is_3d=True, physics=None):
     }
 
 
+def is_helper_physics(obj):
+    """这个物体是不是**插件/工具生成的辅助物理体**(不该导出碰撞)。
+
+    目前只认 MMD:模之屋的 .pmx 用 mmd_tools 导入后,会额外生成
+    **每根骨头一个**的刚体小球/小方块 + 关节(用户的胡桃模型是 848 个)。
+    它们身上带着 `mmd_type` / `mmd_rigid` / `mmd_joint` 自定义属性。
+
+    ── 不排除会怎样(实测)────────────────────────────────────────
+    用户截图里角色周围一堆蓝条、场景里 2301 个碰撞体,就是这么来的:
+    这 848 个刚体每个只有 34 个顶点,导出后全变成 Godot 里的
+    StaticBody3D + CollisionShape3D —— 视觉上一片蓝框,性能上也白烧。
+    而且它们本来就带 `gk_physics`(应该是插件早期自动加的),
+    所以"用户没配就不导出"这条规则拦不住。
+
+    ── 为什么敢直接跳过 ──────────────────────────────────────────
+    MMD 的刚体是给 MMD 自己的物理模拟用的(头发/裙子摆动)。
+    glTF 不导出这套模拟,Godot 也不认,所以它们到 Godot 里
+    只是一堆静止的小方块 —— 没有任何正面作用。
+    真需要裙子物理的用户会在 Godot 里用 BoneAttachment3D 自己做。
+    """
+    for key in HELPER_PHYSICS_KEYS:
+        if key in getattr(obj, "keys", lambda: [])():
+            return True
+    return False
+
+
 def collect_physics(scene):
     """收集场景里所有物体的物理设置。
 
     返回 [(物体, 设置对象, 是否启用)] —— 顺序跟场景一致,生成结果稳定。
     不导入 bpy:scene 由调用方传进来,这样离线测试也能跑。
+
+    辅助物理体(MMD 刚体等)会被**跳过** —— 见 is_helper_physics。
     """
     if scene is None:
         return []
     out = []
     for obj in scene.objects:
+        if is_helper_physics(obj):
+            continue
         physics = getattr(obj, "gk_physics", None)
         # 以前这里有个"是否导出"的开关,后来按用户要求删掉了:
         # 所有网格都导出,碰撞盒要不要在属性里直接配,不用先开一个总开关。
@@ -1769,7 +1811,7 @@ def scene_materials(scene, enabled_only=True, file_names=None):
     for obj in scene.objects:
         if getattr(obj, "type", "") != "MESH":
             continue
-        if obj.get(PREVIEW_MARK):
+        if obj.get(PREVIEW_MARK) or is_helper_physics(obj):
             continue
         material = first_real_material(obj)
         if material is None:
@@ -1908,7 +1950,8 @@ def write_materials(export_dir, objects, shader_res_dir="shaders"):
         scene = getattr(bpy.context, "scene", None)
         objects = [obj for obj in (scene.objects if scene else [])
                    if getattr(obj, "type", "") == "MESH"
-                   and not obj.get(PREVIEW_MARK)]
+                   and not obj.get(PREVIEW_MARK)
+                   and not is_helper_physics(obj)]
 
     # ── 文件名先去重,再逐个写 ──────────────────────────────────────
     # 不过滤重名的话,M MD 那种几十个材质槽的模型会全部落到同一个
@@ -2308,7 +2351,7 @@ def meshes_without_material(scene):
     for obj in scene.objects:
         if getattr(obj, "type", "") != "MESH":
             continue
-        if obj.get(PREVIEW_MARK):
+        if obj.get(PREVIEW_MARK) or is_helper_physics(obj):
             continue
         if not obj.data.materials:
             out.append(obj.name)

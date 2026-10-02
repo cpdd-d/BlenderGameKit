@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
@@ -780,11 +781,43 @@ class GK_OT_ExportAssets(bpy.types.Operator):
                       "并把上一次导出的脚本挂到根节点上。没材质的用默认白色")
     bl_options = {"REGISTER"}
 
+    # ── 进度反馈(用户要求)──────────────────────────────────────────
+    # 实测:49 MB / 1056 骨骼的 MMD 工程要导 **26 秒**,其中
+    # 14.2s + 12s 全在 Blender 的 glTF 导出器里。
+    # 用户原话:"导出时间有点...或许可以加一个进度条,要不然以为卡住了"。
+    #
+    # 诚实地说明能做到什么程度:导出内部是**同步阻塞**的
+    # (bpy.ops.export_scene.gltf 一调就回不来),所以这期间界面不重绘,
+    # 进度条**不会动**。真正有效的是:
+    #   1. 状态栏文字 —— 明确告诉用户"正在导出,这个模型大概要 20~30 秒"
+    #   2. 结束后把每一步的**实测耗时**打出来,下次心里有数
+    # 想让它真的动起来,得把整条流水线改成生成器 + 定时器驱动,
+    # 那是另一个量级的改动(已记进 docs/待办清单.md)。
+    def _progress(self, context, text):
+        try:
+            context.workspace.status_text_set(f"BlenderGameKit:{text}")
+        except Exception:
+            pass
+
+    def _finish_progress(self, context):
+        try:
+            context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
     def execute(self, context):
+        started = time.time()
+        # 先按模型规模给个预估,免得用户以为卡死
+        mesh_count = sum(1 for o in context.scene.objects
+                         if getattr(o, "type", "") == "MESH")
+        estimate = "预计 20~30 秒" if mesh_count > 200 else "预计几秒"
+        self._progress(context, f"正在导出({estimate},请勿关闭 Blender)")
+
         scene = context.scene
         settings = exporter.build_settings(scene)
         directory, ok = _resolve_project(self, context, create=True)
         if not ok:
+            self._finish_progress(context)
             return {"CANCELLED"}
         settings["output_dir"] = directory
 
@@ -804,12 +837,16 @@ class GK_OT_ExportAssets(bpy.types.Operator):
                 script_name=LAST_EXPORT.get("script_name") or None,
             )
         except Exception as exc:
+            self._finish_progress(context)
             _report(self, "ERROR", f"导出失败: {type(exc).__name__}: {exc}")
             return {"CANCELLED"}
 
         if outcome.get("error"):
+            self._finish_progress(context)
             _report(self, "ERROR", outcome["error"])
             return {"CANCELLED"}
+
+        self._finish_progress(context)
 
         for warning in outcome.get("warnings", []):
             _report(self, "WARNING", warning)
@@ -823,11 +860,13 @@ class GK_OT_ExportAssets(bpy.types.Operator):
 
         bounds = asset_export.object_bounds(objects)
         size = bounds["size"] if bounds else (0, 0, 0)
+        elapsed = time.time() - started
         _report(self, "INFO",
                 f"已导出 {len(objects)} 个网格、{outcome['materials']} 个材质、"
                 f"{outcome['bodies']} 个碰撞体、{outcome['cameras']} 个相机、"
                 f"{outcome['lights']} 盏灯"
-                f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}）")
+                f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}，"
+                f"耗时 {elapsed:.1f} 秒）")
         for path in written:
             # 防御:written 里理论上不该有 None,但一旦混进来,
             # `os.path.basename(None)` 会崩,而且崩在"报告结果"这一步 ——
