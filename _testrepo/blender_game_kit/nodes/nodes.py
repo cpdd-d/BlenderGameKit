@@ -773,123 +773,6 @@ _ANIM_TREE_HINT = (
 
 
 @N
-class GKNodeAnimState(B.GKStatementNode):
-    bl_idname = "GKNodeAnimState"
-    bl_label = "动画状态(旧)"
-    bl_icon = "POSE_HLT"
-    gk_category = "动画系统"
-    gk_tree_type = "GKAnimationTree"
-    # ── 从菜单里**隐藏**(用户选了"统一成一种卡片")────────────────
-    # 用户原话:"选择B" —— B 是"砍掉『动画状态』,只留『动画_切状态』,
-    # 条件全靠拉线,更蓝图"。
-    #
-    # 但**没有删除**:已经用过它的动画树还得能打开 ——
-    # 删了那些图会报"无法将 'GKNodeAnimState' 类型的节点添加/加载",
-    # 用户会以为文件坏了。所以只是不出现在"添加节点"菜单里。
-    # codegen 仍然认识它(见 codegen._anim_tree_states)。
-    gk_hidden = True
-    gk_doc = ("【旧版,已隐藏】把条件和目标写在状态自己身上。"
-              "现在统一用『动画_切状态』卡片 —— 条件从逻辑判断拉线进来,"
-              "和蓝图一致。这个节点只为兼容已有的图而保留")
-    gk_doc = ("一个动画状态。状态名就是动画名。"
-              "切换条件有两种写法 —— "
-              "『自己写』:把条件接到右边那个布尔引脚上(想多复杂都行);"
-              "『选输入』:直接在节点上选一个输入动作,不用另外拉表达式节点。"
-              "『优先级』小的先判(同时为真时用它决定谁赢)")
-    gk_inputs = (
-        S.pin(BOOL, "条件", False),
-    )
-    gk_outputs = ()
-    gk_prop_defs = (
-        # ── 状态名 = 动画名,用**动作数据块**选,不用手打 ──────────────
-        # 用户原话:"状态idle/run/jump等的应该可以预设成一个个节点卡片,
-        # 而不是自己输入(如果自己输入错误,又产生不必要的麻烦)"
-        #
-        # 说得对:手打"run"打成"rnu"不会有任何提示,要到 Godot 运行时
-        # 才发现。改成和『动画_播放』一样的**原生动作选择器**,
-        # 从文件里真实的动作里挑 —— 选错了根本选不出来。
-        #
-        # 和下面 `gk_state_name` 的分工:
-        #   gk_anim_action 有值 -> 用它的 name(首选)
-        #   否则               -> 用手填的 gk_state_name(兜底/跨文件引用)
-        ("gk_anim_action", "action", None, "状态动画",
-         "从文件里所有动作中选一个(原生选择器,能搜索)"),
-        ("gk_state_name", "string", "idle", "状态名(手填兜底)",
-         "没选『状态动画』时才用它"),
-        # ── 复合条件:不用额外拉表达式节点 ──────────────────────────
-        # 用户要"利用 blender 的优点和虚幻蓝图的优点结合" ——
-        # 蓝图里最常见的条件就是"某个键按住/松开",为了这个去拉
-        # 一个『输入_按住』节点再连线,状态一多整张图就全是线。
-        # 所以让状态节点**自己**能选:条件来源 = 选输入时,
-        # 直接在节点上挑动作 + 挑判断方式。
-        ("gk_cond_source", "enum", "PIN", "条件来源",
-         "『自己写』= 用右边的条件引脚;『选输入』= 在下面直接挑",
-         (("PIN", "自己写(接引脚)", "想多复杂都行:速度、距离、组合条件"),
-          ("ACTION_PRESSED", "选输入:按住", "按键按住期间为真"),
-          ("ACTION_JUST", "选输入:刚按下", "按键刚按下那一帧为真"),
-          ("ACTION_RELEASED", "选输入:松开", "按键松开期间为真"))),
-        ("gk_cond_action", "string", "move_right", "输入动作",
-         "只有『条件来源』选了输入类才用得上"),
-        ("gk_priority", "int", 0, "优先级", "数字小的先判;同时为真时它赢"),
-        ("gk_is_default", "bool", False, "起始状态",
-         "勾上 = 进游戏时的默认状态(整个树里只该勾一个)"),
-    )
-
-    def resolved_state_name(self):
-        """这个状态到底叫什么 —— 优先用选中的**动作**,否则用手填的。
-
-        两种来源都支持是为了两件事:
-          * 选了动作 -> 名字一定对(动画不存在根本选不出来)
-          * 没选     -> 还能手填(比如动画是运行时才加载的)
-        """
-        action = getattr(self, "gk_anim_action", None)
-        if action is not None:
-            name = str(getattr(action, "name", "") or "")
-            if name:
-                return name
-        return str(getattr(self, "gk_state_name", "") or "")
-
-    def draw_buttons(self, context, layout):
-        # 主入口:原生动作选择器(和『动画_播放』一致)
-        layout.prop(self, "gk_anim_action", text="")
-        if self.gk_anim_action is not None:
-            layout.label(text=f"状态:{self.gk_anim_action.name}",
-                         icon="CHECKMARK")
-        else:
-            layout.prop(self, "gk_state_name", text="", icon="SORTALPHA")
-        layout.prop(self, "gk_cond_source", text="")
-        # 选了"自己写"才提示去接引脚;选了输入就直接给动作名输入框
-        if str(getattr(self, "gk_cond_source", "PIN")) == "PIN":
-            layout.label(text="条件 -> 接右边引脚", icon="LINKED")
-        else:
-            layout.prop(self, "gk_cond_action", text="")
-        row = layout.row(align=True)
-        row.prop(self, "gk_priority", text="优先")
-        row.prop(self, "gk_is_default", text="起始")
-
-    def condition_expr(self, ctx):
-        """这个状态的条件表达式;没有条件就返回 None。
-
-        两种来源都支持,见上面 gk_cond_source 的说明。
-        """
-        source = str(getattr(self, "gk_cond_source", "PIN"))
-        if source == "PIN":
-            socket = self.inputs.get("条件")
-            if socket is None or not getattr(socket, "is_linked", False):
-                return None
-            return ctx.expr_of(socket)
-        action = str(getattr(self, "gk_cond_action", "move_right") or "")
-        if not action:
-            return None
-        const = ctx.add_action(action)
-        return {
-            "ACTION_PRESSED": f"Input.is_action_pressed({const})",
-            "ACTION_JUST": f"Input.is_action_just_pressed({const})",
-            "ACTION_RELEASED": f"Input.is_action_just_released({const})",
-        }.get(source)
-
-
-@N
 class GKNodeAnimLocomotion(B.GKExpressionNode):
     bl_idname = "GKNodeAnimLocomotion"
     bl_label = "动画判断_移动状态"
@@ -898,8 +781,8 @@ class GKNodeAnimLocomotion(B.GKExpressionNode):
     gk_tree_type = "GKAnimationTree"
     gk_doc = (
         "把动画切换最常用的判断一次给你 —— 不用为每个条件单独拉节点。"
-        "输出全是布尔,直接接到状态节点的『条件』引脚:"
-        "『在地面』『在移动』『在地面且在移动』『已离地』『在上升』"
+        "输出全是布尔,直接接到转场节点的『条件』引脚:"
+        "『在地面』『在移动』『地面且移动』『已离地』『在上升』"
         "『在下落』『速度快』『速度慢』。"
         "『速度阈值』用来区分走和跑")
     gk_inputs = (
@@ -929,84 +812,147 @@ class GKNodeAnimLocomotion(B.GKExpressionNode):
         row.prop(self, "gk_fast_threshold", text="跑")
 
 
-def animation_tree_items():
-    """『树名』下拉的选项:文件里所有动画树。
+@N
+class GKNodeAnimState(B.GKStatementNode):
+    bl_idname = "GKNodeAnimState"
+    bl_label = "动画状态(旧)"
+    bl_icon = "POSE_HLT"
+    gk_category = "动画系统"
+    gk_tree_type = "GKAnimationTree"
+    # ── 从菜单里**隐藏**(用户选了"统一成一种卡片")────────────────
+    # 用户原话:"选择B" —— B 是"砍掉『动画状态』,只留『动画_切状态』,
+    # 条件全靠拉线,更蓝图"。
+    #
+    # 但**没有删除**:已经用过它的动画树还得能打开 ——
+    # 删了那些图会报"无法将 'GKNodeAnimState' 类型的节点添加/加载",
+    # 用户会以为文件坏了。所以只是不出现在"添加节点"菜单里。
+    # codegen 仍然认识它(见 codegen._anim_tree_states)。
+    gk_hidden = True
+    gk_doc = ("【旧版,已隐藏】把条件和目标写在状态自己身上。"
+              "现在统一用『动画_切状态』卡片 —— 条件从逻辑判断拉线进来,"
+              "和蓝图一致。这个节点只为兼容已有的图而保留")
+    gk_doc = ("一个动画状态。状态名就是动画名。"
+              "切换条件有两种写法 —— "
+              "『自己写』:把条件接到右边那个布尔引脚上(想多复杂都行);"
+              "『选输入』:直接在节点上选一个输入动作,不用另外拉表达式节点。"
+              "『优先级』小的先判(同时为真时用它决定谁赢)")
+    # ── A 方案:照虚幻 5 的动画状态机(用户确认)──────────────────
+    # UE5 里状态之间**只能有一条出线**(出线接一个 Transition,
+    # Transition 再接下一个状态的入口),所以不需要额外给"完成"引脚 ——
+    # 『转到』一条就够了。
+    #
+    #   [动画_状态 idle] ● 进入        ● 转到 ──> [动画_转场] ● 转到 ──> [动画_状态 run] ● 进入
+    #
+    # 一条链就是一张状态机图,一眼看出从哪来、到哪去。
+    gk_inputs = (
+        S.pin(FLOW, "进入"),
+    )
+    gk_outputs = (
+        S.pin(FLOW, "转到"),
+    )
+    gk_prop_defs = (
+        # 状态名 = 动画名,用**动作数据块**选,不用手打。
+        # 手打 "run" 打成 "rnu" 不会有任何提示,要到 Godot 运行时才发现。
+        ("gk_anim_action", "action", None, "动画",
+         "这个状态播哪个动作(原生选择器,能搜索)"),
+        ("gk_state_name", "string", "idle", "状态名(手填兜底)",
+         "没选『动画』时才用它"),
+    )
 
-    ── 为什么改成下拉(用户问的)──────────────────────────────────
-    用户原话:"下面的树名又是怎么填(一般都是两个就可以了吧,
-    哪个物体的哪个属性,或者说像蓝图一样可以自己添加全局变量连接点!)"
+    def resolved_state_name(self):
+        """这个状态叫什么 —— 优先用选中的**动作**,否则用手填的。
 
-    **问得对,那个手填字段确实是多余的。** 手打树名一旦打错,
-    导出时只会说"找不到动画树",用户还得回去对名字。
-    改成把所有动画树列出来直接选 —— 而且顺便把每张树有几个状态
-    写在标签里,一眼能看出该选哪张。
-    """
-    try:
-        import bpy
-    except Exception:
-        return []
-    data = getattr(bpy, "data", None)
-    groups = getattr(data, "node_groups", None)
-    if groups is None:
-        return []
-    entries = []
-    for group in groups:
-        if getattr(group, "bl_idname", "") != "GKAnimationTree":
-            continue
-        name = str(getattr(group, "name", ""))
-        count = len([n for n in getattr(group, "nodes", ()) or ()
-                     if getattr(n, "bl_idname", "") == "GKNodeAnimState"])
-        entries.append((name, f"{name}  ({count} 个状态)", name))
-    # 「自动」放最前面 —— 只有一张树时用户根本不用想
-    entries.sort(key=lambda item: item[0])
-    return [("", "自动(用第一张动画树)", "文件里只有一张时选这个就行")] + entries
+        两种来源都支持是为了两件事:
+          * 选了动作 -> 名字一定对(动画不存在根本选不出来)
+          * 没选     -> 还能手填(比如动画是运行时才加载的)
+        """
+        action = getattr(self, "gk_anim_action", None)
+        if action is not None:
+            name = str(getattr(action, "name", "") or "")
+            if name:
+                return name
+        return str(getattr(self, "gk_state_name", "") or "")
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_anim_action", text="")
+        if self.gk_anim_action is not None:
+            layout.label(text=f"状态:{self.gk_anim_action.name}",
+                         icon="CHECKMARK")
+        else:
+            layout.prop(self, "gk_state_name", text="", icon="SORTALPHA")
+        layout.label(text="转到 -> 接一个『动画_转场』", icon="FORWARD")
 
 
 @N
 class GKNodeAnimTransition(B.GKStatementNode):
     bl_idname = "GKNodeAnimTransition"
-    bl_label = "动画_切状态"
+    bl_label = "动画_转场"
     bl_icon = "TRACKING_FORWARDS_SINGLE"
     gk_category = "动画系统"
     gk_tree_type = "GKAnimationTree"
     gk_doc = (
-        "一张**切换卡片**。条件引脚接逻辑判断(『动画判断_移动状态』"
-        "之类),条件为真时切到『目标状态』。"
-        "这就是那个『从逻辑判断拉线来决定切哪个动画』的连接点。"
-        "多张卡片按『优先级』依次判断,数字小的先判"
+        "一条转场规则(对应虚幻 5 的 Transition Rule):"
+        "『条件』为真时,从左边连过来的状态切到右边连着的状态。"
+        "『条件来源』可以直接选一个输入动作(按住/刚按下/松开),"
+        "不用另外拉节点;选『自己写』则把判断接到『条件』引脚上"
     )
+    # ── 为什么有两个输入引脚 ────────────────────────────────────────
+    # 『进入』= **执行流**入口,接上游状态的『转到』。
+    # 『条件』= 布尔判断,接『动画判断_移动状态』之类的输出,
+    #          或者用『条件来源』在节点上直接选一个按键。
+    #
+    # 两者必须分开:一条转移既要知道"从哪来"(流),
+    # 又要知道"什么条件下切"(布尔)。合成一个引脚会互相覆盖。
     gk_inputs = (
+        S.pin(FLOW, "进入"),
         S.pin(BOOL, "条件", False),
     )
-    gk_outputs = ()
+    gk_outputs = (
+        S.pin(FLOW, "转到"),
+    )
     gk_prop_defs = (
-        ("gk_to_action", "action", None, "目标动画",
-         "切到哪个动画(从文件里的动作里选)"),
-        ("gk_to_state", "string", "", "目标状态(手填兜底)",
-         "没选『目标动画』时才用它"),
-        ("gk_priority", "int", 0, "优先级", "数字小的先判"),
-        ("gk_is_default", "bool", False, "起始状态",
-         "勾上 = 进游戏时的默认状态(整个树里只该勾一个)"),
+        # ── 复合条件:不用额外拉表达式节点 ──────────────────────────
+        # 蓝图里最常见的条件就是"某个键按住/松开"。为了这个去拉一个
+        # 『输入_按住』节点再连线,状态一多整张图就全是线 —— 那正是
+        # 用户抱怨的"密密麻麻"。
+        ("gk_cond_source", "enum", "PIN", "条件来源",
+         "『自己写』= 用左边的条件引脚;『选输入』= 在下面直接挑",
+         (("PIN", "自己写(接引脚)", "想多复杂都行:速度、距离、组合条件"),
+          ("ACTION_PRESSED", "选输入:按住", "按键按住期间为真"),
+          ("ACTION_JUST", "选输入:刚按下", "按键刚按下那一帧为真"),
+          ("ACTION_RELEASED", "选输入:松开", "按键松开期间为真"))),
+        ("gk_cond_action", "string", "move_right", "输入动作",
+         "只有『条件来源』选了输入类才用得上"),
     )
 
-    def resolved_state_name(self):
-        """目标状态名 —— 优先用选中的动作,否则用手填的。"""
-        action = getattr(self, "gk_to_action", None)
-        if action is not None:
-            name = str(getattr(action, "name", "") or "")
-            if name:
-                return name
-        return str(getattr(self, "gk_to_state", "") or "")
+    def condition_expr(self, ctx):
+        """这条转场的条件表达式;没有条件就返回 None。
+
+        两种来源都支持 —— 见上面 gk_cond_source 的说明。
+        """
+        source = str(getattr(self, "gk_cond_source", "PIN"))
+        if source == "PIN":
+            socket = self.inputs.get("条件")
+            if socket is None or not getattr(socket, "is_linked", False):
+                return None
+            return ctx.expr_of(socket)
+        action = str(getattr(self, "gk_cond_action", "move_right") or "")
+        if not action:
+            return None
+        const = ctx.add_action(action)
+        return {
+            "ACTION_PRESSED": f"Input.is_action_pressed({const})",
+            "ACTION_JUST": f"Input.is_action_just_pressed({const})",
+            "ACTION_RELEASED": f"Input.is_action_just_released({const})",
+        }.get(source)
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "gk_to_action", text="")
-        if self.gk_to_action is not None:
-            layout.label(text=f"-> {self.gk_to_action.name}", icon="FORWARD")
+        layout.prop(self, "gk_cond_source", text="")
+        if str(getattr(self, "gk_cond_source", "PIN")) == "PIN":
+            layout.label(text="条件 -> 接左边", icon="LINKED")
         else:
-            layout.prop(self, "gk_to_state", text="", icon="FORWARD")
-        row = layout.row(align=True)
-        row.prop(self, "gk_priority", text="优先")
-        row.prop(self, "gk_is_default", text="起始")
+            layout.prop(self, "gk_cond_action", text="")
+        layout.label(text="转到 -> 接下一个状态", icon="FORWARD")
 
 
 @N

@@ -1573,13 +1573,30 @@ def _stmt_anim_tree_ref(ctx, node, indent):
     Animation Blueprint 那样拆开,别都堆在一个节点里)。
     """
     tree = _find_animation_tree(getattr(node, "gk_tree_name", ""))
-    states = _anim_tree_states(tree) if tree is not None else []
-    if not states:
-        ctx.warn(f"节点『{node.bl_label}』找不到动画树"
+    entry, entries = _anim_tree_entry(tree) if tree is not None else (None, [])
+    if entry is None:
+        ctx.warn(f"节点『{node.bl_label}』找不到可用的动画状态机"
                  f"{'『' + node.gk_tree_name + '』' if node.gk_tree_name else ''}"
-                 f"。先在『游戏动画』面板里建一张,并在里面放几个"
-                 f"『动画状态』节点")
+                 f"。先在『游戏动画』面板里建一张动画树,放一个『动画_状态』"
+                 f"(它的『进入』不接线 = 起始状态),再用『动画_转场』连下去")
         return
+    chain, chain_warnings = _walk_state_chain(entry)
+    # ── 只对"真的孤立"的状态告警(踩过的坑)────────────────────────
+    # 环(idle <-> run)里两个状态都"没有外来入边",按入口判定都算候选 ——
+    # 但它们是**连着的**。直接报"有 2 个入口"是误报,
+    # 用户会以为哪里配错了,其实图完全正常。
+    #
+    # 正确判断:走完链之后,不在链上的状态才是真的孤立。
+    on_chain = {id(state) for state, _tr in chain}
+    orphans = [s for s in entries if id(s) not in on_chain]
+    if orphans:
+        names = "、".join(_state_label(s) for s in orphans[:4])
+        ctx.warn(f"动画树里有 {len(orphans) + 1} 段互不相连的状态机 —— "
+                 f"导出只用了含『{_state_label(entry)}』的那一段。"
+                 f"孤立的是:({names})。"
+                 f"请用『动画_转场』把它们连起来")
+    for note in chain_warnings:
+        ctx.warn(note)
 
     player = ctx.animation_player(node)
     var_name = ctx.declare_var(
@@ -1600,19 +1617,9 @@ def _stmt_anim_tree_ref(ctx, node, indent):
         # 再写 `var _ap0 := ...` 就是**同一作用域里重复声明**,
         # Godot 会报 "There is already a variable named ..."。
         ctx.add_line(indent, f"{player_temp} = {player}")
-    def _name_of(state):
-        fn = getattr(state, "resolved_state_name", None)
-        if fn is not None:
-            return fn()
-        return str(getattr(state, "gk_state_name", "") or "")
-
-    default_name = ""
-    for item in states:
-        if bool(getattr(item, "gk_is_default", False)):
-            default_name = _name_of(item)
-            break
-    if not default_name:
-        default_name = _name_of(states[0])
+    # 起始状态 = 链路的**入口**(『进入』没接线的那个)--
+    # 照 UE5 的 Entry 节点。不用再靠 gk_is_default 勾选框。
+    default_name = _state_label(entry)
     ctx.add_line(indent, f"if {var_name}.is_empty():")
     ctx.add_line(indent + 1, f"{var_name} = {gd_string(default_name)}")
 
@@ -1620,12 +1627,302 @@ def _stmt_anim_tree_ref(ctx, node, indent):
         # 交给 generate() 统一发射到 _physics_process —— 跟移动同步判定,
         # 避免"人走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
         ctx.anim_trees.append({
-            "node": node, "states": states, "var": var_name,
+            "node": node, "chain": chain, "var": var_name,
             "player": player_temp,
         })
         ctx.need_anim_tree_process = True
         return
-    _emit_tree_transitions(ctx, node, indent, states, var_name, player_temp)
+    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp)
+
+
+def _find_animation_tree(name):
+    """按名字找一张动画树;名字为空就用文件里第一张。"""
+    try:
+        import bpy
+    except Exception:
+        return None
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return None
+    wanted = str(name or "")
+    first = None
+    for group in groups:
+        if getattr(group, "bl_idname", "") != "GKAnimationTree":
+            continue
+        if first is None:
+            first = group
+        if wanted and str(getattr(group, "name", "")) == wanted:
+            return group
+    return first if not wanted else None
+
+
+def _anim_tree_links(tree):
+    """把动画树里的连线整理成两张表。
+
+    返回 (links, targets):
+      * links   = {id(节点): [(输出引脚名, 目标节点), ...]}
+      * targets = {id(节点)} —— 被别人指到过的节点
+
+    做这一层的理由:入口判定和走链都要反复问"谁指到谁",
+    在每个节点上现翻 `socket.links` 又慢又容易漏(实测漏过)。
+    """
+    links = {}
+    targets = set()
+    if tree is None:
+        return links, targets
+    for node in getattr(tree, "nodes", ()) or ():
+        outs = []
+        for socket in getattr(node, "outputs", ()) or ():
+            if not getattr(socket, "is_linked", False):
+                continue
+            for link in getattr(socket, "links", ()) or ():
+                target = getattr(link, "to_node", None)
+                if target is None:
+                    continue
+                outs.append((getattr(socket, "name", ""), target))
+                targets.add(id(target))
+        if outs:
+            links[id(node)] = outs
+    return links, targets
+
+
+def _anim_tree_entry(tree):
+    """找状态机的**入口状态** —— 照 UE5 的 Entry 节点。
+
+    -- 判断规则:**没有被任何『转到』指到**的状态才是入口 ----------
+    第一版写成"『进入』引脚没接线就是入口",**是错的**:
+    链上第一个状态的『进入』本来就没接线(没有上游),这没错;
+    但**环**里的状态会同时满足两个身份 —— 实测 `idle -> run -> idle`
+    里 run 也被判成了入口,于是报"有 2 个入口",而且入口选错了。
+
+    真正的语义是"谁指到我":没有任何『转到』指向我 = 我是起点。
+    """
+    if tree is None:
+        return None, []
+    _links, targets = _anim_tree_links(tree)
+    all_states = [n for n in (getattr(tree, "nodes", ()) or ())
+                  if getattr(n, "bl_idname", "") == "GKNodeAnimState"]
+    entries = [n for n in all_states if id(n) not in targets]
+    if not entries and all_states:
+        # -- 全是环(idle <-> run)时的兜底 ---------------------------
+        # 每个状态都被别人指到,那就没人是"天然入口"了 —— 但状态机
+        # **总得有个起点**。按位置取最上面那个(布局习惯:起始状态
+        # 放左上,后面的往下排)。
+        #
+        # 实测踩过:idle -> run -> idle 构成环 -> 候选为空 ->
+        # 直接报"找不到可用的动画状态机",用户一头雾水。
+        all_states.sort(key=lambda n: (getattr(n, "location", (0.0, 0.0))[1],
+                                       getattr(n, "location", (0.0, 0.0))[0]))
+        return all_states[0], all_states
+    if not entries:
+        return None, []
+    entries.sort(key=lambda n: getattr(n, "location", (0.0, 0.0))[1])
+    return entries[0], entries
+
+
+def _next_of(node, output_name):
+    """沿某个输出引脚找出下一个节点。
+
+    返回 (下一个节点 或 None, 出线条数)。
+
+    -- 多条出线要报错,不能静默取第一条(踩过的坑)----------------
+    照 UE5 的规则:**一个状态只能有一条出线**(想多方分支就在转场里
+    把条件写全)。实测如果用户接了两条,`next(iter(...))` 只会拿第一条,
+    **第二条被静默丢掉** -- 用户会以为规则生效了,但游戏里怎么都不切。
+
+    所以这里把"有几条"一起返回,由调用方决定怎么告警。
+    """
+    socket = node.outputs.get(output_name) if hasattr(node, "outputs") else None
+    if socket is None or not getattr(socket, "is_linked", False):
+        return None, 0
+    links = list(socket.links)
+    if not links:
+        return None, 0
+    return getattr(links[0], "to_node", None), len(links)
+
+
+def _walk_state_chain(entry):
+    """从入口状态沿『转到 -> 转场 -> 转到 -> 状态』走一圈。
+
+    返回 (chain, warnings),chain 是 [(状态节点, 转场节点或 None), ...]。
+    最后一个元素的转场是 None(走到头了,或者绕回已经来过的状态)。
+
+    ── 为什么要防环 ────────────────────────────────────────────────
+    状态机图**天然会有环**(idle -> run -> idle)。走链时必须有
+    "走过的不再走"的保护,不然导出会无限递归。
+    回到已访问状态就停止 —— 语义上也对:那条转移已经生成过了。
+    """
+    chain = []
+    warnings = []
+    seen = set()
+    state = entry
+    while state is not None:
+        key = id(state)
+        if key in seen:
+            # ── 环:回到走过的状态 -> 停 ─────────────────────────────
+            # 别再往链里追加东西:上一轮循环**已经**把那条转移
+            # (`chain[-1] = (上一个状态, 那条转场)`)记进去了,
+            # 再补一个 (这个状态, 同一条转场) 会生成出一条
+            # 条件用 A 的、目标却写成 B 的**错规则**。
+            #
+            # 实测踩过:idle -> run -> idle 多生成了一条
+            #     if anim_state == "idle" and <T2 的条件>: anim_state = "idle"
+            # 条件不对、目标也不对,而且是重复规则。
+            break
+        seen.add(key)
+        transition, link_count = _next_of(state, "转到")
+        if link_count > 1:
+            warnings.append(
+                f"状态『{_state_label(state)}』的『转到』接了 "
+                f"{link_count} 条线,只会用第一条 —— "
+                f"一个状态只能有一条出线(想多方分支就把条件都写进"
+                f"那一个『动画_转场』里)")
+        if transition is None:
+            chain.append((state, None))
+            break
+        if getattr(transition, "bl_idname", "") != "GKNodeAnimTransition":
+            label = getattr(transition, "bl_label", "?")
+            warnings.append(f"状态『{_state_label(state)}』的『转到』接的是"
+                            f"『{label}』,不是『动画_转场』—— 这条链到此为止")
+            chain.append((state, None))
+            break
+        chain.append((state, transition))
+        nxt, _n = _next_of(transition, "转到")
+        if nxt is None:
+            warnings.append(f"转场接出去了,但没有连到下一个状态的『进入』")
+            break
+        if getattr(nxt, "bl_idname", "") != "GKNodeAnimState":
+            label = getattr(nxt, "bl_label", "?")
+            warnings.append(f"转场连到了『{label}』,不是『动画_状态』")
+            break
+        state = nxt
+    return chain, warnings
+
+
+def _state_label(state):
+    """状态显示名,给告警用。"""
+    fn = getattr(state, "resolved_state_name", None)
+    name = fn() if fn is not None else getattr(state, "gk_state_name", "")
+    return name or getattr(state, "bl_label", "?")
+
+
+def _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp):
+    """沿链生成"这条转移的条件为真就切过去"。
+
+    每段的形态:
+        if anim_state == "起始" and <条件>:
+            anim_state = "目标"
+            <播目标状态的动画>
+    """
+    emitted = set()
+    for index, (state, transition) in enumerate(chain):
+        if transition is None:
+            continue
+        # 同一条转场只生成一次 —— 环会让它在链里出现两次
+        if id(transition) in emitted:
+            continue
+        emitted.add(id(transition))
+        start_name = _state_label(state)
+        # 下一段的状态就是目标状态。
+        # 走到链尾(环)时用**转移自己**指的那个节点当目标。
+        if index + 1 < len(chain):
+            nxt = chain[index + 1][0]
+        else:
+            nxt, _n = _next_of(transition, "转到")
+        if nxt is None:
+            continue
+        end_name = _state_label(nxt)
+        if not end_name:
+            continue
+        getter = getattr(transition, "condition_expr", None)
+        condition = getter(ctx) if getter is not None else None
+        if not condition:
+            ctx.warn(f"转场『{start_name} -> {end_name}』没有条件,"
+                     f"不会生效。把判断接到它的『条件』引脚上,"
+                     f"或者把『条件来源』改成『选输入』直接挑一个按键")
+            continue
+        ctx.add_line(indent, f'if {var_name} == {gd_string(start_name)} '
+                             f'and {condition}:')
+        ctx.add_line(indent + 1, f'{var_name} = {gd_string(end_name)}')
+        ctx.add_line(indent + 1, f"if {player_temp} != null and "
+                                 f"{player_temp}.has_animation({gd_string(end_name)}):")
+        ctx.add_line(indent + 2,
+                     f"{player_temp}.play({gd_string(end_name)}, -1.0, 1.0)")
+        ctx.add_line(indent + 1, "else:")
+        ctx.add_line(indent + 2,
+                     f'push_warning("[GK] 状态『{end_name}』没有对应的动画: %s" % '
+                     f"{gd_string(end_name)})")
+
+
+@stmt_node("GKNodeAnimStateMachineRef")
+def _stmt_anim_tree_ref(ctx, node, indent):
+    """驱动一张**动画树** —— 玩法图和动画图分开放。
+
+    见 nodes.py 里 GKNodeAnimState 那段的说明(用户要求照虚幻 5 的
+    Animation Blueprint 那样拆开,别都堆在一个节点里)。
+    """
+    tree = _find_animation_tree(getattr(node, "gk_tree_name", ""))
+    entry, entries = _anim_tree_entry(tree) if tree is not None else (None, [])
+    if entry is None:
+        ctx.warn(f"节点『{node.bl_label}』找不到可用的动画状态机"
+                 f"{'『' + node.gk_tree_name + '』' if node.gk_tree_name else ''}"
+                 f"。先在『游戏动画』面板里建一张动画树,放一个『动画_状态』"
+                 f"(它的『进入』不接线 = 起始状态),再用『动画_转场』连下去")
+        return
+    chain, chain_warnings = _walk_state_chain(entry)
+    # ── 只对"真的孤立"的状态告警(踩过的坑)────────────────────────
+    # 环(idle <-> run)里两个状态都"没有外来入边",按入口判定都算候选 ——
+    # 但它们是**连着的**。直接报"有 2 个入口"是误报,
+    # 用户会以为哪里配错了,其实图完全正常。
+    #
+    # 正确判断:走完链之后,不在链上的状态才是真的孤立。
+    on_chain = {id(state) for state, _tr in chain}
+    orphans = [s for s in entries if id(s) not in on_chain]
+    if orphans:
+        names = "、".join(_state_label(s) for s in orphans[:4])
+        ctx.warn(f"动画树里有 {len(orphans) + 1} 段互不相连的状态机 —— "
+                 f"导出只用了含『{_state_label(entry)}』的那一段。"
+                 f"孤立的是:({names})。"
+                 f"请用『动画_转场』把它们连起来")
+    for note in chain_warnings:
+        ctx.warn(note)
+
+    player = ctx.animation_player(node)
+    var_name = ctx.declare_var(
+        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
+        "String")
+    # -- 播放器引用必须是**成员变量**,不能是局部变量(踩过的坑)------
+    # 状态判断跑在 _physics_process 里,而 _ready 里也用它。
+    # 用 new_temp()(局部变量)会炸:
+    #     Identifier "_ap1" not declared in the current scope
+    # 实测用户导出后报了这个错。
+    #
+    # 而且只在 _ready 里赋值一次就够了(它不会变),
+    # 所以赋值语句只在 _ready 那次执行时生成,避免每个物理帧都查一遍。
+    player_temp = ctx.member_temp("ap")
+    if not getattr(ctx, "_anim_player_assigned", False):
+        ctx._anim_player_assigned = True
+        # 用 `=` 不用 `:=`:成员变量已经在类顶部声明过 `var _ap0 = null`,
+        # 再写 `var _ap0 := ...` 就是**同一作用域里重复声明**,
+        # Godot 会报 "There is already a variable named ..."。
+        ctx.add_line(indent, f"{player_temp} = {player}")
+    # 起始状态 = 链路的**入口**(『进入』没接线的那个)--
+    # 照 UE5 的 Entry 节点。不用再靠 gk_is_default 勾选框。
+    default_name = _state_label(entry)
+    ctx.add_line(indent, f"if {var_name}.is_empty():")
+    ctx.add_line(indent + 1, f"{var_name} = {gd_string(default_name)}")
+
+    if str(getattr(node, "gk_check_mode", "EVERY_FRAME")) == "EVERY_FRAME":
+        # 交给 generate() 统一发射到 _physics_process —— 跟移动同步判定,
+        # 避免"人走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
+        ctx.anim_trees.append({
+            "node": node, "chain": chain, "var": var_name,
+            "player": player_temp,
+        })
+        ctx.need_anim_tree_process = True
+        return
+    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp)
 
 
 def _find_animation_tree(name):
@@ -3451,12 +3748,12 @@ class Generator:
                 _emit_state_transitions(self.ctx, machine["node"], 1,
                                         machine["rules"], machine["var"],
                                         machine["player"])
-            for entry in self.ctx.anim_trees:
+            for machine in self.ctx.anim_trees:
                 self.ctx._active.clear()
-                self.ctx._current_event = entry["node"].name
-                _emit_tree_transitions(self.ctx, entry["node"], 1,
-                                       entry["states"], entry["var"],
-                                       entry["player"])
+                self.ctx._current_event = machine["node"].name
+                _emit_chain_transitions(self.ctx, machine["node"], 1,
+                                        machine["chain"], machine["var"],
+                                        machine["player"])
             sections.append({
                 "signature": "func _physics_process(_delta: float) -> void:",
                 "lines": list(lines.lines),

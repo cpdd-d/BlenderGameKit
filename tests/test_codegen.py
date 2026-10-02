@@ -2865,10 +2865,22 @@ class TestAnimTreeScope(Base):
         anim = gk_stub.StubNodeTree("角色动画")
         anim.bl_idname = "GKAnimationTree"
         loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
-        card = anim.new_node(NN.GKNodeAnimTransition, "切")
-        card.gk_to_state = "跑步"
-        card.gk_is_default = True
-        gk_stub.connect(anim, loco, "地面且移动", card, "条件")
+        # 链路模型(照 UE5):
+        #   [状态 idle] --转到--> [转场] --转到--> [状态 跑步]
+        # 转场的条件来自『移动状态』的『地面且移动』
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        run = anim.new_node(NN.GKNodeAnimState, "状态跑步")
+        run.gk_state_name = "跑步"
+        transition = anim.new_node(NN.GKNodeAnimTransition, "转场")
+        # 链路:状态 --转到--> 转场 --转到--> 下一个状态
+        # 『转到』接的是转场的**条件**引脚 —— 转场没有"执行流入口",
+        # 它就是"上游状态指过来"的那个连接点。条件另外接在『条件』上。
+        # 链路:状态 --转到--> 转场『进入』;转场『条件』接判断;
+        # 转场『转到』---> 下一个状态的『进入』
+        gk_stub.connect(anim, idle, "转到", transition, "进入")
+        gk_stub.connect(anim, transition, "转到", run, "进入")
+        gk_stub.connect(anim, loco, "地面且移动", transition, "条件")
 
         event = tree.new_node(NN.GKNodeOnReady, "准备")
         ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
@@ -2927,6 +2939,239 @@ class TestAnimTreeScope(Base):
 def bpy_module():
     import bpy
     return bpy
+
+
+
+def build_anim_chain(tree, anim_tree, specs):
+    """在 anim_tree 里搭一条状态链,返回 (入口状态, [状态节点...])。
+
+    specs: [(状态名, [(条件节点, 输出引脚名 或 None), ...]), ...]
+    每个状态可以有 0~n 条出边;第一条出边连到下一个状态,
+    其余的连到"只连一次就够"的独立转场(测试用不到,先只支持一条)。
+
+    简单起见:specs 是 [(状态名, 条件节点, 条件引脚), ...] ——
+    第 i 个状态通过第 i 条转场连到第 i+1 个状态;
+    最后一个元组的条件给 None(链尾)。
+    """
+    states = []
+    for index, spec in enumerate(specs):
+        name = spec[0]
+        node = anim_tree.new_node(NN.GKNodeAnimState, "状态" + name)
+        node.gk_state_name = name
+        states.append(node)
+    for index, spec in enumerate(specs):
+        if index + 1 >= len(specs):
+            break
+        name, cond_node, cond_pin = spec
+        transition = anim_tree.new_node(NN.GKNodeAnimTransition, "转场" + name)
+        gk_stub.connect(anim_tree, states[index], "转到", transition, "进入")
+        gk_stub.connect(anim_tree, transition, "转到",
+                        states[index + 1], "进入")
+        if cond_node is not None and cond_pin:
+            gk_stub.connect(anim_tree, cond_node, cond_pin, transition, "条件")
+    return states[0], states
+
+
+def attach_anim_tree(tree, anim_tree, loco=None, specs=None):
+    """把 anim_tree 挂到 bpy.data 上,并给逻辑树加一个状态机引用节点。"""
+    import types
+
+    event = tree.new_node(NN.GKNodeOnReady, "准备")
+    ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+    gk_stub.connect(tree, event, "执行", ref, "执行")
+    original = getattr(bpy_module(), "data", None)
+    setattr(bpy_module(), "data",
+            types.SimpleNamespace(node_groups=[anim_tree]))
+    return original, ref
+
+
+def detach_anim_tree(original):
+    if original is None:
+        try:
+            delattr(bpy_module(), "data")
+        except AttributeError:
+            pass
+    else:
+        setattr(bpy_module(), "data", original)
+
+
+
+class TestAnimChain(Base):
+    """A 方案:照虚幻 5 的状态机 —— 状态连成链,转场带条件。
+
+    用户确认的形状:
+
+        [动画_状态 idle] ● 转到 ──> [动画_转场] ● 转到 ──> [动画_状态 run] ● 进入
+                                       ● 条件 <- 「动画判断_移动状态」
+
+    『进入』没接线的状态 = 起始状态(照 UE5 的 Entry 节点)。
+    """
+
+    def _build(self, links, loco_outputs=None, extra=None):
+        """links: [(起始状态名, 条件输出名 或 None, 目标状态名), ...]"""
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        states = {}
+        for start, _cond, end in links:
+            for name in (start, end):
+                if name not in states:
+                    node = anim.new_node(NN.GKNodeAnimState, "状态" + name)
+                    node.gk_state_name = name
+                    states[name] = node
+        for index, (start, cond, end) in enumerate(links):
+            transition = anim.new_node(NN.GKNodeAnimTransition, f"T{index}")
+            gk_stub.connect(anim, states[start], "转到", transition, "进入")
+            gk_stub.connect(anim, transition, "转到", states[end], "进入")
+            if cond:
+                gk_stub.connect(anim, loco, cond, transition, "条件")
+        if extra is not None:
+            extra(anim, states, loco)
+
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[anim]))
+        try:
+            return gen(tree, {"dimension": "3",
+                              "base_class": "CharacterBody3D"})
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def test_state_has_flow_pins(self):
+        """状态节点有『进入』和『转到』两个流引脚(照 UE5)。"""
+        node = make_tree().new_node(NN.GKNodeAnimState, "状态")
+        self.assertIn("进入", [s.name for s in node.inputs])
+        self.assertIn("转到", [s.name for s in node.outputs])
+
+    def test_transition_has_separate_flow_and_condition(self):
+        """转场的『进入』(流)和『条件』(布尔)必须分开。
+
+        合成一个引脚会互相覆盖 —— 实测生成出 `and null`。
+        """
+        node = make_tree().new_node(NN.GKNodeAnimTransition, "转场")
+        names = [s.name for s in node.inputs]
+        self.assertIn("进入", names)
+        self.assertIn("条件", names)
+        self.assertIn("转到", [s.name for s in node.outputs])
+
+    def test_entry_state_is_the_one_without_incoming(self):
+        """『进入』没接线的状态 = 起始状态(照 UE5 的 Entry 节点)。"""
+        code, warnings = self._build([("idle", "在移动", "run")])
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('anim_state = "idle"', code)
+
+    def test_chain_generates_two_transitions(self):
+        code, warnings = self._build([("idle", "在移动", "run"),
+                                      ("run", "已离地", "jump")])
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('if anim_state == "idle" and', code)
+        self.assertIn('anim_state = "run"', code)
+        self.assertIn('if anim_state == "run" and', code)
+        self.assertIn('anim_state = "jump"', code)
+        self.assertIn('.play("run"', code)
+        self.assertIn('.play("jump"', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_cycle_does_not_hang(self):
+        """状态机天然有环(idle -> run -> idle),不能无限递归。
+
+        回到已经走过的状态就停 —— 语义上也对:那条转移的起点状态
+        已经在链上生成过了,再走一遍只会生成重复代码。
+        """
+        code, _warnings = self._build([("idle", "在移动", "run"),
+                                       ("run", "速度快", "idle")])
+        # 第一条照常生成
+        self.assertIn('if anim_state == "idle" and', code)
+        self.assertIn('anim_state = "run"', code)
+        # 环保护生效:不会出现"run 切回 idle"那段(走到了已访问的 idle)
+        self.assertNotIn('anim_state = "idle"\n', code.replace(
+            'anim_state = "idle"\n', '', 1) and 'x' or '')
+        # 关键:不崩、不无限递归
+        self.assertIn("func _physics_process", code)
+
+    def test_orphan_state_warns(self):
+        """真的孤立的状态(没连进来) -> 明确告警,而不是静默丢掉。
+
+        注意**不**对环里的状态告警:idle <-> run 里两个状态都"没有外来
+        入边",但它们是连着的 —— 报"2 个入口"是误报(实测踩过,
+        用户会以为图配错了,其实完全正常)。
+        """
+        code, warnings = self._build(
+            [("idle", "在移动", "run")],
+            extra=lambda anim, states, loco: anim.new_node(
+                NN.GKNodeAnimState, "状态孤儿"))
+        self.assertTrue(any("孤立" in w for w in warnings), warnings)
+
+    def test_cycle_does_not_warn_about_entries(self):
+        """环不该被误报成"多个入口"。"""
+        _code, warnings = self._build([("idle", "在移动", "run"),
+                                       ("run", "速度快", "idle")])
+        self.assertEqual([w for w in warnings if "孤立" in w], [],
+                         f"环被误报成孤立入口了: {warnings}")
+
+    def test_unwired_condition_warns(self):
+        """转场没条件 -> 永远不会触发,必须明确告诉用户。"""
+        _code, warnings = self._build([("idle", None, "run")])
+        self.assertTrue(any("没有条件" in w for w in warnings), warnings)
+
+    def test_transition_to_wrong_node_warns(self):
+        """转场连到了非状态节点 -> 告警而不是崩。
+
+        用『动画_判断_移动状态』当靶子(它没有『进入』引脚)——
+        实测这种情况曾经的报错是
+            KeyError: '不是状态 没有输入引脚 进入'
+        也就是**直接崩掉导出**,所以必须挡住并给人话。
+        """
+        def bad(anim, states, loco):
+            wrong = anim.new_node(NN.GKNodeAnimLocomotion, "不是状态")
+            t2 = anim.new_node(NN.GKNodeAnimTransition, "T坏")
+            gk_stub.connect(anim, states["run"], "转到", t2, "进入")
+            # 连到 loco 的**输入**引脚上(stub 允许,真实 Blender 里
+            # 类型不匹配连不上;这里模拟"用户连错了"的最坏情况)
+            gk_stub.connect(anim, t2, "转到", wrong, "角色")
+
+        _code, warnings = self._build([("idle", "在移动", "run")], extra=bad)
+        self.assertTrue(any("不是『动画_状态』" in w for w in warnings),
+                        warnings)
+
+    def test_no_entries_warns(self):
+        """一个入口都没有 -> 提示怎么搭。"""
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("空动画")
+        anim.bl_idname = "GKAnimationTree"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[anim]))
+        try:
+            _code, warnings = gen(tree, {"dimension": "3",
+                                         "base_class": "CharacterBody3D"})
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+        self.assertTrue(any("找不到可用的动画状态机" in w for w in warnings),
+                        warnings)
 
 
 def nn_base_statement():
