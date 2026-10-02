@@ -2153,6 +2153,59 @@ class TestCameraFollowClock(Base):
         self.assert_indent_sane(code)
 
 
+class TestMoveAxes(Base):
+    """『移动_按方向』的前进/横移轴要能像 UPBGE 那样改。
+
+    用户反馈:"移动输入反馈倒过来了:按前往后、按左往右"。
+    相机朝向一变,输入和视觉方向就可能对不上 —— 这不该逼用户改脚本,
+    给两个选项翻过来就行。
+    """
+
+    def _tree(self, axis_h="X", axis_v="Z", sign="NEG", keep_y=True):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        move.gk_keep_y = keep_y
+        move.gk_axis_h = axis_h
+        move.gk_axis_v = axis_v
+        move.gk_forward_sign = sign
+        gk_stub.connect(tree, ev, "执行", move, "执行")
+        gk_stub.connect(tree, vec, "方向", move, "方向")
+        return tree
+
+    def test_default_forward_is_negative_z(self):
+        """默认前进走 -Z,这是 Godot / glTF 的『前』。"""
+        code, _ = gen(self._tree(), V3)
+        self.assertIn("velocity.z = (-", code)
+
+    def test_forward_sign_can_be_flipped(self):
+        code, _ = gen(self._tree(sign="POS"), V3)
+        self.assertNotIn("velocity.z = (-", code)
+        self.assertIn("velocity.z = ", code)
+
+    def test_horizontal_axis_can_change(self):
+        code, _ = gen(self._tree(axis_h="Z", axis_v="X"), V3)
+        self.assertIn("velocity.z = _dir", code)
+        self.assertIn("velocity.x = ", code)
+
+    def test_same_axis_adds_instead_of_overwriting(self):
+        """横移和前进选同一根轴时必须相加 —— 直接赋值会把前一个吃掉。"""
+        code, _ = gen(self._tree(axis_h="Z", axis_v="Z"), V3)
+        self.assertIn("velocity.z +=", code)
+
+    def test_y_axis_never_gets_movement(self):
+        """Y 轴永远留给重力,否则重力刚加上就被抹掉。"""
+        code, _ = gen(self._tree(axis_h="Y", axis_v="Y"), V3)
+        self.assertNotIn("velocity.y = ", code)
+        self.assertIn("get_gravity()", code)
+
+    def test_2d_ignores_axis_options(self):
+        code, _ = gen(self._tree(axis_h="Z", axis_v="Y", sign="POS"), V2)
+        self.assertNotIn("velocity.z", code)
+        self.assertIn("velocity.x", code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

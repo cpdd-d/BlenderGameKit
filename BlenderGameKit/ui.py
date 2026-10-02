@@ -421,8 +421,18 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             guess = auto_shape_for(obj, is_3d)
             col.label(text=f"按尺寸会选: {SHAPE_LABELS.get(guess, guess)}",
                       icon="CHECKMARK")
+            # ── 手动尺寸会**覆盖**上面那个自动结果,必须说出来 ──────────
+            # `shape_size` 只要是非 0,不管你选胶囊还是球,用的都是这组数字。
+            # 用户实测踩过:选了「胶囊」却因为残留的手动尺寸,
+            # 导出的碰撞体比模型又宽又高,角色走到别的模型跟前就穿模 ——
+            # 而他完全看不出"自动"其实没生效。
+            manual = tuple(round(float(v), 3) for v in physics.shape_size)
+            if any(abs(v) > 1e-6 for v in manual):
+                col.label(text=f"实际用手动尺寸 {manual}", icon="ERROR")
+                col.label(text="清成 0 才会用上面的自动结果")
         elif shape not in ("none",):
             col.prop(physics, "shape_size")
+            col.label(text="填了就用这组数字,不再自动贴合模型", icon="INFO")
 
         if shape != "none":
             row = col.row(align=True)

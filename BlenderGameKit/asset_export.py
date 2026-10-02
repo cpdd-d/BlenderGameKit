@@ -1101,6 +1101,72 @@ def _godot_position(obj, is_3d=True):
     return (x, z, -y)
 
 
+def colliders_that_mismatch_mesh(scene, min_ratio=0.8):
+    """找出"碰撞体明显比网格小"的物体名。
+
+    返回 [(物体名, 网格尺寸, 碰撞体尺寸)]。
+
+    ── 为什么需要查这个(用户实测反馈)──────────────────────────────
+    『碰撞尺寸』(`shape_size`)是手动尺寸,**一旦填了它就覆盖一切** ——
+    不管你把形状选成胶囊还是球,用的都是这组数字。填小了不会有任何报错:
+    导出的场景看着完全正常,但运行起来"角色走到模型跟前就**陷进去**"。
+    用户把这个现象描述成"渲染错误",其实是碰撞体和可见模型对不上。
+
+    实测踩过:用户给一个 2×2×2 的方块填了 `shape_size=(0.5, 1, 0.5)`,
+    导出的球半径只有 0.5 —— 角色能**陷进去一大半**。
+
+    ── 为什么只报"偏小" ────────────────────────────────────────────
+    碰撞体比模型大,最坏是"还没碰到就撞上了";比模型小才会**视觉穿模**,
+    那才是用户会当成 bug 报的现象。另外用户可能故意把地面做得很大,
+    只报偏小就不会拿这种正常配置去刷屏。
+    """
+    out = []
+    if scene is None:
+        return out
+    for obj, physics, enabled in collect_physics(scene):
+        if not enabled or getattr(obj, "type", "") != "MESH":
+            continue
+        if obj.get(PREVIEW_MARK):
+            continue
+        built = build_collision(obj, True, physics)
+        if built is None:
+            continue
+        bounds = object_bounds([obj])
+        if bounds is None:
+            continue
+        mesh_size = sorted((abs(v) for v in bounds["size"]), reverse=True)
+
+        # 碰撞体的外接尺寸:box 直接用 size;capsule / sphere 由半径和高算
+        sub = built["sub_resource"]
+        numbers = {}
+        for key in ("radius", "size", "height"):
+            m = re.search(rf"^{key} = (.+)$", sub, re.MULTILINE)
+            if m:
+                numbers[key] = m.group(1)
+        if "size" in numbers:
+            dims = [float(v) for v in re.findall(r"-?\d+\.?\d*", numbers["size"])]
+            collider_size = sorted((abs(v) for v in dims[:3]), reverse=True)
+        else:
+            found = re.findall(r"-?\d+\.?\d*", numbers.get("radius", "0"))
+            r = float(found[0]) if found else 0.0
+            found_h = re.findall(r"-?\d+\.?\d*", numbers.get("height", ""))
+            h = float(found_h[0]) if found_h else r * 2.0
+            # 胶囊总高 = 圆柱段 + 两端半球;球就是 2r
+            collider_size = sorted((r * 2.0, max(h, r * 2.0), r * 2.0), reverse=True)
+
+        if len(collider_size) < 3 or not any(mesh_size):
+            continue
+        # 只看**最大的两条边**:地面这种"又大又薄"的物体本来就该配一个
+        # 小盒子(用户常这么干,而且贴合得很好),拿最短边去比会误报。
+        ratios = [c / m for m, c in zip(mesh_size[:2], collider_size[:2])
+                  if m > 1e-6]
+        if len(ratios) >= 2 and min(ratios) < min_ratio:
+            out.append((obj.name,
+                        tuple(round(v, 3) for v in mesh_size),
+                        tuple(round(v, 3) for v in collider_size)))
+    return out
+
+
 def guess_collision_shape(obj, is_3d=True):
     """按物体尺寸猜一个合适的碰撞形状。
 
@@ -2289,6 +2355,20 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None):
             + "、".join(no_material)
             + "。在 Blender 里给它们指定一个材质(『材质属性』面板 → 新建),"
               "再导出一次就有颜色了。"
+        )
+
+    # ---- 6) 碰撞体和网格尺寸差太多 —— 看起来像"陷进去/悬空" ----
+    # 导出本身不会失败,但运行起来"走到模型跟前就穿模"或者"没碰到就撞上",
+    # 用户很容易把它当成渲染 bug(实测就这么被报过)。
+    mismatched = colliders_that_mismatch_mesh(scene)
+    if mismatched:
+        details = ";".join(
+            f"{name} 网格{mesh} 碰撞体{collider}"
+            for name, mesh, collider in mismatched[:4])
+        result["warnings"].append(
+            "这些物体的碰撞体和网格尺寸差得比较多,运行时会看起来"
+            "『陷进去』或『悬空』:" + details
+            + "。在『游戏物理』面板里把『碰撞尺寸』清成 0,让碰撞体自动贴合模型。"
         )
 
     return result

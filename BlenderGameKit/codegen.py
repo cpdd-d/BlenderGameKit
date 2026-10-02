@@ -1155,6 +1155,22 @@ def _stmt_move_direction(ctx, node, indent):
                         "3D 一般用 3~10。"))
     temp = ctx.new_temp("dir")
     ctx.add_line(indent, f"var {temp} := ({direction}).normalized()")
+
+    # ── 输入往哪个世界轴走(用户要求:像 UPBGE 那样能设)──────────────
+    # 默认:横移走 X,前进走 Z 的**负向**(Godot / glTF 的"前"就是 -Z)。
+    # 实测踩过:相机朝向一变,"按前往后、按左往右"完全可能 ——
+    # 这不该逼用户去改脚本,给两个选项翻过来就行。
+    # 2D 只有 X 轴,这两项直接忽略。
+    if ctx.dim == 2:
+        axis_h, axis_v = "x", None
+        horiz_expr, vert_expr = f"{temp}.x", f"{temp}.y"
+    else:
+        axis_h = str(getattr(node, "gk_axis_h", "X") or "X").lower()
+        axis_v = str(getattr(node, "gk_axis_v", "Z") or "Z").lower()
+        negate = str(getattr(node, "gk_forward_sign", "NEG")) == "NEG"
+        horiz_expr = f"{temp}.{axis_h}"
+        vert_expr = (f"(-{temp}.{axis_v})" if negate else f"{temp}.{axis_v}")
+
     if getattr(node, "gk_keep_y", False):
         # ── 有重力时必须做两件事 ────────────────────────────────────
         # 1) Godot 4 的 CharacterBody2D/3D **不会自动施加重力** ——
@@ -1166,12 +1182,23 @@ def _stmt_move_direction(ctx, node, indent):
         #    重力刚加上去就被抹掉。
         ctx.add_line(indent, f"{target}.velocity += {target}.get_gravity() * "
                              f"get_physics_process_delta_time()")
-        # 只改水平分量。3D 里水平是 X 与 Z，纵向 Y 留给重力；
-        # 2D 里水平只有 X。这里按维度取分量，不能盲目写 .z ——
-        # 上游如果是 Vector2(比如 Input.get_vector)会编译不过。
-        ctx.add_line(indent, f"{target}.velocity.x = {temp}.x * {speed}")
-        if ctx.dim != 2:
-            ctx.add_line(indent, f"{target}.velocity.z = {temp}.z * {speed}")
+        if axis_v is None:
+            ctx.add_line(indent, f"{target}.velocity.x = {horiz_expr} * {speed}")
+        else:
+            # 3D:按用户选的轴写。**Y 轴永远留给重力** ——
+            # 用户真把某个轴设成 Y 时也不动它,否则 gravity 刚加上就被抹掉
+            # (那正是"重力模式"要解决的问题)。
+            written = set()
+            for axis, expr in ((axis_h, horiz_expr), (axis_v, vert_expr)):
+                if axis == "y":
+                    continue
+                op = "=" if axis not in written else "+="
+                ctx.add_line(indent,
+                             f"{target}.velocity.{axis} {op} {expr} * {speed}")
+                written.add(axis)
+            if not written:
+                # 两个轴都选了 Y —— 退回默认的 X,至少能动
+                ctx.add_line(indent, f"{target}.velocity.x = {horiz_expr} * {speed}")
     else:
         ctx.add_line(indent, f"{target}.velocity = {temp} * {speed}")
     ctx.add_line(indent, f"{target}.move_and_slide()")

@@ -234,7 +234,9 @@ class GKNodeMoveDirection(B.GKStatementNode):
     bl_icon = "ORIENTATION_GLOBAL"
     gk_category = "移动"
     gk_doc = ("沿指定方向移动。**平台跳跃 / 有重力的游戏务必勾上『重力模式』**："
-              "Godot 4 的 CharacterBody 不会自动施加重力，不勾角色会浮在原地不动")
+              "Godot 4 的 CharacterBody 不会自动施加重力，不勾角色会浮在原地不动。\n"
+              "『前进轴』『横移轴』决定输入往哪个世界轴走 —— 按着不对就翻一下"
+              "(和 UPBGE 里设移动轴是一回事)")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         target_pin(),
@@ -247,6 +249,20 @@ class GKNodeMoveDirection(B.GKStatementNode):
         ("gk_dir_x", "float", 0.0, "方向 X", ""),
         ("gk_dir_y", "float", 0.0, "方向 Y", ""),
         ("gk_speed", "float", 300.0, "速度", "未连线时的速度"),
+        # ── 输入往哪个世界轴走(用户要求:像 UPBGE 那样能设)──────────
+        # 默认 XZ 平面、前进走 -Z(Godot / glTF 的"前")。
+        # 实测踩过:相机朝向不同时,"按前往后、按左往右"完全可能 ——
+        # 这不该逼用户去改脚本,给个选项翻过来就行。
+        # 2D 项目用不到(只有 X 轴),这两项会被忽略。
+        ("gk_axis_h", "enum", "X", "横移轴",
+         "左右输入作用在哪个世界轴上",
+         (("X", "X (左右)", ""), ("Z", "Z (前后)", ""), ("Y", "Y (上下)", ""))),
+        ("gk_axis_v", "enum", "Z", "前进轴",
+         "前后输入作用在哪个世界轴上",
+         (("Z", "Z (前后)", ""), ("X", "X (左右)", ""), ("Y", "Y (上下)", ""))),
+        ("gk_forward_sign", "enum", "NEG", "前进方向",
+         "按『前』时沿前进轴的正向还是负向走。默认负向 = Godot / glTF 的『前』",
+         (("NEG", "负 (Godot 的『前』)", ""), ("POS", "正", ""))),
         # ── 为什么需要这个开关 ────────────────────────────────────────
         # Godot 4 的 CharacterBody2D/3D **不会自动施加重力**，它只按你设的
         # velocity 移动。所以平台跳跃游戏必须自己累加重力，否则角色
