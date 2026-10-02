@@ -965,7 +965,17 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                     pos = list(position)
                 lines.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
                              f"{_fmt(pos[0])}, {_fmt(pos[1])}, {_fmt(pos[2])})")
-                lines.append(f'script = ExtResource("{script_id}")')
+                # ── 脚本**不能挂两遍**(踩过的坑)──────────────────────
+                # 角色场景(胡桃_mesh.tscn)自己已经把脚本挂在根节点上了,
+                # 而下面那个 `Model` 子节点**实例化的就是那个角色场景**。
+                # 如果这里再写一次 `script = ...`,运行时就跑两遍 ——
+                # 用户实测:控制台把 "你好,世界" 打印了**两次**。
+                #
+                # 更麻烦的是:两个实例都会跑移动逻辑、都会读输入,
+                # 角色会以双倍速度移动,而且互相打架。
+                #
+                # 所以实例化角色场景时**不再重复挂脚本** ——
+                # 实例会把角色场景根节点的脚本一起带进来。
                 lines.append("")
                 shape_type_name = "CollisionShape3D" if is_3d else "CollisionShape2D"
                 lines.append(f'[node name="Collision" type="{shape_type_name}" '
