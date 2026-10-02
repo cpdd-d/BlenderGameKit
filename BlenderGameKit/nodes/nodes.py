@@ -628,11 +628,29 @@ class GKNodePlayAnim(B.GKStatementNode):
     gk_category = "动画"
     gk_doc = ("播放动画片段(对应 AnimationPlayer.play)。"
               "『动画播放器』留空 = 自动找:glTF 导入时 AnimationPlayer 藏在"
-              "模型实例内部,自动找会自动把它挖出来,不用你填路径")
+              "模型实例内部,自动找会自动把它挖出来,不用你填路径。"
+              "── 右侧三个事件出口 ──"
+              "『开始时』= 动画刚开始那一刻;"
+              "『每帧』= 播放期间每一帧(做持续判定用);"
+              "『结束时』= 播完了那一刻(做连招、循环用)。"
+              "只对连了线的出口生成代码,没连就没有开销")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "动画名", "idle"),
         target_pin("动画播放器"),
+    )
+    # ── 三个事件出口(照 UPBGE 的 Play Animation 设计)────────────────
+    # UPBGE 那个节点最值钱的就是 Started / Running / On Finish ——
+    # 有它们才能做"播完接下一招""循环期间持续判定"。
+    # 我们以前只有"完成",接不了任何后续判断。
+    #
+    # 顺序:"完成"在前(沿用原来的默认出口,老图不受影响),
+    # 然后依次是三个事件出口 —— 视觉上从上到下就是 UPBGE 那个排列。
+    gk_outputs = (
+        S.pin(FLOW, "完成"),
+        S.pin(FLOW, "开始时"),
+        S.pin(FLOW, "每帧"),
+        S.pin(FLOW, "结束时"),
     )
     gk_input_props = {"动画名": "gk_anim_name", "动画播放器": "gk_player"}
     gk_prop_defs = (

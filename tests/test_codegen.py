@@ -2564,6 +2564,101 @@ class TestAnimationNameSources(Base):
         self.assertIsNotNone(desc, "gk_anim_action 没声明")
 
 
+class TestAnimationEvents(Base):
+    """动画的三个事件出口(Started / Running / On Finish)。
+
+    照 UPBGE 的 Play Animation 节点设计 —— 那三个输出是它最值钱的地方,
+    有它们才能做"播完接下一招""循环期间持续判定"。
+    """
+
+    def _build(self, wire):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="骨骼动作")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        for socket_name, text in wire.items():
+            printer = tree.new_node(NN.GKNodePrint, "打印" + socket_name)
+            printer.gk_text = text
+            gk_stub.connect(tree, play, socket_name, printer, "执行")
+        return gen(tree, V3)
+
+    def test_node_has_three_event_outputs(self):
+        node = make_tree().new_node(NN.GKNodePlayAnim, "播放")
+        names = [s.name for s in node.outputs]
+        for want in ("完成", "开始时", "每帧", "结束时"):
+            self.assertIn(want, names)
+
+    def test_started_and_finished_use_signals(self):
+        code, warnings = self._build({"开始时": "开始!", "结束时": "播完了"})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("animation_started.connect(", code)
+        self.assertIn("animation_finished.connect(", code)
+        self.assertIn("开始!", code)
+        self.assertIn("播完了", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_connections_are_in_the_success_branch(self):
+        """接线必须在 `play()` 成功那条分支里。
+
+        踩过的坑:第一版把 connect 写在 `else:` 里 —— 那是"动画不存在"
+        的分支,于是信号只在**播放失败**时接上,正常播放永远不接。
+        """
+        code, _ = self._build({"结束时": "播完了"})
+        lines = code.splitlines()
+        play_at = next(i for i, ln in enumerate(lines) if ".play(" in ln)
+        connect_at = next(i for i, ln in enumerate(lines)
+                          if "animation_finished.connect(" in ln)
+        warn_at = next(i for i, ln in enumerate(lines) if "push_warning" in ln)
+        self.assertGreater(connect_at, play_at, "接线应该在 play() 之后")
+        self.assertLess(connect_at, warn_at, "接线不能在警告(else 分支)里")
+
+    def test_running_generates_process_check(self):
+        """Godot 没有"正在播"的信号 -> 只能每帧查一次。"""
+        code, warnings = self._build({"每帧": "播放中"})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _process(", code)
+        self.assertIn("is_playing()", code)
+        self.assertIn("current_animation ==", code)
+        self.assertIn("播放中", code)
+        self.assert_indent_sane(code)
+
+    def test_running_without_user_process_node_still_works(self):
+        """整张图里没有用户自己的 `每当_帧` 时,也要能生成 _process。"""
+        code, _ = self._build({"每帧": "播放中"})
+        self.assertEqual(code.count("func _process("), 1)
+
+    def test_each_output_gets_its_own_handler(self):
+        """两个出口共用一个编号 -> 生成两个同名函数,一个覆盖另一个。"""
+        code, _ = self._build({"开始时": "甲", "结束时": "乙"})
+        # 只看事件回调(`_gk_started_*` / `_gk_finished_*` / `_gk_running_*`),
+        # 不算 `_gk_find_animation_player` 那种辅助函数。
+        handlers = []
+        for line in code.splitlines():
+            if not line.startswith("func _gk_"):
+                continue
+            name = line.split("(")[0].replace("func ", "")
+            if any(name.startswith(f"_gk_{kind}_")
+                   for kind in ("started", "finished", "running")):
+                handlers.append(name)
+        self.assertEqual(len(handlers), len(set(handlers)),
+                         f"回调函数重名了: {handlers}")
+        self.assertEqual(len(handlers), 2, handlers)
+
+    def test_no_events_means_no_extra_code(self):
+        """三个出口都不接线时,不该白白生成信号相关代码。"""
+        code, _ = self._build({})
+        self.assertNotIn("animation_started", code)
+        self.assertNotIn("animation_finished", code)
+
+    def test_handler_compares_animation_name(self):
+        """回调里要比对动画名 —— 否则别的代码播了同一播放器上的
+        另一个动画时,这段逻辑会被误触发。"""
+        code, _ = self._build({"结束时": "播完了"})
+        self.assertIn("StringName", code)
+        self.assertIn("!= _name", code)
+
+
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode

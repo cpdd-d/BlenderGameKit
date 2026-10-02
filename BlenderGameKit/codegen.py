@@ -224,6 +224,13 @@ class GenContext:
         self.need_camera_finder = False
         # 只有真的用了动画节点才生成 _gk_find_animation_player()
         self.need_anim_finder = False
+        # 动画事件出口(Started / Running / On Finish)——
+        # 见 _stmt_play_anim。有事件出口就要生成信号回调;
+        # 其中"每帧"那个还要在 _process 里插一段检查。
+        self.need_anim_signals = False
+        self.need_anim_running = False
+        # 每次播放登记一条:{player, name, func, node, output, kind, signal}
+        self.anim_events = []
         # 动画名留空时要生成 _gk_first_animation()(见 _stmt_play_anim)
         self.need_first_animation = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
@@ -1298,6 +1305,22 @@ def _animation_name_of(ctx, node):
 
 @stmt_node("GKNodePlayAnim")
 def _stmt_play_anim(ctx, node, indent):
+    """播动画 + 三个事件出口(Started / Running / On Finish)。
+
+    ── 为什么要事件出口 ────────────────────────────────────────────
+    UPBGE 的 Play Animation 节点最值钱的就是这三个输出 ——
+    有它们才能做"播完接下一招""循环期间持续判定"这类逻辑。
+    以前我们的节点只有"完成",接不了任何后续判断。
+
+    ── 三个出口分别怎么实现 ────────────────────────────────────────
+      * **开始时** -> `AnimationPlayer.animation_started` 信号
+      * **结束时** -> `AnimationPlayer.animation_finished` 信号
+      * **每帧**   -> Godot **没有**对应信号,只能每个 `_process` 查一次
+                     `is_playing()` + `current_animation`
+
+    信号那两个都带 `animation_name` 参数,所以回调里比对一下名字,
+    避免"别的代码播了同一个播放器上的另一个动画"时误触发。
+    """
     player = ctx.animation_player(node)
     anim = _animation_name_of(ctx, node)
     speed = gd_number(getattr(node, "gk_speed", 1.0))
@@ -1319,20 +1342,71 @@ def _stmt_play_anim(ctx, node, indent):
         ctx.add_line(indent, f"var {name_temp} := _gk_first_animation({player_temp})")
     else:
         ctx.add_line(indent, f"var {name_temp} := {anim}")
+
+    # ── 先探测三个事件出口有没有接线,并登记 ────────────────────────
+    # 顺序很重要:`_emit_event_connections` 是遍历 `ctx.anim_events`
+    # 来写 connect 行的,登记晚了就一行都不写(实测踩过)。
+    wanted = []
+    for output_name, suffix in (("开始时", "started"),
+                                ("每帧", "running"),
+                                ("结束时", "finished")):
+        if _next_nodes(node, output_name):
+            wanted.append((output_name, suffix))
+    # 每个出口一个**独立**编号 —— 曾经两个出口共用一个编号,
+    # 生成出两个同名函数(一个覆盖另一个,用户的"结束时"逻辑直接消失)。
+    numbered = []
+    for output_name, suffix in wanted:
+        unique = ctx.new_temp("ae")
+        handler = f"_gk_{suffix}_{unique}"
+        # 变量名:`_gk_running__ae3` -> `_gk_run__ae3`。
+        # 不这么剥的话会拼出 `_gk_run__gk_running__ae3` 这种又长又脏的名字。
+        plain = handler[len(f"_gk_{suffix}_"):]
+        signal_name = None
+        if suffix != "running":
+            signal_name = ("animation_started" if suffix == "started"
+                           else "animation_finished")
+        var_name = f"_gk_run_{plain}"
+        numbered.append((suffix, handler, signal_name, var_name))
+        ctx.anim_events.append({
+            "player": player_temp, "name": name_temp,
+            "func": handler, "node": node, "output": output_name,
+            "indent": indent,
+            "kind": "running" if suffix == "running" else "signal",
+            "signal": signal_name,
+            "var": var_name,
+        })
+    if numbered:
+        # 有任何事件出口就要生成信号回调函数
+        ctx.need_anim_signals = True
+        # "每帧"那个还需要在 _process 里插一段检查(Godot 没有对应信号)
+        if any(suffix == "running" for suffix, _h, _s, _v in numbered):
+            ctx.need_anim_running = True
+
+    # ---- 播放 + 接线 ----
     ctx.add_line(indent, f"if {player_temp} != null and "
                          f"{player_temp}.has_animation({name_temp}):")
     ctx.add_line(indent + 1, f"{player_temp}.play({name_temp}, -1.0, {speed})")
+    # ── 接线必须在**成功分支内**、紧挨着 play()(踩过的坑)──────────
+    # 上一版把 connect 写在下面的 `else:` 里 —— 那是"动画不存在"的分支,
+    # 于是信号只在**播放失败**时接上,正常播放永远不接。
+    # 用 CONNECT_ONE_SHOT:触发一次自动断开,重复播放不会累积连接。
+    for _suffix, handler, signal_name, _var in numbered:
+        if signal_name is None:
+            continue
+        ctx.add_line(indent + 1,
+                     f"{player_temp}.{signal_name}.connect({handler}, "
+                     f"CONNECT_ONE_SHOT)")
     ctx.add_line(indent, "else:")
-    # ── 名字填错时,把**可用的动画名**打出来 ────────────────────────
-    # 实测踩过:用户从 MMD 导入的模型,Blender 里的动作叫『骨骼动作』,
-    # 而节点里默认填的是 "idle" —— 只报一句"动画不存在: idle",
-    # 用户根本不知道正确的名字是什么,只能来回猜。
-    # 现在直接把 AnimationPlayer 里真实存在的名字列出来。
+
+    # 动画不存在时的警告
     ctx.add_line(indent + 1, f"if {player_temp} == null:")
     ctx.add_line(indent + 2,
                  'push_warning("[GK] 没找到 AnimationPlayer,播不了动画: %s" % '
                  f"{name_temp})")
     ctx.add_line(indent + 1, "else:")
+    # 名字填错时,把**可用的动画名**打出来。实测踩过:用户从 MMD
+    # 导入的模型,动作叫『骨骼动作』,而节点里默认填 "idle" ——
+    # 只报一句"动画不存在: idle",用户根本不知道正确的名字是什么。
     ctx.add_line(indent + 2,
                  'push_warning("[GK] 动画不存在: %s。这个模型里可用的动画有: %s" % '
                  f"[{name_temp}, {player_temp}.get_animation_list()])")
@@ -2986,6 +3060,64 @@ class Generator:
                 "empty_body": "    pass",
                 "separator": True,
             })
+
+        # ---- "每帧"动画事件出口需要的那段 _process 代码 ----
+        # Godot **没有**"动画正在播"的信号,只能每帧查一次
+        # `is_playing()` + `current_animation`。
+        #
+        # **必须放在事件循环之后** —— `need_anim_running` 是在生成
+        # `_ready` 的函数体时(也就是上面那个循环里)才被置上的。
+        # 放在循环前面的话条件永远为假,`_process` 一行都不生成
+        # (实测踩过:接了「每帧」却没有任何代码)。
+        #
+        # 而且可能整张图里根本没有用户自己的 `每当_帧` 节点 ——
+        # 那时 _process 函数压根不存在,得由我们新建一个。
+        if self.ctx.need_anim_running:
+            lines = self.ctx.new_section()
+            for event in self.ctx.anim_events:
+                if event.get("kind") != "running":
+                    continue
+                var = event.get("var", "_gk_running")
+                lines.add(1, f"if {event['player']} != null "
+                             f"and not {event['name']}.is_empty():")
+                lines.add(2, f"var {var}: bool = "
+                             f"{event['player']}.current_animation == {event['name']} "
+                             f"and {event['player']}.is_playing()")
+                lines.add(2, f"if {var}:")
+                self.ctx._active.clear()
+                self.ctx._current_event = event["func"]
+                _chain(self.ctx, event["node"], 3, event["output"])
+            sections.append({
+                "signature": "func _process(_delta: float) -> void:",
+                "lines": list(lines.lines),
+                "empty_body": "    pass",
+            })
+
+        # ---- 动画事件出口的回调函数 ----
+        # 见 _stmt_play_anim。每个接了线的事件出口生成一个函数,
+        # 函数体就是那个出口后面连的节点。
+        if self.ctx.need_anim_signals:
+            for event in self.ctx.anim_events:
+                if event.get("kind") != "signal":
+                    continue   # "每帧"那个走 _process,不生成函数
+                lines = self.ctx.new_section()
+                # Godot 的信号回调可以声明形参接收信号带的参数。
+                # `animation_started` / `animation_finished` 都会带一个
+                # `animation_name: StringName`,这里收下来用于比对。
+                lines.add(1, "var _name: String = String(__name)")
+                # 比对名字,避免"别的代码播了同一个播放器上的另一个动画"
+                # 时误触发这段逻辑。
+                lines.add(1, f"if {event['name']} != _name:")
+                lines.add(2, "return")
+                self.ctx._active.clear()
+                self.ctx._current_event = event["func"]
+                _chain(self.ctx, event["node"], 1, event["output"])
+                sections.append({
+                    "signature": f"func {event['func']}(__name: StringName) -> void:",
+                    "lines": list(lines.lines),
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
 
         # ---- 动画名留空时用的"随便挑一个"工具 ----
         if self.ctx.need_first_animation:
