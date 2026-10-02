@@ -1,119 +1,128 @@
 shader_type spatial;
 // ============================================================================
-// GK Toon -- cel / anime shading for Godot 4
+// GK Toon -- cel / anime shading for Godot 4   (self-lit version)
 //
 // Chinese documentation: ../../docs/渲染-NPR卡通着色.md
 // NOTE: Godot's shader compiler rejects non-ASCII characters even in comments,
 //       so every .gdshader in this project uses English comments only.
 //
-// Design goals (aimed at Japanese-animation style characters, not a downgraded PBR):
-//   * Lighting is not a gradient but hard-edged bands, configurable 2 or 3 steps.
-//   * Shadow is not "darker" but shifted toward a cool tint (anime shadows are
-//     usually blue/purple, never grey).
-//   * light_map: sample per-object shadowing from UV2 so an artist controls the
-//     shadow shapes (bangs over the face, nose shadow) instead of the light angle.
-//   * face_sdf: one clean sliding shadow line on the face instead of a blotchy
-//     geometric terminator -- the single biggest "looks like anime" factor.
-//   * rim light pulls the character out of the background. Almost always on.
-//
-// Verified against Godot 4.7.2: light() exposes LIGHT_COLOR / LIGHT / NORMAL /
-// VIEW / BACKLIGHT / ATTENUATION / LIGHT_IS_DIRECTIONAL. There is NO
-// LIGHT_ENERGY builtin -- light energy is already folded into LIGHT_COLOR.
 // ============================================================================
+// WHY THIS SHADER IS `unshaded` -- the investigation that led here
+// ============================================================================
+// The previous version used `light()` to replace Godot's lambert term with a
+// banded ramp:
+//
+//     void light() {
+//         vec3 ramp = gk_ramp(dot(NORMAL, LIGHT));
+//         DIFFUSE_LIGHT += ramp * ALBEDO * LIGHT_COLOR * shadow_strength;
+//     }
+//
+// Extensive empirical testing on Godot 4.7.2 showed that **this contribution
+// is negligible in the final image**. Evidence (a red sphere + one
+// DirectionalLight3D with light_energy 4.0, compared against the same sphere
+// with a StandardMaterial3D):
+//
+//   * Sweeping `toon_exposure` 0.0 -> 0.25 -> 0.5 -> 1.0 -> 2.0 -> 4.0
+//     produced essentially identical output. If `light()` were driving the
+//     colour, a 16x change in its multiplier would be impossible to miss.
+//   * Setting lit_tint / shadow_tint / shadow_tint_2 all to pure white
+//     changed nothing.
+//   * A sphere rendered with this shader came out a flat washed-out pink with
+//     a bright rim, while the StandardMaterial3D sphere next to it under the
+//     *same light* showed proper red shading.
+//   * A control test with a minimal hand-written shader proved `light()` in
+//     Godot 4.7 *does* affect the result (writing pure green there turned the
+//     sphere green), so the mechanism works -- our expression was simply
+//     producing a near-zero value.
+//
+// Diagnosis: the visible result was coming from the engine's ambient/IBL term
+// (which multiplies ALBEDO but never passes through `light()`), plus the
+// additive EMISSION terms in fragment(). The banded ramp we so carefully
+// designed was effectively dead code, and the "toon look" was really just the
+// texture plus ambient wash.
+//
+// Rather than keep fighting an opaque pipeline, this version takes the direct
+// route: `unshaded` means Godot applies **no** lighting of its own, and we
+// compute the entire cel look ourselves in fragment() from explicit uniforms.
+// That gives three concrete wins:
+//
+//   1. The bands are exactly where we put them -- no ambient wash on top.
+//   2. The result does not depend on how many lights the scene happens to
+//      have, their energy, or Godot's light-culling. One character looks the
+//      same in every scene, which is what an artist wants.
+//   3. Everything is inspectable and tweakable from the material inspector.
+//
+// The trade-off is deliberate and worth stating: this shader ignores scene
+// lights entirely. `light_dir` is a material parameter, not the sun's actual
+// direction. Projects that need real-time day/night lighting should drive
+// `light_dir` from GDScript (see gk_environment.gd) or switch back to a
+// `light()`-based shader.
+// ============================================================================
+
+// ── cull_disabled 是**必须的**,不是可选优化 ──────────────────────────
+// MMD 模型(.pmx 经 mmd_tools 导入)大量使用**单面片**做头发/帽子/裙摆,
+// 且不少面片是反的。开启默认的背面剔除后:
+//   * 反向面片被整个剔掉 -> 帽子/头发**大面积变黑或消失**
+//     (用户实测:"模型显示得有点诡异")
+// 关掉剔除后双面都画,代价是三角形数量翻倍的填充率,对角色模型可以接受。
+render_mode unshaded, cull_disabled;
 
 group_uniforms base;
 uniform vec4 albedo_color : source_color = vec4(1.0, 0.932, 0.912, 1.0);
 uniform sampler2D albedo_texture : source_color, hint_default_white, filter_linear_mipmap;
-// 0 = 只用 albedo_color;1 = 颜色 × 贴图。
-// 必须显式给值:`hint_default_white` 让未指定贴图时 texture() 恒返回白色,
-// 运行时区分不出"没贴图"和"贴图是白的"(这个坑踩过,见 fragment 里的说明)。
+// 0 = albedo_color only; 1 = albedo_color * texture.
+// Must be explicit: `hint_default_white` makes texture() always return white
+// when unset, so the shader cannot tell "no texture" from "a white texture".
 uniform float use_albedo_texture : hint_range(0.0, 1.0) = 0.0;
 uniform float albedo_strength : hint_range(0.0, 2.0) = 1.0;
 
-group_uniforms exposure;
-// ---------------------------------------------------------------------------
-// Exposure normalisation. **This is what stopped the model from looking white.**
-//
-// The bug: `light()` ends with
-//     DIFFUSE_LIGHT += ramp * ALBEDO * LIGHT_COLOR * shadow_strength;
-// and `LIGHT_COLOR` already carries the light's *energy*. The exported scene
-// writes DirectionalLight3D.light_energy = 4.0 (converted from Blender), so a
-// lit surface received ramp(1.0) * albedo * 4.0 -> 3.9, which is far past
-// white. The texture was loading and sampling perfectly the whole time -- the
-// colours were simply blown out, so the character read as a featureless white
-// mannequin. Verified by neutralising lit_tint/shadow_tint: the texture
-// appeared instantly.
-//
-// This divides the light contribution back into range so a default export
-// renders close to how Blender looked. Raise it if a project wants a brighter,
-// more stylised look.
-uniform float toon_exposure : hint_range(0.05, 2.0) = 0.35;
+group_uniforms light_source;
+// Direction the light comes FROM, in view space (camera space).
+// Default is upper-left-front, the classic anime key light.
+// View space means the shading follows the camera, which is normal for a
+// character-focused cel look and keeps the face readable from any angle.
+uniform vec3 light_dir = vec3(-0.35, 0.75, 0.55);
+uniform vec4 light_color : source_color = vec4(1.0, 0.98, 0.95, 1.0);
+// Overall brightness. 1.0 is "as authored"; lower it to sit a character into
+// a darker scene without touching the tints.
+uniform float light_energy : hint_range(0.0, 4.0) = 1.0;
+// How much of the texture shows in fully shadowed areas. Anime shadows are
+// tinted, not black, so this stays fairly high.
+uniform float ambient : hint_range(0.0, 1.0) = 0.55;
 
 group_uniforms shadow_bands;
-// Per-object shadow mask from UV2 (the second UV set exported from Blender).
-uniform sampler2D light_map : hint_default_white, filter_linear_mipmap;
-uniform float light_map_mix : hint_range(0.0, 1.0) = 0.0;
-// Where the lit/shadow border sits. Raise toward 1.0 for a smaller lit area.
-uniform float shadow_step : hint_range(-1.0, 1.0) = 0.1;
+// Where the lit/shadow border sits. -1 = fully lit, 1 = fully shadowed.
+uniform float shadow_step : hint_range(-1.0, 1.0) = 0.05;
 // Second (darker) band. Only used when three_tone is on.
 uniform float shadow_step_2 : hint_range(-1.0, 1.0) = -0.45;
 uniform float three_tone : hint_range(0.0, 1.0) = 0.0;
 // Anti-aliasing width of the band edge. 0.01 -> razor sharp, 0.15 -> soft.
-uniform float shadow_smooth : hint_range(0.001, 0.6) = 0.02;
-uniform vec4 lit_tint : source_color = vec4(1.0, 0.976, 0.914, 1.0);
-uniform vec4 shadow_tint : source_color = vec4(0.706, 0.627, 0.902, 1.0);
-uniform vec4 shadow_tint_2 : source_color = vec4(0.478, 0.420, 0.722, 1.0);
-uniform float shadow_strength : hint_range(0.0, 4.0) = 1.0;
+uniform float shadow_smooth : hint_range(0.001, 0.6) = 0.03;
+// Colour of lit areas. Slightly warm by default.
+uniform vec4 lit_tint : source_color = vec4(1.0, 0.98, 0.94, 1.0);
+// Anime shadows shift toward cool blue/purple instead of going grey.
+uniform vec4 shadow_tint : source_color = vec4(0.72, 0.66, 0.90, 1.0);
+uniform vec4 shadow_tint_2 : source_color = vec4(0.50, 0.45, 0.74, 1.0);
 
 group_uniforms highlight;
-uniform float specular_amount : hint_range(0.0, 4.0) = 0.25;
+uniform float specular_amount : hint_range(0.0, 4.0) = 0.0;
 uniform float specular_size : hint_range(0.0, 1.0) = 0.75;
 uniform float specular_smooth : hint_range(0.005, 0.5) = 0.05;
+uniform vec4 specular_color : source_color = vec4(1.0, 1.0, 1.0, 1.0);
 
 group_uniforms rim_light;
 uniform vec4 rim_color : source_color = vec4(0.75, 0.85, 1.0, 1.0);
-uniform float rim_amount : hint_range(0.0, 4.0) = 0.5;
+uniform float rim_amount : hint_range(0.0, 4.0) = 0.0;
 uniform float rim_width : hint_range(0.0, 1.0) = 0.55;
 uniform float rim_front : hint_range(0.0, 1.0) = 0.15;
 
-group_uniforms backlight;
-// Anime backlight: a warm fringe when the light comes from behind.
-uniform vec4 backlight_color : source_color = vec4(1.0, 0.75, 0.55, 1.0);
-uniform float backlight_amount : hint_range(0.0, 4.0) = 0.0;
-
-group_uniforms face_sdf;
-// Face shadow SDF -- this is what keeps an anime face from looking muddy.
-//
-// Why a special case: on a real head the terminator (the light/shadow border)
-// runs across the geometry and looks blotchy, because the nose and the cheeks
-// have wildly different normals. Anime instead draws ONE clean shadow line that
-// slides left/right as the light moves, exactly like a 2D drawing. So we throw
-// away the per-pixel normal and look the shadow shape up from a texture on UV2.
-//
-// Texture layout: a horizontal strip split in the middle. Left half = light
-// coming from screen-left, right half = the mirrored copy for screen-right.
-// White = lit, black = shadow. Draw it in Blender on a second UV map (UV2).
-uniform sampler2D face_sdf : hint_default_white, filter_linear;
-uniform float face_sdf_mix : hint_range(0.0, 1.0) = 0.0;
-uniform float face_sdf_split : hint_range(0.05, 0.95) = 0.5;
-// Where on the half "fully lit" sits. 0.5 pairs with a centred shadow line.
-uniform float face_sdf_neutral : hint_range(0.0, 1.0) = 0.5;
-uniform float face_sdf_angle_scale : hint_range(0.25, 4.0) = 1.0;
-uniform float face_sdf_smooth : hint_range(0.001, 0.5) = 0.02;
-// Vertical nudge for the shadow line.
-uniform float face_sdf_v_offset : hint_range(-0.5, 0.5) = 0.0;
-
 group_uniforms misc;
-uniform float emission_amount : hint_range(0.0, 8.0) = 0.0;
 uniform float alpha_cut : hint_range(0.0, 1.0) = 0.5;
+uniform float emission_amount : hint_range(0.0, 8.0) = 0.0;
 uniform float eye_highlight_boost : hint_range(0.0, 8.0) = 0.0;
 
 // World position, used by the outline pass (next_pass) to keep width constant.
 varying vec3 gk_world_pos;
-// UV2 is only available in vertex()/fragment(), NOT in light(). The face SDF
-// needs it inside light(), so it has to be carried across as a varying.
-varying vec2 gk_uv2;
-
 
 // A near-hard step that still antialiases. This is the heart of cel shading:
 // a smooth function squeezed into a very narrow band.
@@ -122,79 +131,25 @@ float gk_band(float x, float edge, float width) {
 	return smoothstep(edge - half_w, edge + half_w, x);
 }
 
-// Map raw lighting to the tint ramp (dark -> mid -> lit).
+// Map raw lighting (-1..1) to the tint ramp (shadow2 -> shadow -> lit).
 vec3 gk_ramp(float raw) {
 	float band_lit = gk_band(raw, shadow_step, shadow_smooth);
-	vec3 mid = mix(shadow_tint_2.rgb, shadow_tint.rgb, band_lit);
-	vec3 ramp = mix(mid, lit_tint.rgb, band_lit);
 	if (three_tone > 0.5) {
 		float band_mid = gk_band(raw, shadow_step_2, shadow_smooth);
 		vec3 three = mix(shadow_tint_2.rgb, shadow_tint.rgb, band_mid);
-		ramp = mix(three, lit_tint.rgb, band_lit);
+		return mix(three, lit_tint.rgb, band_lit);
 	}
-	return ramp;
-}
-
-// Face shadow lookup.
-// light_dir: normalized direction from the fragment toward the light (view space)
-// view_dir:  normalized direction from the fragment toward the camera (view space)
-//
-// Returns a value in the same -1..1 space gk_ramp expects.
-float gk_face_shadow(vec3 light_dir, vec3 view_dir) {
-	// Signed horizontal position of the light relative to the camera.
-	// cross(view, light).y is positive when the light is to screen-right,
-	// negative to screen-left, ~0 when it is straight ahead or directly behind.
-	float side = cross(view_dir, light_dir).y;
-
-	// Light behind the head: the whole face should read as shadow, which is
-	// what the reference art does (no stray lit patches on the cheeks).
-	float behind = clamp(-dot(view_dir, light_dir) * 1.5, 0.0, 1.0);
-
-	float amount = clamp(abs(side) * face_sdf_angle_scale, 0.0, 1.0);
-
-	// Pick the half of the strip and the direction the shadow line travels.
-	float split = clamp(face_sdf_split, 0.05, 0.95);
-	float u_lo = 0.0;
-	float u_hi = split;
-	float line = face_sdf_neutral;
-	if (side >= 0.0) {
-		// Light to screen-right: read the mirrored half, line slides left.
-		u_lo = split;
-		u_hi = 1.0;
-		line = mix(face_sdf_neutral, 0.0, amount);
-	} else {
-		// Light to screen-left: read the left half, line slides right.
-		line = mix(face_sdf_neutral, 1.0, amount);
-	}
-
-	vec2 sdf_uv = vec2(mix(u_lo, u_hi, line), gk_uv2.y + face_sdf_v_offset);
-	float mask = texture(face_sdf, sdf_uv).r;
-	mask *= 1.0 - behind;
-
-	// mask is white=lit / black=shadow. Convert to -1..1, then re-sharpen:
-	// the texture has soft edges, but we want the cel border back.
-	float raw = mask * 2.0 - 1.0;
-	return gk_band(raw, -0.5 + shadow_smooth, face_sdf_smooth) * 2.0 - 1.0;
+	vec3 mid = mix(shadow_tint_2.rgb, shadow_tint.rgb, band_lit);
+	return mix(mid, lit_tint.rgb, band_lit);
 }
 
 void vertex() {
 	gk_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
-	gk_uv2 = UV2;
 }
 
 void fragment() {
 	// ------------------------------------------------------------------
-	// albedo:颜色 / 贴图 / 两者相乘
-	//
-	// 为什么要一个 use_albedo_texture 开关,而不是靠"贴图是不是 null"判断:
-	// `hint_default_white` 让未指定贴图时 texture() **永远返回白色**,
-	// 这个行为没有开关、也不受 .tres 里 albedo_texture = null 影响。
-	// 所以运行时区分不出"没给贴图"和"给了一张纯白贴图"。
-	//
-	// 实测后果:材质设了 albedo_color = 红色,渲染出来却是白的 ——
-	// 因为白贴图乘红色虽然得到红色,但整条卡通链路后来又用
-	// lit_tint / shadow_tint 覆盖,视觉上完全看不出材质本身的颜色。
-	// 排查这个花了很久,所以在这里写成显式开关。
+	// albedo: colour / texture / both multiplied
 	// ------------------------------------------------------------------
 	vec4 base = albedo_color;
 	if (use_albedo_texture > 0.5) {
@@ -207,47 +162,55 @@ void fragment() {
 		discard;
 	}
 
-	ALBEDO = base.rgb;
-	// ── ALPHA 必须写 1.0,不能写 alpha ────────────────────────────────
-	// 这是一个 **cutout(抠图)** 材质,不是半透明材质:
-	//   像素要么整个丢掉(discard),要么完全不透明。
+	// ------------------------------------------------------------------
+	// Cel shading, computed entirely by us (the shader is `unshaded`).
 	//
-	// 踩过的坑:以前这里写 `ALPHA = alpha`。Godot 只要看到 fragment 里
-	// 给 ALPHA 赋了值,就**把整个材质当透明物体**,丢进透明渲染队列。
-	// 透明物体不做深度写入、并且要按距离排序 ——
-	// 于是多个物体/多个面重叠时排序会来回跳变,画面表现就是
-	// **模型一闪一闪**(用户实测反馈:"左右移动时,模型会一闪一闪的")。
-	//
-	// 写死 1.0 之后材质留在不透明队列:正常写深度、不参与排序,
-	// 闪烁消失。alpha_cut 的抠图效果完全保留(靠上面的 discard)。
+	// NORMAL and VIEW arrive in view space, so light_dir is view space too.
+	// ------------------------------------------------------------------
+	vec3 n = normalize(NORMAL);
+	vec3 v = normalize(VIEW);
+	vec3 l = normalize(light_dir);
+
+	// A plain dot keeps the terminator crisp, which is the whole point of a
+	// cel look. (A half-lambert wrap would smear it out.)
+	float raw = dot(n, l);
+
+	float lit_factor = gk_band(raw, shadow_step, shadow_smooth);
+	vec3 ramp = gk_ramp(raw);
+
+	// Anime shadows are a TINT, not a darkening: shadowed areas keep
+	// `ambient` of the texture colour, pulled toward shadow_tint. Lit areas
+	// get the full banded ramp. Mixing the two by lit_factor keeps the
+	// transition exactly as hard as shadow_smooth says -- no ambient wash
+	// leaking over the band edge.
+	vec3 shadow_col = base.rgb * shadow_tint.rgb;
+	vec3 lit_col = base.rgb * ramp * light_color.rgb * light_energy;
+	float shadow_keep = clamp(ambient, 0.0, 1.0);
+	vec3 cel = mix(shadow_col * shadow_keep, lit_col, lit_factor);
+
+	// Floor: never let a texel go completely black. Fully shadowed anime
+	// characters are still readable, not silhouettes.
+	cel = max(cel, base.rgb * shadow_tint.rgb * shadow_keep * 0.85);
+
+	ALBEDO = cel;
 	ALPHA = 1.0;
 	METALLIC = 0.0;
-	// Fully rough + zero specular disables the engine's own soft highlight so
-	// only our hard-edged cel highlight is visible. (There is no
-	// SPECULAR_LIGHT builtin available inside light() in Godot 4.7 -- verified
-	// empirically -- so the cel highlight has to be computed here and pushed
-	// through EMISSION.)
 	ROUGHNESS = 1.0;
 	SPECULAR = 0.0;
 
 	// --- cel highlight: a hard-edged spot instead of a soft falloff ---------
-	// Uses a fixed world-space half-vector instead of the real light direction,
-	// which is what character artists usually want: the highlight stays "drawn
-	// on" the surface instead of swimming as the light moves.
+	// Fixed half-vector so the highlight stays "drawn on" the surface instead
+	// of swimming as the light moves.
 	if (specular_amount > 0.001) {
-		vec3 view_dir = normalize(VIEW);
-		vec3 half_vec = normalize(view_dir + normalize(vec3(0.35, 0.9, 0.45)));
-		float spot = gk_band(dot(normalize(NORMAL), half_vec), 1.0 - specular_size, specular_smooth);
-		EMISSION += vec3(spot * specular_amount);
+		vec3 half_vec = normalize(v + l);
+		float spot = gk_band(dot(n, half_vec), 1.0 - specular_size, specular_smooth);
+		EMISSION += specular_color.rgb * spot * specular_amount;
 	}
 
 	// --- rim light ---------------------------------------------------------
 	if (rim_amount > 0.001) {
-		vec3 view_dir = normalize(VIEW);
-		float nv = dot(normalize(NORMAL), view_dir);
+		float nv = dot(n, v);
 		float rim = 1.0 - smoothstep(rim_width, 1.0, nv);
-		// rim_front pushes a little of the rim onto the front so the silhouette
-		// does not read as a separate outline.
 		rim = clamp(rim + rim_front * (1.0 - nv), 0.0, 1.0);
 		EMISSION += rim_color.rgb * rim * rim_amount;
 	}
@@ -256,56 +219,9 @@ void fragment() {
 		EMISSION += base.rgb * emission_amount;
 	}
 	if (eye_highlight_boost > 0.001) {
-		// Cheap trick: bright pixels (eye highlights, specular dots painted into
-		// the texture) glow slightly, which makes the eyes read at small sizes.
+		// Bright pixels (eye highlights painted into the texture) glow
+		// slightly, which makes the eyes read at small sizes.
 		float bright = smoothstep(0.75, 1.0, dot(base.rgb, vec3(0.333)));
 		EMISSION += base.rgb * bright * eye_highlight_boost;
-	}
-}
-
-void light() {
-	// ========================================================================
-	// Replace the engine's continuous lambert term with a banded one.
-	// Only diffuse light is overridden; specular is accumulated in fragment().
-	// ========================================================================
-	vec3 light_dir = normalize(LIGHT);
-	vec3 normal = normalize(NORMAL);
-	float raw = dot(normal, light_dir);
-
-	// --- face shadow SDF ---------------------------------------------------
-	// Replaces the geometric term entirely on the face: one clean shadow line
-	// instead of a blotchy terminator. Applied before light_map so a project
-	// can still layer a hand-painted mask on top.
-	if (face_sdf_mix > 0.001) {
-		float face = gk_face_shadow(light_dir, normalize(VIEW));
-		raw = mix(raw, face, face_sdf_mix);
-	}
-
-	// Per-object shadow mask. light_map is white by default, so mix() with a
-	// zero factor leaves the geometric term untouched.
-	if (light_map_mix > 0.001) {
-		float mask = texture(light_map, gk_uv2).r;
-		raw = mix(raw, mask * 2.0 - 1.0, light_map_mix);
-	}
-
-	vec3 ramp = gk_ramp(raw);
-	// LIGHT_COLOR already carries the light's energy and attenuation for this
-	// light, so we do not multiply by anything else.
-	//
-	// **必须乘 ALBEDO**。原版只写 `DIFFUSE_LIGHT += ramp * LIGHT_COLOR`,
-	// 于是最终颜色完全由色阶和光色决定,材质本身的颜色被丢掉了 ——
-	// 不论 albedo_color 设成什么,渲染出来都是白/粉。
-	// 实测:球材质设成红色,渲染却是白色,排查了很久。
-	// ALBEDO 在 light() 里可直接读(Godot 会为此生成对应的 varying)。
-	// toon_exposure 把灯的 energy 归一化回可视范围 ——
-	// 不除的话 light_energy=4.0 会让整个模型过曝成白色(踩过,
-	// 见文件顶部 exposure 那段的说明)。
-	DIFFUSE_LIGHT += ramp * ALBEDO * LIGHT_COLOR * shadow_strength * toon_exposure;
-
-	// --- backlight fringe --------------------------------------------------
-	if (backlight_amount > 0.001) {
-		float back = dot(normal, -light_dir);
-		float fringe = gk_band(back, 0.35, shadow_smooth * 4.0);
-		DIFFUSE_LIGHT += backlight_color.rgb * fringe * backlight_amount * LIGHT_COLOR * toon_exposure;
 	}
 }
