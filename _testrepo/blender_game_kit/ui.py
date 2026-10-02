@@ -272,6 +272,14 @@ class GK_PT_AnimTree(bpy.types.Panel):
             if not default and cards:
                 box.label(text="还没勾『起始』,会用第一张", icon="ERROR")
 
+        # ── 回游戏逻辑图的按钮 ──────────────────────────────────────
+        # 用户原话:"从游戏动画返回也应该加一个返回按钮,也是由于回去
+        # 还要多按一遍"。切过来有按钮、切回去没有,是不对称的。
+        row = layout.row(align=True)
+        back = row.operator("gk.switch_tree", text="← 回到游戏逻辑",
+                            icon="LOOP_BACK")
+        back.target = "GKGameLogicTree"
+
         layout.operator("gk.add_node_menu", text="添加节点", icon="ADD")
         layout.operator("gk.export_script", text="导出脚本", icon="FILE_TICK")
 
@@ -914,7 +922,8 @@ class GK_PT_Main(bpy.types.Panel):
         if anim_trees:
             for tree in anim_trees:
                 count = len([n for n in tree.nodes
-                             if getattr(n, "bl_idname", "") == "GKNodeAnimState"])
+                             if getattr(n, "bl_idname", "") in
+                             ("GKNodeAnimTransition", "GKNodeAnimState")])
                 box.label(text=f"{tree.name}  ({count} 个状态)",
                           icon="NODETREE")
         else:
