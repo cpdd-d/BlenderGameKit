@@ -4291,7 +4291,6 @@ def _stmt_camera_spring_arm(ctx, node, indent):
         # (不是"注册了再判断"—— 那样白跑一辈子,还占着名字)
         return
     pos_var = ctx.declare_var("_gk_spring_pos", "Vector3")
-    basis_var = ctx.declare_var("_gk_spring_basis", "Basis")
     ready_var = ctx.declare_var("_gk_spring_ready", "bool", initial="false")
     # 右侧输出的三个量(枢轴 / 方向 / 相机位置)——
     # 存成员变量,所以**别的地方**随时读都是最新值(不是只在执行点算一次)
@@ -4362,6 +4361,8 @@ def _stmt_camera_spring_arm(ctx, node, indent):
     # 默认 `look_at(枢轴)`:比手算欧拉角稳,也没有万向节问题。
     # 有旋转平滑时改成 slerp 一个 Basis(相机朝 -Z 看,所以目标是 -_gk_dir)。
     if lag_rot > 0.0:
+        # 朝向平滑才需要这个临时变量(声明了不用会被 Godot 警告)
+        basis_var = ctx.declare_var("_gk_spring_basis", "Basis")
         lines += [
             "    var _gk_want_basis := Basis.looking_at(-_gk_dir, Vector3.UP)",
             f"    if not {ready_var}:",

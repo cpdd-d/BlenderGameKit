@@ -1,0 +1,206 @@
+======================================================================
+BlenderGameKit 诊断信息
+======================================================================
+
+【1】插件
+  Blender: 4.5.5 LTS
+  插件路径: C:\Users\34571\AppData\Roaming\Blender Foundation\Blender\4.5\extensions\user_default\blender_game_kit
+  节点数: 132
+    GKNodeSetPosition: 有
+    GKNodeDistance: 有
+    GKNodeTextJoin: 有
+    GKNodeLogicOutput: 有
+    GKNodeGetPosition: 有
+
+【2】文件
+  .blend: D:\BlenderGameKit\examples\demo_level\关卡示例.blend
+  dimension = '3'
+  base_class = 'auto'
+  class_name = 'LevelPlayer'
+  node_name = 'Player'
+  main_camera = ''
+  toon_materials = True
+  write_scene = True
+  export_tunables = True
+
+【3】物体 / 物理 / 尺寸
+  地面:
+      类型=MESH 位置=(0.0, 0.0, -0.2)
+      网格尺寸=(30.0, 30.0, 0.4)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(30.000000, 0.400000, 30.000000)
+  北墙:
+      类型=MESH 位置=(0.0, 15.0, 0.6)
+      网格尺寸=(30.4, 0.4, 1.2)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(30.400000, 1.200000, 0.400000)
+  南墙:
+      类型=MESH 位置=(0.0, -15.0, 0.6)
+      网格尺寸=(30.4, 0.4, 1.2)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(30.400000, 1.200000, 0.400000)
+  东墙:
+      类型=MESH 位置=(15.0, 0.0, 0.6)
+      网格尺寸=(0.4, 30.4, 1.2)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(0.400000, 1.200000, 30.400000)
+  西墙:
+      类型=MESH 位置=(-15.0, 0.0, 0.6)
+      网格尺寸=(0.4, 30.4, 1.2)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(0.400000, 1.200000, 30.400000)
+  中央高台:
+      类型=MESH 位置=(0.0, 0.0, 1.2)
+      网格尺寸=(6.0, 6.0, 2.4)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(6.000000, 2.400000, 6.000000)
+  东高台:
+      类型=MESH 位置=(11.0, 9.0, 1.3)
+      网格尺寸=(4.0, 4.0, 2.6)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 2.000000
+  西高台:
+      类型=MESH 位置=(-11.0, 9.0, 1.3)
+      网格尺寸=(4.0, 4.0, 2.6)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 2.000000
+  金币1:
+      类型=MESH 位置=(-9.0, -9.0, 0.9)
+      网格尺寸=(0.7, 0.7, 0.7)
+      物理: 启用=? body=Area3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 0.494975
+  金币2:
+      类型=MESH 位置=(9.0, -9.0, 0.9)
+      网格尺寸=(0.7, 0.7, 0.7)
+      物理: 启用=? body=Area3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 0.350000
+  金币3:
+      类型=MESH 位置=(0.0, 0.0, 3.2)
+      网格尺寸=(0.7, 0.7, 0.7)
+      物理: 启用=? body=Area3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 0.494975
+  金币4:
+      类型=MESH 位置=(11.0, 9.0, 0.9)
+      网格尺寸=(0.7, 0.7, 0.7)
+      物理: 启用=? body=Area3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 0.350000
+  金币5:
+      类型=MESH 位置=(-11.0, 9.0, 3.4)
+      网格尺寸=(0.7, 0.7, 0.7)
+      物理: 启用=? body=Area3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="SphereShape3D" id="shape"] radius = 0.494975
+  终点门:
+      类型=MESH 位置=(0.0, 14.4, 1.2)
+      网格尺寸=(2.0, 0.4, 2.4)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(2.000000, 2.400000, 0.400000)
+  示例角色:
+      类型=MESH 位置=(0.0, -11.0, 0.9)
+      网格尺寸=(1.0, 1.0, 1.6)
+      物理: 启用=? body=CharacterBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=True
+      碰撞体: [sub_resource type="CapsuleShape3D" id="shape"] radius = 0.500000 height = 1.600000
+  侧视机位:
+      类型=CAMERA 位置=(0.0, -16.0, 6.0)
+      网格尺寸=(0.0, 0.0, 0.0)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(0.100000, 0.100000, 0.100000)
+  俯瞰机位:
+      类型=CAMERA 位置=(0.0, 0.0, 24.0)
+      网格尺寸=(0.0, 0.0, 0.0)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(0.100000, 0.100000, 0.100000)
+  Sun:
+      类型=LIGHT 位置=(6.0, -6.0, 12.0)
+      网格尺寸=(0.0, 0.0, 0.0)
+      物理: 启用=? body=StaticBody3D 形状=auto 手填尺寸=(0.0, 0.0, 0.0) 脚本体=False
+      碰撞体: [sub_resource type="BoxShape3D" id="shape"] size = Vector3(0.100000, 0.100000, 0.100000)
+
+【4】主相机
+  解析结果: 侧视机位  <- 跟着 Blender 视口的当前相机
+  Blender 视口当前相机: 侧视机位
+  场景里的相机: ['侧视机位', '俯瞰机位']
+
+【5】节点图
+  [GKGameLogicTree] 玩家逻辑: 65 节点 / 65 连线 / 参与导出=True
+      对外端口: [('金币数', 'float', 'out'), ('通关', 'bool', 'out')]
+      - GKNodeOnReady 「每当_准备」 @(-1400,500)
+      - GKNodeMouseMode 「锁定鼠标」 @(-1100,500)
+      - GKNodeCameraSetup 「设定初始机位」 @(-800,500)
+      - GKNodeUiText 「HUD标题」 @(-500,500)
+      - GKNodeUiText 「HUD提示」 @(-500,300)
+      - GKNodeOnPhysicsProcess 「每当_物理帧」 @(-1400,0)
+      - GKNodeInputDirection 「输入_方向」 @(-1400,-260)
+      - GKNodeMoveDirection 「移动_按方向」 @(-1000,0)
+      - GKNodeIsOnFloor 「在地面吗」 @(-1000,-300)
+      - GKNodeKey 「空格」 @(-1000,-520)
+      - GKNodeLogic 「能跳吗」 @(-760,-400)
+      - GKNodeBranch 「如果_否则」 @(-500,-400)
+      - GKNodeJump 「起跳」 @(-220,-400)
+      - GKNodeCameraSpringArm 「弹簧臂(第三人称)」 @(200,-1900)
+      - GKNodeMouseMotion 「鼠标移动量」 @(-1400,-800)
+      - GKNodeVectorSplit 「拆成 XY」 @(-1150,-800)
+      - GKNodeMath 「灵敏度」 @(-1000,-700)
+      - GKNodeMath 「左右灵敏度」 @(-780,-760)
+      - GKNodeMath 「上下灵敏度」 @(-780,-900)
+      - GKNodeCameraRotation 「转动视角」 @(-420,-800)
+      - GKNodeKey 「按 C」 @(-1400,-1100)
+      - GKNodeBranch 「如果_否则.001」 @(-1000,-1100)
+      - GKNodeCameraSetCurrent 「切到俯瞰」 @(-700,-1100)
+      - GKNodeKey 「按 V」 @(-1400,-1320)
+      - GKNodeBranch 「如果_否则.002」 @(-1000,-1320)
+      - GKNodeCameraSetCurrent 「切回侧视」 @(-700,-1320)
+      - GKNodeGetVar 「读当前分数」 @(-1120,-1620)
+      - GKNodeMath 「加一」 @(-1000,-1700)
+      - GKNodeSetVar 「写回分数」 @(-820,-1700)
+      - GKNodeDistance 「到金币1的距离」 @(-1400,-1960)
+      - GKNodeCompare 「够近吗1」 @(-1080,-1960)
+      - GKNodeBranch 「如果_否则1」 @(-780,-1960)
+      - GKNodeQueueFree 「吃掉金币1」 @(-480,-1960)
+      - GKNodeDistance 「到金币2的距离」 @(-1400,-2220)
+      - GKNodeCompare 「够近吗2」 @(-1080,-2220)
+      - GKNodeBranch 「如果_否则2」 @(-780,-2220)
+      - GKNodeQueueFree 「吃掉金币2」 @(-480,-2220)
+      - GKNodeDistance 「到金币3的距离」 @(-1400,-2480)
+      - GKNodeCompare 「够近吗3」 @(-1080,-2480)
+      - GKNodeBranch 「如果_否则3」 @(-780,-2480)
+      - GKNodeQueueFree 「吃掉金币3」 @(-480,-2480)
+      - GKNodeDistance 「到金币4的距离」 @(-1400,-2740)
+      - GKNodeCompare 「够近吗4」 @(-1080,-2740)
+      - GKNodeBranch 「如果_否则4」 @(-780,-2740)
+      - GKNodeQueueFree 「吃掉金币4」 @(-480,-2740)
+      - GKNodeDistance 「到金币5的距离」 @(-1400,-3000)
+      - GKNodeCompare 「够近吗5」 @(-1080,-3000)
+      - GKNodeBranch 「如果_否则5」 @(-780,-3000)
+      - GKNodeQueueFree 「吃掉金币5」 @(-480,-3000)
+      - GKNodeGetVar 「读金币数」 @(-700,-2400)
+      - GKNodeTextJoin 「拼前半」 @(-420,-2400)
+      - GKNodeTextJoin 「拼后半」 @(-160,-2400)
+      - GKNodeUiText 「刷新HUD」 @(120,-2400)
+      - GKNodeGetPosition 「读自己的位置」 @(-1400,-2800)
+      - GKNodeCompare 「掉下去了吗」 @(-1100,-2800)
+      - GKNodeBranch 「如果_否则.003」 @(-820,-2800)
+      - GKNodeSetPosition 「送回出生点」 @(-520,-2800)
+      - GKNodeGetVar 「读金币数(通关)」 @(-700,-2700)
+      - GKNodeCompare 「集满了吗」 @(-420,-2700)
+      - GKNodeLogicOutput 「通关端口」 @(-160,-2700)
+      - GKNodeUiText 「通关提示」 @(120,-2700)
+      - GKNodeBranch 「如果_否则.004」 @(-420,-2950)
+      - GKNodeKey 「Esc」 @(-1400,-3100)
+      - GKNodeBranch 「如果_否则.005」 @(-1000,-3100)
+      - GKNodeQuitGame 「退出游戏」 @(-700,-3100)
+
+【6】试导出
+  生成 336 行
+  告警 1 条:
+      ! 脚本基类是 auto，但节点图里用了 取值_是否在地面、移动_按方向、移动_跳跃 —— 这些节点生成的是 move_and_slide()，只有 CharacterBody2D / CharacterBody3D 才有这个方法。Godot 会在加载脚本时报 『Function "move_and_slide()" not found in base self』。
+改法(二选一)：
+  1) 选中要做角色的那个物体 → 『游戏物理』面板 → 类型改成 『3D 角色 CharacterBody3D』(2D 则 CharacterBody2D)；
+  2) 或者把侧栏『脚本基类』设成『自动(跟着物体走)』，让它跟着物体走。
+      · 对外端口『金币数』(float)-> 输出_金币数
+      · 对外端口『通关』(bool)-> 输出_通关
+  输入动作: [('quit_game', 'ESC'), ('view_side', 'V'), ('view_top', 'C'), ('jump', 'SPACE'), ('move_up', ''), ('move_down', ''), ('move_left', ''), ('move_right', '')]
+  导出目录: D:\BlenderGameKit\examples\demo_level\game_godot  (跟着 .blend)
+
+======================================================================
+(以上全部内容复制给我就行)
+======================================================================

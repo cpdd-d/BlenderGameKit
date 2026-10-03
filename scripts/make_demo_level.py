@@ -222,7 +222,8 @@ def build_logic(player, coins, goal):
     # ---- 每当_准备:锁鼠标 + 机位 + HUD ----
     ready = add("GKNodeOnReady", "每当_准备", -1400.0, 500.0)
     lock = add("GKNodeMouseMode", "锁定鼠标", -1100.0, 500.0, gk_mode="CAPTURED")
-    setup = add("GKNodeCameraSetup", "设定初始机位", -800.0, 500.0,
+    # 开场只设**视野**(机位交给弹簧臂:它才是这台相机的主人)
+    setup = add("GKNodeCameraSetup", "设定初始视野", -800.0, 500.0,
                 gk_target="侧视机位", gk_fov=60.0, gk_distance=0.0,
                 gk_smooth=0.0)
     hud_title = add("GKNodeUiText", "HUD标题", -500.0, 500.0,
@@ -297,11 +298,19 @@ def build_logic(player, coins, goal):
     tree.links.new(pitch.outputs["结果"], turn.inputs["俯仰"])
 
     # 切视角:C 俯瞰 / V 侧视
+    # ── C / V:改**弹簧臂的杆长**(不是"切相机")──────────────────────
+    # 踩过的坑:原来用『相机_切换』,而弹簧臂每帧都在写同一台相机的位置
+    # —— 切相机的过渡**永远被弹簧臂覆盖**,表现就是"切了没反应/闪一下"。
+    # 弹簧臂才是这台相机的主人,所以 C/V 改成改它的参数:
+    #   C = 拉远到 14 米、俯仰 55°(看清全局)
+    #   V = 收回 5 米、俯仰 12°(第三人称)
     view_key = add("GKNodeKey", "按 C", -1400.0, -1100.0,
                    gk_key="C", gk_action="view_top", gk_trigger="JUST")
     view_branch = add("GKNodeBranch", "如果_否则", -1000.0, -1100.0)
-    to_top = add("GKNodeCameraSetCurrent", "切到俯瞰", -700.0, -1100.0,
-                 gk_target="俯瞰机位", gk_blend=0.6)
+    to_top = add("GKNodeCameraSpringArm", "拉远(全局视角)", -700.0, -1100.0,
+                 gk_target="", gk_camera="", gk_arm=14.0, gk_height=2.0,
+                 gk_pitch=55.0, gk_side=0.0, gk_collision=True,
+                 gk_radius=0.35, gk_lag=0.15)
     tree.links.new(physics.outputs["执行"], view_branch.inputs["执行"])
     tree.links.new(view_key.outputs["结果"], view_branch.inputs["条件"])
     tree.links.new(view_branch.outputs["是"], to_top.inputs["执行"])
@@ -309,8 +318,10 @@ def build_logic(player, coins, goal):
     back_key = add("GKNodeKey", "按 V", -1400.0, -1320.0,
                    gk_key="V", gk_action="view_side", gk_trigger="JUST")
     back_branch = add("GKNodeBranch", "如果_否则", -1000.0, -1320.0)
-    to_side = add("GKNodeCameraSetCurrent", "切回侧视", -700.0, -1320.0,
-                  gk_target="侧视机位", gk_blend=0.6)
+    to_side = add("GKNodeCameraSpringArm", "收回(第三人称)", -700.0, -1320.0,
+                  gk_target="", gk_camera="", gk_arm=5.0, gk_height=1.4,
+                  gk_pitch=12.0, gk_side=0.0, gk_collision=True,
+                  gk_radius=0.35, gk_lag=0.12)
     tree.links.new(physics.outputs["执行"], back_branch.inputs["执行"])
     tree.links.new(back_key.outputs["结果"], back_branch.inputs["条件"])
     tree.links.new(back_branch.outputs["是"], to_side.inputs["执行"])
