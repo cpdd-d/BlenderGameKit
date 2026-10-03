@@ -84,11 +84,40 @@ class StubNode:
         pass
 
 
+class StubPortCollection(list):
+    """桩里的端口集合(模仿 Blender 的 CollectionProperty 三件套)。
+
+    有它才能测『对外端口』那条链:声明 -> 生成变量 -> 校验。
+    """
+
+    def add(self):
+        port = StubPort()
+        self.append(port)
+        return port
+
+    def remove(self, index):
+        del self[index]
+
+
+class StubPort:
+    """一个端口(名字 / 类型 / 方向 / 初值)。"""
+
+    def __init__(self):
+        self.port_name = "端口"
+        self.port_type = "bool"
+        self.direction = "out"
+        self.default_value = "false"
+        self.comment = ""
+
+
 class StubNodeTree:
     def __init__(self, name="GameLogic"):
         self.name = name
         self.nodes = []
         self.links = []
+        # 对外端口(逻辑图的"真接口")—— 桩里也要有,否则校验那条路测不到
+        self.gk_ports = StubPortCollection()
+        self.gk_enabled = True
 
     def new_node(self, node_class, name=None, location=(0.0, 0.0), **props):
         node = node_class()

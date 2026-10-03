@@ -120,25 +120,28 @@ def main():
                                for category, _classes in props_mod.node_menu_entries()}
     expected_recent = ui._menu_name("最近使用")
 
-    # Shift+A 菜单
+    # Shift+A 菜单 —— nested 形态:只放『添加游戏逻辑节点』子菜单 + 自动连线。
+    # 分类列表收在子菜单里(直接铺开会和 Blender 自带的『添加』并排,看起来像重复);
+    # 搜索 / 常用 / 最近在右键的 flat 形态里,这里不直接出现。
     holder = _Holder()
     ui._draw_add_menu(holder, _Ctx("GKGameLogicTree"))
     calls = holder.layout.calls
     drawn_menus = {c[1] for c in calls if isinstance(c, tuple) and c[0] == "menu"}
-    print(f"    Shift+A 条目数: {len(calls)},画出的子菜单数: {len(drawn_menus)}")
-    check("Shift+A 里有搜索入口", _has_operator(calls, "gk.find_node"), str(calls[:4]))
-    missing = expected_category_menus - drawn_menus
-    check(f"Shift+A 里全部 {len(expected_category_menus)} 个分类菜单都在",
-          not missing, f"缺: {len(missing)} 个")
-    check("Shift+A 里有最近使用", expected_recent in drawn_menus,
-          f"期望 {expected_recent},实际 {sorted(drawn_menus)}")
+    print(f"    Shift+A 条目数: {len(calls)},画出的子菜单: {sorted(drawn_menus)}")
+    check("Shift+A 里有『添加游戏逻辑节点』子菜单",
+          ui.GK_MT_AddNodeCategories.bl_idname in drawn_menus, str(calls))
+    check("Shift+A 里有自动连线入口", _has_operator(calls, "gk.auto_link"), str(calls))
+    check("Shift+A 里不直接铺开分类(已收进子菜单)",
+          not (expected_category_menus & drawn_menus), str(sorted(drawn_menus)))
 
-    # 右键菜单
+    # 右键菜单 —— flat 形态:搜索 / 最近 / 分类 都直接铺开
     holder = _Holder()
     ui._draw_context_menu(holder, _Ctx("GKGameLogicTree"))
     calls = holder.layout.calls
     print(f"    右键条目数: {len(calls)}")
     check("右键里有搜索入口", _has_operator(calls, "gk.find_node"), str(calls))
+    check("右键里有最近使用", expected_recent in {
+        c[1] for c in calls if isinstance(c, tuple) and c[0] == "menu"}, str(calls))
     check("右键里有分类入口",
           any(isinstance(c, tuple) and c[0] == "menu" for c in calls), str(calls))
 

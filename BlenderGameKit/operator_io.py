@@ -214,6 +214,31 @@ def _unregister_handlers():
         pass
 
 
+def node_tree_error(cls, tree):
+    """这个节点能不能放进这棵树?不能就返回**一句人话**,能放返回 None。
+
+    ── 为什么单独抽成函数(用户 2026-10-03 的报错就在这里)──────────
+    用户截图里的那条:
+        RuntimeError:『常量_数值』是游戏逻辑树里的节点,不能放进当前的图
+    出处就是这里。原因是 `gk_tree_type` 允许是**元组**(常量/数学/比较
+    这些"两张树都能用"的值节点),而老代码拿元组和字符串比
+    (`wanted != actual`)**永远是真** —— 于是所有"两张树都能用"的节点
+    全被挡在门外,而用户明明只是想给转场条件加一个数值。
+
+    抽出来还有一个好处:它是**纯函数**,可以直接在测试里喂真实节点树
+    (不用模拟 Blender 的 space_data 上下文)。
+    """
+    actual = getattr(tree, "bl_idname", "")
+    if props.node_fits_tree(cls, actual):
+        return None
+    kinds = props.node_tree_kinds(cls)
+    where = "动画树(『游戏动画』)" if "GKAnimationTree" in kinds else "游戏逻辑树"
+    hint = ("侧栏『游戏逻辑』面板 -> 『动画系统』-> 点『打开/新建动画树』"
+            if "GKAnimationTree" in kinds else "请切到游戏逻辑图")
+    return (f"『{getattr(cls, 'bl_label', cls)}』是{where}里的节点,"
+            f"不能放进当前的图。{hint}")
+
+
 class GK_OT_AddNode(bpy.types.Operator):
     """按分类添加一个 GK 节点。"""
 
@@ -245,18 +270,10 @@ class GK_OT_AddNode(bpy.types.Operator):
         # —— 这是 `poll()` 挡下来了,但**用户看不懂该去哪**。
         #
         # 所以在这里先拦一道,给一句人话:告诉他该去哪种树。
-        wanted = getattr(cls, "gk_tree_type", "GKGameLogicTree")
-        actual = getattr(tree, "bl_idname", "")
-        if wanted != actual:
-            where = ("动画树(『游戏动画』)" if wanted == "GKAnimationTree"
-                     else "游戏逻辑树")
-            _report(self, "ERROR",
-                    f"『{cls.bl_label}』是{where}里的节点,"
-                    f"不能放进当前的图。"
-                    + ("侧栏『游戏逻辑』面板 -> 『动画系统』-> "
-                       "点『打开/新建动画树』"
-                       if wanted == "GKAnimationTree" else
-                       "请切到游戏逻辑图"))
+        # 判断本身在 node_tree_error 里(那里解释了元组树类型的坑)。
+        problem = node_tree_error(cls, tree)
+        if problem:
+            _report(self, "ERROR", problem)
             return {"CANCELLED"}
 
         location = context.space_data.cursor_location if context.space_data else (0.0, 0.0)
@@ -844,6 +861,14 @@ class GK_OT_PickAnimName(bpy.types.Operator):
             self.report({"WARNING"}, "没找到目标节点,动画名没写进去")
             return {"CANCELLED"}
         node.gk_anim_name = self.choice
+        # ── 同时把**原生动作指针**也指上(踩过的坑)──────────────────
+        # `_animation_name_of` 的优先级是"动作指针 > 文本框",用户先用这个
+        # 列表选了名字、之后再动节点上那个原生选择器(或反过来),
+        # 两边就会各说各话 —— 界面上是"没选动作",导出却用文本名。
+        # 所以这里一并把对应的 Action 指上,让两个属性、界面三者一致。
+        action = bpy.data.actions.get(self.choice)
+        if action is not None and hasattr(node, "gk_anim_action"):
+            node.gk_anim_action = action
         self.report({"INFO"}, f"动画名 -> {self.choice}")
         return {"FINISHED"}
 
@@ -906,6 +931,301 @@ class GK_OT_PickAnimTree(bpy.types.Operator):
             op = self.layout.operator("gk.pick_anim_tree", text=label)
             op.node_name = self.node_name
             op.choice = ident
+
+
+def apply_captured_key(context, node_name, key, tree=None,
+                       key_prop="gk_key", action_prop="gk_action"):
+    """把"按一下键"捕获到的键写进节点。返回 (成功?, 提示文字)。
+
+    ── 为什么单独抽成函数(不是为了好看)────────────────────────────
+    Blender 的算子**不能直接 new**(`bpy_struct.__new__(struct): expected a
+    single argument`),模态算子又只能在界面上按出来 —— 逻辑留在 modal 里面
+    就永远测不到 (`context.space_data` 在没有界面时是 None,连树都找不到)。
+    抽出来之后测试可以直接把树喂进来验证。
+
+    key_prop / action_prop:「输入_方向」这种一个节点有**四组**键的,
+    每组各点各的按钮 —— 按钮上带着"写到哪个属性"。
+    """
+    if tree is None:
+        tree = props.current_tree(context)
+    node = tree.nodes.get(node_name) if tree is not None else None
+    if node is None or not hasattr(node, key_prop):
+        return False, "没找到目标节点,按键没绑上"
+    key = str(key or "").strip()
+    if not key:
+        return False, "没识别出按键"
+    setattr(node, key_prop, key)
+    # 动作名留空就按按键名生成 —— 用户不用想名字。
+    # 已经自动生成过的(key_xxx)也跟着新键改名,否则"先绑 W 又改绑 Q"
+    # 时动作名还停在 key_w,看着像没生效。
+    current = str(getattr(node, action_prop, "") or "").strip()
+    if not current or current.startswith("key_"):
+        setattr(node, action_prop, "key_" + key.lower())
+    return True, (f"{key_prop} -> {key}"
+                  f"(动作名:{getattr(node, action_prop)})")
+
+
+# 等按键期间会**不停刷进来**的事件 —— 必须忽略,否则鼠标一动就当按了键。
+# (鼠标移动、计时器、窗口激活/失焦、数位板、3D 鼠标…)
+_IGNORED_EVENT_TYPES = {
+    "MOUSEMOVE", "INBETWEEN_MOUSEMOVE", "TIMER", "TIMER0", "TIMER1",
+    "TIMER2", "TIMERJOBS", "TIMER_REPEAT", "WINDOW_DEACTIVATE",
+    "WINDOW_ACTIVATE", "NDOF_MOTION", "HEADER", "TRACKPADPAN",
+    "TRACKPADZOOM", "MOUSEROTATE", "NOTHING", "EVENT_NONE",
+    # 鼠标键不走这里(鼠标有专门的节点;绑到"键盘"节点上只会让人困惑)
+    "LEFTMOUSE", "MIDDLEMOUSE", "RIGHTMOUSE", "BUTTON4MOUSE",
+    "BUTTON5MOUSE", "BUTTON6MOUSE", "BUTTON7MOUSE",
+}
+
+# 这些键名和 Blender 的语义对不上/不该绑,按了就当取消或忽略
+_CANCEL_KEYS = {"ESC"}
+
+
+def key_from_event(event):
+    """从 Blender 事件里取出"用户按了哪个键"。
+
+    返回 `(键名 或 None, 是否取消)` —— None 表示"这个事件不算按键,继续等"。
+
+    ── 为什么不能判断 `event.type == "KEYDOWN"`(实测踩过的坑)────────
+    Blender 里**根本没有** `KEYDOWN` 这个事件类型。按 W 时是:
+
+        event.type   == "W"          # 键名就是类型名
+        event.value  == "PRESS"      # 按下 / RELEASE 松开
+
+    第一版写的是 `if event.type == "KEYDOWN"`,于是**按字母键毫无反应**:
+    模态一直挂着(状态栏那句"按一下你要绑的键"不消失),
+    用户 2026-10-03 截图报"输入按键部分未正常工作"——就是这个。
+    正确做法:`event.value == "PRESS"` + 排除鼠标/移动/计时器。
+
+    抽成独立函数是为了**能测**:Blender 的模态算子没法在无界面下按出来,
+    但喂一个假事件进去判断"认不认"是可以测的。
+    """
+    kind = str(getattr(event, "type", "") or "")
+    value = str(getattr(event, "value", "") or "")
+    if kind in _CANCEL_KEYS:
+        return None, True
+    if not kind or kind in _IGNORED_EVENT_TYPES or kind.startswith("TIMER"):
+        return None, False
+    # 松开、拖拽、双击都跳过 —— 只在"按下"那一刻取
+    if value not in ("PRESS", "CLICK"):
+        return None, False
+    return kind, False
+
+
+def curve_object_items(_self=None, _context=None):
+    """场景里所有**曲线**物体的名字(给『相机_路径』挑轨道用)。"""
+    items = []
+    for obj in getattr(bpy.data, "objects", ()) or ():
+        if getattr(obj, "type", "") == "CURVE":
+            items.append((obj.name, obj.name, "拿它当运镜轨道", "CURVE_DATA", 0))
+    if not items:
+        items.append(("", "(场景里没有曲线)", "先加一条曲线:添加 → 曲线 → 路径/贝塞尔",
+                      "ERROR", 0))
+    return items
+
+
+class GK_OT_PickCurve(bpy.types.Operator):
+    """挑一条曲线当相机的运镜轨道(照 UPBGE 那种原生选择器的体验)。"""
+
+    bl_idname = "gk.pick_curve"
+    bl_label = "选曲线"
+    bl_description = "把这条曲线设为相机的运镜轨道"
+    bl_property = "curve_name"      # 弹出搜索框时默认聚焦这个
+
+    node_name: StringProperty(name="节点", default="")
+    curve_name: EnumProperty(name="曲线", items=curve_object_items)
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        if node is None or not hasattr(node, "gk_curve"):
+            self.report({"WARNING"}, "没找到目标节点")
+            return {"CANCELLED"}
+        if not self.curve_name:
+            self.report({"WARNING"}, "场景里还没有曲线物体")
+            return {"CANCELLED"}
+        node.gk_curve = self.curve_name
+        self.report({"INFO"}, f"运镜轨道 -> {self.curve_name}")
+        return {"FINISHED"}
+
+
+class GK_OT_CaptureKey(bpy.types.Operator):
+    """**按一下键盘上任意键**就把它绑到节点上(照 UPBGE 的 Press & Choose)。
+
+    ── 为什么要这个(用户 2026-10-03 的要求)──────────────────────────
+    用户原话:"在输入按键时,按下键盘任意键即可设置哪个键盘控制输入等,
+    如 upbge 的 keyboard key 设计逻辑"。
+
+    以前只能**打字**填动作名(`jump` / `move_right`),而且得记住
+    "jump 绑空格、move_right 绑 D"这套约定 —— 名字打错了不报错,
+    只是游戏里按了没反应。现在按一下键就绑上,名字自动生成。
+
+    ── 实现要点 ────────────────────────────────────────────────────
+    * 模态算子(invoke_modal):等在键盘上按一下,而不是弹个对话框让你选
+    * 认的是 `event.value == "PRESS"`(**不是** `KEYDOWN`,见 key_from_event)
+    * `Esc` 取消 —— 否则用户想退出都退不出来
+    * 存的是 `event.type`(Blender 的键名,如 `W` / `SPACE` / `LEFT_SHIFT`),
+      导出时再翻成 Godot 的 keycode(见 project.KEY_TO_GODOT)
+    """
+
+    bl_idname = "gk.capture_key"
+    bl_label = "按一下键"
+    bl_description = "按一下你想用的键(比如 W);按 Esc 取消"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    # 「输入_方向」一个节点有四组键,按钮上带着"写到哪个属性"
+    key_prop: StringProperty(name="按键属性", default="gk_key")
+    action_prop: StringProperty(name="动作属性", default="gk_action")
+
+    def invoke(self, context, event):
+        if context.area is not None:
+            context.area.header_text_set("按一下你要绑的键(Esc 取消)")
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        key, cancel = key_from_event(event)
+        if cancel:
+            self._finish(context)
+            return {"CANCELLED"}
+        if key:
+            self._apply(context, key)
+            return {"FINISHED"}
+        return {"RUNNING_MODAL"}
+
+    def _finish(self, context):
+        if context.area is not None:
+            context.area.header_text_set(None)
+
+    def _apply(self, context, key):
+        self._finish(context)
+        ok, message = apply_captured_key(context, self.node_name, key,
+                                         key_prop=self.key_prop,
+                                         action_prop=self.action_prop)
+        self.report({"INFO" if ok else "WARNING"}, message)
+        if ok:
+            # 记下来给"最近用过"菜单用
+            try:
+                remember_node("GKNodeKey")
+            except Exception:
+                pass
+            # ── 让界面立刻显示新绑的键(踩过的坑)──────────────────────
+            # 节点属性是在"没有界面"的情况下被改的,不主动刷新的话
+            # 节点上那个『按键』框还是空的,用户以为没绑上。
+            try:
+                if context.area is not None:
+                    context.area.tag_redraw()
+                for window in getattr(context, "window_manager", None).windows \
+                        if getattr(context, "window_manager", None) else ():
+                    screen = getattr(window, "screen", None)
+                    for area in getattr(screen, "areas", ()) or ():
+                        if area.type == "NODE_EDITOR":
+                            area.tag_redraw()
+            except Exception:
+                pass
+
+
+class GK_OT_PickAnimState(bpy.types.Operator):
+    """从**这张动画树的状态**里挑一个,填进转场的『从』/『到』。
+
+    ── 为什么要它(用户 2026-10-03 踩的坑)────────────────────────────
+    他把状态的『转到』直接连到下一个状态的『进入』,转场的『上游』空着,
+    导出后整台状态机是死的(`_physics_process` 只有 pass)。连线是首选,
+    但**手打状态名太容易错**,而错了同样会静默失效。
+    所以给下拉兜底:忘了连线也能从列表里点一个。
+    """
+
+    bl_idname = "gk.pick_anim_state"
+    bl_label = "选择状态"
+    bl_description = "从这张动画树的状态里挑一个(连线优先,这只是兜底)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    prop_name: StringProperty(name="属性", default="gk_from_state")
+    choice: StringProperty(name="状态名", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        context.window_manager.invoke_search_popup(self)
+        # 搜索弹窗是异步的,这里必须显式返回集合(见 gk.pick_anim_name)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or not hasattr(node, self.prop_name):
+            self.report({"WARNING"}, "没找到目标节点,状态名没写进去")
+            return {"CANCELLED"}
+        setattr(node, self.prop_name, self.choice)
+        self.report({"INFO"}, f"{self.prop_name} -> {self.choice}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        # 状态在**当前这张树**里找(转场的『从』『到』只能是同一张树的状态)
+        owner = getattr(node, "id_data", None) if node is not None else None
+        for ident, label, description in node_lib.animation_tree_states(owner):
+            op = self.layout.operator("gk.pick_anim_state", text=label)
+            op.node_name = self.node_name
+            op.prop_name = self.prop_name
+            op.choice = ident
+
+
+class GK_OT_TagAnimCategory(bpy.types.Operator):
+    """给一个动作打分类标签(静止/移动/攻击…)。
+
+    ── 为什么要它 ──────────────────────────────────────────────────
+    动作一多(MMD 模型动辄几十个),下拉列表里全是名字,分不清哪个是
+    "待机"哪个是"攻击"。打上分类之后:
+      * 『选…』列表里按分类聚在一起、分类摆在最前
+      * 导出的 GDScript 里会生成一张按分类索引的表(见 codegen),
+        Godot 侧可以直接按分类随机/顺序挑动作
+
+    标签存进 Action 的**自定义属性**(见 nodes.ANIM_CATEGORY_KEY),
+    随 .blend 保存,禁用插件也不丢。
+    """
+
+    bl_idname = "gk.tag_anim_category"
+    bl_label = "动作分类"
+    bl_description = "给这个动作打个分类(只有一个分类,再点其它分类会改过去)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    action_name: StringProperty(name="动作", default="")
+    # 用 EnumProperty 而不是字符串:面板上用 `operator_menu_enum` 把
+    # 六个分类直接列成菜单,点一下就打上,不用弹对话框。
+    category: EnumProperty(
+        name="分类",
+        items=[(name, name, f"标记为『{name}』")
+               for name in node_lib.ANIM_CATEGORY_NAMES],
+        default=node_lib.ANIM_CATEGORY_NAMES[0],
+    )
+    clear: BoolProperty(name="清除分类", default=False)
+
+    def execute(self, context):
+        action = bpy.data.actions.get(self.action_name)
+        if action is None:
+            self.report({"WARNING"},
+                        f"找不到动作『{self.action_name}』(可能已被删除)")
+            return {"CANCELLED"}
+        if self.clear:
+            node_lib.set_action_category(action, "")
+            self.report({"INFO"}, f"已清除『{action.name}』的动作分类")
+            return {"FINISHED"}
+        if not self.category:
+            self.report({"WARNING"}, "没指定分类")
+            return {"CANCELLED"}
+        node_lib.set_action_category(action, self.category)
+        self.report({"INFO"}, f"『{action.name}』-> {self.category}")
+        return {"FINISHED"}
 
 
 class GK_OT_ExportAssets(bpy.types.Operator):
@@ -1209,6 +1529,16 @@ class GK_OT_OpenGodot(bpy.types.Operator):
         if not self.editor and self.auto_export and pref_on:
             self._auto_prepare(context, directory)
 
+        # ── 启动前先说一句"要等几秒"(用户 2026-10-03:"打开的有点慢")────
+        # 导出本身只要几毫秒(日志里有),慢的是 **Godot 引擎自己启动**
+        # (Vulkan 初始化 + 资源导入,普通机器 3~6 秒)。
+        # 那段时间 Blender 界面上什么都不会发生,很容易被当成"卡住了"。
+        # 所以先把话说在前面;顺便提示第一次导入会更久。
+        if not self.editor:
+            _report(self, "INFO",
+                    "正在启动 Godot(引擎启动约 3~6 秒;首次打开项目"
+                    "还要额外导入资源,会更久一点)")
+
         opened, message = project.open_in_godot(directory, context,
                                                 editor=bool(self.editor))
         if not opened:
@@ -1419,6 +1749,14 @@ GK_CLASSES = (
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
     GK_OT_PickAnimName,
     GK_OT_PickAnimTree,
+    # 转场的『从』/『到』状态选择器(忘了连线时的兜底)
+    GK_OT_PickAnimState,
+    # 按一下键盘就绑定按键(照 UPBGE 的 Press & Choose)
+    GK_OT_CaptureKey,
+    # 挑一条曲线当运镜轨道(『相机_路径』用)
+    GK_OT_PickCurve,
+    # 动作分类标签(给动作打"静止/移动/攻击…",导出时按分类成表)
+    GK_OT_TagAnimCategory,
     # 碰撞体可视化(像 UPBGE 那样能在视口里看到碰撞范围)
     GK_OT_ShowCollision,
     GK_OT_HideCollision,

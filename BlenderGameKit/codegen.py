@@ -22,10 +22,16 @@
   Blender。
 """
 
+import contextlib
+
 from . import gk_sockets as S
 from .nodes import node_base as B
 from .nodes.node_base import TARGET_SELF, gd_node_path, gd_string, snake_case
-from .nodes.nodes import parse_transitions, transition_pin_name
+from .nodes.nodes import (ANIM_CATEGORY_NAMES, action_category,
+                          parse_transitions, transition_pin_name)
+# 节点定义模块本身 —— 动画树的"图"解析(状态 / 转场 / 直连)住在那边,
+# 因为面板、节点上的预览、代码生成三处必须用同一份判断。
+from .nodes import nodes as node_lib
 
 # 事件节点 bl_idname -> (函数名, 是否需要 delta, 排序属性)
 EVENT_KINDS = {
@@ -180,11 +186,20 @@ class GenContext:
         self.signals = []          # 要声明的 signal 名
         self.vars = {}             # 变量名 -> 类型
         self.var_order = []
+        self.var_initials = {}     # 变量名 -> 初值字面量(动画树变量用)
         self.onready = {}          # 变量名 -> (节点访问表达式, GDScript 类型)
         self._onready_by_path = {}  # 节点访问表达式 -> 变量名(避免重复声明同一个节点)
         self.exports = []          # @export 参数行 (名字, 类型, 初值, 注释)
+        # 已经发给 @export 的名字 —— 脚本变量不能和它重名
+        # (Godot: Variable "x" has the same name as a previously declared variable)
+        self.export_vars = set()
+        # 被改过名的变量:原名 -> 实际用的名字(见 declare_var)
+        self._var_aliases = {}
         self.input_actions = {}    # 常量名 -> 输入动作名
+        # 常量名 -> 用户在『输入_按键』上捕获的那个键(导出时写进 project.godot)
+        self.action_keys = {}
         self.warnings = []
+        self.notes = []    # 提示(正常用法),不算告警
         self.read_vars = set()     # 只读未写的变量(仍然要声明)
         self.sink = _Statements()  # 当前正在写入的收集器
         self._export_names = {}
@@ -202,6 +217,10 @@ class GenContext:
         # 跨函数共享的成员变量(见 member_temp)
         self._member_seq = 0
         self.member_vars = []
+        # 播放器成员变量(整个脚本共用一个,见 anim_player_member)
+        self._anim_player_var = None
+        # 用到『播放完成』/『播完就切』时要在 _ready 里接 animation_finished
+        self.need_anim_finished_signal = False
         # 生成的代码**用到了哪些类才有的成员** -> 基类需求
         # (见 require_base_class / check_base_class)
         self.base_class_requirements = {}
@@ -244,8 +263,17 @@ class GenContext:
         # 动画树(独立那张图)驱动的状态机 —— 同样挂 _physics_process
         self.anim_trees = []
         self.need_anim_tree_process = False
+        # 『动画_开始』的开始条件 —— 要在每物理帧判一次"现在能不能开始"
+        self.anim_starts = []
+        self.need_anim_start_process = False
+        # 状态变量名 -> 已经生成的"_进入状态"函数名。
+        # 同一个变量只生成一个函数(见 enter_anim_state_func);
+        # 不同的动画树各有各的状态变量,所以是按变量名分开的。
+        self.anim_enter_funcs = {}
         # 动画名留空时要生成 _gk_first_animation()(见 _stmt_play_anim)
         self.need_first_animation = False
+        # 用了『层』≥1 的播放节点时要生成 _gk_layer_player()(上下半身分离)
+        self.need_layer_player = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
         self.need_save_helpers = False
         # 只有真的用了界面节点才生成 UI 容器辅助函数
@@ -266,6 +294,26 @@ class GenContext:
         """开一段新的代码块(一个函数)，返回它的收集器。"""
         self.sink = _Statements()
         return self.sink
+
+    @contextlib.contextmanager
+    def capture(self):
+        """把中途生成的代码收进**独立的一段**,结束后把写入目标还回去。
+
+        ── 为什么必须还回去(踩过的坑,很隐蔽)────────────────────────
+        `new_section()` 会把 `self.sink` 换成新的一段,而且**不会自己换回来**。
+        在"生成某个节点的代码途中"开新段(状态的『进入时』/『离开时』函数、
+        按钮的点击回调),之后的 `add_line` 就全跑到那一段里去了。
+
+        实测表现(动画状态机):`_ready` 里那句"起始状态播一下"
+        **整行消失**,它跑到了 `_gk_anim_enter_状态()` 的函数体里 ——
+        结果进游戏什么动画都不播,而脚本语法完全正确,特别难查。
+        """
+        saved = self.sink
+        section = self.new_section()
+        try:
+            yield section
+        finally:
+            self.sink = saved
 
     # ---- 语句派发 ----
     def emit_statement(self, node, indent, output="完成"):
@@ -299,6 +347,18 @@ class GenContext:
         _chain(self, node, indent, "执行")
 
     # ---- 记录 ----
+    def note(self, message):
+        """提示(不是问题):导出报告里单独一栏,不算告警。
+
+        ── 为什么要分两档(2.5D 示例)────────────────────────────────
+        "没填相机 = 自动用当前相机"这种是**正常的默认用法**。全塞进 warnings
+        之后,"零告警"这条验收线就没法用了(正常图也会有几十条),
+        真正的告警被淹掉。现在 notes 只展示、不参与验收。
+        """
+        text = str(message)
+        if text not in self.notes:
+            self.notes.append(text)
+
     def warn(self, message):
         if message not in self.warnings:
             self.warnings.append(message)
@@ -347,6 +407,170 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         self.member_vars.append(name)
         return name
 
+    def anim_player_member(self):
+        """**同一个** AnimationPlayer 成员变量(整个脚本共用一个)。
+
+        ── 为什么需要它(踩过的坑)──────────────────────────────────
+        `member_temp()` 每次调用都返回**新名字**。状态机和"动画_播放完成"
+        节点都要保存播放器引用,各调一次就会生成 `_ap0` / `_ap1` 两个
+        成员变量、两遍查找。而且两处都会去连 `animation_finished` 信号 ——
+        同一个回调连两次,动画播完时回调会被调用两次。
+
+        所以播放器引用收成一份,由 `_anim_player_assigned` 标记保证只赋值/连接一次。
+        """
+        if self._anim_player_var is None:
+            self._anim_player_var = self.member_temp("ap")
+        return self._anim_player_var
+
+    def anim_finished_flag(self, tree_name="动画"):
+        """"刚刚播完的是哪个动画"的成员变量与回调。
+
+        ── 为什么不能直接查 current_animation(实测踩过,而且是用户报的 bug)──
+        第一版把"播完"写成:
+            _ap0.current_animation == "骨骼动作" and not _ap0.is_playing()
+        **它永远不会成立**。在 Godot 4.7 上跑真工程实测:
+
+            t=5.50  current_animation=[骨骼动作] is_playing=true  pos=5.43
+            t=6.08  animation_finished(骨骼动作)
+                    current_animation=[]         is_playing=false pos=6.02
+
+        一次性动画播完的那一刻,`current_animation` **被清成空字符串** ——
+        所以 "等于某个名字" 和 "已经不在播" 这两个条件**不可能同时为真**,
+        状态机永远停在第一个状态(用户的形态键动画就是这么"播不出来"的)。
+
+        正解是用 Godot 自己的事件:`animation_finished` 信号带**动画名**,
+        回调里把它记下来,用的时候比这个名字。
+
+        ── 标志是"粘住"的,不是只活一帧 ─────────────────────────────
+        标志一直保留到**下一段动画开始播**(见下面的
+        `_gk_on_anim_started` 回调)。这样"动画播完了**并且**在地面上"
+        这种复合条件才写得出来 —— 如果只活一帧,那一刻玩家没落地,
+        这条转场就永远等不到了。
+
+        ── 为什么连 `animation_started` 来清(而不是在播的地方各清一次)──
+        "开始播"的路径不止一条:`_gk_anim_enter()`(状态机)、
+        『动画_播放』节点、用户自己写的 `play()`。挨个去加"清标志"既
+        容易漏,又会因为**生成顺序**而漏(先播后判的图里,变量还没声明)。
+        信号是唯一的汇聚点:接一次 `animation_started`,所有路径都覆盖到。
+
+        返回 (标志变量名, 播完回调名)。
+        """
+        finished_var = self.declare_var("_gk_anim_finished", "String",
+                                        initial='""')
+        self.need_anim_finished_signal = True
+        handler = self.declare_func_name("_gk_on_anim_finished",
+                                         key=finished_var)
+        started = self.declare_func_name("_gk_on_anim_started",
+                                        key=finished_var)
+        made = getattr(self, "_anim_finished_funcs", None)
+        if made is None:
+            made = set()
+            self._anim_finished_funcs = made
+        if handler not in made:
+            made.add(handler)
+            self.extra_sections.append({
+                "signature": f"func {handler}(anim_name: StringName) -> void:",
+                "lines": [
+                    f"    # {tree_name}:动画播完时记下名字,给『播放完成』/『播完就切』用",
+                    f"    {finished_var} = String(anim_name)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+        if started not in made:
+            made.add(started)
+            self.extra_sections.append({
+                "signature": f"func {started}(_anim_name: StringName) -> void:",
+                "lines": [
+                    f"    # {tree_name}:有新动画开播 -> 上一次的『播放完成』作废",
+                    f'    {finished_var} = ""',
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+        return finished_var, handler
+
+    def connect_anim_finished(self, indent=None):
+        """登记"要用『播放完成』/『播完就切』"。
+
+        **只声明标志 + 打标记**,真正的信号连接由 `generate()` 统一补进
+        `_ready`(见那边的说明)。
+
+        ── 为什么不在调用点连(踩过的坑)────────────────────────────
+        这个函数是从**表达式求值**里调的,而表达式可能在 `_physics_process`
+        里(比如"每帧检查动画播完了没")。在那里连信号的话,生成的代码会变成
+
+            func _physics_process(delta):
+                _ap0 = _gk_find_animation_player(self)
+                if _ap0 != null and not _ap0.animation_finished.is_connected(...):
+                    _ap0.animation_finished.connect(...)     # 每帧都在检查
+
+        虽然 `is_connected` 挡住了重复连接,但"每帧查一遍连接、每帧赋一次
+        播放器"既难看又白费。信号是**一次性**的事,应该在 `_ready` 里做。
+        """
+        return self.anim_finished_flag()
+
+    def _ensure_finished_connect(self, indent):
+        """在 `_ready` 里真的把两个信号接上。"""
+        finished_var = self.declare_var("_gk_anim_finished", "String",
+                                        initial='""')
+        player_temp = self.anim_player_member()
+        handler = self.declare_func_name("_gk_on_anim_finished",
+                                         key=finished_var)
+        started = self.declare_func_name("_gk_on_anim_started",
+                                        key=finished_var)
+        self.add_line(indent, f"if {player_temp} == null:")
+        self.add_line(indent + 1, f"{player_temp} = "
+                                 f"_gk_find_animation_player(self)")
+        for signal_name, func in (("animation_finished", handler),
+                                  ("animation_started", started)):
+            self.add_line(indent, f"if {player_temp} != null "
+                                 f"and not {player_temp}.{signal_name}"
+                                 f".is_connected({func}):")
+            self.add_line(indent + 1,
+                          f"{player_temp}.{signal_name}.connect({func})")
+        self._anim_finished_connected = True
+        return finished_var, player_temp
+
+    def anim_finish_func(self, started_var, done_var, state_var, player_temp,
+                         graph):
+        """生成『动画_结束』的处理函数(每个状态变量一个)。
+
+        走到结束口 = 这段动画演完了:
+
+            func _gk_anim_finish() -> void:
+                _gk_anim_done = true          # 玩法图读这个
+                _gk_anim_started = false      # 等开始条件再开一次
+                anim_state = ""
+                # 可选:把播放器停住(不勾就保持最后一帧的姿势)
+                if _ap0 != null:
+                    _ap0.stop()
+        """
+        key = ("finish", state_var, started_var, done_var)
+        existing = self.anim_enter_funcs.get(key)
+        if existing:
+            return existing
+        func_name = self.declare_func_name("_gk_anim_finish")
+        self.anim_enter_funcs[key] = func_name
+        exit_node = graph.get("exit") if graph else None
+        body = [
+            f"    {done_var} = true",
+            f"    {started_var} = false",
+            f'    {state_var} = ""',
+        ]
+        if exit_node is not None and getattr(exit_node, "gk_stop_player", False):
+            body += [
+                f"    if {player_temp} != null:",
+                f"        {player_temp}.stop()",
+            ]
+        self.extra_sections.append({
+            "signature": f"func {func_name}() -> void:",
+            "lines": body,
+            "empty_body": "    pass",
+            "separator": True,
+        })
+        return func_name
+
     def unique_name(self, base, scope="p"):
         """在导出参数命名空间里取一个不冲突的名字。
 
@@ -386,34 +610,93 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         类型并告警，而不是生成自相矛盾的脚本。
         """
         clean = name if name.startswith("_") else snake_case(name, "v")
+        # 已经被改过名的(和检查器参数撞了)—— 后续调用要用同一个名字，
+        # 否则同一个变量会被声明两次(见下面 export_vars 的说明)
+        clean = self._var_aliases.get(clean, clean)
+        if clean in self.export_vars and clean not in self.vars:
+            # ── 和自动生成的检查器参数重名(实测踩过)──────────────────
+            # 动画树里的变量叫 `move_speed`,而『移动_按方向』的『速度』
+            # 会生成 `@export var move_speed: float = 6.0` —— 同一个脚本里
+            # 两个同名变量,Godot 报
+            #     Parse Error: Variable "move_speed" has the same name as
+            #     a previously declared variable
+            # **整个脚本加载失败**。变量是用户起的名,优先保它,
+            # 把自动生成的那个参数加序号(在 Godot 检查器里只是名字不同)。
+            renamed = self.unique_name(clean, "var")
+            self._var_aliases[clean] = renamed
+            self.warn(f"变量『{clean}』和自动生成的检查器参数重名了,"
+                      f"已把变量改名为『{renamed}』(Godot 不允许同名)。"
+                      f"想用回原名,就把动画树里的变量或那个节点的参数改个名")
+            clean = renamed
         if key is None:
             if clean in self.vars:
                 existing = self.vars.get(clean)
                 if gd_type and existing not in (None, "Variant", gd_type):
+                    # ── 布尔变量被喂了数字?给一条**能照着改**的告警 ──────
+                    # 最常见的触发方式:动画树的变量面板里声明了 bool,
+                    # 玩法图里却用『变量_设置』填了个数字(节点上那个
+                    # 数字框只能填数字)。原来只说"请改用不同的变量名",
+                    # 用户会去改一个根本没问题的地方(实测被抱怨过)。
+                    if existing == "bool" and gd_type in ("float", "int"):
+                        self.warn(
+                            f"变量『{clean}』是**布尔**变量,但这里给它的是"
+                            f"数字 —— 想给真假就接一个『常量_布尔』到『值』引脚上"
+                            f"(节点上那个框只能填数字)。这次先生成了 "
+                            f"{clean} = false/true 的等价写法")
+                        return clean
                     self.warn(f"变量『{clean}』同时被当成 {existing} 和 {gd_type} 使用，"
                               f"已保留 {existing}。请改用不同的变量名。")
                 elif gd_type and existing in (None, "Variant"):
                     self.vars[clean] = gd_type
+                if initial is not None:
+                    # 第一次声明时记下的初值优先 —— 后面再有人声明同一个
+                    # 名字不该把初值改掉(那会让生成结果依赖节点顺序)
+                    self.var_initials.setdefault(clean, initial)
                 return clean
             self.vars[clean] = gd_type
             self._var_owner[clean] = None
             self.var_order.append(clean)
+            self._var_names[clean] = self._var_names.get(clean, 0) + 1
+            if initial is not None:
+                self.var_initials[clean] = initial
             return clean
 
+        # 端口别名优先:声明过端口的名字,一律用端口那个变量
+        aliases = getattr(self, "_var_aliases", None)
+        if aliases:
+            hit = aliases.get(clean) or aliases.get(f"输出_{clean}")
+            if hit:
+                if gd_type and self.vars.get(hit) in (None, "Variant"):
+                    self.vars[hit] = gd_type
+                return hit
         owner = self._var_owner.get(clean)
         if clean in self.vars and owner == key:
             # 同一个节点再次引用 —— 复用
             if gd_type and self.vars[clean] in (None, "Variant"):
                 self.vars[clean] = gd_type
+            if initial is not None:
+                self.var_initials.setdefault(clean, initial)
             return clean
         # 首次声明，或该名字已被别的节点占用 -> 加序号另开一个
+        # ── 计数要从"名字已被占"算起(2.5D 示例真跑抓出来的坑)────────
+        # `key=None` 那条路只写 self.vars、**不动** _var_names,于是:
+        #   1) 先有节点按名字声明 anim_state(key=None)
+        #   2) 状态机再用 key 声明同名 -> 这里读到 used=0 -> 不加序号
+        #      -> var_order 里出现两条一模一样的 `var anim_state: String`
+        # Godot 直接拒绝整个脚本:
+        #   Parse Error: Variable "anim_state" has the same name as a
+        #   previously declared variable.
         used = self._var_names.get(clean, 0)
+        if used == 0 and clean in self.vars:
+            used = 1
         self._var_names[clean] = used + 1
         if used:
             clean = f"{clean}_{used + 1}"
         self.vars[clean] = gd_type
         self._var_owner[clean] = key
         self.var_order.append(clean)
+        if initial is not None:
+            self.var_initials[clean] = initial
         return clean
 
     def declare_export(self, base, gd_type, value_expr, comment=""):
@@ -422,6 +705,14 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         只对"未连线的输入引脚"调用:连线了说明值由节点图算出来，不该暴露。
         """
         name = self.unique_name(base, "param")
+        # 和已声明的脚本变量重名 -> 加序号。
+        # 两边都可能先出现,所以两个方向都要挡(见 declare_var 里的说明)。
+        if name in self.vars:
+            renamed = self.unique_name(f"{base}_param", "param")
+            self.warn(f"检查器参数『{name}』和脚本变量重名了,已改名为"
+                      f"『{renamed}』(Godot 不允许同名)")
+            name = renamed
+        self.export_vars.add(name)
         self.exports.append((name, gd_type, value_expr, comment))
         return name
 
@@ -444,13 +735,20 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         self._func_owners[name] = key
         return name
 
-    def register_input_handler(self, func_name, reset=False):
-        """登记一个要挂进 _input(event) 的回调。
+    def register_input_handler(self, func_name, reset=False, body=None):
+        """登记一个要挂进 `_input(event)` 的回调。
 
-        触屏拖动这类输入没有"当前值"这种属性，只能靠事件累积，
-        所以必须有地方接事件。这里登记后由 generate() 统一拼一个 _input。
+        ── 为什么要 `body`(踩过的坑,2026-10-03)──────────────────────
+        触屏拖动这类输入没有"当前值"这种属性,只能靠事件累积,
+        所以必须有地方接事件。原来这张表只记 `(函数名, 是否清零)`,
+        函数体在发射时才**写死成触屏拖动那几行** ——
+        鼠标滚轮复用这张表之后,同一个函数名被生成了**两份**
+        (一份滚轮、一份触屏),Godot 直接拒绝整个脚本:
+            Parse Error: Function "_gk_mouse_wheel_event" has the same
+            name as a previously declared function.
+        现在函数体跟着登记一起带过来,发射时照抄,谁登记的谁的体。
         """
-        entry = (func_name, bool(reset))
+        entry = (func_name, bool(reset), list(body or []))
         if entry not in self._input_handlers:
             self._input_handlers.append(entry)
         return func_name
@@ -525,7 +823,12 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         # 会"产生副作用"的表达式节点(射线检测要先射出去)不能缓存:
         # 缓存之后第二次求值只会复用第一次的表达式，射线就不再重新射了。
         cacheable = not getattr(type(node), "gk_no_cache", False)
-        key = f"{id(node)}::{output_name or ''}"
+        # 缓存键用**节点身份**而不是节点名:两个不同节点可以同名，
+        # 用名字做键会把它们的结果串在一起。
+        # 身份走 node_lib.node_key(as_pointer):Blender 里同一个节点的两个
+        # Python 包装对象 id() 不同,用 id() 会**撞键**(拿错别人的表达式)
+        # 或者漏缓存 —— 详见 nodes.node_key。
+        key = f"{node_lib.node_key(node)}::{output_name or ''}"
         if cacheable:
             cached = self._expr_cache.get(key)
             if cached is not None:
@@ -686,11 +989,15 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         self._onready_by_path[path] = var
         return var
 
-    def add_action(self, action):
+    def add_action(self, action, key=""):
         """登记一个输入动作名，返回脚本顶部常量的名字。
 
         这样所有输入动作都集中在脚本开头，改名一眼可见，
         也不会和 Godot 内置的 ui_* 动作混淆。
+
+        key: 用户在『输入_按键』上**捕获**的那个键(比如 "W")。
+        记下来给导出用 —— 导出时会把它写进 project.godot 的输入映射,
+        这样"在 Blender 里按一下 W,Godot 里 W 就真的能用"。
         """
         name = (action or "").strip()
         if not name:
@@ -698,6 +1005,9 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         const = "ACTION_" + snake_case(name, "input").upper()
         if const not in self.input_actions:
             self.input_actions[const] = name
+        key = str(key or "").strip()
+        if key and const not in self.action_keys:
+            self.action_keys[const] = key
         return const
 
     # ---- 目标节点 ----
@@ -715,8 +1025,14 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             return "self"
         return self.target_expr(node, prop)
 
-    def animation_player(self, node):
-        raw = (getattr(node, "gk_player", "") or "").strip()
+    def animation_player(self, node, use_target=True):
+        """这个节点用哪个动画播放器。
+
+        use_target=False 表示**只看脚本所在物体**(忽略节点上的
+        『动画播放器』物体选择)—— 『动画_状态机』用它:那个节点作用在
+        自己身上,而老文件里可能还留着已经废弃的物体名,不能让它复活。
+        """
+        raw = (getattr(node, "gk_player", "") or "").strip() if use_target else ""
         if not raw or raw == TARGET_SELF:
             # ── 不能写成 `$AnimationPlayer`(踩过的坑)──────────────────
             # glTF 导入时,AnimationPlayer 会被放在**模型实例内部**:
@@ -733,6 +1049,106 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             self.need_anim_finder = True
             return "_gk_find_animation_player(self)"
         return self.target_expr(node, "gk_player", hint="anim")
+
+    def enter_anim_state_func(self, node, var_name, player_temp, debug=False,
+                              finished_var=None, enter_hooks=None,
+                              exit_hooks=None):
+        """生成/复用一个"进入动画状态"的成员函数,返回它的名字。
+
+        ── 为什么抽成一个函数(而不是每处切换内联四行)──────────────
+        状态切换在两个地方发生:起始状态(在 _ready 里播)和每条转移。
+        老代码把
+            if _ap0 != null and _ap0.has_animation("run"): _ap0.play("run")
+            else: push_warning(...)
+        内联在**每一处**,于是"进入状态时还想做点什么"(打印、触发事件、
+        改速度)就得改 N 个地方 —— 而且漏改一处只有运行时才看得出来。
+
+        函数体长这样:
+
+            func _gk_anim_enter(next_state: String) -> void:
+                match anim_state:                 # 离开旧状态
+                    "攻击":
+                        _gk_anim_exit_攻击()
+                <停掉上一次"同时播"的层播放器>
+                anim_state = next_state
+                _gk_anim_finished = ""            # 进新状态 = 上次的"播完"作废
+                if _ap0 == null:
+                    push_warning(...)
+                    return
+                if _ap0.has_animation(next_state):
+                    _ap0.play(next_state)
+                else:
+                    push_warning(...)
+                match next_state:                 # 进入新状态
+                    "攻击":
+                        _gk_anim_enter_攻击()     # 进入时语句 + 同时播的动画
+
+        按**状态变量名**缓存:同一张图被两个节点驱动、或者重复导出时
+        只生成一份。不同的动画树各有各的状态变量,所以互不干扰。
+        """
+        enter_hooks = enter_hooks or {}
+        exit_hooks = exit_hooks or {}
+        key = (var_name, finished_var, tuple(sorted(enter_hooks.items())),
+               tuple(sorted(exit_hooks.items())))
+        existing = self.anim_enter_funcs.get(key)
+        if existing:
+            return existing
+        func_name = self.declare_func_name("_gk_anim_enter",
+                                        key=var_name)
+        self.anim_enter_funcs[key] = func_name
+        body = []
+        # ── 1) 先跑旧状态的『离开时』────────────────────────────────
+        # 必须在 anim_state 被改写**之前**跑,否则状态名已经变了,
+        # "离开时"里的判断读到的会是新状态。
+        if exit_hooks:
+            body.append("    match " + var_name + ":")
+            for name, hook in sorted(exit_hooks.items()):
+                body.append(f"        {gd_string(name)}:")
+                body.append(f"            {hook}()")
+        # ── 2) 停掉上一次"同时播"的层播放器 ──────────────────────────
+        # 新状态没填那几段的话,旧的会一直播下去(层播放器是独立的节点)。
+        max_layers = int(getattr(self, "_anim_layer_count", 0) or 0)
+        if max_layers:
+            layers = ", ".join(str(index) for index in range(1, max_layers + 1))
+            body.append(f"    for _gk_layer in [{layers}]:")
+            body.append(f"        var _gk_lp = "
+                        f"_gk_layer_player({player_temp}, _gk_layer)")
+            body.append("        if _gk_lp != null:")
+            body.append("            _gk_lp.stop()")
+        body.append(f"    {var_name} = next_state")
+        if finished_var:
+            # 进入新状态 = 上一次的"播完"作废,否则会立刻再切一次
+            body.append(f'    {finished_var} = ""')
+        body += [
+            f"    if {player_temp} == null:",
+            # 找不到播放器时也要说一句 —— 否则用户只看到"状态在切、人不动"
+            '        push_warning("[GK] 没找到 AnimationPlayer,'
+            '动画状态机没法播动画")',
+            "        return",
+            f"    if {player_temp}.has_animation(next_state):",
+            f"        {player_temp}.play(next_state)",
+            "    else:",
+            # 动画名不存在时把**可用清单**打出来 —— 和『动画_播放』同一个做法,
+            # 否则用户只知道"没播",不知道模型里到底叫什么
+            '        push_warning("[GK] 状态『%s』没有对应的动画,'
+            '这个模型里可用的有: %s" % [next_state, '
+            f"{player_temp}.get_animation_list()])",
+        ]
+        if debug:
+            body.append('    print("[GK] 动画状态 -> %s" % next_state)')
+        # ── 3) 最后跑新状态的『进入时』+ 同时播的动画 ────────────────
+        if enter_hooks:
+            body.append("    match next_state:")
+            for name, hook in sorted(enter_hooks.items()):
+                body.append(f"        {gd_string(name)}:")
+                body.append(f"            {hook}()")
+        self.extra_sections.append({
+            "signature": f"func {func_name}(next_state: String) -> void:",
+            "lines": body,
+            "empty_body": "    pass",
+            "separator": True,
+        })
+        return func_name
 
     # ---- 内部 ----
     @staticmethod
@@ -838,6 +1254,124 @@ def expr_node(*bl_idnames):
     return wrapper
 
 
+# ── 三张注册表都放在**最前面** ───────────────────────────────────
+# 踩过的坑:注册表原来散在文件各处,新加的处理器只要写在定义之前就会
+# `NameError: name 'multi_output' is not defined` —— 为了让"处理器
+# 可以随便放",把注册表统一提到所有处理器之前。
+MULTI_OUTPUT = {
+    "GKNodeVectorSplit": {"X": ".x", "Y": ".y", "Z": ".z"},
+}
+
+# bl_idname -> 函数(ctx, node) -> {输出引脚名: 表达式} 或 None
+MULTI_OUTPUT_FUNCS = {}
+
+
+def multi_output(bl_idname):
+    """注册一个"自定义多输出"表达式节点。"""
+    def wrapper(func):
+        MULTI_OUTPUT_FUNCS[bl_idname] = func
+        return func
+    return wrapper
+
+
+@multi_output("GKNodeGetBone")
+def _expr_get_bone(ctx, node):
+    """读骨骼姿势:位置 / 旋转(度) / 缩放 / 世界位置。"""
+    reader = ctx.declare_func_name("_gk_read_bone", key="bone")
+    ctx.need_bone_reader = True
+    call = (f"{reader}({_skeleton_expr(ctx, node)}, "
+            f"{gd_string(str(getattr(node, 'gk_bone', '') or ''))})")
+    return {
+        "位置": f"({call}.get(\"pos\", Vector3.ZERO) as Vector3)",
+        "旋转": f"({call}.get(\"rot\", Vector3.ZERO) as Vector3)",
+        "缩放": f"({call}.get(\"scale\", Vector3.ONE) as Vector3)",
+        "世界位置": f"({call}.get(\"world\", Vector3.ZERO) as Vector3)",
+    }
+
+
+@multi_output("GKNodeInputDirection")
+def _expr_input_direction(ctx, node):
+    """『输入_方向』:上下左右四个键 -> 二维方向向量 + 左右/前后分量。
+
+    用户 2026-10-03(第四轮):"输入这里,这两个都可以整合到一起的,
+    比如输入按键时有 x,y 的属性输出,这样就可以调节向前向量和向右向量
+    (这还是虚幻蓝图的设计逻辑),这应该是自带的,不应该要再设置变量"。
+
+    所以这里**一次算全**:方向(向量) / 左右(X) / 前后(Y) / 有输入。
+    接『移动_按方向』的『方向』引脚就能走,不用自己拼向量、也不用设变量。
+    (多输出节点在多个地方被引用也只求值一次 —— 和『动画判断_移动状态』
+    同一个做法,靠 multi_output 注册。)
+    """
+    expr = {}
+    deadzone = float(getattr(node, "gk_deadzone", 0.2) or 0.0)
+    for direction in ("up", "down", "left", "right"):
+        action = None
+        key = ""
+        resolver = getattr(node, "action_for", None)
+        if callable(resolver):
+            action, key = resolver(direction)
+        else:
+            action, key = f"move_{direction}", ""
+        const = ctx.add_action(action, key)
+        expr[direction] = f"Input.get_action_strength({const})"
+    # ── 先落到局部变量再算(不是图省事)────────────────────────────
+    # 直接内联的话每个分量要写两遍(一次判死区、一次取值),生成出来是
+    # 一行两百多字符的怪物,而且 `get_action_strength` 会被调用两次。
+    # 抽成 `var _gk_in_x := …` 之后:生成结果一眼能读,调用也只发生一次。
+    x_var = ctx.new_temp("in_x")
+    y_var = ctx.new_temp("in_y")
+    len_var = ctx.new_temp("in_len")
+    ctx.add_line(ctx._expr_indent,
+                 f"var {x_var} := {expr['right']} - {expr['left']}")
+    ctx.add_line(ctx._expr_indent,
+                 f"var {y_var} := {expr['up']} - {expr['down']}")
+    if deadzone > 0.0:
+        dz = gd_number(deadzone)
+        ctx.add_line(ctx._expr_indent,
+                     f"if absf({x_var}) < {dz}: {x_var} = 0.0")
+        ctx.add_line(ctx._expr_indent,
+                     f"if absf({y_var}) < {dz}: {y_var} = 0.0")
+    if getattr(node, "gk_normalize", True):
+        # 斜着走不能变成 1.41 倍速(虚幻的 Normalize 就是这个作用)。
+        # ── 一定要在**分量上**夹,不能只夹向量(踩过的坑)──────────────
+        # 3D 项目里『方向』输出的是 `Vector3(_in_x, 0.0, _in_y)`,
+        # 如果只在 `Vector2(...).limit_length(1.0)` 上夹,那个被夹过的值
+        # 根本没进输出 —— 斜着走照样比直着走快 41%。
+        # 所以这里直接把分量归一化,后面谁用都对。
+        ctx.add_line(ctx._expr_indent,
+                     f"var {len_var} := sqrt({x_var} * {x_var} + "
+                     f"{y_var} * {y_var})")
+        ctx.add_line(ctx._expr_indent, f"if {len_var} > 1.0:")
+        ctx.add_line(ctx._expr_indent + 1, f"{x_var} /= {len_var}")
+        ctx.add_line(ctx._expr_indent + 1, f"{y_var} /= {len_var}")
+    # ── 3D 项目里『方向』要给 Vector3 ───────────────────────────────
+    # 这个引脚主要就是喂给『移动_按方向』的,而它在 3D 里写的是
+    # `velocity.z = -方向.z` —— 给 Vector2 会报
+    #     Cannot find member "z" in base "Vector2"
+    # **整个脚本编译不过**(实测,两个新脚本都被 Godot 挡下来了)。
+    # 平面移动在 3D 里就是 XZ 平面:x -> 世界 X,y -> 世界 Z(朝前是 -Z,
+    # 由『移动_按方向』那头取负)。和老的『输入_方向向量』保持同一套约定。
+    direction_out = (f"Vector2({x_var}, {y_var})" if ctx.dim == 2
+                     else f"Vector3({x_var}, 0.0, {y_var})")
+    return {
+        "方向": direction_out,
+        "左右": x_var,
+        "前后": y_var,
+        "有输入": f"(({x_var} != 0.0) or ({y_var} != 0.0))",
+    }
+
+
+STMT_HANDLERS = {}
+
+
+def stmt_node(*bl_idnames):
+    def wrapper(func):
+        for bl_idname in bl_idnames:
+            STMT_HANDLERS[bl_idname] = func
+        return func
+    return wrapper
+
+
 @expr_node("GKNodeConstFloat")
 def _expr_const_float(ctx, node):
     return gd_number(node.input_value(ctx, None, getattr(node, "gk_value", 0.0)))
@@ -863,8 +1397,19 @@ def _expr_const_vector(ctx, node):
 @expr_node("GKNodeMath")
 def _expr_math(ctx, node):
     op = getattr(node, "gk_op", "ADD")
+
+    # ── 没连线时,B 的默认值按运算符走(用户 2026-10-03)────────────
+    # 用户图里『数学_运算』选了"乘",B 没填 -> 默认 0 -> 乘出来恒为 0 ->
+    # 「滚轮缩放」整条链失效,而节点看着完全正常(他报的就是"缩放失效")。
+    # 乘法/除法/取模的**中性值是 1**,不是 0 —— 面板上没填就按中性值算。
+    neutral = {"MUL": "1.0", "DIV": "1.0", "MOD": "1.0",
+               "POW": "1.0", "LERP": "1.0"}.get(op, "0.0")
+
     def arg(name):
+        if name == "B" and neutral == "1.0":
+            return ctx.input_number(node, name, neutral)
         return ctx.input_number(node, name, "0.0")
+
     if op == "ADD":
         return f"({arg('A')} + {arg('B')})"
     if op == "SUB":
@@ -928,14 +1473,38 @@ def _expr_compare(ctx, node):
 
 @expr_node("GKNodeLogic")
 def _expr_logic(ctx, node):
-    op = getattr(node, "gk_op", "AND")
-    left = ctx.input_bool_expr(node, "A")
-    right = ctx.input_bool_expr(node, "B")
-    if op == "AND":
-        return f"({left} and {right})"
-    if op == "OR":
-        return f"({left} or {right})"
-    return f"(not {left})"
+    """与 / 或 / 非 / 异或 —— 输入引脚数量由节点自己长(见 nodes.GKNodeLogic)。
+
+    ── 为什么按 inputs 逐个取,而不是写死 A、B ──────────────────────
+    用户在节点上把『输入数量』调到 4,就应该真的按 4 个输入算。
+    写死 A、B 的话多出来的引脚是**画着好看**,实际被忽略 ——
+    那种"看着连了、其实没生效"的节点最难查。
+    """
+    op = str(getattr(node, "gk_op", "AND"))
+    names = [socket.name for socket in (getattr(node, "inputs", None) or ())]
+    if not names:
+        names = ["A", "B"]
+    parts = []
+    for name in names:
+        socket = ctx._socket(node, name)
+        wired = bool(socket is not None and getattr(socket, "is_linked", False))
+        if op == "AND" and not wired:
+            # 与运算里一个假就全假 —— 空着的引脚会被当成假,
+            # 结果整个节点恒为假。这是最容易"配了却完全没效果"的坑。
+            ctx.warn(f"『逻辑_布尔运算』的输入『{name}』没接线,按假(false)算,"
+                     f"整个『与』的结果会一直是假。"
+                     f"要少用一个输入就把『输入数量』调小")
+        parts.append(ctx.input_bool_expr(node, name))
+    if op == "NOT":
+        return f"(not {parts[0]})"
+    if op == "XOR":
+        # 布尔 != 就是异或,串起来就是"奇数个为真"(N 输入也对)
+        expr = parts[0]
+        for part in parts[1:]:
+            expr = f"({expr} != {part})"
+        return expr
+    joined = " and ".join(parts) if op == "AND" else " or ".join(parts)
+    return f"({joined})"
 
 
 @expr_node("GKNodeRandomRange")
@@ -954,6 +1523,114 @@ def _expr_vector_make(ctx, node):
 def _expr_vector_split(ctx, node):
     # 拆分节点有三个输出，单独由 _expr_of_output 处理
     return "null"
+
+
+@multi_output("GKNodeGetPosition")
+def _expr_get_position(ctx, node):
+    """读物体的位置:输出分开的 X / Y / Z。
+
+    走辅助函数(和『相机_取状态』同一个做法):位置是个 Vector,
+    而用户要的是三个浮点 —— 一次算好、三个输出共用,不然表达式会
+    重复三遍(那种"500 字符一行"的怪物已经踩过一次)。
+    """
+    target = ctx.target_expr(node, "gk_target", hint="节点")
+    global_scope = bool(getattr(node, "gk_global", True))
+    prop = "global_position" if global_scope else "position"
+    made = getattr(ctx, "_pos_helpers", None)
+    if made is None:
+        made = set()
+        ctx._pos_helpers = made
+    key = f"{prop}_{'2d' if ctx.dim == 2 else '3d'}"
+    if key not in made:
+        made.add(key)
+        if ctx.dim == 2:
+            body = [
+                f"    if host is Node2D:",
+                f"        return (host as Node2D).{prop}",
+                "    return Vector2.ZERO",
+            ]
+            ret = "Vector2"
+        else:
+            body = [
+                f"    if host is Node3D:",
+                f"        return (host as Node3D).{prop}",
+                "    return Vector3.ZERO",
+            ]
+            ret = "Vector3"
+        ctx.extra_sections.append({
+            "signature": f"func _gk_{key}(host: Node) -> {ret}:",
+            "lines": body,
+            "empty_body": "    pass",
+            "separator": True,
+        })
+    call = f"_gk_{key}({target})"
+    return {
+        "X": f"({call}).x",
+        "Y": f"({call}).y",
+        "Z": f"({call}).z" if ctx.dim != 2 else "0.0",
+    }
+
+
+@stmt_node("GKNodeSetPosition")
+def _stmt_set_position(ctx, node, indent):
+    """直接摆到某个位置(传送 / 回出生点)。"""
+    target = ctx.target_expr(node, "gk_target", hint="节点")
+    x = ctx.input_number(node, "X", "0.0")
+    y = ctx.input_number(node, "Y", "0.0")
+    z = ctx.input_number(node, "Z", "0.0")
+    relative = bool(getattr(node, "gk_relative", False))
+    if ctx.dim == 2:
+        point = f"Vector2({x}, {y})"
+    else:
+        point = f"Vector3({x}, {y}, {z})"
+    if relative:
+        ctx.add_line(indent, f"{target}.global_position += {point}")
+    else:
+        ctx.add_line(indent, f"{target}.global_position = {point}")
+
+
+@expr_node("GKNodeTextJoin")
+def _expr_text_join(ctx, node):
+    """文本拼接(A + 中间 + B)。数字会自动转文字 —— HUD 拼字符串用。"""
+    socket_a = ctx._socket(node, "甲")
+    socket_b = ctx._socket(node, "乙")
+    first = (ctx.expr_of(socket_a)
+             if socket_a is not None and getattr(socket_a, "is_linked", False)
+             else gd_string(str(getattr(node, "gk_a", "") or "")))
+    second = (ctx.expr_of(socket_b)
+              if socket_b is not None and getattr(socket_b, "is_linked", False)
+              else gd_string(str(getattr(node, "gk_b", "") or "")))
+    middle = str(getattr(node, "gk_middle", "") or "")
+    parts = [f"str({first})"]
+    if middle:
+        parts.append(gd_string(middle))
+    parts.append(f"str({second})")
+    return " + ".join(parts)
+
+
+@expr_node("GKNodeDistance")
+def _expr_distance(ctx, node):
+    """两个物体之间的距离(2D 用 distance_to,3D 也是)。
+
+    『甲』留空 = 脚本自己 —— 这样"离玩家多远"只要填『乙』一边,
+    是拾取判定最常见的用法。
+    """
+    first = ctx.target_expr(node, "gk_a", hint="节点")
+    second = ctx.target_expr(node, "gk_b", hint="节点")
+    # ── 已销毁的物体要当成"无限远"(用户实测:吃到金币之后游戏卡死)──────
+    # 拾取是"距离够 -> 销毁金币";金币被 queue_free() 之后,@onready 变量
+    # 还指着那个**已释放的实例**,下一帧读 .global_position 直接抛错 ——
+    # 而 `_physics_process` 里一抛错,后面的移动/相机**全都不执行**,
+    # 表现就是"吃到金币就动不了了"。
+    # 所以两边都加 is_instance_valid():失效 = 离得无穷远 = 不会触发拾取。
+    guard = (f"is_instance_valid({first}) and is_instance_valid({second})")
+    if ctx.dim == 2:
+        return (f"(({first} as Node2D).global_position.distance_to("
+                f"({second} as Node2D).global_position)"
+                f" if {guard} else INF)")
+    return (f"(({first} as Node3D).global_position.distance_to("
+            f"({second} as Node3D).global_position)"
+            f" if {guard} else INF)")
 
 
 @expr_node("GKNodeVectorLength")
@@ -1008,6 +1685,196 @@ def _expr_is_on_floor(ctx, node):
     return f"{ctx.target_expr(node)}.is_on_floor()"
 
 
+@expr_node("GKNodeKey")
+def _expr_key(ctx, node):
+    """『输入_按键』:一个节点三种触发方式(照 UPBGE 的 Keyboard Key)。
+
+    捕获到的**按键**只在导出时用来写 project.godot 的输入映射;
+    脚本里仍然走"输入动作"(Godot 的输入抽象),这样手柄/触屏
+    以后要映射到同一个动作时不用改图。
+    """
+    action = "jump"
+    resolver = getattr(node, "resolved_action", None)
+    if callable(resolver):
+        action = resolver()
+    else:
+        action = (str(getattr(node, "gk_action", "") or "").strip()
+                  or str(getattr(node, "gk_action", "jump")))
+    const = ctx.add_action(action, getattr(node, "gk_key", ""))
+    trigger = str(getattr(node, "gk_trigger", "PRESSED"))
+    func = {
+        "PRESSED": "is_action_pressed",
+        "JUST": "is_action_just_pressed",
+        "RELEASED": "is_action_just_released",
+    }.get(trigger, "is_action_pressed")
+    return f"Input.{func}({const})"
+
+
+def _mouse_button_const(button):
+    return {
+        "LEFT": "MOUSE_BUTTON_LEFT",
+        "RIGHT": "MOUSE_BUTTON_RIGHT",
+        "MIDDLE": "MOUSE_BUTTON_MIDDLE",
+        "MB4": "MOUSE_BUTTON_XBUTTON1",
+        "MB5": "MOUSE_BUTTON_XBUTTON2",
+    }.get(str(button or "LEFT"), "MOUSE_BUTTON_LEFT")
+
+
+@expr_node("GKNodeMouseButton")
+def _expr_mouse_button(ctx, node):
+    button = _mouse_button_const(getattr(node, "gk_button", "LEFT"))
+    return f"Input.is_mouse_button_pressed({button})"
+
+
+@expr_node("GKNodeMouseButtonDown")
+def _expr_mouse_button_down(ctx, node):
+    """鼠标键"刚按下" —— Godot **没有**这个 API,只能自己记上一帧。
+
+    和手柄按键同一个做法(见 `_expr_joy_button_down`):
+    多输出节点会在多个地方被求值,所以状态用**成员变量**存,
+    每一帧比一次、更新一次。
+
+    ── 去重键为什么不能用 `id(node)`(项目里踩过的老坑)─────────────
+    本项目明确规定过(见 `node_key` 的说明):`id()` 会在对象被回收后**复用**,
+    一次导出里前后创建的两批节点可能拿到同一个 id,于是新的"刚按下"节点
+    被误判成"已经登记过",**那一路的按键永远不生效**。
+    这里用节点自己的指针当键(拿不到指针时退回名字)。
+    """
+    button = _mouse_button_const(getattr(node, "gk_button", "LEFT"))
+    key = ctx.member_temp("mouse_prev")
+    ctx.physics_hooks.setdefault("mouse_button_edge", [])
+    already = getattr(ctx, "_mouse_edge_nodes", None)
+    if already is None:
+        already = set()
+        ctx._mouse_edge_nodes = already
+    marker = node_lib.node_key(node)
+    if marker not in already:
+        already.add(marker)
+        ctx.physics_hooks["mouse_button_edge"] += [
+            f"{key} = Input.is_mouse_button_pressed({button})",
+        ]
+    # 值本身在"上一帧还没按、这一帧按了"时为真 —— 由上面的钩子维护。
+    # 这里返回"当前按着 && 上一帧没按"的即时判断(不依赖顺序)
+    return (f"(Input.is_mouse_button_pressed({button}) "
+            f"and not {key})")
+
+
+@expr_node("GKNodeMouseWheel")
+def _expr_mouse_wheel(ctx, node):
+    """滚轮这一帧滚了多少。
+
+    Godot 的滚轮是**事件**(InputEventMouseButton 的 WHEEL_UP/DOWN),
+    没有"当前值"这种属性,所以要自己累积:
+    生成器补一个 `_input(event)` 收事件,并每帧清零
+    (不清零的话手指/滚轮不动也会一直输出)。
+    """
+    var = ctx.declare_var("_gk_wheel", "float")
+    handler = ctx.declare_func_name("_gk_mouse_wheel_event", key="wheel")
+    made = getattr(ctx, "_wheel_handlers", None)
+    if made is None:
+        made = set()
+        ctx._wheel_handlers = made
+    if handler not in made:
+        made.add(handler)
+        # 函数体跟着登记一起带过去 —— 见 register_input_handler 的说明
+        ctx.register_input_handler(handler, reset=False, body=[
+            "    if event is InputEventMouseButton and event.pressed:",
+            "        if event.button_index == MOUSE_BUTTON_WHEEL_UP:",
+            f"            {var} += 1.0",
+            "        elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:",
+            f"            {var} -= 1.0",
+        ])
+    # ── 清零的时机(2.5D 示例真跑抓出来的坑)────────────────────────
+    # 原来是"在 _process 里清零"。但 Godot 一帧的顺序是
+    #     _input(滚轮事件) -> _physics_process -> _process(清零)
+    # 于是:滚轮值在**同一个物理帧**里被读之前就先被清掉了 ——
+    # 表现是"滚轮完全没反应"(实测:直接给变量赋值都读不到)。
+    #
+    # 现在改成:
+    #   * 物理帧末尾清(那时用户的逻辑已经读过了)—— 放在 physics_hooks 末尾
+    #   * 没有物理 tick 的那些帧,在 _process 里清一次,免得值跨帧粘住
+    # 两处都清,但由"上一物理帧号"保证同一帧不会被清两次。
+    frame_var = ctx.declare_var("_gk_wheel_frame", "int", initial="-1")
+    ctx.physics_hooks.setdefault("mouse_wheel_reset", [])
+    reset_key = f"_gk_wheel_reset_{handler}"
+    if not getattr(ctx, reset_key, False):
+        setattr(ctx, reset_key, True)
+        ctx.physics_hooks["mouse_wheel_reset"] += [
+            f"{var} = 0.0    # 物理帧末尾清零:本帧该读的都已经读到了",
+            f"{frame_var} = Engine.get_physics_frames()",
+        ]
+        ctx.process_hooks.setdefault("mouse_wheel_reset", [])
+        ctx.process_hooks["mouse_wheel_reset"] += [
+            f"if {frame_var} != Engine.get_physics_frames():",
+            f"    {var} = 0.0",
+        ]
+    return var
+
+
+@expr_node("GKNodeMousePosition")
+def _expr_mouse_position(ctx, node):
+    if getattr(node, "gk_relative", False):
+        # 相对模式也是**位移**(不是速度):和『鼠标_移动量』统一,
+        # 免得用户拿两个不同的量去做同一件事
+        return _expr_mouse_motion(ctx, node)
+    return "get_viewport().get_mouse_position()"
+
+
+def ensure_mouse_delta(ctx):
+    """保证 `_gk_mouse_delta`(这一帧鼠标走了多少像素)存在并会被累积。
+
+    两处要用:『鼠标_移动量』节点,以及**自由飞行相机**(它用同一个量转视角)。
+    抽出来共用,免得各写一份、其中一份忘了登记处理函数。
+    """
+    var = ctx.declare_var("_gk_mouse_delta", "Vector2")
+    key = "_gk_mouse_motion_registered"
+    if getattr(ctx, key, False):
+        return var
+    setattr(ctx, key, True)
+    ctx.register_input_handler(
+        "_gk_mouse_motion_event",
+        reset=False,
+        # 第一行必须自带缩进(踩过:顶格会让 Godot 报
+        # "Expected indented block after function declaration")
+        body=[
+            "    if event is InputEventMouseMotion:",
+            f"        {var} += event.relative",
+        ],
+    )
+    frame_var = ctx.declare_var("_gk_mouse_frame", "int", initial="-1")
+    ctx.physics_hooks.setdefault("mouse_motion_reset", [])
+    ctx.physics_hooks["mouse_motion_reset"] += [
+        f"{var} = Vector2.ZERO",
+        f"{frame_var} = Engine.get_physics_frames()",
+    ]
+    ctx.process_hooks.setdefault("mouse_motion_reset", [])
+    ctx.process_hooks["mouse_motion_reset"] += [
+        f"if {frame_var} != Engine.get_physics_frames():",
+        f"    {var} = Vector2.ZERO",
+    ]
+    return var
+
+
+@expr_node("GKNodeMouseMotion")
+def _expr_mouse_motion(ctx, node):
+    """鼠标这一帧移动了多少(**像素**)。
+
+    ── 为什么不用 `Input.get_last_mouse_velocity()`(用户 2026-10-03)────
+    用户原话:"运行时视角一卡一卡的"。原因:
+      * `get_last_mouse_velocity()` 是**按渲染帧**算出来的速度(像素/秒),
+        而且是"这一帧到上一帧"的差分 —— 值本身就很抖;
+      * 我们的逻辑跑在 `_physics_process` 里,物理帧和渲染帧**不同步**
+        (60Hz 物理跑在 144Hz 渲染中间,有时一帧吃两次、有时一次都吃不到),
+        于是转视角的增量一会儿大一会儿小 —— 看起来就是一卡一卡。
+    正确做法(所有 FPS 游戏都这么做):在 `_input` 里把
+    `InputEventMouseMotion.relative` **累加**起来,物理帧里取走并清零 ——
+    和滚轮用的是同一套机制。这样"物理帧拿到的是这段时间里鼠标真实走过的
+    像素总数",无论帧率怎么变,转过的角度总和都对得上。
+    """
+    return ensure_mouse_delta(ctx)
+
+
+
 @expr_node("GKNodeActionPressed")
 def _expr_action_pressed(ctx, node):
     return f"Input.is_action_pressed({ctx.input_action(node, 'gk_action', 'jump')})"
@@ -1016,6 +1883,153 @@ def _expr_action_pressed(ctx, node):
 @expr_node("GKNodeActionJustPressed")
 def _expr_action_just_pressed(ctx, node):
     return f"Input.is_action_just_pressed({ctx.input_action(node, 'gk_action', 'jump')})"
+
+
+def _skeleton_expr(ctx, node, prop="gk_skeleton_node"):
+    """拿骨架:填了节点路径就用它,留空就自动找(带缓存)。"""
+    raw = str(getattr(node, prop, "") or "").strip()
+    if raw and raw != TARGET_SELF:
+        return ctx.target_expr(node, prop, "骨架")
+    cache = ctx.declare_var("_gk_skeleton_cache", "Skeleton3D")
+    ctx.need_skeleton_helper = True
+    return f"({cache} if {cache} != null and is_instance_valid({cache}) " \
+           f"else _gk_find_skeleton(self))"
+
+
+def _bone_setup(ctx, node, indent, lines):
+    """生成"找骨架 + 找骨头 + 找不到就告警"的几行(返回两个变量名)。
+
+    ── 为什么必须判 -1(踩过的坑)──────────────────────────────────
+    `Skeleton3D.find_bone()` 找不到骨头时返回 **-1**,而骨骼 API 收到 -1
+    会抛错刷屏(Godot 里是 "Index p_bone = -1 is out of bounds")。
+    骨骼名是用户手填的字符串,打错很正常 —— 与其让游戏里刷一屏红字,
+    不如这里判掉并**指名道姓**地告警。
+    """
+    bone_expr = gd_string(str(getattr(node, "gk_bone", "") or ""))
+    skel_var = ctx.new_temp("skel")
+    idx_var = ctx.new_temp("bone")
+    lines.append(f"var {skel_var} = {_skeleton_expr(ctx, node)}")
+    lines.append(f"var {idx_var}: int = -1")
+    lines.append(f"if {skel_var} != null:")
+    lines.append(f"    {idx_var} = {skel_var}.find_bone({bone_expr})")
+    lines.append(f"if {idx_var} < 0:")
+    lines.append(f'    push_warning("[GK] 找不到骨骼 %s —— 检查骨骼名,'
+                 f'或者模型还没生成骨架" % {bone_expr})')
+    return skel_var, idx_var
+
+
+@stmt_node("GKNodeSetBone")
+def _stmt_set_bone(ctx, node, indent):
+    """摆骨骼姿势(ADD = 在现有姿势上叠加)。"""
+    lines = []
+    skel_var, idx_var = _bone_setup(ctx, node, indent, lines)
+    do_rot = bool(getattr(node, "gk_do_rot", True))
+    do_pos = bool(getattr(node, "gk_do_pos", False))
+    do_scale = bool(getattr(node, "gk_do_scale", False))
+    mode = str(getattr(node, "gk_mode", "ADD"))
+    lines.append("else:")
+    if do_rot:
+        rot = ctx.input_vector(node, "旋转")
+        # ── 度数转弧度**要按分量转**(踩过的坑)──────────────────────
+        # 写成 `deg_to_rad(Vector3(...))` 是错的:Godot 4 的 deg_to_rad
+        # 只收 float,而且是**解析期**就报
+        #     Invalid argument for "deg_to_rad()" function
+        # 整个脚本加载失败。向量乘 `PI / 180.0` 才是对的写法。
+        rot_rad = f"(({rot}) * (PI / 180.0))"
+        if mode == "ADD":
+            lines.append(f"    {skel_var}.set_bone_pose_rotation({idx_var}, "
+                         f"{skel_var}.get_bone_pose_rotation({idx_var}) * "
+                         f"Quaternion.from_euler({rot_rad}))")
+        else:
+            lines.append(f"    {skel_var}.set_bone_pose_rotation({idx_var}, "
+                         f"Quaternion.from_euler({rot_rad}))")
+    if do_pos:
+        pos = ctx.input_vector(node, "位置")
+        if mode == "ADD":
+            lines.append(f"    {skel_var}.set_bone_pose_position({idx_var}, "
+                         f"{skel_var}.get_bone_pose_position({idx_var}) "
+                         f"+ ({pos}))")
+        else:
+            lines.append(f"    {skel_var}.set_bone_pose_position({idx_var}, "
+                         f"{pos})")
+    if do_scale:
+        scale = ctx.input_vector(node, "缩放")
+        lines.append(f"    {skel_var}.set_bone_pose_scale({idx_var}, "
+                     f"{scale})")
+    if not (do_rot or do_pos or do_scale):
+        lines.append("    pass    # 三个通道都没勾,什么都不改")
+    for line in lines:
+        ctx.add_line(indent, line)
+
+
+@stmt_node("GKNodeBoneLookAtCamera")
+def _stmt_bone_look_at_camera(ctx, node, indent):
+    """**让一根骨头跟着相机转**(第一人称的"脖子/上半身跟随")。
+
+    ── 怎么做的 ────────────────────────────────────────────────────
+    1. 每物理帧读相机的世界朝向(和相机更新同一个时钟,不然会甩)
+    2. 取偏航 / 俯仰,各自乘一个**权重**(只跟一部分才像活人)
+    3. 按『最大角度』夹一下(脖子不能拧 180°)
+    4. 指数平滑(和弹簧臂同一个写法,和帧率无关)
+    5. 写成这根骨头姿势上的**叠加**
+
+    之所以是叠加:骨骼姿势是"相对父骨"的,直接覆盖会把动画本身的头部动作
+    (点头、摇头)一起抹掉 —— 而跟随视角要的正是"在动画之上再加一点"。
+    """
+    enabled_look = True
+    bone_expr = gd_string(str(getattr(node, "gk_bone", "") or ""))
+    skel_var = ctx.new_temp("skel")
+    idx_var = ctx.new_temp("bone")
+    camera = _camera_node_expr(ctx, node, "gk_camera")
+    yaw_w = float(getattr(node, "gk_yaw_weight", 0.5) or 0.0)
+    pitch_w = float(getattr(node, "gk_pitch_weight", 0.35) or 0.0)
+    limit = float(getattr(node, "gk_limit", 60.0) or 0.0)
+    smooth = float(getattr(node, "gk_smooth", 8.0) or 0.0)
+    cam_var = ctx.declare_var("_gk_look_cam", "Node")
+    cur_yaw = ctx.declare_var("_gk_look_yaw", "float")
+    cur_pitch = ctx.declare_var("_gk_look_pitch", "float")
+    ctx.add_line(indent, f"{cam_var} = {camera}")
+    if not enabled_look:
+        return
+
+    # 每帧的动作挂 _physics_process(和相机/角色同一个时钟)——
+    # 写在执行点的话只会转一下,第二帧就被动画覆盖回去了。
+    frame = [
+        f"if {cam_var} != null and {cam_var} is Node3D:",
+        f"    var {skel_var}: Skeleton3D = "
+        f"{_skeleton_expr(ctx, node)}",
+        f"    if {skel_var} != null:",
+        f"        var {idx_var}: int = {skel_var}.find_bone({bone_expr})",
+        f"        if {idx_var} >= 0:",
+        f"            var _gk_cam_rot: Vector3 = "
+        f"({cam_var} as Node3D).global_rotation",
+        f"            var _gk_want_yaw: float = clampf("
+        f"-_gk_cam_rot.y * {gd_number(yaw_w)}, "
+        f"-deg_to_rad({gd_number(limit)}), deg_to_rad({gd_number(limit)}))",
+        f"            var _gk_want_pitch: float = clampf("
+        f"-_gk_cam_rot.x * {gd_number(pitch_w)}, "
+        f"-deg_to_rad({gd_number(limit)}), deg_to_rad({gd_number(limit)}))",
+    ]
+    if smooth > 0.0:
+        t = (f"clampf({gd_number(smooth)} * "
+             f"get_physics_process_delta_time(), 0.0, 1.0)")
+        frame += [
+            f"            {cur_yaw} = lerpf({cur_yaw}, _gk_want_yaw, {t})",
+            f"            {cur_pitch} = lerpf({cur_pitch}, _gk_want_pitch, {t})",
+        ]
+    else:
+        frame += [
+            f"            {cur_yaw} = _gk_want_yaw",
+            f"            {cur_pitch} = _gk_want_pitch",
+        ]
+    frame += [
+        # 叠加:原姿势 × 想要的那点旋转(不覆盖动画自己的头部动作)
+        f"            {skel_var}.set_bone_pose_rotation({idx_var}, "
+        f"{skel_var}.get_bone_pose_rotation({idx_var}) * "
+        f"Quaternion(Vector3.UP, {cur_yaw}) * "
+        f"Quaternion(Vector3.RIGHT, {cur_pitch}))",
+    ]
+    ctx.physics_hooks.setdefault("bone_look_at_camera", []).extend(frame)
 
 
 @expr_node("GKNodeGetAxis")
@@ -1065,22 +2079,6 @@ def _expr_get_vector(ctx, node):
 #   * 自定义函数:自己生成代码并返回 {输出名: 表达式}
 #     —— 需要先算中间变量的节点用它(比如"移动状态"要一次算速度、
 #       离地、上升,三个输出共用那几个变量,分开算会重复生成三遍)
-MULTI_OUTPUT = {
-    "GKNodeVectorSplit": {"X": ".x", "Y": ".y", "Z": ".z"},
-}
-
-# bl_idname -> 函数(ctx, node) -> {输出引脚名: 表达式} 或 None
-MULTI_OUTPUT_FUNCS = {}
-
-
-def multi_output(bl_idname):
-    """注册一个"自定义多输出"表达式节点。"""
-    def wrapper(func):
-        MULTI_OUTPUT_FUNCS[bl_idname] = func
-        return func
-    return wrapper
-
-
 def expression_for_output(ctx, node, output_name):
     """带多输出的表达式节点。
 
@@ -1103,15 +2101,21 @@ def expression_for_output(ctx, node, output_name):
 # ==========================================================================
 # 语句节点处理器
 # ==========================================================================
-STMT_HANDLERS = {}
 
 
-def stmt_node(*bl_idnames):
-    def wrapper(func):
-        for bl_idname in bl_idnames:
-            STMT_HANDLERS[bl_idname] = func
-        return func
-    return wrapper
+
+
+
+@stmt_node("GKNodeMouseMode")
+def _stmt_mouse_mode(ctx, node, indent):
+    """鼠标模式:第一人称锁鼠标 / 菜单放出来。"""
+    mode = {
+        "VISIBLE": "MOUSE_MODE_VISIBLE",
+        "HIDDEN": "MOUSE_MODE_HIDDEN",
+        "CAPTURED": "MOUSE_MODE_CAPTURED",
+        "CONFINED": "MOUSE_MODE_CONFINED",
+    }.get(str(getattr(node, "gk_mode", "CAPTURED")), "MOUSE_MODE_CAPTURED")
+    ctx.add_line(indent, f"Input.mouse_mode = Input.{mode}")
 
 
 def _emit_body(ctx, node, indent, output="完成"):
@@ -1207,7 +2211,7 @@ def _tunable_number(ctx, node, socket_name, fallback, base_name,
             if cache is None:
                 cache = {}
                 ctx._tunable_cache = cache
-            key = (id(node), socket_name)
+            key = (node_lib.node_key(node), socket_name)
             if key in cache:
                 return cache[key]
             literal = ctx.input_number(node, socket_name, fallback)
@@ -1334,9 +2338,24 @@ def _stmt_move_direction(ctx, node, indent):
 
 @stmt_node("GKNodeJump")
 def _stmt_jump(ctx, node, indent):
+    """起跳:竖直速度给一个冲量。
+
+    ── 2D 和 3D 的"上"是**反的**(2.5D 示例真跑抓出来的坑)──────────
+    2D 里屏幕的上方是 **-Y**,3D 里世界的上方是 **+Y**。
+    老代码一律写 `velocity.y = -强度` —— 3D 项目里这是**把角色往地里按**,
+    而 `move_and_slide()` 会把它当"撞墙"直接把速度清零:
+    表现就是"按了跳跃键完全没反应"(实测:插桩看到起跳那一行执行了、
+    速度设成了 -6,下一帧就被地面挡回 0,角色一动不动)。
+
+    2D 的写法不动(老图/2D 示例生成结果一个字符都不变),
+    3D 走 `+强度`。
+    """
     target = ctx.target_expr(node)
     force = _tunable_number(ctx, node, "强度", "400.0", "jump_force")
-    ctx.add_line(indent, f"{target}.velocity.y = -{force}")
+    if ctx.dim == 2:
+        ctx.add_line(indent, f"{target}.velocity.y = -{force}")
+    else:
+        ctx.add_line(indent, f"{target}.velocity.y = {force}")
 
 
 @stmt_node("GKNodeAddImpulse")
@@ -1401,6 +2420,52 @@ def _animation_name_of(ctx, node):
     return ctx.input_string(node, "动画名", "")
 
 
+def _scene_fps():
+    """当前场景帧率 —— 把用户填的"帧"换算成 Godot 要的"秒"。
+
+    Blender 里说"第 30 帧"很自然,Godot 的 `seek` / `play_section` 收的
+    却是秒。两边差一个帧率,所以导出时换算一次。
+    拿不到场景(离线测试)就用 Blender 的默认 24。
+    """
+    try:
+        import bpy
+        render = getattr(getattr(bpy.context, "scene", None), "render", None)
+        fps = float(getattr(render, "fps", 0.0) or 0.0)
+        if fps > 0:
+            return fps
+    except Exception:
+        pass
+    return 24.0
+
+
+def _anim_category_table():
+    """{分类: [动作名, ...]} —— 用户打过分类标签的动作。
+
+    分类是用户在『动作分类』面板里给 Action 打的自定义属性
+    (见 nodes.ANIM_CATEGORY_KEY)。导出时把它整理成一张表,
+    Godot 侧就能按分类挑动作(随机/顺序),不用手写名字。
+
+    测试桩里的 bpy 没有 .data,这里返回空 —— 于是老图、离线测试
+    生成的代码**一模一样**(不打标签就一行都不生成)。
+    """
+    try:
+        import bpy
+    except Exception:
+        return {}
+    actions = getattr(getattr(bpy, "data", None), "actions", None)
+    if actions is None:
+        return {}
+    table = {}
+    for action in actions:
+        category = action_category(action)
+        if not category:
+            continue
+        table.setdefault(category, []).append(str(action.name))
+    for names in table.values():
+        names.sort()
+    return table
+
+
 @stmt_node("GKNodePlayAnim")
 def _stmt_play_anim(ctx, node, indent):
     """播动画 + 三个事件出口(Started / Running / On Finish)。
@@ -1420,8 +2485,30 @@ def _stmt_play_anim(ctx, node, indent):
     避免"别的代码播了同一个播放器上的另一个动画"时误触发。
     """
     player = ctx.animation_player(node)
+    # ── 层(上下半身分离动画)────────────────────────────────────────
+    # layer ≥ 1 时**另起一个播放器**:复制原播放器当"上层"。
+    # 两个播放器指向同一个骨架,谁**后处理**谁覆盖 —— 复制出来的那个是
+    # 后加的子节点,处理顺序在后面,正好是"上半身盖住下半身"。
+    # 前提:动作得是**按部位拆开**的(上半身动作只含上半身骨骼),
+    # 所以是"用户把上半身动作挂 1 层,下半身动作留 0 层"这种用法。
+    layer = int(getattr(node, "gk_layer", 0) or 0)
+    if layer >= 1:
+        ctx.need_layer_player = True
+        player = f"_gk_layer_player({player}, {layer})"
     anim = _animation_name_of(ctx, node)
     speed = gd_number(getattr(node, "gk_speed", 1.0))
+    # ── Blend-In / 起始帧 / 结束帧 ──────────────────────────────────
+    # 都以 0 / -1 为"不生效",老图生成的代码完全不变。
+    blend = float(getattr(node, "gk_blend_in", -1.0) or 0.0)
+    blend_expr = gd_number(blend) if blend > 0 else "-1.0"
+    start_frame = float(getattr(node, "gk_start_frame", 0.0) or 0.0)
+    end_frame = float(getattr(node, "gk_end_frame", 0.0) or 0.0)
+    # Godot 收的是**秒**,Blender 里填的是**帧** —— 按场景帧率换算。
+    fps = _scene_fps()
+    start_sec = start_frame / fps if start_frame > 0 else 0.0
+    end_sec = end_frame / fps if end_frame > 0 else 0.0
+    # 『续播』= 同名动画正在播就不重新开始(避免连续触发时鬼畜重播)
+    keep_playing = str(getattr(node, "gk_blend_mode", "REPLACE")) == "CONTINUE"
     name_temp = ctx.new_temp("anim")
     player_temp = ctx.new_temp("ap")
     ctx.add_line(indent, f"var {player_temp} := {player}")
@@ -1483,7 +2570,28 @@ def _stmt_play_anim(ctx, node, indent):
     # ---- 播放 + 接线 ----
     ctx.add_line(indent, f"if {player_temp} != null and "
                          f"{player_temp}.has_animation({name_temp}):")
-    ctx.add_line(indent + 1, f"{player_temp}.play({name_temp}, -1.0, {speed})")
+    # 『续播』模式:同名动画正在播就整段跳过(连信号都不重接)。
+    body = indent + 1
+    if keep_playing:
+        ctx.add_line(indent + 1,
+                     f"if {player_temp}.current_animation != {name_temp} "
+                     f"or not {player_temp}.is_playing():")
+        body = indent + 2
+    if end_sec > 0:
+        # 有结束帧 -> 用 play_section 一次把 起始/结束/Blend-In/速度 全给它。
+        # (Godot 4.3+ 的 API:`play_section(名, 起, 止, 混合, 速度)`)
+        ctx.add_line(body,
+                     f"{player_temp}.play_section({name_temp}, "
+                     f"{gd_number(start_sec)}, {gd_number(end_sec)}, "
+                     f"{blend_expr}, {speed})")
+    else:
+        ctx.add_line(body,
+                     f"{player_temp}.play({name_temp}, {blend_expr}, {speed})")
+        if start_sec > 0:
+            # 只设了起始帧、没设结束帧 -> play 之后 seek 到起点。
+            # 第二个参数 true = 立刻刷新姿势,不然要等下一帧才跳过去。
+            ctx.add_line(body,
+                         f"{player_temp}.seek({gd_number(start_sec)}, true)")
     # ── 接线必须在**成功分支内**、紧挨着 play()(踩过的坑)──────────
     # 上一版把 connect 写在下面的 `else:` 里 —— 那是"动画不存在"的分支,
     # 于是信号只在**播放失败**时接上,正常播放永远不接。
@@ -1491,7 +2599,7 @@ def _stmt_play_anim(ctx, node, indent):
     for _suffix, handler, signal_name, _var in numbered:
         if signal_name is None:
             continue
-        ctx.add_line(indent + 1,
+        ctx.add_line(body,
                      f"{player_temp}.{signal_name}.connect({handler}, "
                      f"CONNECT_ONE_SHOT)")
     ctx.add_line(indent, "else:")
@@ -1565,79 +2673,412 @@ def _expr_anim_locomotion(ctx, node):
     }
 
 
+# ==========================================================================
+# 动画树的自定义变量(侧栏『变量』那一栏 / 取变量 / 设变量节点)
+# ==========================================================================
+# 变量在 Blender 侧存在动画树上(见 properties.GKAnimVariable),
+# 导出后就是脚本里的一个成员变量。这里负责三件事:
+#   1. 把侧栏里写的类型/初值翻成 GDScript(`var hp: float = 100.0`)
+#   2. 使用这张动画树时,**所有**声明的变量都落地(哪怕还没节点用它)
+#   3. 『动画_取变量』求值成变量名,『动画_设变量』生成一行赋值
+_ANIM_VAR_TYPES = {
+    "bool": ("bool", "false"),
+    "int": ("int", "0"),
+    "float": ("float", "0.0"),
+    "string": ("String", '""'),
+    "vector": ("Vector3", "Vector3.ZERO"),
+}
+
+
+def _anim_var_spec(tree, name):
+    """在动画树的变量表里按名字找一个变量(找不到返回 None)。"""
+    for var in (getattr(tree, "gk_variables", ()) or ()):
+        if str(getattr(var, "var_name", "") or "") == name:
+            return var
+    return None
+
+
+def _anim_var_initial(kind, text):
+    """把侧栏里填的『初值』文本转成合法的 GDScript 字面量。
+
+    用户填的是自由文本(和『比较』节点上的 A/B 一个道理),
+    所以这里按类型各自做一次转换;转不动就退回该类型的零值,
+    绝不让"文本里多打一个字符"变成 Godot 的语法错误。
+    """
+    raw = str(text or "").strip()
+    if kind == "bool":
+        return "true" if raw.lower() in ("1", "true", "真", "是", "yes") else "false"
+    if kind == "int":
+        try:
+            return str(int(float(raw)))
+        except Exception:
+            return "0"
+    if kind == "float":
+        try:
+            return gd_number(float(raw))
+        except Exception:
+            return "0.0"
+    if kind == "vector":
+        return raw or "Vector3.ZERO"
+    return gd_string(str(text or ""))
+
+
+def _anim_var_ref(ctx, node):
+    """把一个『动画_取变量 / 设变量』节点解析成成员变量名。"""
+    raw = str(getattr(node, "gk_var_name", "") or "").strip()
+    if not raw:
+        ctx.warn(f"节点『{node.bl_label}』还没选变量 —— "
+                 f"先在侧栏『变量』里加一个,再点它那行的『取』/『设』"
+                 f"(或者用节点上的放大镜挑)")
+        return "null"
+    spec = _anim_var_spec(getattr(node, "id_data", None), raw)
+    if spec is None:
+        # 侧栏里没声明过这个名字 —— 退回"按名字自动声明"的老行为,
+        # 让手工打的名字也还能用(只是没有类型和初值)
+        return ctx.declare_var(raw)
+    kind = str(getattr(spec, "var_type", "float") or "float")
+    gd_type, fallback = _ANIM_VAR_TYPES.get(kind, ("Variant", "null"))
+    initial = _anim_var_initial(kind, getattr(spec, "default_value", ""))
+    return ctx.declare_var(raw, gd_type, initial=initial or fallback)
+
+
+def _declare_anim_vars(ctx, tree):
+    """把一张动画树里声明的变量**全部**落成成员变量。
+
+    和 `_anim_var_ref` 的区别:这里不管有没有节点引用 ——
+    侧栏里写下的变量就该在脚本里存在(和蓝图一样,变量属于这一"个"
+    动画蓝图,不是"被谁用到才存在")。
+    """
+    for spec in (getattr(tree, "gk_variables", ()) or ()):
+        raw = str(getattr(spec, "var_name", "") or "").strip()
+        if not raw:
+            continue
+        if not raw.isascii():
+            # GDScript 的标识符只认 ASCII —— 中文名会被压成下划线。
+            # 用户在这套中文界面里几乎一定会填中文名,不提醒的话
+            # 导出结果里只会剩个 `var v`,而且多个中文名会挤成同一个变量。
+            ctx.warn(f"动画树变量『{raw}』不是英文名 —— GDScript 不支持中文"
+                     f"变量名,导出后会写成 `{snake_case(raw, 'v')}`。"
+                     f"请在侧栏『变量』里改成英文(比如 hp、is_invincible)")
+        kind = str(getattr(spec, "var_type", "float") or "float")
+        gd_type, fallback = _ANIM_VAR_TYPES.get(kind, ("Variant", "null"))
+        initial = _anim_var_initial(kind, getattr(spec, "default_value", ""))
+        ctx.declare_var(raw, gd_type, initial=initial or fallback)
+
+
+@expr_node("GKNodeAnimFinished")
+def _expr_anim_finished(ctx, node):
+    """某段动画播完了吗 —— 给转场条件 / 玩法图用。
+
+    值来自 `animation_finished` 信号记下的名字(见 anim_finished_flag):
+    动画名留空 = 只要有任意动画播完就算真 —— 这样用户不填也能用。
+    """
+    finished_var, _player = ctx.connect_anim_finished()
+    action = getattr(node, "gk_anim_action", None)
+    name = str(getattr(action, "name", "") or "") if action is not None else ""
+    if not name:
+        name = str(getattr(node, "gk_anim_name", "") or "").strip()
+    if not name:
+        return f"(not {finished_var}.is_empty())"
+    return f"({finished_var} == {gd_string(name)})"
+
+
+@stmt_node("GKNodeTweenProperty")
+def _stmt_tween_property(ctx, node, indent):
+    """把某个节点的某个属性在时间里推过去 —— 时间轴的一条轨道。
+
+    ── 用 Godot 的 Tween,而不是自己写每帧插值 ─────────────────────
+    `create_tween().tween_property(node, "fov", 30.0, 0.8)` 一句话搞定,
+    而且 Tween 是**异步**的:调用完立刻返回,曲线在后台自己跑。
+    这意味着"几条缓动同时进行"是**天然的**,不需要线程/协程
+    —— 用户要的"不同动画的整体联动"就是这么拼出来的。
+    """
+    target = ctx.target_expr(node, "gk_target")
+    prop = (getattr(node, "gk_property", "") or "").strip()
+    if not prop:
+        ctx.warn(f"『{node.bl_label}』没填『属性』,这一句被跳过了"
+                 f"(要动相机视野就填 fov,动位置填 position 或 position:y)")
+        return
+    socket = ctx._socket(node, "到")
+    if socket is not None and getattr(socket, "is_linked", False):
+        to_expr = ctx.expr_of(socket)
+    else:
+        to_expr = _tunable_number(ctx, node, "到", "0.0", "tween_to")
+    duration = _tunable_number(ctx, node, "时长", "0.5", "tween_time")
+    trans = getattr(node, "gk_trans", "TRANS_SINE") or "TRANS_SINE"
+    ease = getattr(node, "gk_ease", "EASE_IN_OUT") or "EASE_IN_OUT"
+
+    tween_var = ctx.new_temp("tween")
+    ctx.add_line(indent, f"var {tween_var} = create_tween()")
+    ctx.add_line(indent, f"{tween_var}.set_trans(Tween.{trans})")
+    ctx.add_line(indent, f"{tween_var}.set_ease(Tween.{ease})")
+    ctx.add_line(indent, f"if {target} != null:")
+    ctx.add_line(indent + 1,
+                 f"{tween_var}.tween_property({target}, "
+                 f"{gd_string(prop)}, {to_expr}, {duration})")
+    if getattr(node, "gk_snap", True):
+        # 浮点插值结束时可能差 0.0001 —— 做"门完全关上""视野正好 30"这类
+        # 判定时会差一点点,所以在下一句补一个精确赋值。
+        # `set_index` 让这句**等前面那条缓动跑完**再执行(Tween 的链式用法)。
+        ctx.add_line(indent, f"{tween_var}.set_parallel(false)")
+        ctx.add_line(indent, f"{tween_var}.chain().tween_callback("
+                             f"func(): {target}.set({gd_string(prop)}, "
+                             f"{to_expr}))")
+
+
+@multi_output("GKNodeAnimStatus")
+def _expr_anim_status(ctx, node):
+    """『动画_运行状态』:把动画图的布尔情况交给玩法图判断。
+
+    三个输出一次给全(用 multi_output,和『动画判断_移动状态』同一个做法)——
+    这样同一个节点上取三个值也不会重复求值。
+    """
+    state_var = ctx.declare_var(
+        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
+        "String")
+    # 闸门变量按**状态变量名**取 —— 有两台状态机时,
+    # 读 `anim_state_2` 的那台就该看 `_gk_anim_done_2`,不能看错人家的
+    done = ctx.declare_var("_gk_anim_done", "bool", initial="false",
+                           key=state_var)
+    started = ctx.declare_var("_gk_anim_started", "bool", initial="false",
+                              key=state_var)
+    return {
+        "已结束": done,
+        "在跑": started,
+        "当前状态": state_var,
+    }
+
+
+@expr_node("GKNodeAnimGetVar")
+def _expr_anim_get_var(ctx, node):
+    return _anim_var_ref(ctx, node)
+
+
+@stmt_node("GKNodeAnimSetVar")
+def _stmt_anim_set_var(ctx, node, indent):
+    name = _anim_var_ref(ctx, node)
+    socket = ctx._socket(node, "值")
+    if socket is not None and getattr(socket, "is_linked", False):
+        value_expr = ctx.expr_of(socket)
+    else:
+        value = node.input_value(ctx, "值", None)
+        value_expr = gd_literal(value) if value is not None else "null"
+    ctx.add_line(indent, f"{name} = {value_expr}")
+
+
+def _emit_state_hooks(ctx, graph, player_temp):
+    """给每个"有事要做"的状态生成『进入时』『离开时』函数。
+
+    返回 ({状态名: 进入函数名}, {状态名: 离开函数名})。
+
+    一个状态需要函数,只要满足任意一条:
+      * 『进入时』引脚接了线(用户要在这个状态里执行语句)
+      * 『离开时』引脚接了线
+      * 它填了『同时播 2 / 同时播 3』(要额外开播放器放那两段动画)
+    """
+    enter_hooks = {}
+    exit_hooks = {}
+    max_layers = 0
+    for state in graph["states"]:
+        name = node_lib.anim_state_name(state)
+        if not name:
+            continue
+        extras = []
+        getter = getattr(state, "extra_animation_names", None)
+        if callable(getter):
+            extras = [extra for extra in getter() if extra and extra != name]
+        has_enter = bool(node_lib.link_targets(state, "进入时"))
+        has_exit = bool(node_lib.link_targets(state, "离开时"))
+        if not (has_enter or has_exit or extras):
+            continue
+        safe = snake_case(name, "state")
+
+        if has_enter or extras:
+            safe = snake_case(name, "state")
+            with ctx.capture() as lines:
+                ctx._active.clear()
+                ctx._current_event = f"状态{name}进入时"
+                for index, extra in enumerate(extras):
+                    # 同时播的第 N 段:开一个"层"播放器(Godot 的 AnimationPlayer
+                    # 一次只能播一段,play() 会把上一段顶掉)
+                    layer = index + 1
+                    max_layers = max(max_layers, layer)
+                    ctx.need_layer_player = True
+                    temp = ctx.new_temp("apx")
+                    lines.add(1, f"var {temp} = _gk_layer_player({player_temp}, "
+                                 f"{layer})")
+                    lines.add(1, f"if {temp} != null and "
+                                 f"{temp}.has_animation({gd_string(extra)}):")
+                    lines.add(2, f"{temp}.play({gd_string(extra)})")
+                if has_enter:
+                    _chain(ctx, state, 1, "进入时")
+                if len(lines) == 0:
+                    lines.add(1, "pass")
+            func_name = ctx.declare_func_name(f"_gk_anim_enter_{safe}")
+            ctx.extra_sections.append({
+                "signature": f"func {func_name}() -> void:",
+                "lines": list(lines.lines),
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            enter_hooks[name] = func_name
+
+        if has_exit:
+            safe = snake_case(name, "state")
+            with ctx.capture() as lines:
+                ctx._active.clear()
+                ctx._current_event = f"状态{name}离开时"
+                _chain(ctx, state, 1, "离开时")
+                if len(lines) == 0:
+                    lines.add(1, "pass")
+            func_name = ctx.declare_func_name(f"_gk_anim_exit_{safe}")
+            ctx.extra_sections.append({
+                "signature": f"func {func_name}() -> void:",
+                "lines": list(lines.lines),
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            exit_hooks[name] = func_name
+    # 记住最多有几层"同时播",_gk_anim_enter 里要按这个数量停旧层
+    ctx._anim_layer_count = max_layers
+    return enter_hooks, exit_hooks
+
+
+def _start_condition(ctx, graph, node_lib):
+    """『动画_开始』的开始条件表达式(没有开始口就返回 None)。
+
+    ── 为什么开始条件要有"可选"的写法(用户 2026-10-03)──────────────
+    用户原话:"游戏动画开始时的条件可自定义,如发生什么,一个变量,
+    一个动画结束,或者是自定义开始动画条件"。
+    所以这里按『开始方式』分派:立刻 / 接引脚 / 变量为真 / 刚按下 / 按住 /
+    上一个动画播完。后四种都不用接线,直接在节点上选。
+    """
+    start = graph.get("start") if graph else None
+    if start is None:
+        return None
+    mode = str(getattr(start, "gk_start_mode", "NOW"))
+    if mode == "NOW":
+        return "true"
+    if mode == "PIN":
+        socket = ctx._socket(start, "条件")
+        if socket is None or not getattr(socket, "is_linked", False):
+            ctx.warn("『动画_开始』的开始方式是『自己写』,但『条件』引脚"
+                     "没接线 —— 这张动画图不会开始。接一个判断节点上去,"
+                     "或者把开始方式改成『立刻开始』")
+            return None
+        return ctx.expr_of(socket)
+    if mode == "VAR":
+        name = str(getattr(start, "gk_var_name", "") or "").strip()
+        if not name:
+            ctx.warn("『动画_开始』选了『变量为真』但没填变量名")
+            return None
+        return ctx.declare_var(name, "bool")
+    if mode in ("ACTION_JUST", "ACTION_PRESSED"):
+        action = str(getattr(start, "gk_cond_action", "") or "").strip()
+        if not action:
+            ctx.warn("『动画_开始』选了按键开始但没填输入动作")
+            return None
+        const = ctx.add_action(action)
+        func = ("is_action_just_pressed" if mode == "ACTION_JUST"
+                else "is_action_pressed")
+        return f"Input.{func}({const})"
+    if mode == "FINISH":
+        finished_var, _player = ctx.connect_anim_finished()
+        name = str(getattr(start, "gk_anim_name", "") or "").strip()
+        if not name:
+            return f"(not {finished_var}.is_empty())"
+        return f"({finished_var} == {gd_string(name)})"
+    return "true"
+
+
 @stmt_node("GKNodeAnimStateMachineRef")
 def _stmt_anim_tree_ref(ctx, node, indent):
     """驱动一张**动画树** —— 玩法图和动画图分开放。
 
     见 nodes.py 里 GKNodeAnimState 那段的说明(用户要求照虚幻 5 的
     Animation Blueprint 那样拆开,别都堆在一个节点里)。
+
+    ── 这一版改了什么(2026-10-03)────────────────────────────────
+    老实现是"从入口状态沿一条链走一圈",只有三个能工作的形状:
+    一条直链、一个环、或者什么都没有。用户实际的图(状态1 的『转到』
+    直接连到状态2 的『进入』)导出后只剩一句 `pass`。现在改成**图**:
+
+        entry --播完--> B                (状态直连,见 nodes.anim_tree_graph)
+        A --[转场:条件]--> B             (转场节点)
+        A --[转场:按住某键]--> C         (同一个状态多条出线)
+
+    生成的形状:
+
+        func _gk_anim_enter(next_state: String) -> void:
+            anim_state = next_state
+            ...真的 play()
+
+        func _physics_process(_delta):
+            if anim_state == "A":
+                if <条件1>: _gk_anim_enter("B")
+                elif <条件2>: _gk_anim_enter("C")
+            elif anim_state == "B":
+                ...
+
+    三个关键点:
+      * **入口状态真的会播** —— 老代码只写 `anim_state = "骨骼动作"`,
+        从头到尾没有一处 play(),所以角色进游戏后一直摆着不动。
+      * **同一个状态多条出线** —— 按画布上下顺序 if/elif,第一条成立就切。
+      * **直连 = 播完就切** —— 用户就是这么连的(见 nodes.anim_tree_graph)。
     """
-    tree = _find_animation_tree(getattr(node, "gk_tree_name", ""))
-    entry, entries = _anim_tree_entry(tree) if tree is not None else (None, [])
-    if entry is None:
+    tree = node_lib.find_animation_tree(getattr(node, "gk_tree_name", ""))
+    # 这张动画树上声明的自定义变量全部落地成成员变量 ——
+    # 即使暂时还没有『动画_取变量』节点引用它。侧栏里写下的东西
+    # 必须在导出的脚本里真实存在,否则用户在 Godot 里根本找不到它。
+    if tree is not None:
+        _declare_anim_vars(ctx, tree)
+    graph = node_lib.anim_tree_graph(tree) if tree is not None else None
+    if graph is None or graph["entry"] is None:
         ctx.warn(f"节点『{node.bl_label}』找不到可用的动画状态机"
                  f"{'『' + node.gk_tree_name + '』' if node.gk_tree_name else ''}"
                  f"。先在『游戏动画』面板里建一张动画树,放一个『动画_状态』"
-                 f"(它的『进入』不接线 = 起始状态),再用『动画_转场』连下去")
+                 f"(没有任何转场指向它 = 起始状态),再把它连到下一个状态"
+                 f"(或者中间放一个『动画_转场』写条件)")
         return
-    # ── 检查"接了条件但没接上游"的转场(用户实测踩过)──────────────
-    # 用户的图:上游状态的『转到』接到了转场的『条件』上,
-    # 转场的『上游』空着 —— 于是链路是空的、整台状态机一条转移都没有。
-    # 光看节点挺像那么回事(线也连了、条件也选了),但**导出后毫无效果**。
-    # 这种"差一根线"的错必须明确报出来。
-    for node_in_tree in (getattr(tree, "nodes", ()) or ()):
-        if getattr(node_in_tree, "bl_idname", "") != "GKNodeAnimTransition":
-            continue
-        up = node_in_tree.inputs.get("上游")
-        cond = node_in_tree.inputs.get("条件")
-        wired_cond = bool(cond is not None
-                          and getattr(cond, "is_linked", False))
-        has_up = bool(up is not None and getattr(up, "is_linked", False))
-        if not has_up:
-            # 上游没接。分两种:
-            #   (a) 它的『转到』指回了某个**状态** -> **线接反了**
-            #       (用户实测踩过:把"转场 -> 状态"接了,
-            #        正确方向是"状态 -> 转场")
-            #   (b) 什么都没接 -> 就是漏了
-            back, _n = _next_of(node_in_tree, "转到")
-            back_label = (getattr(back, "bl_label", None)
-                          if back is not None else None)
-            if back_label == "动画_状态":
-                ctx.warn(
-                    f"转场『{getattr(node_in_tree, 'name', '?')}』的线"
-                    f"**接反了**:现在是它指向状态,但方向应该是"
-                    f"『上一个状态的『转到』 -> 这个转场的『上游』』。"
-                    f"请把这两根线对调,转场的『转到』去接"
-                    f"**下一个状态的『进入』**")
-            elif wired_cond:
-                ctx.warn(
-                    f"转场『{getattr(node_in_tree, 'name', '?')}』接了条件,"
-                    f"但『上游』没接 —— 它不知道『从哪个状态切过去』,"
-                    f"所以这条规则不会生效。"
-                    f"请把**上一个状态的『转到』**接到这个转场的『上游』")
+    # 树自己解析出来的问题,一条条转成导出告警 ——
+    # 用户看的是导出报告,所以这里必须**原样带出去**,而不是只画在面板上。
+    for problem in graph["problems"]:
+        ctx.warn(problem)
 
-    chain, chain_warnings = _walk_state_chain(entry)
-    # ── 只对"真的孤立"的状态告警(踩过的坑)────────────────────────
-    # 环(idle <-> run)里两个状态都"没有外来入边",按入口判定都算候选 ——
-    # 但它们是**连着的**。直接报"有 2 个入口"是误报,
-    # 用户会以为哪里配错了,其实图完全正常。
+    # ── 播放器:一定是**脚本所在物体**上的那个 ────────────────────────
+    # 用户 2026-10-03 要求删掉『动画_状态机』的物体选择("在此物体选择
+    # 动画_状态机时自然是作用于本身")。所以这里 use_target=False ——
+    # 连老文件里存着的那个已废弃物体名也不认,免得它偷偷复活,
+    # 生成一条指向别的物体的路径。
+    player = ctx.animation_player(node, use_target=False)
+    # ── 状态变量**按节点**独立(用户 2026-10-03:"一个游戏逻辑里是否可以
+    #    有多个游戏动画?")────────────────────────────────────────────
+    # 以前**不行**:两张动画树都写进同一个 `anim_state`、共用同一个
+    # `_gk_anim_enter`,后一张把前一张整个盖掉 ——
+    # 实测:两个『动画_状态机』节点只生成了一套状态机。
+    # 按节点当 key 声明之后,第二台自动叫 `anim_state_2`,互不干扰。
+    # ── 状态变量:按**名字**共享(而不是自动加序号)──────────────────
+    # 试过"每台状态机自动 anim_state / anim_state_2":两台机器确实不打架了,
+    # 但『动画_运行状态』(按名字读 anim_state)就对不上了 —— 它读到的是
+    # 别人那一份,状态永远显示错。
     #
-    # 正确判断:走完链之后,不在链上的状态才是真的孤立。
-    on_chain = {id(state) for state, _tr in chain}
-    orphans = [s for s in entries if id(s) not in on_chain]
-    if orphans:
-        names = "、".join(_state_label(s) for s in orphans[:4])
-        ctx.warn(f"动画树里有 {len(orphans) + 1} 段互不相连的状态机 —— "
-                 f"导出只用了含『{_state_label(entry)}』的那一段。"
-                 f"孤立的是:({names})。"
-                 f"请用『动画_转场』把它们连起来")
-    for note in chain_warnings:
-        ctx.warn(note)
-
-    player = ctx.animation_player(node)
-    var_name = ctx.declare_var(
-        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
-        "String")
+    # 现在:名字就是身份。一台机器占一个名字;第二台还想用同一个名字时
+    # **明确告警**,告诉用户去改『状态变量名』(比如 ui_state)。
+    # 这样"一台机器 + 一个读取节点"这种 99% 的用法永远是对的,
+    # 多台的时候也只需要用户动一次手、而且看得见原因。
+    requested = snake_case(getattr(node, "gk_state_var", "anim_state"),
+                           "anim_state")
+    owners = getattr(ctx, "_state_var_owners", None)
+    if owners is None:
+        owners = {}
+        ctx._state_var_owners = owners
+    mine = node_lib.node_key(node)
+    if requested in owners and owners[requested] != mine:
+        ctx.warn(f"有两台『动画_状态机』都用『状态变量名 = {requested}』—— "
+                 f"它们会互相覆盖(动画会乱跳)。把其中一台的『状态变量名』"
+                 f"改个名字(比如 ui_state),然后『动画_运行状态』也填同一个")
+    owners[requested] = mine
+    var_name = ctx.declare_var(requested, "String")
     # -- 播放器引用必须是**成员变量**,不能是局部变量(踩过的坑)------
     # 状态判断跑在 _physics_process 里,而 _ready 里也用它。
     # 用 new_temp()(局部变量)会炸:
@@ -1646,411 +3087,260 @@ def _stmt_anim_tree_ref(ctx, node, indent):
     #
     # 而且只在 _ready 里赋值一次就够了(它不会变),
     # 所以赋值语句只在 _ready 那次执行时生成,避免每个物理帧都查一遍。
-    player_temp = ctx.member_temp("ap")
+    player_temp = ctx.anim_player_member()
     if not getattr(ctx, "_anim_player_assigned", False):
         ctx._anim_player_assigned = True
         # 用 `=` 不用 `:=`:成员变量已经在类顶部声明过 `var _ap0 = null`,
         # 再写 `var _ap0 := ...` 就是**同一作用域里重复声明**,
         # Godot 会报 "There is already a variable named ..."。
-        ctx.add_line(indent, f"{player_temp} = {player}")
-    # 起始状态 = 链路的**入口**(『进入』没接线的那个)--
-    # 照 UE5 的 Entry 节点。不用再靠 gk_is_default 勾选框。
-    default_name = _state_label(entry)
-    ctx.add_line(indent, f"if {var_name}.is_empty():")
-    ctx.add_line(indent + 1, f"{var_name} = {gd_string(default_name)}")
+        #
+        # 带 `if == null` 的守卫是为了和 generate() 里补的那次赋值**幂等**:
+        # 用户没接『动画_播放完成』时只有这里赋一次;接了的话 _ready 里
+        # 还会补一次(那时玩家图里可能先用到它),两次都不该重复赋值。
+        ctx.add_line(indent, f"if {player_temp} == null:")
+        ctx.add_line(indent + 1, f"{player_temp} = {player}")
+
+    # ── "上游动画播完"要靠信号,不能靠 current_animation(实测踩过)────
+    # 详见 anim_finished_flag 里的实测数据。只有图里真的有"播完"边
+    # 才生成这套东西(没用到就不占行数)。
+    has_finish = any(edge["kind"] == node_lib.ANIM_EDGE_FINISH
+                     for edge in graph["edges"])
+    finished_var = None
+    if has_finish:
+        tree_name = getattr(tree, "name", "动画树")
+        # 只声明标志;信号连接由 generate() 统一补进 _ready(见那里的说明)
+        finished_var = ctx.anim_finished_flag(tree_name)[0]
+
+    # ── 状态自己的执行流 + 同时播多段动画(2026-10-03 新增)──────────
+    # 每个"有事要做"的状态生成一个函数:
+    #     _gk_anim_enter_攻击()   ← 『进入时』接的语句 + 同时播的第 2/3 段动画
+    #     _gk_anim_exit_攻击()    ← 『离开时』接的语句
+    # 然后 _gk_anim_enter() 里按状态名分派(match)。
+    #
+    # ── 为什么不把语句直接内联进 _gk_anim_enter ──────────────────
+    # 那几个分支的长度完全由用户的图决定,内联会让"进入状态"这个唯一入口
+    # 变成一大坨;拆成函数之后,每个状态自己的逻辑在脚本里也是**分开的一块**。
+    enter_hooks, exit_hooks = _emit_state_hooks(ctx, graph, player_temp)
+
+    debug = bool(getattr(node, "gk_debug_print", False))
+    # ── 进入状态统一走一个函数 ──────────────────────────────────────
+    # 老代码每处切换都内联四行(`if has_animation` / `play` / `else` /
+    # `push_warning`),想加一个"进入时打印"要改 N 处。收成一个函数之后,
+    # 状态切换只有**一个**生成点,而且"进入状态"这件事有了唯一的定义。
+    enter_func = ctx.enter_anim_state_func(node, var_name, player_temp, debug,
+                                           finished_var,
+                                           enter_hooks=enter_hooks,
+                                           exit_hooks=exit_hooks)
+
+    # 起始状态 = 图里**没有任何边指向**的那个状态(照 UE5 的 Entry 节点);
+    # 放了『动画_开始』就以它连的那个为准(显式指定,不用猜)。
+    entry_name = node_lib.anim_state_name(graph["entry"])
+    # ── 开始口 / 结束口(用户 2026-10-03)──────────────────────────
+    # 有这两个口之一时,这张图变成"有始有终"的:条件成立才开始,
+    # 走到『动画_结束』就停下并把『已结束』置真 —— 玩法图用
+    # 『动画_运行状态』读它,接着做下一步逻辑。
+    # 两个口都没有的老图**生成结果一字不变**(见下面的 else 分支)。
+    start_node = graph.get("start")
+    start_expr = _start_condition(ctx, graph, node_lib)
+    has_start = start_node is not None and start_expr is not None
+    has_exit = any(edge["kind"] == node_lib.ANIM_EDGE_EXIT
+                   for edge in graph["edges"])
+    started = done = None
+    finish_func = None
+    if has_start or has_exit:
+        # 闸门变量也按状态变量区分 —— 否则两台机器会互相把对方的
+        # "开始/结束"标志清掉(一个播完另一个也跟着收工)
+        started = ctx.declare_var("_gk_anim_started", "bool",
+                                  initial="false", key=var_name)
+        done = ctx.declare_var("_gk_anim_done", "bool",
+                               initial="false", key=var_name)
+        if has_exit:
+            finish_func = ctx.anim_finish_func(started, done, var_name,
+                                               player_temp, graph)
+    if has_start:
+        # 条件每物理帧判一次 —— 一开始就判的话,条件当时不成立就再也没机会
+        ctx.anim_starts.append({
+            "node": node, "expr": start_expr, "var": started, "done": done,
+            "enter": enter_func, "entry": entry_name,
+        })
+        ctx.need_anim_start_process = True
+    elif has_exit:
+        # 没有开始口但有结束口:第一帧直接开演,但**演完不会自己重来**
+        # (要有开始口 + 条件才会重来)
+        ctx.add_line(indent, f"if not {started} and not {done}:")
+        ctx.add_line(indent + 1, f"{started} = true")
+        ctx.add_line(indent + 1, f"{done} = false")
+        ctx.add_line(indent + 1, f"{enter_func}({gd_string(entry_name)})")
+    else:
+        # 两个口都没有(老图):一进游戏就播起始状态,和以前一模一样
+        ctx.add_line(indent, f"if {var_name}.is_empty():")
+        ctx.add_line(indent + 1, f"{enter_func}({gd_string(entry_name)})")
 
     if str(getattr(node, "gk_check_mode", "EVERY_FRAME")) == "EVERY_FRAME":
         # 交给 generate() 统一发射到 _physics_process —— 跟移动同步判定,
         # 避免"人走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
         ctx.anim_trees.append({
-            "node": node, "chain": chain, "var": var_name,
-            "player": player_temp,
-            "debug": bool(getattr(node, "gk_debug_print", False)),
+            "node": node, "graph": graph, "var": var_name,
+            "player": player_temp, "enter": enter_func, "debug": debug,
+            "finished": finished_var, "gate": started,
+            "finish": finish_func,
         })
         ctx.need_anim_tree_process = True
         return
-    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp,
-                            debug_print=bool(getattr(
-                                node, "gk_debug_print", False)))
+    _emit_state_graph(ctx, indent, graph, var_name, player_temp, enter_func,
+                      finished_var, finish_func, started)
 
 
 def _find_animation_tree(name):
-    """按名字找一张动画树;名字为空就用文件里第一张。"""
-    try:
-        import bpy
-    except Exception:
-        return None
-    data = getattr(bpy, "data", None)
-    groups = getattr(data, "node_groups", None)
-    if groups is None:
-        return None
-    wanted = str(name or "")
-    first = None
-    for group in groups:
-        if getattr(group, "bl_idname", "") != "GKAnimationTree":
-            continue
-        if first is None:
-            first = group
-        if wanted and str(getattr(group, "name", "")) == wanted:
-            return group
-    return first if not wanted else None
+    """按名字找一张动画树;名字为空就用文件里第一张。
 
-
-def _anim_tree_links(tree):
-    """把动画树里的连线整理成两张表。
-
-    返回 (links, targets):
-      * links   = {id(节点): [(输出引脚名, 目标节点), ...]}
-      * targets = {id(节点)} —— 被别人指到过的节点
-
-    做这一层的理由:入口判定和走链都要反复问"谁指到谁",
-    在每个节点上现翻 `socket.links` 又慢又容易漏(实测漏过)。
+    判断只有一份,在 `nodes.find_animation_tree` —— 面板、节点上的预览、
+    导出三处必须看到同一张树,不然会出现"面板说用 A、导出却用了 B"。
     """
-    links = {}
-    targets = set()
-    if tree is None:
-        return links, targets
-    for node in getattr(tree, "nodes", ()) or ():
-        outs = []
-        for socket in getattr(node, "outputs", ()) or ():
-            if not getattr(socket, "is_linked", False):
-                continue
-            for link in getattr(socket, "links", ()) or ():
-                target = getattr(link, "to_node", None)
-                if target is None:
-                    continue
-                outs.append((getattr(socket, "name", ""), target))
-                targets.add(id(target))
-        if outs:
-            links[id(node)] = outs
-    return links, targets
+    return node_lib.find_animation_tree(name)
+
+
+def _state_label(state):
+    """状态显示名,给告警用。
+
+    真名判断在 `nodes.anim_state_name`(优先用选中的动作名,否则用手填的)——
+    这里保留一个同名的转发,是因为早期写下的诊断脚本/测试都在调它。
+    """
+    return node_lib.anim_state_name(state) or getattr(state, "bl_label", "?")
 
 
 def _anim_tree_entry(tree):
     """找状态机的**入口状态** —— 照 UE5 的 Entry 节点。
 
-    -- 判断规则:**没有被任何『转到』指到**的状态才是入口 ----------
-    第一版写成"『进入』引脚没接线就是入口",**是错的**:
-    链上第一个状态的『进入』本来就没接线(没有上游),这没错;
-    但**环**里的状态会同时满足两个身份 —— 实测 `idle -> run -> idle`
-    里 run 也被判成了入口,于是报"有 2 个入口",而且入口选错了。
+    -- 判断规则:**没有任何一条转场指到**的状态才是入口 ------------
+    (老注释里写的"『进入』引脚没接线就是入口"是错的:环里的状态
+    同时满足两个身份,实测 `idle -> run -> idle` 里 run 也被判成了入口。)
 
-    真正的语义是"谁指到我":没有任何『转到』指向我 = 我是起点。
+    保留这个函数是因为侧栏面板和冒烟测试都在用它 —— 但判断本身已经
+    挪进 `nodes.anim_tree_graph`,这里只负责取结果。
     """
     if tree is None:
         return None, []
-    _links, targets = _anim_tree_links(tree)
-    all_states = [n for n in (getattr(tree, "nodes", ()) or ())
-                  if getattr(n, "bl_idname", "") == "GKNodeAnimState"]
-    entries = [n for n in all_states if id(n) not in targets]
-    if not entries and all_states:
-        # -- 全是环(idle <-> run)时的兜底 ---------------------------
-        # 每个状态都被别人指到,那就没人是"天然入口"了 —— 但状态机
-        # **总得有个起点**。按位置取最上面那个(布局习惯:起始状态
-        # 放左上,后面的往下排)。
-        #
-        # 实测踩过:idle -> run -> idle 构成环 -> 候选为空 ->
-        # 直接报"找不到可用的动画状态机",用户一头雾水。
-        all_states.sort(key=lambda n: (getattr(n, "location", (0.0, 0.0))[1],
-                                       getattr(n, "location", (0.0, 0.0))[0]))
-        return all_states[0], all_states
-    if not entries:
-        return None, []
-    entries.sort(key=lambda n: getattr(n, "location", (0.0, 0.0))[1])
-    return entries[0], entries
-
-
-def _next_of(node, output_name):
-    """沿某个输出引脚找出下一个节点。
-
-    返回 (下一个节点 或 None, 出线条数)。
-
-    -- 多条出线要报错,不能静默取第一条(踩过的坑)----------------
-    照 UE5 的规则:**一个状态只能有一条出线**(想多方分支就在转场里
-    把条件写全)。实测如果用户接了两条,`next(iter(...))` 只会拿第一条,
-    **第二条被静默丢掉** -- 用户会以为规则生效了,但游戏里怎么都不切。
-
-    所以这里把"有几条"一起返回,由调用方决定怎么告警。
-    """
-    socket = node.outputs.get(output_name) if hasattr(node, "outputs") else None
-    if socket is None or not getattr(socket, "is_linked", False):
-        return None, 0
-    links = list(socket.links)
-    if not links:
-        return None, 0
-    return getattr(links[0], "to_node", None), len(links)
-
-
-def _walk_state_chain(entry):
-    """从入口状态沿『转到 -> 转场 -> 转到 -> 状态』走一圈。
-
-    返回 (chain, warnings),chain 是 [(状态节点, 转场节点或 None), ...]。
-    最后一个元素的转场是 None(走到头了,或者绕回已经来过的状态)。
-
-    ── 为什么要防环 ────────────────────────────────────────────────
-    状态机图**天然会有环**(idle -> run -> idle)。走链时必须有
-    "走过的不再走"的保护,不然导出会无限递归。
-    回到已访问状态就停止 —— 语义上也对:那条转移已经生成过了。
-    """
-    chain = []
-    warnings = []
-    seen = set()
-    state = entry
-    while state is not None:
-        key = id(state)
-        if key in seen:
-            # ── 环:回到走过的状态 -> 停 ─────────────────────────────
-            # 别再往链里追加东西:上一轮循环**已经**把那条转移
-            # (`chain[-1] = (上一个状态, 那条转场)`)记进去了,
-            # 再补一个 (这个状态, 同一条转场) 会生成出一条
-            # 条件用 A 的、目标却写成 B 的**错规则**。
-            #
-            # 实测踩过:idle -> run -> idle 多生成了一条
-            #     if anim_state == "idle" and <T2 的条件>: anim_state = "idle"
-            # 条件不对、目标也不对,而且是重复规则。
-            break
-        seen.add(key)
-        transition, link_count = _next_of(state, "转到")
-        if link_count > 1:
-            warnings.append(
-                f"状态『{_state_label(state)}』的『转到』接了 "
-                f"{link_count} 条线,只会用第一条 —— "
-                f"一个状态只能有一条出线(想多方分支就把条件都写进"
-                f"那一个『动画_转场』里)")
-        if transition is None:
-            chain.append((state, None))
-            break
-        if getattr(transition, "bl_idname", "") != "GKNodeAnimTransition":
-            label = getattr(transition, "bl_label", "?")
-            warnings.append(f"状态『{_state_label(state)}』的『转到』接的是"
-                            f"『{label}』,不是『动画_转场』—— 这条链到此为止")
-            chain.append((state, None))
-            break
-        chain.append((state, transition))
-        nxt, _n = _next_of(transition, "转到")
-        if nxt is None:
-            warnings.append(f"转场接出去了,但没有连到下一个状态的『进入』")
-            break
-        if getattr(nxt, "bl_idname", "") != "GKNodeAnimState":
-            label = getattr(nxt, "bl_label", "?")
-            warnings.append(f"转场连到了『{label}』,不是『动画_状态』")
-            break
-        state = nxt
-    return chain, warnings
-
-
-def _state_label(state):
-    """状态显示名,给告警用。"""
-    fn = getattr(state, "resolved_state_name", None)
-    name = fn() if fn is not None else getattr(state, "gk_state_name", "")
-    return name or getattr(state, "bl_label", "?")
-
-
-def _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp,
-                            debug_print=False):
-    """沿链生成"这条转移的条件为真就切过去"。
-
-    每段的形态:
-        if anim_state == "起始" and <条件>:
-            anim_state = "目标"
-            <播目标状态的动画>
-    """
-    emitted = set()
-    for index, (state, transition) in enumerate(chain):
-        if transition is None:
-            continue
-        # 同一条转场只生成一次 —— 环会让它在链里出现两次
-        if id(transition) in emitted:
-            continue
-        emitted.add(id(transition))
-        start_name = _state_label(state)
-        # 下一段的状态就是目标状态。
-        # 走到链尾(环)时用**转移自己**指的那个节点当目标。
-        if index + 1 < len(chain):
-            nxt = chain[index + 1][0]
-        else:
-            nxt, _n = _next_of(transition, "转到")
-        if nxt is None:
-            continue
-        end_name = _state_label(nxt)
-        if not end_name:
-            continue
-        getter = getattr(transition, "condition_expr", None)
-        condition = getter(ctx) if getter is not None else None
-        if not condition:
-            ctx.warn(f"转场『{start_name} -> {end_name}』没有条件,"
-                     f"不会生效。把判断接到它的『条件』引脚上,"
-                     f"或者把『条件来源』改成『选输入』直接挑一个按键")
-            continue
-        ctx.add_line(indent, f'if {var_name} == {gd_string(start_name)} '
-                             f'and {condition}:')
-        ctx.add_line(indent + 1, f'{var_name} = {gd_string(end_name)}')
-        # 调试打印(节点上的『打印状态变化』勾了才生成)
-        if debug_print:
-            ctx.add_line(indent + 1,
-                         f'print("[GK] 动画状态: %s -> %s" % '
-                         f'[{gd_string(start_name)}, {var_name}])')
-        ctx.add_line(indent + 1, f"if {player_temp} != null and "
-                                 f"{player_temp}.has_animation({gd_string(end_name)}):")
-        ctx.add_line(indent + 2,
-                     f"{player_temp}.play({gd_string(end_name)}, -1.0, 1.0)")
-        ctx.add_line(indent + 1, "else:")
-        ctx.add_line(indent + 2,
-                     f'push_warning("[GK] 状态『{end_name}』没有对应的动画: %s" % '
-                     f"{gd_string(end_name)})")
-
-
-@stmt_node("GKNodeAnimStateMachineRef")
-def _stmt_anim_tree_ref(ctx, node, indent):
-    """驱动一张**动画树** —— 玩法图和动画图分开放。
-
-    见 nodes.py 里 GKNodeAnimState 那段的说明(用户要求照虚幻 5 的
-    Animation Blueprint 那样拆开,别都堆在一个节点里)。
-    """
-    tree = _find_animation_tree(getattr(node, "gk_tree_name", ""))
-    entry, entries = _anim_tree_entry(tree) if tree is not None else (None, [])
+    graph = node_lib.anim_tree_graph(tree)
+    entry = graph["entry"]
     if entry is None:
-        ctx.warn(f"节点『{node.bl_label}』找不到可用的动画状态机"
-                 f"{'『' + node.gk_tree_name + '』' if node.gk_tree_name else ''}"
-                 f"。先在『游戏动画』面板里建一张动画树,放一个『动画_状态』"
-                 f"(它的『进入』不接线 = 起始状态),再用『动画_转场』连下去")
-        return
-    chain, chain_warnings = _walk_state_chain(entry)
-    # ── 只对"真的孤立"的状态告警(踩过的坑)────────────────────────
-    # 环(idle <-> run)里两个状态都"没有外来入边",按入口判定都算候选 ——
-    # 但它们是**连着的**。直接报"有 2 个入口"是误报,
-    # 用户会以为哪里配错了,其实图完全正常。
-    #
-    # 正确判断:走完链之后,不在链上的状态才是真的孤立。
-    on_chain = {id(state) for state, _tr in chain}
-    orphans = [s for s in entries if id(s) not in on_chain]
-    if orphans:
-        names = "、".join(_state_label(s) for s in orphans[:4])
-        ctx.warn(f"动画树里有 {len(orphans) + 1} 段互不相连的状态机 —— "
-                 f"导出只用了含『{_state_label(entry)}』的那一段。"
-                 f"孤立的是:({names})。"
-                 f"请用『动画_转场』把它们连起来")
-    for note in chain_warnings:
-        ctx.warn(note)
-
-    player = ctx.animation_player(node)
-    var_name = ctx.declare_var(
-        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
-        "String")
-    # -- 播放器引用必须是**成员变量**,不能是局部变量(踩过的坑)------
-    # 状态判断跑在 _physics_process 里,而 _ready 里也用它。
-    # 用 new_temp()(局部变量)会炸:
-    #     Identifier "_ap1" not declared in the current scope
-    # 实测用户导出后报了这个错。
-    #
-    # 而且只在 _ready 里赋值一次就够了(它不会变),
-    # 所以赋值语句只在 _ready 那次执行时生成,避免每个物理帧都查一遍。
-    player_temp = ctx.member_temp("ap")
-    if not getattr(ctx, "_anim_player_assigned", False):
-        ctx._anim_player_assigned = True
-        # 用 `=` 不用 `:=`:成员变量已经在类顶部声明过 `var _ap0 = null`,
-        # 再写 `var _ap0 := ...` 就是**同一作用域里重复声明**,
-        # Godot 会报 "There is already a variable named ..."。
-        ctx.add_line(indent, f"{player_temp} = {player}")
-    # 起始状态 = 链路的**入口**(『进入』没接线的那个)--
-    # 照 UE5 的 Entry 节点。不用再靠 gk_is_default 勾选框。
-    default_name = _state_label(entry)
-    ctx.add_line(indent, f"if {var_name}.is_empty():")
-    ctx.add_line(indent + 1, f"{var_name} = {gd_string(default_name)}")
-
-    if str(getattr(node, "gk_check_mode", "EVERY_FRAME")) == "EVERY_FRAME":
-        # 交给 generate() 统一发射到 _physics_process —— 跟移动同步判定,
-        # 避免"人走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
-        ctx.anim_trees.append({
-            "node": node, "chain": chain, "var": var_name,
-            "player": player_temp,
-            "debug": bool(getattr(node, "gk_debug_print", False)),
-        })
-        ctx.need_anim_tree_process = True
-        return
-    _emit_chain_transitions(ctx, node, indent, chain, var_name, player_temp,
-                            debug_print=bool(getattr(
-                                node, "gk_debug_print", False)))
+        return None, []
+    # 节点身份一律走 node_key(as_pointer),不能用 id()/is ——
+    # 详见 nodes.node_key:同一个节点从连线拿到的是**另一个**包装对象。
+    targeted = {node_lib.node_key(edge["to"]) for edge in graph["edges"]}
+    named = [s for s in graph["states"] if node_lib.anim_state_name(s)]
+    entries = [s for s in named
+               if node_lib.node_key(s) not in targeted] or [entry]
+    return entry, entries
 
 
-def _find_animation_tree(name):
-    """按名字找一张动画树;名字为空就用文件里第一张。"""
-    try:
-        import bpy
-    except Exception:
-        return None
-    data = getattr(bpy, "data", None)
-    groups = getattr(data, "node_groups", None)
-    if groups is None:
-        return None
-    wanted = str(name or "")
-    first = None
-    for group in groups:
-        if getattr(group, "bl_idname", "") != "GKAnimationTree":
-            continue
-        if first is None:
-            first = group
-        if wanted and str(getattr(group, "name", "")) == wanted:
-            return group
-    return first if not wanted else None
+def _edge_condition(ctx, edge, player_temp, finished_var=None):
+    """一条边的条件表达式;算不出来返回 None。
 
-
-def _anim_tree_states(tree):
-    """取出动画树里的**切换卡片**,按优先级排好(小的先判)。
-
-    支持两种节点:
-      * GKNodeAnimState      -- 状态卡片(条件写在状态自己身上)
-      * GKNodeAnimTransition -- 切换卡片(从逻辑判断拉线过来)
-    两者语义一样("条件为真就切到目标状态"),所以这里合并处理。
-    后者正是用户要的"右边有输出连接点、能从逻辑判断拉线"那种。
+    kind 决定从哪儿取:
+      FINISH    -> 上游那段动画播完了(靠 animation_finished 信号,见
+                   _anim_finished_helpers:查 current_animation 是不行的)
+      ACTION_*  -> 节点上直接选的输入动作
+      PIN       -> 接在『条件』引脚上的表达式
     """
-    if tree is None:
-        return []
-    found = []
-    for item in getattr(tree, "nodes", ()) or ():
-        if getattr(item, "bl_idname", "") in ("GKNodeAnimState",
-                                              "GKNodeAnimTransition"):
-            found.append(item)
-    found.sort(key=lambda n: (int(getattr(n, "gk_priority", 0) or 0),
-                              getattr(n, "location", (0.0, 0.0))[1]))
-    return found
+    kind = edge.get("kind")
+    if kind == node_lib.ANIM_EDGE_FINISH:
+        source = node_lib.anim_state_name(edge["from"])
+        if not source or not finished_var:
+            return None
+        # 信号回调里记下的名字 == 上游状态的名字 -> 就是"它播完了"
+        return f"({finished_var} == {gd_string(source)})"
+    if kind == node_lib.ANIM_EDGE_EXIT:
+        # 走到『动画_结束』= 无条件(它就是"演完了"这个动作本身)
+        return "true"
+    trans = edge.get("transition")
+    if trans is None:
+        return None
+    if kind in node_lib.ANIM_ACTION_SOURCES:
+        action = str(getattr(trans, "gk_cond_action", "") or "").strip()
+        if not action:
+            return None
+        const = ctx.add_action(action)
+        return f"{node_lib.ANIM_ACTION_SOURCES[kind]}({const})"
+    getter = getattr(trans, "condition_expr", None)
+    if getter is None:
+        return None
+    return getter(ctx)
 
 
-def _emit_tree_transitions(ctx, node, indent, states, var_name, player_temp):
-    """生成"哪条条件先为真就去哪个状态"的判断链。
+def _emit_state_graph(ctx, indent, graph, var_name, player_temp, enter_func,
+                      finished_var=None, finish_func=None, gate=None):
+    """把状态图生成成 if/elif 链。
 
-    和转移表那版不同:这里条件来自**状态节点的引脚**,
-    所以不需要 `transition_pin_name`,直接读那个叫『条件』的引脚。
+    每个状态一段,状态内部按画布上下顺序判转移:
+
+        if anim_state == "A":
+            if <条件1>:
+                _gk_anim_enter("B")
+            elif <条件2>:
+                _gk_anim_enter("C")
+
+    -- 为什么状态内用 elif 而不是各自一个 if ------------------------
+    "A 同时满足两条转移"必须有确定答案。虚幻 5 的语义是"从上往下第一个
+    成立的赢",而且一帧只走一步 —— 用一串 if 的话同一帧能连跳三四个状态,
+    表现是"一按键直接跳到最终状态、中间的动作一帧都没播"。
     """
-    for item in states:
-        # 状态名可能来自**选中的动作**或手填的字符串 —— 见 resolved_state_name
-        resolver = getattr(item, "resolved_state_name", None)
-        state_name = (resolver() if resolver is not None
-                      else str(getattr(item, "gk_state_name", "") or ""))
-        if not state_name:
+    emitted = 0
+    # ── 开始口 / 结束口的"闸门" ──────────────────────────────────────
+    # 有开始口或结束口时,转场只在**"这段动画正在跑"**的时候判:
+    # 还没开始 -> 不判;走到结束口了 -> 也不判(否则"结束"这个状态
+    # 会立刻被别的转场拉走,用户根本等不到玩法图读到"已结束")。
+    body_indent = indent
+    if gate:
+        ctx.add_line(indent, f"if {gate}:")
+        body_indent = indent + 1
+    for state in graph["states"]:
+        name = node_lib.anim_state_name(state)
+        if not name:
             continue
-        # 条件有两种来源(接引脚 / 节点上直接选输入)—— 见 GKNodeAnimState。
-        condition = None
-        getter = getattr(item, "condition_expr", None)
-        if getter is not None:
-            condition = getter(ctx)
-        else:   # 兜底:老节点没有 condition_expr
-            socket = item.inputs.get("条件")
-            if socket is not None and getattr(socket, "is_linked", False):
-                condition = ctx.expr_of(socket)
-        if not condition:
-            continue          # 没条件 = 不会被主动切过去(可能就是起始状态)
-        ctx.add_line(indent, f'if {var_name} != {gd_string(state_name)} '
-                             f'and {condition}:')
-        ctx.add_line(indent + 1, f'{var_name} = {gd_string(state_name)}')
-        ctx.add_line(indent + 1, f"if {player_temp} != null and "
-                                 f"{player_temp}.has_animation({gd_string(state_name)}):")
-        ctx.add_line(indent + 2,
-                     f"{player_temp}.play({gd_string(state_name)}, -1.0, 1.0)")
-        ctx.add_line(indent + 1, "else:")
-        ctx.add_line(indent + 2,
-                     f'push_warning("[GK] 状态『{state_name}』没有对应的动画: %s" % '
-                     f"{gd_string(state_name)})")
+        state_key = node_lib.node_key(state)
+        outgoing = [e for e in graph["edges"]
+                    if node_lib.node_key(e["from"]) == state_key]
+        if not outgoing:
+            continue
+        # 同一个状态里的边按画布顺序(上面的先判)。
+        # 同一个节点驱动两次时顺序也必须稳定,所以排序键里带上目标名。
+        outgoing.sort(key=lambda e: (e["order"],
+                                     node_lib.anim_state_name(e["to"])))
+        ctx.add_line(body_indent, f"{'if' if emitted == 0 else 'elif'} "
+                                  f"{var_name} == {gd_string(name)}:")
+        first = True
+        for edge in outgoing:
+            condition = _edge_condition(ctx, edge, player_temp, finished_var)
+            if edge["kind"] == node_lib.ANIM_EDGE_EXIT:
+                # 走到『动画_结束』:不切状态,而是**收工**
+                if not condition or not finish_func:
+                    continue
+                ctx.add_line(body_indent + 1,
+                             f"{'if' if first else 'elif'} {condition}:")
+                ctx.add_line(body_indent + 2, f"{finish_func}()")
+                first = False
+                continue
+            target = node_lib.anim_state_name(edge["to"])
+            if not condition or not target:
+                # 条件算不出来(比如『条件来源=自己写』但引脚没接)——
+                # anim_tree_graph 已经报过原因,这里不重复刷告警。
+                continue
+            ctx.add_line(body_indent + 1,
+                         f"{'if' if first else 'elif'} {condition}:")
+            ctx.add_line(body_indent + 2, f"{enter_func}({gd_string(target)})")
+            first = False
+        if first:
+            # 这一段一条转移都没生成出来 —— 留个 pass 免得语法错误
+            ctx.add_line(body_indent + 1, "pass")
+        emitted += 1
+    if emitted == 0:
+        ctx.add_line(body_indent, "pass")
+    # ── 这里**不能**清 `_gk_anim_finished`(改过两次才对)──────────────
+    # 第一版每帧判完就清,结果"(某动画播完了) 并且 (在地面上)"这种复合条件
+    # 永远等不到:那一刻玩家还在空中,条件为假,标志却被清掉了,
+    # 之后落地也不会再触发。现在标志**粘住**到下一段动画开播
+    # (由 `_gk_on_anim_started` 信号和 `_gk_anim_enter` 负责清)。
 
 
 @stmt_node("GKNodeAnimStateMachine")
@@ -2082,9 +3372,14 @@ def _stmt_anim_state_machine(ctx, node, indent):
         return
 
     player = ctx.animation_player(node)
+    # ── 状态变量**按节点**独立(用户 2026-10-03 的问题)──────────────
+    # 用户问"一个游戏逻辑里是否可以有多个游戏动画?"—— 以前**不行**:
+    # 两张动画树都写进同一个 `anim_state`、共用同一个 `_gk_anim_enter`,
+    # 后一张把前一张整个盖掉(实测:两张树只生成一套状态机)。
+    # 现在按节点 key 声明,第二个状态机自动叫 `anim_state_2`。
     var_name = ctx.declare_var(
         snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
-        "String")
+        "String", key=node_lib.node_key(node))
     player_temp = ctx.new_temp("ap")
     ctx.add_line(indent, f"var {player_temp} := {player}")
     # 首次执行时把状态设成"起始状态"
@@ -2286,8 +3581,26 @@ def _camera_expr(ctx, node, auto="first"):
     if raw and raw != TARGET_SELF:
         return ctx.target_expr(node, hint="cam"), True
     if auto == "first":
-        ctx.warn(f"『{node.bl_label}』没有指定相机，"
-                 f"已改成运行时自动找场景里第一个相机(Camera2D / Camera3D)")
+        # ── "没填相机"就找**正在用的那台**(2.5D 示例真跑抓出来的坑)──────
+        # 原来只找 `gk_camera` 分组 / 场景里第一个 —— 但示例场景里的相机
+        # 不在任何分组里,于是 `_cam3` 是 null,滚轮缩放整段被跳过:
+        # 表现是"滚轮完全没反应",而代码看着完全正常。
+        # 顺序改成:视口里正在用的 -> 分组 -> 场景里第一个。
+        _fallback_cam = ctx.declare_var("_gk_cam_auto", "Node")
+        ctx.note(f"『{node.bl_label}』没指定相机 —— 运行时自动用当前相机"
+                 f"(单相机项目这样就行;想固定某台就在节点上选)")
+        return (f"({_fallback_cam} if {_fallback_cam} != null else "
+                f"(get_viewport().get_camera_3d() if "
+                f"get_viewport().get_camera_3d() != null else "
+                f"(get_viewport().get_camera_2d() if "
+                f"get_viewport().get_camera_2d() != null else "
+                f"get_tree().get_first_node_in_group(\"gk_camera\"))))"), True
+        # ── 这只是"提示",不是"问题"(2.5D 示例抓出来的体验问题)────────
+        # 不填相机 = 用当前相机,这是**文档写明的默认行为**(单相机项目
+        # 根本不用填)。原来报成 warn,于是"零告警导出"这条验收线被
+        # 一堆正常用法刷屏,真正的告警反而淹掉了。
+        ctx.note(f"『{node.bl_label}』没指定相机 —— 运行时自动用当前相机"
+                 f"(单相机项目这样就行;想固定某台就在节点上选)")
         return 'get_tree().get_first_node_in_group("gk_camera")', False
     return "null", False
 
@@ -2313,24 +3626,859 @@ def _stmt_set_paused(ctx, node, indent):
     ctx.add_line(indent, f"{ctx.target_expr(node)}.process_mode = Node.{mode}")
 
 
+def _path_name(path):
+    """从生成的节点引用表达式里取出**节点名**。
+
+    `$"侧视机位"` / `$Camera` -> `侧视机位` / `Camera`;
+    不是这种形式的(比如 `self` 或已经算好的表达式)原样返回。
+    """
+    text = str(path or "").strip()
+    if text.startswith("$"):
+        text = text[1:].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'"):
+        text = text[1:-1]
+    return text
+
+
+def _sample_curve_points(curve_name, samples=48):
+    """把一条 Blender 曲线采样成世界坐标点列。
+
+    ── 为什么在**导出时**采样(而不是把曲线导进游戏)────────────────
+    用户的想法是"在场景里建模一条曲线,相机挂在上面"。但 glTF **不支持
+    曲线**:导出时曲线会被转成网格(那就变成一根有厚度的管子,不是轨道了)。
+    所以正确做法是:导出时把曲线的形状**采样成点**,写进生成的脚本 ——
+    游戏里只需要一串 Vector3,不依赖任何曲线资源。
+
+    曲线物体的 `matrix_world` 也要乘上,否则在场景里挪动曲线时,
+    采到的点还停在原地(用户一定会这么干)。
+    """
+    try:
+        import bpy
+    except Exception:
+        return []
+    name = str(curve_name or "").strip()
+    if not name:
+        return []
+    obj = (getattr(bpy.data, "objects", None) or {}).get(name) \
+        if hasattr(getattr(bpy.data, "objects", None), "get") else None
+    if obj is None or getattr(obj, "type", "") != "CURVE":
+        return []
+    # ── 必须先刷新一次求值(踩过的坑)──────────────────────────────
+    # `obj.matrix_world` 是**求值后**的属性:刚 new 出来、或者用户刚在视口里
+    # 拖过曲线,`matrix_world` 还停在旧值(新建时就是单位矩阵)。
+    # 实测:在场景里把曲线挪到 (1,2,0),采到的点仍然是 (0,0,…) ——
+    # 也就是说"相机沿轨道走"会走一条**看不见的、没挪动过的**轨道。
+    # 先 view_layer.update() 一下,矩阵才跟上。
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    matrix = obj.matrix_world
+    points = []
+    data = getattr(obj, "data", None)
+    for spline in getattr(data, "splines", ()) or ():
+        try:
+            count = len(spline.points)
+        except Exception:
+            count = 0
+        if count >= 2:
+            # 多段线 / NURBS:points 是四维(带权重)
+            for index in range(count):
+                point = spline.points[index]
+                local = (point.co[0], point.co[1], point.co[2])
+                world = matrix @ _vec3(local)
+                points.append((world.x, world.y, world.z))
+        else:
+            bezier = getattr(spline, "bezier_points", None)
+            if not bezier:
+                continue
+            for handle in bezier:
+                local = (handle.co[0], handle.co[1], handle.co[2])
+                world = matrix @ _vec3(local)
+                points.append((world.x, world.y, world.z))
+    if len(points) < 2:
+        return points
+    # ── 重采样成**等距**的 N 个点 ──────────────────────────────────
+    # 贝塞尔的控制点疏密不均,直接拿去插值会出现"该慢的地方飞快"。
+    # 先按折线累计长度,再按等距取点 —— 这样『位置 = 0.5』真的在中间。
+    dense = []
+    for i in range(len(points) - 1):
+        a, b = points[i], points[i + 1]
+        dense.append(a)
+        for step in range(1, 8):
+            t = step / 8.0
+            dense.append((a[0] + (b[0] - a[0]) * t,
+                          a[1] + (b[1] - a[1]) * t,
+                          a[2] + (b[2] - a[2]) * t))
+    dense.append(points[-1])
+    lengths = [0.0]
+    for i in range(1, len(dense)):
+        dx = dense[i][0] - dense[i - 1][0]
+        dy = dense[i][1] - dense[i - 1][1]
+        dz = dense[i][2] - dense[i - 1][2]
+        lengths.append(lengths[-1] + (dx * dx + dy * dy + dz * dz) ** 0.5)
+    total = lengths[-1]
+    if total <= 0.0001:
+        return points
+    out = []
+    for index in range(samples):
+        want = total * index / float(samples - 1)
+        # 线性找第一个超过它的段(点很少,不值得二分)
+        cursor = 0
+        while cursor < len(lengths) - 1 and lengths[cursor] < want:
+            cursor += 1
+        prev = max(0, cursor - 1)
+        span = lengths[cursor] - lengths[prev]
+        t = 0.0 if span <= 0.0001 else (want - lengths[prev]) / span
+        a, b = dense[prev], dense[cursor]
+        out.append((a[0] + (b[0] - a[0]) * t,
+                    a[1] + (b[1] - a[1]) * t,
+                    a[2] + (b[2] - a[2]) * t))
+    return out
+
+
+def _vec3(values):
+    """(x, y, z) -> 一个能乘矩阵的对象(离线时手算)。"""
+    try:
+        from mathutils import Vector
+        return Vector(values)
+    except Exception:
+        return _PlainVec(values)
+
+
+class _PlainVec:
+    """没有 mathutils 时的最小替代(离线测试用)。"""
+
+    def __init__(self, values):
+        self.x, self.y, self.z = values
+
+
+@stmt_node("GKNodeCameraPath")
+def _stmt_camera_path(ctx, node, indent):
+    """相机沿曲线走(运镜轨道)。
+
+    曲线在**导出时**被采样成点列写进脚本 —— 游戏里只是一串 Vector3,
+    不依赖任何曲线资源(glTF 也不支持曲线,见 _sample_curve_points)。
+    """
+    curve_name = str(getattr(node, "gk_curve", "") or "").strip()
+    points = _sample_curve_points(curve_name)
+    if not curve_name:
+        ctx.warn("『相机_路径』还没选曲线 —— 点节点上的『选曲线』挑一条"
+                 "(场景里没有的话:添加 → 曲线 → 路径)")
+        return
+    if len(points) < 2:
+        ctx.warn(f"『相机_路径』的曲线『{curve_name}』采不到点 —— "
+                 f"确认它是曲线物体,而且有至少两个点")
+        return
+    path_var = ctx.declare_var("_gk_cam_path", "PackedVector3Array")
+    ctx.var_initials[path_var] = "PackedVector3Array([" + ", ".join(
+        f"Vector3({gd_number(x)}, {gd_number(y)}, {gd_number(z)})"
+        for x, y, z in points) + "])"
+    camera = _camera_node_expr(ctx, node)
+    cam_var = ctx.declare_var("_gk_path_cam", "Node")
+    pos_var = ctx.declare_var("_gk_path_pos", "Vector3")
+    t_var = ctx.declare_var("_gk_path_t", "float")
+    ctx.add_line(indent, f"{cam_var} = {camera}")
+    position = ctx.input_number(node, "位置", "0.0")
+    speed = float(getattr(node, "gk_speed", 0.0) or 0.0)
+    smooth = float(getattr(node, "gk_smooth", 8.0) or 0.0)
+    loop = bool(getattr(node, "gk_loop", False))
+    mode = str(getattr(node, "gk_look_mode", "FORWARD"))
+    target = ""
+    if mode == "TARGET":
+        raw = str(getattr(node, "gk_look_target", "") or "").strip()
+        target = (ctx.target_expr(node, "gk_look_target", "看向") if raw
+                  else "null")
+    frame = [
+        f"if {cam_var} != null and {cam_var} is Node3D:",
+        f"    var _gk_count: int = {path_var}.size()",
+        f"    if _gk_count >= 2:",
+        f"        {t_var} = clampf({t_var}, 0.0, 1.0)",
+        f"        var _gk_f: float = {t_var} * float(_gk_count - 1)",
+        "        var _gk_i: int = int(floor(_gk_f))",
+        "        var _gk_frac: float = _gk_f - float(_gk_i)",
+        f"        var _gk_want: Vector3 = {path_var}[_gk_i].lerp("
+        f"{path_var}[mini(_gk_i + 1, _gk_count - 1)], _gk_frac)",
+    ]
+    if smooth > 0.0:
+        t = (f"clampf({gd_number(smooth)} * "
+             f"get_physics_process_delta_time(), 0.0, 1.0)")
+        frame += [
+            f"        {pos_var} = {pos_var}.lerp(_gk_want, {t})",
+        ]
+    else:
+        frame += [f"        {pos_var} = _gk_want"]
+    frame += [
+        f"        ({cam_var} as Node3D).global_position = {pos_var}",
+    ]
+    if mode == "FORWARD":
+        # 朝前 = 用"下一个点 - 当前位置"当方向(算出来才准,
+        # 拿曲线切线的话还得再采样一次)
+        frame += [
+            f"        var _gk_ahead: Vector3 = {path_var}[mini(_gk_i + 1, "
+            f"_gk_count - 1)]",
+            f"        if ({cam_var} as Node3D).global_position.distance_to("
+            f"_gk_ahead) > 0.01:",
+            f"            ({cam_var} as Node3D).look_at(_gk_ahead, Vector3.UP)",
+        ]
+    elif mode == "TARGET" and target:
+        frame += [
+            f"        if {target} is Node3D:",
+            f"            ({cam_var} as Node3D).look_at("
+            f"({target} as Node3D).global_position, Vector3.UP)",
+        ]
+    if speed > 0.0:
+        frame += [
+            f"        {t_var} += {gd_number(speed / 100.0)} * "
+            f"get_physics_process_delta_time()",
+        ]
+        if loop:
+            frame += [
+                f"        if {t_var} > 1.0:",
+                f"            {t_var} = 0.0",
+            ]
+        else:
+            frame += [f"        {t_var} = minf({t_var}, 1.0)"]
+    # 起始位置由执行点的『位置』引脚给(通常是 0)
+    ctx.add_line(indent, f"{t_var} = {position}")
+    ctx.physics_hooks.setdefault("camera_path", []).extend(frame)
+
+
 @stmt_node("GKNodeCameraSetCurrent")
 def _stmt_camera_set_current(ctx, node, indent):
+    """切相机;填了『过渡』就是丝滑推镜。
+
+    ── 丝滑推镜怎么做的(不用 await,也不用挪走旧相机)────────────
+    1. 先记住**新相机自己**的位姿(end)
+    2. 把新相机**瞬移**到旧相机的位姿(start),然后 make_current()
+    3. 之后每帧把它从 start 插值回 end(登记进 physics_hooks)
+    4. 到位后精确写回 end
+
+    关键在"动的是**新**相机":它最后停在的正是自己本来的位姿,所以
+    过渡结束不需要任何还原;旧相机从头到尾没被碰过,来回切也不会跑位。
+    (先动旧相机再切的做法会把它永久挪到新位置 —— 切回去就发现镜头歪了。)
+
+    每帧逻辑挂在 `_physics_process`(和角色移动同一个时钟),避免相机
+    在渲染帧里追、角色在物理帧里跑,两个节拍一差拍画面就抖。
+    """
     camera, _auto = _camera_expr(ctx, node)
-    ctx.add_line(indent, f"{camera}.make_current()")
+    blend = float(getattr(node, "gk_blend", 0.0) or 0.0)
+    # `to_var` 必须是**成员变量**,而且这里**不能写 `var`**:
+    # 过渡逻辑跑在 _physics_process 里(另一个函数),用局部变量会
+    #   1) `Identifier "_cam_to2" not declared in the current scope`(实测)
+    #   2) 就算声明成成员变量,再写一次 `var` 会**遮蔽**它 ——
+    #      局部那个出了 if 块就没了,钩子里读到的永远是 null,
+    #      相机过渡**静默失效**(测试里就是这么发现的第一版)
+    to_var = ctx.declare_var("_gk_cam_to", "Node")
+    ctx.add_line(indent, f"{to_var} = {camera}")
+    ctx.add_line(indent, f"if {to_var} == null:")
+    ctx.add_line(indent + 1, f"push_warning(\"[GK] 相机_切换:没找到相机\")")
+    if blend <= 0.0:
+        ctx.add_line(indent, f"else:")
+        ctx.add_line(indent + 1, f"{to_var}.make_current()")
+        return
+
+    # ---- 带过渡 ----
+    from_var = ctx.declare_var("_gk_cam_from", "Node")
+    left_var = ctx.declare_var("_gk_cam_blend_left", "float")
+    total_var = ctx.declare_var("_gk_cam_blend_total", "float")
+    start3 = ctx.declare_var("_gk_cam_start3", "Transform3D")
+    # ── 目标相机"本来的位姿"要**缓存**,不能每次现读(用户 2026-10-03)──
+    # 连续点 C/V 时相机一路往后飘,原因就在这:
+    #   第一次切换:end = 相机本来的位姿(对的) -> 过渡到 end
+    #   过渡还没走完又按一次:此时相机正停在**半路**,再读一次"它本来的
+    #   位姿"读到的就是那个半路位置 -> end 被改成了半路位置 ->
+    #   下一次再往后退一点…… 按几次退几次。
+    # 现在把每台相机的"家"记在字典里,第一次见到它时存下来,以后一直用它。
+    homes = ctx.declare_var("_gk_cam_homes", "Dictionary")
+    end3 = ctx.declare_var("_gk_cam_end3", "Transform3D")
+    start2 = ctx.declare_var("_gk_cam_start2", "Vector2")
+    end2 = ctx.declare_var("_gk_cam_end2", "Vector2")
+    zoom2 = ctx.declare_var("_gk_cam_endzoom", "Vector2")
+    ctx.add_line(indent, f"else:")
+    ctx.add_line(indent + 1, f"{from_var} = get_viewport().get_camera_3d()")
+    ctx.add_line(indent + 1, f"if {from_var} == null:")
+    ctx.add_line(indent + 2, f"{from_var} = get_viewport().get_camera_2d()")
+    ctx.add_line(indent + 1, f"if {to_var} is Camera3D and {from_var} is Camera3D:")
+    # 第一次见到这台相机 -> 把它的"家"记下来;以后每次都回到那个家
+    ctx.add_line(indent + 2, f"if not {homes}.has({to_var}):")
+    ctx.add_line(indent + 3, f"{homes}[{to_var}] = "
+                             f"({to_var} as Camera3D).global_transform")
+    ctx.add_line(indent + 2, f"{end3} = {homes}[{to_var}]")
+    ctx.add_line(indent + 2, f"{start3} = ({from_var} as Camera3D).global_transform")
+    ctx.add_line(indent + 2, f"({to_var} as Camera3D).global_transform = {start3}")
+    ctx.add_line(indent + 2, f"({to_var} as Camera3D).make_current()")
+    ctx.add_line(indent + 2, f"{total_var} = maxf({gd_number(blend)}, 0.0001)")
+    ctx.add_line(indent + 2, f"{left_var} = {total_var}")
+    ctx.add_line(indent + 1, f"elif {to_var} is Camera2D and {from_var} is Camera2D:")
+    ctx.add_line(indent + 2, f"if not {homes}.has({to_var}):")
+    ctx.add_line(indent + 3, f"{homes}[{to_var}] = ["
+                             f"({to_var} as Camera2D).global_position, "
+                             f"({to_var} as Camera2D).zoom]")
+    ctx.add_line(indent + 2, f"{end2} = ({homes}[{to_var}] as Array)[0]")
+    ctx.add_line(indent + 2, f"{zoom2} = ({homes}[{to_var}] as Array)[1]")
+    ctx.add_line(indent + 2, f"{start2} = ({from_var} as Camera2D).global_position")
+    ctx.add_line(indent + 2, f"({to_var} as Camera2D).global_position = {start2}")
+    ctx.add_line(indent + 2, f"({to_var} as Camera2D).zoom = "
+                             f"({from_var} as Camera2D).zoom")
+    ctx.add_line(indent + 2, f"({to_var} as Camera2D).make_current()")
+    ctx.add_line(indent + 2, f"{total_var} = maxf({gd_number(blend)}, 0.0001)")
+    ctx.add_line(indent + 2, f"{left_var} = {total_var}")
+    ctx.add_line(indent + 1, f"else:")
+    ctx.add_line(indent + 2, f"{to_var}.make_current()")
+
+    # ---- 每帧推进(和相机震动同一个机制)----
+    hook_key = "camera_blend"
+    if hook_key not in ctx.physics_hooks:
+        ctx.physics_hooks[hook_key] = [
+            f"if {left_var} > 0.0:",
+            f"    {left_var} -= delta",
+            f"    var _gk_ct: float = clampf(1.0 - {left_var} / {total_var}, "
+            f"0.0, 1.0)",
+            f"    if ({to_var} is Camera3D) and ({from_var} is Camera3D):",
+            f"        ({to_var} as Camera3D).global_transform = "
+            f"{start3}.interpolate_with({end3}, _gk_ct)",
+            f"    elif ({to_var} is Camera2D) and ({from_var} is Camera2D):",
+            f"        ({to_var} as Camera2D).global_position = "
+            f"{start2}.lerp({end2}, _gk_ct)",
+            f"        ({to_var} as Camera2D).zoom = "
+            f"({from_var} as Camera2D).zoom.lerp({zoom2}, _gk_ct)",
+            f"    if {left_var} <= 0.0:",
+            # 到位:精确写回,免得浮点插值差一点点(镜头会"差一丝")
+            f"        if {to_var} is Camera3D:",
+            f"            ({to_var} as Camera3D).global_transform = {end3}",
+            f"        elif {to_var} is Camera2D:",
+            f"            ({to_var} as Camera2D).global_position = {end2}",
+            f"            ({to_var} as Camera2D).zoom = {zoom2}",
+        ]
 
 
 @stmt_node("GKNodeCameraZoom")
 def _stmt_camera_zoom(ctx, node, indent):
+    """缩放 / 视野;填了『时长』就用 Tween 平滑过去。"""
     camera, _auto = _camera_expr(ctx, node)
     value = _tunable_number(ctx, node, "数值", "1.0", "camera_zoom")
+    duration = float(getattr(node, "gk_time", 0.0) or 0.0)
+    # ── 上下限(用户 2026-10-03:"可以无限拉长,应该添加自定义范围")──────
+    # 0 = 不限制。填了就在**生成时**夹一次:
+    #   zoom 当固定值 -> 直接 clamp 那个常量,生成的代码还是干净的
+    #   zoom 是表达式(滚轮链)-> 用 clampf(...) 包一层
+    low = float(getattr(node, "gk_min_value", 0.0) or 0.0)
+    high = float(getattr(node, "gk_max_value", 0.0) or 0.0)
+    if low != 0.0 or high != 0.0:
+        lo = gd_number(low) if low != 0.0 else "-INF"
+        hi = gd_number(high) if high != 0.0 else "INF"
+        value = f"clampf({value}, {lo}, {hi})"
     temp = ctx.new_temp("cam")
-    # 2D 的 zoom 是"越大越近"的倍数，3D 的 fov 是垂直视场角(度)。
+    # 2D 的 zoom 是"越大越近"的倍数,3D 的 fov 是垂直视场角(度)。
     # 两者语义不同，所以按相机真实类型分派，而不是按项目维度猜。
     ctx.add_line(indent, f"var {temp} = {camera}")
+    if duration > 0.0:
+        tween_var = ctx.new_temp("tween")
+        ctx.add_line(indent, f"if {temp} != null:")
+        ctx.add_line(indent + 1, f"var {tween_var} = create_tween()")
+        ctx.add_line(indent + 1, f"{tween_var}.set_trans(Tween.TRANS_SINE)")
+        ctx.add_line(indent + 1, f"{tween_var}.set_ease(Tween.EASE_IN_OUT)")
+        ctx.add_line(indent + 1, f"if {temp} is Camera2D:")
+        ctx.add_line(indent + 2, f"{tween_var}.tween_property({temp}, "
+                                 f"\"zoom\", Vector2({value}, {value}), "
+                                 f"{gd_number(duration)})")
+        ctx.add_line(indent + 1, f"elif {temp} is Camera3D:")
+        ctx.add_line(indent + 2, f"{tween_var}.tween_property({temp}, "
+                                 f"\"fov\", {value}, {gd_number(duration)})")
+        return
     ctx.add_line(indent, f"if {temp} is Camera2D:")
     ctx.add_line(indent + 1, f"{temp}.zoom = Vector2({value}, {value})")
     ctx.add_line(indent, f"elif {temp} is Camera3D:")
     ctx.add_line(indent + 1, f"{temp}.fov = {value}")
+
+
+def _camera_node_expr(ctx, node, prop="gk_target", hint="相机"):
+    """取"这台相机"的表达式(留空 = 运行时找当前相机)。
+
+    ── 为什么区分"指定相机"和"当前相机"(照虚幻的习惯)──────────────
+    虚幻里 Activate 是作用在**具体某个组件**上的,而"当前在用哪台"
+    则是 ViewTarget。我们两种都给:填了就用填的(@onready 引用),
+    留空就用 `get_viewport().get_camera_3d()/2d()` —— 单相机项目
+    不用填任何东西就能用。
+    """
+    raw = str(getattr(node, prop, "") or "").strip()
+    if raw and raw != TARGET_SELF:
+        return ctx.target_expr(node, prop, hint)
+    auto = ctx.declare_var("_gk_cam_auto", "Node")
+    return (f"({auto} if {auto} != null else "
+            f"(get_viewport().get_camera_3d() if "
+            f"get_viewport().get_camera_3d() != null else "
+            f"get_viewport().get_camera_2d()))")
+
+
+@stmt_node("GKNodeCameraActive")
+def _stmt_camera_active(ctx, node, indent):
+    """启用 / 禁用相机(照虚幻的 Activate / Deactivate)。"""
+    camera = _camera_node_expr(ctx, node)
+    temp = ctx.new_temp("cam")
+    ctx.add_line(indent, f"var {temp} = {camera}")
+    ctx.add_line(indent, f"if {temp} == null:")
+    ctx.add_line(indent + 1, 'push_warning("[GK] 相机_启用:没找到相机")')
+    if getattr(node, "gk_active", True):
+        ctx.add_line(indent, f"else:")
+        ctx.add_line(indent + 1, f"{temp}.make_current()")
+    else:
+        # 禁用 = 正开着才摘下来(不是它开着的话什么都不做,免得把别人的画面弄黑)
+        ctx.add_line(indent, f"elif {temp} is Camera3D and "
+                             f"({temp} as Camera3D).is_current():")
+        ctx.add_line(indent + 1, f"({temp} as Camera3D).clear_current()")
+        ctx.add_line(indent, f"elif {temp} is Camera2D and "
+                             f"({temp} as Camera2D).is_current():")
+        ctx.add_line(indent + 1, f"({temp} as Camera2D).clear_current()")
+
+
+@stmt_node("GKNodeCameraSetup")
+def _stmt_camera_setup(ctx, node, indent):
+    """一次设好:视野 + 视距(+ 平滑)。
+
+    ── 0 = **不动它**(用户 2026-10-03 真跑踩出来的坑)────────────────
+    文档里写的就是"0 = 不动它",但代码是**无条件**写进去的 ——
+    用户在节点上没填视野(默认 0),于是生成 `camera.fov = 0`:
+    Godot 里 fov=0 等于镜头废掉,**整个画面就废了**,
+    表现是"视角完全不对/看不到东西"。
+    现在:没填(0)且没连线的项直接不生成,并且在导出报告里说清楚
+    这次到底改了什么。
+
+    平滑走 `create_tween()` —— 和『定时_缓动属性』同一个机制。
+    """
+    camera = _camera_node_expr(ctx, node)
+    fov_socket = ctx._socket(node, "视野")
+    dist_socket = ctx._socket(node, "视距")
+    fov_linked = bool(fov_socket is not None
+                      and getattr(fov_socket, "is_linked", False))
+    dist_linked = bool(dist_socket is not None
+                       and getattr(dist_socket, "is_linked", False))
+    fov_value = float(getattr(node, "gk_fov", 0.0) or 0.0)
+    dist_value = float(getattr(node, "gk_distance", 0.0) or 0.0)
+    want_fov = fov_linked or abs(fov_value) > 0.0001
+    want_dist = dist_linked or abs(dist_value) > 0.0001
+    smooth = float(getattr(node, "gk_smooth", 0.0) or 0.0)
+    if not want_fov and not want_dist:
+        ctx.warn("『相机_设置』什么都没设(视野 0、视距 0)—— 它不会改任何"
+                 "东西。想改视野就填一个角度(比如 55),想推远就填视距;"
+                 "两个都不填的话,这个节点可以删掉")
+        return
+    temp = ctx.new_temp("cam")
+    ctx.add_line(indent, f"var {temp} = {camera}")
+    ctx.add_line(indent, f"if {temp} == null:")
+    ctx.add_line(indent + 1, 'push_warning("[GK] 相机_设置:没找到相机")')
+    ctx.add_line(indent, f"else:")
+    body = indent + 1
+    setter = None
+    if smooth > 0.0:
+        tween = ctx.new_temp("tween")
+        ctx.add_line(body, f"var {tween} = create_tween()")
+        ctx.add_line(body, f"{tween}.set_trans(Tween.TRANS_SINE)")
+        ctx.add_line(body, f"{tween}.set_ease(Tween.EASE_IN_OUT)")
+        setter = f"{tween}.tween_property"
+    if want_fov:
+        fov = ctx.input_number(node, "视野", "0.0")
+        ctx.add_line(body, f"if {temp} is Camera2D:")
+        if setter:
+            ctx.add_line(body + 1,
+                         f"{setter}({temp}, \"zoom\", Vector2({fov}, {fov}), "
+                         f"{gd_number(smooth)})")
+        else:
+            ctx.add_line(body + 1, f"{temp}.zoom = Vector2({fov}, {fov})")
+        ctx.add_line(body, f"elif {temp} is Camera3D:")
+        if setter:
+            ctx.add_line(body + 1,
+                         f"{setter}({temp}, \"fov\", {fov}, "
+                         f"{gd_number(smooth)})")
+        else:
+            ctx.add_line(body + 1, f"{temp}.fov = {fov}")
+    if want_dist:
+        # 视距:沿**相机自己的朝向**推远(负 = 拉近)。
+        # 用 global_transform 而不是 position,父节点有旋转也照样对。
+        distance = ctx.input_number(node, "视距", "0.0")
+        ctx.add_line(body, f"if {temp} is Node3D:")
+        ctx.add_line(body + 1, f"var _gk_back := "
+                               f"({temp} as Node3D).global_transform.basis.z")
+        if setter:
+            ctx.add_line(body + 1,
+                         f"{setter}({temp}, \"global_position\", "
+                         f"({temp} as Node3D).global_position + _gk_back * "
+                         f"{distance}, {gd_number(smooth)})")
+        else:
+            ctx.add_line(body + 1, f"({temp} as Node3D).global_position += "
+                                   f"_gk_back * {distance}")
+
+
+@stmt_node("GKNodeCameraPosition")
+def _stmt_camera_position(ctx, node, indent):
+    """设位置:向量优先,没接就用 X/Y/Z 三个浮点。"""
+    camera = _camera_node_expr(ctx, node)
+    socket = ctx._socket(node, "位置")
+    if socket is not None and getattr(socket, "is_linked", False):
+        target = ctx.expr_of(socket)
+    else:
+        x = ctx.input_number(node, "X", "0.0")
+        y = ctx.input_number(node, "Y", "0.0")
+        z = ctx.input_number(node, "Z", "0.0")
+        target = f"Vector3({x}, {y}, {z})"
+    mode = str(getattr(node, "gk_mode", "ADD"))
+    smooth = float(getattr(node, "gk_smooth", 0.0) or 0.0)
+    temp = ctx.new_temp("cam")
+    ctx.add_line(indent, f"var {temp} = {camera}")
+    ctx.add_line(indent, f"if {temp} is Node3D:")
+    if mode == "SET":
+        expr = target
+    else:
+        expr = f"({temp} as Node3D).global_position + ({target})"
+    if smooth > 0.0:
+        tween = ctx.new_temp("tween")
+        ctx.add_line(indent + 1, f"var {tween} = create_tween()")
+        ctx.add_line(indent + 1, f"{tween}.set_trans(Tween.TRANS_SINE)")
+        ctx.add_line(indent + 1, f"{tween}.tween_property({temp}, "
+                                 f"\"global_position\", {expr}, "
+                                 f"{gd_number(smooth)})")
+    else:
+        ctx.add_line(indent + 1, f"({temp} as Node3D).global_position = {expr}")
+
+
+@stmt_node("GKNodeCameraRotation")
+def _stmt_camera_rotation(ctx, node, indent):
+    """设朝向:向量优先(单位度),没接就用偏航/俯仰/翻滚。"""
+    camera = _camera_node_expr(ctx, node)
+    yaw = ctx.input_number(node, "偏航", "0.0")
+    pitch = ctx.input_number(node, "俯仰", "0.0")
+    roll = ctx.input_number(node, "翻滚", "0.0")
+    # ── 反转开关(用户要求:默认跟随鼠标,但要能自定义方向)──────────
+    # 在**生成时**给表达式套个负号:填了常量就直接取负,是表达式就
+    # `-(expr)` —— 生成的代码仍然是一句干净的话。
+    def flip(expr, invert):
+        if not invert or expr in ("0.0", "0"):
+            return expr
+        if expr.startswith("-"):
+            return expr[1:]
+        return f"-({expr})"
+
+    yaw = flip(yaw, bool(getattr(node, "gk_invert_x", False)))
+    pitch = flip(pitch, bool(getattr(node, "gk_invert_y", False)))
+    target = f"Vector3({pitch}, {yaw}, {roll})"
+    mode = str(getattr(node, "gk_mode", "ADD"))
+    smooth = float(getattr(node, "gk_smooth", 0.0) or 0.0)
+    clamp = bool(getattr(node, "gk_clamp_pitch", True))
+    temp = ctx.new_temp("cam")
+    base = f"({temp} as Node3D).rotation_degrees"
+    ctx.add_line(indent, f"var {temp} = {camera}")
+    # ── 手动转视角要**打断**正在进行的相机过渡(用户:"视角会卡住")──────
+    # 相机切换的过渡是每帧把位姿插值覆盖回去的;用户这时候转视角,
+    # 刚转过去下一帧就被覆盖 -> 表现就是"转了没效果 / 视角卡住"。
+    # 手动操作 = 打断过渡,并且把"家"更新成用户现在摆的位置。
+    left = ctx.declare_var("_gk_cam_blend_left", "float")
+    homes = ctx.declare_var("_gk_cam_homes", "Dictionary")
+    ctx.add_line(indent, f"if {temp} != null and {left} > 0.0:")
+    ctx.add_line(indent + 1, f"{left} = 0.0")
+    ctx.add_line(indent + 1, f"if {temp} is Node3D:")
+    ctx.add_line(indent + 2, f"{homes}[{temp}] = "
+                             f"({temp} as Node3D).global_transform")
+    ctx.add_line(indent, f"if {temp} is Node3D:")
+    body = indent + 1
+    if mode == "SET":
+        ctx.add_line(body, f"var _gk_rot: Vector3 = {target}")
+    else:
+        ctx.add_line(body, f"var _gk_rot: Vector3 = {base} + ({target})")
+    if clamp:
+        # 俯仰限制在 ±89°:第一人称转视角不加这个会翻过头(画面上下颠倒)
+        ctx.add_line(body, "if _gk_rot.x > 89.0:")
+        ctx.add_line(body + 1, "_gk_rot.x = 89.0")
+        ctx.add_line(body, "elif _gk_rot.x < -89.0:")
+        ctx.add_line(body + 1, "_gk_rot.x = -89.0")
+    if smooth > 0.0:
+        tween = ctx.new_temp("tween")
+        ctx.add_line(body, f"var {tween} = create_tween()")
+        ctx.add_line(body, f"{tween}.set_trans(Tween.TRANS_SINE)")
+        ctx.add_line(body, f"{tween}.tween_property({temp}, "
+                           f"\"rotation_degrees\", _gk_rot, "
+                           f"{gd_number(smooth)})")
+    else:
+        ctx.add_line(body, f"({temp} as Node3D).rotation_degrees = _gk_rot")
+
+
+@multi_output("GKNodeCameraSpringArm")
+def _expr_spring_arm_outputs(ctx, node):
+    """弹簧臂右侧的三个输出 —— 让别处能读到杆子的状态。
+
+    用户 2026-10-03:"向量右侧输出引脚:便于在运行过程中设置向量"。
+    三个都是**成员变量**,由每帧那段逻辑更新 —— 所以在任何地方读都是
+    最新值(准星、判断"镜头有没有被墙顶进来"、把相机位置喂给别的节点)。
+
+    注意:这个节点同时是**语句节点**(有执行流)。两边都注册:
+    走执行流那支用 STMT_HANDLERS,取数据那支用 MULTI_OUTPUT_FUNCS。
+    """
+    pivot = ctx.declare_var("_gk_spring_pivot", "Vector3")
+    direction = ctx.declare_var("_gk_spring_dir", "Vector3")
+    cam = ctx.declare_var("_gk_spring_cam", "Node")
+    return {
+        "枢轴": pivot,
+        "方向": direction,
+        "相机位置": (f"(({cam} as Node3D).global_position if {cam} is Node3D "
+                     f"else Vector3.ZERO)"),
+    }
+
+
+@stmt_node("GKNodeCameraSpringArm")
+def _stmt_camera_spring_arm(ctx, node, indent):
+    """**弹簧臂**(虚幻的 SpringArmComponent)。
+
+    ── 每物理帧做五件事 ───────────────────────────────────────────
+    1. 算出"枢轴"(挂在跟随对象身上的支点)
+    2. 从枢轴沿杆子方向量出"想到的位置"
+    3. 打一条射线,撞到东西就把杆子缩短(这就是不穿墙的全部秘密)
+    4. 平滑(位置 / 朝向各自可调)
+    5. 把相机摆过去,并让它看向枢轴
+
+    ── 为什么挂在 _physics_process(而不是 _process)────────────────
+    和角色移动同一个时钟。一个在物理帧跑、一个在渲染帧跑,两个节拍一差
+    画面就抖(相机跟随当年就是踩了这个,见 physics_hooks 的说明)。
+    """
+    follow = ctx.target_expr(node, "gk_target", "跟随")
+    camera = _camera_node_expr(ctx, node, "gk_camera")
+    # 相机过渡用的变量(过渡期间弹簧臂不抢相机 —— 用户第 25 轮:
+    # "按视角切换会闪一下":过渡每帧插值写位姿,弹簧臂也每帧写,
+    # 相机就在两个位置之间来回跳。谁在过渡谁说了算。)
+    # 必须在函数**最外层**声明:写在某个 if 分支里的话,别处引用会
+    # UnboundLocalError(踩过)。
+    blend_left = ctx.declare_var("_gk_cam_blend_left", "float")
+    # ── 杆子挂在哪:接了引脚就用引脚,否则用『弹簧臂』属性,再否则跟随对象 ──
+    # 用户 2026-10-03:"应该还要加设置哪个为弹簧臂引脚" —— 想让杆子挂在
+    # 肩膀 / 摄像机架子 / 空节点上时,填这个(或接线)就行。
+    arm_socket = ctx._socket(node, "弹簧臂")
+    if arm_socket is not None and getattr(arm_socket, "is_linked", False):
+        arm_node = ctx.expr_of(arm_socket)
+    else:
+        raw_arm = str(getattr(node, "gk_arm_node", "") or "").strip()
+        arm_node = (ctx.target_expr(node, "gk_arm_node", "弹簧臂")
+                    if raw_arm and raw_arm != TARGET_SELF else follow)
+    # ── 运行中可改的三个量:引脚 > 属性 ────────────────────────────
+    arm = ctx.input_number(node, "臂长", gd_number(
+        float(getattr(node, "gk_arm", 4.0) or 0.0)))
+    pitch = ctx.input_number(node, "俯仰", gd_number(
+        float(getattr(node, "gk_pitch", -15.0) or 0.0)))
+    off_socket = ctx._socket(node, "偏移")
+    height = float(getattr(node, "gk_height", 1.5) or 0.0)
+    side = float(getattr(node, "gk_side", 0.0) or 0.0)
+    if off_socket is not None and getattr(off_socket, "is_linked", False):
+        offset_expr = ctx.expr_of(off_socket)
+    else:
+        offset_expr = f"Vector3(0.0, {gd_number(height)}, {gd_number(side)})"
+    yaw_offset = float(getattr(node, "gk_yaw_offset", 0.0) or 0.0)
+    collision = bool(getattr(node, "gk_collision", True))
+    radius = float(getattr(node, "gk_radius", 0.3) or 0.0)
+    lag = float(getattr(node, "gk_lag", 8.0) or 0.0)
+    lag_rot = float(getattr(node, "gk_lag_rot", 0.0) or 0.0)
+    enabled = bool(getattr(node, "gk_enabled", True))
+    if enabled and str(arm) in ("0.0", "0"):
+        # 臂长填 0 = 杆子收到底,相机贴在枢轴上 —— 那是"第一人称"的做法,
+        # 但多数人填 0 是想"先不生效"。这里给一句提醒,免得画面变成贴脸。
+        ctx.warn("『相机_弹簧臂』的臂长是 0 —— 相机会贴在枢轴上(第一人称"
+                 "效果)。想暂时关掉这条杆子,请把『启用』的勾去掉")
+
+    cam_var = ctx.declare_var("_gk_spring_cam", "Node")
+    # 绑定写在执行点(通常是 _ready);每帧逻辑进 physics_hooks
+    ctx.add_line(indent, f"{cam_var} = {camera}")
+    ctx.add_line(indent, f"if {cam_var} == null:")
+    ctx.add_line(indent + 1, 'push_warning("[GK] 相机_弹簧臂:没找到相机")')
+    if not enabled:
+        # 关掉 = 连每帧用的成员变量都不声明,更不注册逻辑
+        # (不是"注册了再判断"—— 那样白跑一辈子,还占着名字)
+        return
+    pos_var = ctx.declare_var("_gk_spring_pos", "Vector3")
+    basis_var = ctx.declare_var("_gk_spring_basis", "Basis")
+    ready_var = ctx.declare_var("_gk_spring_ready", "bool", initial="false")
+    # 右侧输出的三个量(枢轴 / 方向 / 相机位置)——
+    # 存成员变量,所以**别的地方**随时读都是最新值(不是只在执行点算一次)
+    pivot_var = ctx.declare_var("_gk_spring_pivot", "Vector3")
+    dir_var = ctx.declare_var("_gk_spring_dir", "Vector3")
+
+    follow3d = f"({follow} as Node3D)"
+    arm3d = f"({arm_node} as Node3D)"
+    lines = [
+        f"if {cam_var} != null and {arm_node} is Node3D:",
+        # 枢轴 = 杆子挂点的位置 + 偏移向量(偏移可以接线,运行中改)
+        f"    var _gk_pivot: Vector3 = {arm3d}.global_position "
+        f"+ ({offset_expr})",
+        f"    var _gk_yaw: float = {arm3d}.rotation.y "
+        f"+ deg_to_rad({gd_number(yaw_offset)})",
+        # 杆子的方向 = 先按俯仰压下去、再按偏航绕一圈。
+        # 从 Basis 取 .z 是因为 Godot 的相机朝 -Z 看 —— 杆子往 +Z 退,
+        # 相机正好回头看向枢轴,不用再手动翻 180°。
+        "    var _gk_arm_basis := Basis.from_euler(Vector3("
+        f"deg_to_rad({pitch}), _gk_yaw, 0.0))",
+        "    var _gk_dir: Vector3 = _gk_arm_basis.z",
+        f"    var _gk_want: Vector3 = _gk_pivot + _gk_dir * ({arm})",
+        # 右侧输出的三个量:每帧更新,别处随时读都是新的
+        f"    {pivot_var} = _gk_pivot",
+        f"    {dir_var} = _gk_dir",
+    ]
+    if collision:
+        # 射线从枢轴打到"想到的位置";撞到就把相机拉到撞点**前面**一点。
+        # 排除跟随对象和相机自己 —— 不排除的话杆子会被"自己"顶住,
+        # 相机会一下贴到脸上(实测最容易踩的就是这个)。
+        lines += [
+            f"    var _gk_space := {follow3d}.get_world_3d().direct_space_state",
+            "    var _gk_exclude: Array[RID] = []",
+            f"    if {follow} is CollisionObject3D:",
+            f"        _gk_exclude.append({follow3d}.get_rid())",
+            f"    if {cam_var} is CollisionObject3D:",
+            f"        _gk_exclude.append(({cam_var} as CollisionObject3D)"
+            ".get_rid())",
+            "    var _gk_query := PhysicsRayQueryParameters3D.create("
+            "_gk_pivot, _gk_want, 0xFFFFFFFF, _gk_exclude)",
+            "    var _gk_hit := _gk_space.intersect_ray(_gk_query)",
+            "    if not _gk_hit.is_empty():",
+            "        var _gk_dist: float = _gk_pivot.distance_to("
+            "_gk_hit[\"position\"])",
+            f"        _gk_dist = maxf(_gk_dist - {gd_number(radius)}, 0.2)",
+            "        _gk_want = _gk_pivot + _gk_dir * _gk_dist",
+        ]
+    if lag > 0.0:
+        # 指数平滑:系数按 delta 换算,**和帧率无关**。
+        # (固定系数的 lerp 在 30 帧和 144 帧下手感完全不一样。)
+        lines += [
+            f"    if not {ready_var}:",
+            f"        {ready_var} = true",
+            f"        {pos_var} = _gk_want",
+            f"    {pos_var} = {pos_var}.lerp(_gk_want, clampf("
+            f"{gd_number(lag)} * get_physics_process_delta_time(), "
+            f"0.0, 1.0))",
+        ]
+        lines.append(f"    if {blend_left} <= 0.0:")
+        lines.append(f"        ({cam_var} as Node3D).global_position = {pos_var}")
+    else:
+        # ── 过渡进行中就**别抢**相机(用户第 25 轮:"切视角会闪一下")────
+        # 相机过渡每帧插值写位姿,弹簧臂也每帧写 —— 两边同时写,
+        # 相机就在两个位置之间来回跳。谁在过渡谁说了算。
+        lines.append(f"    if {blend_left} <= 0.0:")
+        lines.append(f"        ({cam_var} as Node3D).global_position = _gk_want")
+    # ── 朝向 ────────────────────────────────────────────────────────
+    # 默认 `look_at(枢轴)`:比手算欧拉角稳,也没有万向节问题。
+    # 有旋转平滑时改成 slerp 一个 Basis(相机朝 -Z 看,所以目标是 -_gk_dir)。
+    if lag_rot > 0.0:
+        lines += [
+            "    var _gk_want_basis := Basis.looking_at(-_gk_dir, Vector3.UP)",
+            f"    if not {ready_var}:",
+            f"        {ready_var} = true",
+            f"        {basis_var} = _gk_want_basis",
+            f"    {basis_var} = {basis_var}.slerp(_gk_want_basis, clampf("
+            f"{gd_number(lag_rot)} * get_physics_process_delta_time(), "
+            f"0.0, 1.0))",
+            f"    var _gk_xform := ({cam_var} as Node3D).global_transform",
+            f"    _gk_xform.basis = {basis_var}",
+            f"    ({cam_var} as Node3D).global_transform = _gk_xform",
+        ]
+    else:
+        lines.append(f"    ({cam_var} as Node3D).look_at(_gk_pivot, Vector3.UP)")
+    ctx.physics_hooks.setdefault("camera_spring_arm", []).extend(lines)
+
+
+@multi_output("GKNodeCameraStatus")
+def _expr_camera_status(ctx, node):
+    """『相机_取状态』:当前相机是谁、在哪、朝哪、视野多少、开没开。
+
+    ── 为什么走**辅助函数**而不是"就地落局部变量"(踩过两次)────────────
+    第一版把表达式内联在每个输出里 -> 「滚轮改视野」那条链生成出一行
+    **500 多字符**的怪物(同样的表达式重复 8 遍)。
+
+    第二版改成"求值时先 add_line 落几个局部变量" —— 更糟:表达式是**在
+    语句生成途中**求值的,那时候"当前缩进"是上一条语句的缩进,
+    于是那几个 var 和包着它的 `if` **缩进对不上**,滚轮那段被嵌进了
+    跳跃分支里(生成的代码看着像对,跑起来逻辑全乱)。
+
+    现在每个值一个小函数:输出引脚就是一句 `_gk_cam_fov()` ——
+    短、缩进无关、求值几次都不会有副作用。
+    """
+    cam = ctx.declare_var("_gk_cam_query", "Node")
+    ctx.need_camera_query_helper = True
+    helpers = [
+        ("_gk_cam_name", "String", [
+            "    var cam := _gk_current_camera()",
+            "    return String(cam.name) if cam != null else \"\"",
+        ]),
+        ("_gk_cam_fov", "float", [
+            "    var cam := _gk_current_camera()",
+            "    if cam is Camera3D:",
+            "        return (cam as Camera3D).fov",
+            "    if cam is Camera2D:",
+            "        return (cam as Camera2D).zoom.x",
+            "    return 0.0",
+        ]),
+        ("_gk_cam_open", "bool", [
+            "    var cam := _gk_current_camera()",
+            "    if cam is Camera3D:",
+            "        return (cam as Camera3D).is_current()",
+            "    if cam is Camera2D:",
+            "        return (cam as Camera2D).is_current()",
+            "    return false",
+        ]),
+    ]
+    if ctx.dim == 2:
+        helpers.append(("_gk_cam_pos", "Vector2", [
+            "    var cam := _gk_current_camera()",
+            "    return (cam as Node2D).global_position if cam is Node2D "
+            "else Vector2.ZERO",
+        ]))
+    else:
+        helpers.append(("_gk_cam_pos", "Vector3", [
+            "    var cam := _gk_current_camera()",
+            "    return (cam as Node3D).global_position if cam is Node3D "
+            "else Vector3.ZERO",
+        ]))
+    helpers.append(("_gk_cam_rot", "Vector3", [
+        "    var cam := _gk_current_camera()",
+        "    return (cam as Node3D).rotation_degrees if cam is Node3D "
+        "else Vector3.ZERO",
+    ]))
+    made = getattr(ctx, "_cam_status_funcs", None)
+    if made is None:
+        made = set()
+        ctx._cam_status_funcs = made
+    for base, ret, body in helpers:
+        if base in made:
+            continue
+        made.add(base)
+        ctx.extra_sections.append({
+            "signature": f"func {base}() -> {ret}:",
+            "lines": body,
+            "empty_body": "    pass",
+            "separator": True,
+        })
+    return {
+        "相机名": "_gk_cam_name()",
+        "位置": "_gk_cam_pos()",
+        "朝向": "_gk_cam_rot()",
+        "视野": "_gk_cam_fov()",
+        "开着吗": "_gk_cam_open()",
+    }
+
+
+@multi_output("GKNodeCameraSpringArm")
+def _expr_spring_arm_outputs(ctx, node):
+    """弹簧臂右侧的三个输出 —— 让别处能读到杆子的状态。
+
+    用户 2026-10-03:"向量右侧输出引脚:便于在运行过程中设置向量"。
+    三个都是**成员变量**,由每帧那段逻辑更新 —— 所以在任何地方读都是
+    最新值(准星、判断"镜头有没有被墙顶进来"、把相机位置喂给别的节点)。
+
+    注意:这个节点同时是**语句节点**(有执行流)。两边都注册:
+    走执行流那支用 STMT_HANDLERS,取数据那支用 MULTI_OUTPUT_FUNCS。
+    """
+    pivot = ctx.declare_var("_gk_spring_pivot", "Vector3")
+    direction = ctx.declare_var("_gk_spring_dir", "Vector3")
+    cam = ctx.declare_var("_gk_spring_cam", "Node")
+    return {
+        "枢轴": pivot,
+        "方向": direction,
+        "相机位置": (f"(({cam} as Node3D).global_position if {cam} is Node3D "
+                     f"else Vector3.ZERO)"),
+    }
 
 
 @stmt_node("GKNodeCameraShake")
@@ -2812,7 +4960,7 @@ def _ui_root(ctx, indent):
 @stmt_node("GKNodeUiText")
 def _stmt_ui_text(ctx, node, indent):
     _layer, root = _ui_root(ctx, indent)
-    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Label", key=id(node))
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Label", key=node_lib.node_key(node))
     text = ctx.input_string(node, "文字", "")
     x = _tunable_number(ctx, node, "X", "20.0", "ui_x")
     y = _tunable_number(ctx, node, "Y", "20.0", "ui_y")
@@ -2836,7 +4984,7 @@ def _stmt_ui_text(ctx, node, indent):
 @stmt_node("GKNodeUiBar")
 def _stmt_ui_bar(ctx, node, indent):
     _layer, root = _ui_root(ctx, indent)
-    widget = ctx.declare_var(f"_gk_ui_{node.name}", "ProgressBar", key=id(node))
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "ProgressBar", key=node_lib.node_key(node))
     value = ctx.input_number(node, "数值", "100.0")
     x = _tunable_number(ctx, node, "X", "20.0", "ui_x")
     y = _tunable_number(ctx, node, "Y", "60.0", "ui_y")
@@ -2876,10 +5024,10 @@ def _stmt_ui_button(ctx, node, indent):
     真正的续接由回调函数 _gk_on_<节点名> 负责。
     """
     _layer, root = _ui_root(ctx, indent)
-    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Button", key=id(node))
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Button", key=node_lib.node_key(node))
     # 回调函数名同样要防同名:两个按钮可以都叫『开始按钮』，
     # 若共用 gk_on_button 就会有两个同名函数，Godot 直接报重复定义。
-    handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'button')}", key=id(node))
+    handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'button')}", key=node_lib.node_key(node))
     text = ctx.input_string(node, "文字", "")
     x = _tunable_number(ctx, node, "X", "100.0", "ui_x")
     y = _tunable_number(ctx, node, "Y", "200.0", "ui_y")
@@ -2997,9 +5145,9 @@ def _stmt_raycast(ctx, node, indent):
 
     # 打到的东西 / 命中点存进成员变量，下游可直接引用
     target_var = ctx.declare_var(f"gk_ray_{snake_case(node.name, 'hit')}", "Variant",
-                                 key=id(node))
+                                 key=node_lib.node_key(node))
     point_var = ctx.declare_var(f"gk_ray_point_{snake_case(node.name, 'hit')}", "Variant",
-                                key=id(node))
+                                key=node_lib.node_key(node))
     ctx.read_vars.add(target_var)
     ctx.read_vars.add(point_var)
 
@@ -3079,8 +5227,8 @@ def _stmt_every_seconds(ctx, node, indent):
     """
     interval = _tunable_number(ctx, node, "间隔", "1.0", "interval")
     timer_var = ctx.declare_var(f"gk_timer_{snake_case(node.name, 'every')}", "Timer",
-                                key=id(node))
-    handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'every')}", key=id(node))
+                                key=node_lib.node_key(node))
+    handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'every')}", key=node_lib.node_key(node))
     autostart = "true" if getattr(node, "gk_start_now", False) else "false"
 
     ctx.add_line(indent, f"if {timer_var} == null:")
@@ -3299,11 +5447,11 @@ def _expr_joy_button_down(ctx, node):
     所以自己记"上一帧是否按住"。"""
     device, button = _joy_button_expr(node)
     now_var = ctx.declare_var(f"gk_joy_now_{snake_case(node.name, 'btn')}", "bool",
-                              key=id(node))
+                              key=node_lib.node_key(node))
     prev_var = ctx.declare_var(f"gk_joy_prev_{snake_case(node.name, 'btn')}", "bool",
-                               key=id(node))
+                               key=node_lib.node_key(node))
     result_var = ctx.declare_var(f"gk_joy_down_{snake_case(node.name, 'btn')}", "bool",
-                                 key=id(node))
+                                 key=node_lib.node_key(node))
     ctx.read_vars.update({now_var, prev_var, result_var})
     indent = ctx._expr_indent
     ctx.add_line(indent, f"{now_var} = Input.is_joy_button_pressed({device}, {button})")
@@ -3352,8 +5500,20 @@ def _expr_touch_drag(ctx, node):
     limit = gd_number(getattr(node, "gk_clamp", 1.0))
     reset = bool(getattr(node, "gk_reset", True))
     handler = ctx.declare_func_name(f"gk_on_touch_{snake_case(node.name, 'drag')}",
-                                    key=id(node))
-    ctx.register_input_handler(handler, reset=reset)
+                                    key=node_lib.node_key(node))
+    # 函数体**跟着登记一起交**(不再是发射时写死的那几行)——
+    # 一个 `_input` 表项一份体,见 register_input_handler 的说明
+    body = [
+        "    if event is InputEventScreenDrag:",
+        "        _gk_touch_drag += (event as InputEventScreenDrag).relative",
+    ]
+    if reset:
+        body += [
+            "    elif event is InputEventScreenTouch:",
+            "        if not (event as InputEventScreenTouch).pressed:",
+            "            _gk_touch_drag = Vector2.ZERO",
+        ]
+    ctx.register_input_handler(handler, reset=reset, body=body)
 
     # 每帧用完就清零。放在 process_hooks 里，会追加到 _process 末尾，
     # 保证"本帧已经读过它"之后才清。
@@ -3412,6 +5572,116 @@ def _stmt_screen_filter(ctx, node, indent):
         ctx.add_line(indent, f"{mat}.set_shader_parameter(\"amount\", {amount})")
 
 
+
+
+_PORT_GD_TYPES = {"bool": "bool", "int": "int", "float": "float",
+                  "string": "String", "vector": "Vector3"}
+
+
+def _emit_logic_ports(ctx):
+    """把侧栏声明的端口变成脚本变量(带类型和初值)。"""
+    tree = getattr(ctx, "tree", None)
+    ports = getattr(tree, "gk_ports", None) if tree is not None else None
+    if not ports:
+        return
+    try:
+        for port in ports:
+            raw = str(port.port_name).strip()
+            if not raw:
+                continue
+            gd_type = _PORT_GD_TYPES.get(str(port.port_type), "Variant")
+            initial = str(port.default_value or "").strip()
+            if not initial:
+                initial = {"bool": "false", "int": "0", "float": "0.0",
+                           "string": '\"\"', "vector": "Vector3.ZERO"}.get(
+                               str(port.port_type), "null")
+            name = ctx.declare_var(f"输出_{raw}", gd_type, initial=initial)
+            # 让『变量_设置/『变量_读取』用同名时命中**这一个**变量 ——
+            # 否则端口那份永远是初值(它俩会各写一份,实测踩到)
+            try:
+                ctx._var_aliases[raw] = name
+            except Exception:
+                pass
+            ctx.note(f"对外端口『{raw}』({gd_type})-> {name}")
+    except Exception:
+        pass
+
+
+def _declared_ports(ctx, direction):
+    """当前图在侧栏声明过的端口名集合;读不到就返回 None(离线/老文件)。
+
+    返回 None 表示"没法校验",调用方**不要**因此报警 —— 校验是加分项,
+    不能因为拿不到 UI 数据就让导出失败。
+    """
+    tree = getattr(ctx, "tree", None)
+    ports = getattr(tree, "gk_ports", None) if tree is not None else None
+    if ports is None:
+        return None
+    try:
+        return {str(p.port_name).strip() for p in ports
+                if str(getattr(p, "direction", "out")) == direction
+                and str(p.port_name).strip()}
+    except Exception:
+        return None
+
+@stmt_node("GKNodeQuitGame")
+def _stmt_quit_game(ctx, node, indent):
+    """退出游戏(桌面版)。
+
+    延迟 > 0 时用 Timer 等一会儿再退 —— 让"退出动画/音效"播完。
+    没有延迟就直接 `get_tree().quit()`。
+    """
+    delay = float(getattr(node, "gk_delay", 0.0) or 0.0)
+    if delay > 0.0:
+        ctx.add_line(indent, f"await get_tree().create_timer("
+                             f"{gd_number(delay)}).timeout")
+        ctx.note("『流程_退出游戏』用了延迟 —— 生成的是 `await`,"
+                 "别把它接在 _physics_process 的中间(会挂起后面的逻辑)")
+    ctx.add_line(indent, "get_tree().quit()")
+
+
+@stmt_node("GKNodeLogicOutput")
+def _stmt_logic_output(ctx, node, indent):
+    """『逻辑_输出结果』:把一个布尔发布成脚本变量 `输出_<名字>`。
+
+    用户第七轮的计划:"一个游戏逻辑最后应该输出布尔变量,以便与其他的
+    游戏逻辑联动"。所有节点图编译成**同一个脚本**,所以"输出"就是
+    "约定一个变量名":这里写,别处用『变量_读取』读。
+
+    导出报告里会列出来(见下面的 note),方便对照谁输出了什么。
+    """
+    raw = str(getattr(node, "gk_output_name", "") or "").strip()
+    if not raw:
+        ctx.warn("『逻辑_输出结果』没填输出名 —— 它不会生成任何东西")
+        return
+    name = ctx.declare_var(f"输出_{raw}", "bool", initial="false")
+    socket = ctx._socket(node, "值")
+    if socket is not None and getattr(socket, "is_linked", False):
+        value_expr = ctx.expr_of(socket)
+    else:
+        value_expr = "true" if getattr(node, "gk_value", True) else "false"
+    # 值可能是个任意表达式(比如『逻辑_比较』的结果)—— bool 变量收别的类型
+    # 会报类型不符,这里统一裹一层 bool()。字面量 true/false 就不用裹了。
+    if value_expr not in ("true", "false"):
+        value_expr = f"bool({value_expr})"
+    ctx.add_line(indent, f"{name} = {value_expr}")
+    outputs = getattr(ctx, "_logic_outputs", None)
+    if outputs is None:
+        outputs = []
+        ctx._logic_outputs = outputs
+    outputs.append((raw, name))
+    # ── 端口校验(用户第 21 轮:"真接口")────────────────────────────
+    # 图在侧栏声明过端口的话,这里比对一下:节点上填的名字**必须**在
+    # 声明表里。以前是随便填 —— 打错一个字母不会报错,别的图读到空值,
+    # 你只会以为是逻辑没跑到(这类"静默失败"最费时间)。
+    declared = _declared_ports(ctx, "out")
+    if declared is not None and raw not in declared:
+        ctx.warn(f"『逻辑_输出结果』写的端口『{raw}』没有在侧栏"
+                 f"『对外端口』里声明过 —— 别的图读它只会读到空值。"
+                 f"要么去声明一个,要么改成已声明的:"
+                 f"{'、'.join(sorted(declared)) or '(还没有)'}")
+
+
 @stmt_node("GKNodeReloadScene")
 def _stmt_reload_scene(ctx, node, indent):
     # 把 reload 推迟到帧末:这个节点常常是"按钮回调 / 计时器回调"里调的，
@@ -3429,19 +5699,106 @@ def _stmt_queue_free(ctx, node, indent):
         ctx.add_line(indent, f"{ctx.target_expr(node)}.queue_free()")
 
 
+def _link_type(socket):
+    """从上游输出引脚的**种类**推断 GDScript 类型(推不出来就 None)。
+
+    ── 为什么要这个(用户 2026-10-03)────────────────────────────
+    `变量_设置` 的『值』接了线时,原来一律当成 Variant ——
+    于是「变量_设置(is_hurt) <- 常量_布尔」生成出
+    `var is_hurt: Variant`,再和其它地方按 bool 用它的代码撞上就报
+    "同时被当成 bool 和 Variant 使用"。
+
+    线那头是什么引脚其实**是知道的**(常量_布尔 的输出就是 NodeSocketBool),
+    照着它声明类型即可,不用猜。
+    """
+    links = getattr(socket, "links", ()) or ()
+    for link in links:
+        from_socket = getattr(link, "from_socket", None)
+        kind = (getattr(from_socket, "bl_idname", "")
+                or getattr(from_socket, "type", ""))
+        mapping = {
+            "NodeSocketBool": "bool",
+            "NodeSocketFloat": "float",
+            "NodeSocketInt": "int",
+            "NodeSocketString": "String",
+        }
+        if kind in mapping:
+            return mapping[kind]
+    return None
+
+
 @stmt_node("GKNodeSetVar")
 def _stmt_set_var(ctx, node, indent):
-    raw_name = getattr(node, "gk_var_name", "value")
-    socket = ctx._socket(node, "值")
-    if socket is not None and getattr(socket, "is_linked", False):
-        value_expr = ctx.expr_of(socket)
-        gd_type = "Variant"
-    else:
-        value = node.input_value(ctx, "值", 0.0)
-        value_expr = gd_literal(value)
-        gd_type = _gd_type_of(value)
-    var_name = ctx.declare_var(raw_name, gd_type)
-    ctx.add_line(indent, f"{var_name} = {value_expr}")
+    """『变量_设置』:一张卡片可以设好几个变量(仿蓝图 Set 节点)。
+
+    ── 为什么第 1 个用老属性名(踩过的坑)────────────────────────────
+    第 1 个变量仍然读 `gk_var_name` / `gk_value`、引脚仍然叫『值』——
+    老文件里接好的线、填好的名字一个字都不用改。第 2 个开始才是
+    `gk_var_name_2` / 『值 2』。
+    """
+    pairs = []
+    slot_getter = getattr(node, "slots", None)
+    if callable(slot_getter):
+        pairs = list(slot_getter())
+    if not pairs:
+        # 桩环境/老节点:退回"只有第一个"的老路径
+        raw_name = getattr(node, "gk_var_name", "value")
+        pairs = [(1, raw_name, getattr(node, "gk_value", 0.0))]
+
+    for index, raw_name, fallback in pairs:
+        # 引脚名:第 1 个叫『值』(老图接的就是它),第 2 个起叫『值 2』『值 3』。
+        # 这里 index 是**槽位号**(1 起),别再 +1 —— 写成 "值 {index+1}"
+        # 会去找一个不存在的『值 3』,于是第 2 个槽永远读不到连线,
+        # 悄悄退回数字框里的值(示例里就是这么被抓到的)。
+        pin_name = "值" if index == 1 else f"值 {index}"
+        raw_value = None
+        socket = ctx._socket(node, pin_name)
+        if socket is not None and getattr(socket, "is_linked", False):
+            value_expr = ctx.expr_of(socket)
+            # ── 值接了线就**不要**替它声明类型(踩过的坑)────────────────
+            # 这里原来写的是 `gd_type = "Variant"` —— 于是
+            # 「变量_设置(is_hurt) <- 常量_布尔」这种最常见的写法会报
+            #     变量『is_hurt』同时被当成 bool 和 Variant 使用,请改用不同的变量名
+            # 用户会去改一个**根本没问题**的变量名,而真正的类型(布尔)
+            # 本来是清楚的:线的那头就是常量_布尔。
+            # 传 None = "我没意见",由别处(动画树的变量面板/取变量节点)决定类型。
+            # 能从上游引脚的种类看出来就用它 —— 见 _link_type
+            gd_type = _link_type(socket)
+        else:
+            raw_value = node.input_value(ctx, pin_name, fallback)
+            # ── 空值要退回属性里的值(踩过的坑)──────────────────────
+            # 多槽卡片的第 2、3… 个引脚是 `build_sockets` 现造的,
+            # 没设过 default_value -> `input_value` 返回 **None** ->
+            # 生成出 `score = null`,而 `var score: float` 收不了 null,
+            # Godot **解析期**就报
+            #     Parse Error: Cannot assign a value of type "null" as "float"
+            # 整个脚本加载失败。这是 2D 示例探针抓出来的。
+            if raw_value is None:
+                raw_value = fallback
+            value_expr = gd_literal(raw_value)
+            gd_type = _gd_type_of(raw_value)
+        var_name = ctx.declare_var(raw_name, gd_type)
+        # ── 布尔变量被喂了数字:转成真假再赋值(不转的话 Godot 报类型不符)──
+        # 触发方式很常见:变量是 bool,用户在节点上那个**数字框**里填 0/1
+        # (那个框只能填数字)。declare_var 已经给了一条"该接『常量_布尔』"
+        # 的告警,这里负责把生成结果弄成能跑的 `= false/true`。
+        if gd_type in ("float", "int") and ctx.vars.get(var_name) == "bool":
+            try:
+                value_expr = "true" if float(raw_value or 0) != 0 else "false"
+            except (TypeError, ValueError):
+                value_expr = "false"
+        # ── 往整数变量里写浮点表达式要**显式转换**(第 22 轮)──────────
+        # 『数学_运算』出来的都是 float,而端口/变量声明的可能是 int:
+        # 直接写会得到 `var x: int` + `x = (x + 1.0)` —— Godot 报
+        # "Cannot assign a value of type float as int",整个脚本加载失败。
+        # 蓝图里这种转换是隐式的,这里补上,不用用户自己套『转换_类型』。
+        if ctx.vars.get(var_name) == "int" and value_expr is not None:
+            text = str(value_expr).strip()
+            looks_int = (text.lstrip("-").isdigit()
+                         or text.startswith(("int(", "true", "false")))
+            if not looks_int:
+                value_expr = f"int({text})"
+        ctx.add_line(indent, f"{var_name} = {value_expr}")
 
 
 @stmt_node("GKNodeEmitSignal")
@@ -3578,13 +5935,30 @@ def _stmt_for_loop(ctx, node, indent):
 
 @stmt_node("GKNodeWait")
 def _stmt_wait(ctx, node, indent):
+    """等待 N 秒(await),然后继续往下走。
+
+    ── 这里**不能**自己再 `_chain` 一次(踩过的坑)──────────────────
+    `emit_statement()` 在调用完处理器之后**已经**会沿『完成』往下走了。
+    处理器里再 `_chain(ctx, node, indent)` 就会把下游整段代码生成**两遍**:
+
+        等待_秒 -> 变量_设置(is_hurt = false)
+        生成结果:
+            await get_tree().create_timer(0.6).timeout
+            is_hurt = false
+            is_hurt = false      <- 多出来的一份
+
+    接在等待后面的要是『音效_播放』『实例_生成』这种有副作用的节点,
+    就是**真的执行两次**(放两个音效、生成两个实例),不只是难看。
+    `_active` 那个断环保护挡不住它 —— 第二次进来时第一次已经出栈了。
+
+    也不需要担心"等待之后没往下走":走不走由 `emit_statement` 统一负责。
+    """
     seconds = ctx.input_number(node, "秒", "1.0")
     use_process = bool(getattr(node, "gk_use_process", False))
     if use_process:
         ctx.add_line(indent, f"await get_tree().create_timer({seconds}, true, false, true).timeout")
     else:
         ctx.add_line(indent, f"await get_tree().create_timer({seconds}).timeout")
-    _chain(ctx, node, indent)
 
 
 def _gd_type_of(value):
@@ -3609,6 +5983,12 @@ class Generator:
         self.tree = tree
         self.options = dict(options or {})
         self.ctx = GenContext(tree, self.options)
+        # ── 先声明对外端口(第 22 轮)──────────────────────────────────
+        # 必须在遍历节点**之前**:端口要抢占变量名。反过来的话,
+        # 『变量_设置(金币数)』会先声明一个 float 的 `金币数`,
+        # 端口再来只能复用它 —— `输出_` 前缀和声明类型(int)全丢,
+        # 别的图按文档读 `输出_金币数` 会读到一个不存在的名字。
+        _emit_logic_ports(self.ctx)
         self.functions = []   # (函数名, delta 参数名, 起始行, 事件节点)
 
     # ---- 主入口 ----
@@ -3701,11 +6081,7 @@ class Generator:
         # ---- 后台每帧行为(相机震动等) ----
         # 挂在 _process 里;已经有 _process 就追加，没有就补一个。
         if self.ctx.process_hooks:
-            target_section = None
-            for section in sections:
-                if section["signature"] == "func _process(delta: float) -> void:":
-                    target_section = section
-                    break
+            target_section = self._section_for(sections, "_process")
             if target_section is None:
                 target_section = {
                     "signature": "func _process(delta: float) -> void:",
@@ -3724,11 +6100,7 @@ class Generator:
         # 和上面 process_hooks 同样的处理,只是挂到 _physics_process。
         # 相机必须和角色在**同一个时钟**里更新,否则两个节拍一差拍画面就抖。
         if self.ctx.physics_hooks:
-            target_section = None
-            for section in sections:
-                if section["signature"] == "func _physics_process(delta: float) -> void:":
-                    target_section = section
-                    break
+            target_section = self._section_for(sections, "_physics_process")
             if target_section is None:
                 target_section = {
                     "signature": "func _physics_process(delta: float) -> void:",
@@ -3757,39 +6129,301 @@ class Generator:
                     "separator": True,
                 }
                 sections.append(target_section)
-            for func_name, reset in self.ctx._input_handlers:
+            for func_name, reset in [(item[0], item[1])
+                                     for item in self.ctx._input_handlers]:
                 target_section["lines"].append(f"    {func_name}(event)")
+
+        # ---- 节点引用的小工具(带兜底查找)----
+        # 只要脚本里出现过 @onready 引用就要生成它。见上面 out 里那段说明:
+        # 脚本挂在碰撞代理上时,相对路径找不到兄弟节点。
+        if self.ctx.onready:
+            sections.append({
+                "signature": ("func _gk_ref(host: Node, wanted: String) "
+                              "-> Node:"),
+                "lines": [
+                    "    if wanted.is_empty():",
+                    "        return null",
+                    "    var direct := host.get_node_or_null(wanted)",
+                    "    if direct != null:",
+                    "        return direct",
+                    "    if host.get_tree() == null:",
+                    "        return null",
+                    "    # 先找同名子节点(限定在 host 子树里),再全树找 ——",
+                    "    # 导出后脚本常在『碰撞代理』物体上,而用户摆的相机/角色",
+                    "    # 是它的兄弟节点,相对路径找不到",
+                    "    for found in host.find_children(wanted, \"\", true, "
+                    "false):",
+                    "        return found",
+                    "    for found in host.get_tree().root.find_children("
+                    "wanted, \"\", true, false):",
+                    "        return found",
+                    '    push_warning("[GK] 没找到节点:%s —— 检查名字拼写,'
+                    '或者它是不是没被导出" % wanted)',
+                    "    return null",
+                ],
+                "empty_body": "    return null",
+                "separator": True,
+            })
+
+        # ---- 骨骼:找 Skeleton3D 的小工具 ----
+        # glTF 导入的模型骨架常常在**好几层子节点**下面,所以递归找。
+        # 找到后缓存在成员变量里 —— 每帧找一遍没必要(骨骼节点不会中途换)。
+        if getattr(self.ctx, "need_skeleton_helper", False):
+            cache = self.ctx.declare_var("_gk_skeleton_cache", "Skeleton3D")
+            sections.append({
+                "signature": "func _gk_find_skeleton(host: Node) -> Skeleton3D:",
+                "lines": [
+                    f"    if {cache} != null and is_instance_valid({cache}):",
+                    f"        return {cache}",
+                    "    if host == null:",
+                    "        return null",
+                    "    if host is Skeleton3D:",
+                    f"        {cache} = host",
+                    f"        return {cache}",
+                    "    for child in host.find_children(\"*\", \"Skeleton3D\", "
+                    "true, false):",
+                    f"        {cache} = child",
+                    f"        return {cache}",
+                    "    if host.get_tree() != null:",
+                    "        for child in host.get_tree().root.find_children("
+                    "\"*\", \"Skeleton3D\", true, false):",
+                    f"            {cache} = child",
+                    f"            return {cache}",
+                    "    return null",
+                ],
+                "empty_body": "    return null",
+                "separator": True,
+            })
+
+        # ---- 骨骼:读一根骨头的姿势(局部 + 世界) ----
+        # 返回字典而不是四个函数:『骨骼_取数据』一次要四个值,
+        # 一次算完最省(和『动画判断_移动状态』的多输出一个思路)。
+        if getattr(self.ctx, "need_bone_reader", False):
+            sections.append({
+                "signature": ("func _gk_read_bone(skel: Skeleton3D, "
+                              "bone_name: String) -> Dictionary:"),
+                "lines": [
+                    "    if skel == null:",
+                    "        return {}",
+                    "    var index: int = skel.find_bone(bone_name)",
+                    "    if index < 0:",
+                    "        return {}",
+                    "    var rot := skel.get_bone_pose_rotation(index)",
+                    "    var result := {",
+                    "        \"pos\": skel.get_bone_pose_position(index),",
+                    "        \"rot\": rot.get_euler() * 180.0 / PI,",
+                    "        \"scale\": skel.get_bone_pose_scale(index),",
+                    "        \"world\": skel.get_bone_global_pose(index).origin,",
+                    "    }",
+                    "    return result",
+                ],
+                "empty_body": "    return {}",
+                "separator": True,
+            })
+
+        # ---- 『相机_取状态』用的小助手 ----
+        # 当前相机是 3D 还是 2D 要先问一遍 viewport;写成函数免得每个
+        # 取值点都抄一遍三元表达式(那种代码没法读,也没法改)。
+        if getattr(self.ctx, "need_camera_query_helper", False):
+            ctx = self.ctx
+            cam = ctx.declare_var("_gk_cam_query", "Node")
+            lines = ctx.new_section()
+            ctx.add_line(1, f"if {cam} != null and is_instance_valid({cam}):")
+            ctx.add_line(2, f"return {cam}")
+            ctx.add_line(1, f"{cam} = get_viewport().get_camera_3d()")
+            ctx.add_line(1, f"if {cam} == null:")
+            ctx.add_line(2, f"{cam} = get_viewport().get_camera_2d()")
+            # ── 一台都没有 -> 造一台"观察相机"(照虚幻的默认视口)────────
+            # 用户实测:"在没有指定摄像机时,我就可以观察哪里动不了" ——
+            # 场景里没有相机时画面全黑,看起来就像"游戏没跑起来",
+            # 完全不知道角色是不是在动。这里当场造一台挂在角色后上方,
+            # 起码能看见发生了什么,并在控制台说清这是兜底的。
+            # ── 有相机、但没设成"当前" -> 把第一台设为当前(不要造新的)──
+            # 踩过的坑:以前只看 `get_viewport().get_camera_3d()`,它是 null
+            # 就直接造一台**自由飞行**相机 —— 于是"按 WASD 角色走、相机也飞",
+            # 而且手动转视角被飞行逻辑覆盖(用户实测:鼠标转不了、按方向键视角乱动)。
+            ctx.add_line(1, f"if {cam} == null:")
+            ctx.add_line(2, f"for found in self.get_tree().root.find_children(\"*\", \"Camera3D\", true, false):")
+            ctx.add_line(3, "(found as Camera3D).make_current()")
+            ctx.add_line(3, f"{cam} = found")
+            ctx.add_line(3, "break")
+            ctx.add_line(2, f"if {cam} == null:")
+            ctx.add_line(3, f"for found in self.get_tree().root.find_children(\"*\", \"Camera2D\", true, false):")
+            ctx.add_line(4, "(found as Camera2D).make_current()")
+            ctx.add_line(4, f"{cam} = found")
+            ctx.add_line(4, "break")
+            ctx.add_line(1, f"if {cam} == null:")
+            ctx.add_line(2, "_gk_make_fallback_camera(self)")
+            ctx.add_line(2, f"{cam} = get_viewport().get_camera_3d()")
+            ctx.add_line(1, f"return {cam}")
+            # 自由飞行的相机要有"每帧动一下"的地方:挂在物理帧末尾
+            ctx.physics_hooks.setdefault("fly_camera", [])
+            ctx.physics_hooks["fly_camera"].append("_gk_fly_update(delta)")
+            ensure_mouse_delta(ctx)
+            self._append_block(sections, "_gk_current_camera",
+                               "func _gk_current_camera() -> Node:",
+                               list(lines.lines))
+            # 造相机的小工具 —— **自由飞行**观察机(用户第 24 轮)
+            # "设置默认摄像机应该是可以到处移动的,不受碰撞,可飞行"。
+            # 所以不只是"挂在角色后上方不动",而是照虚幻的 Spectator:
+            # WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角,
+            # 而且**直接改坐标、不过物理**,想穿墙就穿墙。
+            # 两个成员变量必须先声明 —— 下面的函数体要用它们,
+            # 不声明就是 `Parse Error: Identifier "_gk_fly_cam" not declared`,
+            # 整个脚本加载失败、所有输入都没反应(实测)
+            ctx.declare_var("_gk_fly_cam", "Node")
+            ctx.declare_var("_gk_fly_speed", "float")
+            self._append_block(sections, "_gk_make_fallback_camera",
+                               "func _gk_make_fallback_camera(host: Node) -> void:",
+                               [
+                                   "    # 场景里一台相机都没有 -> 造一台自由飞行观察机",
+                                   "    var cam := Camera3D.new()",
+                                   '    cam.name = "GK观察相机(自由飞行)"',
+                                   "    host.get_tree().root.add_child(cam)",
+                                   "    if host is Node3D:",
+                                   "        var back := (host as Node3D).global_transform.basis.z",
+                                   "        cam.global_position = (host as Node3D).global_position + back * 6.0 + Vector3(0.0, 3.0, 0.0)",
+                                   "        cam.look_at((host as Node3D).global_position, Vector3.UP)",
+                                   "    cam.make_current()",
+                                   "    _gk_fly_cam = cam",
+                                   "    _gk_fly_speed = 8.0",
+                                   '    push_warning("[GK] 场景里没有相机 —— '
+                                   '造了一台 GK观察相机(自由飞行)。'
+                                   'WASD 平移 / 空格上升 / Shift 下降 / '
+                                   '鼠标转视角(不受碰撞)。'
+                                   '想用固定机位:在节点上指定相机")',
+                               ])
+            # 飞行控制:每帧一次(挂在角色脚本上,不用额外节点)
+            self._append_block(sections, "_gk_fly_update",
+                               "func _gk_fly_update(delta: float) -> void:",
+                               [
+                                   "    if _gk_fly_cam == null or not is_instance_valid(_gk_fly_cam):",
+                                   "        return",
+                                   "    if not (_gk_fly_cam as Camera3D).is_current():",
+                                   "        return",
+                                   "    # 鼠标转视角(用累积位移,和玩家视角同一个量)",
+                                   "    if _gk_mouse_delta != Vector2.ZERO:",
+                                   "        var rot := (_gk_fly_cam as Node3D).rotation_degrees",
+                                   "        rot.y -= _gk_mouse_delta.x * 0.25",
+                                   "        rot.x = clampf(rot.x - _gk_mouse_delta.y * 0.25, -89.0, 89.0)",
+                                   "        (_gk_fly_cam as Node3D).rotation_degrees = rot",
+                                   "    # WASD 平移 + 空格/Shift 升降(**不走碰撞**)",
+                                   "    var fly := Vector3.ZERO",
+                                   "    var basis := (_gk_fly_cam as Node3D).global_transform.basis",
+                                   "    if Input.is_key_pressed(KEY_W):",
+                                   "        fly -= basis.z",
+                                   "    if Input.is_key_pressed(KEY_S):",
+                                   "        fly += basis.z",
+                                   "    if Input.is_key_pressed(KEY_A):",
+                                   "        fly -= basis.x",
+                                   "    if Input.is_key_pressed(KEY_D):",
+                                   "        fly += basis.x",
+                                   "    if Input.is_key_pressed(KEY_SPACE):",
+                                   "        fly += Vector3.UP",
+                                   "    if Input.is_key_pressed(KEY_SHIFT):",
+                                   "        fly -= Vector3.UP",
+                                   "    if fly != Vector3.ZERO:",
+                                   "        (_gk_fly_cam as Node3D).global_position += fly.normalized() * _gk_fly_speed * delta",
+                               ])
+
+        # ---- 『动画_播放完成』需要的信号连接 ----
+        # 状态机自己会在它的执行点连(那里本来就是 _ready);但如果用户只在
+        # **玩法图**里用了『播放完成』(例如"播完了就设个变量"),就必须由
+        # 生成器补一个 _ready —— 否则那个条件永远是假。
+        if (self.ctx.need_anim_finished_signal
+                and not getattr(self.ctx, "_anim_finished_connected", False)):
+            lines = self.ctx.new_section()
+            self.ctx._ensure_finished_connect(1)
+            self._append_block(sections, "_ready",
+                               "func _ready() -> void:", list(lines.lines))
 
         # ---- 自动找动画播放器的小工具 ----
         # glTF 导入时 AnimationPlayer 藏在模型实例内部(见 animation_player
         # 的说明),所以不能写死路径,得运行时找。
         if self.ctx.need_anim_finder:
+            # ── 找到之后要**记住**(实测的性能问题)────────────────────
+            # 这个函数会被『动画_是否在播』『动画_时长』这类节点**每帧**
+            # 调用一次,而它内部是 `find_children("*", "AnimationPlayer")`
+            # —— 用户那个 1058 个节点的 MMD 模型,等于每帧遍历上千个节点。
+            # 所以第一次找到就缓存进成员变量,后面直接用。
+            # `is_instance_valid` 是必须的:场景切换 / 节点被 free 之后
+            # 缓存的引用会变成"野指针",不判会报 freed instance 错误。
+            cache = self.ctx.member_temp("gk_ap")
             sections.append({
                 "signature": "func _gk_find_animation_player(host: Node) -> Node:",
                 "lines": [
+                    f"    if {cache} != null and is_instance_valid({cache}):",
+                    f"        return {cache}",
                     # 先看自己身上有没有(把 AnimationPlayer 直接放在脚本节点下也能用)
                     "    if host is AnimationPlayer:",
-                    "        return host",
+                    f"        {cache} = host",
+                    f"        return {cache}",
                     '    var direct := host.get_node_or_null("AnimationPlayer")',
                     "    if direct is AnimationPlayer:",
-                    "        return direct",
+                    f"        {cache} = direct",
+                    f"        return {cache}",
                     # 再全场景递归找:glTF 的 AnimationPlayer 在 Model/ 下面
                     '    for found in host.find_children("*", "AnimationPlayer", true, false):',
-                    "        return found",
+                    f"        {cache} = found",
+                    f"        return {cache}",
                     "    if host.get_tree() != null:",
                     '        for found in host.get_tree().root.find_children("*", "AnimationPlayer", true, false):',
-                    "            return found",
+                    f"            {cache} = found",
+                    f"            return {cache}",
                     "    return null",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
             })
 
+        # ---- 分层播放(上下半身分离)的第二个播放器 ----
+        # 播放节点填了『层』≥1 时会调用它。AnimationPlayer 自己**没有**
+        # 层/加法混合的概念(那是 AnimationTree 的能力),所以这里退而求其次:
+        # 复制一个同骨架的播放器当"上层",谁**后处理**谁覆盖。
+        # 复制出来的节点是后 add_child 的,处理顺序排在原播放器之后,
+        # 于是"上层动作盖住下层动作"就成立了。
+        #
+        # 前提是动作按部位拆开(上半身动作只含上半身骨骼)—— 这属于用户
+        # 的用法约定,不是我们能在导出时替他判断的。
+        if self.ctx.need_layer_player:
+            sections.append({
+                "signature": "func _gk_layer_player(base: Node, layer: int) -> Node:",
+                "lines": [
+                    "    if base == null or base.get_parent() == null:",
+                    "        return base",
+                    # 缓存:同一个层只复制一次,反复播放不会一直堆节点
+                    '    var cache_name := "_gk_layer_%d" % layer',
+                    "    var existing: Node = base.get_parent().get_node_or_null(cache_name)",
+                    "    if existing is AnimationPlayer:",
+                    "        return existing",
+                    "    var copy: Node = base.duplicate()",
+                    "    copy.name = cache_name",
+                    "    base.get_parent().add_child(copy)",
+                    "    return copy",
+                ],
+                "empty_body": "    return base",
+                "separator": True,
+            })
+
         # ---- 动画状态机(『每帧检查』模式)的 _physics_process ----
         # 状态切换要跟移动同步判定 —— 放在渲染帧里会出现
         # "人已经走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
-        if self.ctx.need_anim_state_process or self.ctx.need_anim_tree_process:
+        if (self.ctx.need_anim_state_process or self.ctx.need_anim_tree_process
+                or self.ctx.need_anim_start_process):
             lines = self.ctx.new_section()
+            # ── 开始口:条件成立才开演(每物理帧判一次)────────────────
+            for starter in self.ctx.anim_starts:
+                self.ctx._active.clear()
+                self.ctx._current_event = starter["node"].name
+                self.ctx._expr_indent = 1
+                self.ctx._current_indent = 1
+                lines.add(1, f"if not {starter['var']} and "
+                             f"not {starter['done']}:")
+                lines.add(2, f"if {starter['expr']}:")
+                lines.add(3, f"{starter['var']} = true")
+                lines.add(3, f"{starter['done']} = false")
+                lines.add(3, f"{starter['enter']}("
+                             f"{gd_string(starter['entry'])})")
             for machine in self.ctx.anim_state_machines:
                 self.ctx._active.clear()
                 self.ctx._current_event = machine["node"].name
@@ -3799,15 +6433,36 @@ class Generator:
             for machine in self.ctx.anim_trees:
                 self.ctx._active.clear()
                 self.ctx._current_event = machine["node"].name
-                _emit_chain_transitions(self.ctx, machine["node"], 1,
-                                        machine["chain"], machine["var"],
-                                        machine["player"],
-                                        machine.get("debug", False))
-            sections.append({
-                "signature": "func _physics_process(_delta: float) -> void:",
-                "lines": list(lines.lines),
-                "empty_body": "    pass",
-            })
+                # ── 表达式求值的缩进要先摆正(踩过的坑)────────────────
+                # 条件里可能有"必须先算几行"的表达式节点(射线检测之类),
+                # 它们的代码行落在**当前缩进**上。不显式设一次的话,
+                # 第一帧的缩进会是上一次生成留下的值(可能是 2),
+                # 那几行就被写进 if 里面 —— 变量还没定义就用了。
+                self.ctx._expr_indent = 1
+                self.ctx._current_indent = 1
+                _emit_state_graph(self.ctx, 1, machine["graph"],
+                                  machine["var"], machine["player"],
+                                  machine["enter"],
+                                  machine.get("finished"),
+                                  machine.get("finish"),
+                                  machine.get("gate"))
+            # ── 并进**已有的** _physics_process,不要另起一个(踩过的坑)──
+            # 用户的图里既有『每当_物理帧』又有动画状态机时,这里原来会
+            # 再 append 一段 `func _physics_process(_delta)`,于是脚本里
+            # 出现两个同名函数 -> Godot:
+            #     Parse Error: Function "_physics_process()" already exists
+            # 整个脚本加载失败(示例工程里实测到)。
+            # ── 参数名统一叫 `delta`(用户真跑看到的警告)──────────────
+            # 这里原来写 `_delta`(为了消"参数没用"的警告),而用户自己的
+            # 『每当_物理帧』生成的是 `delta` + `var _unused_delta := delta`。
+            # 两段**合并成一个函数**(按函数名合并),签名保留的是先建的那份:
+            # 谁的段先建,另一段就被塞进不匹配的参数名里 ——
+            # 轻则 Godot 报一条 "The parameter _delta ..." 的警告(用户截图里
+            # 那条),重则直接 `Identifier "delta" not declared` 编译不过。
+            # 统一叫 delta,警告顶多一条(而且是"参数没用"这种无害的)。
+            self._append_block(sections, "_physics_process",
+                               "func _physics_process(delta: float) -> void:",
+                               list(lines.lines))
 
         # ---- "每帧"动画事件出口需要的那段 _process 代码 ----
         # `is_playing()` + `current_animation`。
@@ -3834,11 +6489,10 @@ class Generator:
                 self.ctx._active.clear()
                 self.ctx._current_event = event["func"]
                 _chain(self.ctx, event["node"], 3, event["output"])
-            sections.append({
-                "signature": "func _process(_delta: float) -> void:",
-                "lines": list(lines.lines),
-                "empty_body": "    pass",
-            })
+            # 同 _physics_process:并进已有的 _process,别另起一个
+            self._append_block(sections, "_process",
+                               "func _process(_delta: float) -> void:",
+                               list(lines.lines))
 
         # ---- 动画事件出口的回调函数 ----
         # 见 _stmt_play_anim。每个接了线的事件出口生成一个函数,
@@ -4060,21 +6714,27 @@ class Generator:
                 "separator": True,
             })
 
-        # ---- 触屏拖动的事件处理 ----
-        for func_name, reset in self.ctx._input_handlers:
-            lines = [
-                "    if event is InputEventScreenDrag:",
-                "        _gk_touch_drag += (event as InputEventScreenDrag).relative",
-            ]
-            if reset:
-                lines += [
-                    "    elif event is InputEventScreenTouch:",
-                    "        if not (event as InputEventScreenTouch).pressed:",
-                    "            _gk_touch_drag = Vector2.ZERO",
+        # ---- 事件处理函数(触屏拖动 / 鼠标滚轮 …)------------------
+        # 函数体是**登记时带过来的** —— 每张表项各写各的,
+        # 不然"同一个名字两份体"会让 Godot 拒绝整个脚本(踩过)。
+        for entry in self.ctx._input_handlers:
+            func_name, reset = entry[0], entry[1]
+            body = list(entry[2]) if len(entry) > 2 else []
+            if not body:
+                body = [
+                    "    if event is InputEventScreenDrag:",
+                    "        _gk_touch_drag += "
+                    "(event as InputEventScreenDrag).relative",
                 ]
+                if reset:
+                    body += [
+                        "    elif event is InputEventScreenTouch:",
+                        "        if not (event as InputEventScreenTouch).pressed:",
+                        "            _gk_touch_drag = Vector2.ZERO",
+                    ]
             sections.append({
                 "signature": f"func {func_name}(event: InputEvent) -> void:",
-                "lines": lines,
+                "lines": body,
                 "empty_body": "    pass",
                 "separator": True,
             })
@@ -4137,6 +6797,40 @@ class Generator:
             _emit_body(self.ctx, target, indent)
 
     # ---- 组装 ----
+    @staticmethod
+    def _section_for(sections, func_name):
+        """找已经存在的那一段函数(按**函数名**找,不看参数名)。
+
+        ── 为什么只比函数名(踩过的坑)────────────────────────────────
+        用户自己的『每当_物理帧』生成的签名是
+            func _physics_process(delta: float) -> void:
+        而状态机生成的是
+            func _physics_process(_delta: float) -> void:
+        参数名不一样(`delta` 用了就写 `delta`,没用就写 `_delta` 消警告),
+        于是"按完整签名找"永远找不到,结果同一个脚本里出现**两个**
+        `_physics_process` —— Godot 直接报
+            Parse Error: Function "_physics_process()" already exists
+        整个游戏跑不起来。实测在示例工程里踩到。
+        """
+        needle = f"func {func_name}("
+        for section in sections:
+            if section["signature"].startswith(needle):
+                return section
+        return None
+
+    def _append_block(self, sections, func_name, signature, lines):
+        """把我们生成的代码块并进已有的同名函数,没有才新建一段。"""
+        target = self._section_for(sections, func_name)
+        if target is None:
+            sections.append({
+                "signature": signature,
+                "lines": list(lines),
+                "empty_body": "    pass",
+                "separator": True,
+            })
+        else:
+            target["lines"].extend(lines)
+
     def _assemble(self, sections):
         """拼出最终脚本。
 
@@ -4190,10 +6884,40 @@ class Generator:
                 out.append(f"const {const} := {gd_string(action)}")
             out.append("")
 
+        # ---- 按分类整理的动作表 ----
+        # 用户在『动作分类』面板里打的标签(<Action>[gk_anim_category])
+        # 在这里变成一张常量表,Godot 侧可以按分类挑动作:
+        #     GK_ANIM_BY_CATEGORY["攻击"].pick_random()
+        # 一个标签都没打时**不生成** —— 老图生成的代码一行都不变。
+        anim_table = _anim_category_table()
+        if anim_table:
+            out.append("# ---- 按分类整理的动作表(『动作分类』面板里打的标签)----")
+            out.append("const GK_ANIM_BY_CATEGORY := {")
+            ordered = [c for c in ANIM_CATEGORY_NAMES if c in anim_table]
+            ordered += sorted(c for c in anim_table if c not in ANIM_CATEGORY_NAMES)
+            for category in ordered:
+                names = ", ".join(gd_string(n) for n in anim_table[category])
+                out.append(f"    {gd_string(category)}: [{names}],")
+            out.append("}")
+            out.append("")
+
         if ctx.onready:
             out.append("# ---- 场景节点引用 ----")
+            # ── 引用用**带兜底的查找**,不写死 `$"节点名"`(用户真跑报告)──
+            # 用户的调试信息里是这两行:
+            #     ERROR: Node not found: "侧视机位"
+            #         (relative to "/root/World/Colliders/示例角色")
+            # 原因:导出时脚本挂在**碰撞代理**物体上,而用户在 Blender 里
+            # 摆的相机是它的**兄弟节点**(World 下),`$"侧视机位"` 是相对
+            # 路径 -> 找不到 -> 『相机_切换』整段失效(表现就是"切相机没用")。
+            #
+            # 现在生成的是一句带兜底的查找:先按路径找,找不到就在整棵树里
+            # **按名字**找一遍,再找不到才告警。这样"物体怎么摆"都不影响
+            # 引用能不能解析 —— 顺带也修好了"用户把相机挪到别的父节点下"。
             for var, (path, gd_type) in ctx.onready.items():
-                out.append(f"@onready var {var}: {gd_type} = {path}")
+                name = _path_name(path)
+                out.append(f"@onready var {var}: {gd_type} = "
+                           f"_gk_ref(self, {gd_string(name)})")
             out.append("")
 
         if ctx.exports:
@@ -4207,7 +6931,14 @@ class Generator:
             out.append("# ---- 成员变量 ----")
             for name in ctx.var_order:
                 gd_type = ctx.vars.get(name) or "Variant"
-                out.append(f"var {name}: {gd_type}")
+                # 动画树的自定义变量带初值(侧栏『变量』里填的那个);
+                # 其它变量没有初值,保持原来的 `var x: T` 写法不变 ——
+                # 老图生成的代码必须一个字符都不差(有测试钉着)。
+                initial = ctx.var_initials.get(name)
+                if initial is None:
+                    out.append(f"var {name}: {gd_type}")
+                else:
+                    out.append(f"var {name}: {gd_type} = {initial}")
             out.append("")
 
         for index, section in enumerate(sections):
@@ -4385,7 +7116,14 @@ def generate(tree, options=None):
     _check_base_class_supports_graph(tree, options or {}, warnings)
     _check_animation_targets(tree, warnings)
     # 登记本次用到的输入动作，供导出流程写进 project.godot
-    globals()["last_used_actions"] = list(generator.ctx.input_actions.values())
+    # 同时把用户在『输入_按键』里**捕获的键**一起带上(动作名, 键)——
+    # 他在 Blender 里按 W,Godot 里 W 就该真的能用,而不是又绑回默认的 D。
+    # 提示(正常用法)单独给出去 —— 导出报告里展示,但不算告警
+    globals()["last_notes"] = list(generator.ctx.notes)
+    globals()["last_used_actions"] = [
+        (action, generator.ctx.action_keys.get(const, ""))
+        for const, action in generator.ctx.input_actions.items()
+    ]
     return code, warnings
 
 

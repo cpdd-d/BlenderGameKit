@@ -143,6 +143,15 @@ def register():
     except Exception as exc:  # pragma: no cover
         print(f"[BlenderGameKit] 物体物理设置挂载失败: {exc}")
 
+    # ── 快捷键(F5 = 直接运行游戏)──────────────────────────────────
+    # 必须在类都注册完之后 —— 快捷键绑的是算子,算子没注册就绑不上。
+    try:
+        from . import ui as _ui
+        if _ui.register_keymaps():
+            print("[BlenderGameKit] 已注册快捷键: 节点编辑器 F5 = 直接运行游戏")
+    except Exception as exc:  # pragma: no cover
+        print(f"[BlenderGameKit] 快捷键注册失败: {exc}")
+
     for name in _SUBMODULES:
         module = sys.modules.get(f"{__name__}.{name}")
         hook = getattr(module, "on_register", None)
@@ -151,6 +160,8 @@ def register():
                 hook()
             except Exception as exc:  # pragma: no cover
                 print(f"[BlenderGameKit] {name}.on_register 失败: {exc}")
+
+
 
 
 def _scene_settings_type():
@@ -167,6 +178,13 @@ def _object_settings_type():
 
 def unregister():
     import bpy
+
+    # ── 先摘快捷键(它绑的是算子,算子注销后会变成悬空引用)────────────
+    try:
+        from . import ui as _ui
+        _ui.unregister_keymaps()
+    except Exception:  # pragma: no cover
+        pass
 
     for name in reversed(_SUBMODULES):
         module = sys.modules.get(f"{__name__}.{name}")

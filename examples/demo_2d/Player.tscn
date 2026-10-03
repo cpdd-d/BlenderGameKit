@@ -20,3 +20,7 @@ shape = SubResource("RectangleShape2D_1")
 libraries = {
 "": ExtResource("3_anim")
 }
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(0, -40)
+enabled = true

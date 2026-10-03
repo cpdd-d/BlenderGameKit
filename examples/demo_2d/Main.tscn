@@ -1,6 +1,7 @@
-[gd_scene load_steps=3 format=3]
+[gd_scene load_steps=4 format=3]
 
 [ext_resource type="PackedScene" path="res://Player.tscn" id="1_player"]
+[ext_resource type="Script" path="res://scripts/probe.gd" id="2_probe"]
 
 [sub_resource type="RectangleShape2D" id="RectangleShape2D_ground"]
 size = Vector2(1400, 40)
@@ -27,3 +28,6 @@ offset_top = -20.0
 offset_right = 700.0
 offset_bottom = 20.0
 color = Color(0.25, 0.45, 0.35, 1)
+
+[node name="Probe" type="Node" parent="."]
+script = ExtResource("2_probe")

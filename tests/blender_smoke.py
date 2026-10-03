@@ -207,9 +207,100 @@ def main():
         traceback.print_exc()
         return 1
 
+    # ---- 动作分类:打标签 -> 导出成常量表 ----
+    # 覆盖 ui/operator 那条链路:`gk.tag_anim_category` 真的能写进 Action 的
+    # 自定义属性,并且导出时变成 GK_ANIM_BY_CATEGORY 常量表。
+    try:
+        tagged = bpy.data.actions.new("冒烟动作")
+        bpy.ops.gk.tag_anim_category(action_name=tagged.name, category="攻击")
+        check("动作分类写进 Action",
+              tagged.get("gk_anim_category") == "攻击",
+              str(tagged.get("gk_anim_category")))
+        code2, _w2 = codegen.generate(tree, {
+            "dimension": "2", "base_class": "CharacterBody2D",
+            "export_tunables": True,
+        })
+        check("导出含分类常量表",
+              'const GK_ANIM_BY_CATEGORY := {' in code2
+              and '"攻击": ["冒烟动作"]' in code2)
+        bpy.data.actions.remove(tagged)
+    except Exception as exc:
+        check("动作分类链路", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 新建动画树不报错 ----
+    # 踩过的坑:创建起始状态时给节点赋值 `gk_is_default`(该属性**从未定义**),
+    # Blender 直接 AttributeError ——「打开/新建动画树」这条路一走到新建分支就崩。
+    try:
+        bpy.ops.gk.open_anim_tree()
+        trees = [g for g in bpy.data.node_groups
+                 if getattr(g, "bl_idname", "") == "GKAnimationTree"]
+        check("新建动画树不报错", bool(trees), str(len(trees)))
+        # 起始状态由**连线拓扑**决定(codegen._anim_tree_entry),不是勾选框
+        entry, entries = codegen._anim_tree_entry(trees[0] if trees else None)
+        check("动画树有起始状态", entry is not None and len(entries) >= 1)
+    except Exception as exc:
+        check("新建动画树不报错", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 动画树自定义变量:数据模型 -> 取/设节点 -> 导出带初值的成员变量 ----
+    # 仿虚幻蓝图:变量属于这一"个"动画蓝图(这张树),不是"被谁用到才存在"。
+    # 这条路一次覆盖三处:GKAnimVariable 集合、GKNodeAnimGetVar/SetVar 节点、
+    # codegen 按类型 + 初值生成成员变量。
+    try:
+        anim_tree = next((g for g in bpy.data.node_groups
+                          if getattr(g, "bl_idname", "") == "GKAnimationTree"), None)
+        check("找到动画树", anim_tree is not None)
+
+        # 1) 数据模型:加一个布尔变量并写初值(和侧栏『添加变量』算子同一条路)
+        # 名字用英文:GDScript 的标识符只认 ASCII,中文名会被压成 `v`
+        # (codegen 会就此告警,见 test_codegen.TestAnimTreeVariables)
+        var = anim_tree.gk_variables.add()
+        var.var_name = "invincible"
+        var.var_type = "bool"
+        var.default_value = "真"          # 中文初值也要能解析成 true
+        check("动画树变量可增删", len(anim_tree.gk_variables) == 1
+              and str(anim_tree.gk_variables[0].var_name) == "invincible")
+
+        # 2) 节点:取变量 / 设变量 都能在这张动画树上建出来
+        get_node = anim_tree.nodes.new("GKNodeAnimGetVar")
+        get_node.gk_var_name = "invincible"
+        set_node = anim_tree.nodes.new("GKNodeAnimSetVar")
+        set_node.gk_var_name = "invincible"
+        check("取/设变量节点可用",
+              get_node.outputs.get("值") is not None
+              and set_node.inputs.get("执行") is not None
+              and set_node.inputs.get("值") is not None)
+
+        # 2b) 逻辑节点(与/或/非)也要能在动画树里拉出来当转场条件
+        check("逻辑节点可用在动画树",
+              node_lib.GKNodeLogic.poll(anim_tree)
+              and node_lib.GKNodeCompare.poll(anim_tree))
+
+        # 3) codegen:玩法图里挂一个『动画_状态机』驱动这张树,
+        #    变量必须落地成 var 无敌: bool = true
+        #    (『开始』的执行输出还没接线,正好拿来启动它)
+        sm_node = tree.nodes.new("GKNodeAnimStateMachineRef")
+        sm_node.name = "状态机"
+        sm_node.gk_tree_name = anim_tree.name
+        tree.links.new(start.outputs["执行"], sm_node.inputs["执行"])
+        code3, _w3 = codegen.generate(tree, {
+            "dimension": "2", "base_class": "CharacterBody2D",
+            "export_tunables": True,
+        })
+        check("动画变量导出成带初值的成员变量",
+              "var invincible: bool = true" in code3,
+              [line for line in code3.splitlines() if "invincible" in line][:3])
+    except Exception as exc:
+        check("动画树变量链路", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 算子注册 ----
     for op_name in ("gk.export_script", "gk.preview_script", "gk.add_node",
-                    "gk.auto_link", "gk.pick_target", "gk.set_target"):
+                    "gk.auto_link", "gk.pick_target", "gk.set_target",
+                    "gk.tag_anim_category", "gk.pick_anim_name",
+                    "gk.pick_anim_tree", "gk.anim_var_add", "gk.anim_var_remove",
+                    "gk.anim_var_make_node", "gk.anim_var_pick"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -231,6 +322,83 @@ def main():
     ui_module = __import__(f"{module_name}.ui", fromlist=["CATEGORY_MENUS"])
     unregistered = [cls.__name__ for cls in ui_module.CATEGORY_MENUS if not hasattr(cls, "bl_rna")]
     check("所有分类子菜单都注册成功", not unregistered, str(unregistered))
+
+    # ---- 右键菜单的排布(用户 2026-10-03,照 UPBGE)------------------
+    props_module = __import__(f"{module_name}.properties", fromlist=["node_menu_tree"])
+    menu_tree = list(props_module.node_menu_tree(None))
+    groups = {category: subs for category, subs in menu_tree}
+    input_subs = [name for name, _classes in (groups.get("输入") or [])]
+    check("『输入』分成了 键盘 / 鼠标 / 手柄 / 触屏",
+          all(want in input_subs for want in ("键盘", "鼠标", "手柄", "触屏")),
+          str(input_subs))
+    calc_subs = [name for name, _classes in (groups.get("运算") or [])]
+    check("『运算』分成了 常量 / 数学 / 向量 / 逻辑 / 转换",
+          all(want in calc_subs for want in ("常量", "数学", "向量", "逻辑", "转换")),
+          str(calc_subs))
+    mouse_nodes = dict(groups.get("输入") or []).get("鼠标", [])
+    check(f"鼠标节点 ({len(mouse_nodes)})", len(mouse_nodes) >= 5,
+          ", ".join(cls.bl_label for cls in mouse_nodes))
+
+    # ---- "按一下键盘就绑定"的算子(照 UPBGE 的 Press & Choose)--------
+    check("『按一下键』算子已注册",
+          "GK_OT_CaptureKey" in [cls.__name__ for cls in bpy.types.Operator.__subclasses__()])
+    # 直接调 `apply_captured_key`(模拟按了一下 W)——
+    # 算子本身不能直接 new,所以绑键逻辑特意抽成了普通函数
+    io_module = __import__(f"{module_name}.operator_io",
+                           fromlist=["apply_captured_key"])
+    tree = None
+    for group in bpy.data.node_groups:
+        if getattr(group, "bl_idname", "") == "GKGameLogicTree":
+            tree = group
+            break
+    if tree is None:
+        tree = bpy.data.node_groups.new("GK按键测试", "GKGameLogicTree")
+    tree.use_fake_user = True
+    key_node = tree.nodes.new("GKNodeKey")
+    key_node.name = "按一下"
+    # 让 props.current_tree(context) 能找到这张树 —— 它按"当前活动的节点树"
+    # 找,没有界面时回退到 scene 上的设置。设不上也没关系:
+    # apply_captured_key 找不到树会返回失败,我们据实报出来。
+    try:
+        for attr in ("gk_active_tree", "gk_tree_name"):
+            if hasattr(bpy.context.scene, attr):
+                setattr(bpy.context.scene, attr, tree.name)
+    except Exception:  # noqa: BLE001
+        pass
+    ok, message = io_module.apply_captured_key(bpy.context, key_node.name,
+                                               "W", tree=tree)
+    check("捕获到的按键写进了节点", ok and key_node.gk_key == "W",
+          f"gk_key = {key_node.gk_key!r} ({message})")
+    check("动作名按按键自动生成", key_node.gk_action == "key_w",
+          f"gk_action = {key_node.gk_action!r}")
+    # 改绑另一个键 -> 自动生成的动作名要跟着变(否则看着像没生效)
+    io_module.apply_captured_key(bpy.context, key_node.name, "Q", tree=tree)
+    check("改绑按键后动作名跟着变", key_node.gk_action == "key_q",
+          f"gk_action = {key_node.gk_action!r}")
+
+    # ---- "等按键"到底认哪些事件(2026-10-03 用户报"未正常工作")--------
+    # 病根:`event.type == "KEYDOWN"` —— Blender 里**没有**这个类型,
+    # 按字母键时 event.type 就是键名("W")、event.value 是 "PRESS"。
+    # 所以模态一直挂着,状态栏那句提示不消失。
+    def _event(kind, value="PRESS"):
+        return type("E", (), {"type": kind, "value": value})()
+
+    cases = [
+        (_event("W"), ("W", False), "按 W"),
+        (_event("SPACE"), ("SPACE", False), "按空格"),
+        (_event("LEFT_SHIFT"), ("LEFT_SHIFT", False), "按左 Shift"),
+        (_event("A", "RELEASE"), (None, False), "松开 A 不算按键"),
+        (_event("MOUSEMOVE", "NOTHING"), (None, False), "鼠标移动要忽略"),
+        (_event("TIMER", "NOTHING"), (None, False), "计时器要忽略"),
+        (_event("LEFTMOUSE"), (None, False), "鼠标键不走键盘节点"),
+        (_event("ESC"), (None, True), "Esc = 取消"),
+    ]
+    bad = []
+    for event, want, label in cases:
+        got = io_module.key_from_event(event)
+        if got != want:
+            bad.append(f"{label}: 期望 {want} 得到 {got}")
+    check("『等按键』认得对(8 种事件)", not bad, "; ".join(bad))
 
     # ---- 卸载不报错 ----
     try:

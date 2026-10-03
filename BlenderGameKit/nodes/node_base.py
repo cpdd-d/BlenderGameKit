@@ -67,13 +67,25 @@ _GDSCRIPT_KEYWORDS = {
 
 
 def snake_case(text, fallback="param"):
-    """把中文/英文标签转成合法的 GDScript 标识符。中文会被压成下划线。"""
+    """把中文/英文标签转成合法的 GDScript 标识符。
+
+    ── 中文**保留**,不再压成下划线(第 22 轮改,踩过的坑)──────────
+    以前的写法是"非 ASCII 一律换成下划线",于是:
+        『金币数』-> ""  -> 落到 fallback "v"
+        『通关』  -> ""  -> 也落到 "v"
+    两个**不同的变量**撞成同一个名字,生成 `var v: float = false`
+    —— 类型和值都对不上,Godot 直接解析失败(实测)。
+
+    实测确认 **Godot 4 支持 Unicode 标识符**(`var 金币数: int = 0` 能过
+    `--check-only`),所以现在中文原样保留:变量名在生成的代码里
+    仍然读得懂,也不会再撞名。
+    """
     out = []
     for index, ch in enumerate(str(text)):
-        if ch.isascii() and (ch.isalnum() or ch == "_"):
-            out.append(ch.lower() if (ch.isupper() and index > 0) else ch)
-        elif ch.isascii() and ch in " -.":
-            out.append("_")
+        if ch == "_" or ch.isalnum():
+            # 字母数字(含中文/日文等 Unicode 字母)一律保留
+            out.append(ch.lower() if (ch.isascii() and ch.isupper()
+                                      and index > 0) else ch)
         else:
             out.append("_")
     name = "".join(out).strip("_")
@@ -129,16 +141,48 @@ def target_pin(name="目标"):
     return S.pin(S.OBJECT, name, TARGET_SELF)
 
 
-def node_candidates(tree):
-    """节点引用下拉列表的候选项。"""
-    items = [(TARGET_SELF, "自身(脚本所在节点)", "本脚本挂载的节点", "OBJECT_DATA", 0)]
-    if tree is None:
+def node_candidates(tree, prop=None):
+    """节点引用下拉列表的候选项。
+
+    ── 列**场景物体**,不列节点图里的节点(用户 2026-10-03 的疑问)──────
+    用户原话:"那个节点是你测试用的吗?……这选择节点上显示多的不知道选哪个"。
+    截图里的下拉列的是『锁定鼠标』『设定初始视野』这些 **节点图里的节点名** ——
+    而这里的引用指的是**导出后场景里的物体**(相机 / 角色 / 空节点),
+    两者根本不是一回事:选了节点名,生成的代码会去找一个不存在的物体。
+    现在列 `bpy.data.objects` 里的物体(带类型图标),这才是能选的东西。
+    """
+    items = [(TARGET_SELF, "自身(脚本所在节点)", "本脚本挂载的节点",
+              "OBJECT_DATA", 0)]
+    objects = None
+    try:
+        import bpy
+        objects = list(getattr(bpy.data, "objects", ()) or ())
+    except Exception:
+        objects = None
+    if objects is None:
+        # 离线桩环境:退回旧行为(测试里只关心生成的代码,不关心下拉内容)
+        if tree is None:
+            return items
+        for index, node in enumerate(getattr(tree, "nodes", ()) or (), start=1):
+            if getattr(node, "gk_is_event", False):
+                continue
+            items.append((node.name, node.name, node.bl_label, "NODE", index))
         return items
+    icons = {"CAMERA": "CAMERA_DATA", "MESH": "MESH_DATA", "LIGHT": "LIGHT",
+             "EMPTY": "EMPTY_DATA", "ARMATURE": "ARMATURE_DATA",
+             "CURVE": "CURVE_DATA"}
     index = 1
-    for node in tree.nodes:
-        if getattr(node, "gk_is_event", False):
-            continue
-        items.append((node.name, node.name, node.bl_label, "NODE", index))
+    for obj in objects:
+        kind = str(getattr(obj, "type", "") or "")
+        label = obj.name
+        if kind == "CAMERA":
+            label = f"{obj.name}   (相机)"
+        elif kind == "MESH":
+            label = f"{obj.name}   (网格)"
+        elif kind == "EMPTY":
+            label = f"{obj.name}   (空物体)"
+        items.append((obj.name, label, f"场景物体:{kind}",
+                      icons.get(kind, "OBJECT_DATA"), index))
         index += 1
     return items
 
@@ -160,7 +204,7 @@ def node_items_for(node, prop="gk_target"):
     所以这里给个说明文字,别让人以为"列表里随便挑一个就行"。
     """
     tree = getattr(node, "id_data", None)
-    items = list(node_candidates(tree))
+    items = list(node_candidates(tree, prop))
     current = getattr(node, prop, None)
     if current in AUTO_LABELS:
         items.insert(1, (current, AUTO_LABELS[current], "不指定具体节点，用约定路径", "AUTO", 1))
@@ -179,8 +223,19 @@ def draw_target_picker(node, layout, prop="gk_target"):
     items = node_items_for(node, prop)
     current = getattr(node, prop, TARGET_SELF) or TARGET_SELF
 
+    # ── 空值不画成一个"空框"(用户 2026-10-03:"这选择节点上显示多的
+    #    不知道选哪个"、"看着像没填完")────────────────────────────────
+    # 留空是有明确含义的:**自动** —— 相机就是"当前正在用的那台",
+    # 角色就是"脚本自己"。所以空的时候直接把含义写出来,
+    # 只在真的选了具体物体时才显示那个名字。
     row = layout.row(align=True)
-    row.prop(node, prop, text="")
+    # 注意:没选过的时候值是 TARGET_SELF("__self__"),**不是**空字符串 ——
+    # 所以两种都要认,否则画出来还是那个 `__self__` 文本框(用户看到的
+    # "空框 / 不知道选哪个"就是它)
+    if (not current) or current == TARGET_SELF:
+        row.label(text="自动(自身 / 当前相机)", icon="AUTO")
+    else:
+        row.prop(node, prop, text="")
     op = row.operator("gk.pick_target", text="", icon="TRIA_DOWN")
     op.node_name = node.name
     op.prop_name = prop
@@ -223,7 +278,19 @@ if _BPY:
         return StringProperty(name=name, description=description, default=default, **kw)
 
     def prop_enum(items, default="", name="", description="", **kw):
-        return EnumProperty(items=items, default=default, name=name, description=description, **kw)
+        # ── items 是**函数**时不能给字符串默认值(踩过的坑)────────────
+        # 动态枚举(候选在运行时才算出来,比如"这张树里有哪些状态")要求
+        # 默认值是**整数下标**,给 "" 会直接抛:
+        #     TypeError: EnumProperty(...): 'default' can only be an
+        #     integer when 'items' is a function
+        # 而注册失败是**整个节点**都注册不上(GKNodeAnimTransition 直接消失),
+        # 连带它的所有属性都读成默认值 —— 表现是"转场怎么突然没条件了"。
+        # 所以:函数型 items 就不传 default,交给 Blender 用第 0 项。
+        if callable(items):
+            return EnumProperty(items=items, name=name,
+                                description=description, **kw)
+        return EnumProperty(items=items, default=default, name=name,
+                            description=description, **kw)
 
     def prop_color(default=(1.0, 1.0, 1.0, 1.0), name="", description="", **kw):
         # ── 为什么不是 ColorProperty ────────────────────────────────────
@@ -349,12 +416,21 @@ def _on_pin_count_changed(node, _context=None):
 
     所以给这些属性挂上 Blender 的 `update` 回调,改一次重建一次。
     找不到 `build_sockets` 的节点会被静默跳过(普通节点不受影响)。
+
+    ── 必须走 rebuild_sockets,不能直接 build_sockets(踩过的坑)──────
+    `build_sockets()` 里第一句就是 `inputs.clear()` —— 它**会连带删掉
+    引脚上的连线**。所以改数量要走 `rebuild_sockets()`,那里会先把连线
+    记下来、重建完再照原名接回去(见它的说明)。
+    实测踩过:动画状态的『入口数量』从 2 调到 3,结果这个状态所有
+    已接好的转场**全断了**,导出时报一堆"不知道从哪个状态切过来"。
     """
-    builder = getattr(node, "build_sockets", None)
-    if builder is None:
+    rebuild = getattr(node, "rebuild_sockets", None)
+    if rebuild is None:
+        rebuild = getattr(node, "build_sockets", None)
+    if rebuild is None:
         return
     try:
-        builder()
+        rebuild()
     except Exception:
         # 重建失败不能让整个属性编辑崩掉 —— 引脚保持原样,用户还能撤销。
         pass
@@ -392,11 +468,15 @@ def materialize_props(cls):
         extra = dict(entry[6]) if len(entry) > 6 and isinstance(entry[6], dict) else {}
         if kind == "enum":
             items = entry[5] if len(entry) > 5 else ()
+            # 枚举也要能吃第六项的 kwargs —— 『逻辑_布尔运算』换运算方式时
+            # 要把引脚从 A+B 变成单个 A(NOT),靠的就是这里的 update 回调。
+            # 以前这里漏了 **extra,枚举上的 update 会被静默丢掉。
             descriptor = prop_enum(
                 items,
                 default if default is not None else (items[0][0] if items else ""),
                 name=label,
                 description=desc,
+                **extra,
             )
         else:
             if _wants_pin_rebuild(prop_name) and "update" not in extra:
@@ -462,11 +542,23 @@ if _USE_BPY_BASE:
         gk_hidden = False
         # 这个节点属于哪种节点树。默认游戏逻辑树;
         # 动画系统节点设成 "GKAnimationTree" —— 两套节点不该互相污染菜单。
+        #
+        # 也可以给一个**元组**表示"两张树里都能用":转场条件是布尔判断,
+        # 用户会想在动画树里直接拼 `按住A 与 速度>阈值`,而不是回到玩法图
+        # 去算。见 properties.node_menu_entries 的同一段过滤逻辑。
         gk_tree_type = "GKGameLogicTree"
 
         @classmethod
+        def gk_tree_kinds(cls):
+            """把 gk_tree_type 归一成元组(单字符串 = 只有一种)。"""
+            kinds = cls.gk_tree_type
+            if isinstance(kinds, str):
+                return (kinds,)
+            return tuple(kinds)
+
+        @classmethod
         def poll(cls, node_tree):
-            return node_tree.bl_idname == cls.gk_tree_type
+            return node_tree.bl_idname in cls.gk_tree_kinds()
 
         # ---- 引脚 ----
         def init(self, context):
@@ -476,10 +568,51 @@ if _USE_BPY_BASE:
             build_declared_sockets(self)
 
         def rebuild_sockets(self):
-            """动态引脚(序列出口数量、向量合并的 2D/3D 切换)用。"""
+            """动态引脚(序列出口数量、动画状态的入口数量…)用。
+
+            ── 为什么要先把连线记下来(踩过的坑)────────────────────────
+            `inputs.clear()` 会**连带删掉引脚上的所有连线**。用户把
+            『出口数量』从 3 调到 4,本来只是想多一个出口 —— 结果这个节点
+            上已经接好的线**全断了**,而且没有任何提示(引脚只是空了)。
+            『动画_状态』的入口数量更要命:断掉的是"哪条转场指向我",
+            用户会以为状态机坏了。
+
+            所以重建时按**引脚名字**把连线记下来,重建完再照原名接回去;
+            名字在新引脚里不存在的(比如出口从 5 减到 3)自然就没了 ——
+            这也符合预期。
+            """
+            tree = getattr(self, "id_data", None)
+            saved_inputs = []
+            saved_outputs = []
+            for socket in getattr(self, "inputs", ()) or ():
+                for link in getattr(socket, "links", ()) or ():
+                    saved_inputs.append((getattr(socket, "name", ""),
+                                         getattr(link, "from_socket", None)))
+            for socket in getattr(self, "outputs", ()) or ():
+                for link in getattr(socket, "links", ()) or ():
+                    saved_outputs.append((getattr(socket, "name", ""),
+                                          getattr(link, "to_socket", None)))
             self.inputs.clear()
             self.outputs.clear()
             self.build_sockets()
+            if tree is None:
+                return
+            for name, source in saved_inputs:
+                target = self.inputs.get(name)
+                if target is None or source is None:
+                    continue
+                try:
+                    tree.links.new(source, target)
+                except Exception:
+                    pass
+            for name, target in saved_outputs:
+                source = self.outputs.get(name)
+                if source is None or target is None:
+                    continue
+                try:
+                    tree.links.new(source, target)
+                except Exception:
+                    pass
 
         # ---- 取值 ----
         def get_input_prop(self, socket_name, fallback=None):
@@ -487,8 +620,17 @@ if _USE_BPY_BASE:
             return self.gk_input_props.get(socket_name, fallback)
 
         def input_value(self, ctx, socket_name, fallback=None):
-            """求某个输入引脚的值:已连线交付 codegen 递归,否则读属性/默认值。"""
-            socket = self.inputs.get(socket_name)
+            """求某个输入引脚的值:已连线交付 codegen 递归,否则读属性/默认值。
+
+            ── `socket_name=None` 要特判(2.5D 示例抓出来的坑)──────────
+            『常量_数值』这类"没有输入引脚、只有属性"的节点会传 None 进来。
+            离线的假 bpy 是个 dict,`.get(None)` 返回 None 没事;
+            **真 Blender 的 `bpy_prop_collection.get(None)` 会抛异常**:
+                returned a result with an exception set
+            于是导出时报『节点『常量_数值』求值失败』,值变成 null ——
+            295 个离线测试全绿也发现不了(它们用的是假 bpy)。
+            """
+            socket = None if socket_name is None else self.inputs.get(socket_name)
             if socket is not None and socket.is_linked:
                 return ctx.expr_of(socket)
             prop = self.get_input_prop(socket_name)
@@ -604,8 +746,17 @@ else:
             return self.gk_input_props.get(socket_name, fallback)
 
         def input_value(self, ctx, socket_name, fallback=None):
-            """求某个输入引脚的值:已连线交付 codegen 递归,否则读属性/默认值。"""
-            socket = self.inputs.get(socket_name)
+            """求某个输入引脚的值:已连线交付 codegen 递归,否则读属性/默认值。
+
+            ── `socket_name=None` 要特判(2.5D 示例抓出来的坑)──────────
+            『常量_数值』这类"没有输入引脚、只有属性"的节点会传 None 进来。
+            离线的假 bpy 是个 dict,`.get(None)` 返回 None 没事;
+            **真 Blender 的 `bpy_prop_collection.get(None)` 会抛异常**:
+                returned a result with an exception set
+            于是导出时报『节点『常量_数值』求值失败』,值变成 null ——
+            295 个离线测试全绿也发现不了(它们用的是假 bpy)。
+            """
+            socket = None if socket_name is None else self.inputs.get(socket_name)
             if socket is not None and socket.is_linked:
                 return ctx.expr_of(socket)
             prop = self.get_input_prop(socket_name)

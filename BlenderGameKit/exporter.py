@@ -67,10 +67,52 @@ def build_settings(scene):
     return settings
 
 
+def resolve_main_camera(scene):
+    """算出"主相机"是谁(用户第 25 轮)。
+
+    顺序:①设置里明确选的 ②Blender 视口当前相机(scene.camera)
+          ③场景里第一台相机 ④None(运行时造一台自由飞行的)
+    返回 (名字, 来源说明) —— 说明文字会写进导出报告,用户能看出用的是哪台。
+    """
+    if scene is None:
+        return "", ""
+    import bpy  # 模块级没有它(文件里其它地方也是函数内 import)
+    settings = getattr(scene, "gk_settings", None)
+    wanted = str(getattr(settings, "main_camera", "") or "").strip()
+    if wanted and bpy.data.objects.get(wanted) is not None:
+        return wanted, "设置里指定的主相机"
+    view_cam = getattr(scene, "camera", None)
+    if view_cam is not None and getattr(view_cam, "type", "") == "CAMERA":
+        return view_cam.name, "跟着 Blender 视口的当前相机"
+    cameras = [o.name for o in scene.objects
+               if getattr(o, "type", "") == "CAMERA"]
+    if cameras:
+        return cameras[0], f"自动(场景里第一台;共 {len(cameras)} 台)"
+    return "", "场景里没有相机(运行时造一台自由飞行观察机)"
+
+
 def script_target_object(scene):
     """找出"挂了游戏逻辑脚本"的那个物体。没有就返回 None。"""
     if scene is None:
         return None
+    for obj in script_targets(scene):
+        return obj
+    return None
+
+
+def script_targets(scene):
+    """所有"挂了游戏逻辑脚本"的物体(用户 2026-10-03:"不知道哪个搭载了脚本,
+    容易重复")。
+
+    ── 为什么要能列出**全部** ────────────────────────────────────
+    以前只有 `script_target_object()`(返回第一个),面板上看不出到底有几个、
+    是哪几个 —— 用户于是会重复勾选,而两个物体同时导出脚本会互相覆盖
+    (后写的赢),表现是"改了没生效"。
+    现在:面板列出名字 + 导出报告里点名,并且**只在多于一个时告警**。
+    """
+    if scene is None:
+        return []
+    found = []
     for obj in scene.objects:
         if getattr(obj, "type", "") != "MESH":
             continue
@@ -78,8 +120,8 @@ def script_target_object(scene):
         if physics is None or not getattr(physics, "enabled", True):
             continue
         if getattr(physics, "script_target", False):
-            return obj
-    return None
+            found.append(obj)
+    return found
 
 
 def resolve_base_class(scene):
@@ -267,6 +309,39 @@ def export_tree(tree, settings=None, write_scene=None):
     settings = dict(settings or default_settings())
     started = time.time()
     code, warnings, script_name, actions = generate_code(tree, settings)
+    # ── 挂了脚本的物体:列出来 + 多于一个就告警(用户 2026-10-03)────────
+    # 两个物体同时勾『挂游戏逻辑脚本』的话,导出是**两次覆盖同一个脚本文件**
+    # (后写的赢),表现是"我改了设置却没生效"。这里点名说清楚。
+    # 离线环境(桩 bpy)里拿不到 scene —— 拿不到就跳过这条检查,
+    # 绝不能因为"报告里想多写一行"而让导出失败
+    targets = []
+    try:
+        import bpy
+        targets = script_targets(bpy.context.scene)
+    except Exception:
+        targets = []
+    if len(targets) > 1:
+        names = "、".join(getattr(o, "name", "?") for o in targets[:4])
+        warnings = list(warnings) + [
+            f"有 {len(targets)} 个物体都勾了『挂游戏逻辑脚本』({names})—— "
+            f"它们会**轮流覆盖**同一个脚本文件,后导出的那个赢。"
+            f"请只留一个(选中其它物体 -> 『游戏物理』面板 -> 取消勾选)"]
+    elif targets:
+        gk_log.info(f"脚本挂在: {getattr(targets[0], 'name', '?')}"
+                    f"(可以在『游戏物理』面板里换)")
+    # 主相机:说清这一局用的是哪台(用户第 25 轮:"多个窗口时就提示选择")
+    try:
+        import bpy as _bpy
+        cam_name, cam_why = resolve_main_camera(_bpy.context.scene)
+        if cam_name:
+            gk_log.info(f"主相机: {cam_name}({cam_why})")
+        else:
+            warnings = list(warnings) + [
+                "场景里一台相机都没有 —— 运行时会自动造一台自由飞行观察机"
+                "(WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角)。"
+                "想固定镜头:放一台相机,或者在『游戏物理』那一栏指定主相机"]
+    except Exception:
+        pass
     directory = settings.get("output_dir") or DEFAULT_OUTPUT_DIR
     # 脚本写进 scripts/ 子目录 —— 项目根目录只放 project.godot,
     # 这样"公用的文件夹"结构清晰:脚本、场景、模型、材质各归各位。

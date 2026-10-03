@@ -661,7 +661,14 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
     hidden_armatures = []
     skipped = []
     for obj in scene.objects:
-        if obj.get(PREVIEW_MARK) or obj in excluded:
+        # ── 预览物体:按**标记**和**名字前缀**双重排除(用户 2026-10-03)──
+        # 用户导出后的 Godot 场景里出现了 `__GK碰撞预览__示例角色` ——
+        # 说明只认标记是不够的:老 .blend 里存的预览物体是**早期版本**建的,
+        # 那时候还没写这个标记,于是它一路进了 .glb(连带一条碰撞体)。
+        # 名字前缀是这套预览物体固有的,加上它就堵住了。
+        is_preview = bool(obj.get(PREVIEW_MARK)) or \
+            str(getattr(obj, "name", "")).startswith("__GK碰撞预览__")
+        if is_preview or obj in excluded:
             skipped.append(obj.name)
             obj.select_set(False)
         else:
@@ -1610,7 +1617,13 @@ def colliders_that_mismatch_mesh(scene, min_ratio=0.8):
     return out
 
 
-def guess_collision_shape(obj, is_3d=True):
+def _is_character_body(physics):
+    """这个物体在『游戏物理』里选的是不是角色体?"""
+    body = str(getattr(physics, "body_type", "") or "")
+    return body in ("CharacterBody3D", "CharacterBody2D")
+
+
+def guess_collision_shape(obj, is_3d=True, prefer_character=False):
     """按物体尺寸猜一个合适的碰撞形状。
 
     规则(面板上显示的和导出时用的是**同一份逻辑**):
@@ -1656,6 +1669,13 @@ def guess_collision_shape(obj, is_3d=True):
     # 细长:一个方向明显更长,另两个方向接近 -> 胶囊(人形、柱子)
     if long_ratio > 1.35 and mid_ratio <= 1.35:
         return "capsule"
+    # ── 角色优先给胶囊(用户 2026-10-03:"示例那里有些还要自己填")────
+    # 三边接近时包围盒分不出球和方盒,默认给球。但**角色**给球是错的:
+    # 球会滚、而且会"坐在"地面接触点上(看起来悬空/打滑)。
+    # 所以物体在『游戏物理』里选的是角色体时,这里直接给胶囊(3D)
+    # 或盒子(2D,横版角色就是矩形)。
+    if prefer_character:
+        return "capsule" if is_3d else "box"
     # 三边接近:包围盒分不出球和方盒。
     # 默认给球 —— 对于"看起来圆"的东西(道具、球体角色)球更贴合,
     # 而方块类物体用户通常会自己去面板上改成盒子。
@@ -1683,7 +1703,14 @@ def collision_preview_mesh(obj, is_3d=True, physics=None):
     if shape == "none":
         return None
     if shape == "auto":
-        shape = guess_collision_shape(obj, is_3d)
+        shape = guess_collision_shape(
+            obj, is_3d, prefer_character=_is_character_body(physics))
+        # ── "自动"就是自动:手动尺寸只在**明确选了形状**时生效 ──────────
+        # 踩过的坑:老版本 shape_size 默认值是 (0.5, 1.0, 0.5),
+        # 于是**所有**物体(包括选着"自动"的地面)都被那组数字覆盖成
+        # 半米见方的一小块 —— 角色一站上去就穿过去。
+        # 现在就算老 .blend 里还留着那组数字,选"自动"也不会再用它。
+        override_size = None
 
     override = None
     if physics is not None:
@@ -1877,23 +1904,58 @@ def build_collision(obj, is_3d=True, physics=None):
     if shape == "none":
         return None
     if shape == "auto":
-        shape = guess_collision_shape(obj, is_3d)
+        shape = guess_collision_shape(
+            obj, is_3d, prefer_character=_is_character_body(physics))
+        # ── "自动"就是自动:手动尺寸只在**明确选了形状**时生效 ──────────
+        # 踩过的坑:老版本 shape_size 默认值是 (0.5, 1.0, 0.5),
+        # 于是**所有**物体(包括选着"自动"的地面)都被那组数字覆盖成
+        # 半米见方的一小块 —— 角色一站上去就穿过去(用户"站不住"的真凶)。
+        # 现在就算老 .blend 里还留着那组数字,选"自动"也不会再用它。
+        override_size = None
 
     bounds = object_bounds([obj])
     if bounds is None:
         return None
     size = bounds["size"]
 
+    # ── 手填尺寸全 0 = "没填",退回自动贴合(用户 2026-10-03)──────────
+    # 面板上写的是"填了就用这组数字",用户把三个框清成 0 表达的是
+    # "我不要手动尺寸" —— 但 (0,0,0) 会生成一个**零大小**的碰撞体,
+    # 表现是"角色直接掉下去"。
+    if override_size is not None and max(abs(v) for v in override_size) < 1e-6:
+        override_size = None
+
+    # ── 最薄的那一边要给个下限(同一天踩到的坑)────────────────────
+    # 地面常常是一张**平面**:包围盒某个方向是 0 -> 盒子碰撞体厚度 0 ->
+    # 角色一站上去就穿过去(用户:"运动一两步就掉下去")。
+    # 给 5 厘米的下限:薄板 / 地面都能站人,厚物体不受影响。
+    MIN_THICKNESS = 0.05
+
     # 形状参数
     if is_3d:
         if override_size is not None:
-            radius = max(override_size[0], 0.001)
+            # 用户填的是**完整尺寸**,三个轴一视同仁地取一半 ——
+            # 以前只把 Y 取了一半,X/Z 原样用,于是"填 0.5 出来 1.0",
+            # 用户看到的正是"它还是这样大"(实测)
+            radius = max(override_size[0], 0.001) * 0.5
             height = max(override_size[1], 0.002)
-            half = (override_size[0], override_size[1] * 0.5, override_size[2])
+            half = (max(override_size[0] * 0.5, MIN_THICKNESS),
+                    max(override_size[1] * 0.5, MIN_THICKNESS),
+                    max(override_size[2] * 0.5, MIN_THICKNESS))
         else:
-            radius = max(size[0], size[2], 0.001) * 0.5
-            height = max(size[1], 0.002)
-            half = (size[0] * 0.5, size[1] * 0.5, size[2] * 0.5)
+            # ── 自动尺寸:**必须做 Z-up -> Y-up 的轴向换算**──────────────
+            # 用户截图里的"地面立起来了"就是这个 bug:
+            # 地面是 20x20 的平面(Blender 里 Z 方向几乎为 0),
+            # 而生成的盒子写的是 Vector3(20, 20, 0.1) ——
+            # 在 **Godot** 里 Y 才是"上",这等于一块 20 宽、**20 高**、
+            # 0.1 厚的**竖墙**。角色当然站不住(摔下去/穿过去)。
+            # 换算规则和 `_godot_position` 一致:Blender(x, y, z) -> Godot(x, z, y)
+            # (尺寸没有正负,所以不用取负号)
+            radius = max(size[0], size[1], 0.001) * 0.5
+            height = max(size[2], 0.002)         # 竖直方向 = Blender 的 Z
+            half = (max(size[0] * 0.5, MIN_THICKNESS),
+                    max(size[2] * 0.5, MIN_THICKNESS),
+                    max(size[1] * 0.5, MIN_THICKNESS))
         params = {
             "x": _fmt(half[0] * 2.0), "y": _fmt(half[1] * 2.0),
             "z": _fmt(half[2] * 2.0),
@@ -1901,10 +1963,25 @@ def build_collision(obj, is_3d=True, physics=None):
         }
         template = SHAPE_TEMPLATES_3D.get(shape, SHAPE_TEMPLATES_3D["box"])
         node_type = "CollisionShape3D"
+        # ── 形状要落在**模型中心**,不能假设原点就在中心 ────────────────
+        # 用户"站不住"的真凶:角色的网格顶点是 z=0..1(原点在**脚底**),
+        # 而胶囊/盒子是以**原点为中心**生成的 —— 于是形状有一半在地面
+        # 之下,Godot 里角色被物理往下挤,看起来就是"掉下去/站不住"。
+        # 这里把"包围盒中心 - 物体原点"算出来,写进碰撞节点的 transform。
         offset = (0.0, 0.0, 0.0)
+        try:
+            center = bounds.get("center")
+            origin = obj.matrix_world.translation
+            dx = float(center[0]) - float(origin.x)
+            dy = float(center[1]) - float(origin.y)
+            dz = float(center[2]) - float(origin.z)
+            # 和 _godot_position 同一套:Blender(x,y,z) -> Godot(x,z,-y)
+            offset = (dx, dz, -dy)
+        except Exception:
+            offset = (0.0, 0.0, 0.0)
     else:
         if override_size is not None:
-            radius = max(override_size[0], 0.001)
+            radius = max(override_size[0], 0.001) * 0.5
             height = max(override_size[1], 0.002)
         else:
             radius = max(size[0], 0.001) * 0.5
@@ -2141,6 +2218,21 @@ def write_materials(export_dir, objects, shader_res_dir="shaders"):
     objects 传 None 表示"整个场景里所有网格的材质" —— 整场景导出时用这个,
     因为场景里每个对象都需要自己的 .tres 才能显示成卡通。
     """
+    # ── 卡通材质总开关 ──────────────────────────────────────────────
+    # 关掉 = 不做任何材质转换(Godot 直接用 glTF 里带过去的 PBR 材质),
+    # 用户就能拿运行画面和 Blender 预览逐项对比("想看看细节")。
+    try:
+        import bpy as _bpy
+        _scene = getattr(_bpy.context, "scene", None)
+        _settings = getattr(_scene, "gk_settings", None) if _scene else None
+        if _settings is not None and not getattr(_settings, "toon_materials",
+                                                 True):
+            print("[GK] 卡通材质已关闭 —— 按原样导出材质(PBR),"
+                  "运行画面会和 Blender 预览一致")
+            return []
+    except Exception:
+        pass
+
     if objects is None:
         import bpy
 

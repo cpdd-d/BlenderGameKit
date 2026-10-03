@@ -208,9 +208,16 @@ class GKObjectSettings(bpy.types.PropertyGroup):
     # 只有选 auto 之外的形状时才用得上
     shape_size: FloatVectorProperty(
         name="形状尺寸",
-        description="覆盖自动计算的尺寸(X=半径/半宽, Y=高度, Z=半径/半深)",
+        description="覆盖自动计算的尺寸(X=半径/半宽, Y=高度, Z=半径/半深);"
+                    "全 0 = 不用手动尺寸,按模型自动贴合",
         size=3,
-        default=(0.5, 1.0, 0.5),
+        # ── 默认必须是全 0 = "没填"(用户 2026-10-03,这是"站不住"的真凶)──
+        # 原来是 (0.5, 1.0, 0.5) —— 于是**每个新建物体**都自带一组
+        # "0.5 x 1 x 0.5 的手动碰撞尺寸"。用户新建一个地面,它的碰撞体
+        # 就是半米见方的一小块,角色当然站不住。
+        # 实测他那份 .blend 里 7 个物体**全部**是 (0.5, 1.0, 0.5) ——
+        # 就是这个默认值,不是他手填的。
+        default=(0.0, 0.0, 0.0),
         subtype="XYZ",
         update=_on_physics_changed,
     )
@@ -301,6 +308,30 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="在侧栏显示最近一次导出的日志",
         default=True,
     )
+    # ── 主相机(用户第 25 轮)────────────────────────────────────────
+    # 整局游戏**默认用哪台相机**。留空 = 自动:
+    #   1) 用 Blender 视口当前那台(scene.camera —— 就是你按小键盘 0 看的那台)
+    #   2) 没有就取场景里第一台 Camera
+    #   3) 一台都没有 -> 运行时造一台自由飞行观察机(见 codegen)
+    # 场景里有多台相机却没明确选时,导出会提示一句"建议指定主相机"。
+    main_camera: StringProperty(
+        name="主相机",
+        description="游戏默认用哪台相机;留空 = 跟着 Blender 视口的当前相机",
+        default="",
+    )
+
+    show_export_settings: BoolProperty(
+        name="展开导出设置", default=False,
+        description="侧栏『导出设置』默认收起 —— 那几项开一次就不用再动")
+
+    # ── 卡通材质开关(用户第 24 轮:"一般是默认卡通渲染导出,但应该加个开关")──
+    # 导出时默认把材质转成卡通风格(卡通描边),好处是"好看、风格统一";
+    # 坏处是**运行画面和 Blender 预览差很多**,想核对细节就没法看了。
+    # 关掉它 = 按原样导出,颜色/粗糙度/金属度都保持 Blender 里的设置。
+    toon_materials: BoolProperty(
+        name="卡通材质", default=True,
+        description="导出时把材质转成卡通风格(关掉 = 原样导出,便于核对细节)")
+
     output_dir: StringProperty(
         name="导出目录",
         description="GDScript 输出到哪里。留空 = 跟着 .blend 文件走(推荐)",
@@ -313,6 +344,93 @@ class GKSceneSettings(bpy.types.PropertyGroup):
                      "项目建在 .blend 旁边,文件夹名 = 文件名 + _godot"),
         default="",
         subtype="DIR_PATH",
+    )
+
+
+# ==========================================================================
+# 动画树的自定义变量(照虚幻蓝图的 My Blueprint 那一栏)
+# ==========================================================================
+# 用户原话:"在侧边栏可以添加变量，自定义变量引脚连线"。
+#
+# ── 为什么存成 PropertyGroup + CollectionProperty ──────────────────
+# 变量属于**这一张动画树**(= 虚幻里的一"个"动画蓝图),不是全局的:
+# 两张动画树各有一套变量,互不串味。挂在 NodeTree 子类上最贴切。
+#
+# ── 为什么不能叫 `name`(踩过的坑)────────────────────────────────
+# `PropertyGroup` 自带一个 `name` 属性(CollectionProperty 用它当条目名),
+# 再声明一个 StringProperty(name="name") 会被 Blender 拒绝注册。
+# 所以变量名存在 `var_name` 上。
+class GKAnimVariable(bpy.types.PropertyGroup):
+    """动画树里的一个自定义变量。"""
+
+    var_name: StringProperty(
+        name="变量名",
+        description="导出成 GDScript 的成员变量名(中文会被转成合法的英文名)",
+        default="新变量",
+    )
+    var_type: EnumProperty(
+        name="类型",
+        description="这个变量存什么",
+        items=(("bool", "布尔", "真/假 —— 可以直接当转场条件"),
+               ("int", "整数", ""),
+               ("float", "浮点", ""),
+               ("string", "文本", ""),
+               ("vector", "向量", "Vector3")),
+        default="float",
+    )
+    default_value: StringProperty(
+        name="初值",
+        description="游戏开始时这个变量的值",
+        default="0",
+    )
+    comment: StringProperty(
+        name="说明",
+        description="写给自己看的备注(不影响导出)",
+        default="",
+    )
+
+
+class GKLogicPort(bpy.types.PropertyGroup):
+    """一张**游戏逻辑图**对外声明的一个端口(用户第 21 轮要的"真接口")。
+
+    ── 为什么要有它(而不是继续用『逻辑_输出结果』随便填名字)──────────
+    原来是"节点上填个名字 + 别的图用『变量_读取』读 `输出_名字`" ——
+    名字全靠自觉:**打错一个字母不会报任何错**,运行时读到的是空值,
+    然后你会以为是逻辑没跑到。
+    现在改成:图**先声明端口**(名字 + 类型),节点上从下拉里挑;
+    导出时再校验一遍"被读写的端口有没有被声明过",没有就明确告警。
+    """
+    port_name: StringProperty(
+        name="端口名",
+        description="导出成脚本变量 `输出_<端口名>`;别的图用同名端口读它",
+        default="完成",
+    )
+    port_type: EnumProperty(
+        name="类型",
+        description="这个端口是什么类型(别的图按这个类型读)",
+        items=(("bool", "布尔", "真/假 —— 最常用:状态、开关、是否完成"),
+               ("int", "整数", ""),
+               ("float", "浮点", ""),
+               ("string", "文本", ""),
+               ("vector", "向量", "Vector3")),
+        default="bool",
+    )
+    direction: EnumProperty(
+        name="方向",
+        description="输出 = 这张图给别人用;输入 = 这张图要别人给",
+        items=(("out", "输出", "这张图产生、别的图读"),
+               ("in", "输入", "别的图产生、这张图读")),
+        default="out",
+    )
+    default_value: StringProperty(
+        name="初值",
+        description="游戏开始时这个端口的值",
+        default="false",
+    )
+    comment: StringProperty(
+        name="说明",
+        description="写给自己看的备注(不影响导出)",
+        default="",
     )
 
 
@@ -364,6 +482,39 @@ def current_tree(context):
     return getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
 
 
+# ==========================================================================
+# "这个节点属于哪种树" —— 只有这一份判断
+# ==========================================================================
+# ── 为什么必须收成一个函数(实测踩过的坑)────────────────────────────
+# `gk_tree_type` 允许是**元组**(两张树里都能用的节点,比如『逻辑_布尔运算』
+# 和『逻辑_比较』—— 动画树的转场条件也要拼组合判断)。
+#
+# 但菜单的四个地方各自写了一遍 `getattr(cls, "gk_tree_type", ...) != kind`,
+# 元组和字符串比永远是 True,于是:
+#   * 动画树里点『运算 ▸ 常量 ▸ 常量_数值』-> 报
+#     `RuntimeError: 『常量_数值』是游戏逻辑树里的节点,不能放进当前的图`
+#     (用户 2026-10-03 截图里的那条)
+#   * 两级子菜单、『常用』、『最近使用』全都没做过滤
+# 判断逻辑收在这里之后,调用方不可能再写错。
+def node_tree_kinds(cls):
+    """一个节点类允许放进哪些树,归一成元组。"""
+    kinds = getattr(cls, "gk_tree_type", "GKGameLogicTree")
+    if isinstance(kinds, str):
+        return (kinds,)
+    return tuple(kinds)
+
+
+def node_fits_tree(cls, tree_type):
+    """这个节点能不能放进 tree_type 那种树?
+
+    tree_type 为 None(拿不到上下文)时一律返回 True —— 菜单宁可多列,
+    也不能在上下文缺失时把整张菜单变空。
+    """
+    if tree_type is None:
+        return True
+    return tree_type in node_tree_kinds(cls)
+
+
 def node_menu_entries():
     """按分类整理所有节点，供"添加节点"菜单使用。"""
     grouped = {}
@@ -392,7 +543,9 @@ def node_menu_entries(tree_type=None):
         if getattr(cls, "gk_hidden", False):
             continue
         if tree_type is not None:
-            if getattr(cls, "gk_tree_type", "GKGameLogicTree") != tree_type:
+            # gk_tree_type 允许是**元组**(两张树里都能用的节点,比如
+            # 逻辑_布尔运算 —— 动画转场条件也要拼组合判断)。见 node_fits_tree
+            if not node_fits_tree(cls, tree_type):
                 continue
         grouped.setdefault(cls.gk_category, []).append(cls)
     ordered = []
@@ -488,4 +641,5 @@ def default_output_dir():
 # 注意:这几个 PropertyGroup 只在这里**注册类**;真正挂到
 # Scene.gk_settings / Object.gk_physics 上的动作在
 # __init__.register() 里做 —— 那边能保证"所有类都注册完了"再挂。
-GK_CLASSES = (GKSceneSettings, GKObjectSettings)
+GK_CLASSES = (GKSceneSettings, GKObjectSettings, GKAnimVariable,
+              GKLogicPort)

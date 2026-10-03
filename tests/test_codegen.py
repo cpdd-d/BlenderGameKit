@@ -8,6 +8,7 @@
 import os
 import re
 import sys
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,31 +37,35 @@ def gen(tree, options=None):
 
 class Base(unittest.TestCase):
     def assert_no_chinese_identifiers(self, code):
-        """生成代码里不应出现中文标识符(注释与字符串字面量除外)。
+        """生成代码里的标识符必须是 Godot 认的写法(中文**可以**)。
 
-        中文字符串是合法的(print("你好"))，但中文标识符会让 GDScript 编译失败。
-        两处**有意为之**的例外(都实测过 Godot 4.7.2 接受):
+        ── 这个断言的立场变过一次(第 22 轮)──────────────────────────
+        以前是"禁止中文标识符",理由是"中文会让 GDScript 编译失败" ——
+        那个理由是**错的**:实测 Godot 4.7.2 接受 Unicode 标识符
+        (`var 金币数: int = 0` 能过 `--check-only`)。
+        真正的问题在**命名**那一步:`snake_case` 把中文压成下划线之后,
+        『金币数』和『通关』会**撞成同一个名字**,生成
+        `var v: float = false` —— 那才是编译失败的根源。
 
-        * `$"主相机"` —— 带引号的节点路径，属于字符串
-        * `_gk_ui_<中文>` —— 界面控件的成员变量名。
-          界面控件是"每个节点一个"的，用节点名做后缀才能一眼对上号；
-          Godot 的标识符本来就允许 Unicode，中文名对中文用户更好读。
+        所以现在改成:中文允许,但**标识符本身必须合法**
+        (字母/下划线/数字/Unicode 字母,不能有空格、横线、点,
+        不能以数字开头)。真正的语法问题交给真 Godot 那一层抓。
         """
-        offenders = []
+        bad = []
+        pattern = re.compile(r"\b(?:var|const)\s+([^\s:=]+)")
         for number, line in enumerate(code.splitlines(), 1):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            body = line.split("#", 1)[0]
-            # 去掉字符串字面量后再检查
-            body = re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)
-            body = re.sub(r"'(?:[^'\\]|\\.)*'", "''", body)
-            # 界面控件的变量名允许中文(见上面的说明)
-            body = body.replace("_gk_ui_", "_GKUI_")
-            body = re.sub(r"_GKUI_[\u4e00-\u9fff\w]*", "_GKUI_X", body)
-            if re.search(r"[\u4e00-\u9fff]", body):
-                offenders.append((number, stripped))
-        self.assertEqual(offenders, [], f"代码里出现中文标识符: {offenders}")
+            body = re.sub(r'"(?:[^"\\]|\\.)*"', '""',
+                          line.split("#", 1)[0])
+            for name in pattern.findall(body):
+                if not name or name[0].isdigit():
+                    bad.append((number, name))
+                    continue
+                if not all(ch.isalnum() or ch == "_" for ch in name):
+                    bad.append((number, name))
+        self.assertEqual(bad, [], f"标识符不合法: {bad}")
 
     def assert_indent_sane(self, code):
         """缩进必须是 4 的倍数，且不能混用制表符。"""
@@ -311,8 +316,10 @@ class TestFlow(Base):
         gk_stub.connect(tree, once, "首次", printer, "执行")
         code, warnings = gen(tree, V2)
         self.assertEqual(warnings, [], warnings)
-        self.assertIn("if not done", code)
-        self.assertIn("var done: bool", code)
+        # 变量名跟着节点标签走(『一次_一次』-> `done_一次`),所以只断言
+        # "有一个 bool 变量 + 用 not 判断过",不写死名字
+        self.assertRegex(code, r"if not done\w*:")
+        self.assertRegex(code, r"var done\w*: bool")
 
 
 class TestVariablesAndSignals(Base):
@@ -353,6 +360,28 @@ class TestVariablesAndSignals(Base):
 
 
 class TestTargets(Base):
+    def test_node_reference_has_fallback_lookup(self):
+        """节点引用不能写死 `$"名字"` —— 要带兜底查找。
+
+        用户真跑报告:脚本挂在『碰撞代理』物体上,而相机是它的**兄弟节点**,
+        `$"侧视机位"` 报 `Node not found` -> 『相机_切换』整段失效。
+        现在生成的是 `_gk_ref(self, "名字")`:先按路径找,再全树按名字找。
+        """
+        for name, script in (
+                ("GKNodeCameraSetCurrent", "相机_切换"),
+                ("GKNodeSetVelocity", "移动_设置速度")):
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            node = tree.new_node(getattr(NN, name), script,
+                                 gk_target="某物")
+            printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="x")
+            gk_stub.connect(tree, event, "执行", printer, "执行")
+            gk_stub.connect(tree, event, "执行", node, "执行")
+            code, _w = gen(tree, V3)
+            self.assertIn('_gk_ref(self, "某物")', code)
+            self.assertNotIn('$"某物"', code)
+            self.assertIn("func _gk_ref(host: Node, wanted: String)", code)
+
     def test_other_node_becomes_onready(self):
         tree = make_tree()
         event = tree.new_node(NN.GKNodeOnReady, "启动")
@@ -360,7 +389,7 @@ class TestTargets(Base):
         gk_stub.connect(tree, event, "执行", velocity, "执行")
         code, _ = gen(tree, V2)
         self.assertIn("@onready var", code)
-        self.assertIn("$Player", code)
+        self.assertIn('_gk_ref(self, "Player")', code)
 
     def test_animation_player_default(self):
         """留空时用**运行时查找**,不能写死 `$AnimationPlayer`。
@@ -474,8 +503,10 @@ class TestNodeLibrary(unittest.TestCase):
         from BlenderGameKit import gk_sockets as S
         from BlenderGameKit.nodes import node_base as NB
         # 动画树里的卡片节点不参与执行流,单独列出来
-        # (`GKNodeAnimTransition` 同 `GKNodeAnimState`:靠条件为真被激活)
-        no_flow = {"GKNodeAnimState", "GKNodeAnimTransition"}
+        # (`GKNodeAnimTransition` 同 `GKNodeAnimState`:靠条件为真被激活;
+        #  `GKNodeAnimEntry` 是**开始口** —— 它只有条件,本身就是源头)
+        no_flow = {"GKNodeAnimState", "GKNodeAnimTransition",
+                   "GKNodeAnimEntry"}
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
                 continue
@@ -658,13 +689,21 @@ class TestDisplayNodes(Base):
         self.assertIn(": Camera3D = ", code_3d)
 
     def test_camera_auto_find_when_unset(self):
-        """没填相机时不该崩，而是自动找第一个相机并告警说明。"""
+        """没填相机时不该崩，而是自动找第一个相机并**提示**(不算告警)。"""
         tree = make_tree()
         event = self._ready(tree)
         node = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头")
         gk_stub.connect(tree, event, "执行", node, "执行")
         code, warnings = gen(tree, V2)
-        self.assertTrue(any("自动找" in w for w in warnings), warnings)
+        # 这是"正常默认用法",归到提示里 —— 否则"零告警导出"这条验收线
+        # 会被一堆正常用法刷屏,真正的告警反而淹掉
+        notes = list(getattr(codegen, "last_notes", []) or [])
+        self.assertTrue(any("没指定相机" in n for n in notes), notes)
+        # 顺序:视口里正在用的 -> 分组 -> 场景里第一个(2.5D 示例抓出来的:
+        # 只找分组的话,不在分组里的相机会让整段逻辑被跳过)
+        self.assertLess(code.index("get_viewport().get_camera_3d()"),
+                        code.index('gk_camera"'))
+        self.assertFalse([w for w in warnings if "相机" in w], warnings)
         self.assertIn('get_tree().get_first_node_in_group("gk_camera")', code)
         self.assert_no_chinese_identifiers(code)
 
@@ -1901,8 +1940,199 @@ class TestInputActions(Base):
         gk_stub.connect(tree, move, "完成", printer, "执行")
         code, _ = gen(tree, V2)
         actions = list(getattr(codegen, "last_used_actions", []) or [])
-        self.assertIn("move_left", actions)
-        self.assertIn("move_right", actions)
+        # 现在是 (动作名, 捕获到的键) 的形式 —— 键来自『输入_按键』的
+        # "按一下键"捕获,导出时要真的写进 project.godot
+        names = [item[0] if isinstance(item, (tuple, list)) else item
+                 for item in actions]
+        self.assertIn("move_left", names)
+        self.assertIn("move_right", names)
+
+    def test_set_var_multiple_slots_with_links(self):
+        """一张『变量_设置』卡片设两个变量,两个值引脚各接不同节点。
+
+        用户 2026-10-03:"在设置变量属性时,卡片里可以设置多个并且引脚
+        可连接不同节点,如虚幻蓝图的变量节点可重复连接"。
+
+        ── 为什么专门盯第 2 个槽 ────────────────────────────────────
+        第一版把槽位号和引脚名算错了(第 2 槽去找不存在的『值 3』),
+        于是它**永远读不到连线**,悄悄退回数字框里的值 ——
+        示例工程里 `combo_ready = 1.0` 就是这么来的(应该是 `true`)。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        setter = tree.new_node(NN.GKNodeSetVar, "设两个")
+        setter.gk_var_count = 2
+        setter.gk_var_name = "is_attacking"
+        setter.gk_var_name_2 = "combo_ready"
+        setter.gk_value_2 = 99.0
+        setter.build_sockets()
+        const_a = tree.new_node(NN.GKNodeConstBool, "假", gk_value=False)
+        const_b = tree.new_node(NN.GKNodeConstBool, "真", gk_value=True)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="x")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        gk_stub.connect(tree, setter, "完成", printer, "执行")
+        gk_stub.connect(tree, const_a, "值", setter, "值")
+        gk_stub.connect(tree, const_b, "值", setter, "值 2")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("is_attacking = false", code)
+        # 第 2 个槽必须用**线那头**的值(true),不是数字框里的 99
+        self.assertIn("combo_ready = true", code)
+        self.assertNotIn("combo_ready = 99", code)
+        # 布尔变量不该被数字框带成 float
+        self.assertIn("var combo_ready: bool", code)
+
+    def test_bool_var_given_a_number_becomes_true_false(self):
+        """布尔变量被填了数字:生成能跑的 true/false(并告警提醒接常量_布尔)。
+
+        数字框只能填数字,所以"变量是 bool 却填了 0"非常常见。
+        `is_hurt = 0.0` 在 GDScript 里是类型不匹配(bool 变量收 float),
+        **整个脚本加载失败** —— 而用户只是"填了个 1"。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeSetVar, "先声明成布尔")
+        first.gk_var_name = "is_hurt"
+        const_true = tree.new_node(NN.GKNodeConstBool, "真", gk_value=True)
+        second = tree.new_node(NN.GKNodeSetVar, "再用数字设一次")
+        second.gk_var_name = "is_hurt"
+        second.gk_value = 1.0
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="x")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, const_true, "值", first, "值")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        gk_stub.connect(tree, second, "完成", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertIn("var is_hurt: bool", code)
+        self.assertIn("is_hurt = true", code)
+        self.assertNotIn("is_hurt = 1.0", code)
+        # 告警要说人话:告诉用户接『常量_布尔』,而不是让他去改变量名
+        self.assertTrue(any("常量_布尔" in w for w in warnings), warnings)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_set_var_flow_fans_out_to_several_branches(self):
+        """『变量_设置』的『完成』可以扇出到**多个**判断节点。
+
+        用户 2026-10-03:"在判断属性时,可由设置变量节点拉出连接,
+        如虚幻蓝图设置变量后就直接连接判断节点"。
+
+        蓝图的执行线天生可以一拖多 —— 我们把『完成』接两个『如果_否则』,
+        两个都要生成,而不是"后接的顶掉先接的"。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        setter = tree.new_node(NN.GKNodeSetVar, "设标志")
+        setter.gk_var_name = "is_ready"
+        const_true = tree.new_node(NN.GKNodeConstBool, "真", gk_value=True)
+        branch_a = tree.new_node(NN.GKNodeBranch, "判断A")
+        branch_b = tree.new_node(NN.GKNodeBranch, "判断B")
+        status = tree.new_node(NN.GKNodeAnimStatus, "动画状态")
+        print_a = tree.new_node(NN.GKNodePrint, "打印A", gk_text="A")
+        print_b = tree.new_node(NN.GKNodePrint, "打印B", gk_text="B")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        gk_stub.connect(tree, const_true, "值", setter, "值")
+        # 扇出:一个『完成』接两个判断节点
+        gk_stub.connect(tree, setter, "完成", branch_a, "执行")
+        gk_stub.connect(tree, setter, "完成", branch_b, "执行")
+        gk_stub.connect(tree, status, "已结束", branch_a, "条件")
+        gk_stub.connect(tree, status, "在跑", branch_b, "条件")
+        gk_stub.connect(tree, branch_a, "是", print_a, "执行")
+        gk_stub.connect(tree, branch_b, "是", print_b, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("is_ready = true", code)
+        self.assertIn('print("A")', code)
+        self.assertIn('print("B")', code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_captured_key_is_recorded_for_export(self):
+        """用户在『输入_按键』里按下的键要跟到导出那一端。
+
+        否则"在 Blender 里按一下 W"这个操作对 Godot 毫无影响 ——
+        按键仍然绑在默认表上(或者根本没绑),用户会以为功能坏了。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        key = tree.new_node(NN.GKNodeKey, "冲刺", gk_key="LEFT_SHIFT",
+                            gk_action="dash")
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="dash")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, key, "结果", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('const ACTION_DASH := "dash"', code)
+        self.assertIn("Input.is_action_pressed(ACTION_DASH)", code)
+        actions = dict(
+            (item[0], item[1]) if isinstance(item, (tuple, list))
+            else (item, "") for item in codegen.last_used_actions)
+        self.assertEqual(actions.get("dash"), "LEFT_SHIFT")
+
+    def test_key_trigger_modes(self):
+        """一个『输入_按键』顶三个:按住 / 刚按下 / 松开(照 UPBGE 的 Tap)。"""
+        for trigger, func in (("PRESSED", "is_action_pressed"),
+                              ("JUST", "is_action_just_pressed"),
+                              ("RELEASED", "is_action_just_released")):
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            node = tree.new_node(NN.GKNodeKey, "键", gk_key="W",
+                                 gk_action="dash", gk_trigger=trigger)
+            printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="x")
+            gk_stub.connect(tree, node, "结果", printer, "内容")
+            gk_stub.connect(tree, event, "执行", printer, "执行")
+            code, _w = gen(tree, V3)
+            self.assertIn(f"Input.{func}(ACTION_DASH)", code)
+
+    def test_mouse_nodes(self):
+        """鼠标节点(UPBGE 的『输入 ▸ 鼠标』那一栏,以前完全没有)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        down = tree.new_node(NN.GKNodeMouseButtonDown, "左键按下",
+                             gk_button="LEFT")
+        mode = tree.new_node(NN.GKNodeMouseMode, "锁鼠标", gk_mode="CAPTURED")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, down, "刚按下", branch, "条件")
+        gk_stub.connect(tree, branch, "是", mode, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)", code)
+        self.assertIn("Input.mouse_mode = Input.MOUSE_MODE_CAPTURED", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_mouse_wheel_uses_input_event(self):
+        """滚轮没有"当前值"这种属性,只能靠事件累积(并每帧清零)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        wheel = tree.new_node(NN.GKNodeMouseWheel, "滚轮")
+        gk_stub.connect(tree, wheel, "滚轮", printer, "内容")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("MOUSE_BUTTON_WHEEL_UP", code)
+        self.assertIn("func _input(event: InputEvent)", code)
+
+    def test_menu_has_input_subcategories(self):
+        """右键菜单里『输入』要分成 键盘 / 鼠标 / 手柄 / 触屏(照 UPBGE)。"""
+        from BlenderGameKit import properties as props
+        groups = dict()
+        for category, subs in props.node_menu_tree(None):
+            groups[category] = subs
+        self.assertIn("输入", groups, "没有『输入』这个分类")
+        subs = groups["输入"] or []
+        names = [name for name, _classes in subs]
+        for want in ("键盘", "鼠标", "手柄", "触屏"):
+            self.assertIn(want, names, f"『输入』下面缺少『{want}』")
+        mouse = dict(subs).get("鼠标", [])
+        labels = [cls.bl_label for cls in mouse]
+        self.assertTrue(any("鼠标" in label for label in labels), labels)
+        # 手柄 / 触屏的节点也收进了『输入』(照 UPBGE 的 输入 ▸ … ▸ 游戏手柄)
+        joy = dict(subs).get("手柄", [])
+        self.assertTrue(joy, "『输入 ▸ 手柄』是空的")
+        # 没有『输入』父分类之外的同名顶层分类(避免两处都能找到、看着重复)
+        self.assertNotIn("手柄", [name for name in groups if name != "输入"])
 
     def test_project_godot_writer_skips_builtin_ui_actions(self):
         """ui_* 是 Godot 内置动作，不能自己重新定义。
@@ -2996,6 +3226,956 @@ def detach_anim_tree(original):
 
 
 
+class TestAnimTreeAdvanced(Base):
+    """这一轮新增的:播放完成 / 状态的进入时·离开时 / 一个状态播多段动画。"""
+
+    def _build(self, anim, extra_nodes=()):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        for node, props in extra_nodes:
+            for key, value in props.items():
+                setattr(node, key, value)
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            return gen(tree, V3)
+        finally:
+            detach_anim_tree(original)
+
+    def test_state_entry_and_exit_hooks_run(self):
+        """状态的『进入时』/『离开时』执行流 -> 『动画_设变量』真的被执行。
+
+        用户 2026-10-03 要的正是这个:他要把状态节点的『转到』接到
+        『动画_设变量』上("上一个播完了就设个布尔变量"),而『转到』是
+        "去下一个状态"的意思 —— 那条线只会报错。现在状态上多了两个
+        **做事的**出口:『进入时』『离开时』。
+        """
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        attack = anim.new_node(NN.GKNodeAnimState, "状态攻击")
+        attack.gk_state_name = "attack"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态待机")
+        idle.gk_state_name = "idle"
+        trans = anim.new_node(NN.GKNodeAnimTransition, "T")
+        gk_stub.connect(anim, attack, "转到", trans, "上游")
+        gk_stub.connect(anim, trans, "转到", idle, "进入")
+        trans.gk_cond_source = "FINISH"
+
+        setter = anim.new_node(NN.GKNodeAnimSetVar, "设标志",
+                               gk_var_name="is_attacking")
+        const = anim.new_node(NN.GKNodeConstBool, "假", gk_value=False)
+        gk_stub.connect(anim, attack, "离开时", setter, "执行")
+        gk_stub.connect(anim, const, "值", setter, "值")
+        anim.gk_variables = [types.SimpleNamespace(var_name="is_attacking",
+                                                  var_type="bool",
+                                                  default_value="0")]
+
+        code, warnings = self._build(anim)
+        self.assertEqual(warnings, [], warnings)
+        # 离开时的函数生成了,而且里面真的有赋值
+        self.assertIn("func _gk_anim_exit_", code)
+        self.assertIn("is_attacking = false", code)
+        # 进新状态时会按状态名分派(先跑离开时)
+        self.assertIn("match anim_state:", code)
+        self.assertIn('"attack":', code)
+
+    def test_dead_set_var_still_warns(self):
+        """没接在进入时/离开时上的『动画_设变量』仍然要告警。"""
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态待机")
+        idle.gk_state_name = "idle"
+        setter = anim.new_node(NN.GKNodeAnimSetVar, "孤儿设变量",
+                               gk_var_name="flag")
+        graph = NN.anim_tree_graph(anim)
+        self.assertTrue(any("不会被执行" in p for p in graph["problems"]),
+                        graph["problems"])
+        # 接到『进入时』之后就不该再报
+        gk_stub.connect(anim, idle, "进入时", setter, "执行")
+        graph = NN.anim_tree_graph(anim)
+        self.assertEqual([p for p in graph["problems"] if "不会被执行" in p], [])
+
+    def test_state_plays_multiple_animations(self):
+        """一个状态同时播多段动画 —— 骨骼动作 + 形态键动作。
+
+        用户的 MMD 模型就是这样:两段动画分开,要看完整动作必须同时播。
+        Godot 的 AnimationPlayer 一次只能播一段(play() 会顶掉上一段),
+        所以额外的几段走"层播放器"(复制出来的第二个播放器)。
+        """
+
+        class FakeAction:
+            def __init__(self, name):
+                self.name = name
+
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态待机")
+        idle.gk_state_name = "idle"
+        idle.gk_anim_action_2 = FakeAction("形态键动作")
+        code, warnings = self._build(anim)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_anim_enter_idle", code)
+        self.assertIn("_gk_layer_player(", code)
+        self.assertIn('_gk_layer_player(_ap0, 1)', code)
+        self.assertIn('"形态键动作"', code)
+        # 切走的时候要把层播放器停掉,否则多播的那段会一直播下去
+        self.assertIn(".stop()", code)
+
+    def test_anim_finished_node_in_logic_tree(self):
+        """『动画_播放完成』能在**玩法图**里用,并且会补上信号连接。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        finished = tree.new_node(NN.GKNodeAnimFinished, "播完了",
+                                 gk_anim_name="攻击")
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        setter = tree.new_node(NN.GKNodeSetVar, "清标志",
+                               gk_var_name="is_attacking")
+        const = tree.new_node(NN.GKNodeConstBool, "假", gk_value=False)
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, finished, "完成", branch, "条件")
+        gk_stub.connect(tree, branch, "是", setter, "执行")
+        gk_stub.connect(tree, const, "值", setter, "值")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_anim_finished == "攻击"', code)
+        # 玩法图里没人在 _ready 里连过信号 -> 生成器要自己补一个
+        self.assertIn("animation_finished.connect(_gk_on_anim_finished)", code)
+        self.assertIn("animation_started.connect(_gk_on_anim_started)", code)
+        self.assertIn("func _ready()", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_finished_flag_is_sticky_until_next_play(self):
+        """标志"粘住"到下一段动画开播 —— 否则复合条件永远等不到。
+
+        如果标志只活一帧,"动画播完了**并且**在地面上"这种条件在玩家
+        还没落地时就永远错过了。
+        清理走 `animation_started` 信号:所有开播路径都覆盖得到。
+        """
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        attack = anim.new_node(NN.GKNodeAnimState, "状态攻击")
+        attack.gk_state_name = "attack"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态待机")
+        idle.gk_state_name = "idle"
+        trans = anim.new_node(NN.GKNodeAnimTransition, "T")
+        gk_stub.connect(anim, attack, "转到", trans, "上游")
+        gk_stub.connect(anim, trans, "转到", idle, "进入")
+        trans.gk_cond_source = "FINISH"          # 用上"播完"这套机制
+        code, warnings = self._build(anim)
+        self.assertEqual(warnings, [], warnings)
+        # 进新状态时清一次 + 有新动画开播时清一次
+        self.assertIn('_gk_anim_finished = ""', code)
+        self.assertIn("func _gk_on_anim_started(", code)
+        self.assertIn("animation_started.connect(", code)
+        # 连接要落在 _ready 里,不能每帧查一遍
+        ready = code.split("func _ready", 1)[1].split("\nfunc ", 1)[0]
+        self.assertIn("animation_finished.connect(", ready)
+
+
+class TestAnimStartExit(Base):
+    """『动画_开始』『动画_结束』两个口 + 布尔状态输出(用户 2026-10-03)。
+
+    用户的话:"游戏动画节点图中应有一个开始口和结束口,明确从哪里开始动画,
+    哪里结束动画,然后可以输出这一个游戏动画的布尔情况,以便于在游戏逻辑里
+    判断执行下一步逻辑";"游戏动画开始时的条件可自定义"。
+    """
+
+    def _tree(self, **entry_props):
+        import types
+
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        start = anim.new_node(NN.GKNodeAnimEntry, "开始", **entry_props)
+        exit_node = anim.new_node(NN.GKNodeAnimExit, "结束")
+        playing = anim.new_node(NN.GKNodeAnimState, "状态攻击")
+        playing.gk_state_name = "attack"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态待机")
+        idle.gk_state_name = "idle"
+        gk_stub.connect(anim, start, "开始", idle, "进入")
+        # 攻击是起始状态的一个出线;攻击打完 -> 结束口
+        trans = anim.new_node(NN.GKNodeAnimTransition, "T")
+        gk_stub.connect(anim, idle, "转到", trans, "上游")
+        gk_stub.connect(anim, trans, "转到", playing, "进入 2")
+        trans.gk_cond_source = "ACTION_JUST"
+        trans.gk_cond_action = "attack"
+        gk_stub.connect(anim, playing, "转到", exit_node, "进入")
+
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            detach_anim_tree(original)
+        return code, warnings, anim
+
+    def test_explicit_entry_wins_over_topology(self):
+        """有开始口时,起始状态 = 开始口连的那个(不用再靠拓扑猜)。"""
+        code, warnings, anim = self._tree(gk_start_mode="NOW")
+        self.assertEqual(warnings, [], warnings)
+        graph = NN.anim_tree_graph(anim)
+        self.assertEqual(NN.anim_state_name(graph["entry"]), "idle")
+        # 开始口存在 -> 生成"条件成立才开演"的闸门 + 结束处理
+        self.assertIn("_gk_anim_started", code)
+        self.assertIn("_gk_anim_done", code)
+        self.assertIn("func _gk_anim_finish()", code)
+        self.assertIn('_gk_anim_enter("idle")', code)
+        # 转场只在"在跑"的时候判
+        self.assertIn("if _gk_anim_started:", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_start_condition_variants(self):
+        """开始条件可以选:变量 / 刚按下 / 播完 / 接引脚(不用接线)。"""
+        code, warnings, _anim = self._tree(gk_start_mode="VAR",
+                                           gk_var_name="battle_on")
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("if battle_on:", code)
+
+        code, warnings, _anim = self._tree(gk_start_mode="ACTION_JUST",
+                                           gk_cond_action="attack")
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.is_action_just_pressed(ACTION_ATTACK)", code)
+
+        code, warnings, _anim = self._tree(gk_start_mode="FINISH",
+                                           gk_anim_name="intro")
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_anim_finished == "intro"', code)
+
+    def test_start_condition_without_wire_warns(self):
+        """选了『自己写』但条件引脚空着 -> 明确告警(否则这张图永远不动)。"""
+        _code, warnings, _anim = self._tree(gk_start_mode="PIN")
+        self.assertTrue(any("开始" in w and "条件" in w for w in warnings),
+                        warnings)
+
+    def test_status_outputs_are_boolean(self):
+        """『动画_运行状态』把布尔情况交给玩法图。"""
+        import types
+
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        start = anim.new_node(NN.GKNodeAnimEntry, "开始")
+        exit_node = anim.new_node(NN.GKNodeAnimExit, "结束")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态待机")
+        idle.gk_state_name = "idle"
+        gk_stub.connect(anim, start, "开始", idle, "进入")
+        gk_stub.connect(anim, idle, "转到", exit_node, "进入")
+
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        branch = tree.new_node(NN.GKNodeBranch, "如果结束了")
+        status = tree.new_node(NN.GKNodeAnimStatus, "动画状态")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="done")
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        gk_stub.connect(tree, physics, "执行", branch, "执行")
+        gk_stub.connect(tree, status, "已结束", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            detach_anim_tree(original)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_anim_done", code)
+        self.assertIn("if _gk_anim_done:", code)
+
+    def test_no_entry_no_exit_keeps_old_output(self):
+        """没放开始口/结束口的**老图**生成结果不变(不带闸门)。"""
+        code, warnings = self._build([("idle", "在移动", "run")]) \
+            if hasattr(self, "_build") else (None, None)
+        # 用最朴素的图直接验证:只有状态 + 转场
+        import types
+
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        run = anim.new_node(NN.GKNodeAnimState, "状态run")
+        run.gk_state_name = "run"
+        trans = anim.new_node(NN.GKNodeAnimTransition, "T")
+        gk_stub.connect(anim, idle, "转到", trans, "上游")
+        gk_stub.connect(anim, trans, "转到", run, "进入")
+        gk_stub.connect(anim, loco, "在移动", trans, "条件")
+
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            detach_anim_tree(original)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_anim_started", code)
+        self.assertNotIn("_gk_anim_done", code)
+        self.assertIn('if anim_state == "idle":', code)
+
+
+class TestMultipleAnimTrees(Base):
+    """一个玩法图里放**多个**『动画_状态机』(用户 2026-10-03 的疑问)。
+
+    用户原话:"一个游戏逻辑里是否可以有多个游戏动画?因为我在动画_状态机
+    节点中发现,它并不能指定与自定义选择哪个游戏动画,就是如果创建多个
+    游戏动画,但动画_状态机只显示第一个创建的。"
+
+    答案是**能** —— 但以前真的不行:两张树都写进同一个 `anim_state`、
+    共用同一个 `_gk_anim_enter`,后一张把前一张整个盖掉(这个测试当时
+    跑出来就是"只有一个 anim_state / 一个 _gk_anim_enter")。
+    """
+
+    def _two_trees(self):
+        import types
+
+        def make_anim(name, states, first, second):
+            tree = gk_stub.StubNodeTree(name)
+            tree.bl_idname = "GKAnimationTree"
+            made = {}
+            for state in states:
+                node = tree.new_node(NN.GKNodeAnimState, "状态" + state)
+                node.gk_state_name = state
+                made[state] = node
+            trans = tree.new_node(NN.GKNodeAnimTransition, "T")
+            gk_stub.connect(tree, made[first], "转到", trans, "上游")
+            gk_stub.connect(tree, trans, "转到", made[second], "进入")
+            trans.gk_cond_source = "FINISH"
+            return tree
+
+        anim_a = make_anim("角色动作", ["idle", "run"], "idle", "run")
+        anim_b = make_anim("UI动作", ["normal", "hover"], "normal", "hover")
+
+        logic = make_tree()
+        event = logic.new_node(NN.GKNodeOnReady, "准备")
+        ref_a = logic.new_node(NN.GKNodeAnimStateMachineRef, "状态机A")
+        ref_a.gk_tree_name = "角色动作"
+        ref_b = logic.new_node(NN.GKNodeAnimStateMachineRef, "状态机B")
+        ref_b.gk_tree_name = "UI动作"
+        # 两台机器必须用**不同**的状态变量名 —— 同名会互相覆盖,
+        # 生成器会明确告警(而不是偷偷给第二台改名,那会让
+        # 『动画_运行状态』读到错的那一份)
+        ref_b.gk_state_var = "ui_state"
+        gk_stub.connect(logic, event, "执行", ref_a, "执行")
+        gk_stub.connect(logic, ref_a, "完成", ref_b, "执行")
+
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[anim_a, anim_b]))
+        try:
+            code, warnings = gen(logic, V3)
+        finally:
+            detach_anim_tree(original)
+        return code, warnings
+
+    def test_two_trees_get_their_own_state_and_functions(self):
+        """两张动画树 -> 两套状态变量 + 两个进入函数,互不覆盖。"""
+        code, warnings = self._two_trees()
+        self.assertEqual(warnings, [], warnings)
+        # 两套状态变量(各用各的名字)
+        self.assertIn("var anim_state: String", code)
+        self.assertIn("var ui_state: String", code)
+        # 两个进入函数
+        self.assertIn("func _gk_anim_enter(", code)
+        self.assertIn("func _gk_anim_enter_2(", code)
+        # 各自的起始状态都播了(不是只播第一张树的)
+        self.assertIn('_gk_anim_enter("idle")', code)
+        self.assertIn('_gk_anim_enter_2("normal")', code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_same_state_var_name_warns(self):
+        """两台状态机用同一个状态变量名 -> 明确告警(不是偷偷改名)。
+
+        偷偷把第二台改成 anim_state_2 的话,按名字读状态的
+        『动画_运行状态』就永远读到错的那一份。
+        """
+        import types
+
+        anim = gk_stub.StubNodeTree("角色动作")
+        anim.bl_idname = "GKAnimationTree"
+        state = anim.new_node(NN.GKNodeAnimState, "A")
+        state.gk_state_name = "idle"
+
+        logic = make_tree()
+        event = logic.new_node(NN.GKNodeOnReady, "准备")
+        ref_a = logic.new_node(NN.GKNodeAnimStateMachineRef, "状态机A")
+        ref_b = logic.new_node(NN.GKNodeAnimStateMachineRef, "状态机B")
+        gk_stub.connect(logic, event, "执行", ref_a, "执行")
+        gk_stub.connect(logic, ref_a, "完成", ref_b, "执行")
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            _code, warnings = gen(logic, V3)
+        finally:
+            detach_anim_tree(original)
+        self.assertTrue(any("状态变量名" in w for w in warnings), warnings)
+
+    def test_tree_name_picks_the_right_tree(self):
+        """『树名』真的决定用哪张树 —— 不是永远第一张。"""
+        import types
+
+        anim_a = gk_stub.StubNodeTree("角色动作")
+        anim_a.bl_idname = "GKAnimationTree"
+        state_a = anim_a.new_node(NN.GKNodeAnimState, "A")
+        state_a.gk_state_name = "idle"
+        anim_b = gk_stub.StubNodeTree("UI动作")
+        anim_b.bl_idname = "GKAnimationTree"
+        state_b = anim_b.new_node(NN.GKNodeAnimState, "B")
+        state_b.gk_state_name = "normal"
+
+        logic = make_tree()
+        event = logic.new_node(NN.GKNodeOnReady, "准备")
+        ref = logic.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        ref.gk_tree_name = "UI动作"          # ← 指名要第二张
+        gk_stub.connect(logic, event, "执行", ref, "执行")
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[anim_a, anim_b]))
+        try:
+            code, _warnings = gen(logic, V3)
+        finally:
+            detach_anim_tree(original)
+        self.assertIn('_gk_anim_enter("normal")', code)
+        self.assertNotIn('_gk_anim_enter("idle")', code)
+
+
+class TestInputDirectionAndBones(Base):
+    """第四轮:输入_方向(整合) + 骨骼节点(照 UPBGE 的 Get/Set Bone Data)。"""
+
+    def test_input_direction_gives_vector_and_components(self):
+        """一个『输入_方向』直接给 方向 / 左右 / 前后 —— 不用设变量。
+
+        用户原话:"这两个都可以整合到一起的,比如输入按键时有 x,y 的属性
+        输出,这样就可以调节向前向量和向右向量……这应该是自带的,
+        不应该要再设置变量"。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向",
+                                  gk_key_up="W", gk_key_down="S",
+                                  gk_key_left="A", gk_key_right="D")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, direction, "方向", move, "方向")
+        # 分量也要能单独取出来(向前向量 / 向右向量)
+        gk_stub.connect(tree, direction, "前后", printer, "内容")
+        code, warnings = gen(tree, V3)
+        # 会有"速度 300 在 3D 里不像米/秒"的提醒 —— 这里只关心输入节点
+        self.assertFalse([w for w in warnings if "输入" in w], warnings)
+        self.assertIn("Input.get_action_strength(ACTION_KEY_D)", code)
+        # 分量先落局部变量:不必把同一个调用写两遍
+        self.assertIn("var _in_x", code)
+        # 3D 项目里『方向』给的是 Vector3(否则 velocity.z 会报 Vector2 没 .z)
+        self.assertIn("Vector3(_in_x", code)
+        # 斜着走不加速:夹的是**分量**(夹向量的话 3D 那条路根本用不上)
+        self.assertIn("_in_x1 /= _in_len3", code)
+        self.assertIn("_in_y2 /= _in_len3", code)
+        self.assertIn("_in_len", code)                # 斜着走不加速
+
+    def test_input_direction_key_capture_reaches_export(self):
+        """四个方向捕获的键都要跟着导出(按键 -> project.godot)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向",
+                                  gk_key_up="W", gk_key_down="S",
+                                  gk_key_left="A", gk_key_right="D")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        gk_stub.connect(tree, direction, "方向", printer, "内容")
+        _code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        pairs = dict((item[0], item[1]) if isinstance(item, (tuple, list))
+                     else (item, "") for item in codegen.last_used_actions)
+        for action, key in (("key_w", "W"), ("key_s", "S"),
+                            ("key_a", "A"), ("key_d", "D")):
+            self.assertEqual(pairs.get(action), key, pairs)
+
+    def test_set_bone_rotation_is_additive(self):
+        """骨骼_设置(保留)= 在原姿势上叠乘,不覆盖动画自己的动作。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        bone = tree.new_node(NN.GKNodeSetBone, "点头",
+                             gk_bone="head", gk_mode="ADD",
+                             gk_do_rot=True, gk_do_pos=False)
+        gk_stub.connect(tree, event, "执行", bone, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('find_bone("head")', code)
+        self.assertIn("get_bone_pose_rotation", code)
+        self.assertIn("Quaternion.from_euler", code)
+        # 找不到骨头要**告警**而不是让 Godot 刷一屏 -1 越界
+        self.assertIn("找不到骨骼", code)
+        self.assertIn("func _gk_find_skeleton", code)
+
+    def test_get_bone_outputs(self):
+        """骨骼_取数据:位置 / 旋转 / 缩放 / 世界位置(枪口在哪)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        bone = tree.new_node(NN.GKNodeGetBone, "枪口", gk_bone="weapon_r")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        gk_stub.connect(tree, bone, "世界位置", printer, "内容")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_read_bone", code)
+        self.assertIn('"world"', code)
+        self.assertIn("get_bone_global_pose", code)
+
+    def test_bone_follows_camera_every_frame(self):
+        """骨骼_跟随视角:每物理帧跟着相机偏,带权重 + 限角 + 平滑。
+
+        这就是回答"第一人称转视角时能不能让角色一部分模型跟着转"。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        look = tree.new_node(NN.GKNodeBoneLookAtCamera, "脖子跟随",
+                             gk_bone="head", gk_camera="Camera",
+                             gk_yaw_weight=0.5, gk_pitch_weight=0.35,
+                             gk_limit=60.0, gk_smooth=8.0)
+        gk_stub.connect(tree, event, "执行", look, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        physics = code.split("func _physics_process", 1)[1]
+        self.assertIn("find_bone(\"head\")", physics)
+        self.assertIn("set_bone_pose_rotation", physics)
+        self.assertIn("clampf", physics)          # 限角
+        self.assertIn("lerpf", physics)           # 平滑
+        self.assertIn("deg_to_rad(60.0)", physics)
+        # 挂 _ready 的那次只做绑定,不该把旋转写在那里
+        ready = code.split("func _ready", 1)[1].split("\nfunc ", 1)[0]
+        self.assertNotIn("set_bone_pose_rotation", ready)
+
+
+class TestCameraSuite(Base):
+    """摄像机套件(照虚幻的 Camera + SpringArm)。
+
+    用户 2026-10-03 第四轮:"摄像机的设置,切换,启用与禁用,视距,视野,
+    分支的场景摄像机的设置,切换,启用与禁用,弹簧臂的设计,摄像机的旋转,
+    缩放,位置等向量,浮点,两变量的设计,同样是按照虚幻蓝图进行"。
+    """
+
+    def test_camera_enable_disable(self):
+        """启用 = make_current;禁用 = **正开着才**摘下来。
+
+        不做"是不是我开着"的判断的话,禁用一台没用着的相机会把
+        当前画面弄黑(用户会以为游戏崩了)。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        on = tree.new_node(NN.GKNodeCameraActive, "开A", gk_target="主相机",
+                           gk_active=True)
+        off = tree.new_node(NN.GKNodeCameraActive, "关B", gk_target="备用相机",
+                           gk_active=False)
+        gk_stub.connect(tree, event, "执行", on, "执行")
+        gk_stub.connect(tree, on, "完成", off, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".make_current()", code)
+        self.assertIn(".is_current():", code)
+        self.assertIn(".clear_current()", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_camera_setup_fov_and_distance(self):
+        """『相机_设置』:视野 + 视距(沿相机朝向推远),带平滑走 Tween。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        setup = tree.new_node(NN.GKNodeCameraSetup, "设机位",
+                              gk_fov=45.0, gk_distance=1.5, gk_smooth=0.4)
+        gk_stub.connect(tree, event, "执行", setup, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("tween_property", code)
+        self.assertIn('"fov"', code)
+        # 视距 = 沿相机自己的 +Z 退(Godot 相机朝 -Z 看,所以退是 +Z)
+        self.assertIn("global_transform.basis.z", code)
+        self.assertIn("global_position + ", code)
+
+    def test_camera_setup_zero_means_leave_alone(self):
+        """『相机_设置』没填的项(0)= **不动它**,不能生成 `camera.fov = 0`。
+
+        用户真跑踩到的:节点上视野没填(默认 0),生成出 fov = 0 ——
+        Godot 里那是"镜头废掉",画面直接不对,而节点看着完全正常。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        setup = tree.new_node(NN.GKNodeCameraSetup, "只推视距",
+                              gk_target="主相机", gk_fov=0.0,
+                              gk_distance=2.0)
+        gk_stub.connect(tree, event, "执行", setup, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn('"fov"', code)          # 视野没填 -> 不碰
+        self.assertNotIn(".fov = ", code)
+        self.assertIn("basis.z", code)           # 视距照做
+
+        # 两个都没填 -> 明确告警(而不是静默生成一个什么都不做的节点)
+        tree2 = make_tree()
+        event2 = tree2.new_node(NN.GKNodeOnReady, "准备")
+        idle = tree2.new_node(NN.GKNodeCameraSetup, "啥也没填",
+                              gk_target="主相机")
+        gk_stub.connect(tree2, event2, "执行", idle, "执行")
+        _code2, warnings2 = gen(tree2, V3)
+        self.assertTrue(any("什么都没设" in w for w in warnings2), warnings2)
+
+    def test_logic_ports_declared_and_validated(self):
+        """逻辑图的『对外端口』:声明了就生成变量,没声明会**明确告警**。
+
+        用户第 21 轮:"一个游戏逻辑最后应该输出布尔变量,以便与其他的
+        游戏逻辑联动"。以前是节点上随便填名字 —— 打错一个字母不报错,
+        别的图读到空值,你只会以为逻辑没跑到。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        out = tree.new_node(NN.GKNodeLogicOutput, "输出",
+                            gk_output_name="完成", gk_value=True)
+        gk_stub.connect(tree, event, "执行", out, "执行")
+
+        # 没声明端口 -> 明确告警(而且说清怎么修)
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("没有在侧栏" in w for w in warnings), warnings)
+
+        # 声明之后 -> 不告警,并且生成带类型的变量
+        tree.gk_ports.add()
+        tree.gk_ports[0].port_name = "完成"
+        tree.gk_ports[0].port_type = "bool"
+        tree.gk_ports[0].default_value = "false"
+        code, warnings2 = gen(tree, V3)
+        self.assertEqual([w for w in warnings2 if "端口" in str(w)], [])
+        # 变量名会被转成合法标识符(中文名 -> 英文),所以断言"类型 + 初值 +
+        # 赋值",而不是断言那个中文名。
+        self.assertIn(": bool = false", code)
+        self.assertIn(" = true", code)
+        # 导出报告里要能看到"这张图对外给了什么"
+        notes = " ".join(getattr(codegen, "last_notes", []) or [])
+        self.assertIn("对外端口", notes, notes)
+
+    def test_camera_position_vector_or_floats(self):
+        """『相机_位置』:向量引脚优先,没接就用 X/Y/Z 浮点。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        pos = tree.new_node(NN.GKNodeCameraPosition, "挪机位",
+                            gk_target="主相机", gk_mode="SET",
+                            gk_x=1.0, gk_y=2.0, gk_z=3.0)
+        gk_stub.connect(tree, event, "执行", pos, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Vector3(1.0, 2.0, 3.0)", code)
+        # SET = 直接换坐标(不是相加)
+        self.assertIn("global_position = Vector3(1.0, 2.0, 3.0)", code)
+
+        # 接了向量就用向量(浮点被忽略)
+        tree2 = make_tree()
+        event2 = tree2.new_node(NN.GKNodeOnReady, "准备")
+        vec = tree2.new_node(NN.GKNodeVectorMake, "向量",
+                             gk_x=7.0, gk_y=8.0, gk_z=9.0)
+        pos2 = tree2.new_node(NN.GKNodeCameraPosition, "挪机位",
+                              gk_target="主相机", gk_mode="ADD")
+        gk_stub.connect(tree2, event2, "执行", pos2, "执行")
+        gk_stub.connect(tree2, vec, "向量", pos2, "位置")
+        code2, warnings2 = gen(tree2, V3)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn("global_position + (Vector3(7.0, 8.0, 9.0))", code2)
+
+    def test_camera_rotation_clamps_pitch(self):
+        """『相机_旋转』:相对加法 + 俯仰限制(第一人称必备)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        rot = tree.new_node(NN.GKNodeCameraRotation, "转视角",
+                            gk_target="主相机", gk_mode="ADD",
+                            gk_yaw=1.0, gk_pitch=-0.5, gk_clamp_pitch=True)
+        gk_stub.connect(tree, event, "执行", rot, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("rotation_degrees + (Vector3(-0.5, 1.0, 0.0))", code)
+        self.assertIn("_gk_rot.x > 89.0", code)
+        self.assertIn("_gk_rot.x = -89.0", code)
+
+    def test_camera_spring_arm_runs_every_physics_frame(self):
+        """弹簧臂:每物理帧摆相机 + 碰撞缩短 + 平滑,而且**不穿墙**。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        arm = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂",
+                            gk_target="示例角色", gk_camera="Camera",
+                            gk_arm=5.0, gk_height=1.6, gk_pitch=-20.0,
+                            gk_collision=True, gk_lag=10.0)
+        gk_stub.connect(tree, event, "执行", arm, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 每帧逻辑必须在 _physics_process 里(和角色同一个时钟)
+        physics = code.split("func _physics_process", 1)[1]
+        self.assertIn("_gk_spring_", physics)
+        self.assertIn("intersect_ray", physics)
+        self.assertIn("PhysicsRayQueryParameters3D.create", physics)
+        # 排除自己:不排除的话杆子会被自己顶住,相机会贴到脸上
+        self.assertIn("_gk_exclude.append", physics)
+        self.assertIn("look_at", physics)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_camera_spring_arm_disabled_registers_nothing(self):
+        """关掉弹簧臂 = 不注册每帧逻辑(不是"注册了再判断")。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        arm = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂",
+                            gk_target="示例角色", gk_enabled=False)
+        gk_stub.connect(tree, event, "执行", arm, "执行")
+        code, _warnings = gen(tree, V3)
+        self.assertNotIn("intersect_ray", code)
+        self.assertNotIn("_gk_spring_pos", code)
+
+    def test_camera_status_outputs(self):
+        """『相机_取状态』:名字 / 位置 / 朝向 / 视野 / 开着吗。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        status = tree.new_node(NN.GKNodeCameraStatus, "相机状态")
+        setter = tree.new_node(NN.GKNodeSetVar, "记下来")
+        setter.gk_var_name = "cam_ready"
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, status, "开着吗", branch, "条件")
+        gk_stub.connect(tree, branch, "是", setter, "执行")
+        gk_stub.connect(tree, status, "相机名", printer, "内容")
+        gk_stub.connect(tree, setter, "完成", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_current_camera()", code)
+        self.assertIn("is_current()", code)
+        self.assertIn(".name", code)
+        self.assert_no_chinese_identifiers(code)
+
+
+class TestTimelineAndCamera(Base):
+    """时间轴 / 相机:缓动任意属性、视野平滑变化、丝滑切相机。"""
+
+    def test_tween_property_uses_godot_tween(self):
+        """『定时_缓动属性』-> Tween 驱动任意节点属性。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        tween = tree.new_node(NN.GKNodeTweenProperty, "推近",
+                              gk_property="fov", gk_to=30.0, gk_time=0.8)
+        gk_stub.connect(tree, event, "执行", tween, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('tween_property(self, "fov",', code)
+        self.assertIn("create_tween()", code)
+        self.assertIn("Tween.TRANS_SINE", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_tween_property_without_name_warns(self):
+        """没填属性名 -> 告警而不是生成一句错的。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        tween = tree.new_node(NN.GKNodeTweenProperty, "没填", gk_property="")
+        gk_stub.connect(tree, event, "执行", tween, "执行")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("属性" in w for w in warnings), warnings)
+
+    def test_camera_switch_with_blend(self):
+        """相机_切换 填了过渡 -> 生成插值 + 每帧推进的钩子。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头",
+                               gk_target="特写机位", gk_blend=0.6)
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_cam_blend_left", code)
+        self.assertIn("interpolate_with(", code)
+        self.assertIn("get_viewport().get_camera_3d()", code)
+        # 每帧推进必须在 _physics_process 里(和角色同一个时钟)
+        physics = code.split("func _physics_process", 1)[1]
+        self.assertIn("_gk_cam_blend_left", physics)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_camera_switch_without_blend_is_instant(self):
+        """没填过渡 = 老行为一字不变(直接 make_current)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头",
+                               gk_target="主相机", gk_blend=0.0)
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, _warnings = gen(tree, V3)
+        self.assertIn(".make_current()", code)
+        self.assertNotIn("_gk_cam_blend_left", code)
+
+    def test_camera_zoom_with_duration_uses_tween(self):
+        """相机_缩放 填了时长 -> Tween;默认 0 -> 和以前一样。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        zoom = tree.new_node(NN.GKNodeCameraZoom, "推近",
+                             gk_value=25.0, gk_time=1.2, gk_target="主相机")
+        gk_stub.connect(tree, event, "执行", zoom, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('tween_property(', code)
+        self.assertIn('"fov"', code)
+        self.assertIn("1.2", code)
+
+        tree2 = make_tree()
+        event2 = tree2.new_node(NN.GKNodeOnReady, "准备")
+        zoom2 = tree2.new_node(NN.GKNodeCameraZoom, "立刻", gk_value=25.0,
+                               gk_time=0.0, gk_target="主相机")
+        gk_stub.connect(tree2, event2, "执行", zoom2, "执行")
+        code2, _w = gen(tree2, V3)
+        # 未连线的数值会变成 @export 检查器参数(这是已有行为),所以检查
+        # "走的是立刻赋值那条路"而不是硬编码数字
+        self.assertIn(".fov = camera_zoom", code2)
+        self.assertNotIn("create_tween", code2)
+
+
+
+    """图状状态机在真实用法里踩出来的坑(每一条都是实测过的)。"""
+
+    def _anim_with(self, specs, with_physics=False, **ref_props):
+        """搭一张动画树 + 逻辑图。specs: [(状态名, 条件输出名, 目标状态名)]"""
+        import types
+
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        states = {}
+        for start, _cond, end in specs:
+            for name in (start, end):
+                if name not in states:
+                    node = anim.new_node(NN.GKNodeAnimState, "状态" + name)
+                    node.gk_state_name = name
+                    states[name] = node
+        for index, (start, cond, end) in enumerate(specs):
+            trans = anim.new_node(NN.GKNodeAnimTransition, f"T{index}")
+            gk_stub.connect(anim, states[start], "转到", trans, "上游")
+            gk_stub.connect(anim, trans, "转到", states[end], "进入")
+            if cond:
+                gk_stub.connect(anim, loco, cond, trans, "条件")
+
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机", **ref_props)
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        if with_physics:
+            physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+            printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="跑")
+            gk_stub.connect(tree, physics, "执行", printer, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            return gen(tree, {"dimension": "3",
+                              "base_class": "CharacterBody3D"})
+        finally:
+            detach_anim_tree(original)
+
+    def test_physics_process_is_not_declared_twice(self):
+        """『每当_物理帧』+ 动画状态机 -> **只能有一个** _physics_process。
+
+        ── 实测踩过(示例工程生成出来的脚本)────────────────────────
+        用户的事件生成的是 `func _physics_process(delta: float)`,
+        状态机生成的是 `func _physics_process(_delta: float)` —— 参数名不同,
+        按完整签名找永远找不到,于是脚本里出现**两个同名函数**:
+            Parse Error: Function "_physics_process()" already exists
+        Godot 直接拒绝加载,游戏一点都跑不起来。
+        """
+        code, warnings = self._anim_with([("idle", "在移动", "run")],
+                                         with_physics=True)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("func _physics_process("), 1, code)
+        # 两边的代码都在,而且都在那一个函数里
+        self.assertIn("print(\"跑\")", code)
+        self.assertIn('if anim_state == "idle":', code)
+        # 状态机的判断必须落在 _physics_process 里(不是 _ready 里)
+        tail = code.split("func _physics_process(", 1)[1]
+        self.assertIn('if anim_state == "idle":', tail.split("func ", 1)[0])
+
+    def test_wait_does_not_emit_downstream_twice(self):
+        """『等待_秒』后面的节点只能生成一次。
+
+        ── 实测踩过(示例工程里 `is_hurt = false` 出现了两行)──────────
+        `emit_statement()` 调用完处理器之后**已经**会沿『完成』往下走,
+        而 `_stmt_wait` 自己又调了一次 `_chain` —— 下游整段生成两遍。
+        接的是『音效_播放』『实例_生成』这类节点时,就是**真的执行两次**。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        wait = tree.new_node(NN.GKNodeWait, "等一秒")
+        wait.inputs.get("秒").default_value = 0.5
+        setter = tree.new_node(NN.GKNodeSetVar, "设标志", gk_var_name="flag")
+        boolean = tree.new_node(NN.GKNodeConstBool, "真", gk_value=True)
+        gk_stub.connect(tree, event, "执行", wait, "执行")
+        gk_stub.connect(tree, wait, "完成", setter, "执行")
+        gk_stub.connect(tree, boolean, "值", setter, "值")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("flag = true"), 1, code)
+        self.assertEqual(code.count("create_timer"), 1, code)
+
+    def test_variable_collision_with_export_is_renamed(self):
+        """脚本变量和检查器参数重名 -> 自动改名,不能生成两个同名变量。
+
+        ── 实测踩过(示例工程里动画树有个变量叫 move_speed)──────────
+        『移动_按方向』的『速度』会生成
+            @export var move_speed: float = 6.0
+        而动画树里的变量也叫 move_speed -> Godot:
+            Parse Error: Variable "move_speed" has the same name as a
+            previously declared variable
+        整个脚本加载失败。变量是用户起的名字,保住它,把自动生成的参数改名。
+        """
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        anim.gk_variables = [types.SimpleNamespace(var_name="move_speed",
+                                                  var_type="float",
+                                                  default_value="1.5")]
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, {"dimension": "3",
+                                        "base_class": "CharacterBody3D"})
+        finally:
+            detach_anim_tree(original)
+        self.assertTrue(any("重名" in w for w in warnings), warnings)
+        # 两个名字都必须只声明一次,而且不能同名
+        self.assertEqual(code.count("var move_speed:"), 1, code)
+        self.assertEqual(code.count("var move_speed_param:"), 1, code)
+
+    def test_state_has_adjustable_inlets(self):
+        """『动画_状态』的入口数量可调。
+
+        ── 为什么需要(Blender 的硬限制)────────────────────────────
+        **一个输入引脚只允许一条连线**。多个转场指向同一个状态时,
+        后接的会把前一条**顶掉**(画布上箭头会跳走)。
+        所以入口要能加:进入 / 进入 2 / 进入 3 …
+        """
+        node = make_tree().new_node(NN.GKNodeAnimState, "状态")
+        self.assertEqual([s.name for s in node.inputs], ["进入", "进入 2"])
+        node.gk_in_count = 4
+        node.build_sockets()
+        self.assertEqual([s.name for s in node.inputs],
+                         ["进入", "进入 2", "进入 3", "进入 4"])
+        # 老文件里接在『进入』上的线不会因为改名而断
+        self.assertEqual(node.inputs[0].name, "进入")
+
+
 class TestAnimChain(Base):
     """A 方案:照虚幻 5 的状态机 —— 状态连成链,转场带条件。
 
@@ -3070,40 +4250,134 @@ class TestAnimChain(Base):
         self.assertIn("转到", [s.name for s in node.outputs])
 
     def test_entry_state_is_the_one_without_incoming(self):
-        """『进入』没接线的状态 = 起始状态(照 UE5 的 Entry 节点)。"""
+        """没有任何转场指向的状态 = 起始状态(照 UE5 的 Entry 节点)。
+
+        而且它**必须真的被播**。老代码只写 `anim_state = "idle"`,
+        从头到尾没有一处 play() —— 用户进游戏后角色一直摆着不动,
+        这正是他报的"动画_状态机未能正常工作"的一半原因。
+        """
         code, warnings = self._build([("idle", "在移动", "run")])
         self.assertEqual(warnings, [], warnings)
-        self.assertIn('anim_state = "idle"', code)
+        self.assertIn('_gk_anim_enter("idle")', code)
+        # 进入状态那个函数里必须真的调 play(而不是只记名字)
+        self.assertIn(".play(next_state)", code)
 
     def test_chain_generates_two_transitions(self):
         code, warnings = self._build([("idle", "在移动", "run"),
                                       ("run", "已离地", "jump")])
         self.assertEqual(warnings, [], warnings)
-        self.assertIn('if anim_state == "idle" and', code)
-        self.assertIn('anim_state = "run"', code)
-        self.assertIn('if anim_state == "run" and', code)
-        self.assertIn('anim_state = "jump"', code)
-        self.assertIn('.play("run"', code)
-        self.assertIn('.play("jump"', code)
+        self.assertIn('if anim_state == "idle":', code)
+        self.assertIn('_gk_anim_enter("run")', code)
+        self.assertIn('elif anim_state == "run":', code)
+        self.assertIn('_gk_anim_enter("jump")', code)
         self.assert_no_chinese_identifiers(code)
         self.assert_indent_sane(code)
 
     def test_cycle_does_not_hang(self):
-        """状态机天然有环(idle -> run -> idle),不能无限递归。
+        """状态机天然有环(idle -> run -> idle),导出不能无限递归。
 
-        回到已经走过的状态就停 —— 语义上也对:那条转移的起点状态
-        已经在链上生成过了,再走一遍只会生成重复代码。
+        ── 这一条和上一版的区别 ────────────────────────────────────
+        上一版是"沿着链走一圈,走到走过的状态就停",环里的**第二条转移
+        会被丢掉**(run -> idle 不生成)。现在按**图**生成:每个状态
+        只看自己的出边,环天然成立,两条转移都在。
         """
-        code, _warnings = self._build([("idle", "在移动", "run"),
-                                       ("run", "速度快", "idle")])
-        # 第一条照常生成
-        self.assertIn('if anim_state == "idle" and', code)
-        self.assertIn('anim_state = "run"', code)
-        # 环保护生效:不会出现"run 切回 idle"那段(走到了已访问的 idle)
-        self.assertNotIn('anim_state = "idle"\n', code.replace(
-            'anim_state = "idle"\n', '', 1) and 'x' or '')
-        # 关键:不崩、不无限递归
+        code, warnings = self._build([("idle", "在移动", "run"),
+                                      ("run", "速度快", "idle")])
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_anim_enter("run")', code)
+        self.assertIn('_gk_anim_enter("idle")', code)
         self.assertIn("func _physics_process", code)
+
+    def test_state_can_have_many_outgoing_transitions(self):
+        """一个状态多条出线 —— 真实状态机最常见的形状。
+
+        实测踩过:老实现走链只取第一条线,第二条**静默丢掉**,
+        于是 `idle -> run` 和 `idle -> jump` 只能活一个。
+        """
+        code, warnings = self._build([("idle", "在移动", "run"),
+                                      ("idle", "已离地", "jump")])
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('if anim_state == "idle":', code)
+        self.assertIn('_gk_anim_enter("run")', code)
+        self.assertIn('_gk_anim_enter("jump")', code)
+        # 状态内部用 elif:一帧只走一步(否则同一帧能连跳好几个状态,
+        # 中间的动作一帧都播不出来)
+        self.assertIn("elif", code)
+        # 两条线都在同一个 if anim_state == "idle" 段里
+        segment = code.split('if anim_state == "idle":', 1)[1]
+        segment = segment.split("func ", 1)[0]
+        self.assertIn("_gk_anim_enter(", segment)
+
+    def test_direct_state_link_means_play_then_switch(self):
+        """状态直接连状态(中间不放过转场)= "这段动画播完就切"。
+
+        用户实际的图就是这么连的(他的『转场』上游空着、状态的『转到』
+        直接指向下一个状态)。老实现把这种情况判成"链路到此为止",
+        导出后 _physics_process 只剩一句 pass。
+        """
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        first = anim.new_node(NN.GKNodeAnimState, "状态骨骼动作", (0.0, 0.0))
+        first.gk_state_name = "骨骼动作"
+        second = anim.new_node(NN.GKNodeAnimState, "状态形态键", (0.0, -200.0))
+        second.gk_state_name = "形态键动作"
+        gk_stub.connect(anim, first, "转到", second, "进入")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, {"dimension": "3",
+                                        "base_class": "CharacterBody3D"})
+        finally:
+            detach_anim_tree(original)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_anim_enter("骨骼动作")', code)
+        # 条件是"骨骼动作 播完了" —— 靠 animation_finished 信号记下来的名字。
+        # **不能**写成 `current_animation == "骨骼动作" and not is_playing()`:
+        # 真 Godot 4.7 实测,一次性动画播完时 current_animation 会被清成 ""
+        # (见 codegen._anim_finished_helpers 里的实测数据),那个条件永远不成立。
+        self.assertIn('if (_gk_anim_finished == "骨骼动作"):', code)
+        self.assertNotIn("current_animation ==", code)
+        self.assertIn("animation_finished.is_connected(", code)
+        self.assertIn("animation_finished.connect(", code)
+        self.assertIn("func _gk_on_anim_finished(anim_name: StringName)", code)
+        self.assertIn('_gk_anim_finished = ""', code)
+        self.assertIn('_gk_anim_enter("形态键动作")', code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_transition_can_use_state_dropdowns(self):
+        """忘了连线时,转场的『从』/『到』下拉也能把图接起来(用户确认要)。"""
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        run = anim.new_node(NN.GKNodeAnimState, "状态run")
+        run.gk_state_name = "run"
+        trans = anim.new_node(NN.GKNodeAnimTransition, "转场",
+                              gk_from_state="idle", gk_to_state="run")
+        gk_stub.connect(anim, loco, "在移动", trans, "条件")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, {"dimension": "3",
+                                        "base_class": "CharacterBody3D"})
+        finally:
+            detach_anim_tree(original)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('if anim_state == "idle":', code)
+        self.assertIn('_gk_anim_enter("run")', code)
 
     def test_orphan_state_warns(self):
         """真的孤立的状态(没连进来) -> 明确告警,而不是静默丢掉。
@@ -3130,6 +4404,119 @@ class TestAnimChain(Base):
         _code, warnings = self._build([("idle", None, "run")])
         self.assertTrue(any("没有条件" in w for w in warnings), warnings)
 
+    def test_wired_condition_ignored_when_source_is_input(self):
+        """接了条件线、『条件来源』却选了输入 -> 线被忽略,必须说出来。
+
+        用户实测就是这样:『在地面』接在『条件』上,而『条件来源』是
+        "选输入:按住 move_right"。光看图完全看不出哪边生效。
+        """
+        def extra(anim, states, loco):
+            trans = anim.new_node(NN.GKNodeAnimTransition, "T输入",
+                                  gk_cond_source="ACTION_PRESSED",
+                                  gk_cond_action="move_right")
+            gk_stub.connect(anim, states["idle"], "转到", trans, "上游")
+            gk_stub.connect(anim, trans, "转到", states["run"], "进入")
+            gk_stub.connect(anim, loco, "在移动", trans, "条件")
+
+        code, warnings = self._build([("idle", "在移动", "run")], extra=extra)
+        self.assertTrue(any("被忽略" in w for w in warnings), warnings)
+        self.assertIn("Input.is_action_pressed(", code)
+
+    def test_duplicate_state_names_warn(self):
+        """两个状态同名 -> 必须告警(状态机按名字判断该播谁)。"""
+        code, warnings = self._build(
+            [("idle", "在移动", "run")],
+            extra=lambda anim, states, loco: setattr(
+                states["run"], "gk_state_name", "idle"))
+        self.assertTrue(any("都叫" in w for w in warnings), warnings)
+
+    def test_only_enter_mode_emits_inline(self):
+        """『只在开始时判』= 不挂 _physics_process,就地判一次。
+
+        这条路径改起来最容易漏(状态图有两个生成点),所以钉住:
+        它必须也能生成出**语法完整**的 if/elif,而不是半截。
+        """
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        run = anim.new_node(NN.GKNodeAnimState, "状态run")
+        run.gk_state_name = "run"
+        trans = anim.new_node(NN.GKNodeAnimTransition, "T")
+        gk_stub.connect(anim, idle, "转到", trans, "上游")
+        gk_stub.connect(anim, trans, "转到", run, "进入")
+        gk_stub.connect(anim, loco, "在移动", trans, "条件")
+
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机",
+                            gk_check_mode="ON_ENTER")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, warnings = gen(tree, {"dimension": "3",
+                                        "base_class": "CharacterBody3D"})
+        finally:
+            detach_anim_tree(original)
+        self.assertEqual(warnings, [], warnings)
+        # 就地判一次:没有 _physics_process,但在 _ready 里有转移判断
+        self.assertNotIn("func _physics_process", code)
+        self.assertIn('if anim_state == "idle":', code)
+        self.assertIn('_gk_anim_enter("run")', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_deprecated_player_property_is_ignored(self):
+        """『动画_状态机』上的『动画播放器』物体选择已经废弃。
+
+        用户要求删掉它("在此物体选择动画_状态机时自然是作用于本身")。
+        老文件里可能还存着值 —— 不能让它复活成 `$别的物体`,
+        否则会把动画播到别的节点上,而且路径还可能根本不存在。
+        """
+        tree = make_tree()
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机",
+                            gk_player="场景里的别的物体")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            code, _warnings = gen(tree, {"dimension": "3",
+                                         "base_class": "CharacterBody3D"})
+        finally:
+            detach_anim_tree(original)
+        self.assertIn("_gk_find_animation_player(self)", code)
+        self.assertNotIn("场景里的别的物体", code)
+
+    def test_no_player_pin_on_state_machine_ref(self):
+        """『动画_状态机』不该再有『动画播放器』引脚(用户要求删掉)。"""
+        node = make_tree().new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        names = [s.name for s in node.inputs]
+        self.assertNotIn("动画播放器", names, names)
+        self.assertIn("执行", names)
+        self.assertIn("树名", names)
+
+    def test_entry_animation_played_only_once(self):
+        """起始状态的动画只在 anim_state 为空时播一次。
+
+        不加这层保护的话,每帧都会重新 play("idle") —— 动画永远停在
+        第一帧,看起来就是"角色卡住不动"。
+        """
+        code, _warnings = self._build([("idle", "在移动", "run")])
+        self.assertIn("if anim_state.is_empty():", code)
+        ready = code.split("func _ready", 1)[1].split("func ", 1)[0]
+        self.assertEqual(ready.count('_gk_anim_enter("idle")'), 1)
+
     def test_transition_to_wrong_node_warns(self):
         """转场连到了非状态节点 -> 告警而不是崩。
 
@@ -3139,16 +4526,30 @@ class TestAnimChain(Base):
         也就是**直接崩掉导出**,所以必须挡住并给人话。
         """
         def bad(anim, states, loco):
-            wrong = anim.new_node(NN.GKNodeAnimLocomotion, "不是状态")
+            # 靶子用**另一个转场节点**(有『上游』这个执行流输入引脚,
+            # 但它显然不是『动画_状态』)—— 模拟"用户连错了对象"
+            wrong = anim.new_node(NN.GKNodeAnimTransition, "不是状态")
             t2 = anim.new_node(NN.GKNodeAnimTransition, "T坏")
             gk_stub.connect(anim, states["run"], "转到", t2, "上游")
-            # 连到 loco 的**输入**引脚上(stub 允许,真实 Blender 里
-            # 类型不匹配连不上;这里模拟"用户连错了"的最坏情况)
-            gk_stub.connect(anim, t2, "转到", wrong, "角色")
+            gk_stub.connect(anim, t2, "转到", wrong, "上游")
 
         _code, warnings = self._build([("idle", "在移动", "run")], extra=bad)
         self.assertTrue(any("不是『动画_状态』" in w for w in warnings),
                         warnings)
+
+    def test_transition_from_wrong_node_warns(self):
+        """转场的『上游』接到了非状态节点 -> 说清接的是什么。
+
+        用户会觉得"我明明接了线啊" —— 所以不能只说"不知道从哪切过来"。
+        """
+        def bad(anim, states, loco):
+            t2 = anim.new_node(NN.GKNodeAnimTransition, "T坏上游")
+            gk_stub.connect(anim, loco, "在地面", t2, "上游")
+            gk_stub.connect(anim, t2, "转到", states["run"], "进入")
+            gk_stub.connect(anim, loco, "在移动", t2, "条件")
+
+        _code, warnings = self._build([("idle", "在移动", "run")], extra=bad)
+        self.assertTrue(any("『上游』接的是" in w for w in warnings), warnings)
 
     def test_no_entries_warns(self):
         """一个入口都没有 -> 提示怎么搭。"""
@@ -3205,6 +4606,344 @@ class TestAnimChain(Base):
                           "GKNodeAnimTransition",
                           "GKNodeAnimLocomotion"):
             self.assertIn(bl_idname, listed, f"{bl_idname} 没进菜单")
+
+
+class TestPlayAnimParams(Base):
+    """照 UPBGE『Play Animation』补齐的几项:起始/结束帧、Blend-In、混合模式、层。
+
+    全部以 0 / -1 / REPLACE 为"不生效" —— **老图生成的代码必须一字不变**,
+    这是这套参数能安全加进来的前提,用测试钉死。
+    """
+
+    def _build(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放",
+                             gk_anim_name="run", **props)
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        return gen(tree, V3)
+
+    def test_defaults_leave_code_unchanged(self):
+        code, warnings = self._build()
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(':= "run"', code)
+        self.assertIn(".play(", code)
+        self.assertIn(", -1.0, 1.0)", code)
+        self.assertNotIn("play_section(", code)
+        self.assertNotIn(".seek(", code)
+        self.assertNotIn("_gk_layer_player(", code)
+
+    def test_start_frame_uses_play_then_seek(self):
+        """只设起始帧 -> play() 之后 seek() 到起点(帧按场景帧率换算成秒)。
+
+        桩环境没有 scene,`_scene_fps()` 退回 Blender 默认的 24 -> 48/24=2 秒。
+        """
+        code, _ = self._build(gk_start_frame=48.0)
+        self.assertIn(", -1.0, 1.0)", code)
+        self.assertIn(".seek(2.0, true)", code)
+        self.assertNotIn("play_section(", code)
+
+    def test_end_frame_uses_play_section(self):
+        """设了结束帧 -> 起止/混合/速度一次交给 play_section(4.3+ 的 API)。"""
+        code, _ = self._build(gk_start_frame=24.0, gk_end_frame=72.0)
+        self.assertIn("play_section(", code)
+        self.assertIn(", 1.0, 3.0, -1.0, 1.0)", code)
+        self.assertNotIn(".seek(", code)
+
+    def test_blend_in_maps_to_custom_blend(self):
+        code, _ = self._build(gk_blend_in=0.25)
+        self.assertIn(".play(", code)
+        self.assertIn(", 0.25, 1.0)", code)
+
+    def test_continue_mode_does_not_restart(self):
+        """『续播』= 同名动画正在播就跳过,避免连续触发时鬼畜重播。"""
+        code, _ = self._build(gk_blend_mode="CONTINUE")
+        self.assertIn("current_animation != ", code)
+        self.assertIn(".is_playing()", code)
+        plain, _ = self._build()
+        self.assertNotIn("current_animation != ", plain)
+
+    def test_layer_uses_second_player(self):
+        """层 ≥ 1 -> 另起一个播放器(复制原播放器当"上层")。"""
+        code, warnings = self._build(gk_layer=1)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_layer_player(", code)
+        self.assertIn("func _gk_layer_player(base: Node, layer: int) -> Node:", code)
+
+    def test_layer_zero_generates_no_helper(self):
+        code, _ = self._build()
+        self.assertNotIn("func _gk_layer_player(", code)
+
+
+class TestAnimCategory(Base):
+    """动作分类标签:存进 Action 自定义属性 + 导出成常量表。"""
+
+    def test_round_trip_on_dict_like_action(self):
+        class FakeAction(dict):
+            name = "砍"
+
+        action = FakeAction()
+        self.assertEqual(NN.action_category(action), "")
+        NN.set_action_category(action, "攻击")
+        self.assertEqual(action[NN.ANIM_CATEGORY_KEY], "攻击")
+        self.assertEqual(NN.action_category(action), "攻击")
+        NN.set_action_category(action, "")
+        self.assertNotIn(NN.ANIM_CATEGORY_KEY, action)
+
+    def test_missing_action_is_safe(self):
+        NN.set_action_category(None, "攻击")
+        self.assertEqual(NN.action_category(None), "")
+
+    def test_table_empty_without_bpy_data(self):
+        self.assertEqual(codegen._anim_category_table(), {})
+
+    def test_no_constant_when_nothing_tagged(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="run")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("GK_ANIM_BY_CATEGORY", code)
+
+    def _tagged_actions(self):
+        class FakeAction(dict):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+
+        attack = FakeAction("砍")
+        walk = FakeAction("走")
+        NN.set_action_category(attack, "攻击")
+        NN.set_action_category(walk, "移动")
+        return walk, attack
+
+    def test_constant_table_in_generated_code(self):
+        """打了标签 -> 导出生成按分类索引的常量表,Godot 侧能按分类挑动作。"""
+        import types
+        walk, attack = self._tagged_actions()
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="砍")
+        gk_stub.connect(tree, event, "执行", play, "执行")
+
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(actions=[walk, attack]))
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("const GK_ANIM_BY_CATEGORY := {", code)
+        self.assertIn('"攻击": ["砍"],', code)
+        # 分类顺序照 ANIM_CATEGORY_NAMES(移动在攻击前面)
+        self.assertIn('"移动": ["走"],', code)
+
+
+class TestLogicNodeMultiInput(Base):
+    """『逻辑_布尔运算』的结构优化(用户要求:"逻辑是否、或者等")。
+
+    以前 A、B 两个输入是写死的 —— 用户在节点上把数量调大,
+    多出来的引脚只是**画着好看**,生成的代码里被完全忽略。
+    """
+
+    def _logic_tree(self, op, count, wired):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        branch = tree.new_node(NN.GKNodeBranch, "分支")
+        logic = tree.new_node(NN.GKNodeLogic, "逻辑", gk_op=op,
+                              gk_input_count=count)
+        for index in range(wired):
+            compare = tree.new_node(NN.GKNodeCompare, f"比较{index}",
+                                    gk_op="GT", gk_a=str(index + 2), gk_b="1")
+            gk_stub.connect(tree, compare, "结果", logic, chr(ord("A") + index))
+        gk_stub.connect(tree, logic, "结果", branch, "条件")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        return tree
+
+    def test_and_with_three_inputs_uses_all(self):
+        code, warnings = gen(self._logic_tree("AND", 3, 3), V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("(2 > 1) and (3 > 1) and (4 > 1)", code)
+
+    def test_or_with_three_inputs(self):
+        code, _ = gen(self._logic_tree("OR", 3, 3), V2)
+        self.assertIn("(2 > 1) or (3 > 1) or (4 > 1)", code)
+
+    def test_not_only_has_one_input(self):
+        """"非"只用一个输入 —— 画出 B 会让人以为它有用。"""
+        node = make_tree().new_node(NN.GKNodeLogic, "逻辑", gk_op="NOT")
+        self.assertEqual([socket.name for s in node.inputs for socket in [s]],
+                         ["A"])
+
+    def test_xor_two_inputs(self):
+        code, _ = gen(self._logic_tree("XOR", 2, 2), V2)
+        self.assertIn("((2 > 1) != (3 > 1))", code)
+
+    def test_and_warns_about_unwired_input(self):
+        """『与』的空输入按假算 —— 结果恒为假,必须明确告警。
+
+        这是最难查的一类错:图看起来连好了,游戏里条件永远不成立。
+        """
+        _code, warnings = gen(self._logic_tree("AND", 3, 2), V2)
+        self.assertTrue(any("没接线" in w for w in warnings), warnings)
+
+    def test_logic_nodes_are_available_in_animation_tree(self):
+        """布尔运算/比较必须能在**动画树**里拉出来(转场条件要用)。
+
+        两张图之间不能连线 —— 只在玩法图里能用 = 动画转场条件做不了组合判断。
+        """
+        from BlenderGameKit import properties as props
+        for tree_type in ("GKGameLogicTree", "GKAnimationTree"):
+            listed = {cls.bl_idname
+                      for _cat, classes in props.node_menu_entries(tree_type)
+                      for cls in classes}
+            for bl_idname in ("GKNodeLogic", "GKNodeCompare"):
+                self.assertIn(bl_idname, listed, f"{bl_idname} 不在 {tree_type} 菜单里")
+
+
+class TestAnimTreeVariables(Base):
+    """动画树的自定义变量:侧栏声明 -> 取/设节点 -> 生成的成员变量。
+
+    用户要求:"在侧边栏可以添加变量，自定义变量引脚连线"。
+    """
+
+    def _anim_with_vars(self, specs):
+        """造一张带变量表的动画树(等价于侧栏里加了几个变量)。"""
+        import types
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        anim.gk_variables = [
+            types.SimpleNamespace(var_name=name, var_type=kind,
+                                  default_value=value)
+            for name, kind, value in specs
+        ]
+        return anim
+
+    def _with_bpy(self, anim):
+        """把动画树挂到假 bpy 上,返回一个"还原"函数。"""
+        import types
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+
+        def restore():
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+        return restore
+
+    def test_declared_variables_land_in_the_script(self):
+        """侧栏里写下的变量必须真的出现在脚本里 —— 带类型和初值。"""
+        anim = self._anim_with_vars([("hp", "float", "100"),
+                                     ("is_ready", "bool", "true"),
+                                     ("score", "int", "3")])
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+
+        restore = self._with_bpy(anim)
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            restore()
+
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var hp: float = 100.0", code)
+        self.assertIn("var is_ready: bool = true", code)
+        self.assertIn("var score: int = 3", code)
+
+    def test_get_var_node_works_as_transition_condition(self):
+        """把『动画_取变量』接到转场条件上 —— 变量直接当状态切换条件。"""
+        anim = self._anim_with_vars([("airspeed", "float", "0")])
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        run = anim.new_node(NN.GKNodeAnimState, "状态run")
+        run.gk_state_name = "run"
+        transition = anim.new_node(NN.GKNodeAnimTransition, "T")
+        getter = anim.new_node(NN.GKNodeAnimGetVar, "取变量", gk_var_name="airspeed")
+        gk_stub.connect(anim, idle, "转到", transition, "上游")
+        gk_stub.connect(anim, transition, "转到", run, "进入")
+        gk_stub.connect(anim, getter, "值", transition, "条件")
+
+        restore = self._with_bpy(anim)
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            restore()
+
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("airspeed", code)
+
+    def test_set_var_node_assigns_with_declared_type(self):
+        """『动画_设变量』生成一行赋值,变量类型/初值来自侧栏声明。"""
+        anim = self._anim_with_vars([("is_ready", "bool", "1")])
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        setter = tree.new_node(NN.GKNodeAnimSetVar, "设变量", gk_var_name="is_ready")
+        setter.id_data = anim
+        source = tree.new_node(NN.GKNodeCompare, "比较",
+                               gk_op="GT", gk_a="2", gk_b="1")
+        gk_stub.connect(tree, source, "结果", setter, "值")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+
+        code, warnings = gen(tree, V2)
+
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var is_ready: bool = true", code)
+        self.assertIn("is_ready = (2 > 1)", code)
+
+    def test_chinese_variable_name_kept(self):
+        """中文变量名**原样保留**,不再压成 `v`(第 22 轮实测修正)。
+
+        以前认为"GDScript 不认中文",于是把中文压成下划线 ——
+        结果『金币数』和『通关』**撞成同一个名字**,生成
+        `var v: float = false`(类型和值都对不上,Godot 直接解析失败)。
+        实测 Godot 4.7.2 **接受 Unicode 标识符**,所以现在原样保留。
+        """
+        anim = self._anim_with_vars([("无敌", "bool", "真")])
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+
+        restore = self._with_bpy(anim)
+        try:
+            code, warnings = gen(tree, V3)
+        finally:
+            restore()
+
+        self.assertIn("var 无敌: bool = true", code)
+
+    def test_var_node_without_name_warns(self):
+        """没选变量的取变量节点要告警,而不是生成一个空名字。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        getter = tree.new_node(NN.GKNodeAnimGetVar, "取变量")
+        gk_stub.connect(tree, getter, "值", printer, "内容")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("还没选变量" in w for w in warnings), warnings)
 
 
 def nn_base_statement():

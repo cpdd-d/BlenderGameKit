@@ -78,8 +78,17 @@ class GKSocketAny(GKSocketBase, bpy.types.NodeSocket):
     def draw(self, context, layout, node, text):
         if self.is_linked or self.is_output:
             layout.label(text=text)
-        else:
-            layout.prop(self, "default_value", text=text)
+            return
+        # ── 通配引脚没有 default_value(用户日志里刷了一屏)──────────────
+        # `NodeSocketVirtual`(GKSocketAny 的基类)没有这个属性,
+        # 无条件 prop() 会抛
+        #     rna_uiItemR: property not found: GKSocketAny.default_value
+        # 每个通配引脚一行 —— 用户日志里几十行全是它。
+        # 所以先问一句"有没有这个属性",没有就画个标签。
+        if not self.bl_rna.properties.get("default_value"):
+            layout.label(text=text)
+            return
+        layout.prop(self, "default_value", text=text)
 
     def draw_color(self, context, node):
         return _COLOR_ANY

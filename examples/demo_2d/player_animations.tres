@@ -34,5 +34,7 @@ tracks/0/keys = {
 }
 
 [resource]
-idle = SubResource("idle")
-attack = SubResource("attack")
+_data = {
+"idle": SubResource("idle"),
+"attack": SubResource("attack")
+}

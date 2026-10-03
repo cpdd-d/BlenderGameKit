@@ -33,13 +33,13 @@ if (-not (Test-Path $project)) {
 }
 
 # ---------- 1. 重新生成示例工程 ----------
-Step "1/3 生成示例工程"
+Step "1/4 生成示例工程"
 & python (Join-Path $Root "scripts\make_demo.py") 2>&1 |
     Select-String -Pattern "已生成|脚本行数|告警" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "生成示例失败"; exit 1 }
 
 # ---------- 2. 导入(编译脚本) ----------
-Step "2/3 Godot 导入并编译"
+Step "2/4 Godot 导入并编译"
 $importLog = & $Godot --headless --path $project --import 2>&1 | Out-String
 $importErrors = $importLog -split "`n" |
     Where-Object { $_ -match "SCRIPT ERROR|Parse Error|ERROR:" } |
@@ -52,20 +52,51 @@ if ($importErrors) {
 }
 
 # ---------- 3. 真实运行若干帧 ----------
-Step "3/3 Godot 运行 $Frames 帧"
-$runLog = & $Godot --headless --path $project --quit-after $Frames 2>&1 | Out-String
+Step "3/4 Godot 运行 $Frames 帧"
+# ── --fixed-fps 是必须的(踩过的坑)──────────────────────────────
+# 无头模式下帧跑得飞快,而物理帧是**按真实时间**推进的 —— 同一份
+# "--quit-after 180" 在别人机器上可能只推进 0.3 秒,探针一个时间点都到不了
+# (实测:180 帧什么都不打印,300 帧全对)。加上 --fixed-fps 之后
+# 180 帧 = 固定 3 秒,和机器快慢无关。
+$runLog = & $Godot --headless --fixed-fps 60 --path $project --quit-after $Frames 2>&1 | Out-String
 $lines = $runLog -split "`n" | Where-Object { $_.Trim() -ne "" }
 $lines | Select-Object -Last 20 | ForEach-Object { Write-Output $_ }
 
 $runtimeErrors = $lines | Where-Object { $_ -match "SCRIPT ERROR|Parse Error|Invalid call|Nonexistent function" }
-$printedHint = $runLog -match "方向键移动"
+# ── 运行标记改用探针的结束行(踩过的坑)────────────────────────────
+# 原来这里匹配的是节点图里那句操作提示("方向键移动…"),结果提示文案一改
+# (改成 "AD 移动")断言就全挂 —— 而真正的问题是"标记选错了对象"。
+# 探针的 PROBE2D_DONE 是**行为验证**自己的产物,文案怎么改都不受影响。
+$printedHint = $runLog -match "PROBE2D_DONE"
+
+# ---------- 4. 行为断言:节点图真的产生了行为吗 ----------
+# 用户 2026-10-03:"用节点图来进行游戏设计……我现在验证不了的节点"。
+# 探针在真 Godot 里**模拟按键**(Input.action_press),再把这些量读回来 ——
+# 不是"能跑就行",而是"按了右键真的往右走了、跳真的抬起来了、加分真的加了"。
+Step "4/4 行为断言(模拟按键)"
+$probeLines = $lines | Where-Object { $_ -match "^PROBE2D" }
+$probeLines | ForEach-Object { Write-Output "   $_" }
+$failed = @()
+function Assert-Probe([string]$pattern, [string]$label) {
+    if ($runLog -notmatch $pattern) { $script:failed += $label }
+}
+Assert-Probe "PROBE2D moved_x=[1-9]"        "按 D 没有往右走"
+Assert-Probe "PROBE2D jump_rise=[1-9]"      "按空格没有跳起来"
+Assert-Probe "PROBE2D score=0\.0 -> [1-9]" "攻击没有加分"
+Assert-Probe "PROBE2D bullets=[1-9]"        "没有生成子弹"
+Assert-Probe "PROBE2D label=[0-9]"          "界面文字没更新"
+Assert-Probe "PROBE2D camera=Camera2D"      "相机跟随没找到相机"
+Assert-Probe "PROBE2D_DONE"                 "探针没跑完"
 
 Write-Output ""
 if ($runtimeErrors) {
     Write-Output "运行期错误:"
     $runtimeErrors | Select-Object -First 15 | ForEach-Object { Write-Output "   $_" }
 }
-if ($importErrors -or $runtimeErrors -or -not $printedHint) {
+if ($failed.Count -gt 0) {
+    Write-Output ("行为断言失败: " + ($failed -join "、"))
+}
+if ($importErrors -or $runtimeErrors -or -not $printedHint -or $failed.Count -gt 0) {
     Write-Output ""
     Write-Output "GODOT_VERIFY=FAILED"
     exit 1
