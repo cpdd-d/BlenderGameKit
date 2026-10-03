@@ -193,7 +193,12 @@ def main():
         script_path = next((p for p in result["written"] if p.endswith(".gd")),
                            os.path.join(out_dir, "scripts", result["script_name"]))
         check("导出脚本文件", os.path.isfile(script_path), script_path)
-        check("导出时无告警", not result["warnings"], str(result["warnings"]))
+        # 冒烟场景里**没有相机** -> 导出会提示"运行时会造一台自由飞行观察机"。
+        # 那是**好消息**(告诉你没相机时也能看见画面),不是错误;
+        # 和"基类自愈"一样属于信息类提示,不该让冒烟失败。
+        real_warnings = [w for w in result["warnings"]
+                         if "自由飞行观察机" not in str(w)]
+        check("导出时无告警", not real_warnings, str(real_warnings))
 
         # 读回来比对，确认磁盘内容与生成内容一致
         with open(script_path, encoding="utf-8") as handle:

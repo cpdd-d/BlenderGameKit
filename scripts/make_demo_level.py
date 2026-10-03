@@ -226,11 +226,14 @@ def build_logic(player, coins, goal):
                 gk_target="侧视机位", gk_fov=60.0, gk_distance=0.0,
                 gk_smooth=0.0)
     hud_title = add("GKNodeUiText", "HUD标题", -500.0, 500.0,
-                    gk_control="", gk_text="金币 0/5", gk_anchor="左上",
-                    gk_size=22)
+                    gk_control="", gk_text="金币 0/5",
+                    gk_x=20.0, gk_y=18.0, gk_size=22)
+    # 两行 HUD 必须**错开位置**:同一个坐标会叠在一起(截图里就是
+    # "金币 0/5"和提示糊成一团)。UI 文本用的是 gk_x / gk_y
+    # (**没有** gk_anchor 那个属性 —— 我一开始猜错了名字)。
     hud_hint = add("GKNodeUiText", "HUD提示", -500.0, 300.0,
                    gk_control="", gk_text="WASD 移动 · 空格 跳 · 鼠标转视角 · C/V 切视角",
-                   gk_anchor="左上", gk_size=15)
+                   gk_x=20.0, gk_y=56.0, gk_size=15)
     tree.links.new(ready.outputs["执行"], lock.inputs["执行"])
     tree.links.new(lock.outputs["完成"], setup.inputs["执行"])
     tree.links.new(setup.outputs["完成"], hud_title.inputs["执行"])
@@ -352,8 +355,8 @@ def build_logic(player, coins, goal):
     join_tail = add("GKNodeTextJoin", "拼后半", -160.0, -2400.0,
                     gk_b="/5")
     hud_update = add("GKNodeUiText", "刷新HUD", 120.0, -2400.0,
-                     gk_control="", gk_text="金币 0/5", gk_anchor="左上",
-                     gk_size=22)
+                     gk_control="", gk_text="金币 0/5",
+                     gk_x=20.0, gk_y=18.0, gk_size=22)
     tree.links.new(read_score.outputs["值"], join_head.inputs["乙"])
     tree.links.new(join_head.outputs["结果"], join_tail.inputs["甲"])
     tree.links.new(join_tail.outputs["结果"], hud_update.inputs["文字"])
@@ -383,8 +386,8 @@ def build_logic(player, coins, goal):
     win_set = add("GKNodeLogicOutput", "通关端口", -160.0, -2700.0,
                   gk_output_name="通关", gk_value=True)
     win_text = add("GKNodeUiText", "通关提示", 120.0, -2700.0,
-                   gk_control="", gk_text="通关!按 Esc 退出", gk_anchor="中上",
-                   gk_size=30)
+                   gk_control="", gk_text="通关!按 Esc 退出",
+                   gk_x=460.0, gk_y=200.0, gk_size=30)
     win_branch = add("GKNodeBranch", "如果_否则", -420.0, -2950.0)
     tree.links.new(read_for_win.outputs["值"], win_check.inputs["A"])
     tree.links.new(score_var.outputs["完成"], win_branch.inputs["执行"])

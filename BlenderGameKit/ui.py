@@ -6,7 +6,7 @@ import bpy
 from bpy.props import (BoolProperty, CollectionProperty,
                        IntProperty, StringProperty)
 
-from . import codegen, exporter, gk_log, project
+from . import codegen, diagnostics, exporter, gk_log, project
 from . import asset_export
 from . import operator_io as ops
 from . import properties as props
@@ -1661,6 +1661,14 @@ class GK_PT_Main(bpy.types.Panel):
                 row.prop(settings, "export_tunables", toggle=True)
                 row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
 
+        # ---- 诊断(用户第 26 轮:"每次又错误时加入调试信息")----
+        # 出问题时点一下:插件版本、每个物体的网格/碰撞尺寸、节点图内容、
+        # 主相机解析结果、导出告警 —— 全写进一个 txt,直接发我。
+        diag = layout.box()
+        diag.label(text="出问题了?", icon="QUESTION")
+        diag.operator("gk.dump_diagnostics", text="导出诊断信息",
+                      icon="TEXT")
+
         # ---- 日志 ----
         if settings is not None and settings.show_log:
             box = layout.box()
@@ -2055,6 +2063,8 @@ GK_CLASSES = (
     GK_OT_FitCollisionSize,
     GK_OT_ClearCollisionSize,
     GK_OT_PickMainCamera,
+    # 诊断信息(用户第 26 轮:出问题时把调试信息发我)
+    diagnostics.GK_OT_DumpDiagnostics,
     GK_OT_OpenAnimTree,
     GK_OT_SwitchTree,
     GK_OT_AnimVarAdd,
