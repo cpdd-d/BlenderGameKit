@@ -206,6 +206,15 @@ def build_logic(player, coins, goal):
         return node
 
     # ---- 对外端口(第 21 轮加的"真接口")----
+    # 视角用的两个变量(鼠标累加进去,弹簧臂读它们)
+    for name, value in (("视角偏航", "0"), ("视角俯仰", "12")):
+        port0 = tree.gk_ports.add()
+        port0.port_name = name
+        port0.port_type = "float"
+        port0.direction = "out"
+        port0.default_value = value
+        port0.comment = "第三人称视角(鼠标累加)"
+
     port = tree.gk_ports.add()
     port.port_name = "金币数"
     port.port_type = "float"
@@ -269,33 +278,61 @@ def build_logic(player, coins, goal):
     # 在有摄像机穿模的情况下就减少"。弹簧臂这个节点本来就是干这个的:
     # 杆子挂在角色身上,鼠标转的是**杆子的朝向**,相机在杆子末端;
     # 射线撞到墙/地面就把杆子缩短 —— "绕 360 度"和"不穿模"一次都有。
-    arm = add("GKNodeCameraSpringArm", "弹簧臂(第三人称)", 200.0, -1900.0,
+    # 鼠标偏航/俯仰要**累加**(每帧转一点),所以用一对"读->加->写"的变量。
+    # 杆子的朝向读这两个变量 —— 相机在杆子末端,于是绕着角色转。
+    yaw_var = add("GKNodeGetVar", "读偏航", 200.0, -2200.0, gk_var_name="视角偏航")
+    yaw_add = add("GKNodeMath", "偏航增量", 440.0, -2200.0, gk_op="ADD",
+                  gk_a=0.0, gk_b=0.0, gk_c=0.0)
+    yaw_set = add("GKNodeSetVar", "写偏航", 680.0, -2200.0, gk_var_name="视角偏航")
+    pitch_var = add("GKNodeGetVar", "读俯仰", 200.0, -2380.0, gk_var_name="视角俯仰")
+    pitch_add = add("GKNodeMath", "俯仰增量", 440.0, -2380.0, gk_op="ADD",
+                    gk_a=0.0, gk_b=0.0, gk_c=0.0)
+    pitch_set = add("GKNodeSetVar", "写俯仰", 680.0, -2380.0, gk_var_name="视角俯仰")
+    # 俯仰先夹在 -20~70 度:太低会穿到地面下,太高变俯视,都不好看
+    pitch_clamp = add("GKNodeMath", "夹住俯仰", 680.0, -2560.0, gk_op="CLAMP",
+                      gk_a=0.0, gk_b=-20.0, gk_c=70.0)
+
+    arm = add("GKNodeCameraSpringArm", "弹簧臂(第三人称)", 980.0, -1900.0,
               gk_target="",              # 跟着脚本自己(角色)
               gk_camera="",              # 相机交给它自己造/接管
               gk_arm=5.0, gk_height=1.4, gk_pitch=12.0, gk_side=0.0,
               gk_collision=True, gk_radius=0.35, gk_lag=0.12)
+    tree.links.new(physics.outputs["执行"], yaw_set.inputs["执行"])
+    tree.links.new(yaw_var.outputs["值"], yaw_add.inputs["A"])
+    # ★ 这根线漏了:没有它,『写偏航』的『值』引脚空着 -> 用节点上的默认值
+    # 100.0 -> 偏航每帧被写成 100 度(实测就是这么发现的)
+    tree.links.new(yaw_add.outputs["结果"], yaw_set.inputs["值"])
+    tree.links.new(yaw_set.outputs["完成"], pitch_set.inputs["执行"])
+    tree.links.new(pitch_var.outputs["值"], pitch_add.inputs["A"])
+    tree.links.new(pitch_add.outputs["结果"], pitch_clamp.inputs["A"])
+    tree.links.new(pitch_clamp.outputs["结果"], pitch_set.inputs["值"])
+    tree.links.new(yaw_var.outputs["值"], arm.inputs["偏航"])
+    tree.links.new(pitch_var.outputs["值"], arm.inputs["俯仰"])
     tree.links.new(physics.outputs["执行"], arm.inputs["执行"])
 
     # 鼠标转视角:像素位移 x 每像素多少度(和 2.5D 示例同一套)
     look = add("GKNodeMouseMotion", "鼠标移动量", -1400.0, -800.0)
     split = add("GKNodeVectorSplit", "拆成 XY", -1150.0, -800.0)
     # 灵敏度 = 每像素多少度(不要乘帧间隔,否则慢 60 倍)
+    # 灵敏度 = 每像素多少度。用乘法节点当"常量":A=0.25, B=1.0
+    # (A 写 0 的话结果恒为 0 —— 实测鼠标怎么动视角都不转)
     delta = add("GKNodeMath", "灵敏度", -1000.0, -700.0, gk_op="MUL",
-                gk_b=0.25)
+                gk_a=0.25, gk_b=1.0, gk_c=0.0)
     yaw = add("GKNodeMath", "左右灵敏度", -780.0, -760.0, gk_op="MUL",
-              gk_b=-1.0)
+              gk_a=0.0, gk_b=-1.0, gk_c=0.0)
     pitch = add("GKNodeMath", "上下灵敏度", -780.0, -900.0, gk_op="MUL",
-                gk_b=-1.0)
-    turn = add("GKNodeCameraRotation", "转动视角", -420.0, -800.0,
-               gk_mode="ADD", gk_clamp_pitch=True)
+                gk_a=0.0, gk_b=-1.0, gk_c=0.0)
     tree.links.new(look.outputs["移动量"], split.inputs["向量"])
+    # 鼠标位移 × 灵敏度 -> 直接进"偏航/俯仰增量"的 B 端
     tree.links.new(delta.outputs["结果"], yaw.inputs["A"])
     tree.links.new(split.outputs["X"], yaw.inputs["B"])
     tree.links.new(delta.outputs["结果"], pitch.inputs["A"])
     tree.links.new(split.outputs["Y"], pitch.inputs["B"])
-    tree.links.new(physics.outputs["执行"], turn.inputs["执行"])
-    tree.links.new(yaw.outputs["结果"], turn.inputs["偏航"])
-    tree.links.new(pitch.outputs["结果"], turn.inputs["俯仰"])
+    tree.links.new(yaw.outputs["结果"], yaw_add.inputs["B"])
+    tree.links.new(pitch.outputs["结果"], pitch_add.inputs["B"])
+    # 『相机_旋转』(turn)不再需要 —— 它改的是相机自己的朝向,
+    # 而弹簧臂每帧 look_at 会覆盖掉(这就是"鼠标没反应"的原因)。
+    # 现在鼠标驱动的是杆子,相机跟着杆子转。
 
     # 切视角:C 俯瞰 / V 侧视
     # ── C / V:改**弹簧臂的杆长**(不是"切相机")──────────────────────

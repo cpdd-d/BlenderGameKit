@@ -66,8 +66,10 @@ def main():
           "GKNodeLogicOutput" in kinds)
 
     ports = [p.port_name for p in getattr(logic, "gk_ports", [])]
-    check("声明了两个对外端口(金币数 / 通关)",
-          set(ports) == {"金币数", "通关"}, str(ports))
+    # 端口:两个游戏进度 + 两个视角(鼠标环绕用)
+    check("对外端口齐全(金币数 / 通关 / 视角偏航 / 视角俯仰)",
+          {"金币数", "通关", "视角偏航", "视角俯仰"} <= set(ports),
+          str(ports))
 
     # ---- 导出 ----
     settings = getattr(bpy.context.scene, "gk_settings", None)

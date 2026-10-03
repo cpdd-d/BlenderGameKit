@@ -3884,6 +3884,8 @@ def _stmt_camera_spring_arm(ctx, node, indent):
     # ── 运行中可改的三个量:引脚 > 属性 ────────────────────────────
     arm = ctx.input_number(node, "臂长", gd_number(
         float(getattr(node, "gk_arm", 4.0) or 0.0)))
+    yaw_in = ctx.input_number(node, "偏航", gd_number(
+        float(getattr(node, "gk_yaw", 0.0) or 0.0)))
     pitch = ctx.input_number(node, "俯仰", gd_number(
         float(getattr(node, "gk_pitch", -15.0) or 0.0)))
     off_socket = ctx._socket(node, "偏移")
@@ -3928,8 +3930,10 @@ def _stmt_camera_spring_arm(ctx, node, indent):
         # 枢轴 = 杆子挂点的位置 + 偏移向量(偏移可以接线,运行中改)
         f"    var _gk_pivot: Vector3 = {arm3d}.global_position "
         f"+ ({offset_expr})",
+        # 偏航 = 挂点自己的朝向 + 节点上的偏移 + **『偏航』引脚**
+        # (引脚给"鼠标环绕"用:每帧累加一点,杆子就绕着角色转)
         f"    var _gk_yaw: float = {arm3d}.rotation.y "
-        f"+ deg_to_rad({gd_number(yaw_offset)})",
+        f"+ deg_to_rad({gd_number(yaw_offset)} + ({yaw_in}))",
         # 杆子的方向 = 先按俯仰压下去、再按偏航绕一圈。
         # 从 Basis 取 .z 是因为 Godot 的相机朝 -Z 看 —— 杆子往 +Z 退,
         # 相机正好回头看向枢轴,不用再手动翻 180°。

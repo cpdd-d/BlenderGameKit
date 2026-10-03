@@ -3639,9 +3639,13 @@ class GKNodeCameraSpringArm(B.GKStatementNode):
         S.pin(OBJECT, "弹簧臂"),
         S.pin(FLOAT, "臂长", 4.0),
         S.pin(VECTOR, "偏移", (0.0, 1.5, 0.5)),
+        # 『偏航』= 杆子**绕角色**转多少度 —— 鼠标左右移动接这个,
+        # 就是"第三人称绕着角色 360 度转"(用户第 29 轮)
+        S.pin(FLOAT, "偏航", 0.0),
         S.pin(FLOAT, "俯仰", -15.0),
     )
-    gk_input_props = {"臂长": "gk_arm", "俯仰": "gk_pitch"}
+    gk_input_props = {"臂长": "gk_arm", "偏航": "gk_yaw",
+                      "俯仰": "gk_pitch"}
     gk_prop_defs = (
         ("gk_target", "node", TARGET_SELF, "跟随谁",
          "杆子挂在谁身上(默认脚本所在节点)"),
@@ -3653,6 +3657,8 @@ class GKNodeCameraSpringArm(B.GKStatementNode):
         ("gk_height", "float", 1.5, "高度偏移", "枢轴抬高多少(瞄肩膀/头)"),
         ("gk_side", "float", 0.5, "侧向偏移", "越肩视角往右挪一点"),
         ("gk_pitch", "float", -15.0, "俯仰", "杆子往下压的角度(度);-15 微俯视"),
+        ("gk_yaw", "float", 0.0, "偏航",
+         "杆子绕角色转多少度 —— 鼠标左右移动接这个(第三人称环绕)"),
         ("gk_yaw_offset", "float", 0.0, "偏航偏移", "相对跟随对象的左右偏(度)"),
         ("gk_collision", "bool", True, "碰撞检测",
          "撞到墙就把杆子缩短(关掉会穿墙,除非你确定场景里没东西)"),
