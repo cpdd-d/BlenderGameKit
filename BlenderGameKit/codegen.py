@@ -3568,6 +3568,20 @@ def _base_supports_visible(base_class):
     return text in _VISIBLE_BASES or text.endswith(("2D", "3D"))
 
 
+
+def _path_name(path):
+    """从生成的节点引用表达式里取出**节点名**。
+
+    `$"侧视机位"` / `$Camera` -> `视视机位` / `Camera`;
+    不是这种形式的(比如 `self`)原样返回。
+    """
+    text = str(path or "").strip()
+    if text.startswith("$"):
+        text = text[1:].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'"):
+        text = text[1:-1]
+    return text
+
 def _camera_expr(ctx, node, auto="first"):
     """求值相机目标。
 
@@ -3582,417 +3596,24 @@ def _camera_expr(ctx, node, auto="first"):
         return ctx.target_expr(node, hint="cam"), True
     if auto == "first":
         # ── "没填相机"就找**正在用的那台**(2.5D 示例真跑抓出来的坑)──────
-        # 原来只找 `gk_camera` 分组 / 场景里第一个 —— 但示例场景里的相机
-        # 不在任何分组里,于是 `_cam3` 是 null,滚轮缩放整段被跳过:
-        # 表现是"滚轮完全没反应",而代码看着完全正常。
-        # 顺序改成:视口里正在用的 -> 分组 -> 场景里第一个。
-        _fallback_cam = ctx.declare_var("_gk_cam_auto", "Node")
+        # 顺序:①节点上 if 指定的 ②视口里正在用的 ③gk_camera 分组
+        #      ④场景里第一台
+        #
+        # ── 为什么走**函数**而不是嵌套三元(第 28 轮,Godot 调试器实证)──
+        # 以前生成的是一行嵌套三元:
+        #     _gk_cam_auto if _gk_cam_auto != null else
+        #       (get_camera_3d() if ... else (get_camera_2d() if ... else
+        #         get_first_node_in_group("gk_camera")))
+        # 三个分支的类型是 Camera3D / Camera2D / Node —— Godot 报
+        #     INCOMPATIBLE_TERNARY: Values of the ternary operator are not
+        #     mutually compatible
+        # (实测一次报 4 条,分属 130/134/138/141 行),而且那一行**算不出
+        # 可用相机** -> 弹簧臂每帧都走"没找到相机"分支 -> 完全不生效。
+        # 现在统一成 `_gk_resolve_camera(self)`,内部全是普通 if,返回 Node。
+        ctx.need_resolve_camera = True
         ctx.note(f"『{node.bl_label}』没指定相机 —— 运行时自动用当前相机"
                  f"(单相机项目这样就行;想固定某台就在节点上选)")
-        return (f"({_fallback_cam} if {_fallback_cam} != null else "
-                f"(get_viewport().get_camera_3d() if "
-                f"get_viewport().get_camera_3d() != null else "
-                f"(get_viewport().get_camera_2d() if "
-                f"get_viewport().get_camera_2d() != null else "
-                f"get_tree().get_first_node_in_group(\"gk_camera\"))))"), True
-        # ── 这只是"提示",不是"问题"(2.5D 示例抓出来的体验问题)────────
-        # 不填相机 = 用当前相机,这是**文档写明的默认行为**(单相机项目
-        # 根本不用填)。原来报成 warn,于是"零告警导出"这条验收线被
-        # 一堆正常用法刷屏,真正的告警反而淹掉了。
-        ctx.note(f"『{node.bl_label}』没指定相机 —— 运行时自动用当前相机"
-                 f"(单相机项目这样就行;想固定某台就在节点上选)")
-        return 'get_tree().get_first_node_in_group("gk_camera")', False
-    return "null", False
-
-
-@stmt_node("GKNodeSetVisible")
-def _stmt_set_visible(ctx, node, indent):
-    target = ctx.target_expr(node)
-    if target == "self" and not _base_supports_visible(ctx.base_class):
-        ctx.warn(f"『{node.bl_label}』的目标是自身，但脚本基类 {ctx.base_class} "
-                 f"没有 visible 属性(Godot 会报错)，已跳过这一句")
-        return
-    socket = ctx._socket(node, "可见")
-    if socket is not None and getattr(socket, "is_linked", False):
-        value = ctx.expr_of(socket)
-    else:
-        value = "true" if getattr(node, "gk_visible", True) else "false"
-    ctx.add_line(indent, f"{target}.visible = {value}")
-
-
-@stmt_node("GKNodeSetPaused")
-def _stmt_set_paused(ctx, node, indent):
-    mode = "PROCESS_MODE_DISABLED" if getattr(node, "gk_paused", True) else "PROCESS_MODE_INHERIT"
-    ctx.add_line(indent, f"{ctx.target_expr(node)}.process_mode = Node.{mode}")
-
-
-def _path_name(path):
-    """从生成的节点引用表达式里取出**节点名**。
-
-    `$"侧视机位"` / `$Camera` -> `侧视机位` / `Camera`;
-    不是这种形式的(比如 `self` 或已经算好的表达式)原样返回。
-    """
-    text = str(path or "").strip()
-    if text.startswith("$"):
-        text = text[1:].strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'"):
-        text = text[1:-1]
-    return text
-
-
-def _sample_curve_points(curve_name, samples=48):
-    """把一条 Blender 曲线采样成世界坐标点列。
-
-    ── 为什么在**导出时**采样(而不是把曲线导进游戏)────────────────
-    用户的想法是"在场景里建模一条曲线,相机挂在上面"。但 glTF **不支持
-    曲线**:导出时曲线会被转成网格(那就变成一根有厚度的管子,不是轨道了)。
-    所以正确做法是:导出时把曲线的形状**采样成点**,写进生成的脚本 ——
-    游戏里只需要一串 Vector3,不依赖任何曲线资源。
-
-    曲线物体的 `matrix_world` 也要乘上,否则在场景里挪动曲线时,
-    采到的点还停在原地(用户一定会这么干)。
-    """
-    try:
-        import bpy
-    except Exception:
-        return []
-    name = str(curve_name or "").strip()
-    if not name:
-        return []
-    obj = (getattr(bpy.data, "objects", None) or {}).get(name) \
-        if hasattr(getattr(bpy.data, "objects", None), "get") else None
-    if obj is None or getattr(obj, "type", "") != "CURVE":
-        return []
-    # ── 必须先刷新一次求值(踩过的坑)──────────────────────────────
-    # `obj.matrix_world` 是**求值后**的属性:刚 new 出来、或者用户刚在视口里
-    # 拖过曲线,`matrix_world` 还停在旧值(新建时就是单位矩阵)。
-    # 实测:在场景里把曲线挪到 (1,2,0),采到的点仍然是 (0,0,…) ——
-    # 也就是说"相机沿轨道走"会走一条**看不见的、没挪动过的**轨道。
-    # 先 view_layer.update() 一下,矩阵才跟上。
-    try:
-        bpy.context.view_layer.update()
-    except Exception:
-        pass
-    matrix = obj.matrix_world
-    points = []
-    data = getattr(obj, "data", None)
-    for spline in getattr(data, "splines", ()) or ():
-        try:
-            count = len(spline.points)
-        except Exception:
-            count = 0
-        if count >= 2:
-            # 多段线 / NURBS:points 是四维(带权重)
-            for index in range(count):
-                point = spline.points[index]
-                local = (point.co[0], point.co[1], point.co[2])
-                world = matrix @ _vec3(local)
-                points.append((world.x, world.y, world.z))
-        else:
-            bezier = getattr(spline, "bezier_points", None)
-            if not bezier:
-                continue
-            for handle in bezier:
-                local = (handle.co[0], handle.co[1], handle.co[2])
-                world = matrix @ _vec3(local)
-                points.append((world.x, world.y, world.z))
-    if len(points) < 2:
-        return points
-    # ── 重采样成**等距**的 N 个点 ──────────────────────────────────
-    # 贝塞尔的控制点疏密不均,直接拿去插值会出现"该慢的地方飞快"。
-    # 先按折线累计长度,再按等距取点 —— 这样『位置 = 0.5』真的在中间。
-    dense = []
-    for i in range(len(points) - 1):
-        a, b = points[i], points[i + 1]
-        dense.append(a)
-        for step in range(1, 8):
-            t = step / 8.0
-            dense.append((a[0] + (b[0] - a[0]) * t,
-                          a[1] + (b[1] - a[1]) * t,
-                          a[2] + (b[2] - a[2]) * t))
-    dense.append(points[-1])
-    lengths = [0.0]
-    for i in range(1, len(dense)):
-        dx = dense[i][0] - dense[i - 1][0]
-        dy = dense[i][1] - dense[i - 1][1]
-        dz = dense[i][2] - dense[i - 1][2]
-        lengths.append(lengths[-1] + (dx * dx + dy * dy + dz * dz) ** 0.5)
-    total = lengths[-1]
-    if total <= 0.0001:
-        return points
-    out = []
-    for index in range(samples):
-        want = total * index / float(samples - 1)
-        # 线性找第一个超过它的段(点很少,不值得二分)
-        cursor = 0
-        while cursor < len(lengths) - 1 and lengths[cursor] < want:
-            cursor += 1
-        prev = max(0, cursor - 1)
-        span = lengths[cursor] - lengths[prev]
-        t = 0.0 if span <= 0.0001 else (want - lengths[prev]) / span
-        a, b = dense[prev], dense[cursor]
-        out.append((a[0] + (b[0] - a[0]) * t,
-                    a[1] + (b[1] - a[1]) * t,
-                    a[2] + (b[2] - a[2]) * t))
-    return out
-
-
-def _vec3(values):
-    """(x, y, z) -> 一个能乘矩阵的对象(离线时手算)。"""
-    try:
-        from mathutils import Vector
-        return Vector(values)
-    except Exception:
-        return _PlainVec(values)
-
-
-class _PlainVec:
-    """没有 mathutils 时的最小替代(离线测试用)。"""
-
-    def __init__(self, values):
-        self.x, self.y, self.z = values
-
-
-@stmt_node("GKNodeCameraPath")
-def _stmt_camera_path(ctx, node, indent):
-    """相机沿曲线走(运镜轨道)。
-
-    曲线在**导出时**被采样成点列写进脚本 —— 游戏里只是一串 Vector3,
-    不依赖任何曲线资源(glTF 也不支持曲线,见 _sample_curve_points)。
-    """
-    curve_name = str(getattr(node, "gk_curve", "") or "").strip()
-    points = _sample_curve_points(curve_name)
-    if not curve_name:
-        ctx.warn("『相机_路径』还没选曲线 —— 点节点上的『选曲线』挑一条"
-                 "(场景里没有的话:添加 → 曲线 → 路径)")
-        return
-    if len(points) < 2:
-        ctx.warn(f"『相机_路径』的曲线『{curve_name}』采不到点 —— "
-                 f"确认它是曲线物体,而且有至少两个点")
-        return
-    path_var = ctx.declare_var("_gk_cam_path", "PackedVector3Array")
-    ctx.var_initials[path_var] = "PackedVector3Array([" + ", ".join(
-        f"Vector3({gd_number(x)}, {gd_number(y)}, {gd_number(z)})"
-        for x, y, z in points) + "])"
-    camera = _camera_node_expr(ctx, node)
-    cam_var = ctx.declare_var("_gk_path_cam", "Node")
-    pos_var = ctx.declare_var("_gk_path_pos", "Vector3")
-    t_var = ctx.declare_var("_gk_path_t", "float")
-    ctx.add_line(indent, f"{cam_var} = {camera}")
-    position = ctx.input_number(node, "位置", "0.0")
-    speed = float(getattr(node, "gk_speed", 0.0) or 0.0)
-    smooth = float(getattr(node, "gk_smooth", 8.0) or 0.0)
-    loop = bool(getattr(node, "gk_loop", False))
-    mode = str(getattr(node, "gk_look_mode", "FORWARD"))
-    target = ""
-    if mode == "TARGET":
-        raw = str(getattr(node, "gk_look_target", "") or "").strip()
-        target = (ctx.target_expr(node, "gk_look_target", "看向") if raw
-                  else "null")
-    frame = [
-        f"if {cam_var} != null and {cam_var} is Node3D:",
-        f"    var _gk_count: int = {path_var}.size()",
-        f"    if _gk_count >= 2:",
-        f"        {t_var} = clampf({t_var}, 0.0, 1.0)",
-        f"        var _gk_f: float = {t_var} * float(_gk_count - 1)",
-        "        var _gk_i: int = int(floor(_gk_f))",
-        "        var _gk_frac: float = _gk_f - float(_gk_i)",
-        f"        var _gk_want: Vector3 = {path_var}[_gk_i].lerp("
-        f"{path_var}[mini(_gk_i + 1, _gk_count - 1)], _gk_frac)",
-    ]
-    if smooth > 0.0:
-        t = (f"clampf({gd_number(smooth)} * "
-             f"get_physics_process_delta_time(), 0.0, 1.0)")
-        frame += [
-            f"        {pos_var} = {pos_var}.lerp(_gk_want, {t})",
-        ]
-    else:
-        frame += [f"        {pos_var} = _gk_want"]
-    frame += [
-        f"        ({cam_var} as Node3D).global_position = {pos_var}",
-    ]
-    if mode == "FORWARD":
-        # 朝前 = 用"下一个点 - 当前位置"当方向(算出来才准,
-        # 拿曲线切线的话还得再采样一次)
-        frame += [
-            f"        var _gk_ahead: Vector3 = {path_var}[mini(_gk_i + 1, "
-            f"_gk_count - 1)]",
-            f"        if ({cam_var} as Node3D).global_position.distance_to("
-            f"_gk_ahead) > 0.01:",
-            f"            ({cam_var} as Node3D).look_at(_gk_ahead, Vector3.UP)",
-        ]
-    elif mode == "TARGET" and target:
-        frame += [
-            f"        if {target} is Node3D:",
-            f"            ({cam_var} as Node3D).look_at("
-            f"({target} as Node3D).global_position, Vector3.UP)",
-        ]
-    if speed > 0.0:
-        frame += [
-            f"        {t_var} += {gd_number(speed / 100.0)} * "
-            f"get_physics_process_delta_time()",
-        ]
-        if loop:
-            frame += [
-                f"        if {t_var} > 1.0:",
-                f"            {t_var} = 0.0",
-            ]
-        else:
-            frame += [f"        {t_var} = minf({t_var}, 1.0)"]
-    # 起始位置由执行点的『位置』引脚给(通常是 0)
-    ctx.add_line(indent, f"{t_var} = {position}")
-    ctx.physics_hooks.setdefault("camera_path", []).extend(frame)
-
-
-@stmt_node("GKNodeCameraSetCurrent")
-def _stmt_camera_set_current(ctx, node, indent):
-    """切相机;填了『过渡』就是丝滑推镜。
-
-    ── 丝滑推镜怎么做的(不用 await,也不用挪走旧相机)────────────
-    1. 先记住**新相机自己**的位姿(end)
-    2. 把新相机**瞬移**到旧相机的位姿(start),然后 make_current()
-    3. 之后每帧把它从 start 插值回 end(登记进 physics_hooks)
-    4. 到位后精确写回 end
-
-    关键在"动的是**新**相机":它最后停在的正是自己本来的位姿,所以
-    过渡结束不需要任何还原;旧相机从头到尾没被碰过,来回切也不会跑位。
-    (先动旧相机再切的做法会把它永久挪到新位置 —— 切回去就发现镜头歪了。)
-
-    每帧逻辑挂在 `_physics_process`(和角色移动同一个时钟),避免相机
-    在渲染帧里追、角色在物理帧里跑,两个节拍一差拍画面就抖。
-    """
-    camera, _auto = _camera_expr(ctx, node)
-    blend = float(getattr(node, "gk_blend", 0.0) or 0.0)
-    # `to_var` 必须是**成员变量**,而且这里**不能写 `var`**:
-    # 过渡逻辑跑在 _physics_process 里(另一个函数),用局部变量会
-    #   1) `Identifier "_cam_to2" not declared in the current scope`(实测)
-    #   2) 就算声明成成员变量,再写一次 `var` 会**遮蔽**它 ——
-    #      局部那个出了 if 块就没了,钩子里读到的永远是 null,
-    #      相机过渡**静默失效**(测试里就是这么发现的第一版)
-    to_var = ctx.declare_var("_gk_cam_to", "Node")
-    ctx.add_line(indent, f"{to_var} = {camera}")
-    ctx.add_line(indent, f"if {to_var} == null:")
-    ctx.add_line(indent + 1, f"push_warning(\"[GK] 相机_切换:没找到相机\")")
-    if blend <= 0.0:
-        ctx.add_line(indent, f"else:")
-        ctx.add_line(indent + 1, f"{to_var}.make_current()")
-        return
-
-    # ---- 带过渡 ----
-    from_var = ctx.declare_var("_gk_cam_from", "Node")
-    left_var = ctx.declare_var("_gk_cam_blend_left", "float")
-    total_var = ctx.declare_var("_gk_cam_blend_total", "float")
-    start3 = ctx.declare_var("_gk_cam_start3", "Transform3D")
-    # ── 目标相机"本来的位姿"要**缓存**,不能每次现读(用户 2026-10-03)──
-    # 连续点 C/V 时相机一路往后飘,原因就在这:
-    #   第一次切换:end = 相机本来的位姿(对的) -> 过渡到 end
-    #   过渡还没走完又按一次:此时相机正停在**半路**,再读一次"它本来的
-    #   位姿"读到的就是那个半路位置 -> end 被改成了半路位置 ->
-    #   下一次再往后退一点…… 按几次退几次。
-    # 现在把每台相机的"家"记在字典里,第一次见到它时存下来,以后一直用它。
-    homes = ctx.declare_var("_gk_cam_homes", "Dictionary")
-    end3 = ctx.declare_var("_gk_cam_end3", "Transform3D")
-    start2 = ctx.declare_var("_gk_cam_start2", "Vector2")
-    end2 = ctx.declare_var("_gk_cam_end2", "Vector2")
-    zoom2 = ctx.declare_var("_gk_cam_endzoom", "Vector2")
-    ctx.add_line(indent, f"else:")
-    ctx.add_line(indent + 1, f"{from_var} = get_viewport().get_camera_3d()")
-    ctx.add_line(indent + 1, f"if {from_var} == null:")
-    ctx.add_line(indent + 2, f"{from_var} = get_viewport().get_camera_2d()")
-    ctx.add_line(indent + 1, f"if {to_var} is Camera3D and {from_var} is Camera3D:")
-    # 第一次见到这台相机 -> 把它的"家"记下来;以后每次都回到那个家
-    ctx.add_line(indent + 2, f"if not {homes}.has({to_var}):")
-    ctx.add_line(indent + 3, f"{homes}[{to_var}] = "
-                             f"({to_var} as Camera3D).global_transform")
-    ctx.add_line(indent + 2, f"{end3} = {homes}[{to_var}]")
-    ctx.add_line(indent + 2, f"{start3} = ({from_var} as Camera3D).global_transform")
-    ctx.add_line(indent + 2, f"({to_var} as Camera3D).global_transform = {start3}")
-    ctx.add_line(indent + 2, f"({to_var} as Camera3D).make_current()")
-    ctx.add_line(indent + 2, f"{total_var} = maxf({gd_number(blend)}, 0.0001)")
-    ctx.add_line(indent + 2, f"{left_var} = {total_var}")
-    ctx.add_line(indent + 1, f"elif {to_var} is Camera2D and {from_var} is Camera2D:")
-    ctx.add_line(indent + 2, f"if not {homes}.has({to_var}):")
-    ctx.add_line(indent + 3, f"{homes}[{to_var}] = ["
-                             f"({to_var} as Camera2D).global_position, "
-                             f"({to_var} as Camera2D).zoom]")
-    ctx.add_line(indent + 2, f"{end2} = ({homes}[{to_var}] as Array)[0]")
-    ctx.add_line(indent + 2, f"{zoom2} = ({homes}[{to_var}] as Array)[1]")
-    ctx.add_line(indent + 2, f"{start2} = ({from_var} as Camera2D).global_position")
-    ctx.add_line(indent + 2, f"({to_var} as Camera2D).global_position = {start2}")
-    ctx.add_line(indent + 2, f"({to_var} as Camera2D).zoom = "
-                             f"({from_var} as Camera2D).zoom")
-    ctx.add_line(indent + 2, f"({to_var} as Camera2D).make_current()")
-    ctx.add_line(indent + 2, f"{total_var} = maxf({gd_number(blend)}, 0.0001)")
-    ctx.add_line(indent + 2, f"{left_var} = {total_var}")
-    ctx.add_line(indent + 1, f"else:")
-    ctx.add_line(indent + 2, f"{to_var}.make_current()")
-
-    # ---- 每帧推进(和相机震动同一个机制)----
-    hook_key = "camera_blend"
-    if hook_key not in ctx.physics_hooks:
-        ctx.physics_hooks[hook_key] = [
-            f"if {left_var} > 0.0:",
-            f"    {left_var} -= delta",
-            f"    var _gk_ct: float = clampf(1.0 - {left_var} / {total_var}, "
-            f"0.0, 1.0)",
-            f"    if ({to_var} is Camera3D) and ({from_var} is Camera3D):",
-            f"        ({to_var} as Camera3D).global_transform = "
-            f"{start3}.interpolate_with({end3}, _gk_ct)",
-            f"    elif ({to_var} is Camera2D) and ({from_var} is Camera2D):",
-            f"        ({to_var} as Camera2D).global_position = "
-            f"{start2}.lerp({end2}, _gk_ct)",
-            f"        ({to_var} as Camera2D).zoom = "
-            f"({from_var} as Camera2D).zoom.lerp({zoom2}, _gk_ct)",
-            f"    if {left_var} <= 0.0:",
-            # 到位:精确写回,免得浮点插值差一点点(镜头会"差一丝")
-            f"        if {to_var} is Camera3D:",
-            f"            ({to_var} as Camera3D).global_transform = {end3}",
-            f"        elif {to_var} is Camera2D:",
-            f"            ({to_var} as Camera2D).global_position = {end2}",
-            f"            ({to_var} as Camera2D).zoom = {zoom2}",
-        ]
-
-
-@stmt_node("GKNodeCameraZoom")
-def _stmt_camera_zoom(ctx, node, indent):
-    """缩放 / 视野;填了『时长』就用 Tween 平滑过去。"""
-    camera, _auto = _camera_expr(ctx, node)
-    value = _tunable_number(ctx, node, "数值", "1.0", "camera_zoom")
-    duration = float(getattr(node, "gk_time", 0.0) or 0.0)
-    # ── 上下限(用户 2026-10-03:"可以无限拉长,应该添加自定义范围")──────
-    # 0 = 不限制。填了就在**生成时**夹一次:
-    #   zoom 当固定值 -> 直接 clamp 那个常量,生成的代码还是干净的
-    #   zoom 是表达式(滚轮链)-> 用 clampf(...) 包一层
-    low = float(getattr(node, "gk_min_value", 0.0) or 0.0)
-    high = float(getattr(node, "gk_max_value", 0.0) or 0.0)
-    if low != 0.0 or high != 0.0:
-        lo = gd_number(low) if low != 0.0 else "-INF"
-        hi = gd_number(high) if high != 0.0 else "INF"
-        value = f"clampf({value}, {lo}, {hi})"
-    temp = ctx.new_temp("cam")
-    # 2D 的 zoom 是"越大越近"的倍数,3D 的 fov 是垂直视场角(度)。
-    # 两者语义不同，所以按相机真实类型分派，而不是按项目维度猜。
-    ctx.add_line(indent, f"var {temp} = {camera}")
-    if duration > 0.0:
-        tween_var = ctx.new_temp("tween")
-        ctx.add_line(indent, f"if {temp} != null:")
-        ctx.add_line(indent + 1, f"var {tween_var} = create_tween()")
-        ctx.add_line(indent + 1, f"{tween_var}.set_trans(Tween.TRANS_SINE)")
-        ctx.add_line(indent + 1, f"{tween_var}.set_ease(Tween.EASE_IN_OUT)")
-        ctx.add_line(indent + 1, f"if {temp} is Camera2D:")
-        ctx.add_line(indent + 2, f"{tween_var}.tween_property({temp}, "
-                                 f"\"zoom\", Vector2({value}, {value}), "
-                                 f"{gd_number(duration)})")
-        ctx.add_line(indent + 1, f"elif {temp} is Camera3D:")
-        ctx.add_line(indent + 2, f"{tween_var}.tween_property({temp}, "
-                                 f"\"fov\", {value}, {gd_number(duration)})")
-        return
-    ctx.add_line(indent, f"if {temp} is Camera2D:")
-    ctx.add_line(indent + 1, f"{temp}.zoom = Vector2({value}, {value})")
-    ctx.add_line(indent, f"elif {temp} is Camera3D:")
-    ctx.add_line(indent + 1, f"{temp}.fov = {value}")
-
-
+        return "_gk_resolve_camera(self)", True
 def _camera_node_expr(ctx, node, prop="gk_target", hint="相机"):
     """取"这台相机"的表达式(留空 = 运行时找当前相机)。
 
@@ -4005,11 +3626,14 @@ def _camera_node_expr(ctx, node, prop="gk_target", hint="相机"):
     raw = str(getattr(node, prop, "") or "").strip()
     if raw and raw != TARGET_SELF:
         return ctx.target_expr(node, prop, hint)
-    auto = ctx.declare_var("_gk_cam_auto", "Node")
-    return (f"({auto} if {auto} != null else "
-            f"(get_viewport().get_camera_3d() if "
-            f"get_viewport().get_camera_3d() != null else "
-            f"get_viewport().get_camera_2d()))")
+    # ── 同样走**类型统一的函数**,不要嵌套三元(第 28 轮)───────────
+    # 嵌套三元里的三个分支是 Camera3D / Camera2D / Node,
+    # Godot 报 `INCOMPATIBLE_TERNARY: Values of the ternary operator are
+    # not mutually compatible`(用户调试器里 4 条,130/134/138/141 行),
+    # 而且那个表达式**算不出可用相机** -> 弹簧臂每帧"没找到相机"。
+    ctx.need_resolve_camera = True
+    ctx.note(f"『{node.bl_label}』没指定相机 —— 运行时自动用当前相机")
+    return "_gk_resolve_camera(self)"
 
 
 @stmt_node("GKNodeCameraActive")
@@ -4481,6 +4105,393 @@ def _expr_spring_arm_outputs(ctx, node):
                      f"else Vector3.ZERO)"),
     }
 
+
+@stmt_node("GKNodeSetVisible")
+def _stmt_set_visible(ctx, node, indent):
+    target = ctx.target_expr(node)
+    if target == "self" and not _base_supports_visible(ctx.base_class):
+        ctx.warn(f"『{node.bl_label}』的目标是自身，但脚本基类 {ctx.base_class} "
+                 f"没有 visible 属性(Godot 会报错)，已跳过这一句")
+        return
+    socket = ctx._socket(node, "可见")
+    if socket is not None and getattr(socket, "is_linked", False):
+        value = ctx.expr_of(socket)
+    else:
+        value = "true" if getattr(node, "gk_visible", True) else "false"
+    ctx.add_line(indent, f"{target}.visible = {value}")
+
+
+@stmt_node("GKNodeSetPaused")
+def _stmt_set_paused(ctx, node, indent):
+    mode = "PROCESS_MODE_DISABLED" if getattr(node, "gk_paused", True) else "PROCESS_MODE_INHERIT"
+    ctx.add_line(indent, f"{ctx.target_expr(node)}.process_mode = Node.{mode}")
+
+
+def _path_name(path):
+    """从生成的节点引用表达式里取出**节点名**。
+
+    `$"侧视机位"` / `$Camera` -> `侧视机位` / `Camera`;
+    不是这种形式的(比如 `self` 或已经算好的表达式)原样返回。
+    """
+    text = str(path or "").strip()
+    if text.startswith("$"):
+        text = text[1:].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'"):
+        text = text[1:-1]
+    return text
+
+
+def _sample_curve_points(curve_name, samples=48):
+    """把一条 Blender 曲线采样成世界坐标点列。
+
+    ── 为什么在**导出时**采样(而不是把曲线导进游戏)────────────────
+    用户的想法是"在场景里建模一条曲线,相机挂在上面"。但 glTF **不支持
+    曲线**:导出时曲线会被转成网格(那就变成一根有厚度的管子,不是轨道了)。
+    所以正确做法是:导出时把曲线的形状**采样成点**,写进生成的脚本 ——
+    游戏里只需要一串 Vector3,不依赖任何曲线资源。
+
+    曲线物体的 `matrix_world` 也要乘上,否则在场景里挪动曲线时,
+    采到的点还停在原地(用户一定会这么干)。
+    """
+    try:
+        import bpy
+    except Exception:
+        return []
+    name = str(curve_name or "").strip()
+    if not name:
+        return []
+    obj = (getattr(bpy.data, "objects", None) or {}).get(name) \
+        if hasattr(getattr(bpy.data, "objects", None), "get") else None
+    if obj is None or getattr(obj, "type", "") != "CURVE":
+        return []
+    # ── 必须先刷新一次求值(踩过的坑)──────────────────────────────
+    # `obj.matrix_world` 是**求值后**的属性:刚 new 出来、或者用户刚在视口里
+    # 拖过曲线,`matrix_world` 还停在旧值(新建时就是单位矩阵)。
+    # 实测:在场景里把曲线挪到 (1,2,0),采到的点仍然是 (0,0,…) ——
+    # 也就是说"相机沿轨道走"会走一条**看不见的、没挪动过的**轨道。
+    # 先 view_layer.update() 一下,矩阵才跟上。
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    matrix = obj.matrix_world
+    points = []
+    data = getattr(obj, "data", None)
+    for spline in getattr(data, "splines", ()) or ():
+        try:
+            count = len(spline.points)
+        except Exception:
+            count = 0
+        if count >= 2:
+            # 多段线 / NURBS:points 是四维(带权重)
+            for index in range(count):
+                point = spline.points[index]
+                local = (point.co[0], point.co[1], point.co[2])
+                world = matrix @ _vec3(local)
+                points.append((world.x, world.y, world.z))
+        else:
+            bezier = getattr(spline, "bezier_points", None)
+            if not bezier:
+                continue
+            for handle in bezier:
+                local = (handle.co[0], handle.co[1], handle.co[2])
+                world = matrix @ _vec3(local)
+                points.append((world.x, world.y, world.z))
+    if len(points) < 2:
+        return points
+    # ── 重采样成**等距**的 N 个点 ──────────────────────────────────
+    # 贝塞尔的控制点疏密不均,直接拿去插值会出现"该慢的地方飞快"。
+    # 先按折线累计长度,再按等距取点 —— 这样『位置 = 0.5』真的在中间。
+    dense = []
+    for i in range(len(points) - 1):
+        a, b = points[i], points[i + 1]
+        dense.append(a)
+        for step in range(1, 8):
+            t = step / 8.0
+            dense.append((a[0] + (b[0] - a[0]) * t,
+                          a[1] + (b[1] - a[1]) * t,
+                          a[2] + (b[2] - a[2]) * t))
+    dense.append(points[-1])
+    lengths = [0.0]
+    for i in range(1, len(dense)):
+        dx = dense[i][0] - dense[i - 1][0]
+        dy = dense[i][1] - dense[i - 1][1]
+        dz = dense[i][2] - dense[i - 1][2]
+        lengths.append(lengths[-1] + (dx * dx + dy * dy + dz * dz) ** 0.5)
+    total = lengths[-1]
+    if total <= 0.0001:
+        return points
+    out = []
+    for index in range(samples):
+        want = total * index / float(samples - 1)
+        # 线性找第一个超过它的段(点很少,不值得二分)
+        cursor = 0
+        while cursor < len(lengths) - 1 and lengths[cursor] < want:
+            cursor += 1
+        prev = max(0, cursor - 1)
+        span = lengths[cursor] - lengths[prev]
+        t = 0.0 if span <= 0.0001 else (want - lengths[prev]) / span
+        a, b = dense[prev], dense[cursor]
+        out.append((a[0] + (b[0] - a[0]) * t,
+                    a[1] + (b[1] - a[1]) * t,
+                    a[2] + (b[2] - a[2]) * t))
+    return out
+
+
+def _vec3(values):
+    """(x, y, z) -> 一个能乘矩阵的对象(离线时手算)。"""
+    try:
+        from mathutils import Vector
+        return Vector(values)
+    except Exception:
+        return _PlainVec(values)
+
+
+class _PlainVec:
+    """没有 mathutils 时的最小替代(离线测试用)。"""
+
+    def __init__(self, values):
+        self.x, self.y, self.z = values
+
+
+@stmt_node("GKNodeCameraPath")
+def _stmt_camera_path(ctx, node, indent):
+    """相机沿曲线走(运镜轨道)。
+
+    曲线在**导出时**被采样成点列写进脚本 —— 游戏里只是一串 Vector3,
+    不依赖任何曲线资源(glTF 也不支持曲线,见 _sample_curve_points)。
+    """
+    curve_name = str(getattr(node, "gk_curve", "") or "").strip()
+    points = _sample_curve_points(curve_name)
+    if not curve_name:
+        ctx.warn("『相机_路径』还没选曲线 —— 点节点上的『选曲线』挑一条"
+                 "(场景里没有的话:添加 → 曲线 → 路径)")
+        return
+    if len(points) < 2:
+        ctx.warn(f"『相机_路径』的曲线『{curve_name}』采不到点 —— "
+                 f"确认它是曲线物体,而且有至少两个点")
+        return
+    path_var = ctx.declare_var("_gk_cam_path", "PackedVector3Array")
+    ctx.var_initials[path_var] = "PackedVector3Array([" + ", ".join(
+        f"Vector3({gd_number(x)}, {gd_number(y)}, {gd_number(z)})"
+        for x, y, z in points) + "])"
+    camera = _camera_node_expr(ctx, node)
+    cam_var = ctx.declare_var("_gk_path_cam", "Node")
+    pos_var = ctx.declare_var("_gk_path_pos", "Vector3")
+    t_var = ctx.declare_var("_gk_path_t", "float")
+    ctx.add_line(indent, f"{cam_var} = {camera}")
+    position = ctx.input_number(node, "位置", "0.0")
+    speed = float(getattr(node, "gk_speed", 0.0) or 0.0)
+    smooth = float(getattr(node, "gk_smooth", 8.0) or 0.0)
+    loop = bool(getattr(node, "gk_loop", False))
+    mode = str(getattr(node, "gk_look_mode", "FORWARD"))
+    target = ""
+    if mode == "TARGET":
+        raw = str(getattr(node, "gk_look_target", "") or "").strip()
+        target = (ctx.target_expr(node, "gk_look_target", "看向") if raw
+                  else "null")
+    frame = [
+        f"if {cam_var} != null and {cam_var} is Node3D:",
+        f"    var _gk_count: int = {path_var}.size()",
+        f"    if _gk_count >= 2:",
+        f"        {t_var} = clampf({t_var}, 0.0, 1.0)",
+        f"        var _gk_f: float = {t_var} * float(_gk_count - 1)",
+        "        var _gk_i: int = int(floor(_gk_f))",
+        "        var _gk_frac: float = _gk_f - float(_gk_i)",
+        f"        var _gk_want: Vector3 = {path_var}[_gk_i].lerp("
+        f"{path_var}[mini(_gk_i + 1, _gk_count - 1)], _gk_frac)",
+    ]
+    if smooth > 0.0:
+        t = (f"clampf({gd_number(smooth)} * "
+             f"get_physics_process_delta_time(), 0.0, 1.0)")
+        frame += [
+            f"        {pos_var} = {pos_var}.lerp(_gk_want, {t})",
+        ]
+    else:
+        frame += [f"        {pos_var} = _gk_want"]
+    frame += [
+        f"        ({cam_var} as Node3D).global_position = {pos_var}",
+    ]
+    if mode == "FORWARD":
+        # 朝前 = 用"下一个点 - 当前位置"当方向(算出来才准,
+        # 拿曲线切线的话还得再采样一次)
+        frame += [
+            f"        var _gk_ahead: Vector3 = {path_var}[mini(_gk_i + 1, "
+            f"_gk_count - 1)]",
+            f"        if ({cam_var} as Node3D).global_position.distance_to("
+            f"_gk_ahead) > 0.01:",
+            f"            ({cam_var} as Node3D).look_at(_gk_ahead, Vector3.UP)",
+        ]
+    elif mode == "TARGET" and target:
+        frame += [
+            f"        if {target} is Node3D:",
+            f"            ({cam_var} as Node3D).look_at("
+            f"({target} as Node3D).global_position, Vector3.UP)",
+        ]
+    if speed > 0.0:
+        frame += [
+            f"        {t_var} += {gd_number(speed / 100.0)} * "
+            f"get_physics_process_delta_time()",
+        ]
+        if loop:
+            frame += [
+                f"        if {t_var} > 1.0:",
+                f"            {t_var} = 0.0",
+            ]
+        else:
+            frame += [f"        {t_var} = minf({t_var}, 1.0)"]
+    # 起始位置由执行点的『位置』引脚给(通常是 0)
+    ctx.add_line(indent, f"{t_var} = {position}")
+    ctx.physics_hooks.setdefault("camera_path", []).extend(frame)
+
+
+@stmt_node("GKNodeCameraSetCurrent")
+def _stmt_camera_set_current(ctx, node, indent):
+    """切相机;填了『过渡』就是丝滑推镜。
+
+    ── 丝滑推镜怎么做的(不用 await,也不用挪走旧相机)────────────
+    1. 先记住**新相机自己**的位姿(end)
+    2. 把新相机**瞬移**到旧相机的位姿(start),然后 make_current()
+    3. 之后每帧把它从 start 插值回 end(登记进 physics_hooks)
+    4. 到位后精确写回 end
+
+    关键在"动的是**新**相机":它最后停在的正是自己本来的位姿,所以
+    过渡结束不需要任何还原;旧相机从头到尾没被碰过,来回切也不会跑位。
+    (先动旧相机再切的做法会把它永久挪到新位置 —— 切回去就发现镜头歪了。)
+
+    每帧逻辑挂在 `_physics_process`(和角色移动同一个时钟),避免相机
+    在渲染帧里追、角色在物理帧里跑,两个节拍一差拍画面就抖。
+    """
+    camera, _auto = _camera_expr(ctx, node)
+    blend = float(getattr(node, "gk_blend", 0.0) or 0.0)
+    # `to_var` 必须是**成员变量**,而且这里**不能写 `var`**:
+    # 过渡逻辑跑在 _physics_process 里(另一个函数),用局部变量会
+    #   1) `Identifier "_cam_to2" not declared in the current scope`(实测)
+    #   2) 就算声明成成员变量,再写一次 `var` 会**遮蔽**它 ——
+    #      局部那个出了 if 块就没了,钩子里读到的永远是 null,
+    #      相机过渡**静默失效**(测试里就是这么发现的第一版)
+    to_var = ctx.declare_var("_gk_cam_to", "Node")
+    ctx.add_line(indent, f"{to_var} = {camera}")
+    ctx.add_line(indent, f"if {to_var} == null:")
+    ctx.add_line(indent + 1, f"push_warning(\"[GK] 相机_切换:没找到相机\")")
+    if blend <= 0.0:
+        ctx.add_line(indent, f"else:")
+        ctx.add_line(indent + 1, f"{to_var}.make_current()")
+        return
+
+    # ---- 带过渡 ----
+    from_var = ctx.declare_var("_gk_cam_from", "Node")
+    left_var = ctx.declare_var("_gk_cam_blend_left", "float")
+    total_var = ctx.declare_var("_gk_cam_blend_total", "float")
+    start3 = ctx.declare_var("_gk_cam_start3", "Transform3D")
+    # ── 目标相机"本来的位姿"要**缓存**,不能每次现读(用户 2026-10-03)──
+    # 连续点 C/V 时相机一路往后飘,原因就在这:
+    #   第一次切换:end = 相机本来的位姿(对的) -> 过渡到 end
+    #   过渡还没走完又按一次:此时相机正停在**半路**,再读一次"它本来的
+    #   位姿"读到的就是那个半路位置 -> end 被改成了半路位置 ->
+    #   下一次再往后退一点…… 按几次退几次。
+    # 现在把每台相机的"家"记在字典里,第一次见到它时存下来,以后一直用它。
+    homes = ctx.declare_var("_gk_cam_homes", "Dictionary")
+    end3 = ctx.declare_var("_gk_cam_end3", "Transform3D")
+    start2 = ctx.declare_var("_gk_cam_start2", "Vector2")
+    end2 = ctx.declare_var("_gk_cam_end2", "Vector2")
+    zoom2 = ctx.declare_var("_gk_cam_endzoom", "Vector2")
+    ctx.add_line(indent, f"else:")
+    ctx.add_line(indent + 1, f"{from_var} = get_viewport().get_camera_3d()")
+    ctx.add_line(indent + 1, f"if {from_var} == null:")
+    ctx.add_line(indent + 2, f"{from_var} = get_viewport().get_camera_2d()")
+    ctx.add_line(indent + 1, f"if {to_var} is Camera3D and {from_var} is Camera3D:")
+    # 第一次见到这台相机 -> 把它的"家"记下来;以后每次都回到那个家
+    ctx.add_line(indent + 2, f"if not {homes}.has({to_var}):")
+    ctx.add_line(indent + 3, f"{homes}[{to_var}] = "
+                             f"({to_var} as Camera3D).global_transform")
+    ctx.add_line(indent + 2, f"{end3} = {homes}[{to_var}]")
+    ctx.add_line(indent + 2, f"{start3} = ({from_var} as Camera3D).global_transform")
+    ctx.add_line(indent + 2, f"({to_var} as Camera3D).global_transform = {start3}")
+    ctx.add_line(indent + 2, f"({to_var} as Camera3D).make_current()")
+    ctx.add_line(indent + 2, f"{total_var} = maxf({gd_number(blend)}, 0.0001)")
+    ctx.add_line(indent + 2, f"{left_var} = {total_var}")
+    ctx.add_line(indent + 1, f"elif {to_var} is Camera2D and {from_var} is Camera2D:")
+    ctx.add_line(indent + 2, f"if not {homes}.has({to_var}):")
+    ctx.add_line(indent + 3, f"{homes}[{to_var}] = ["
+                             f"({to_var} as Camera2D).global_position, "
+                             f"({to_var} as Camera2D).zoom]")
+    ctx.add_line(indent + 2, f"{end2} = ({homes}[{to_var}] as Array)[0]")
+    ctx.add_line(indent + 2, f"{zoom2} = ({homes}[{to_var}] as Array)[1]")
+    ctx.add_line(indent + 2, f"{start2} = ({from_var} as Camera2D).global_position")
+    ctx.add_line(indent + 2, f"({to_var} as Camera2D).global_position = {start2}")
+    ctx.add_line(indent + 2, f"({to_var} as Camera2D).zoom = "
+                             f"({from_var} as Camera2D).zoom")
+    ctx.add_line(indent + 2, f"({to_var} as Camera2D).make_current()")
+    ctx.add_line(indent + 2, f"{total_var} = maxf({gd_number(blend)}, 0.0001)")
+    ctx.add_line(indent + 2, f"{left_var} = {total_var}")
+    ctx.add_line(indent + 1, f"else:")
+    ctx.add_line(indent + 2, f"{to_var}.make_current()")
+
+    # ---- 每帧推进(和相机震动同一个机制)----
+    hook_key = "camera_blend"
+    if hook_key not in ctx.physics_hooks:
+        ctx.physics_hooks[hook_key] = [
+            f"if {left_var} > 0.0:",
+            f"    {left_var} -= delta",
+            f"    var _gk_ct: float = clampf(1.0 - {left_var} / {total_var}, "
+            f"0.0, 1.0)",
+            f"    if ({to_var} is Camera3D) and ({from_var} is Camera3D):",
+            f"        ({to_var} as Camera3D).global_transform = "
+            f"{start3}.interpolate_with({end3}, _gk_ct)",
+            f"    elif ({to_var} is Camera2D) and ({from_var} is Camera2D):",
+            f"        ({to_var} as Camera2D).global_position = "
+            f"{start2}.lerp({end2}, _gk_ct)",
+            f"        ({to_var} as Camera2D).zoom = "
+            f"({from_var} as Camera2D).zoom.lerp({zoom2}, _gk_ct)",
+            f"    if {left_var} <= 0.0:",
+            # 到位:精确写回,免得浮点插值差一点点(镜头会"差一丝")
+            f"        if {to_var} is Camera3D:",
+            f"            ({to_var} as Camera3D).global_transform = {end3}",
+            f"        elif {to_var} is Camera2D:",
+            f"            ({to_var} as Camera2D).global_position = {end2}",
+            f"            ({to_var} as Camera2D).zoom = {zoom2}",
+        ]
+
+
+@stmt_node("GKNodeCameraZoom")
+def _stmt_camera_zoom(ctx, node, indent):
+    """缩放 / 视野;填了『时长』就用 Tween 平滑过去。"""
+    camera, _auto = _camera_expr(ctx, node)
+    value = _tunable_number(ctx, node, "数值", "1.0", "camera_zoom")
+    duration = float(getattr(node, "gk_time", 0.0) or 0.0)
+    # ── 上下限(用户 2026-10-03:"可以无限拉长,应该添加自定义范围")──────
+    # 0 = 不限制。填了就在**生成时**夹一次:
+    #   zoom 当固定值 -> 直接 clamp 那个常量,生成的代码还是干净的
+    #   zoom 是表达式(滚轮链)-> 用 clampf(...) 包一层
+    low = float(getattr(node, "gk_min_value", 0.0) or 0.0)
+    high = float(getattr(node, "gk_max_value", 0.0) or 0.0)
+    if low != 0.0 or high != 0.0:
+        lo = gd_number(low) if low != 0.0 else "-INF"
+        hi = gd_number(high) if high != 0.0 else "INF"
+        value = f"clampf({value}, {lo}, {hi})"
+    temp = ctx.new_temp("cam")
+    # 2D 的 zoom 是"越大越近"的倍数,3D 的 fov 是垂直视场角(度)。
+    # 两者语义不同，所以按相机真实类型分派，而不是按项目维度猜。
+    ctx.add_line(indent, f"var {temp} = {camera}")
+    if duration > 0.0:
+        tween_var = ctx.new_temp("tween")
+        ctx.add_line(indent, f"if {temp} != null:")
+        ctx.add_line(indent + 1, f"var {tween_var} = create_tween()")
+        ctx.add_line(indent + 1, f"{tween_var}.set_trans(Tween.TRANS_SINE)")
+        ctx.add_line(indent + 1, f"{tween_var}.set_ease(Tween.EASE_IN_OUT)")
+        ctx.add_line(indent + 1, f"if {temp} is Camera2D:")
+        ctx.add_line(indent + 2, f"{tween_var}.tween_property({temp}, "
+                                 f"\"zoom\", Vector2({value}, {value}), "
+                                 f"{gd_number(duration)})")
+        ctx.add_line(indent + 1, f"elif {temp} is Camera3D:")
+        ctx.add_line(indent + 2, f"{tween_var}.tween_property({temp}, "
+                                 f"\"fov\", {value}, {gd_number(duration)})")
+        return
+    ctx.add_line(indent, f"if {temp} is Camera2D:")
+    ctx.add_line(indent + 1, f"{temp}.zoom = Vector2({value}, {value})")
+    ctx.add_line(indent, f"elif {temp} is Camera3D:")
+    ctx.add_line(indent + 1, f"{temp}.fov = {value}")
 
 @stmt_node("GKNodeCameraShake")
 def _stmt_camera_shake(ctx, node, indent):
@@ -6134,6 +6145,32 @@ class Generator:
                                      for item in self.ctx._input_handlers]:
                 target_section["lines"].append(f"    {func_name}(event)")
 
+        # ---- 相机解析(类型统一,不用嵌套三元)----
+        if getattr(self.ctx, "need_resolve_camera", False):
+            self._append_block(sections, "_gk_resolve_camera",
+                               "func _gk_resolve_camera(host: Node) -> Node:",
+                               [
+                                   "    # ① 视口里正在用的那台",
+                                   "    var cam: Node = host.get_viewport().get_camera_3d()",
+                                   "    if cam != null:",
+                                   "        return cam",
+                                   "    cam = host.get_viewport().get_camera_2d()",
+                                   "    if cam != null:",
+                                   "        return cam",
+                                   "    # ② 打了 gk_camera 分组的",
+                                   "    var grouped := host.get_tree().get_first_node_in_group(\"gk_camera\")",
+                                   "    if grouped != null:",
+                                   "        return grouped",
+                                   "    # ③ 场景里第一台相机(顺手把它设成当前 —— 不然画面全黑)",
+                                   "    for found in host.get_tree().root.find_children(\"*\", \"Camera3D\", true, false):",
+                                   "        (found as Camera3D).make_current()",
+                                   "        return found",
+                                   "    for found in host.get_tree().root.find_children(\"*\", \"Camera2D\", true, false):",
+                                   "        (found as Camera2D).make_current()",
+                                   "        return found",
+                                   "    return null",
+                               ])
+
         # ---- 节点引用的小工具(带兜底查找)----
         # 只要脚本里出现过 @onready 引用就要生成它。见上面 out 里那段说明:
         # 脚本挂在碰撞代理上时,相对路径找不到兄弟节点。
@@ -6272,6 +6309,8 @@ class Generator:
             # 两个成员变量必须先声明 —— 下面的函数体要用它们,
             # 不声明就是 `Parse Error: Identifier "_gk_fly_cam" not declared`,
             # 整个脚本加载失败、所有输入都没反应(实测)
+            # 相机解析:返回 Node,内部全是 if —— 不用嵌套三元
+            # (Godot 的 INCOMPATIBLE_TERNARY 就是它引起的,见上面说明)
             ctx.declare_var("_gk_fly_cam", "Node")
             ctx.declare_var("_gk_fly_speed", "float")
             self._append_block(sections, "_gk_make_fallback_camera",

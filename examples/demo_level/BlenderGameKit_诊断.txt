@@ -125,7 +125,7 @@ BlenderGameKit 诊断信息
       对外端口: [('金币数', 'float', 'out'), ('通关', 'bool', 'out')]
       - GKNodeOnReady 「每当_准备」 @(-1400,500)
       - GKNodeMouseMode 「锁定鼠标」 @(-1100,500)
-      - GKNodeCameraSetup 「设定初始机位」 @(-800,500)
+      - GKNodeCameraSetup 「设定初始视野」 @(-800,500)
       - GKNodeUiText 「HUD标题」 @(-500,500)
       - GKNodeUiText 「HUD提示」 @(-500,300)
       - GKNodeOnPhysicsProcess 「每当_物理帧」 @(-1400,0)
@@ -145,10 +145,10 @@ BlenderGameKit 诊断信息
       - GKNodeCameraRotation 「转动视角」 @(-420,-800)
       - GKNodeKey 「按 C」 @(-1400,-1100)
       - GKNodeBranch 「如果_否则.001」 @(-1000,-1100)
-      - GKNodeCameraSetCurrent 「切到俯瞰」 @(-700,-1100)
+      - GKNodeCameraSpringArm 「拉远(全局视角)」 @(-700,-1100)
       - GKNodeKey 「按 V」 @(-1400,-1320)
       - GKNodeBranch 「如果_否则.002」 @(-1000,-1320)
-      - GKNodeCameraSetCurrent 「切回侧视」 @(-700,-1320)
+      - GKNodeCameraSpringArm 「收回(第三人称)」 @(-700,-1320)
       - GKNodeGetVar 「读当前分数」 @(-1120,-1620)
       - GKNodeMath 「加一」 @(-1000,-1700)
       - GKNodeSetVar 「写回分数」 @(-820,-1700)
@@ -190,7 +190,7 @@ BlenderGameKit 诊断信息
       - GKNodeQuitGame 「退出游戏」 @(-700,-3100)
 
 【6】试导出
-  生成 336 行
+  生成 313 行
   告警 1 条:
       ! 脚本基类是 auto，但节点图里用了 取值_是否在地面、移动_按方向、移动_跳跃 —— 这些节点生成的是 move_and_slide()，只有 CharacterBody2D / CharacterBody3D 才有这个方法。Godot 会在加载脚本时报 『Function "move_and_slide()" not found in base self』。
 改法(二选一)：
