@@ -54,6 +54,8 @@ def build_settings(scene):
         "export_tunables": bool(getattr(props, "export_tunables", True)),
         "write_scene": bool(getattr(props, "write_scene", True)),
         "node_name": getattr(props, "node_name", "Player"),
+        # 运行日志开关(用户第 29 轮:运行时的状态要能复制出来)
+        "debug_runtime": bool(getattr(props, "debug_runtime", False)),
     })
 
     manual = (getattr(props, "output_dir", "") or "").strip()

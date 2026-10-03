@@ -320,6 +320,15 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         default="",
     )
 
+    # ── 运行日志(用户第 29 轮:"角色在掉落,鼠标没反应,其他大概也有问题")──
+    # 打开后,生成的脚本**每秒**在 Godot 控制台打一行:
+    #   位置 / 速度 / 是否在地面 / 当前相机 / HUD 文本
+    # 用户整段复制就能告诉我"运行时到底发生了什么" ——
+    # 和『导出诊断信息』配成一对(那个管编辑期,这个管运行期)。
+    debug_runtime: BoolProperty(
+        name="运行日志", default=False,
+        description="玩游戏时每秒在 Godot 控制台打一行状态(位置/速度/相机),排查用")
+
     show_export_settings: BoolProperty(
         name="展开导出设置", default=False,
         description="侧栏『导出设置』默认收起 —— 那几项开一次就不用再动")

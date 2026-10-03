@@ -1562,6 +1562,7 @@ class GK_PT_Main(bpy.types.Panel):
             # 卡通材质开关(用户第 24 轮:"应该加个开关,想看看细节")
             # —— 关掉后按 Blender 原样导出 PBR 材质,运行画面和预览一致
             row.prop(settings, "toon_materials", toggle=True)
+            row.prop(settings, "debug_runtime", toggle=True)
             row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
             # 主相机(用户第 25 轮:"没看到默认摄像机按钮")
             cam_row = box.row(align=True)

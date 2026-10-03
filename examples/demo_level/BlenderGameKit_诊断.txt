@@ -190,7 +190,7 @@ BlenderGameKit 诊断信息
       - GKNodeQuitGame 「退出游戏」 @(-700,-3100)
 
 【6】试导出
-  生成 313 行
+  生成 334 行
   告警 1 条:
       ! 脚本基类是 auto，但节点图里用了 取值_是否在地面、移动_按方向、移动_跳跃 —— 这些节点生成的是 move_and_slide()，只有 CharacterBody2D / CharacterBody3D 才有这个方法。Godot 会在加载脚本时报 『Function "move_and_slide()" not found in base self』。
 改法(二选一)：
@@ -198,6 +198,8 @@ BlenderGameKit 诊断信息
   2) 或者把侧栏『脚本基类』设成『自动(跟着物体走)』，让它跟着物体走。
       · 对外端口『金币数』(float)-> 输出_金币数
       · 对外端口『通关』(bool)-> 输出_通关
+      · 『相机_弹簧臂』没指定相机 —— 运行时自动用当前相机
+      · 『相机_旋转』没指定相机 —— 运行时自动用当前相机
   输入动作: [('quit_game', 'ESC'), ('view_side', 'V'), ('view_top', 'C'), ('jump', 'SPACE'), ('move_up', ''), ('move_down', ''), ('move_left', ''), ('move_right', '')]
   导出目录: D:\BlenderGameKit\examples\demo_level\game_godot  (跟着 .blend)
 

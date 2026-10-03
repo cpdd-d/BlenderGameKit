@@ -6001,6 +6001,10 @@ class Generator:
         # 端口再来只能复用它 —— `输出_` 前缀和声明类型(int)全丢,
         # 别的图按文档读 `输出_金币数` 会读到一个不存在的名字。
         _emit_logic_ports(self.ctx)
+        # 运行日志用的计时器变量:同样要**提前声明**(遍历节点之后再声明,
+        # 变量清单已经写进 out 了 -> Godot 报 not declared。端口那次踩过)
+        if bool(self.options.get("debug_runtime", False)):
+            self.ctx.declare_var("_gk_debug_timer", "float")
         self.functions = []   # (函数名, delta 参数名, 起始行, 事件节点)
 
     # ---- 主入口 ----
@@ -6980,6 +6984,29 @@ class Generator:
                 else:
                     out.append(f"var {name}: {gd_type} = {initial}")
             out.append("")
+
+        # ── 运行日志(用户第 29 轮)────────────────────────────────────
+        # 开关打开时,每秒在 Godot 控制台打一行:
+        #   位置 / 速度 / 是否在地面 / 当前相机 / 刚体状态
+        # 用户直接复制控制台就能告诉我"运行时到底怎么回事",
+        # 不用靠截图猜 —— 和『导出诊断信息』配成一对(编辑期 / 运行期)。
+        if bool(self.options.get("debug_runtime", False)):
+            self._append_block(
+                sections, "_process",
+                "func _gk_debug_tick(delta: float) -> void:",
+                [
+                    "    _gk_debug_timer += delta",
+                    "    if _gk_debug_timer < 1.0:",
+                    "        return",
+                    "    _gk_debug_timer = 0.0",
+                    "    var pos := global_position if self is Node3D else Vector3.ZERO",
+                    "    var vel := velocity if self is CharacterBody3D else Vector3.ZERO",
+                    "    var floor_ok := is_on_floor() if self is CharacterBody3D else false",
+                    "    var cam := get_viewport().get_camera_3d()",
+                    "    print(\"[GK-DBG] pos=(%.1f, %.1f, %.1f) vel=(%.1f, %.1f, %.1f) 在地面=%s 相机=%s\" % [pos.x, pos.y, pos.z, vel.x, vel.y, vel.z, str(floor_ok), String(cam.name) if cam != null else \"(无)\"])",
+                ])
+            self.ctx.process_hooks.setdefault("debug", [])
+            self.ctx.process_hooks["debug"].append("_gk_debug_tick(delta)")
 
         for index, section in enumerate(sections):
             if index > 0 and section.get("separator"):

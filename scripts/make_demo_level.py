@@ -422,6 +422,7 @@ def write_export_settings(scene, player):
     settings = getattr(scene, "gk_settings", None)
     if settings is not None:
         for attr, value in (("dimension", "3"),
+                            ("debug_runtime", True),
                             ("base_class", "CharacterBody3D"),
                             ("class_name", "LevelPlayer")):
             if hasattr(settings, attr):
