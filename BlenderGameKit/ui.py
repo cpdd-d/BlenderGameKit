@@ -3,15 +3,16 @@
 import os
 
 import bpy
-from bpy.props import (BoolProperty, CollectionProperty,
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        IntProperty, StringProperty)
 
-from . import codegen, diagnostics, exporter, gk_log, project
+from . import codegen, diagnostics, export_report, exporter, gk_log, project
 from . import asset_export
 from . import operator_io as ops
 from . import properties as props
 from .nodes import nodes as node_lib
 from .nodes import node_base as NB
+from .nodes.node_base import snake_case
 
 
 # ==========================================================================
@@ -35,6 +36,19 @@ class GKGameLogicTree(bpy.types.NodeTree):
     # "被读写的端口有没有声明过",打错名字不再是静默失败。
     gk_ports: CollectionProperty(type=props.GKLogicPort)
     gk_port_index: IntProperty(name="选中端口", default=0)
+
+    # ── 这张逻辑图声明的变量(用户 2026-10-04)───────────────────────
+    # 声明过 = 侧栏一处定好名字/类型/初值,节点里从下拉里挑;
+    # 没声明过的变量仍然能用『变量_设置』隐式建出来(兼容老图)。
+    gk_vars: CollectionProperty(type=props.GKLogicVariable)
+    gk_var_index: IntProperty(name="选中变量", default=0)
+
+    # ── 这张图声明的**函数**(用户 2026-10-05 第十七轮)─────────────────
+    # 用户原话:"可查看函数,自定义函数,折叠函数等"。
+    # 名字/返回类型/参数在这里一处写好,『函数_定义』『函数_调用』
+    # 从下拉里挑 —— 调用点的参数引脚按这份声明自动长出来。
+    gk_funcs: CollectionProperty(type=props.GKLogicFunction)
+    gk_func_index: IntProperty(name="选中函数", default=0)
 
     @classmethod
     def poll(cls, context):
@@ -503,7 +517,11 @@ def _menu_has_entries(menu_name, context, classes_getter):
     kind = props.current_tree_type(context)
     try:
         classes = classes_getter()
-    except Exception:
+    except (AttributeError, ImportError, KeyError, TypeError):
+        # 菜单绘制路径上拿不到节点类清单(模块还没就绪 / 属性缺失),
+        # 这时**不画**这张子菜单即可。收窄成这几种是防止真正的 bug
+        # 被当成"这张菜单是空的"悄悄吞掉(GPT 审查)。
+        gk_log.exception("节点菜单取类清单失败(这张子菜单不画)")
         return False
     for cls in classes:
         if getattr(cls, "gk_hidden", False):
@@ -584,6 +602,55 @@ def _make_recent_menu():
         "bl_label": "最近使用",
         "draw": draw,
         "__doc__": "最近用过的游戏逻辑节点",
+    })
+
+
+def _make_top_menu():
+    """右键菜单顶部的『搜索与常用』子菜单(用户 2026-10-04)。
+
+    右键菜单原来把「搜索 / 常用 / 最近使用 / 自动接续提示」全平铺在最上面,
+    四行起步;现在收成一项,菜单明显短了。
+    """
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
+        # 与 _draw_node_menu_contents 一致:当前树没有可用常用节点时就不画
+        if _menu_has_entries("常用", context, props.common_node_classes):
+            layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
+        layout.menu(_menu_name("最近使用"), text="最近使用", icon="FILE_REFRESH")
+        link_from = _menu_link_from(context)
+        if link_from:
+            layout.separator()
+            layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
+
+    return type("GK_MT_NodeTop", (bpy.types.Menu,), {
+        "bl_idname": _menu_name("搜索与常用"),
+        "bl_label": "搜索与常用",
+        "draw": draw,
+        "__doc__": "搜索 / 常用 / 最近使用 节点",
+    })
+
+
+def _make_tools_menu():
+    """右键菜单底部的『节点工具』子菜单(用户 2026-10-04)。"""
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator("gk.auto_link", text="把选中的两个节点连起来",
+                        icon="LINKED")
+        layout.operator("gk.add_comment_box", text="注释框(框住选中节点)",
+                        icon="PIVOT_BOUNDBOX")
+        layout.operator("gk.collapse_to_function",
+                        text="折叠成函数(框住选中节点)", icon="FILE_SCRIPT")
+
+    return type("GK_MT_NodeTools", (bpy.types.Menu,), {
+        "bl_idname": _menu_name("节点工具"),
+        "bl_label": "节点工具",
+        "draw": draw,
+        "__doc__": "自动连线 / 注释框 / 折叠成函数",
     })
 
 
@@ -714,6 +781,62 @@ def _make_target_picker_draw(node_name, prop_name):
 
 
 # ==========================================================================
+# 场景 -> 逻辑图 绑定(用户 2026-10-04:一个 .blend 多个 Blender 场景,
+# 每个场景各出一张 .tscn,得让用户说清"这个场景用哪棵图")
+# ==========================================================================
+class GK_OT_SetLogicTree(bpy.types.Operator):
+    """把"本场景用哪棵游戏逻辑图"写进场景设置。空串 = 自动。"""
+
+    bl_idname = "gk.set_logic_tree"
+    bl_label = "设置场景逻辑图"
+    bl_options = {"REGISTER", "UNDO"}
+
+    value: StringProperty(default="")
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        if settings is None:
+            return {"CANCELLED"}
+        settings.logic_tree = self.value
+        self.report({"INFO"}, f"本场景逻辑图 = {self.value or '自动'}")
+        return {"FINISHED"}
+
+
+class GK_OT_PickLogicTree(bpy.types.Operator):
+    """弹出下拉,选本场景用哪棵游戏逻辑图。"""
+
+    bl_idname = "gk.pick_logic_tree"
+    bl_label = "选择本场景的逻辑图"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        from . import exporter
+        trees = exporter.game_logic_trees()
+        settings = getattr(context.scene, "gk_settings", None)
+        current = str(getattr(settings, "logic_tree", "") or "")
+
+        def _draw(self, context):
+            layout = self.layout
+            op = layout.operator(
+                "gk.set_logic_tree", text="自动(只有一棵图时就用它)",
+                icon="CHECKMARK" if not current else "NODETREE")
+            op.value = ""
+            layout.separator()
+            if not trees:
+                layout.label(text="整个 .blend 里没有游戏逻辑图", icon="INFO")
+                return
+            for tree in trees:
+                op = layout.operator(
+                    "gk.set_logic_tree", text=tree.name,
+                    icon="CHECKMARK" if tree.name == current else "NODETREE")
+                op.value = tree.name
+
+        context.window_manager.popup_menu(
+            _draw, title="本场景用哪棵游戏逻辑图", icon="NODETREE")
+        return {"FINISHED"}
+
+
+# ==========================================================================
 # 侧栏面板
 # ==========================================================================
 # ==========================================================================
@@ -772,8 +895,15 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             # 而他完全看不出"自动"其实没生效。
             manual = tuple(round(float(v), 3) for v in physics.shape_size)
             if any(abs(v) > 1e-6 for v in manual):
-                col.label(text=f"实际用手动尺寸 {manual}", icon="ERROR")
-                col.label(text="清成 0 才会用上面的自动结果")
+                col.label(text=f"手动尺寸 {manual} 在『自动』下不生效",
+                          icon="INFO")
+                col.label(text="想用它请选一个具体形状;清成 0 可去掉这行")
+        elif shape == "convex":
+            # 凸包(本轮):形状 = 网格真实外形,尺寸不用填
+            col.label(text="按网格真实外形生成(凸包),尺寸不用填",
+                      icon="CHECKMARK")
+            col.label(text="适合石头 / 雕像这类不规则模型;只有 3D 支持",
+                      icon="INFO")
         elif shape not in ("none",):
             col.prop(physics, "shape_size")
             # ── 一键贴合模型(用户第 21 轮要的)────────────────────────
@@ -796,6 +926,27 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             row.prop(physics, "collision_mask", text="")
             col.prop(physics, "is_trigger")
 
+        # ── 子物体碰撞块(本轮:"人形头/身/腿各摆一个")────────────────
+        # 勾上 = 这个物体不出现在画面里,形状并入父物体的碰撞体。
+        # 放在碰撞区最后:它是"高级用法",不打断常规设置的主线。
+        col.separator()
+        col.prop(physics, "collision_piece")
+        if physics.collision_piece:
+            owner = asset_export.collision_owner(obj)
+            if owner is None:
+                col.label(text="找不到父物体:碰撞块要挂在别的网格下面",
+                          icon="ERROR")
+            else:
+                col.label(text=f"并入父物体『{owner.name}』的碰撞体,"
+                               f"本物体不出现在画面里", icon="CHECKMARK")
+        else:
+            pieces = asset_export.collision_pieces(obj)
+            if pieces:
+                names = "、".join(piece.name for piece in pieces[:3])
+                if len(pieces) > 3:
+                    names += "…"
+                col.label(text=f"含 {len(pieces)} 个碰撞块:{names}", icon="INFO")
+
         # ---- 物理属性 ----
         body = physics.body_type
         if "RigidBody" in body:
@@ -812,6 +963,96 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
         col.prop(physics, "script_target")
         if physics.script_target:
             box.label(text="节点图导出的脚本会挂到这个物体上", icon="INFO")
+
+        # ---- 静态资产(用户 2026-10-05:"游戏静态资产设计")----------
+        # 一个模型只导一次、场景里摆很多份:同名的算同一个资产,
+        # 没勾"作为实例"的那一个是**本体**(定义模型),其余拿它的模型。
+        box = layout.box()
+        box.label(text="静态资产", icon="ASSET_MANAGER")
+        col = box.column(align=True)
+        col.prop(physics, "asset_name", text="")
+        col.prop(physics, "asset_instance")
+        name = str(getattr(physics, "asset_name", "") or "").strip()
+        if not name:
+            col.label(text="留空 = 普通物体(自己导一份模型)", icon="INFO")
+        else:
+            # ── 『场景里共几份』(用户 2026-10-05)──────────────────────────
+            # 实例摆多了很容易忘了总共摆了几份("我到底种了几棵树"),
+            # 这里把总数和"这是第几份"直接报出来 —— 一个模型导一次、
+            # 场景里摆多份,数得清才好管。
+            total, index = _asset_count(context, name, obj)
+            if physics.asset_instance:
+                col.label(text=f"『{name}』第 {index}/{total} 份(实例)",
+                          icon="DUPLICATE")
+                col.label(text="复用本体的模型", icon="INFO")
+            else:
+                col.label(text=f"『{name}』的本体(模型由它定义)", icon="MESH_DATA")
+                col.label(text=f"场景里共 {total} 份"
+                               f"(含 {max(total - 1, 0)} 份实例)", icon="INFO")
+        # 点一个按钮就能在场景里再摆一份(复制本体、勾上"作为实例")
+        row = col.row(align=True)
+        row.operator("gk.add_asset_instance", text="再加一份实例",
+                     icon="DUPLICATE")
+
+        # ---- 粒子特效(需求 5,2026-10-05 第二十一轮)------------------
+        # Blender 的粒子系统导不进 glTF,所以这里做的是"标记 + 参数":
+        # 导出时在 Godot 里生成 GPUParticles3D / CPUParticles3D,
+        # 运行时用『特效_播放』『特效_停止』『特效_爆发』控制。
+        fx = getattr(obj, "gk_fx", None)
+        if fx is not None:
+            box = layout.box()
+            box.label(text="粒子特效", icon="MOD_PARTICLES")
+            col = box.column(align=True)
+            col.prop(fx, "enabled")
+            if not fx.enabled:
+                col.label(text="勾上 = 导出成 Godot 的粒子节点"
+                               "(Blender 自己的粒子导不出去)", icon="INFO")
+            else:
+                col.prop(fx, "particle_type", text="")
+                row = col.row(align=True)
+                row.prop(fx, "amount")
+                row.prop(fx, "lifetime")
+                row = col.row(align=True)
+                row.prop(fx, "one_shot")
+                row.prop(fx, "auto_play")
+                col.prop(fx, "explosiveness")
+                if not fx.auto_play:
+                    col.label(text="不自动播放:要靠『特效_播放』/"
+                                   "『特效_爆发』启动", icon="INFO")
+                col.separator()
+                col.prop(fx, "direction")
+                row = col.row(align=True)
+                row.prop(fx, "speed")
+                row.prop(fx, "spread")
+                col.prop(fx, "gravity")
+                row = col.row(align=True)
+                row.prop(fx, "radius")
+                row.prop(fx, "randomness")
+                col.separator()
+                col.prop(fx, "start_color")
+                col.prop(fx, "end_color")
+                row = col.row(align=True)
+                row.prop(fx, "start_size")
+                row.prop(fx, "end_size")
+                col.prop(fx, "preprocess")
+                row = col.row(align=True)
+                row.prop(fx, "local_coords")
+                row.prop(fx, "additive")
+                col.separator()
+                col.prop(fx, "hide_mesh")
+                if fx.hide_mesh:
+                    col.label(text="本体网格不导出:这个物体只当发射器标记",
+                              icon="CHECKMARK")
+                # 贴图来源(和导出用的是**同一个函数**,不会说法不一致)
+                if asset_export.fx_texture_file(obj) \
+                        == asset_export.FX_DEFAULT_TEXTURE:
+                    col.label(text="贴图:内置圆形柔光(本物体没有材质贴图)",
+                              icon="IMAGE_DATA")
+                else:
+                    col.label(text="贴图:用本物体材质的贴图", icon="IMAGE_DATA")
+                if obj.type != "MESH":
+                    col.label(text="空物体也能当发射器:只标位置和朝向",
+                              icon="INFO")
 
         # ---- 视口预览 ----
         # 碰撞体在 Godot 里是运行时的东西,Blender 视口里本来看不见。
@@ -849,6 +1090,8 @@ SHAPE_LABELS = {
     "box": "盒子",
     "sphere": "球",
     "capsule": "胶囊",
+    "cylinder": "圆柱",
+    "convex": "凸包",
 }
 
 
@@ -1249,8 +1492,10 @@ def _draw_logic_port_box(layout, context):
     if ports is None:
         return
 
-    box = layout.box()
-    box.label(text=f"对外端口 ({len(ports)})", icon="PLUGIN")
+    box, opened = collapsible_box(layout, "logic_ports",
+                                  f"对外端口 ({len(ports)})", "PLUGIN")
+    if not opened:
+        return
     if not len(ports):
         box.label(text="声明过的端口:别的图能读到、导出时会校验", icon="INFO")
 
@@ -1271,6 +1516,809 @@ def _draw_logic_port_box(layout, context):
     box.operator("gk.port_add", text="添加端口", icon="ADD")
     if len(ports):
         box.label(text="别的图:『变量_读取』填 输出_<端口名>", icon="INFO")
+
+
+def _logic_tree_of(context):
+    """当前正在编辑的玩法图(编辑的是动画图就返回 None)。"""
+    if props.current_tree_type(context) != "GKGameLogicTree":
+        return None
+    return props.current_tree(context)
+
+
+class GK_OT_LogicVarAdd(bpy.types.Operator):
+    """在当前逻辑图里声明一个变量。"""
+
+    bl_idname = "gk.logic_var_add"
+    bl_label = "声明一个变量"
+    bl_description = "在当前逻辑图里声明一个变量(名字 / 类型 / 初值)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _logic_tree_of(context)
+        if tree is None:
+            self.report({"WARNING"}, "请先打开一张游戏逻辑图")
+            return {"CANCELLED"}
+        used = {str(var.var_name) for var in tree.gk_vars}
+        name, index = "新变量", 1
+        while name in used:
+            index += 1
+            name = f"新变量{index}"
+        var = tree.gk_vars.add()
+        var.var_name = name
+        tree.gk_var_index = len(tree.gk_vars) - 1
+        self.report({"INFO"}, f"声明了变量『{name}』—— 节点上点放大镜挑它")
+        return {"FINISHED"}
+
+
+class GK_OT_LogicVarRemove(bpy.types.Operator):
+    """删掉一个声明的变量。"""
+
+    bl_idname = "gk.logic_var_remove"
+    bl_label = "删除变量"
+    bl_description = "删掉这个声明(图里已经引用它的节点会退回隐式声明)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="第几个", default=0)
+
+    def execute(self, context):
+        tree = _logic_tree_of(context)
+        if tree is None or not (0 <= self.index < len(tree.gk_vars)):
+            return {"CANCELLED"}
+        name = str(tree.gk_vars[self.index].var_name)
+        tree.gk_vars.remove(self.index)
+        tree.gk_var_index = max(0, min(int(tree.gk_var_index),
+                                       len(tree.gk_vars) - 1))
+        self.report({"INFO"}, f"删了变量声明『{name}』")
+        return {"FINISHED"}
+
+
+class GK_OT_PickVar(bpy.types.Operator):
+    """在取/设变量节点上挑一个**已声明**的变量(和『选动画』同一套搜索弹窗)。"""
+
+    bl_idname = "gk.pick_var"
+    bl_label = "选择变量"
+    bl_description = "从这张图声明的变量里挑一个填进节点"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    slot: IntProperty(name="第几个变量槽", default=1)
+    choice: StringProperty(name="变量名", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None:
+            self.report({"WARNING"}, "没找到目标节点,变量名没写进去")
+            return {"CANCELLED"}
+        attr = "gk_var_name" if self.slot <= 1 else f"gk_var_name_{self.slot}"
+        if not hasattr(node, attr):
+            self.report({"WARNING"}, "这个节点没有对应的变量槽,没写进去")
+            return {"CANCELLED"}
+        setattr(node, attr, self.choice)
+        self.report({"INFO"}, f"变量 -> {self.choice}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        tree = props.current_tree(context)
+        for var in (getattr(tree, "gk_vars", ()) or ()):
+            op = self.layout.operator("gk.pick_var", text=str(var.var_name))
+            op.node_name = self.node_name
+            op.slot = self.slot
+            op.choice = str(var.var_name)
+
+
+def _draw_variable_box(layout, context):
+    """侧栏『变量』盒子 —— 声明 + 集中视图(用户 2026-10-04)。
+
+    上半是**声明区**:一处定好变量的名字 / 类型 / 初值,节点上从下拉里挑,
+    导出时按这里的类型生成成员变量(打在脚本顶部的成员变量清单里)。
+    下半是**引用区**:把整张图扫一遍,列出"谁在读、谁在写" ——
+    没声明过的名字会标『未声明』,点放大镜能选中所有引用它的节点。
+    """
+    tree = _logic_tree_of(context)
+    if tree is None:
+        return
+    declared = getattr(tree, "gk_vars", None) or ()
+    declared_names = {str(var.var_name) for var in declared}
+    usages = props.variable_references(tree)
+
+    box, opened = collapsible_box(
+        layout, "variables",
+        f"变量 ({len(declared)} 声明 · {len(usages)} 引用)", "SORTALPHA")
+    if not opened:
+        return
+
+    # ---- 声明区:一处定好名字 / 类型 / 初值,节点上从下拉里挑 ----
+    if not declared:
+        box.label(text="声明一个变量,节点上就能从下拉里挑名字", icon="INFO")
+    for index, var in enumerate(declared):
+        row = box.row(align=True)
+        row.prop(var, "var_name", text="")
+        row.prop(var, "var_type", text="")
+        get = row.operator("gk.var_make_node", text="取")
+        get.var_name = str(var.var_name)
+        get.make_set = False
+        put = row.operator("gk.var_make_node", text="设")
+        put.var_name = str(var.var_name)
+        put.make_set = True
+        remove = row.operator("gk.logic_var_remove", text="", icon="X")
+        remove.index = index
+        detail = box.row(align=True)
+        detail.prop(var, "default_value", text="初值")
+        detail.prop(var, "comment", text="", icon="INFO")
+        # 监视开关(第二十二轮):勾上的变量进**游戏内调试面板**。
+        # 一个都不勾 = 面板显示脚本里全部变量(见 GKLogicVariable.watch)。
+        detail.prop(var, "watch", text="", toggle=True,
+                    icon="HIDE_OFF" if getattr(var, "watch", True)
+                    else "HIDE_ON")
+        # ── 变量的"实现"(用户 2026-10-05:照 UE5 的 getter/setter)────────
+        # 读 / 写这个变量时改调的函数。绑了之后图里照样用『变量_读取』
+        # 『变量_设置』,生成出来却是函数调用 —— "读的时候要算一下"
+        # 就不用每个读取点各连一遍。
+        impl = box.row(align=True)
+        getter = str(getattr(var, "getter", "") or "")
+        setter = str(getattr(var, "setter", "") or "")
+        pick = impl.operator("gk.var_bind_impl", text="读→" + (getter or "变量"),
+                             icon="TRIA_RIGHT")
+        pick.slot = index
+        pick.which = "getter"
+        pick = impl.operator("gk.var_bind_impl", text="写→" + (setter or "变量"),
+                             icon="TRIA_LEFT")
+        pick.slot = index
+        pick.which = "setter"
+        declared_funcs = props.tree_functions(tree)
+        for label, bound in (("读取时调用", getter), ("写入时调用", setter)):
+            if bound and bound not in declared_funcs:
+                box.label(text=f"⚠ {label}的『{bound}』没有声明过 —— "
+                               f"导出时会改回直接用变量", icon="ERROR")
+            elif bound and label == "写入时调用":
+                params = declared_funcs.get(bound, {}).get("params") or []
+                if len(params) != 1:
+                    box.label(text=f"⚠ setter『{bound}』要正好 1 个参数"
+                                   f"(现在 {len(params)} 个)", icon="ERROR")
+    box.operator("gk.logic_var_add", text="声明一个变量", icon="ADD")
+    if declared:
+        box.label(text="『读→/写→』= 读写这个变量时改调的函数(UE5 的 getter/setter)",
+                  icon="INFO")
+
+    # ---- 引用区:图里谁读谁写;没声明的名字标出来 ----
+    box.separator()
+    if not usages:
+        box.label(text="图里还没有节点用到变量", icon="INFO")
+    for name, sets, gets in usages:
+        row = box.row(align=True)
+        if name in declared_names:
+            row.label(text=name, icon="SORTALPHA")
+        else:
+            row.label(text=f"{name} · 未声明", icon="ERROR")
+        row.label(text=f"设 {len(sets)} · 读 {len(gets)}")
+        find = row.operator("gk.var_find_refs", text="", icon="VIEWZOOM")
+        find.var_name = name
+        get = row.operator("gk.var_make_node", text="取", icon="CHECKBOX_DEHLT")
+        get.var_name = name
+        get.make_set = False
+        put = row.operator("gk.var_make_node", text="设", icon="CHECKBOX_HLT")
+        put.var_name = name
+        put.make_set = True
+    if usages:
+        box.label(text="点放大镜选中所有引用该变量的节点", icon="INFO")
+
+
+class GK_OT_VarBindImpl(bpy.types.Operator):
+    """给变量绑一个"实现"函数(用户 2026-10-05:照 UE5 的 getter/setter)。
+
+    图里照样用『变量_读取』『变量_设置』,生成出来却是函数调用 ——
+    这样"读的时候要算一下 / 写的时候顺带做别的事"只写一处。
+    """
+
+    bl_idname = "gk.var_bind_impl"
+    bl_label = "绑定实现函数"
+    bl_description = ("读 / 写这个变量时改调的函数(留空 = 直接用变量本身)。"
+                      "从侧栏『函数』框里声明的函数里挑")
+    bl_property = "choice"
+
+    slot: IntProperty(name="第几个变量", default=0)
+    which: StringProperty(name="getter 还是 setter", default="getter")
+    choice: EnumProperty(name="函数", items=lambda self, context: [
+        ("", "(不绑定 —— 直接用变量)", "取消绑定", "X", 0)] + [
+        (name, name, spec.get("comment") or "这个函数", "FILE_SCRIPT", 0)
+        for name, spec in sorted(
+            props.tree_functions(props.current_tree(context) or object())
+            .items())])
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        tree = _logic_tree_of(context)
+        if tree is None or not (0 <= self.slot < len(tree.gk_vars)):
+            return {"CANCELLED"}
+        var = tree.gk_vars[self.slot]
+        attr = "setter" if self.which == "setter" else "getter"
+        setattr(var, attr, self.choice or "")
+        label = "写入时调用" if attr == "setter" else "读取时调用"
+        if self.choice:
+            self.report({"INFO"}, f"『{var.var_name}』的{label} -> {self.choice}")
+        else:
+            self.report({"INFO"}, f"『{var.var_name}』取消绑定(直接用变量)")
+        return {"FINISHED"}
+
+
+class GK_OT_FuncAdd(bpy.types.Operator):
+    """在当前逻辑图里声明一个函数(用户 2026-10-05 第十七轮)。"""
+
+    bl_idname = "gk.func_add"
+    bl_label = "声明一个函数"
+    bl_description = "在当前逻辑图里声明一个函数(名字 / 返回 / 参数)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _logic_tree_of(context)
+        if tree is None:
+            self.report({"WARNING"}, "请先打开一张游戏逻辑图")
+            return {"CANCELLED"}
+        used = {str(item.func_name) for item in tree.gk_funcs}
+        name, index = "新函数", 1
+        while name in used:
+            index += 1
+            name = f"新函数{index}"
+        func = tree.gk_funcs.add()
+        func.func_name = name
+        tree.gk_func_index = len(tree.gk_funcs) - 1
+        self.report({"INFO"}, f"声明了函数『{name}』—— 用『函数_定义』写它、"
+                              f"『函数_调用』用它")
+        return {"FINISHED"}
+
+
+class GK_OT_FuncRemove(bpy.types.Operator):
+    """删掉一个声明的函数。"""
+
+    bl_idname = "gk.func_remove"
+    bl_label = "删除函数"
+    bl_description = ("删掉这个函数声明。⚠ 图里引用它的『函数_定义』"
+                      "『函数_调用』节点会变成没声明的状态(导出时告警)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="第几个", default=0)
+
+    def execute(self, context):
+        tree = _logic_tree_of(context)
+        if tree is None or not (0 <= self.index < len(tree.gk_funcs)):
+            return {"CANCELLED"}
+        name = str(tree.gk_funcs[self.index].func_name)
+        tree.gk_funcs.remove(self.index)
+        tree.gk_func_index = max(0, min(int(tree.gk_func_index),
+                                        len(tree.gk_funcs) - 1))
+        self.report({"INFO"}, f"删了函数声明『{name}』")
+        return {"FINISHED"}
+
+
+class GK_OT_MakeFunctionNode(bpy.types.Operator):
+    """一键拖出『函数_定义』或『函数_调用』节点(省得去菜单里翻)。"""
+
+    bl_idname = "gk.func_make_node"
+    bl_label = "函数节点"
+    bl_description = "为这个函数造一个定义 / 调用节点"
+    bl_options = {"REGISTER", "UNDO"}
+
+    func_name: StringProperty(name="函数名", default="")
+    make_call: BoolProperty(name="造调用节点", default=False)
+
+    def execute(self, context):
+        tree = _logic_tree_of(context)
+        if tree is None or not self.func_name:
+            return {"CANCELLED"}
+        if self.func_name not in props.tree_functions(tree):
+            self.report({"WARNING"}, f"没有声明过函数『{self.func_name}』")
+            return {"CANCELLED"}
+        node = tree.nodes.new("GKNodeFunctionCall" if self.make_call
+                              else "GKNodeFunctionDefine")
+        node.gk_func_name = self.func_name
+        node.name = (f"调用_{self.func_name}" if self.make_call
+                     else f"定义_{self.func_name}")
+        # 摆在视口中间偏一点,免得和别的节点叠在一起看不见
+        node.location = (0.0, 200.0 if self.make_call else 0.0)
+        builder = getattr(node, "build_sockets", None)
+        if callable(builder):
+            builder()
+        self.report({"INFO"}, f"造了{'调用' if self.make_call else '定义'}节点:"
+                              f"{node.name}")
+        return {"FINISHED"}
+
+
+class GK_OT_PickFunction(bpy.types.Operator):
+    """在函数节点上挑一个**已声明**的函数(和『选变量』同一套搜索弹窗)。"""
+
+    bl_idname = "gk.pick_function"
+    bl_label = "选择函数"
+    bl_description = "从这张图声明的函数里挑一个填进节点"
+    bl_property = "func_name"
+
+    node_name: StringProperty(name="节点", default="")
+    func_prop: StringProperty(name="属性名", default="gk_func_name")
+    func_name: EnumProperty(name="函数", items=lambda self, context: [
+        (name, f"{name}({len(spec['params'])} 参数)"
+         + (f" -> {spec['return']}" if spec["return"] else ""),
+         spec.get("comment") or "这个函数", "FILE_SCRIPT", 0)
+        for name, spec in sorted(
+            props.tree_functions(props.current_tree(context) or object())
+            .items())] or [("", "(还没有函数)", "先在侧栏『函数』框声明", "ERROR", 0)])
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.func_name:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        if node is None or not hasattr(node, self.func_prop):
+            self.report({"WARNING"}, "没找到目标节点(或它没有函数栏位)")
+            return {"CANCELLED"}
+        setattr(node, self.func_prop, self.func_name)
+        # 换了函数 -> 参数引脚要跟着重长(不然还是上一个函数的参数框)
+        builder = getattr(node, "build_sockets", None)
+        if callable(builder):
+            builder()
+        self.report({"INFO"}, f"函数 -> {self.func_name}")
+        return {"FINISHED"}
+
+
+def _draw_function_box(layout, context):
+    """侧栏『函数』盒子(用户 2026-10-05 第十七轮:"查看函数,自定义函数")。
+
+    上半是**声明区**:一处写好名字 / 返回 / 参数,节点上从下拉里挑;
+    每个函数旁边两个按钮直接造『函数_定义』『函数_调用』节点。
+    下半是**清单**:图里哪些函数真的有定义 / 有被调用 ——
+    "声明了但从来没定义"是最常见的忘接线,这里一眼能看出来。
+    """
+    tree = _logic_tree_of(context)
+    if tree is None:
+        return
+    declared = getattr(tree, "gk_funcs", None) or ()
+    specs = props.tree_functions(tree)
+    # 扫图:哪些函数有『函数_定义』、哪些被调用过
+    defined, called = set(), set()
+    for node in getattr(tree, "nodes", ()) or ():
+        name = str(getattr(node, "gk_func_name", "") or "").strip()
+        idname = getattr(node, "bl_idname", "")
+        if not name:
+            continue
+        if idname == "GKNodeFunctionDefine":
+            defined.add(name)
+        elif idname == "GKNodeFunctionCall":
+            called.add(name)
+
+    box, opened = collapsible_box(
+        layout, "functions",
+        f"函数 ({len(declared)} 声明 · {len(defined)} 有定义)", "FILE_SCRIPT")
+    if not opened:
+        return
+
+    if not declared:
+        box.label(text="声明一个函数,就能一处定义、多处调用", icon="INFO")
+    for index, func in enumerate(declared):
+        row = box.row(align=True)
+        row.prop(func, "func_name", text="")
+        row.prop(func, "return_type", text="")
+        remove = row.operator("gk.func_remove", text="", icon="X")
+        remove.index = index
+        detail = box.row(align=True)
+        detail.prop(func, "params", text="参数")
+        row = box.row(align=True)
+        op = row.operator("gk.func_make_node", text="造定义", icon="FILE_SCRIPT")
+        op.func_name = str(func.func_name)
+        op.make_call = False
+        op = row.operator("gk.func_make_node", text="造调用", icon="PLAY")
+        op.func_name = str(func.func_name)
+        op.make_call = True
+        box.prop(func, "comment", text="", icon="INFO")
+        name = str(func.func_name)
+        if name in specs:
+            spec = specs[name]
+            note = [text for text in (
+                "有定义" if name in defined else "⚠ 没有『函数_定义』节点",
+                f"被调用 {1 if name in called else 0} 次") if text]
+            box.label(text=" · ".join(note), icon="INFO")
+            if spec.get("bad_types"):
+                box.label(text="⚠ 参数类型不认识(已按浮点): "
+                               + "、".join(spec["bad_types"]), icon="ERROR")
+    box.operator("gk.func_add", text="声明一个函数", icon="ADD")
+    if declared:
+        box.label(text="函数体 = 从『函数_定义』的执行口接出去的那串节点",
+                  icon="INFO")
+    # 『折叠 + 复用』的入口 —— 选中一串节点,一键收进函数(照蓝图
+    # 的 Collapse to Function)。放在这里是因为"折叠"这事的结果就是
+    # 多出一个函数,在这个框里最容易找到。
+    collapse = box.row(align=True)
+    collapse.operator("gk.collapse_to_function",
+                      text="折叠选中的节点成函数", icon="FILE_SCRIPT")
+
+
+class GK_OT_CollapseToFunction(bpy.types.Operator):
+    """把选中的一串节点**折叠成一个函数**(用户 2026-10-05 第十七轮)。
+
+    用户原话:"可查看函数,自定义函数,折叠函数等"(照虚幻蓝图 Collapse to
+    Function)。
+
+    ── 干什么 ──────────────────────────────────────────────────────
+    选中一段执行流 → 一键做完三件事:
+      ① 侧栏『函数』框里**声明**一个新函数(名字自动取,可改);
+      ② 把选中的节点搬进函数体(前面接一个『函数_定义』);
+      ③ 在原来的位置**留一个『函数_调用』**,原来的上游/下游照旧接上。
+
+    所以折叠前后**行为完全一样**,只是那串节点被收进函数里、可以复用。
+
+    ── 不能自动折叠的情况(明确报出来,而不是折叠坏)────────────────
+      * 选中里有**多个入口**(两条上游都指进来)—— 函数只能有一个入口;
+      * 有**数据线穿过边界**(函数里的值给外面用 / 外面的值给里面用)——
+        那需要参数和返回值,得手动摆;
+      * 出口超过一个(比如选中了分支节点的『是』『否』两边)。
+    """
+
+    bl_idname = "gk.collapse_to_function"
+    bl_label = "折叠成函数"
+    bl_description = ("把选中的节点收进一个新函数,原位置留一个调用节点。"
+                      "⚠ 需要:一个入口、一个出口,且数据线不跨边界")
+    bl_options = {"REGISTER", "UNDO"}
+
+    func_name: StringProperty(name="函数名", default="")
+
+    # ---- 小工具 ----
+    @staticmethod
+    def _exec_in(node):
+        """节点上那个叫『执行』的输入引脚(没有就 None)。"""
+        getter = getattr(getattr(node, "inputs", None), "get", None)
+        return getter("执行") if callable(getter) else None
+
+    @staticmethod
+    def _exec_out(node):
+        getter = getattr(getattr(node, "outputs", None), "get", None)
+        if not callable(getter):
+            return None
+        for name in ("完成", "执行"):
+            socket = getter(name)
+            if socket is not None:
+                return socket
+        return None
+
+    def _flow_links(self, tree, selected):
+        """把连线分成三类:(从外进里的, 从里出去的, 跨边界的数据线)。"""
+        incoming, outgoing, crossing = [], [], []
+        for link in tree.links:
+            from_node = getattr(link, "from_node", None)
+            to_node = getattr(link, "to_node", None)
+            inside_from = from_node in selected
+            inside_to = to_node in selected
+            if inside_from and inside_to:
+                continue
+            if inside_from and not inside_to:
+                socket = getattr(link, "from_socket", None)
+                # 执行流出口 vs 数据出口:靠引脚种类分(Flow 是 GK 自己的种类)
+                if _is_flow_socket(socket):
+                    outgoing.append(link)
+                else:
+                    crossing.append(link)
+            elif inside_to and not inside_from:
+                socket = getattr(link, "to_socket", None)
+                if _is_flow_socket(socket):
+                    incoming.append(link)
+                else:
+                    crossing.append(link)
+        return incoming, outgoing, crossing
+
+    @staticmethod
+    def _kind_of(socket):
+        """这根引脚跑的是什么类型 -> 声明里用的短名(bool/int/float/string/vector)。
+
+        认不出来就给 float —— 和『参数』那一栏"类型不认识就按浮点"一个规矩。
+        """
+        idname = str(getattr(socket, "bl_idname", "")
+                     or getattr(socket, "type", "") or "")
+        return {
+            "NodeSocketBool": "bool",
+            "NodeSocketInt": "int",
+            "NodeSocketFloat": "float",
+            "NodeSocketString": "string",
+            "NodeSocketVector": "vector",
+            "NodeSocketVector2D": "vector",
+        }.get(idname, "float")
+
+    def execute(self, context):
+        # ── 用 ops._tree_of 而不是 props.current_tree ────────────────
+        # 无头 / 搜索弹窗那条路上 context 里没有 space_data,
+        # 而"折叠"必须拿到**选中节点所在的**那棵树(_tree_of 有退路)。
+        tree = ops._tree_of(self, context) or props.current_tree(context)
+        if tree is None:
+            return {"CANCELLED"}
+        selected = [node for node in tree.nodes
+                    if getattr(node, "select", False)
+                    and not getattr(node, "gk_is_comment", False)]
+        # 跨边界的数据线分析要用到"选中集合"和"当前树",挂成实例属性
+        # (几个小工具函数都在用,逐个传参太啰嗦)
+        self._selected = selected
+        self._tree = tree
+        if len(selected) < 1:
+            self.report({"WARNING"}, "先选中要折叠的那串节点(至少一个)")
+            return {"CANCELLED"}
+        # 『函数_定义』『函数_调用』本身不能再被折叠
+        for node in selected:
+            if getattr(node, "bl_idname", "") in ("GKNodeFunctionDefine",
+                                                  "GKNodeFunctionCall"):
+                self.report({"WARNING"}, "选中的节点里有函数节点,不能再折叠它")
+                return {"CANCELLED"}
+
+        incoming, outgoing, crossing = self._flow_links(tree, selected)
+        if len(incoming) > 1:
+            self.report({"WARNING"}, "选中的节点有**多个入口** —— 函数只能有一个"
+                                     "入口,请少选一段,分两次折叠")
+            return {"CANCELLED"}
+        if not incoming:
+            self.report({"WARNING"}, "选中的这段**没有上游**(没人驱动它)—— "
+                                     "函数得从别处被调用,请把它接在一条执行流后面")
+            return {"CANCELLED"}
+        if len(outgoing) > 1:
+            self.report({"WARNING"}, "选中的这段有**多个出口**(比如选了分支的"
+                                     "两边)—— 请只选一条路径")
+            return {"CANCELLED"}
+        # ── 出口必须是"往下一句走"的口(『完成』『执行』)─────────────────
+        # 如果出口是分支的『是』/『否』,折叠后它会被挪到**调用之后**、
+        # 变成无条件执行 —— 行为就变了(实测想清楚才发现,不是报错而是
+        # "静默改语义",这种最坑)。
+        if outgoing:
+            exit_socket = getattr(outgoing[0], "from_socket", None)
+            exit_name = str(getattr(exit_socket, "name", "") or "")
+            if exit_name not in ("完成", "执行"):
+                self.report(
+                    {"WARNING"},
+                    f"选中这段的出口是『{exit_name}』(分支/循环的出口)——"
+                    f"折叠后它会变成**无条件执行**,行为会变。请只选一条"
+                    f"直着往下的路径(出口是『完成』)")
+                return {"CANCELLED"}
+        if crossing:
+            # 跨边界的数据线现在**自动**变成参数 / 返回值(见 _wire_boundary_data):
+            # 外面给里面用 -> 参数;里面给外面用 -> 返回值(只能一个)。
+            # 先算出"要几个参数、返回值什么类型",写进声明 —— 必须在建
+            # 『函数_调用』节点**之前**算完:那个节点的参数引脚是按声明长出来的,
+            # 建完之后再改声明就得重建引脚,而重建会把接好的线全冲掉。
+            boundary = self._plan_boundary_data(crossing)
+            if boundary["error"]:
+                self.report({"WARNING"}, boundary["error"])
+                return {"CANCELLED"}
+        else:
+            boundary = {"params": [], "return": None, "error": ""}
+
+        # ---- ① 声明函数 ----
+        used = {str(item.func_name) for item in tree.gk_funcs}
+        raw = self.func_name.strip()
+        if not raw:
+            index = 1
+            raw = "折叠函数"
+            while raw in used:
+                index += 1
+                raw = f"折叠函数{index}"
+        elif raw in used:
+            self.report({"WARNING"}, f"已经有一个叫『{raw}』的函数了,换个名字")
+            return {"CANCELLED"}
+        func = tree.gk_funcs.add()
+        func.func_name = raw
+        func.comment = "由『折叠成函数』从选中的 %d 个节点生成" % len(selected)
+        if boundary["params"]:
+            func.params = ", ".join(f"{name}:{kind}"
+                                    for name, kind, _src, _targets
+                                    in boundary["params"])
+        if boundary["return"]:
+            func.return_type = boundary["return"]["kind"]
+
+        # ---- ② 摆『函数_定义』,把它接在入口前面 ----
+        xs = [node.location[0] for node in selected]
+        ys = [node.location[1] for node in selected]
+        define = tree.nodes.new("GKNodeFunctionDefine")
+        define.gk_func_name = raw
+        define.name = f"定义_{raw}"
+        define.location = (min(xs) - 260.0, max(ys))
+        builder = getattr(define, "build_sockets", None)
+        if callable(builder):
+            builder()
+        entry_link = incoming[0]
+        entry_socket = getattr(entry_link, "to_socket", None)
+        from_socket = getattr(entry_link, "from_socket", None)
+        # 先把旧线拆掉:上游 -> 入口 改成 上游 -> 调用
+        tree.links.remove(entry_link)
+        # 定义节点 -> 入口
+        define_out = self._exec_out(define)
+        if define_out is not None and entry_socket is not None:
+            tree.links.new(define_out, entry_socket)
+
+        # ---- ③ 在原来位置留一个『函数_调用』 ----
+        # ⚠ 这一步之后**不能再重建引脚**(重建会把刚接的线冲掉),所以
+        #   参数的声明必须在上面就写好 —— 参数框在这一步按声明长出来。
+        call = tree.nodes.new("GKNodeFunctionCall")
+        call.gk_func_name = raw
+        call.name = f"调用_{raw}"
+        call.location = (min(xs) - 260.0,
+                         min(ys) - 120.0)
+        builder = getattr(call, "build_sockets", None)
+        if callable(builder):
+            builder()
+        call_in = self._exec_in(call)
+        if call_in is not None and from_socket is not None:
+            tree.links.new(from_socket, call_in)
+        if outgoing:
+            exit_link = outgoing[0]
+            # ⚠ 必须**先读**引脚再删线:删掉之后 link 的 StructRNA 就失效了,
+            # 再去 getattr(link, "to_socket") 会报
+            #     ReferenceError: StructRNA of type NodeLink has been removed
+            # (实测踩过)
+            to_socket = getattr(exit_link, "to_socket", None)
+            tree.links.remove(exit_link)
+            call_out = self._exec_out(call)
+            if call_out is not None and to_socket is not None:
+                tree.links.new(call_out, to_socket)
+
+        # ---- ④ 跨边界的数据线 -> 接成参数 / 返回值(用户 2026-10-05)----
+        made = self._wire_boundary_data(tree, boundary, define, call, selected)
+
+        for node in tree.nodes:
+            if hasattr(node, "select"):
+                node.select = False
+        call.select = True
+        extra = ""
+        if made["params"]:
+            extra += ",参数 " + "、".join(made["params"])
+        if made["return_type"]:
+            extra += f",返回 {made['return_type']}"
+        self.report({"INFO"}, f"已折叠成函数『{raw}』({len(selected)} 个节点"
+                              f"{extra});函数体 = 『定义_{raw}』后面那串")
+        return {"FINISHED"}
+
+    def _plan_boundary_data(self, crossing):
+        """先算清楚"要几个参数、返回值什么类型"(不动图)。
+
+        返回 {"params": [(名字, 类型, 外部源引脚, [(内部目标引脚, 线)])...],
+              "return": {"kind", "socket", "links"} 或 None, "error": 文本}。
+        """
+        result = {"params": [], "return": None, "error": ""}
+        selected = self._selected
+        data_in, data_out = {}, {}
+        for link in crossing:
+            from_node = getattr(link, "from_node", None)
+            to_node = getattr(link, "to_node", None)
+            from_socket = getattr(link, "from_socket", None)
+            to_socket = getattr(link, "to_socket", None)
+            inside_from = from_node in selected
+            inside_to = to_node in selected
+            if inside_to and not inside_from:            # 外面的值 -> 里面用
+                key = _socket_key(from_socket)
+                entry = data_in.setdefault(key, {"socket": from_socket,
+                                                 "node": from_node,
+                                                 "targets": []})
+                entry["targets"].append((to_socket, link))
+            elif inside_from and not inside_to:          # 里面的值 -> 外面用
+                key = _socket_key(from_socket)
+                data_out.setdefault(key, {"socket": from_socket,
+                                          "links": []})["links"].append(link)
+
+        # ── 返回值只能有一个 ─────────────────────────────────────────
+        # 多个不同来源要往外送,折叠后就得写多个返回 —— 那得打包成字典 /
+        # 列表才行。这里明确拒绝,比"悄悄只返回一个"安全得多。
+        if len(data_out) > 1:
+            result["error"] = ("有**多个**值要往外送(折叠需要一个返回值)"
+                               "—— 请用一个字典 / 列表把它们装起来再往外接,"
+                               "或者分两次折叠")
+            return result
+        if data_out:
+            entry = list(data_out.values())[0]
+            entry["kind"] = self._kind_of(entry["socket"])
+            result["return"] = entry
+
+        # ── 参数:按外部源引脚下标去重 ───────────────────────────────
+        # 同一个外部值喂给选中里两个节点时,只生成**一个**参数 ——
+        # 生成两个的话调用点会多出两个框,用户还得各自接一遍。
+        taken = {str(getattr(v, "var_name", "")) for v in self._tree_vars()}
+        for index, entry in enumerate(data_in.values(), start=1):
+            base = snake_case(str(getattr(entry["node"], "name", "") or ""), "")
+            name = base or f"输入{index}"
+            if name in taken:
+                suffix = 2
+                while f"{name}_{suffix}" in taken:
+                    suffix += 1
+                name = f"{name}_{suffix}"
+            taken.add(name)
+            result["params"].append((name, self._kind_of(entry["socket"]),
+                                     entry["socket"], entry["targets"]))
+        return result
+
+    def _tree_vars(self):
+        """当前树里已声明的变量(给参数起名时避重名用)。"""
+        return list(getattr(self._tree, "gk_vars", ()) or ())
+
+    def _wire_boundary_data(self, tree, boundary, define, call, selected):
+        """按计划把跨边界的数据线接成参数与返回值(只接线,不再改声明)。
+
+        ── 两条通路 ────────────────────────────────────────────────────
+        外面 -> 里面(参数):
+            外面那个输出 ──► 调用节点的参数框
+            函数体里插一个『变量_读取(参数名)』──► 原来那个输入
+        里面 -> 外面(返回值):
+            里面的输出 ──► 定义节点的『返回』引脚
+            调用节点的『结果』──► 原来接在外面的那几个输入
+        """
+        made = {"params": [], "return_type": ""}
+        for name, kind, source, targets in boundary["params"]:
+            for target_socket, link in targets:
+                tree.links.remove(link)
+                reader = tree.nodes.new("GKNodeGetVar")
+                reader.name = f"读取参数_{name}"
+                reader.gk_var_name = name
+                reader.location = (min(n.location[0] for n in selected) - 120.0,
+                                   max(n.location[1] for n in selected) + 60.0)
+                builder = getattr(reader, "build_sockets", None)
+                if callable(builder):
+                    builder()
+                value_out = reader.outputs.get("值")
+                if value_out is not None and target_socket is not None:
+                    tree.links.new(value_out, target_socket)
+            call_pin = call.inputs.get(name)
+            if call_pin is not None and source is not None:
+                tree.links.new(source, call_pin)
+            made["params"].append(f"{name}({kind})")
+
+        entry = boundary.get("return")
+        if entry:
+            made["return_type"] = entry["kind"]
+            return_pin = define.inputs.get("返回")
+            if return_pin is not None and entry["socket"] is not None:
+                tree.links.new(entry["socket"], return_pin)
+            result_out = call.outputs.get("结果")
+            for link in entry["links"]:
+                to_socket = getattr(link, "to_socket", None)
+                tree.links.remove(link)
+                if result_out is not None and to_socket is not None:
+                    tree.links.new(result_out, to_socket)
+        return made
+
+
+def _is_flow_socket(socket):
+    """这根引脚是不是执行流(靠 GK 的种类判断,不靠名字)。"""
+    if socket is None:
+        return False
+    try:
+        from . import gk_sockets as S
+        return S.is_flow(socket)
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
+def _socket_key(socket):
+    """给引脚一个可比较的身份。
+
+    同一个引脚每次取到的是**不同的 Python 包装对象**(Blender 的行为),
+    用 `id()` 会把"同一根引脚"当成两根 —— 于是同一个外部值会被算成
+    两个参数。`as_pointer()` 才是稳定身份(和 gk_sockets._socket_key
+    同一个坑、同一个解法)。
+    """
+    if socket is None:
+        return None
+    pointer = getattr(socket, "as_pointer", None)
+    if callable(pointer):
+        try:
+            return ("p", pointer())
+        except Exception:                                 # noqa: BLE001
+            pass
+    name = getattr(socket, "name", None)
+    owner = getattr(socket, "node", None)
+    return ("n", getattr(owner, "name", ""), name)
 
 
 class GK_OT_PortAdd(bpy.types.Operator):
@@ -1334,8 +2382,9 @@ class GK_OT_PortMakeNode(bpy.types.Operator):
 
 def _draw_tree_list_box(layout, context):
     """把所有节点图列出来:一行一张,可跳转、可切换"参与导出"。"""
-    box = layout.box()
-    box.label(text="节点图", icon="NODETREE")
+    box, opened = collapsible_box(layout, "tree_list", "节点图", "NODETREE")
+    if not opened:
+        return
     groups = [g for g in bpy.data.node_groups
               if getattr(g, "bl_idname", "") in ("GKGameLogicTree",
                                                  "GKAnimationTree")]
@@ -1361,9 +2410,118 @@ def _draw_tree_list_box(layout, context):
     box.label(text="大纲视图切到 Blend File 也能看到这些图", icon="INFO")
 
 
+def _draw_preset_box(layout, context):
+    """预设:一键生成第三人称角色(用户 2026-10-04 第六条的中间那块)。
+
+    按钮点开是个小对话框(参数都在里面),生成的是**两张普通节点图** ——
+    之后想怎么改都行,不是黑盒。实现见 presets.py。
+    """
+    box, opened = collapsible_box(layout, "preset_box", "预设", "AUTO")
+    if not opened:
+        return
+    box.label(text="一套能跑的第三人称角色:", icon="INFO")
+    box.label(text="输入 · 移动 · 跳跃 · 相机 · 动画")
+    box.operator("gk.character_preset", text="生成第三人称角色(预设)",
+                 icon="PLAY")
+    box.label(text="相机物体自己摆,名字对上就行", icon="CAMERA_DATA")
+
+
+def _draw_asset_box(layout, context):
+    """场景资产(用户 2026-10-05):一个模型导一次、场景里摆多份。
+
+    ── 用户要解决的两件事(原话)────────────────────────────────────
+      * "不可能最后场景一大堆模型在那" -> 资产列表 + 实例化引用;
+      * "有时要定位到一个模型,拉过去的话,视图上会有拉不动,显示到头了等"
+        -> 点一下**定位到它**(选中 + 视图聚焦),顺便检查**视图裁剪**
+           (clip_end 太小的话大场景会被整片裁掉,看起来就是"拉不动")。
+    """
+    box, opened = collapsible_box(layout, "scene_assets", "场景资产",
+                                 "ASSET_MANAGER")
+    if not opened:
+        return
+    try:
+        assets = asset_export.collect_assets(context.scene)
+    except Exception:                                     # noqa: BLE001
+        assets = {}
+    if not assets:
+        box.label(text="还没有资产(留空 = 普通物体)", icon="INFO")
+        box.label(text="选中模型 -> 『游戏物理』-> 填『资产名』")
+        box.label(text="复制一份、勾『作为实例』= 再摆一份", icon="DUPLICATE")
+        _draw_view_clip_row(box, context)
+        return
+
+    total_instances = 0
+    total_members = 0
+    for name in sorted(assets):
+        entry = assets[name]
+        members = entry["members"]
+        source = entry["source"]
+        total_instances += max(0, len(members) - 1)
+        total_members += len(members)
+        row = box.row(align=True)
+        icon = "ERROR" if source is None else "MESH_DATA"
+        row.label(text=f"{name}({len(members)} 份)", icon=icon)
+        # 定位:选中 + 视图聚焦(用户:"定位不到模型")
+        op = row.operator("gk.focus_object", text="", icon="VIEWZOOM")
+        op.object_name = (source or members[0]).name
+        # 再加一份实例
+        add = row.operator("gk.add_asset_instance", text="", icon="DUPLICATE")
+        add.source_name = source.name if source is not None else ""
+        if source is None:
+            box.label(text=f"⚠ 『{name}』没有本体,实例会没有模型", icon="ERROR")
+        elif entry["extra_sources"]:
+            box.label(text=f"⚠ 『{name}』有多个本体(只用了 {source.name})",
+                      icon="ERROR")
+    # ── 场景里的总数统计(用户 2026-10-05:"场景里标出实例总数统计")────
+    # 一行看清"这个场景一共摆了多少份资产/实例",不用一个个资产去加。
+    box.label(text=f"{len(assets)} 个资产 · {total_instances} 份实例 · "
+                   f"共 {total_members} 份物体", icon="CHECKMARK")
+    box.label(text="一个模型导一次,实例各自带碰撞", icon="INFO")
+    _draw_view_clip_row(box, context)
+
+
+def _asset_count(context, name, obj=None):
+    """这个资产在场景里一共摆了几份,以及**当前这个物体**是第几份。
+
+    用户 2026-10-05:"给实例添加显示多少在场景中这样的显示信息" ——
+    实例摆多了很容易忘了总数(到底种了几棵树),面板上直接报
+    `第 2/3 份` / `场景里共 3 份`,数得清才好管。
+    """
+    members = []
+    try:
+        entry = asset_export.collect_assets(context.scene).get(name)
+        members = list(entry.get("members") or []) if entry else []
+    except Exception:                                     # noqa: BLE001
+        members = []
+    total = len(members) or 1
+    for position, member in enumerate(members, start=1):
+        if member == obj:
+            return total, position
+    return total, 1
+
+
+def _draw_view_clip_row(box, context):
+    """视图裁剪检查(用户:"拉过去视图上拉不动、显示到头了")。
+
+    `frame_selected` 之后什么都看不见,最常见的原因**不是**模型丢了,
+    而是 3D 视图的『裁剪终点(clip_end)』比场景尺寸小 —— 远景被裁掉,
+    看起来像"拉不动 / 显示到头了"。这里直接把当前值报出来。
+    """
+    space = getattr(context, "space_data", None)
+    clip = getattr(space, "clip_end", None)
+    if clip is None or clip >= 1000.0:
+        return
+    row = box.row(align=True)
+    row.label(text=f"视图裁剪 {clip:.0f}(远处会被裁掉)", icon="ERROR")
+    row.operator("gk.fix_view_clip", text="改大", icon="FULLSCREEN_ENTER")
+
+
 def _draw_script_carrier_box(layout, context):
     """显示**哪些物体挂了游戏逻辑脚本**(重复勾选会互相覆盖)。"""
-    box = layout.box()
+    box, opened = collapsible_box(layout, "script_carrier",
+                                  "谁挂了脚本", "OBJECT_DATA")
+    if not opened:
+        return
     try:
         carriers = exporter.script_targets(context.scene)
     except Exception:
@@ -1430,6 +2588,104 @@ class GK_OT_FocusObject(bpy.types.Operator):
 
 
 
+class GK_OT_AddAssetInstance(bpy.types.Operator):
+    """再加一份资产的实例(用户 2026-10-05:"游戏静态资产设计")。
+
+    复制**本体**(共享网格数据 = Blender 侧就是实例),摆在它旁边,
+    自动勾上『作为实例』—— 导出的场景里这一份复用本体的模型。
+    """
+
+    bl_idname = "gk.add_asset_instance"
+    bl_label = "再加一份实例"
+    bl_description = ("复制本体、在旁边摆一份新实例(自动勾『作为实例』)。"
+                      "位置可以在视口里随便拖")
+    bl_options = {"REGISTER", "UNDO"}
+
+    source_name: StringProperty(name="本体", default="")
+
+    def execute(self, context):
+        source = bpy.data.objects.get(self.source_name) \
+            if self.source_name else None
+        if source is None:
+            # 没指名本体:用当前选中的物体;它自己如果是实例,就找它的本体
+            obj = getattr(context, "object", None)
+            physics = getattr(obj, "gk_physics", None) if obj else None
+            if obj is not None and physics is not None:
+                name = str(getattr(physics, "asset_name", "") or "").strip()
+                if name:
+                    from . import asset_export
+                    entry = asset_export.collect_assets(context.scene).get(name)
+                    if entry is not None:
+                        source = entry["source"]
+        if source is None or getattr(source, "type", "") != "MESH":
+            self.report({"WARNING"}, "没找到本体:先在『游戏物理』里填『资产名』,"
+                                     "或在列表里点这个资产")
+            return {"CANCELLED"}
+        physics = getattr(source, "gk_physics", None)
+        asset_name = str(getattr(physics, "asset_name", "") or "").strip() \
+            if physics is not None else ""
+        copy = source.copy()                    # 共享网格数据(天然实例)
+        copy.data = source.data
+        copy.name = f"{asset_name or source.name}_实例"
+        for collection in source.users_collection:
+            collection.objects.link(copy)
+        # 摆在旁边(沿 X 挪一个身位),用户不满意可以直接拖
+        width = max(float(getattr(source.dimensions, "x", 1.0) or 1.0), 0.5)
+        copy.location = (source.location.x + width * 1.2,
+                         source.location.y, source.location.z)
+        copy_physics = getattr(copy, "gk_physics", None)
+        if copy_physics is not None:
+            copy_physics.asset_name = asset_name or source.name
+            copy_physics.asset_instance = True
+            copy_physics.script_target = False       # 实例不挂脚本
+        for other in context.scene.objects:
+            other.select_set(False)
+        copy.select_set(True)
+        context.view_layer.objects.active = copy
+        # 报一下"现在场景里共几份" —— 连点几下也知道摆到第几份了
+        from . import asset_export
+        total = len((asset_export.collect_assets(context.scene)
+                     .get(copy_physics.asset_name if copy_physics else "", {})
+                     or {}).get("members") or [])
+        self.report({"INFO"}, f"已加一份实例: {copy.name}"
+                              f"(资产『{copy_physics.asset_name if copy_physics else '?'}』"
+                              f",场景里现在共 {total or 1} 份)")
+        return {"FINISHED"}
+
+
+class GK_OT_FixViewClip(bpy.types.Operator):
+    """把 3D 视图的『裁剪终点』改大(用户:"拉过去视图上拉不动、显示到头了")。
+
+    默认 100 米对稍大一点的场景就太小了 —— 视图聚焦到远处时整片被裁掉,
+    看起来像"模型不见了 / 拉不动",其实只是没画出来。
+    """
+
+    bl_idname = "gk.fix_view_clip"
+    bl_label = "改大视图裁剪"
+    bl_description = "把所有 3D 视图的『裁剪终点』提到 10000 米(大场景不再被裁掉)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        changed = 0
+        windows = getattr(context.window_manager, "windows", ()) or ()
+        for window in windows:
+            screen = getattr(window, "screen", None)
+            for area in getattr(screen, "areas", ()) or ():
+                if getattr(area, "type", "") != "VIEW_3D":
+                    continue
+                for space in getattr(area, "spaces", ()) or ():
+                    if getattr(space, "type", "") != "VIEW_3D":
+                        continue
+                    if float(getattr(space, "clip_end", 0.0) or 0.0) < 10000.0:
+                        space.clip_end = 10000.0
+                        changed += 1
+        if not changed:
+            self.report({"INFO"}, "视图裁剪已经够大了")
+        else:
+            self.report({"INFO"}, f"已把 {changed} 个 3D 视图的裁剪终点改到 10000")
+        return {"FINISHED"}
+
+
 class GK_OT_FitCollisionSize(bpy.types.Operator):
     """把碰撞尺寸填成"正好包住这个模型"。"""
 
@@ -1481,22 +2737,163 @@ class GK_OT_ClearCollisionSize(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class GK_OT_PickMainCamera(bpy.types.Operator):
-    """抓 Blender 视口当前那台相机当主相机(就是你按小键盘 0 看到的那台)。"""
+# ==========================================================================
+# 可折叠的侧栏盒子(用户 2026-10-04:"那几个也可以像导出设置那样折叠起来")
+# ==========================================================================
+# 侧栏原来是一长串盒子,全摊开着 —— 常用的一两块被一堆"看一眼就够"的
+# 信息挤到看不见。『导出设置』早就能折叠(默认收起),现在把同一套交互
+# 铺到每个盒子上:标题行可点,三角箭头朝下=展开 / 朝右=收起。
+#
+# 折叠状态存在模块字典里(跟着当前 Blender 会话走)。**不写进 .blend** ——
+# 它是纯粹的"界面偏好",不该在文件里留下用户看不见的数据。
+_OPEN_SECTIONS = {}
 
-    bl_idname = "gk.pick_main_camera"
-    bl_label = "用视口当前相机"
-    bl_options = {"REGISTER", "UNDO"}
+
+def collapsible_box(layout, key, label, icon="", default_open=True,
+                    header_extra=None):
+    """画一个可折叠盒子,返回 (盒子布局, 是否展开)。
+
+    用法:
+        box, opened = collapsible_box(layout, "tree_list", "节点图", "NODETREE")
+        if opened:
+            box.label(text="...")     # 展开时才画内容
+
+    header_extra 是一个 `func(row)`,用来在标题行最右边再放点东西
+    (比如日志盒子的"关闭日志"按钮)。
+    """
+    opened = _OPEN_SECTIONS.get(key, default_open)
+    box = layout.box()
+    header = box.row(align=True)
+    if icon:
+        header.label(text="", icon=icon)
+    toggle = header.operator(
+        "gk.toggle_section", text=label, emboss=False,
+        icon="TRIA_DOWN" if opened else "TRIA_RIGHT")
+    toggle.key = key
+    toggle.default_open = default_open
+    if header_extra is not None:
+        header_extra(header)
+    return box, opened
+
+
+class GK_OT_ToggleSection(bpy.types.Operator):
+    """折叠 / 展开侧栏里的一个盒子。"""
+
+    bl_idname = "gk.toggle_section"
+    bl_label = "折叠/展开分区"
+    bl_description = "收起或展开这块面板"
+
+    key: StringProperty(name="分区标识", default="")
+    default_open: BoolProperty(name="默认展开", default=True)
 
     def execute(self, context):
-        settings = getattr(context.scene, "gk_settings", None)
-        cam = getattr(context.scene, "camera", None)
-        if settings is None or cam is None:
-            self.report({"WARNING"}, "视口当前没有相机(按小键盘 0 切到相机视角)")
-            return {"CANCELLED"}
-        settings.main_camera = cam.name
-        self.report({"INFO"}, f"主相机设为 {cam.name}")
+        opened = _OPEN_SECTIONS.get(self.key, self.default_open)
+        _OPEN_SECTIONS[self.key] = not opened
+        # 强制重画侧栏,点了立刻见效(否则要等下一次界面刷新才变)
+        area = getattr(context, "area", None)
+        if area is not None:
+            area.tag_redraw()
         return {"FINISHED"}
+
+
+# ==========================================================================
+# 导出报告(用户 2026-10-05 第二十三轮:"导出报告可视化")
+# ==========================================================================
+# 数据在 export_report 里(结构化:level / message / hint / node_name),
+# 这里只负责画:摘要 + 按级别分组的清单 + 每条一个『定位』按钮。
+# 报告本身能一键复制成文本 —— 出问题时用户要把它发出来。
+
+def _report_title(report):
+    """折叠盒子的标题(带徽标:错了几个 / 警了几个)。"""
+    if not report:
+        return "上次导出报告"
+    errors, warnings, _infos = export_report.counts(report)
+    if errors:
+        return f"上次导出报告(❌ {errors} 错误 · {warnings} 警告)"
+    if warnings:
+        return f"上次导出报告(⚠ {warnings} 警告)"
+    return "上次导出报告(✅ 没有告警)"
+
+
+def _wrap_text(text, width=34):
+    """按字数硬折行。
+
+    Blender 的 `label()` **不会自动换行** —— 超长的句子直接被截断
+    ("…"),而我们的诊断动辄两三句(还带"怎么修")。所以自己折。
+    """
+    text = str(text or "")
+    lines = []
+    while len(text) > width:
+        lines.append(text[:width])
+        text = text[width:]
+    lines.append(text)
+    return lines
+
+
+def _draw_export_report(box, report):
+    """画一份导出报告。"""
+    if not report:
+        box.label(text="还没有导出过 —— 点上面的『导出为 Godot 脚本』导一次",
+                  icon="INFO")
+        return
+    errors, warnings, infos = export_report.counts(report)
+    summary = "成功" if report.get("ok") else "失败"
+    if report.get("script_name"):
+        summary += f" · {report['script_name']}({report.get('lines', 0)} 行)"
+    summary += f" · {report.get('written', 0)} 个文件"
+    if report.get("elapsed_ms"):
+        summary += f" · {report['elapsed_ms']:.0f} ms"
+    box.label(text=summary,
+              icon="CHECKMARK" if report.get("ok") else "ERROR")
+    if report.get("error"):
+        stage = f"[{report['stage']}] " if report.get("stage") else ""
+        for index, line in enumerate(_wrap_text(stage + report["error"])):
+            if index == 0:
+                box.label(text=line, icon="ERROR")
+            else:
+                box.label(text="    " + line)
+    if report.get("at"):
+        box.label(text=f"{report['at']}", icon="TIME")
+    if not (errors or warnings or infos):
+        box.label(text="这次导出没有任何问题", icon="CHECKMARK")
+    for level, label, icon in (("error", "错误", "ERROR"),
+                               ("warning", "警告", "ERROR"),
+                               ("info", "提示", "INFO")):
+        items = export_report.items_of(report, level)
+        if not items:
+            continue
+        box.separator()
+        box.label(text=f"{label}({len(items)})", icon=icon)
+        for item in items:
+            _draw_report_item(box, item)
+    if report.get("dropped"):
+        box.label(text=f"(还有 {report['dropped']} 条没列出来)", icon="INFO")
+    row = box.row(align=True)
+    row.operator("gk.export_report_copy", icon="COPYDOWN")
+    row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
+    box.label(text="出问题时点『复制导出报告』,粘出来就能发", icon="INFO")
+
+
+def _draw_report_item(box, item):
+    """报告里的一条:消息 + 怎么修 + (有节点名就给)定位按钮。"""
+    lines = _wrap_text(item.get("message", ""))
+    for index, line in enumerate(lines):
+        if index > 0:
+            box.label(text="    " + line)
+        elif str(item.get("level")) == "error":
+            box.label(text=line, icon="ERROR")
+        else:
+            box.label(text=line, icon="DOT")
+    if item.get("hint"):
+        for index, line in enumerate(_wrap_text("怎么修:" + item["hint"], 32)):
+            box.label(text=("    " if index else "  ") + line, icon="INFO")
+    if item.get("node_name"):
+        row = box.row(align=True)
+        focus = row.operator("gk.export_report_focus",
+                             text=f"定位到『{item['node_name']}』",
+                             icon="VIEWZOOM")
+        focus.node_name = item["node_name"]
+
 
 class GK_PT_Main(bpy.types.Panel):
     bl_idname = "GK_PT_Main"
@@ -1540,42 +2937,94 @@ class GK_PT_Main(bpy.types.Panel):
         # 都留着,随时能开回来)。点名字直接跳进那张图。
         _draw_tree_list_box(layout, context)
 
+        # ---- 预设(用户 2026-10-04 第六条:一键生成第三人称角色)----
+        _draw_preset_box(layout, context)
+
         # ---- 谁挂了脚本(用户第五轮:"不知道哪个搭载了脚本,容易重复")----
         _draw_script_carrier_box(layout, context)
+
+        # ---- 场景资产(用户 2026-10-05:"游戏静态资产设计")----
+        _draw_asset_box(layout, context)
 
         # ---- 对外端口(第 21 轮:"一个游戏逻辑最后应该输出布尔变量")----
         _draw_logic_port_box(layout, context)
 
-        # ---- 导出脚本 ----
-        box = layout.box()
-        box.label(text="导出为 Godot 脚本", icon="EXPORT")
-        row = box.row(align=True)
-        row.scale_y = 1.4
-        row.operator("gk.export_script", icon="FILE_TICK")
-        row.operator("gk.preview_script", text="", icon="HIDE_OFF")
+        # ---- 变量集中视图(用户 2026-10-04:"图里有哪些变量?谁读谁写?"）----
+        _draw_variable_box(layout, context)
 
+        # ---- 函数(用户 2026-10-05 第十七轮:"查看函数,自定义函数")----
+        _draw_function_box(layout, context)
+
+        # ---- 导出脚本 ----
         settings = getattr(context.scene, "gk_settings", None)
-        if settings is not None:
-            col = box.column(align=True)
-            row = col.row(align=True)
-            row.prop(settings, "write_scene", toggle=True)
-            # 卡通材质开关(用户第 24 轮:"应该加个开关,想看看细节")
-            # —— 关掉后按 Blender 原样导出 PBR 材质,运行画面和预览一致
-            row.prop(settings, "toon_materials", toggle=True)
-            row.prop(settings, "debug_runtime", toggle=True)
-            row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
-            # 主相机(用户第 25 轮:"没看到默认摄像机按钮")
-            cam_row = box.row(align=True)
-            cam_row.label(text="主相机", icon="CAMERA_DATA")
-            cam_row.prop(settings, "main_camera", text="")
-            pick = cam_row.operator("gk.pick_main_camera", text="", icon="EYEDROPPER")
-            cameras = [o.name for o in context.scene.objects
-                       if getattr(o, "type", "") == "CAMERA"]
-            if not getattr(settings, "main_camera", ""):
-                if len(cameras) > 1:
-                    box.label(text=f"场景里有 {len(cameras)} 台相机 —— "
-                                   f"建议指定主相机", icon="INFO")
-                elif cameras:
+        box, opened = collapsible_box(layout, "export_script",
+                                      "导出为 Godot 脚本", "EXPORT")
+        if opened:
+            row = box.row(align=True)
+            row.scale_y = 1.4
+            row.operator("gk.export_script", icon="FILE_TICK")
+            row.operator("gk.preview_script", text="", icon="HIDE_OFF")
+            # ── 导出前预览碰撞体(本轮:"预览接进导出")────────────────
+            # 把这次导出会生成的全部碰撞体一次显示成线框 ——
+            # 线框和导出用**同一套计算**,看到的尺寸就是生成出来的尺寸。
+            preview_row = box.row(align=True)
+            preview_row.operator("gk.preview_colliders", icon="SHADING_WIRE")
+            preview_row.operator("gk.hide_collision", text="", icon="X")
+
+            if settings is not None:
+                col = box.column(align=True)
+                row = col.row(align=True)
+                row.prop(settings, "write_scene", toggle=True)
+                # 卡通材质开关(用户第 24 轮:"应该加个开关,想看看细节")
+                # —— 关掉后按 Blender 原样导出 PBR 材质,运行画面和预览一致
+                row.prop(settings, "toon_materials", toggle=True)
+                row.prop(settings, "debug_runtime", toggle=True)
+                row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
+                # ── 游戏内调试面板(用户 2026-10-05 第二十二轮:调试体验)────
+                # 『运行日志』只能往控制台打字;这个是**玩的时候能看**的一块
+                # HUD:FPS / 状态 / 变量实时值 / 最近打印,另一个键复制全部。
+                dbg_row = box.row(align=True)
+                dbg_row.prop(settings, "debug_panel", toggle=True, icon="INFO")
+                if getattr(settings, "debug_panel", False):
+                    dbg_row.prop(settings, "debug_key", text="")
+                    dbg_row.prop(settings, "debug_copy_key", text="")
+                    box.label(text="游戏里:左键弹出 / 收起面板,右键把全部内容"
+                                   "复制到剪贴板(也打到控制台)", icon="INFO")
+                    if str(getattr(settings, "dimension", "3")) == "2":
+                        # 面板在**环境脚本**里,而环境脚本目前只给 3D 生成
+                        # (2D 项目没有材质/上帝机那一套)。别让用户开了却没反应。
+                        box.label(text="⚠ 2D 项目暂时没有调试面板(只支持 3D);"
+                                       "先用『运行日志』或『导出诊断信息』",
+                                  icon="ERROR")
+                # 卡通是否跟着场景光照画明暗(用户 2026-10-04:导出有"光照残留")。
+                # 卡通 shader 是 unshaded,但它会自己按 light_dir 画色阶;旧版
+                # 导出脚本默认每物理帧把场景平行光同步进去 —— 场景有太阳时
+                # 模型身上就有明暗带。默认关 = 全平涂。只在开着卡通材质时显示。
+                if getattr(settings, "toon_materials", True):
+                    light_row = box.row(align=True)
+                    light_row.prop(settings, "toon_follow_light", toggle=True,
+                                   icon="LIGHT_SUN")
+                    if getattr(settings, "toon_follow_light", False):
+                        light_row.label(text="明暗跟着场景太阳转", icon="INFO")
+                    else:
+                        light_row.label(text="全平涂(推荐)", icon="CHECKMARK")
+                # 上帝摄像机(用户 2026-10-04:把"主相机"那一行改成这个开关)。
+                # 原来这里是"主相机"下拉 + 拾取按钮 —— 用户的原话是
+                # "改成其他要用的或者删了";改成常驻一台上帝摄像机,
+                # 运行时按 Tab 在玩家相机和它之间切。
+                cam_row = box.row(align=True)
+                cam_row.prop(settings, "god_camera", toggle=True,
+                             icon="CAMERA_DATA")
+                cameras = [o.name for o in context.scene.objects
+                           if getattr(o, "type", "") == "CAMERA"]
+                if getattr(settings, "god_camera", False):
+                    box.label(text="运行时按 Tab 切换玩家相机 / "
+                                   "上帝摄像机(WASD + 空格/Shift + 鼠标)",
+                              icon="INFO")
+                elif not cameras:
+                    box.label(text="场景里没有相机 —— 运行时会自动造一台观察机",
+                              icon="INFO")
+                else:
                     box.label(text=f"自动:跟着视口当前相机({cameras[0]})",
                               icon="CHECKMARK")
 
@@ -1584,56 +3033,63 @@ class GK_PT_Main(bpy.types.Panel):
         # 材质跟着模型一起导出:没设材质就自动给默认白色。
         # 以前这里拆成"导出模型"和"导出材质"两个按钮,但用户实际
         # 永远是两个一起点 —— 拆开只是多一步操作,所以合并成一个。
-        box = layout.box()
-        box.label(text="导出模型和材质", icon="MESH_DATA")
-        row = box.row(align=True)
-        row.scale_y = 1.4
-        row.operator("gk.export_assets", icon="EXPORT")
-        box.label(text="选中网格 = 只导选中的；不选 = 导出全部", icon="INFO")
-        box.label(text="没材质的物体会用默认白色材质", icon="INFO")
-        box.label(text="导出会带上卡通材质；描边等额外效果请在 Godot 里加",
-                  icon="INFO")
+        box, opened = collapsible_box(layout, "export_assets",
+                                      "导出模型和材质", "MESH_DATA")
+        if opened:
+            row = box.row(align=True)
+            row.scale_y = 1.4
+            row.operator("gk.export_assets", icon="EXPORT")
+            box.label(text="选中网格 = 只导选中的；不选 = 导出全部", icon="INFO")
+            box.label(text="没材质的物体会用默认白色材质", icon="INFO")
+            box.label(text="导出会带上卡通材质；描边等额外效果请在 Godot 里加",
+                      icon="INFO")
 
-        last = ops.LAST_EXPORT
-        if last:
-            sub = box.column(align=True)
-            sub.label(text=f"上次导出: {last.get('script_name', '')}"
-                           f"（{last.get('lines', 0)} 行）", icon="CHECKMARK")
-            for warning in last.get("warnings", [])[:4]:
-                sub.label(text=warning, icon="ERROR")
+            # ── 上次导出报告(用户 2026-10-05 第二十三轮:导出报告可视化)──
+            # 以前这里只列**前 4 条**警告、还把每条压成一行普通 label ——
+            # 诊断里附的"怎么修"(hint)完全看不见,而且转头就找不到了。
+            # 现在是独立的可折叠盒子:按级别分组、带修复建议、能定位到
+            # 出问题的那个节点、能一键复制成文本发出来。
+            report = export_report.load(context.scene)
+            report_box, report_open = collapsible_box(
+                layout, "export_report", _report_title(report), "TEXT",
+                default_open=bool(report))
+            if report_open:
+                _draw_export_report(report_box, report)
 
         # ---- 节点树状态 ----
-        box = layout.box()
-        box.label(text="节点图", icon="NODETREE")
-        if tree is None:
-            box.label(text="当前没有游戏逻辑节点树", icon="INFO")
-            box.operator("node.new_node_tree", text="新建节点树", icon="ADD").type = "GKGameLogicTree"
-        else:
-            events, statements = props.event_summary(tree)
-            col = box.column(align=True)
-            col.label(text=f"节点总数:{len(tree.nodes)}")
-            col.label(text=f"事件:{events}    动作:{statements}")
-            if events == 0:
-                col.label(text="还没有事件节点，脚本不会执行任何逻辑", icon="ERROR")
-            # 「添加节点」按钮删掉(用户第 25 轮):Shift+A 和右键菜单都在,
-            # 侧栏再放一个是重复的,而且它常年占着最显眼的位置。
+        box, opened = collapsible_box(layout, "tree_status", "节点图", "NODETREE")
+        if opened:
+            if tree is None:
+                box.label(text="当前没有游戏逻辑节点树", icon="INFO")
+                box.operator("node.new_node_tree", text="新建节点树",
+                             icon="ADD").type = "GKGameLogicTree"
+            else:
+                events, statements = props.event_summary(tree)
+                col = box.column(align=True)
+                col.label(text=f"节点总数:{len(tree.nodes)}")
+                col.label(text=f"事件:{events}    动作:{statements}")
+                if events == 0:
+                    col.label(text="还没有事件节点，脚本不会执行任何逻辑", icon="ERROR")
+                # 「添加节点」按钮删掉(用户第 25 轮):Shift+A 和右键菜单都在,
+                # 侧栏再放一个是重复的,而且它常年占着最显眼的位置。
 
         # ---- 动画系统(独立那张树)----
-        box = layout.box()
-        box.label(text="动画系统(单独一张图)", icon="ARMATURE_DATA")
-        anim_trees = [g for g in bpy.data.node_groups
-                      if getattr(g, "bl_idname", "") == "GKAnimationTree"]
-        if anim_trees:
-            for tree in anim_trees:
-                count = len([n for n in tree.nodes
-                             if getattr(n, "bl_idname", "") in
-                             ("GKNodeAnimTransition", "GKNodeAnimState")])
-                box.label(text=f"{tree.name}  ({count} 个状态)",
-                          icon="NODETREE")
-        else:
-            box.label(text="还没有动画树", icon="INFO")
-        box.operator("gk.open_anim_tree", text="打开/新建动画树",
-                     icon="FILE_NEW")
+        box, opened = collapsible_box(layout, "anim_system",
+                                      "动画系统(单独一张图)", "ARMATURE_DATA")
+        if opened:
+            anim_trees = [g for g in bpy.data.node_groups
+                          if getattr(g, "bl_idname", "") == "GKAnimationTree"]
+            if anim_trees:
+                for anim_tree in anim_trees:
+                    count = len([n for n in anim_tree.nodes
+                                 if getattr(n, "bl_idname", "") in
+                                 ("GKNodeAnimTransition", "GKNodeAnimState")])
+                    box.label(text=f"{anim_tree.name}  ({count} 个状态)",
+                              icon="NODETREE")
+            else:
+                box.label(text="还没有动画树", icon="INFO")
+            box.operator("gk.open_anim_tree", text="打开/新建动画树",
+                         icon="FILE_NEW")
 
         # 「动作分类」删掉(用户第 24、25 轮两次点名):
         # 它只是给动作打个标签,而标签现在没有任何地方用到 ——
@@ -1658,6 +3114,11 @@ class GK_PT_Main(bpy.types.Panel):
                 col.prop(settings, "base_class", text="")
                 col.prop(settings, "class_name", text="类名")
                 col.prop(settings, "node_name", text="节点名")
+                # 本场景用哪棵逻辑图(用户 2026-10-04:多场景各导一张 .tscn)。
+                # 留空 = 自动(整个 .blend 只有一棵图时就用它)。
+                row = col.row(align=True)
+                row.operator("gk.pick_logic_tree", text="逻辑图:"
+                             + (settings.logic_tree or "自动"), icon="NODETREE")
                 row = col.row(align=True)
                 row.prop(settings, "export_tunables", toggle=True)
                 row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
@@ -1665,23 +3126,25 @@ class GK_PT_Main(bpy.types.Panel):
         # ---- 诊断(用户第 26 轮:"每次又错误时加入调试信息")----
         # 出问题时点一下:插件版本、每个物体的网格/碰撞尺寸、节点图内容、
         # 主相机解析结果、导出告警 —— 全写进一个 txt,直接发我。
-        diag = layout.box()
-        diag.label(text="出问题了?", icon="QUESTION")
-        diag.operator("gk.dump_diagnostics", text="导出诊断信息",
-                      icon="TEXT")
+        diag, opened = collapsible_box(layout, "diagnostics", "出问题了?", "QUESTION")
+        if opened:
+            diag.operator("gk.dump_diagnostics", text="导出诊断信息",
+                          icon="TEXT")
 
         # ---- 日志 ----
         if settings is not None and settings.show_log:
-            box = layout.box()
-            row = box.row()
-            row.label(text="日志", icon="TEXT")
-            row.prop(settings, "show_log", text="", icon="TRASH")
-            records = gk_log.records()[-8:]
-            if not records:
-                box.label(text="(还没有日志)")
-            for level, line in records:
-                icon = {"ERROR": "ERROR", "WARN": "ERROR"}.get(level, "INFO")
-                box.label(text=line[11:] if len(line) > 11 else line, icon=icon)
+            box, opened = collapsible_box(
+                layout, "log", "日志", "TEXT",
+                header_extra=lambda row: row.prop(
+                    settings, "show_log", text="", icon="TRASH"))
+            if opened:
+                records = gk_log.records()[-8:]
+                if not records:
+                    box.label(text="(还没有日志)")
+                for level, line in records:
+                    icon = {"ERROR": "ERROR", "WARN": "ERROR"}.get(level, "INFO")
+                    box.label(text=line[11:] if len(line) > 11 else line,
+                              icon=icon)
 
 
 def _draw_project_box(layout, context):
@@ -1695,8 +3158,9 @@ def _draw_project_box(layout, context):
     项目还没建出来时不显示它(没东西可打开)。所以未建状态下必须
     把下一步说清楚,不能只放一个孤零零的按钮。
     """
-    box = layout.box()
-    box.label(text="Godot 项目", icon="FILE_FOLDER")
+    box, opened = collapsible_box(layout, "project", "Godot 项目", "FILE_FOLDER")
+    if not opened:
+        return
 
     if not bpy.data.filepath:
         box.label(text="这个 .blend 还没保存", icon="ERROR")
@@ -1792,48 +3256,25 @@ def _draw_node_menu_contents(layout, context, nested=False):
     加个新分类很容易只加到一个入口里。
 
     ── nested 两种形态 ───────────────────────────────────────────────
-    flat(默认):直接铺开「搜索 / 常用 / 最近 / 全部分类 / 自动连线」。
-      右键菜单用这个 —— 一按就到，不用再点一层。
+    flat(默认):「搜索与常用」子菜单 + 全部分类 + 「节点工具」子菜单。
+      右键菜单用这个 —— 顶部/底部各收成一项,菜单更短(用户 2026-10-04)。
 
     nested:把这些内容收进一个『添加游戏逻辑节点』子菜单里。
       Shift+A 用这个:Blender 自带的『添加』菜单也在同一个菜单里，
       不收起来的话一屏里会出现两套并列的"加节点"，看起来就像重复了。
     """
-    tree = props.current_tree(context)
-    link_from = ""
-    if tree is not None and getattr(tree, "nodes", None) is not None:
-        active = getattr(tree.nodes, "active", None)
-        if active is not None:
-            link_from = active.name
-
     if nested:
         layout.menu(GK_MT_AddNodeCategories.bl_idname,
                     text="添加游戏逻辑节点", icon="NODETREE")
         layout.operator("gk.auto_link", text="把选中的两个节点连起来", icon="LINKED")
+        layout.operator("gk.add_comment_box", text="注释框(框住选中节点)",
+                        icon="PIVOT_BOUNDBOX")
         return
 
     # ── flat 形态 ──────────────────────────────────────────────────
-    # 最上面放搜索 —— 蓝图里最常用的入口。89 个节点靠翻分类找太慢,
-    # 直接打字搜最快。
-    row = layout.row(align=True)
-    row.scale_y = 1.3
-    row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
-
-    # 「常用」放第二:新手第一次打开不用翻分类就能起步。
-    # 但**当前树里一个常用节点都没有时不画** —— 动画树里它就是空的
-    # (实测:点开是空白菜单,比没有这一项更让人困惑)。
-    if _menu_has_entries("常用", context, props.common_node_classes):
-        layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
-
-    # 「最近使用」**始终显示**,哪怕还是空的。
-    # 一开始写成"空就不画",结果新用户第一次按 Shift+A 时菜单里没有这一项,
-    # 等他用过几个节点之后菜单**形状变了** —— 这会让肌肉记忆失效。
-    # 菜单结构应该稳定,空的时候由它的 draw 里显示"(还没用过任何节点)"。
-    layout.menu(_menu_name("最近使用"), text="最近使用", icon="FILE_REFRESH")
-    layout.separator()
-
-    if link_from:
-        layout.label(text=f"新节点会自动接到: {link_from}", icon="LINKED")
+    # 顶部四项(搜索 / 常用 / 最近使用 / 自动接续提示)收进一个子菜单
+    # (用户 2026-10-04:"右键菜单的那几个也可以折叠起来")。
+    layout.menu(_menu_name("搜索与常用"), text="搜索与常用", icon="VIEWZOOM")
 
     # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
     #
@@ -1851,8 +3292,9 @@ def _draw_node_menu_contents(layout, context, nested=False):
     for category, subs in entries:
         layout.menu(_menu_name(category), text=category)
 
+    # 底部两项(自动连线 / 注释框)也收进一个子菜单(用户 2026-10-04)。
     layout.separator()
-    layout.operator("gk.auto_link", text="把选中的两个节点连起来", icon="LINKED")
+    layout.menu(_menu_name("节点工具"), text="节点工具", icon="TOOL_SETTINGS")
 
 
 def _draw_add_menu(self, context):
@@ -1998,6 +3440,9 @@ def _recent_classes(limit=8):
 # 所以放在这里而不是文件开头。
 RECENT_MENU = _make_recent_menu()
 COMMON_MENU = _make_common_menu()
+# 右键菜单收起来的两块(用户 2026-10-04):顶部『搜索与常用』/ 底部『节点工具』
+TOP_MENU = _make_top_menu()
+TOOLS_MENU = _make_tools_menu()
 
 
 # ==========================================================================
@@ -2060,10 +3505,24 @@ GK_CLASSES = (
     GK_OT_PortAdd,
     GK_OT_PortRemove,
     GK_OT_PortMakeNode,
+    # 逻辑图的变量声明 + 节点下拉选(用户 2026-10-04)
+    GK_OT_LogicVarAdd,
+    GK_OT_LogicVarRemove,
+    GK_OT_PickVar,
+    # 变量的"实现"(UE5 的 getter/setter;用户 2026-10-05 第十七轮)
+    GK_OT_VarBindImpl,
+    # 逻辑图的函数声明 + 函数节点(用户 2026-10-05 第十七轮)
+    GK_OT_FuncAdd,
+    GK_OT_FuncRemove,
+    GK_OT_MakeFunctionNode,
+    GK_OT_PickFunction,
+    GK_OT_CollapseToFunction,
     # 碰撞一键贴合
     GK_OT_FitCollisionSize,
     GK_OT_ClearCollisionSize,
-    GK_OT_PickMainCamera,
+    # 静态资产:再加一份实例 + 修视图裁剪(用户 2026-10-05)
+    GK_OT_AddAssetInstance,
+    GK_OT_FixViewClip,
     # 诊断信息(用户第 26 轮:出问题时把调试信息发我)
     diagnostics.GK_OT_DumpDiagnostics,
     GK_OT_OpenAnimTree,
@@ -2078,9 +3537,16 @@ GK_CLASSES = (
     GK_MT_AddNodeCategories,
     COMMON_MENU,
     RECENT_MENU,
+    TOP_MENU,
+    TOOLS_MENU,
     GK_MT_TargetPicker,
     GK_OT_SetTarget,
     GK_OT_PickTarget,
+    # 场景 -> 逻辑图 绑定(用户 2026-10-04:多场景各导一张 .tscn)
+    GK_OT_SetLogicTree,
+    GK_OT_PickLogicTree,
+    # 侧栏盒子的折叠开关(用户 2026-10-04)
+    GK_OT_ToggleSection,
     GK_PT_Main,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,

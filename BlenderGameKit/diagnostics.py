@@ -142,14 +142,15 @@ def build_report(context=None):
             from bl_ext.user_default.blender_game_kit import codegen, project
             options = {"dimension": str(getattr(settings, "dimension", "3")),
                        "base_class": str(getattr(settings, "base_class", "auto"))}
-            code, warnings = codegen.generate(logic, options)
-            add(f"  生成 {len(code.splitlines())} 行")
-            add(f"  告警 {len(warnings)} 条:")
-            for item in warnings:
+            # 用返回值拿结果,不再读 codegen 的模块级全局变量(GPT 审查)
+            result = codegen.generate_result(logic, options)
+            add(f"  生成 {len(result.code.splitlines())} 行")
+            add(f"  告警 {len(result.warnings)} 条:")
+            for item in result.warnings:
                 add(f"      ! {item}")
-            for item in (getattr(codegen, "last_notes", []) or []):
+            for item in result.notes:
                 add(f"      · {item}")
-            add(f"  输入动作: {getattr(codegen, 'last_used_actions', [])}")
+            add(f"  输入动作: {result.input_actions}")
             directory, reason = project.resolve(scene)
             add(f"  导出目录: {directory}  ({reason})")
         except Exception as exc:                          # noqa: BLE001

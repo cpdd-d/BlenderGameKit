@@ -12,6 +12,7 @@
 """
 
 import os
+import re
 import sys
 import tempfile
 import traceback
@@ -86,6 +87,11 @@ def main():
     # ---- 建一棵真实节点树 ----
     try:
         tree = bpy.data.node_groups.new("冒烟测试", "GKGameLogicTree")
+        # ⚠ 必须给 fake user:没有用户的节点图在**存盘/导出那一步会被丢掉**
+        # (实测:后半段"导出报告/函数/变量面板"全部报
+        #  `StructRNA of type GKGameLogicTree has been removed`)——
+        # 示例脚本里也都写了 use_fake_user,一个道理。
+        tree.use_fake_user = True
         check("创建节点树", tree is not None)
     except Exception as exc:
         check("创建节点树", False, f"{type(exc).__name__}: {exc}")
@@ -154,6 +160,905 @@ def main():
     check("连线(6 条，第 7 条如预期被拒绝)", len(tree.links) == 6,
           f"实际 {len(tree.links)} 条")
     check("第二条连同一个输入引脚会被拒绝", len(link_problems) == 1, str(link_problems))
+
+    # ---- 注释框(UE 蓝图的 Comment Box)----
+    # 选中两个节点 -> 一键建框 -> 应该框住它们,而且**不影响代码生成**
+    # (NodeFrame 不是 GK 节点,codegen 必须当它不存在)。
+    try:
+        for node in tree.nodes:
+            node.select = False
+        do_jump.select = True
+        printer.select = True
+        tree.nodes.active = printer
+        result = bpy.ops.gk.add_comment_box()
+        frames = [n for n in tree.nodes if n.bl_idname == "NodeFrame"]
+        frame = frames[0] if frames else None
+        check("注释框已创建", result == {"FINISHED"} and len(frames) == 1,
+              f"{result} frames={len(frames)}")
+        check("注释框认了两个子节点",
+              frame is not None and do_jump.parent == frame and printer.parent == frame)
+        check("注释框有默认标题与颜色",
+              frame is not None and frame.label == "注释"
+              and bool(frame.use_custom_color) and frame.width > 0.0)
+    except Exception as exc:
+        check("注释框", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 碰撞形状的"智能推荐"(用户 2026-10-06:"正方体对角穿模")----
+    # 真 Blender 里造一个**默认正方体**(8 顶点 + 6 面中心)和一个球,
+    # 断言判出来的形状:正方体 -> 盒子(球会内切、八个角漏出来),
+    # 球 -> 球。以前这里无脑给球,所以正方体的角上会穿模。
+    try:
+        asset_export = import_module(f"{module_name}.asset_export")
+        bpy.ops.mesh.primitive_cube_add(size=2.0)
+        cube = bpy.context.active_object
+        cube_shape = asset_export.guess_collision_shape(cube, True)
+        cube_ratio = asset_export.mesh_roundness(cube)
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0)
+        ball = bpy.context.active_object
+        ball_shape = asset_export.guess_collision_shape(ball, True)
+        ball_ratio = asset_export.mesh_roundness(ball)
+        for obj in (cube, ball):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        check("碰撞形状:正方体给盒子(不是球)", cube_shape == "box",
+              f"判成 {cube_shape}(圆度 {cube_ratio:.3f})")
+        check("碰撞形状:圆球还是给球", ball_shape == "sphere",
+              f"判成 {ball_shape}(圆度 {ball_ratio:.3f})")
+        check("圆度判据分得开(正方体 < 0.85 <= 球)",
+              cube_ratio is not None and ball_ratio is not None
+              and cube_ratio < 0.85 <= ball_ratio,
+              f"正方体 {cube_ratio} / 球 {ball_ratio}")
+    except Exception as exc:
+        check("碰撞形状智能推荐", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 碰撞系统打磨(本轮):偏移 / 子物体碰撞块 / 凸包 ----
+    # 三件事的"最终证据"都在同一份生成的 .tscn 里:
+    #   ① 偏移:原点在脚底的方块,碰撞形状要抬到包围盒中心
+    #      (老修复曾被漏掉:Collision 节点上没有 position -> 一半埋地里);
+    #   ② 碰撞块:勾『作为父级的碰撞块』的小方块 -> 合并成 Collision2,
+    #      位置 = 相对宿主的偏移;而且**不单独生成 body**;
+    #   ③ 凸包:手动选『凸包』-> ConvexPolygonShape3D + 点集;
+    #   ④ 碰撞层写在 body 上(以前写在 shape 上会被 Godot 忽略)。
+    try:
+        import mathutils
+        import shutil
+
+        asset_export = import_module(f"{module_name}.asset_export")
+
+        work = os.path.join(tempfile.gettempdir(), "gk_collide_polish")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+
+        # 清掉场景里现有的东西,免得混进断言
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(3.0, 0.0, 0.0))
+        host = bpy.context.active_object
+        host.name = "脚底方块"
+        # 网格整体上移 1 -> 原点在**脚底**(z=0)、包围盒中心在 z=1
+        host.data.transform(mathutils.Matrix.Translation((0.0, 0.0, 1.0)))
+        host.gk_physics.collision_layer = "2"       # 顺便验层写在 body 上
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(3.0, 0.0, 3.0))
+        piece = bpy.context.active_object
+        piece.name = "头块"
+        piece.gk_physics.collision_piece = True
+        piece.parent = host
+        piece.matrix_parent_inverse = host.matrix_world.inverted()
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(size=1.5, location=(8.0, 0.0, 0.0))
+        rock = bpy.context.active_object
+        rock.name = "凸包石头"
+        rock.gk_physics.collision_shape = "convex"
+        bpy.context.view_layer.update()
+
+        # 先出世界 glb(write_world_scene 要从里面读网格名;顺带验证
+        # 碰撞块的网格**没进 glb** —— 它是纯辅助物)
+        glb_path, glb_ok, _glb_msg = asset_export.export_scene_glb(work, "World")
+        check("世界 glb 导出成功(碰撞块不该在里面)", glb_ok, str(_glb_msg))
+
+        path, _count = asset_export.write_world_scene(
+            work, "World", scene=bpy.context.scene, dimension="3")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        lines = text.splitlines()
+
+        check("碰撞偏移写进 Collision 节点(抬到包围盒中心)",
+              "position = Vector3(0.000000, 1.000000, 0.000000)" in text,
+              text[-900:])
+        check("碰撞块合并成 Collision2 + 相对偏移",
+              '[node name="Collision2"' in text
+              and "position = Vector3(0.000000, 3.000000, 0.000000)" in text)
+        check("碰撞块不单独生成 body(只是宿主的形状)",
+              '[node name="头块"' not in text)
+
+        layer_index = next((i for i, line in enumerate(lines)
+                            if line.strip() == "collision_layer = 2"), None)
+        owner_line = ""
+        if layer_index is not None:
+            owner_line = next((line for line in reversed(lines[:layer_index])
+                               if line.startswith("[node ")), "")
+        check("碰撞层写在 body 节点上(不是 shape 上)",
+              layer_index is not None and "脚底方块" in owner_line,
+              f"{owner_line} (index={layer_index})")
+
+        check("凸包生成 ConvexPolygonShape3D + 点集",
+              "ConvexPolygonShape3D" in text
+              and "points = PackedVector3Array(" in text)
+    except Exception as exc:
+        check("碰撞系统打磨", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 粒子特效(需求 5,用户 2026-10-05 第二十一轮)----
+    # Blender 侧只有"标记 + 参数",粒子节点是**导出时**生成的。这一节在
+    # 真 Blender 里验五件事:
+    #   ① 有物理体的发射器挂在 Colliders/<名字> 下(跟着角色动)、
+    #      空物体发射器挂在 Particles 容器里;
+    #   ② 方向 / 重力按 glTF 的 Y-up 换轴(不换火苗横着喷);
+    #   ③ 勾『不显示本体网格』的发射器 -> 网格**不进世界 glb**;
+    #   ④ 贴图链路:材质里有图就用它、没有就用内置那张(现写一张 PNG);
+    #   ⑤ 『特效_播放』在真 Blender 里编得出带**具体类型**的引用
+    #      (声明成 Node 调 .emitting,GDScript 直接编译不过)。
+    try:
+        import math
+        import shutil
+
+        asset_export = import_module(f"{module_name}.asset_export")
+
+        work = os.path.join(tempfile.gettempdir(), "gk_particle_fx")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+
+        # ① 火把:网格 + 静态物理(会生成 body)-> 粒子挂在 Colliders/火把 下
+        bpy.ops.mesh.primitive_cube_add(size=0.6, location=(2.0, 0.0, 1.0))
+        torch = bpy.context.active_object
+        torch.name = "火把"
+        torch.rotation_euler = (0.0, math.radians(30.0), 0.0)   # 斜着喷
+        torch.gk_physics.body_type = "StaticBody3D"
+        torch_fx = torch.gk_fx
+        torch_fx.enabled = True
+        torch_fx.amount = 24
+        torch_fx.speed = 1.6
+        torch_fx.gravity = 2.5
+        torch_fx.radius = 0.2
+        torch_fx.start_size = 0.25
+        torch_fx.end_size = 0.0
+
+        # ② 烟雾:空物体 + CPU 粒子 -> 挂在 Particles 容器里
+        smoke = bpy.data.objects.new("烟雾", None)
+        bpy.context.scene.collection.objects.link(smoke)
+        smoke.location = (-2.0, 0.0, 2.0)
+        smoke.gk_fx.enabled = True
+        smoke.gk_fx.particle_type = "cpu"
+        smoke.gk_fx.start_size = 0.9        # 好和火把(0.25)分开认
+
+        # ③ 火星:网格 + 勾『不显示本体网格』-> 只当标记,网格不进 glb
+        bpy.ops.mesh.primitive_cube_add(size=0.4, location=(0.0, 3.0, 1.0))
+        spark = bpy.context.active_object
+        spark.name = "火星"
+        spark.gk_fx.enabled = True
+        spark.gk_fx.hide_mesh = True
+
+        # ④ 给『火星』挂一张真贴图:粒子贴图该走现有材质/贴图链路
+        image = bpy.data.images.new("火光贴图", 32, 32)
+        material = bpy.data.materials.new("火材质")
+        material.use_nodes = True
+        material_nodes = material.node_tree.nodes
+        tex_node = material_nodes.new("ShaderNodeTexImage")
+        tex_node.image = image
+        principled = next(node for node in material_nodes
+                          if node.type == "BSDF_PRINCIPLED")
+        material.node_tree.links.new(tex_node.outputs["Color"],
+                                     principled.inputs["Base Color"])
+        spark.data.materials.append(material)
+        bpy.context.view_layer.update()
+
+        texture_name = asset_export.fx_texture_file(spark)
+        check("粒子:材质有贴图时就用它(不走内置图)",
+              texture_name != asset_export.FX_DEFAULT_TEXTURE, texture_name)
+        # 文件还没导 -> 判断要退回内置那张(.tscn 不能引用不存在的资源)
+        check("粒子:贴图文件不在时退回内置图",
+              asset_export.fx_texture_file(spark, work)
+              == asset_export.FX_DEFAULT_TEXTURE)
+        # 导贴图 + 写内置图,再判断一次:这回该认材质那张了(名字两边一致)
+        asset_export.export_textures(work, [material])
+        asset_export.ensure_fx_default_texture(work)
+        check("粒子:贴图落盘后名字对得上",
+              asset_export.fx_texture_file(spark, work) == texture_name,
+              asset_export.fx_texture_file(spark, work))
+        check("粒子:内置贴图是真 PNG",
+              open(os.path.join(work, "art", asset_export.FX_DEFAULT_TEXTURE),
+                   "rb").read(8) == b"\x89PNG\r\n\x1a\n")
+
+        # 发射器表(『特效_*』节点靠它知道目标是什么类型)
+        table = asset_export.fx_codegen_map(bpy.context.scene, "3")
+        check("粒子:发射器表按 GPU / CPU 给节点类型",
+              table.get("火把", {}).get("node_type") == "GPUParticles3D"
+              and table.get("烟雾", {}).get("node_type") == "CPUParticles3D"
+              and table.get("火星", {}).get("node_type") == "GPUParticles3D",
+              str(table))
+
+        # 排除表就是导出流程用的那个函数(见 export_assets_pipeline 里
+        # `excluded.extend(fx_hidden_meshes(scene))`)——
+        # 不然这里验的就不是"导出真的会排除",只是"这个函数看起来对"。
+        hidden = asset_export.fx_hidden_meshes(bpy.context.scene)
+        check("粒子:『不显示本体网格』的发射器会进排除表",
+              [obj.name for obj in hidden] == ["火星"], str(hidden))
+        glb_path, glb_ok, _glb_msg = asset_export.export_scene_glb(
+            work, "World", exclude=hidden or None)
+        check("粒子:世界 glb 导出成功", glb_ok, str(_glb_msg))
+        meshes = asset_export.glb_scene_nodes(work, "World").get("meshes", {})
+        check("粒子:勾了『不显示本体网格』-> 网格不进世界 glb",
+              "火星" not in meshes and "火把" in meshes, str(sorted(meshes)))
+
+        path, _count = asset_export.write_world_scene(
+            work, "World", scene=bpy.context.scene, dimension="3")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+
+        check("粒子:有物理体的发射器挂在 body 下面(跟着动)",
+              '[node name="火把" type="GPUParticles3D" '
+              'parent="Colliders/火把"]' in text)
+        check("粒子:空物体发射器挂在 Particles 容器里",
+              '[node name="Particles" type="Node3D" parent="."]' in text
+              and '[node name="烟雾" type="CPUParticles3D" '
+                  'parent="Particles"]' in text)
+        check("粒子:方向按 Y-up 换轴(Blender +Z -> Godot +Y)",
+              "direction = Vector3(0.000000, 1.000000, 0.000000)" in text)
+        check("粒子:重力正数往下(Godot 的 -Y)",
+              "gravity = Vector3(0, -2.500000, 0)" in text)
+        check("粒子:发射半径 -> 球形发射区",
+              "emission_shape = 1" in text
+              and "emission_sphere_radius = 0.200000" in text)
+        check("粒子:CPU 粒子参数直接写在节点上(scale_amount_*)",
+              "scale_amount_min = 0.900000" in text
+              and "scale_amount_curve = SubResource(" in text)
+        check("粒子:两个发射器各引用自己的贴图",
+              f'path="res://art/{asset_export.FX_DEFAULT_TEXTURE}"' in text
+              and f'path="res://art/{texture_name}"' in text,
+              text[:600])
+        # 绕 Blender Y 轴转 30° -> Godot 基按 Y-up 换轴后的**精确** 9 个数
+        # (列优先:x 轴 3 个、y 轴 3 个、z 轴 3 个)。挂 body 下所以原点是 0。
+        check("粒子:斜着的发射器写进了 transform(换轴 + 列优先)",
+              "transform = Transform3D(0.866025, 0.500000, 0.000000, "
+              "-0.500000, 0.866025, 0.000000, "
+              "0.000000, 0.000000, 1.000000, "
+              "0.000000, 0.000000, 0.000000)" in text,
+              [line for line in text.splitlines()
+               if line.startswith("transform = ")][:2])
+
+        # ── 静态物体的碰撞代理也要带旋转(第二十八轮修)────────────────
+        # 火把是绕 Y 轴转 30° 的静态物体。以前碰撞代理只写位置、基写死单位阵
+        # —— 于是"看得见的网格是斜的、碰撞体是正的":20° 斜坡走不上去、
+        # 45° 方块斜对角照样穿模。这里把 body 的 transform 抓出来单独看。
+        body_match = re.search(
+            r'\[node name="火把" type="StaticBody3D" parent="Colliders"\]\n'
+            r'(transform = Transform3D\([^)]*\))', text)
+        check("碰撞代理带上了物体的旋转(斜坡/斜方块不再'网格斜、碰撞正')",
+              bool(body_match) and body_match.group(1).startswith(
+                  "transform = Transform3D(0.866025, 0.500000, 0.000000, "
+                  "-0.500000, 0.866025, 0.000000, "
+                  "0.000000, 0.000000, 1.000000, "),
+              body_match.group(1) if body_match else "没找到火把的 StaticBody3D 块")
+
+        # ⑤ 节点侧:『特效_播放』在真 Blender 里编出带类型的引用
+        fx_tree = bpy.data.node_groups.new("粒子冒烟", "GKGameLogicTree")
+        ready_node = fx_tree.nodes.new("GKNodeOnReady")
+        play_node = fx_tree.nodes.new("GKNodeFxPlay")
+        play_node.gk_target = "火把"
+        fx_tree.links.new(ready_node.outputs["执行"], play_node.inputs["执行"])
+        fx_code, fx_warnings = codegen.generate(fx_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "fx": asset_export.fx_codegen_map(bpy.context.scene, "3"),
+        })
+        check("粒子:『特效_播放』编出带具体类型的引用",
+              ": GPUParticles3D = " in fx_code
+              and ".emitting = true" in fx_code
+              and not fx_warnings, f"{fx_code} {fx_warnings}")
+        bpy.data.node_groups.remove(fx_tree)
+
+        # 收尾:把这一节的物体清掉,别影响后面的步骤(它们默认"场景干净")
+        for leftover in (torch, smoke, spark):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+    except Exception as exc:
+        check("粒子特效", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 游戏内调试面板(用户 2026-10-05 第二十二轮:调试体验)----
+    # 真 Blender 里验两件事:
+    #   ① 场景开关打开 -> 写出的**环境脚本**里带着面板(按键 / 复制 / 变量过滤),
+    #      而且按键跟着场景设置走(F8 / 反引号);
+    #   ② 代码生成开着面板 -> 脚本里有日志缓冲,『打印_输出』会往面板推一行。
+    try:
+        import shutil
+
+        asset_export = import_module(f"{module_name}.asset_export")
+
+        work = os.path.join(tempfile.gettempdir(), "gk_debug_panel")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+        bpy.context.view_layer.update()
+
+        settings = bpy.context.scene.gk_settings
+        settings.debug_panel = True
+        settings.debug_key = "F8"
+        settings.debug_copy_key = "`"
+
+        asset_export.export_scene_glb(work, "World")
+        path, _count = asset_export.write_world_scene(
+            work, "World", scene=bpy.context.scene, dimension="3")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        env_file = os.path.join(work, "scripts", "gk_environment.gd")
+        env_code = ""
+        if os.path.isfile(env_file):
+            with open(env_file, encoding="utf-8") as handle:
+                env_code = handle.read()
+        check("调试面板:环境脚本里有面板本体 + 复制",
+              "func _gk_dbg_setup() -> void:" in env_code
+              and "func _gk_dbg_text() -> String:" in env_code
+              and "DisplayServer.clipboard_set(text)" in env_code)
+        check("调试面板:按键跟着场景设置走(F8 / 反引号)",
+              "const _GK_DBG_KEY := KEY_F8" in env_code
+              and "const _GK_DBG_COPY_KEY := KEY_QUOTELEFT" in env_code)
+        check("调试面板:开关默认值 = 场景设置",
+              "var debug_panel: bool = true" in env_code)
+        check("调试面板:主场景里引用了环境脚本",
+              'id="env_script"' in text)
+
+        # ② 代码生成:开着面板时打印节点会往面板推一行
+        # ⚠ 变量名别和外层重名(踩过:`printer` 是前面那张图里的节点,
+        # 这里再绑一次会把它**换掉**,后面的"折叠成函数"就对着一个
+        # 已被删掉的节点操作 -> KeyError)。
+        dbg_tree = bpy.data.node_groups.new("调试冒烟", "GKGameLogicTree")
+        dbg_ready = dbg_tree.nodes.new("GKNodeOnReady")
+        dbg_printer = dbg_tree.nodes.new("GKNodePrint")
+        dbg_printer.gk_text = "调试一行"
+        dbg_tree.links.new(dbg_ready.outputs["执行"], dbg_printer.inputs["执行"])
+        dbg_code, _dbg_warnings = codegen.generate(dbg_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "debug_panel": True,
+        })
+        check("调试面板:打印节点会往面板推一行",
+              "var _gk_debug_logs: Array = []" in dbg_code
+              and 'print("调试一行")' in dbg_code
+              and '_gk_debug_log_append("调试一行")' in dbg_code)
+        bpy.data.node_groups.remove(dbg_tree)
+
+        # 收尾:开关关回去、物体清掉,别影响后面的步骤
+        settings.debug_panel = False
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+    except Exception as exc:
+        check("调试面板", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 常用件(第二十五轮):追人 / 变量加减 / 冷却 / 数字转文字 ----
+    # 四个新节点的**注册与引脚**在真 Blender 里过一遍(bl_icon 写错会让
+    # 整个节点注册失败,那条路只有真 Blender 能验),再生成一次代码。
+    try:
+        gap_tree = bpy.data.node_groups.new("常用件冒烟", "GKGameLogicTree")
+        gap_physics = gap_tree.nodes.new("GKNodeOnPhysicsProcess")
+        gap_chase = gap_tree.nodes.new("GKNodeMoveToward")
+        gap_chase.name = "追人"
+        gap_chase.gk_goal = "小玩家"
+        gap_chase.gk_speed = 3.0
+        gap_add = gap_tree.nodes.new("GKNodeAddVar")
+        gap_add.name = "金币加一"
+        gap_add.gk_var_name = "金币数"
+        # 侧栏声明成 **int** —— 『变量_增减』才会走"浮点表达式补 int(...)"
+        # 那条路(没声明的话按 float 处理,生成的是不带 int() 的版本)
+        gap_var = gap_tree.gk_vars.add()
+        gap_var.var_name = "金币数"
+        gap_var.var_type = "int"
+        gap_var.default_value = "0"
+        gap_cd = gap_tree.nodes.new("GKNodeCooldown")
+        gap_cd.name = "受伤冷却"
+        gap_num = gap_tree.nodes.new("GKNodeNumberText")
+        gap_hud = gap_tree.nodes.new("GKNodeUiText")
+        gap_hud.gk_text = "金币"
+        for link_pair in (
+                (gap_physics, "执行", gap_chase, "执行"),
+                (gap_chase, "完成", gap_add, "执行"),
+                (gap_add, "完成", gap_cd, "执行"),
+                (gap_cd, "可以", gap_hud, "执行"),
+                (gap_num, "文字", gap_hud, "文字")):
+            gap_tree.links.new(link_pair[0].outputs[link_pair[1]],
+                               link_pair[2].inputs[link_pair[3]])
+        gap_inputs = [s.name for s in gap_chase.inputs]
+        gap_outputs = [s.name for s in gap_cd.outputs]
+        check("常用件:『移动_朝向目标』的引脚(执行/目标/速度)",
+              gap_inputs == ["执行", "目标", "速度"], str(gap_inputs))
+        check("常用件:『流程_冷却』两个出口(可以/还在冷却)",
+              gap_outputs == ["可以", "还在冷却"], str(gap_outputs))
+        check("常用件:『变量_增减』有『新值』输出",
+              any(s.name == "新值" for s in gap_add.outputs),
+              str([s.name for s in gap_add.outputs]))
+        gap_code, gap_warnings = codegen.generate(gap_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True,
+        })
+        check("常用件:生成代码(追人 / 加减 / 冷却 / 数字文字)",
+              ".velocity = " in gap_code
+              and "move_and_slide()" in gap_code
+              and "金币数 = int((金币数 + 1.0))" in gap_code
+              and "Time.get_ticks_msec() - _gk_cd_ticks" in gap_code
+              and "_gk_num_text(" in gap_code)
+        check("常用件:无告警", not gap_warnings, str(gap_warnings))
+        bpy.data.node_groups.remove(gap_tree)
+    except Exception as exc:
+        check("常用件", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 常用件二批(第二十六轮):加速/到达 / 夹范围 / 抽稀 / 闪红 / 飘字 ----
+    # 两个**新节点**(特效_闪红、界面_飘字)的注册只能在真 Blender 里验
+    # (bl_icon 写错会让整个类注册失败),所以这里建图 + 出一次代码。
+    try:
+        r26_tree = bpy.data.node_groups.new("常用件二批冒烟", "GKGameLogicTree")
+        r26_physics = r26_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r26_chase = r26_tree.nodes.new("GKNodeMoveToward")
+        r26_chase.name = "追人"
+        r26_chase.gk_goal = "小玩家"
+        r26_chase.gk_speed = 3.0
+        r26_chase.gk_accel = 8.0          # 平滑加减速
+        r26_chase.gk_stop_distance = 1.5
+        r26_branch = r26_tree.nodes.new("GKNodeBranch")
+        r26_branch.name = "到了吗"
+        r26_cd = r26_tree.nodes.new("GKNodeCooldown")
+        r26_cd.name = "每两次"
+        r26_cd.gk_every = 2               # 抽稀:每来 2 次放行 1 次
+        r26_add = r26_tree.nodes.new("GKNodeAddVar")
+        r26_add.name = "扣血"
+        r26_add.gk_var_name = "血量"
+        r26_add.gk_amount = -1.0
+        r26_add.gk_clamp = True
+        r26_add.gk_min = 0.0
+        r26_add.gk_max = 3.0
+        r26_hp = r26_tree.gk_vars.add()
+        r26_hp.var_name = "血量"
+        r26_hp.var_type = "float"
+        r26_hp.default_value = "3.0"
+        r26_flash = r26_tree.nodes.new("GKNodeFlashRed")
+        r26_flash.name = "受伤闪红"
+        r26_text = r26_tree.nodes.new("GKNodeFloatText")
+        r26_text.name = "受伤飘字"
+        r26_text.gk_target = "小玩家"
+        r26_text.gk_prefix = "-"
+        for link_pair in (
+                (r26_physics, "执行", r26_chase, "执行"),
+                (r26_chase, "到达", r26_branch, "条件"),
+                (r26_chase, "完成", r26_branch, "执行"),
+                (r26_branch, "是", r26_cd, "执行"),
+                (r26_cd, "可以", r26_add, "执行"),
+                (r26_add, "完成", r26_flash, "执行"),
+                (r26_flash, "完成", r26_text, "执行")):
+            r26_tree.links.new(link_pair[0].outputs[link_pair[1]],
+                               link_pair[2].inputs[link_pair[3]])
+        r26_outputs = [socket.name for socket in r26_chase.outputs]
+        r26_inputs = [socket.name for socket in r26_flash.inputs]
+        check("常用件二批:『移动_朝向目标』的出口(完成/到达)",
+              r26_outputs == ["完成", "到达"], str(r26_outputs))
+        check("常用件二批:『特效_闪红』注册成功(执行/秒)",
+              r26_inputs == ["执行", "秒"], str(r26_inputs))
+        r26_code, r26_warnings = codegen.generate(r26_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True,
+        })
+        check("常用件二批:生成代码(加速 / 到达 / 夹取 / 抽稀 / 闪红 / 飘字)",
+              "velocity.move_toward(" in r26_code
+              and "get_physics_process_delta_time()" in r26_code
+              and ".length() <= 1.5" in r26_code
+              and "血量 = clampf((血量 + -1.0), 0.0, 3.0)" in r26_code
+              and "_gk_cd_count % 2 == 0" in r26_code
+              and "func _gk_flash_3d(node: Node, color: Color, "
+                  "seconds: float) -> void:" in r26_code
+              and "Label3D.new()" in r26_code
+              and "_gk_num_text(1.0)" in r26_code)
+        check("常用件二批:无告警", not r26_warnings, str(r26_warnings))
+        bpy.data.node_groups.remove(r26_tree)
+    except Exception as exc:
+        check("常用件二批", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 先放完再重复(第二十七轮):动画_播放的『重复触发时』----
+    # 选项**键**没改(老 .blend 的值仍然对得上)+ 填物体名时走"从它开始找
+    # 播放器"那条路(以前直接把物体当播放器 -> 运行时对着 Area3D 调
+    # has_animation 报错,整条链断掉)。
+    try:
+        r27_tree = bpy.data.node_groups.new("先放完再重复冒烟", "GKGameLogicTree")
+        r27_physics = r27_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r27_key = r27_tree.nodes.new("GKNodeKey")
+        r27_key.name = "E 键"
+        r27_key.gk_key = "E"
+        r27_key.gk_action = "key_e"
+        r27_key.gk_trigger = "JUST"
+        r27_branch = r27_tree.nodes.new("GKNodeBranch")
+        r27_branch.name = "按了 E?"
+        r27_play = r27_tree.nodes.new("GKNodePlayAnim")
+        r27_play.name = "敌1受击抖动"
+        r27_play.gk_player = "敌1"
+        r27_play.gk_anim_name = "敌1抖动"
+        r27_play.gk_blend_mode = "CONTINUE"
+        for link_pair in ((r27_key, "结果", r27_branch, "条件"),
+                          (r27_physics, "执行", r27_branch, "执行"),
+                          (r27_branch, "是", r27_play, "执行")):
+            r27_tree.links.new(link_pair[0].outputs[link_pair[1]],
+                               link_pair[2].inputs[link_pair[3]])
+        r27_items = next(entry[5] for entry in r27_play.gk_prop_defs
+                         if entry[0] == "gk_blend_mode")
+        r27_code, r27_warnings = codegen.generate(r27_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("先放完再重复:选项键没变(REPLACE/CONTINUE)",
+              [item[0] for item in r27_items] == ["REPLACE", "CONTINUE"],
+              str([item[0] for item in r27_items]))
+        check("先放完再重复:填物体名 -> 从它开始找播放器 + 在播就跳过",
+              "_gk_find_animation_player(anim_敌1)" in r27_code
+              and "current_animation != _anim" in r27_code
+              and '"敌1抖动"' in r27_code)
+        check("先放完再重复:无告警", not r27_warnings, str(r27_warnings))
+        bpy.data.node_groups.remove(r27_tree)
+    except Exception as exc:
+        check("先放完再重复", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
+    # Godot 的运动学角色**不会**自动上台阶(0.35 米在它眼里就是堵墙)。
+    # 填了高度才生成"三关探测"(被竖面挡住 / 抬起来的路通 / 落点有地),
+    # 默认 0 必须**一个字都不生成** —— 老图产物不变。
+    try:
+        r29_tree = bpy.data.node_groups.new("上台阶冒烟", "GKGameLogicTree")
+        r29_physics = r29_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r29_move = r29_tree.nodes.new("GKNodeMoveDirection")
+        r29_move.name = "移动"
+        r29_move.gk_speed = 6.0
+        r29_tree.links.new(r29_physics.outputs["执行"], r29_move.inputs["执行"])
+        r29_off, _r29_w0 = codegen.generate(r29_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        r29_move.gk_step_height = 0.5
+        r29_code, r29_warnings = codegen.generate(r29_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("上台阶:默认 0 -> 不生成探测(老图一字不变)",
+              "test_move" not in r29_off)
+        check("上台阶:填 0.5 -> 生成三关探测(被挡/路通/有地)",
+              "test_move" in r29_code
+              and "KinematicCollision3D.new()" in r29_code
+              and "absf(" in r29_code
+              and "Vector3.UP * 0.5" in r29_code
+              and "Vector3.DOWN * 0.45" in r29_code
+              and "_step_ahead" in r29_code
+              and "get_normal().y >= 0.5" in r29_code
+              and "global_position += _step_lift" in r29_code)
+        check("上台阶:无告警", not r29_warnings, str(r29_warnings))
+        bpy.data.node_groups.remove(r29_tree)
+    except Exception as exc:
+        check("上台阶", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 移动平台 + 可驾驶载具(第三十轮)----
+    # ① **站上去跟着走**:平台必须导出成 AnimatableBody —— 被脚本/时间轴
+    #    每帧挪位置时它的**速度**会传给站在上面的角色;StaticBody 是
+    #    "瞬移",角色只会原地留在那儿(平台从脚下溜走);
+    # ② **可驾驶**:上车/驾驶节点生成的状态写在载具自己身上
+    #    (set_meta),驾驶 = 车头方向前进 / A-D 转车头 / 每帧钉座位。
+    try:
+        import shutil
+
+        asset_export = import_module(f"{module_name}.asset_export")
+
+        work = os.path.join(tempfile.gettempdir(), "gk_platform_vehicle")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        platform = bpy.context.active_object
+        platform.name = "移动平台"
+        platform.scale = (3.0, 0.4, 3.0)
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        platform.gk_physics.body_type = "AnimatableBody3D"
+        bpy.context.view_layer.update()
+
+        # 世界 glb 要先出(write_world_scene 按 glb 里的网格名过滤)
+        asset_export.export_scene_glb(work, "World")
+        path, _count = asset_export.write_world_scene(
+            work, "World", scene=bpy.context.scene, dimension="3")
+        with open(path, encoding="utf-8") as handle:
+            world_text = handle.read()
+        check("移动平台:导出成 AnimatableBody3D(角色才会被带着走)",
+              '[node name="移动平台" type="AnimatableBody3D" '
+              'parent="Colliders"]' in world_text,
+              world_text[-600:])
+
+        r30_tree = bpy.data.node_groups.new("载具冒烟", "GKGameLogicTree")
+        r30_physics = r30_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r30_move = r30_tree.nodes.new("GKNodeMoveDirection")
+        r30_move.name = "移动"
+        r30_move.gk_speed = 6.0
+        r30_drive = r30_tree.nodes.new("GKNodeDriveVehicle")
+        r30_drive.name = "驾驶"
+        r30_drive.gk_vehicle = "移动平台"
+        r30_drive.gk_speed = 10.0
+        r30_enter = r30_tree.nodes.new("GKNodeEnterVehicle")
+        r30_enter.name = "上车"
+        r30_enter.gk_vehicle = "移动平台"
+        for link_pair in ((r30_physics, "执行", r30_move, "执行"),
+                          (r30_move, "完成", r30_drive, "执行"),
+                          (r30_drive, "完成", r30_enter, "执行")):
+            r30_tree.links.new(link_pair[0].outputs[link_pair[1]],
+                               link_pair[2].inputs[link_pair[3]])
+        r30_code, r30_warnings = codegen.generate(r30_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("可驾驶载具:状态互通 + 车头方向 + 转车头 + 钉座位",
+              'set_meta("gk_driving", true)' in r30_code
+              and 'get_meta("gk_driving", false)' in r30_code
+              and 'set_meta("gk_seat"' in r30_code
+              and ".rotation.y -= deg_to_rad(" in r30_code
+              and "global_transform * (载具_移动平台.get_meta" in r30_code,
+              r30_code[-400:])
+        check("可驾驶载具:无告警", not r30_warnings, str(r30_warnings))
+        bpy.data.node_groups.remove(r30_tree)
+    except Exception as exc:
+        check("移动平台 / 载具", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 多场景导出的输入映射(第三十一轮)----
+    # 两个 Blender 场景各带一个按键动作时,project.godot 的 [input] 里
+    # **两个动作都要在** —— 每个场景的脚本导出各重写一次标记块,后写的
+    # 会把先写的覆盖掉。真实观测(第三十一轮):关卡1 新加的 `E 上车`
+    # 没了(只剩关卡2 的动作),第一关怎么按都上不了车。
+    try:
+        import shutil
+
+        asset_export = import_module(f"{module_name}.asset_export")
+        project_mod = import_module(f"{module_name}.project")
+
+        work = os.path.join(tempfile.gettempdir(), "gk_multi_input")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+
+        original_scene = bpy.context.window.scene
+        made_scenes = []
+        # ⚠ 变量名一律带 r31_ 前缀:这段和后面几段共用 main() 的局部变量,
+        # 起名 `tree` 会把上面那棵"冒烟测试"覆盖掉(实测:后面所有章节
+        # 全报 StructRNA ... has been removed)。
+        for r31_label, r31_action in (("冒烟关卡甲", "smoke_key_a"),
+                                      ("冒烟关卡乙", "smoke_key_b")):
+            r31_scene = bpy.data.scenes.new(r31_label)
+            made_scenes.append(r31_scene)
+            r31_scene.gk_settings.logic_tree = f"{r31_label}逻辑"
+            r31_tree = bpy.data.node_groups.new(f"{r31_label}逻辑",
+                                                "GKGameLogicTree")
+            r31_tree.use_fake_user = True
+            r31_event = r31_tree.nodes.new("GKNodeOnPhysicsProcess")
+            r31_key = r31_tree.nodes.new("GKNodeKey")
+            r31_key.name = f"{r31_label}按键"
+            r31_key.gk_key = "K"
+            r31_key.gk_action = r31_action
+            r31_key.gk_trigger = "JUST"
+            r31_branch = r31_tree.nodes.new("GKNodeBranch")
+            r31_tree.links.new(r31_key.outputs["结果"], r31_branch.inputs["条件"])
+            r31_tree.links.new(r31_event.outputs["执行"],
+                               r31_branch.inputs["执行"])
+        project_mod.create_project(work, title="输入合并",
+                                   blend_file_name="冒烟.blend")
+        asset_export.export_all_scenes(work, dimension="3")
+        with open(os.path.join(work, "project.godot"),
+                  encoding="utf-8") as handle:
+            text = handle.read()
+        check("多场景导出:两个场景的输入动作都在 [input] 里(不被覆盖)",
+              "smoke_key_a=" in text and "smoke_key_b=" in text,
+              [line for line in text.splitlines()
+               if line.startswith("smoke_key")])
+
+        bpy.context.window.scene = original_scene
+        for r31_scene in made_scenes:
+            bpy.data.scenes.remove(r31_scene)
+        for r31_name in ("冒烟关卡甲逻辑", "冒烟关卡乙逻辑"):
+            r31_group = bpy.data.node_groups.get(r31_name)
+            if r31_group is not None:
+                bpy.data.node_groups.remove(r31_group)
+    except Exception as exc:
+        check("多场景导出:输入映射合并", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 导出报告(用户 2026-10-05 第二十三轮:"导出报告可视化")----
+    # 真 Blender 里验四件事:
+    #   ① remember_export 顺手把**结构化报告**记进 .blend(清掉内存还能读回);
+    #   ② 『复制导出报告』能跑:剪贴板 + 文本编辑器 + 控制台;
+    #   ③ 『定位到出问题的节点』真的能选中那个节点(报告里带 node_name);
+    #   ④ 报告文本里有"怎么修"和节点名(用户要发出来的就是这份)。
+    try:
+        # ⚠ 在 Blender 里插件是 bl_ext.<仓库>.<包名>,不是 `BlenderGameKit`
+        # (直接 import 会 ModuleNotFoundError —— 别的块都用 import_module)
+        export_report = import_module(f"{module_name}.export_report")
+        models = import_module(f"{module_name}.models")
+        ops = import_module(f"{module_name}.operator_io")
+
+        scene = bpy.context.scene
+        report_node = new_node("GKNodePrint", "报警节点", gk_text="报告用")
+        diagnostic = models.Diagnostic(
+            level="warning", code="ANIM_TARGET_MISMATCH",
+            message="动画『走路』不在『身体』上",
+            hint="检查节点上的『动画播放器』",
+            node_name="报警节点")
+        export_report.clear()
+        ops.remember_export(scene, {
+            "ok": True, "script_name": "smoke_report.gd", "directory": "",
+            "lines": 12, "elapsed_ms": 4.0, "written": ["a"],
+            "diagnostics": [diagnostic],
+            "warnings": [diagnostic.render(), "这些网格没有材质: 地面"],
+            "notes": ["参考: 无"],
+        })
+        export_report.clear()                      # 只留 .blend 里那份
+        loaded = export_report.load(scene)
+        check("导出报告:记进 .blend,清掉内存还能读回",
+              loaded.get("script_name") == "smoke_report.gd"
+              and len(loaded.get("items") or []) == 3,
+              str(loaded)[:200])
+        text = export_report.report_text(loaded)
+        check("导出报告:文本里有『怎么修』和节点名",
+              "怎么修:" in text and "相关节点: 报警节点" in text)
+
+        result = bpy.ops.gk.export_report_copy()
+        copied_text = bpy.data.texts.get("导出报告")
+        check("导出报告:『复制报告』把文本放进文本编辑器",
+              result == {"FINISHED"} and copied_text is not None
+              and "导出报告" in copied_text.as_string(),
+              f"{result}")
+
+        bpy.ops.gk.export_report_focus(node_name="报警节点")
+        check("导出报告:『定位』选中了那个节点", bool(report_node.select),
+              f"select={report_node.select}")
+        export_report.clear()
+    except Exception as exc:
+        check("导出报告", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 函数:折叠成函数(用户 2026-10-05 第十七轮)----
+    # 选**一个节点**(printer —— 上游是别的执行流节点)试折叠,断言五件事:
+    #   ① 侧栏多了一个函数声明;② 多了『函数_定义』和『函数_调用』两个节点;
+    #   ③ 上游照旧接上(折叠前 printer 的上游 → 现在指向调用节点);
+    #   ④ 折叠出来的函数能**真的编出 func**(不是只在图里好看);
+    #   ⑤ 跨边界的数据线(外面的常量 → printer 的『内容』)自动变成**参数**。
+    try:
+        # 先造一根跨边界的数据线:常量 → printer.内容
+        amount = new_node("GKNodeConstFloat", "金额", gk_value=7.0)
+        link(amount, "值", printer, "内容")
+        for node in tree.nodes:
+            node.select = False
+        printer.select = True
+        # 折叠**前**记下 printer 的上游是谁 —— 折叠后调用节点的上游应该一样
+        # ⚠ 不写死"跳跃"这个节点名:Blender 的 links.new 对"已经接了线的输入"
+        # 是**替换**旧线(不是拒绝),所以 printer 的上游到底是哪个节点得实测。
+        before_up = [(l.from_node.name, l.from_socket.name) for l in tree.links
+                     if l.to_node == printer and l.to_socket.name == "执行"]
+        funcs_before = len(tree.gk_funcs)
+        nodes_before = len(tree.nodes)
+        result = bpy.ops.gk.collapse_to_function(func_name="smoke_collapse")
+        declared = [f for f in tree.gk_funcs if str(f.func_name) == "smoke_collapse"]
+        # 新增节点 = 定义 + 调用 + 一个『变量_读取(参数名)』(跨边界数据线)
+        check("折叠成函数:已声明 + 加了 3 个节点",
+              result == {"FINISHED"} and len(tree.gk_funcs) == funcs_before + 1
+              and len(tree.nodes) == nodes_before + 3 and bool(declared),
+              f"{result} 声明={len(tree.gk_funcs)} "
+              f"新增节点={len(tree.nodes) - nodes_before}")
+        define = next((n for n in tree.nodes
+                       if n.bl_idname == "GKNodeFunctionDefine"
+                       and str(n.gk_func_name) == "smoke_collapse"), None)
+        call = next((n for n in tree.nodes
+                     if n.bl_idname == "GKNodeFunctionCall"
+                     and str(n.gk_func_name) == "smoke_collapse"), None)
+        # 上游:折叠前 printer 的**执行**上游 -> 现在指向调用节点
+        # ⚠ 只比『执行』那根:调用节点上还多了参数框的线(那是数据的,不是执行流)
+        into_call = [(l.from_node.name, l.from_socket.name) for l in tree.links
+                     if l.to_node == call and l.to_socket.name == "执行"]
+        upstream_ok = sorted(into_call) == sorted(before_up)
+        # 定义 -> printer 的『执行』(函数体从这里开始)
+        into_entry = any(l.to_node == printer
+                         and getattr(l.from_node, "bl_idname", "") == "GKNodeFunctionDefine"
+                         for l in tree.links)
+        check("折叠成函数:上游接上、函数体接上",
+              define is not None and call is not None and upstream_ok and into_entry,
+              f"折叠前上游={before_up} 调用节点的执行上游={into_call} "
+              f"定义->入口={into_entry}")
+        # 跨边界的数据线 -> 参数:声明里有参数、调用点接了外面那个常量、
+        # 函数体里插了一个『变量_读取(参数名)』
+        params_text = str(declared[0].params) if declared else ""
+        param_names = [part.split(":")[0].strip() for part in params_text.split(",")
+                       if part.strip()]
+        readers = [n for n in tree.nodes
+                   if n.bl_idname == "GKNodeGetVar"
+                   and str(n.gk_var_name) in param_names]
+        call_param_links = [l for l in tree.links
+                            if l.to_node == call
+                            and l.to_socket.name in param_names]
+        check("折叠成函数:跨边界数据线变成了参数",
+              bool(params_text) and bool(readers)
+              and any(getattr(l.from_node, "bl_idname", "") == "GKNodeConstFloat"
+                      for l in call_param_links),
+              f"参数=『{params_text}』读取节点={len(readers)} "
+              f"调用点参数线={len(call_param_links)}")
+        # 折叠出来的函数要能**真的编出代码**(不是只在图里好看)
+        # ⚠ 现在它带了参数 -> 签名是 `func smoke_collapse(金额: float) -> void:`
+        code_text, _gen_warnings, _name, _actions, _diag = \
+            exporter.generate_code_result(tree, exporter.default_settings())
+        check("折叠成函数:能编出 func",
+              "func smoke_collapse(" in code_text
+              and "smoke_collapse(" in code_text
+              and "金额: float" in code_text,
+              code_text[-400:])
+    except Exception as exc:
+        check("折叠成函数", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 变量集中面板:查找引用 + 拉取/设节点(用户 2026-10-04)----
+    try:
+        var_set = new_node("GKNodeSetVar", "写生命", gk_var_name="hp")
+        var_get = new_node("GKNodeGetVar", "读生命", gk_var_name="hp")
+        result = bpy.ops.gk.var_find_refs(var_name="hp")
+        check("查找引用返回完成", result == {"FINISHED"}, str(result))
+        check("读/写两个节点都被选中",
+              bool(var_set.select) and bool(var_get.select))
+        before = len(tree.nodes)
+        made = bpy.ops.gk.var_make_node(var_name="hp", make_set=False)
+        selected = [n for n in tree.nodes if getattr(n, "select", False)]
+        new_obj = selected[0] if selected else None
+        check("拉取变量节点已创建",
+              made == {"FINISHED"} and len(tree.nodes) == before + 1
+              and new_obj is not None and new_obj.bl_idname == "GKNodeGetVar"
+              and str(new_obj.gk_var_name) == "hp",
+              f"{made} 新增={len(tree.nodes) - before} 选中={new_obj}")
+    except Exception as exc:
+        check("变量面板", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 通配引脚自动类型提示(真实引脚/连线路径)----
+    try:
+        gk_sockets = import_module(f"{module_name}.gk_sockets")
+        const = new_node("GKNodeConstFloat", "常量")
+        setter = new_node("GKNodeSetVar", "设置", gk_var_name="mp")
+        source = const.outputs.get("值")
+        target = setter.inputs.get("值")
+        tree.links.new(source, target)
+        label = gk_sockets.resolved_type_label(target)
+        check("通配引脚解析出上游类型", label == "数值", label)
+        check("通配引脚标签补了类型",
+              gk_sockets.socket_caption(target, "值") == "值 (数值)",
+              gk_sockets.socket_caption(target, "值"))
+    except Exception as exc:
+        check("通配引脚类型提示", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 侧栏折叠 + 右键菜单子菜单(用户 2026-10-04)----
+    try:
+        ui_mod = import_module(f"{module_name}.ui")
+        before = ui_mod._OPEN_SECTIONS.get("smoke_key", True)
+        result = bpy.ops.gk.toggle_section(key="smoke_key", default_open=True)
+        after = ui_mod._OPEN_SECTIONS.get("smoke_key", True)
+        check("侧栏折叠开关能翻转",
+              result == {"FINISHED"} and before is True and after is False,
+              f"{result} {before}->{after}")
+        check("右键菜单的两个子菜单已注册",
+              hasattr(ui_mod.TOP_MENU, "bl_rna")
+              and hasattr(ui_mod.TOOLS_MENU, "bl_rna"))
+    except Exception as exc:
+        check("侧栏折叠", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
 
     # ---- 生成代码 ----
     try:
@@ -320,6 +1225,34 @@ def main():
         check("添加节点菜单已注册", "GK_MT_AddNodeCategories" in menu_names)
     except Exception as exc:
         check("添加节点菜单已注册", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- 插件偏好设置(2026-10-04:以前从未注册,面板打不开)--------
+    try:
+        prefs_module = __import__(f"{module_name}.project.addon_prefs",
+                                  fromlist=["GKAddonPreferences"])
+        prefs_cls = prefs_module.GKAddonPreferences
+        check("插件偏好设置已注册", hasattr(prefs_cls, "bl_rna"),
+              f"bl_idname={getattr(prefs_cls, 'bl_idname', '?')}")
+        # bl_idname 必须等于插件根模块名,否则 Blender 找不到归属
+        check("偏好设置 bl_idname 指向插件根",
+              getattr(prefs_cls, "bl_idname", "") == module_name,
+              f"bl_idname={getattr(prefs_cls, 'bl_idname', '?')} "
+              f"module={module_name}")
+    except Exception as exc:
+        check("插件偏好设置已注册", False, f"{type(exc).__name__}: {exc}")
+
+    # 偏好设置**读得到**才算真的生效:godot_path / auto_export_on_run 都靠它。
+    # 以前 preferences() 用的是错的插件名,永远返回 None —— 面板里改的设置
+    # 全都不起作用(用户 2026-10-04)。
+    project_module = __import__(f"{module_name}.project",
+                                fromlist=["preferences"])
+    prefs_obj = project_module.preferences(bpy.context)
+    check("偏好设置可读取(preferences() 拿到对象)", prefs_obj is not None,
+          "返回 None -> Godot 路径 / 运行前自动导出等设置不会生效")
+    check("偏好设置里有 godot_path / auto_export_on_run",
+          prefs_obj is not None and hasattr(prefs_obj, "godot_path")
+          and hasattr(prefs_obj, "auto_export_on_run"))
+
     categories = [cls.bl_label for cls in
                   __import__(f"{module_name}.ui", fromlist=["CATEGORY_MENUS"]).CATEGORY_MENUS]
     check(f"分类子菜单 ({len(categories)})", len(categories) >= 8, str(categories))

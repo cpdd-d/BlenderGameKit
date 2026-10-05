@@ -75,9 +75,17 @@ class GKSocketAny(GKSocketBase, bpy.types.NodeSocket):
     def gk_semantic(cls):
         return SEMANTIC_ANY
 
+    def gk_type_name(self):
+        """通配引脚解析出类型后,返回具体类型名(否则仍是『任意』)。"""
+        return resolved_type_label(self) or self.bl_label
+
     def draw(self, context, layout, node, text):
+        # ── 通配引脚没有类型,按连线对面 / 变量声明把类型补在名字后面 ───────
+        # 用户 2026-10-04 要的"自动类型提示":一根灰色万能线到底传的是
+        # 数值还是文本,以前完全看不出来。现在解析出来就写成『值 (数值)』。
+        caption = socket_caption(self, text)
         if self.is_linked or self.is_output:
-            layout.label(text=text)
+            layout.label(text=caption)
             return
         # ── 通配引脚没有 default_value(用户日志里刷了一屏)──────────────
         # `NodeSocketVirtual`(GKSocketAny 的基类)没有这个属性,
@@ -86,12 +94,13 @@ class GKSocketAny(GKSocketBase, bpy.types.NodeSocket):
         # 每个通配引脚一行 —— 用户日志里几十行全是它。
         # 所以先问一句"有没有这个属性",没有就画个标签。
         if not self.bl_rna.properties.get("default_value"):
-            layout.label(text=text)
+            layout.label(text=caption)
             return
-        layout.prop(self, "default_value", text=text)
+        layout.prop(self, "default_value", text=caption)
 
     def draw_color(self, context, node):
-        return _COLOR_ANY
+        # 解析出类型就按那个类型上色,和普通引脚一致;解析不出来才用万能灰。
+        return resolved_color(self)
 
 
 # ---- 内置引脚上的语义标记：靠 bl_idname 反查，无需自定义 ----
@@ -146,6 +155,159 @@ def is_flow(socket):
 
 def is_any(socket):
     return getattr(socket, "gk_semantic", lambda: None)() == SEMANTIC_ANY
+
+
+# ==========================================================================
+# 通配引脚的自动类型提示(用户 2026-10-04)
+# ==========================================================================
+# 「任意值」引脚是灰的万能接口,接什么都能通 —— 但也因此**看不出**
+# 这根线上跑的是数值还是文本。这里做两件事:
+#   1. 沿连线(输入看上游 / 输出看下游)找出对面的**具体**引脚类型;
+#   2. 找不到就看节点填的『变量名』在树里有没有声明类型(动画树变量)。
+# 解析出的类型用来给引脚**上色**、把类型名**写在引脚标签后面**。
+_COLOR_BY_IDNAME = {
+    "NodeSocketFloat": (0.63, 0.63, 0.63, 1.0),
+    "NodeSocketInt": (0.25, 0.55, 0.25, 1.0),
+    "NodeSocketBool": (0.75, 0.45, 0.30, 1.0),
+    "NodeSocketString": (0.42, 0.60, 0.80, 1.0),
+    "NodeSocketVector": (0.30, 0.32, 0.72, 1.0),
+    "NodeSocketVector2D": (0.36, 0.30, 0.55, 1.0),
+    "NodeSocketColor": (0.75, 0.75, 0.20, 1.0),
+    "NodeSocketObject": (0.20, 0.60, 0.20, 1.0),
+}
+
+# 动画树变量的声明类型 -> GK 引脚类型 idname
+_VAR_TYPE_TO_IDNAME = {
+    "bool": "NodeSocketBool",
+    "int": "NodeSocketInt",
+    "float": "NodeSocketFloat",
+    "string": "NodeSocketString",
+    "vector": "NodeSocketVector",
+}
+
+
+# GDScript 类型名 -> GK 引脚类型 idname。函数声明的『参数:类型』要用它
+# 给『函数_调用』长出对应颜色的参数引脚(用户 2026-10-05 第十七轮)。
+_GD_TYPE_TO_IDNAME = {
+    "bool": "NodeSocketBool",
+    "int": "NodeSocketInt",
+    "float": "NodeSocketFloat",
+    "String": "NodeSocketString",
+    "Vector2": "NodeSocketVector2D",
+    "Vector3": "NodeSocketVector",
+    "Node": "NodeSocketObject",
+}
+
+
+def idname_for_gd_type(gd_type):
+    """GDScript 类型 -> 引脚类型 idname(不认识就给『任意值』引脚)。"""
+    return _GD_TYPE_TO_IDNAME.get(str(gd_type or ""), "GKSocketAny")
+
+
+def _socket_key(socket):
+    """给引脚一个可比较的身份。
+
+    Blender 里同一个引脚每次取到的是**不同的 Python 包装对象**,`id()`
+    会变 —— 用 `as_pointer()` 才能认出"还是那根引脚",避免在环里绕死。
+    """
+    pointer = getattr(socket, "as_pointer", None)
+    if callable(pointer):
+        try:
+            return ("p", pointer())
+        except Exception:
+            pass
+    return ("i", id(socket))
+
+
+def _linked_socket(socket):
+    """沿连线走一步:输入引脚看上游,输出引脚看下游(取第一条连线)。"""
+    is_output = bool(getattr(socket, "is_output", False))
+    for link in getattr(socket, "links", ()) or ():
+        other = (getattr(link, "to_socket", None) if is_output
+                 else getattr(link, "from_socket", None))
+        if other is not None:
+            return other
+    return None
+
+
+def _walk_type_idname(socket, limit=64):
+    """沿连线找对面的**具体**引脚类型(通配引脚要一路走下去)。"""
+    pending = [socket]
+    seen = set()
+    steps = 0
+    while pending and steps < limit:
+        current = pending.pop(0)
+        steps += 1
+        key = _socket_key(current)
+        if key in seen:
+            continue
+        seen.add(key)
+        idname = str(getattr(current, "bl_idname", "") or "")
+        if idname and idname != "GKSocketAny" and idname in _TYPE_TABLE:
+            return idname
+        nxt = _linked_socket(current)
+        if nxt is not None:
+            pending.append(nxt)
+    return ""
+
+
+def _declared_type_idname(socket):
+    """节点上填的『变量名』在树里声明过类型时,返回那个类型(动画树变量)。"""
+    node = getattr(socket, "node", None)
+    if node is None:
+        return ""
+    name = str(getattr(node, "gk_var_name", "") or "").strip()
+    if not name:
+        return ""
+    tree = getattr(node, "id_data", None)
+    variables = getattr(tree, "gk_variables", None) if tree is not None else None
+    if not variables:
+        return ""
+    for var in variables:
+        if str(getattr(var, "var_name", "") or "") == name:
+            return _VAR_TYPE_TO_IDNAME.get(str(getattr(var, "var_type", "")), "")
+    return ""
+
+
+def resolved_type_idname(socket):
+    """通配引脚实际承载的 GK 引脚类型 idname;解析不出来返回空串。
+
+    优先级:**连线对面**(上游/下游)的具体类型 > 节点声明的变量类型。
+    """
+    if socket is None:
+        return ""
+    idname = str(getattr(socket, "bl_idname", "") or "")
+    if idname and idname != "GKSocketAny" and idname in _TYPE_TABLE:
+        return idname
+    found = _walk_type_idname(socket)
+    if found:
+        return found
+    return _declared_type_idname(socket)
+
+
+def resolved_type_label(socket):
+    """通配引脚实际承载类型的**中文标签**(如『数值』);解析不出来返回空串。"""
+    idname = resolved_type_idname(socket)
+    return type_label(idname) if idname else ""
+
+
+def resolved_color(socket):
+    """通配引脚按解析出的类型取显示颜色;解析不出来用默认万能灰。"""
+    return _COLOR_BY_IDNAME.get(resolved_type_idname(socket), _COLOR_ANY)
+
+
+def socket_caption(socket, text):
+    """引脚的显示文字:通配引脚解析出类型后补一句『值 (数值)』。
+
+    非通配引脚原样返回 —— 它们本身的颜色/形状已经说明了类型,
+    再加文字反而是噪音。
+    """
+    # 直接看 bl_idname,不走 gk_semantic —— 离线桩引脚没有 gk_semantic,
+    # 靠它判断会在测试台里静默失效。
+    if str(getattr(socket, "bl_idname", "")) != "GKSocketAny":
+        return text
+    label = resolved_type_label(socket)
+    return f"{text} ({label})" if label else text
 
 
 # 供 node_base 使用的常用引脚速记

@@ -1,4 +1,4 @@
-﻿# End-to-end check for the 2D platformer demo.
+# End-to-end check for the 2D platformer demo.
 #
 #   powershell -File scripts/platformer_verify.ps1
 #
@@ -17,11 +17,15 @@
 
 param(
     [string]$Godot = "D:\godot\Godot_v4.7.2-stable_win64_console.exe",
-    [string]$Root = "D:\BlenderGameKit"
+    [string]$Root = "D:\BlenderGameKit",
+    # Where to generate the demo. Default is the shipped showcase under
+    # examples\demo_platformer; the one-button gate passes _dist\platformer_e2e
+    # so the tracked example files are never rewritten by a test run.
+    [string]$OutDir = ""
 )
 
 $ErrorActionPreference = "Continue"
-$demo = Join-Path $Root "examples\demo_platformer"
+if ($OutDir) { $demo = $OutDir } else { $demo = Join-Path $Root "examples\demo_platformer" }
 $scene = Join-Path $demo "Main.tscn"
 $backup = Join-Path $demo "Main.tscn.gkbackup"
 $checker = Join-Path $demo "_gk_check.gd"
@@ -37,7 +41,7 @@ if (-not (Test-Path $Godot)) { Write-Output "SKIP: godot not found"; exit 0 }
 
 # ---------- 1. regenerate ----------
 Step "1/3 regenerate demo"
-& python (Join-Path $Root "scripts\make_platformer_demo.py") 2>&1 |
+& python (Join-Path $Root "scripts\make_platformer_demo.py") $demo 2>&1 |
     Select-String -Pattern "generated|lines|warning" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "generator failed"; exit 1 }
 
@@ -46,12 +50,28 @@ if ($LASTEXITCODE -ne 0) { Write-Error "generator failed"; exit 1 }
 # left one behind, the "best score updates" check below becomes flaky
 # (we would read an old record instead of the one this run writes).
 # Godot maps user:// to %APPDATA%\Godot\app_userdata\<project name>.
+#
+# Scope the deletion to THIS demo's own folder. It used to glob every
+# app_userdata folder for gk_*.json, which would wipe save files belonging to
+# unrelated Godot projects on the machine the moment the check ran. The folder
+# name is CJK, so resolve it at runtime from project.godot instead of writing a
+# literal here (this file must stay ASCII-only, see the note at the top).
 Step "1b/3 clear previous save"
-$userData = Join-Path $env:APPDATA "Godot\app_userdata"
+$projName = ""
+$projFile = Join-Path $demo "project.godot"
+if (Test-Path $projFile) {
+    $projText = Get-Content $projFile -Raw -Encoding utf8
+    if ($projText -match 'config/name="([^"]*)"') { $projName = $Matches[1] }
+}
 $removed = 0
-if (Test-Path $userData) {
-    Get-ChildItem $userData -Recurse -Filter "gk_*.json" -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+if ($projName) {
+    $userDir = Join-Path (Join-Path $env:APPDATA "Godot\app_userdata") $projName
+    if (Test-Path $userDir) {
+        Get-ChildItem $userDir -Filter "gk_*.json" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+    }
+} else {
+    Write-Output "could not resolve project name; skipping save cleanup (nothing deleted)"
 }
 Write-Output ("removed {0} old save file(s)" -f $removed)
 

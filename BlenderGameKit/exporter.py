@@ -2,9 +2,11 @@
 
 import os
 import re
+import tempfile
 import time
 
-from . import codegen, gk_log, project
+from . import (blender_adapter, codegen, curve_assets, gk_log, models, paths,
+               project)
 from .nodes.node_base import snake_case
 
 GDScriptVersion = 4
@@ -13,8 +15,13 @@ GDScriptVersion = 4
 # 正常情况下不该走到这里 —— 场景目录应该由 project.resolve() 给出。
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "BlenderGameKit_Export")
 
-# 场景文件里引用脚本的写法
-_EXTENDS_TEMPLATE = """[gd_scene load_steps=2 format=3]
+# 场景文件里引用脚本的写法。
+# ── 开头那行注释是干什么的(第十三轮)──────────────────────────────
+# 它是"这个文件是插件生成的"的**内容标记**,给旧文件清理用
+# (见 generated_files.is_generated_file)。Godot 的 .tscn 允许 `;` 注释,
+# 实测 4.7.2 能正常加载(带注释的场景 load 成功)。
+_EXTENDS_TEMPLATE = """; 由 BlenderGameKit 自动生成,请勿手动修改
+[gd_scene load_steps=2 format=3]
 
 [ext_resource type="Script" path="{script_name}" id="1_script"]
 
@@ -24,12 +31,18 @@ script = ExtResource("1_script")
 
 
 def safe_file_name(text, fallback="player"):
-    """把节点树名字转成安全的文件名(中文会被压成下划线，那就用回退名)。"""
-    name = snake_case(text or "", "")
-    if not name or len(name.strip("_")) < 2:
+    """把节点树名字转成安全的文件名(中文会被压成下划线，那就用回退名)。
+
+    ── 顺序不能反(踩过的坑)───────────────────────────────────────
+    原来先判"名字够不够长"、再压字符集 —— 于是『角色逻辑(预设)』这种
+    "中文 + 标点"的名字会通过第一关(中文也算字符),压完只剩 `_`,
+    最后落成 `_.gd`(实测:预设建的树就撞上了)。
+    正确顺序:先按字符集压干净,再判断压完还剩什么,不行才用回退名。
+    """
+    name = re.sub(r"[^A-Za-z0-9_\-]", "", snake_case(text or "", ""))
+    if len(name.strip("_")) < 2:
         return fallback
-    name = re.sub(r"[^A-Za-z0-9_\-]", "", name)
-    return name or fallback
+    return name
 
 
 def build_settings(scene):
@@ -56,6 +69,12 @@ def build_settings(scene):
         "node_name": getattr(props, "node_name", "Player"),
         # 运行日志开关(用户第 29 轮:运行时的状态要能复制出来)
         "debug_runtime": bool(getattr(props, "debug_runtime", False)),
+        # 游戏内调试面板(用户 2026-10-05 第二十二轮):开了之后生成的脚本
+        # 会带一份日志缓冲(_gk_debug_logs),面板(环境脚本)从宿主脚本里
+        # 读变量和最近打印 —— 这里只影响代码生成,面板本身在环境脚本里。
+        "debug_panel": bool(getattr(props, "debug_panel", False)),
+        # 上帝摄像机开关(用户 2026-10-04)
+        "god_camera": bool(getattr(props, "god_camera", False)),
     })
 
     manual = (getattr(props, "output_dir", "") or "").strip()
@@ -66,6 +85,28 @@ def build_settings(scene):
         directory, reason = project.resolve(scene)
         settings["output_dir"] = directory or ""
         settings["dir_source"] = reason
+
+    # ── 静态资产表(用户 2026-10-05)──────────────────────────────────
+    # 『资产_创建实例』是**运行时**节点:按资产名生成一份新实例,所以它
+    # 需要"这个名字对应哪份 glb、碰撞生成多大"。资产名是用户在 Blender 里
+    # 随手起的,只有导出侧知道这份对应关系 —— 在这里算好塞进设置,
+    # 代码生成那边直接查(见 asset_export.asset_codegen_map)。
+    # 算不出来(离线/桩环境)就给空表:用到了资产节点的图会拿到一条
+    # "资产不在场景里"的告警,而不是让整个导出失败。
+    try:
+        from . import asset_export
+        settings["assets"] = asset_export.asset_codegen_map(
+            scene, settings.get("dimension", "3"))
+        # ── 粒子发射器表(用户 2026-10-05 第二十一轮)──────────────────
+        # 『特效_播放』『特效_停止』『特效_爆发』要知道目标**具体是什么
+        # 节点类型** —— 同一个物体名可能是 GPUParticles3D 也可能是
+        # CPUParticles3D(面板上选的 GPU / CPU),名字里看不出来。
+        # 算好塞进设置,代码生成那边直接查(见 asset_export.fx_codegen_map)。
+        settings["fx"] = asset_export.fx_codegen_map(
+            scene, settings.get("dimension", "3"))
+    except Exception:                                     # noqa: BLE001
+        settings["assets"] = {}
+        settings["fx"] = {}
     return settings
 
 
@@ -91,6 +132,68 @@ def resolve_main_camera(scene):
     if cameras:
         return cameras[0], f"自动(场景里第一台;共 {len(cameras)} 台)"
     return "", "场景里没有相机(运行时造一台自由飞行观察机)"
+
+
+def game_logic_trees():
+    """整个 .blend 里的『游戏逻辑』节点图,按名字排序。
+
+    离线(桩 bpy)环境里拿不到 bpy.data -> 返回空表,由调用方兜底。
+    """
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return []
+    groups = getattr(getattr(bpy, "data", None), "node_groups", None)
+    if groups is None:
+        return []
+    return sorted((g for g in groups
+                   if getattr(g, "bl_idname", "") == "GKGameLogicTree"),
+                  key=lambda g: getattr(g, "name", ""))
+
+
+def resolve_scene_tree(scene):
+    """算出**某个 Blender 场景**该用哪棵游戏逻辑图(用户 2026-10-04)。
+
+    ── 为什么需要这个 ──────────────────────────────────────────────
+    一个 .blend 里可以有多个 Blender 场景(关卡1 / 关卡2 / ...),导出时
+    每个场景各出一张 .tscn。但"场景"和"节点图"原本没有绑定关系 ——
+    多场景时只能靠"当前节点编辑器里打开的那棵",必然搞不清哪棵属于谁。
+    所以每个场景在设置里显式选一棵,这里负责把它解析出来。
+
+    顺序:①场景设置里显式选的(要存在且确实是游戏逻辑图)
+          ②整个 .blend 只有一棵 -> 就用它(单场景项目行为完全不变)
+          ③其余情况返回 None,由调用方告警
+    返回 (tree, 说明文字)。
+    """
+    if scene is None:
+        return None, ""
+    settings = getattr(scene, "gk_settings", None)
+    wanted = str(getattr(settings, "logic_tree", "") or "").strip()
+    if wanted:
+        try:
+            import bpy
+        except Exception:                                 # noqa: BLE001
+            return None, "离线环境取不到节点图"
+        tree = bpy.data.node_groups.get(wanted)
+        if tree is not None and getattr(tree, "bl_idname", "") == "GKGameLogicTree":
+            return tree, "场景设置里指定的逻辑图"
+        return None, f"场景设置里指定的『{wanted}』不存在(或不是游戏逻辑图)"
+    trees = game_logic_trees()
+    if len(trees) == 1:
+        return trees[0], "只有一棵游戏逻辑图,自动使用"
+    if not trees:
+        return None, "整个 .blend 里没有游戏逻辑图"
+    return None, (f"有 {len(trees)} 棵游戏逻辑图,但这个场景没选 —— "
+                  f"请在『导出』面板给场景指定一棵")
+
+
+def exportable_scenes():
+    """要导出成 .tscn 的 Blender 场景列表(按 .blend 里的顺序)。"""
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return []
+    return list(getattr(bpy.data, "scenes", []) or [])
 
 
 def script_target_object(scene):
@@ -151,16 +254,8 @@ def resolve_base_class(scene):
 
 
 def default_settings():
-    return {
-        "dimension": "3",
-        "base_class": "CharacterBody3D",
-        "class_name": "",
-        "export_tunables": True,
-        "output_dir": "",
-        "dir_source": "",
-        "write_scene": False,
-        "node_name": "Player",
-    }
+    """默认导出设置 —— 直接由数据模型给出,避免"默认值散落多处不一致"。"""
+    return models.ExportSettings().to_dict()
 
 
 def generate_code(tree, settings=None):
@@ -170,7 +265,33 @@ def generate_code(tree, settings=None):
     但 Godot 的 project.godot 里如果没登记它们,运行时会刷一屏
         ERROR: The InputMap action "move_left" doesn't exist.
     而且按键完全没反应。所以调用方要拿这份清单去写 [input] 段。
+
+    这是**旧签名**,只给"看看代码和文本告警"的调用方(如预览)用。
+    要结构化诊断请用 `generate_code_result()`。
     """
+    code, warnings, file_name, actions, _diagnostics = generate_code_result(
+        tree, settings)
+    return code, warnings, file_name, actions
+
+
+def generate_code_result(tree, settings=None):
+    """同 `generate_code`,但多返回一份结构化诊断(models.Diagnostic)。
+
+    ── 为什么和 generate_code 拆开(GPT 审查:统一诊断机制)──────────
+    导出报告需要按 `code` 归类问题,而预览只需要文本告警。多给一份诊断,
+    同时**不改 `generate_code` 的签名** —— 免得所有调用方都跟着改。
+
+    返回值(5 个):(代码, 告警, 文件名, 输入动作, 诊断)。
+    曲线资源(第十二轮)走 `_generate_code_full` —— 它是"生成时顺带采好的
+    数据",导出脚本那一步(export_tree)要拿它写 curves/*.tres。
+    """
+    code, warnings, file_name, actions, diagnostics, _assets = \
+        _generate_code_full(tree, settings)
+    return code, warnings, file_name, actions, diagnostics
+
+
+def _generate_code_full(tree, settings=None):
+    """`generate_code_result` 的完整版:多返回一个曲线资源表(第六项)。"""
     if tree is None:
         raise codegen.CodegenAbort("请先在节点编辑器里选择一棵『游戏逻辑』节点树")
     options = dict(settings or {})
@@ -196,12 +317,34 @@ def generate_code(tree, settings=None):
     else:
         warnings_extra = ""
 
-    code, warnings = codegen.generate(tree, options)
+    # ── 用返回值拿结果,不再回头读 codegen 的模块级全局变量 ──────────
+    # 以前是 `codegen.generate()` + `getattr(codegen, "last_used_actions")`:
+    # 生成失败时那个全局变量还留着上一次的旧值(GPT 审查 / 用户 2026-10-04)。
+    result = codegen.generate_result(tree, options)
+    code, warnings = result.code, list(result.warnings)
+    diagnostics = list(getattr(result, "diagnostics", []) or [])
     if warnings_extra:
+        # 基类被自动改写:渲染出来的文本与以前逐字一致,只是额外留一份
+        # 带 code 的结构化诊断,方便导出报告归类。
+        diagnostics.insert(0, models.Diagnostic(
+            level="warning", code="BASE_CLASS_OVERRIDDEN",
+            message=warnings_extra))
         warnings.insert(0, warnings_extra)
-    file_name = safe_file_name(getattr(tree, "name", ""), "game_logic") + ".gd"
-    actions = list(getattr(codegen, "last_used_actions", []) or [])
-    return code, warnings, file_name, actions
+    # 脚本名默认取节点树名(中文压成空 -> 回退 game_logic.gd)。
+    # ── 多场景时必须能**指定**名字(用户 2026-10-04)─────────────────
+    # 两棵树的脚本都叫 game_logic.gd 的话会互相覆盖 —— 后写完的那个
+    # 赢,前一关的逻辑整份丢(实测:关卡1 还挂着玩家逻辑的场景,跑的
+    # 却是关卡2 的脚本)。export_all_scenes 按场景名传进来(见那里的说明)。
+    # 传进来的名字**已经 sanitize 过**,这里不再二次压缩 ——
+    # 再压一次会把中文抹掉("game_logic_关卡1" -> "game_logic_1")。
+    override = str(options.get("script_name") or "").strip()
+    if override:
+        file_name = override if override.endswith(".gd") else override + ".gd"
+    else:
+        file_name = safe_file_name(getattr(tree, "name", ""), "game_logic") + ".gd"
+    actions = list(result.input_actions)
+    assets = dict(getattr(result, "curve_assets", {}) or {})
+    return code, warnings, file_name, actions, diagnostics, assets
 
 
 # 哪些基类"已经提供了"某个类的能力 —— 用来避免无谓的替换。
@@ -219,18 +362,110 @@ def _class_provides(have, want):
     return want in _PROVIDES.get(have, set())
 
 
-def write_text(path, text):
-    """UTF-8 写文件(Godot 与 Blender 都能正确读取)。"""
+def atomic_write_text(path, text):
+    """原子写:先写同目录临时文件,再 `os.replace` 覆盖目标。
+
+    ── 为什么不用直接 `open(path, "w")` ─────────────────────────────
+    直接写的话,进程被杀 / 磁盘写满 / 编码错误都可能留下一个**半截**的 .gd。
+    那个文件在 Godot 里是一条语法错误,用户完全不知道刚才发生了什么。
+    `os.replace` 在同一文件系统内是**原子**操作:目标要么还是旧内容,
+    要么完整变成新内容,不存在"写了一半"的中间态。
+    """
     folder = os.path.dirname(path)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", newline="\n", dir=folder or ".",
+        prefix=".gk_tmp_", suffix=".part", delete=False)
+    try:
+        with handle:
+            handle.write(text)
+        os.replace(handle.name, path)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
     return path
 
 
-def write_scene_file(directory, node_name, base_class, script_name, script_res_path=None):
-    """写场景装配文件到 scenes/ 子目录。
+def write_text(path, text):
+    """UTF-8 写文件(Godot 与 Blender 都能正确读取)。走原子写。"""
+    return atomic_write_text(path, text)
+
+
+class FileTransaction:
+    """记录一次导出将要改写的所有文件,任一步失败就整体回滚。
+
+    ── 为什么需要(GPT 审查 / 用户 2026-10-04)──────────────────────
+    一次导出会动三类文件:脚本(.gd)、场景(.tscn)以及 project.godot
+    (输入映射 + 主场景)。原来的顺序是"写脚本 -> 改 project.godot -> 写场景",
+    中间任何一步抛异常,磁盘上就是**半成品**:脚本已经换成新的、场景还是旧的
+    —— Godot 里表现为"我改了却没生效",而且没有任何提示。
+
+    这个类在动任何文件之前先把内容**快照**下来;失败时逐个还原,
+    原来不存在的文件就删掉。于是"导出"对外变成**全有或全无**。
+    另外 `write()` 内部走原子写,单个文件也不会写半截。
+    """
+
+    def __init__(self):
+        self._snapshots = {}
+        self.written = []
+
+    def _snapshot(self, path):
+        if path in self._snapshots:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                self._snapshots[path] = handle.read()
+        except FileNotFoundError:
+            self._snapshots[path] = None
+        except OSError as exc:
+            # 读不出来(权限/编码)也要登记成"不存在",回滚时删掉它,
+            # 总比留下一个被改了一半的文件强
+            gk_log.warn(f"快照失败,回滚将删除该文件: {path}({exc})")
+            self._snapshots[path] = None
+
+    def note(self, path):
+        """登记一个**由外部函数改写**的文件(如 project.godot),只做快照。
+
+        用于 `project.set_input_actions()` / `set_main_scene()`:它们自己
+        直接写盘,我们没法在中间插手,所以只能事先留底、出错时还原。
+        """
+        if path:
+            self._snapshot(path)
+
+    def write(self, path, text):
+        self._snapshot(path)
+        atomic_write_text(path, text)
+        if path not in self.written:
+            self.written.append(path)
+        return path
+
+    def rollback(self):
+        """把登记过的文件还原到导出前。返回还原失败的路径列表。"""
+        failed = []
+        for path, original in self._snapshots.items():
+            try:
+                if original is None:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                else:
+                    atomic_write_text(path, original)
+            except OSError as exc:
+                failed.append(path)
+                gk_log.error(f"回滚失败,请手动检查这个文件: {path}({exc})")
+        self.written = []
+        return failed
+
+
+def render_scene_file(directory, node_name, base_class, script_name,
+                      script_res_path=None):
+    """算出场景文件的 (路径, 内容),**不写盘**。
+
+    拆出这一步是为了让导出能"先在内存里备齐所有内容、校验之后再落盘"
+    (GPT 审查:导出要原子)。`write_scene_file` 仍保留原签名,内部调它。
 
     .tscn 里引用脚本必须用 **res:// 路径**。写相对路径的话 Godot 找不到脚本,
     而且**不会报错** —— 只是在检查器里显示脚本缺失,很难查。
@@ -240,11 +475,17 @@ def write_scene_file(directory, node_name, base_class, script_name, script_res_p
     if not script_res_path:
         # 默认脚本在 scripts/ 下
         script_res_path = f"{project.SCRIPTS_DIR}/{script_name}"
-    if not script_res_path.startswith("res://"):
-        script_res_path = f"res://{script_res_path}"
+    script_res_path = paths.to_res_path(script_res_path)
     text = _EXTENDS_TEMPLATE.format(
         script_name=script_res_path, node_name=node_name or "Main", base_class=base_class
     )
+    return path, text
+
+
+def write_scene_file(directory, node_name, base_class, script_name, script_res_path=None):
+    """写场景装配文件到 scenes/ 子目录(原子写)。"""
+    path, text = render_scene_file(directory, node_name, base_class, script_name,
+                                   script_res_path)
     return write_text(path, text)
 
 
@@ -306,11 +547,49 @@ def build_starter_graph(tree):
     return 2, "每当_准备 → 打印_输出"
 
 
+def validate_output_dir(directory):
+    """检查导出目录能不能安全写入。返回 (ok, 归一化后的路径或错误说明)。
+
+    ── 为什么要这一步(GPT 审查 / 用户 2026-10-04)──────────────────
+    `output_dir` 以前是"给什么就用什么":路径拼错、指到一个**文件**、
+    指到系统目录,导出器都会照样建目录、覆盖 scripts/*.gd 和 project.godot。
+    用户可能因此把别的项目覆盖掉,而且事后完全不知道是插件干的。
+    现在先归一化(`abspath`)再检查:必须是目录(或尚不存在、可创建),
+    不能指向一个已存在的文件。
+    """
+    if not directory or not str(directory).strip():
+        return False, "没有导出目录(先在『项目』面板把 .blend 绑定到一个 Godot 项目)"
+    # 归一化 + 边界判断统一走 paths(纯标准库,可离线单测)
+    return paths.validate_project_dir(directory)
+
+
 def export_tree(tree, settings=None, write_scene=None):
-    """导出节点树，返回一个结果字典(给 UI 用)。"""
-    settings = dict(settings or default_settings())
+    """导出节点树，返回一个结果字典(给 UI 用)。
+
+    ── 现在是**事务式**的(GPT 审查 / 用户 2026-10-04)────────────────
+    内容先在内存里备齐、校验,再统一落盘;中途任何一步失败都会把已经
+    写过的文件**回滚**成导出前的样子,不留下"脚本是新的、场景是旧的"
+    这种半成品项目。`settings["dry_run"] = True` 时只算清单、不写盘。
+    """
+    # 边界仍接受 dict(脚本/测试一直这么传),进来先归一化成数据模型 ——
+    # 内部一律用属性访问,拼错字段名会直接报错而不是"静默读默认值"。
+    options = models.ExportSettings.from_dict(settings or default_settings())
+    settings = options.to_dict()
     started = time.time()
-    code, warnings, script_name, actions = generate_code(tree, settings)
+    dry_run = options.dry_run
+    code, warnings, script_name, actions, diagnostics, curve_assets_data = \
+        _generate_code_full(tree, settings)
+    warnings = list(warnings)          # 已在 codegen 出口摊平成字符串
+    diagnostics = list(diagnostics)    # 结构化诊断(level / code / message / hint)
+
+    def _note(diagnostic):
+        """登记一条结构化诊断:既保留对象(给程序化消费),又把摊平后的
+        文本放进 warnings —— UI / 日志 / `self.report()` 一直吃字符串,
+        这里做一次转换,边界之外的类型**完全不变**(GPT 审查:统一诊断机制)。
+        """
+        diagnostics.append(diagnostic)
+        warnings.append(diagnostic.render())
+
     # ── 挂了脚本的物体:列出来 + 多于一个就告警(用户 2026-10-03)────────
     # 两个物体同时勾『挂游戏逻辑脚本』的话,导出是**两次覆盖同一个脚本文件**
     # (后写的赢),表现是"我改了设置却没生效"。这里点名说清楚。
@@ -318,61 +597,147 @@ def export_tree(tree, settings=None, write_scene=None):
     # 绝不能因为"报告里想多写一行"而让导出失败
     targets = []
     try:
-        import bpy
-        targets = script_targets(bpy.context.scene)
+        # 场景统一从适配层取;离线(无 bpy.context)时拿到 None,
+        # script_targets(None) 直接返回空表 —— 与旧行为一致,不再需要
+        # 单独捕获 AttributeError。
+        targets = script_targets(blender_adapter.scene())
     except Exception:
+        gk_log.exception("检查『挂脚本物体』时出错(继续导出)")
         targets = []
     if len(targets) > 1:
         names = "、".join(getattr(o, "name", "?") for o in targets[:4])
-        warnings = list(warnings) + [
-            f"有 {len(targets)} 个物体都勾了『挂游戏逻辑脚本』({names})—— "
-            f"它们会**轮流覆盖**同一个脚本文件,后导出的那个赢。"
-            f"请只留一个(选中其它物体 -> 『游戏物理』面板 -> 取消勾选)"]
+        _note(models.Diagnostic(
+            level="warning", code="MULTIPLE_SCRIPT_TARGETS",
+            message=(f"有 {len(targets)} 个物体都勾了『挂游戏逻辑脚本』({names})—— "
+                     f"它们会**轮流覆盖**同一个脚本文件,后导出的那个赢。"),
+            hint="请只留一个(选中其它物体 -> 『游戏物理』面板 -> 取消勾选)"))
     elif targets:
         gk_log.info(f"脚本挂在: {getattr(targets[0], 'name', '?')}"
                     f"(可以在『游戏物理』面板里换)")
     # 主相机:说清这一局用的是哪台(用户第 25 轮:"多个窗口时就提示选择")
-    try:
-        import bpy as _bpy
-        cam_name, cam_why = resolve_main_camera(_bpy.context.scene)
-        if cam_name:
-            gk_log.info(f"主相机: {cam_name}({cam_why})")
-        else:
-            warnings = list(warnings) + [
-                "场景里一台相机都没有 —— 运行时会自动造一台自由飞行观察机"
-                "(WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角)。"
-                "想固定镜头:放一台相机,或者在『游戏物理』那一栏指定主相机"]
-    except Exception:
-        pass
-    directory = settings.get("output_dir") or DEFAULT_OUTPUT_DIR
+    scene_now = blender_adapter.scene()
+    if scene_now is not None:
+        try:
+            cam_name, cam_why = resolve_main_camera(scene_now)
+            if cam_name:
+                gk_log.info(f"主相机: {cam_name}({cam_why})")
+            else:
+                _note(models.Diagnostic(
+                    level="warning", code="NO_CAMERA",
+                    message=("场景里一台相机都没有 —— 运行时会自动造一台自由飞行"
+                             "观察机(WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角)。"),
+                    hint="想固定镜头:放一台相机,并把它设为 Blender 视口的"
+                          "当前相机(小键盘 0);也可以打开『上帝摄像机』"))
+        except Exception:
+            gk_log.exception("检查主相机时出错(继续导出)")
+
+    # ── 先校验目录,再动任何文件 ────────────────────────────────────
+    valid, directory = validate_output_dir(
+        options.output_dir or DEFAULT_OUTPUT_DIR)
+    if not valid:
+        gk_log.error(directory)
+        return {
+            "ok": False, "error": directory, "stage": "校验导出目录",
+            "rolled_back": True, "code": code, "warnings": list(warnings),
+            "diagnostics": list(diagnostics),
+            "script_name": script_name, "written": [], "manifest": [],
+            "directory": "", "lines": len(code.splitlines()), "elapsed_ms": 0.0,
+        }
+
     # 脚本写进 scripts/ 子目录 —— 项目根目录只放 project.godot,
     # 这样"公用的文件夹"结构清晰:脚本、场景、模型、材质各归各位。
-    script_path = write_text(
-        os.path.join(directory, project.SCRIPTS_DIR, script_name), code)
-
-    # 把用到的输入动作写进 project.godot。
-    # 不做这一步的话,Godot 里按键完全没反应,而且只刷一行
-    # ERROR: The InputMap action "move_left" doesn't exist.
-    # 用户根本想不到"要去输入映射里手工加动作"。
-    if actions:
-        count = project.set_input_actions(directory, actions)
-        if count:
-            gk_log.info(f"已把 {count} 个输入动作写进 project.godot")
-
-    written = [script_path]
-    should_write_scene = settings.get("write_scene") if write_scene is None else write_scene
+    script_path = paths.safe_join_project(directory, project.SCRIPTS_DIR,
+                                          script_name)
+    should_write_scene = (options.write_scene if write_scene is None
+                          else write_scene)
+    scene_path = None
+    scene_text = None
     if should_write_scene:
-        scene_path = write_scene_file(
+        scene_path, scene_text = render_scene_file(
             directory,
-            settings.get("node_name", "Player"),
-            settings.get("base_class", "CharacterBody3D"),
+            options.node_name,
+            options.base_class,
             script_name,
         )
-        written.append(scene_path)
         # 顺手把主场景指过去,否则 Godot 里按 F5 会弹"没有设置主场景"
-        scene_name = os.path.basename(scene_path)
-        if project.set_main_scene(directory, f"{project.SCENES_DIR}/{scene_name}"):
-            gk_log.info(f"已把主场景设为 {project.SCENES_DIR}/{scene_name}")
+
+    project_file = os.path.join(directory, "project.godot")
+    manifest = [script_path]
+    # ── 曲线资源(第十二轮)──────────────────────────────────────────
+    # 脚本里写死 `res://curves/xxx.tres`(相机沿曲线运镜 / 时间轴的曲线),
+    # 所以必须和脚本同一次落盘 —— 少写一次就是"脚本引用了不存在的资源"
+    # (运行时只是警句 + 退回直线过渡,但用户会以为曲线没生效)。
+    curve_files = curve_assets.curve_files(directory, curve_assets_data)
+    manifest.extend(path for _name, path, _text in curve_files)
+    if scene_path:
+        manifest.append(scene_path)
+    if actions or should_write_scene:
+        manifest.append(project_file)
+    if not os.path.isfile(project_file):
+        _note(models.Diagnostic(
+            level="warning", code="NO_PROJECT_FILE",
+            message="导出目录里没有 project.godot —— 输入映射和主场景这次不会写进去。",
+            hint="先建好 Godot 项目(『项目』面板 -> 创建),否则 Godot 里按 F5 跑不起来"))
+        manifest = [p for p in manifest if p != project_file]
+
+    if dry_run:
+        gk_log.info(f"[dry-run] 将写入 {len(manifest)} 个文件: {manifest}")
+        return {
+            "ok": True, "dry_run": True, "code": code, "warnings": list(warnings),
+            "diagnostics": list(diagnostics),
+            "script_name": script_name, "written": [], "manifest": manifest,
+            "directory": directory, "lines": len(code.splitlines()),
+            "elapsed_ms": 0.0,
+        }
+
+    transaction = FileTransaction()
+    stage = "写脚本"
+    try:
+        transaction.write(script_path, code)
+
+        # 曲线资源(和脚本一起进事务:出错一起回滚)
+        if curve_files:
+            stage = "写曲线资源"
+            for name, path, text in curve_files:
+                transaction.write(path, text)
+            gk_log.info(f"曲线资源 {len(curve_files)} 个 -> {project.CURVES_DIR}/")
+
+        # 把用到的输入动作写进 project.godot。
+        # 不做这一步的话,Godot 里按键完全没反应,而且只刷一行
+        # ERROR: The InputMap action "move_left" doesn't exist.
+        # 用户根本想不到"要去输入映射里手工加动作"。
+        if actions:
+            stage = "写输入映射"
+            transaction.note(project_file)
+            count = project.set_input_actions(directory, actions)
+            if count:
+                gk_log.info(f"已把 {count} 个输入动作写进 project.godot")
+
+        if should_write_scene:
+            stage = "写场景"
+            transaction.write(scene_path, scene_text)
+            stage = "设主场景"
+            transaction.note(project_file)
+            scene_name = os.path.basename(scene_path)
+            if project.set_main_scene(directory, f"{project.SCENES_DIR}/{scene_name}"):
+                gk_log.info(f"已把主场景设为 {project.SCENES_DIR}/{scene_name}")
+    except Exception as exc:
+        failed = transaction.rollback()
+        gk_log.exception(f"导出失败({stage}),已回滚本次写入")
+        if failed:
+            message = (f"{stage}失败: {exc};有 {len(failed)} 个文件回滚失败,"
+                       f"请手动检查: {'、'.join(failed)}")
+        else:
+            message = f"{stage}失败(已回滚,工程保持原样): {exc}"
+        gk_log.error(message)
+        return {
+            "ok": False, "error": str(exc), "stage": stage, "message": message,
+            "rolled_back": not failed, "code": code, "warnings": list(warnings),
+            "diagnostics": list(diagnostics),
+            "script_name": script_name, "written": [], "manifest": manifest,
+            "directory": directory, "lines": len(code.splitlines()),
+            "elapsed_ms": (time.time() - started) * 1000.0,
+        }
 
     elapsed = (time.time() - started) * 1000.0
     gk_log.info(f"导出完成: {script_path} ({len(code.splitlines())} 行, {elapsed:.0f} ms)")
@@ -383,8 +748,15 @@ def export_tree(tree, settings=None, write_scene=None):
         "ok": True,
         "code": code,
         "warnings": warnings,
+        "diagnostics": list(diagnostics),
         "script_name": script_name,
-        "written": written,
+        # 这次导出用到的输入动作(动作名, 捕获的键)—— 多场景导出要靠它
+        # 把各场景的动作**并起来**再写 [input](见 export_all_scenes)。
+        # 不返回的话,后导出的场景会覆盖前一个场景的动作(第三十一轮实测:
+        # 关卡1 的 key_e 被关卡2 的覆盖,第一关按 E 完全没反应)。
+        "input_actions": list(actions),
+        "written": list(transaction.written),
+        "manifest": manifest,
         "directory": directory,
         "lines": len(code.splitlines()),
         "elapsed_ms": elapsed,

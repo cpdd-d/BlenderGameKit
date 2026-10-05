@@ -17,7 +17,10 @@
 param(
     [string]$Blender = "D:\blender-4.5.5-windows-x64\blender.exe",
     [string]$Root = "D:\BlenderGameKit",
+    [string]$Godot = "D:\godot\Godot_v4.7.2-stable_win64_console.exe",
     [switch]$SkipInstall,
+    [switch]$SkipGodot,
+    [switch]$Deep,
     [switch]$KeepTestRepo
 )
 
@@ -48,13 +51,36 @@ function Remove-TestRepo {
 
 if (-not (Test-Path $Blender)) { Write-Error "找不到 Blender: $Blender"; exit 1 }
 
+# 跑一个"旁路"Godot 验证脚本,把它输出的关键行透出来,并按标记给 ok/skip/fail。
+# 三个脚本的标记各不相同(GODOT_VERIFY / PLATFORMER_VERIFY / ANIM_VERIFY),
+# 所以做成通用函数,新增一层覆盖只要再加一次调用。
+function Invoke-Verify {
+    param([string]$Script, [string[]]$CallArgs, [string]$OkMarker)
+    $log = & powershell -ExecutionPolicy Bypass -File $Script @CallArgs 2>&1 | Out-String
+    $log -split "`n" | Where-Object {
+        $_ -match "^(跳过|SKIP:|导入无错误|导入期报错|运行期错误|行为断言失败|脚本在 Godot|GODOT_VERIFY|PLATFORMER_VERIFY|ANIM_VERIFY|结果:|\[PASS\]|\[FAIL\])" -or
+        $_ -match "^(PROBE2D|PROBE25|LANDED|CAMERA|BEFORE|AFTER|COINS_LEFT|HUD=|SAVE_EXISTS|CHECK|SPRING)"
+    } | ForEach-Object { Write-Host $_.TrimEnd() }
+    $status = if ($log -match $OkMarker) { "ok" }
+              elseif ($log -match "跳过:找不到 Godot" -or $log -match "SKIP: godot not found") { "skip" }
+              else { "fail" }
+    if ($status -eq "fail") {
+        # 注意：函数里 Write-Output 会变成"返回值"被调用方捕获,看不见 ——
+        # 所以透传日志一律用 Write-Host。
+        Write-Host "---- $([System.IO.Path]::GetFileName($Script)) 输出(尾部 40 行) ----"
+        ($log -split "`n") | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 40 |
+            ForEach-Object { Write-Host $_ }
+    }
+    return @{ Status = $status; Log = $log }
+}
+
 # ---------- 1. 离线单元测试 ----------
-Step "1/5 离线代码生成测试 (不需要 Blender)"
+Step "1/6 离线代码生成测试 (不需要 Blender)"
 & python (Join-Path $Root "tests\test_codegen.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "离线测试失败"; exit 1 }
 
 # ---------- 2. 构建扩展 ----------
-Step "2/5 构建 Blender 扩展"
+Step "2/6 构建 Blender 扩展"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 & $Blender --command extension build --source-dir $pkg --output-dir $dist 2>&1 |
     Select-String -Pattern "building|complete|created|FATAL|Error" | ForEach-Object { $_.Line }
@@ -63,7 +89,7 @@ Write-Output ("扩展包: {0} ({1:N0} 字节)" -f $zip, (Get-Item $zip).Length)
 
 # ---------- 3. 干净重装 ----------
 if (-not $SkipInstall) {
-    Step "3/5 重装到临时测试仓库(不会动 user_default)"
+    Step "3/6 重装到临时测试仓库(不会动 user_default)"
     Remove-TestRepo
     & $Blender --command extension repo-add $testRepoName --name "GK Test" --directory $repo 2>&1 |
         Select-String -Pattern "Error|error" | ForEach-Object { $_.Line }
@@ -78,11 +104,11 @@ if (-not $SkipInstall) {
         Write-Output "安装期无注册错误"
     }
 } else {
-    Step "3/5 跳过重装"
+    Step "3/6 跳过重装"
 }
 
 # ---------- 4. 冒烟测试 ----------
-Step "4/5 Blender 冒烟测试"
+Step "4/6 Blender 冒烟测试"
 # 注意:不能加 --factory-startup，否则 Blender 看不到用户扩展仓库
 $smoke = Join-Path $Root "tests\blender_smoke.py"
 $out = & $Blender -b --python $smoke 2>&1
@@ -91,16 +117,190 @@ $text -split "`n" | Select-String -Pattern "^\[(PASS|FAIL)\]|^结果:|^失败项
     ForEach-Object { $_.Line }
 $smokeOk = $text -match "SMOKE_RESULT=OK"
 
-# ---------- 5. 汇总 ----------
-Step "5/5 结果"
+# ---------- 5. Godot 端到端 ----------
+# ── 为什么要单列这一关 ──────────────────────────────────────────────
+# 前面 1~4 步都停在"Blender 里看起来对"。可生成物**是给 Godot 吃的** ——
+# 基类和 .tscn 节点类型不一致、InputMap 少登记一个动作、资源缓存是旧的,
+# 这些都只在 Godot 里才炸(历史反复踩过)。所以最后一关必须真跑 Godot。
+# 默认两层(都离线生成,产物写在 _dist,不碰已入库的 examples):
+#   5a  2D 示例    节点图 -> GDScript -> 导入编译 -> 真跑 -> 模拟按键行为断言
+#   5b  平台跳跃   重力/落地、相机、吃金币加分、HUD、存档落盘
+# 加 -Deep 再跑 5c 动画系统六层验证(要真 Blender,耗时长)。
+$godotOk = $true
+$godotSkipped = $false
+$godotRan = @()
+if ($SkipGodot) {
+    Step "5/6 跳过 Godot 端到端(-SkipGodot)"
+} else {
+    Step "5/6 Godot 端到端(2D 示例 + 平台跳跃)"
+    # 5a. 2D 示例:节点图 -> GDScript -> Godot 导入编译 -> 真跑 -> 行为断言
+    $r = Invoke-Verify -Script (Join-Path $Root "scripts\godot_verify.ps1") `
+        -CallArgs @("-Root", $Root, "-Godot", $Godot, "-OutDir", (Join-Path $dist "godot_e2e")) `
+        -OkMarker "GODOT_VERIFY=OK"
+    switch ($r.Status) {
+        "ok"    { $godotRan += "2D示例" }
+        "skip"  { $godotSkipped = $true }
+        default { $godotOk = $false }
+    }
+
+    # 5b. 平台跳跃:重力/落地、相机、吃金币加分、HUD、存档落盘
+    if (-not $godotSkipped) {
+        Write-Output ""
+        $r = Invoke-Verify -Script (Join-Path $Root "scripts\platformer_verify.ps1") `
+            -CallArgs @("-Root", $Root, "-Godot", $Godot, "-OutDir", (Join-Path $dist "platformer_e2e")) `
+            -OkMarker "PLATFORMER_VERIFY=OK"
+        switch ($r.Status) {
+            "ok"    { $godotRan += "平台跳跃" }
+            "skip"  { $godotSkipped = $true }
+            default { $godotOk = $false }
+        }
+    }
+
+    # 5c. 动画系统深层验证(仅 -Deep):6 层,含真 Blender 建图 + 真 Godot 跑探针,
+    #     耗时长且会重建 examples\demo_anim_tree,所以不放进默认门禁。
+    if ($Deep -and -not $godotSkipped) {
+        Write-Output ""
+        if (-not (Test-Path $Blender)) {
+            Write-Output "跳过动画深层验证:找不到 Blender"
+        } else {
+            Step "5c 动画系统深层验证(-Deep)"
+            $r = Invoke-Verify -Script (Join-Path $Root "scripts\verify_anim_system.ps1") `
+                -CallArgs @("-Root", $Root, "-Blender", $Blender) `
+                -OkMarker "ANIM_VERIFY=OK"
+            switch ($r.Status) {
+                "ok"    { $godotRan += "动画系统" }
+                default { $godotOk = $false }
+            }
+        }
+    }
+
+    # 5d. 曲线运镜 + 时间轴示例:先用真 Blender **重建**示例(导出产物会跟着
+    #     最新代码走),再用真 Godot 跑探针断言"现象"。
+    #     ── 为什么要重建(否则这一步是假绿)────────────────────────────
+    #     只检查仓库里那份已导出的工程的话,插件代码改了、示例没重导,
+    #     这一关照样绿 —— 等于没测。重建 + 跑探针才算端到端。
+    if (-not $godotSkipped) {
+        Write-Output ""
+        $demoDir = Join-Path $Root "examples\demo_curve"
+        $maker = Join-Path $Root "scripts\make_curve_demo.py"
+        if (-not (Test-Path $Blender)) {
+            Write-Output "跳过曲线示例:找不到 Blender(示例要先重建才能真跑)"
+        } elseif (-not (Test-Path $demoDir)) {
+            Write-Output "跳过曲线示例:还没有 examples\demo_curve"
+        } else {
+            $buildLog = & $Blender -b --python $maker 2>&1 | Out-String
+            if ($buildLog -notmatch "已保存") {
+                Write-Host "---- 重建示例失败,尾部 20 行 ----"
+                ($buildLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                    Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+                $godotOk = $false
+            } else {
+                $checker = Join-Path $Root "scripts\check_curve_demo.py"
+                $log = & python $checker --godot $Godot 2>&1 | Out-String
+                $log -split "`n" | Where-Object { $_ -match "^(DEMO|CHECK_CURVE_DEMO|跳过|✗)" } |
+                    ForEach-Object { Write-Host $_.TrimEnd() }
+                if ($log -match "CHECK_CURVE_DEMO=OK") {
+                    $godotRan += "曲线示例"
+                } elseif ($log -match "跳过") {
+                    Write-Output "（曲线示例跳过）"
+                } else {
+                    $godotOk = $false
+                }
+            }
+        }
+    }
+
+    # 5e. 小游戏示例(第二十四轮):同样"先重建再跑探针"。
+    #     这一关测的是**整条链路**:角色移动 / 触发区拾取 / 粒子 / 时间轴巡逻 /
+    #     HUD / 受伤 / 胜负 / 按 R 重开 —— 真 Godot 里把这一关玩一遍。
+    if (-not $godotSkipped) {
+        Write-Output ""
+        $gameDir = Join-Path $Root "examples\demo_game"
+        $gameMaker = Join-Path $Root "scripts\make_game_demo.py"
+        if (-not (Test-Path $Blender)) {
+            Write-Output "跳过小游戏示例:找不到 Blender(示例要先重建才能真跑)"
+        } elseif (-not (Test-Path $gameDir)) {
+            Write-Output "跳过小游戏示例:还没有 examples\demo_game"
+        } else {
+            $gameLog = & $Blender -b --python $gameMaker 2>&1 | Out-String
+            if ($gameLog -notmatch "已保存") {
+                Write-Host "---- 重建小游戏示例失败,尾部 20 行 ----"
+                ($gameLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                    Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+                $godotOk = $false
+            } else {
+                $gameChecker = Join-Path $Root "scripts\check_game_demo.py"
+                $gameOut = & python $gameChecker --godot $Godot 2>&1 | Out-String
+                $gameOut -split "`n" | Where-Object { $_ -match "^(DEMO|CHECK_GAME_DEMO|跳过|✗)" } |
+                    ForEach-Object { Write-Host $_.TrimEnd() }
+                if ($gameOut -match "CHECK_GAME_DEMO=OK") {
+                    $godotRan += "小游戏示例"
+                } elseif ($gameOut -match "跳过") {
+                    Write-Output "（小游戏示例跳过）"
+                } else {
+                    $godotOk = $false
+                }
+            }
+        }
+
+        # 5f. 物理测试场(第二十八轮):斜坡 / 台阶 / 对角方块 / 推箱子 /
+        #     多碰撞体 / 窄缝 / 薄墙 —— 真 Godot 里把角色一个个工位走一遍。
+        Write-Output ""
+        $physDir = Join-Path $Root "examples\demo_physics"
+        $physMaker = Join-Path $Root "scripts\make_physics_demo.py"
+        if (-not (Test-Path $Blender)) {
+            Write-Output "跳过物理测试场:找不到 Blender(示例要先重建才能真跑)"
+        } elseif (-not (Test-Path $physDir)) {
+            Write-Output "跳过物理测试场:还没有 examples\demo_physics"
+        } else {
+            $physLog = & $Blender -b --python $physMaker 2>&1 | Out-String
+            if ($physLog -notmatch "已保存") {
+                Write-Host "---- 重建物理测试场失败,尾部 20 行 ----"
+                ($physLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                    Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+                $godotOk = $false
+            } else {
+                $physChecker = Join-Path $Root "scripts\check_physics_demo.py"
+                $physOut = & python $physChecker --godot $Godot 2>&1 | Out-String
+                $physOut -split "`n" | Where-Object { $_ -match "^(PHYS|CHECK_PHYSICS_DEMO|跳过|✗)" } |
+                    ForEach-Object { Write-Host $_.TrimEnd() }
+                if ($physOut -match "CHECK_PHYSICS_DEMO=OK") {
+                    $godotRan += "物理测试场"
+                } elseif ($physOut -match "跳过") {
+                    Write-Output "（物理测试场跳过）"
+                } else {
+                    $godotOk = $false
+                }
+            }
+        }
+    }
+
+    if ($godotSkipped) {
+        Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
+    } elseif ($godotOk) {
+        Write-Output ("Godot 端到端通过: " + ($godotRan -join " / "))
+    }
+}
+
+# ---------- 6. 汇总 ----------
+Step "6/6 结果"
 Remove-TestRepo
-if ($smokeOk) {
-    Write-Output "全部通过"
+if ($smokeOk -and $godotOk) {
+    if ($godotSkipped) {
+        Write-Output "全部通过（Godot 端到端未跑:本机找不到 Godot）"
+    } else {
+        Write-Output ("全部通过（含 Godot 端到端: " + ($godotRan -join " / ") + "）")
+    }
     Write-Output "（测试仓库已注销,Blender 里不会留下多余的插件条目）"
     exit 0
 } else {
-    Write-Output "冒烟测试未通过"
-    Write-Output "--- 失败详情(尾部 60 行) ---"
-    ($text -split "`n") | Select-Object -Last 60 | ForEach-Object { Write-Output $_ }
+    if (-not $smokeOk) {
+        Write-Output "冒烟测试未通过"
+        Write-Output "--- 失败详情(尾部 60 行) ---"
+        ($text -split "`n") | Select-Object -Last 60 | ForEach-Object { Write-Output $_ }
+    }
+    if (-not $godotOk) {
+        Write-Output "Godot 端到端未通过（上方已打印失败脚本的尾部输出）"
+    }
     exit 1
 }

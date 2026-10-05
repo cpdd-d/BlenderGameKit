@@ -598,4 +598,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # 允许把示例生成到别处:platformer_verify.ps1 的门禁跑在
+    # _dist\platformer_e2e,免得每跑一次测试就把 examples/demo_platformer
+    # 这批**已入库**的文件改一遍。
+    if len(sys.argv) > 1:
+        OUT_DIR = os.path.abspath(sys.argv[1])
+        ART_DIR = os.path.join(OUT_DIR, "art")
+        SCRIPT_DIR = os.path.join(OUT_DIR, "scripts")
     sys.exit(main())

@@ -1,0 +1,31 @@
+# 离线测试入口与环境声明(GPT 审查第 9 条 / 用户 2026-10-04)。
+#
+# 这个仓库不是一个 pip 安装的库 —— 插件本体由 Blender 的扩展构建命令打包
+# (见 scripts/build_and_test.ps1),所以**不声明 build-system**,避免让人以为
+# 可以 `pip install`。这里只做两件事:
+#   1. 声明项目元信息与开发期依赖;
+#   2. 给 pytest 一份配置,让离线单测和需要 Blender / Godot 的集成测试
+#      分层跑(集成测试默认不选中,见下方 markers)。
+
+[project]
+name = "blendergamekit"
+version = "0.1.0"
+description = "在 Blender 里用中文节点图做游戏逻辑,一键导出 Godot 4 GDScript"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+# 离线单测只需要 pytest;真机集成测试另外需要 Blender / Godot 可执行文件
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# 集成测试(需要真实 Blender / Godot)用 marker 标出来,默认只跑离线单测:
+#     pytest                      # 只跑离线(unittest 风格的回归测试)
+#     pytest -m blender           # 只跑需要 Blender 的
+#     pytest -m "not blender and not godot"   # 显式排除集成测试
+addopts = "-m 'not blender and not godot'"
+markers = [
+    "blender: 需要真实 Blender 可执行文件的集成测试",
+    "godot: 需要真实 Godot 可执行文件的集成测试",
+]

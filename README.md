@@ -103,16 +103,36 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 ## 目录结构
 
 ```
+pyproject.toml                  pytest 配置与开发依赖(离线测试入口)
 BlenderGameKit/                 插件本体(这个文件夹就是要安装的东西)
 ├── __init__.py                 注册入口(按依赖顺序注册所有类)
 ├── blender_manifest.toml       Blender 扩展清单
 ├── gk_sockets.py               引脚类型:执行流 / 任意值 + 内置类型语义表
 ├── gk_log.py                   日志(面板里能看最近 200 条)
-├── codegen.py                  ★ 节点图 → GDScript 代码生成器
-├── exporter.py                 脚本落盘、Godot 工程骨架
+├── models.py                   共享数据模型:ExportSettings / CodegenResult / Diagnostic
+├── paths.py                    路径工具(纯标准库):res:// 归一化、目录穿越防护
+├── blender_adapter.py          Blender 适配层:集中 bpy 访问(.blend 路径 / 当前场景)
+├── exporter.py                 脚本落盘、Godot 工程骨架(事务式导出,失败整体回滚)
+├── codegen/                    ★ 节点图 → GDScript 代码生成器(按领域拆分)
+│   ├── literals.py             字面量 / 类型名 / 常量工具
+│   ├── registry.py             装饰器 + 注册表 + 派发(expr / stmt / multi_output)
+│   ├── expressions.py          非动画表达式发射器(数学 / 逻辑 / 输入 / 骨骼……)
+│   ├── statements.py           非动画语句发射器(运动 / 属性 / 射线 / 流程控制……)
+│   ├── animation.py            动画播放 / 状态机 / 动画树 / 动画变量
+│   ├── camera.py               相机套件(切换 / 机位 / 弹簧臂 / 路径 / 跟随)
+│   ├── services.py             音频 / 存档 / 屏幕 UI 与滤镜
+│   ├── context.py              CodegenAbort / _Statements / GenContext
+│   ├── generator.py            Generator 主体(扫描 → 组装)
+│   ├── validation.py           导出前静态校验与告警
+│   └── api.py                  对外入口(generate / generate_result / required_base_class)
 ├── asset_export.py             ★ 资产导出:glTF + 卡通材质 + 场景装配
 ├── npr_preview.py              ★ Blender 端 NPR 预览材质(EEVEE 里调卡通参数)
-├── project.py                  ★ 一个 .blend 一个 Godot 项目:路径解析 / 建骨架 / 启动 Godot
+├── project/                    ★ 一个 .blend 一个 Godot 项目
+│   ├── layout.py               路径解析 / 建骨架(art、scripts、scenes…)
+│   ├── godot.py                引擎定位与进程管理
+│   ├── input_map.py            把用到的输入动作写进 project.godot
+│   ├── scene.py                主场景读写
+│   └── metadata.py             生成标记(.gk_generated)
 ├── properties.py               场景级导出设置(2D/3D、基类、类名…)
 ├── operator_io.py              算子:导出脚本 / 导出模型 / NPR 预览 / 素材导出
 ├── ui.py                       侧栏面板、添加节点菜单、节点引用选择器
@@ -122,7 +142,10 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 │   └── gk_toon_2d.gdshader     2D 精灵:伪造光照 / 边缘高光 / 受击闪白
 └── nodes/
     ├── node_base.py            节点基类、声明式属性、桩环境支持
-    └── nodes.py                ★ 128 个节点的定义
+    ├── nodes.py                门面:合并下面各领域模块的命名空间
+    └── _events.py / _flow.py / _movement.py / _animation.py /
+        _instances.py / _variables.py / _input.py / _expressions.py /
+        _display.py / _containers.py       ★ 128 个节点按领域拆分
 
 docs/
 ├── Blender与Godot互通.md       资产管线 + 脚本搭载 + C++ GDExtension
@@ -130,8 +153,8 @@ docs/
 
 tests/
 ├── gk_stub.py                  离线 bpy 打桩(让 codegen 脱离 Blender 可测)
-├── test_codegen.py             295 个回归测试,秒级跑完,不需要 Blender
-├── blender_smoke.py            59 项冒烟测试,在真实 Blender 里跑(含菜单结构与按键捕获)
+├── test_codegen.py             321 个回归测试,秒级跑完,不需要 Blender
+├── blender_smoke.py            63 项冒烟测试,在真实 Blender 里跑(含菜单结构、按键捕获与插件偏好设置注册/读取)
 ├── blender_anim_tree.py        ★ 动画/输入/相机/骨骼(真 Blender 建图导出,59 项)
 ├── bad_script_fixture.gd       故意写错的 GDScript,验证检查器真的能抓错
 ├── blender_asset_export.py     20 项资产导出测试(真的导出 .glb 并检查)
@@ -147,13 +170,13 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          构建 + 重装 + 冒烟测试
+├── build_and_test.ps1          一键门禁:构建 + 重装 + 63 项冒烟 + Godot 端到端(2D 示例 + 平台跳跃;-Deep 再加动画六层)
 ├── verify_anim_system.ps1      ★ 动画系统六层验证(离线/真 Blender/示例/Godot 解析/**真跑 1.5 秒**/反例)
 ├── check_gdscript.ps1          ★ 把生成的 .gd 交给真 Godot 解析(带反例)
 ├── make_anim_example.py        ★ 生成动画状态机示例 .blend
 ├── check_anim_example.py       ★ 示例工程自查(22 项,含按键→Godot 映射)
 ├── make_anim_runtime_probe.py  ★ 把生成的脚本包成最小 Godot 工程真跑(解析过≠跑得起来;含弹簧臂不穿墙)
-├── godot_verify.ps1            用 Godot 真实编译并运行 2D 示例
+├── godot_verify.ps1            ★ 用 Godot 真实编译并运行 2D 示例(导入→真跑→行为断言);-OutDir 可输出到隔离目录
 ├── verify_shaders.py           ★ 在真实 Godot 里编译着色器,把错误带出来
 ├── render_shots.ps1            扫光出图(验证面部阴影 SDF 必需)
 ├── verify_jitter.ps1           ★ 手绘描边动画 A/B 验证(抓帧做像素差分)
@@ -520,11 +543,19 @@ NPR demo 的渲染结果：
 # 1. 离线回归测试(秒级,不需要 Blender)—— 改 codegen 后必跑
 python tests\test_codegen.py
 
+# 1b. 也可以交给 pytest(pyproject.toml 里配好了分层:
+#     默认只跑离线;-m blender / -m godot 单独跑需要真引擎的集成测试)
+pip install pytest && python -m pytest
+
 # 2. 着色器编译校验 —— 改 .gdshader 后必跑
 python scripts\verify_shaders.py
 
-# 3. 构建 + 装进 Blender + 59 项冒烟测试 —— 改节点/UI 后必跑
+# 3. 一键门禁:构建 + 装进 Blender + 63 项冒烟 + Godot 端到端 —— 改节点/UI/生成代码后必跑
+#    端到端默认跑两层(2D 示例、平台跳跃),产物写在 _dist(不动 examples);
+#    加 -Deep 再跑动画系统六层验证(要真 Blender、会重建 examples\demo_anim_tree,较慢)
+#    本机没装 Godot 时自动跳过;加 -SkipGodot 可显式跳过
 powershell -File scripts\build_and_test.ps1
+powershell -File scripts\build_and_test.ps1 -Deep
 
 # 4. 资产导出测试(真的导出 .glb 并检查装配结果)
 blender -b --python tests\blender_asset_export.py

@@ -7,9 +7,11 @@ import sys
 import time
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
+                       StringProperty)
 
-from . import asset_export, codegen, exporter, gk_log, npr_preview, project
+from . import (asset_export, codegen, curve_assets, export_report, exporter,
+               gk_log, npr_preview, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -43,6 +45,14 @@ def remember_export(scene, result):
     """
     LAST_EXPORT.clear()
     LAST_EXPORT.update(result)
+    # ── 顺带记一份**结构化报告**(用户 2026-10-05 第二十三轮)──────────
+    # 面板上那块"上次导出"以前只列前 4 条、还把诊断压成一行(附在消息里的
+    # "怎么修"全看不见)。报告在 export_report 里统一做:排序、截断、
+    # 带 hint / node_name 的清单 + 可复制成文本。
+    try:
+        export_report.record(scene, result)
+    except Exception as exc:                              # noqa: BLE001
+        gk_log.warn(f"导出报告记录失败(不影响导出): {exc}")
     if scene is None:
         return
     try:
@@ -135,6 +145,15 @@ def _tree_of(operator, context):
     active = getattr(getattr(context, "space_data", None), "edit_tree", None)
     if active is not None and active in candidates:
         return active
+    # ── 有**选中节点**的那棵树优先(用户 2026-10-05 第十七轮)─────────
+    # 『折叠成函数』这类"对选中节点动手"的算子必须拿到**选中节点所在的**
+    # 那棵树:有两棵树时,上一条"只有一棵才敢用"的规矩会让它直接报错 ——
+    # 而用户明明就选中了节点(无头测试里也在跑同样的路径)。
+    with_selection = [group for group in candidates
+                      if any(getattr(node, "select", False)
+                             for node in group.nodes)]
+    if len(with_selection) == 1:
+        return with_selection[0]
     if len(candidates) == 1:
         return candidates[0]
 
@@ -300,6 +319,172 @@ class GK_OT_AddNode(bpy.types.Operator):
         return context.window_manager.invoke_search_popup(self)
 
 
+# ==========================================================================
+# 注释框(UE 蓝图的 Comment Box)
+# ==========================================================================
+# 用户要「节点内联注释」—— 蓝图里那个能**框住一组节点**、带标题和颜色、
+# 拖动框会带着整组节点走的 Comment Box。Blender 里对应的就是原生
+# `NodeFrame`:它天生支持认子节点(parent)、有 label、能自定义颜色,
+# 拖框即拖整组。所以这里不重造轮子,而是给一个"一键建好"的入口:
+# 选中节点 -> 点『注释框』-> 自动算包围盒、建 Frame、认子、上色。
+#
+# ── 为什么不直接调 Blender 自带的 `node.join_in_new_frame` ──────────
+# 它依赖节点编辑器的 UI 上下文(area/space_data),在无头/测试环境里
+# 调不动;而且它不带我们想要的默认标题与配色。自己算包围盒更可控,
+# 也能把"算包围盒"这段单独拿出来测。
+def _node_bounds(node):
+    """返回节点的 (左上角 x, 左上角 y, 宽, 高)。
+
+    Blender 的 node.location 是**左上角**,高度向下延伸(y 减小)。
+    """
+    wx, wy = node.location[0], node.location[1]
+    width, height = getattr(node, "dimensions", (0.0, 0.0))
+    if not width or width < 1.0:
+        width = float(getattr(node, "width", 0.0) or 0.0) or 160.0
+    if not height or height < 1.0:
+        # 还没画过时 dimensions 是 (0,0)(无头/刚建的节点) —— 按引脚数估个高度
+        count = (len(getattr(node, "inputs", ()) or ())
+                 + len(getattr(node, "outputs", ()) or ()))
+        height = 60.0 + 22.0 * count
+    return wx, wy, float(width), float(height)
+
+
+def comment_box_rect(nodes):
+    """若干节点的包围盒 -> 注释框的 (location, width, height)。纯函数,可离线测。"""
+    left = right = top = bottom = None
+    for node in nodes:
+        wx, wy, width, height = _node_bounds(node)
+        n_left, n_right = wx, wx + width
+        n_top, n_bottom = wy, wy - height
+        left = n_left if left is None else min(left, n_left)
+        right = n_right if right is None else max(right, n_right)
+        top = n_top if top is None else max(top, n_top)
+        bottom = n_bottom if bottom is None else min(bottom, n_bottom)
+    pad, bar = 24.0, 30.0
+    location = (left - pad, top + pad + bar)
+    return location, (right - left) + 2.0 * pad, (top - bottom) + 2.0 * pad + bar
+
+
+class GK_OT_AddCommentBox(bpy.types.Operator):
+    """把选中的节点框进一个注释框(UE 蓝图的 Comment Box)。
+
+    不生成任何代码 —— 它只是节点图上的排版/备注工具。
+    """
+
+    bl_idname = "gk.add_comment_box"
+    bl_label = "注释框"
+    bl_description = ("把选中的节点框起来:可写标题、改颜色,拖动框会带着节点一起走。"
+                      "不生成任何代码")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _tree_of(self, context)
+        if tree is None:
+            _report(self, "ERROR", "请先打开『游戏逻辑』或『游戏动画』节点图")
+            return {"CANCELLED"}
+        picked = [node for node in tree.nodes
+                  if getattr(node, "select", False)
+                  and getattr(node, "bl_idname", "") != "NodeFrame"]
+        if not picked:
+            _report(self, "ERROR", "先选中要框住的节点,再点『注释框』")
+            return {"CANCELLED"}
+
+        location, width, height = comment_box_rect(picked)
+        frame = tree.nodes.new("NodeFrame")
+        # ── 顺序要紧:先定好框的位置,再认子 ──────────────────────────
+        # Blender 在 `node.parent = frame` 时会把节点的 location
+        # **自动换算成相对坐标**(实测:100,-50 的节点、框在 60,30,
+        # 认子后自动变成 40,-80)。所以框的位置必须在认子**之前**定死,
+        # 否则子节点会被算歪。
+        frame.location = location
+        frame.width = width
+        frame.height = height
+        frame.use_custom_color = True
+        frame.color = (0.16, 0.30, 0.45)
+        frame.label = "注释"
+        frame.label_size = 16
+        for node in picked:
+            node.parent = frame
+
+        for other in tree.nodes:
+            other.select = False
+        frame.select = True
+        tree.nodes.active = frame
+        _report(self, "INFO",
+                f"已把 {len(picked)} 个节点框进注释框。按 F2 改标题,侧栏可改颜色")
+        return {"FINISHED"}
+
+
+class GK_OT_VarFindRefs(bpy.types.Operator):
+    """选中图里所有引用某个变量的节点(蓝图 Find References)。"""
+
+    bl_idname = "gk.var_find_refs"
+    bl_label = "查找引用"
+    bl_description = "选中这张图里所有读到/写到这个变量的节点"
+    bl_options = {"REGISTER", "UNDO"}
+
+    var_name: StringProperty(name="变量名", default="")
+
+    def execute(self, context):
+        tree = _tree_of(self, context)
+        if tree is None:
+            return {"CANCELLED"}
+        hits = props.nodes_for_variable(tree, self.var_name)
+        if not hits:
+            _report(self, "INFO", f"图里没有节点引用『{self.var_name}』")
+            return {"CANCELLED"}
+        for node in tree.nodes:
+            node.select = False
+        for node in hits:
+            node.select = True
+        tree.nodes.active = hits[0]
+        # 顺手把镜头带到选中的节点上,不然高亮了也不一定在视野里。
+        # 没有合适的区域时(view_selected 找不到节点编辑器)就算了。
+        try:
+            bpy.ops.node.view_selected()
+        except Exception:
+            pass
+        _report(self, "INFO", f"『{self.var_name}』被 {len(hits)} 个节点引用")
+        return {"FINISHED"}
+
+
+class GK_OT_VarMakeNode(bpy.types.Operator):
+    """把变量拉到图里 —— 生成『变量_读取』或『变量_设置』节点。"""
+
+    bl_idname = "gk.var_make_node"
+    bl_label = "把变量拉进图"
+    bl_description = "生成一个读/写这个变量的节点(放在节点编辑器的光标位置)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    var_name: StringProperty(name="变量名", default="")
+    make_set: BoolProperty(name="是设置", default=False)
+
+    def execute(self, context):
+        tree = _tree_of(self, context)
+        if tree is None:
+            return {"CANCELLED"}
+        name = str(self.var_name or "").strip()
+        # 『取』必须有个变量名;『设』留空则用节点自带的默认名("health"),
+        # 相当于"新建一个变量"(面板空的时候给的那颗按钮)。
+        if not name and not self.make_set:
+            _report(self, "ERROR", "先给变量起个名字")
+            return {"CANCELLED"}
+        space = getattr(context, "space_data", None)
+        location = getattr(space, "cursor_location", None) or (0.0, 0.0)
+        node = tree.nodes.new("GKNodeSetVar" if self.make_set else "GKNodeGetVar")
+        node.location = location
+        if name:
+            node.gk_var_name = name
+        for other in tree.nodes:
+            other.select = False
+        node.select = True
+        tree.nodes.active = node
+        _report(self, "INFO",
+                f"放了{'设置' if self.make_set else '读取'}变量"
+                f"『{name or getattr(node, 'gk_var_name', '')}』的节点")
+        return {"FINISHED"}
+
+
 class GK_OT_StarterGraph(bpy.types.Operator):
     """在当前节点树里搭一个可运行的最小示例。
 
@@ -335,6 +520,106 @@ class GK_OT_StarterGraph(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_CharacterPreset(bpy.types.Operator):
+    """一键生成第三人称角色(预设)。
+
+    ── 为什么要有它(用户 2026-10-04 第 6 条)────────────────────────
+    用户原话:"把现有 输入 / 移动 / 动画 / 相机 节点封装成'一键生成第三人称
+    角色'模板,不改底层节点"。所以这里**只建节点 + 连线 + 填参数** ——
+    建出来的是一张普通节点图,之后想怎么改都行;连线和参数取自
+    examples/demo_level 里那套已经跑通的手感(见 presets 模块)。
+
+    相机物体**不建**(用户确认:"只连图,相机我自己摆")—— 名字对上就行,
+    场景里没有同名相机时运行时本来就有兜底告警。
+    """
+
+    bl_idname = "gk.character_preset"
+    bl_label = "生成第三人称角色(预设)"
+    bl_description = ("新建两棵连好的图:角色逻辑(输入/移动/跳跃/相机)"
+                      " + 角色动作(待机/跑步/跳跃),并顺手把角色的物理类型"
+                      "与『脚本挂载目标』配好。相机物体自己摆,名字对上即可")
+    bl_options = {"REGISTER", "UNDO"}
+
+    character: StringProperty(
+        name="角色物体", default="",
+        description="留空 = 用当前选中的网格 / 已经挂了脚本的物体")
+    camera_side: StringProperty(name="跟随机位名", default="侧视机位",
+                                description="第三人称跟随机位(弹簧臂的主人)")
+    camera_top: StringProperty(name="俯瞰机位名", default="俯瞰机位",
+                               description="按 C 切过去的俯瞰机位")
+    move_speed: FloatProperty(name="移动速度(米/秒)", default=6.0,
+                              min=0.1, max=50.0)
+    jump_force: FloatProperty(name="跳跃强度", default=7.0, min=0.1, max=50.0)
+    sensitivity: FloatProperty(name="鼠标灵敏度(度/像素)", default=0.25,
+                               min=0.01, max=2.0)
+    arm_length: FloatProperty(name="弹簧臂长度", default=5.0, min=0.5, max=40.0)
+    arm_height: FloatProperty(name="杆子高度", default=1.4, min=0.0, max=10.0)
+    aim_pitch: FloatProperty(name="起始俯仰(度)", default=12.0,
+                             min=-89.0, max=89.0)
+    with_animation: BoolProperty(name="连动画状态机(待机/跑步/跳跃)",
+                                 default=True)
+    with_ports: BoolProperty(name="对外端口(位置 X/Y/Z + 在地面)",
+                             default=True)
+    with_god_camera: BoolProperty(name="打开场景的『上帝摄像机』开关",
+                                  default=True)
+
+    def invoke(self, context, event):
+        # 参数都摆在一个小对话框里 —— 一次性动作,不占侧栏
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "character")
+        box = layout.box()
+        box.label(text="机位(自己摆好,名字对上就行)", icon="CAMERA_DATA")
+        box.prop(self, "camera_side")
+        box.prop(self, "camera_top")
+        box = layout.box()
+        box.label(text="手感", icon="DRIVER")
+        box.prop(self, "move_speed")
+        box.prop(self, "jump_force")
+        box.prop(self, "sensitivity")
+        box.prop(self, "arm_length")
+        box.prop(self, "arm_height")
+        box.prop(self, "aim_pitch")
+        box = layout.box()
+        box.label(text="带什么", icon="CHECKBOX_HLT")
+        box.prop(self, "with_animation")
+        box.prop(self, "with_ports")
+        box.prop(self, "with_god_camera")
+
+    def execute(self, context):
+        from . import presets
+
+        scene = context.scene
+        character = presets.resolve_character(scene, self.character)
+        try:
+            logic_tree, _anim_tree, notes = presets.create_character_preset(
+                scene, character,
+                character=self.character,
+                camera_side=self.camera_side, camera_top=self.camera_top,
+                move_speed=self.move_speed, jump_force=self.jump_force,
+                sensitivity=self.sensitivity, arm_length=self.arm_length,
+                arm_height=self.arm_height, aim_pitch=self.aim_pitch,
+                with_animation=self.with_animation,
+                with_ports=self.with_ports,
+                with_god_camera=self.with_god_camera)
+        except Exception as exc:                          # noqa: BLE001
+            _report(self, "ERROR", f"生成失败:{type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
+        for note in notes:
+            print(f"[BlenderGameKit] {note}")
+        _report(self, "INFO",
+                f"预设已生成『{logic_tree.name}』—— 相机名对不上时在 "
+                f"『弹簧臂 / 相机_切换』节点里改一下即可")
+        # 顺手切到新那张图,让用户立刻看到成果(没有节点编辑器就算了)
+        try:
+            bpy.ops.gk.focus_tree(tree_name=logic_tree.name)
+        except Exception:                                 # noqa: BLE001
+            pass
+        return {"FINISHED"}
+
+
 def _regenerate_one_preview(obj):
     """只重建某个物体的碰撞线框(实时预览用)。
 
@@ -348,6 +633,9 @@ def _regenerate_one_preview(obj):
     if scene is None:
         return False
 
+    # 碰撞块改了参数 -> 要刷新的是**宿主**那条线框(块的形状画在宿主身上)
+    if asset_export.is_collision_piece(obj):
+        obj = asset_export.collision_owner(obj) or obj
     physics = getattr(obj, "gk_physics", None)
     is_3d = str(getattr(scene.gk_settings, "dimension", "3")) != "2"
 
@@ -434,7 +722,11 @@ class GK_OT_ShowCollision(bpy.types.Operator):
         is_3d = str(getattr(context.scene.gk_settings, "dimension", "3")) != "2"
 
         if self.target_all:
-            objects = [obj for obj in context.scene.objects if obj.type == "MESH"]
+            # 子物体碰撞块不单独显示 —— 它们的形状跟着宿主一起画
+            # (分开画会重叠两份线框,看起来像没对齐)
+            objects = [obj for obj in context.scene.objects
+                       if obj.type == "MESH"
+                       and not asset_export.is_collision_piece(obj)]
         else:
             # ⚠ 只认**活动对象**(属性面板里正在看的那个),不做任何退让。
             #
@@ -460,7 +752,11 @@ class GK_OT_ShowCollision(bpy.types.Operator):
                         f"再点『显示这一个』"
                         f"（已顺手清掉旧的碰撞线框）")
                 return {"CANCELLED"}
-            objects = [active]
+            # 预览碰撞块 = 预览它的**宿主**(整组一起看,才知道头/身/腿拼得对不对)
+            root = active
+            if asset_export.is_collision_piece(active):
+                root = asset_export.collision_owner(active) or active
+            objects = [root]
 
         made = []
         skipped = 0
@@ -556,6 +852,54 @@ class GK_OT_HideCollision(bpy.types.Operator):
             return {"CANCELLED"}
         removed = _remove_previews(context.scene)
         _report(self, "INFO", f"已清除 {removed} 个碰撞线框")
+        return {"FINISHED"}
+
+
+class GK_OT_PreviewColliders(bpy.types.Operator):
+    """导出前预览碰撞体:把**这次导出会生成**的全部碰撞体显示成线框。"""
+
+    bl_idname = "gk.preview_colliders"
+    bl_label = "导出前预览碰撞体"
+    bl_description = ("把这次导出会生成的所有碰撞体显示成线框"
+                      "(只显示、不会导出);看一眼有没有漏设 / 尺寸不对")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        if context.scene is None:
+            return {"CANCELLED"}
+        # 先清干净再重建,反复点不会叠出残留
+        _remove_previews(context.scene)
+        is_3d = str(getattr(context.scene.gk_settings, "dimension", "3")) != "2"
+
+        made = 0
+        shape_total = 0
+        for obj in context.scene.objects:
+            if getattr(obj, "type", "") != "MESH":
+                continue
+            # 碰撞块不单独画:它们的形状跟着宿主一起显示(和导出结构一致)
+            if asset_export.is_collision_piece(obj):
+                continue
+            preview = asset_export.collision_preview_mesh(
+                obj, is_3d, getattr(obj, "gk_physics", None))
+            if preview is None:
+                continue
+            _make_preview_object(context, obj, preview, is_3d)
+            made += 1
+            # 数准实际会生成的形状(形状设成『无』的块不算)
+            for piece in asset_export.collision_pieces(obj):
+                if asset_export.build_collision(
+                        piece, is_3d, getattr(piece, "gk_physics", None)):
+                    shape_total += 1
+        shape_total += made
+
+        if not made:
+            _report(self, "WARNING",
+                    "没有可预览的碰撞体(碰撞形状是不是都设成了『无』?)")
+            return {"FINISHED"}
+        _report(self, "INFO",
+                f"这次导出会生成 {shape_total} 个碰撞形状"
+                f"(分布在 {made} 个物体上);线框只显示、不会导出。"
+                f"看完点『隐藏碰撞体』清理")
         return {"FINISHED"}
 
 
@@ -781,6 +1125,86 @@ class GK_OT_Export(bpy.types.Operator):
                    + (f"，{len(result['warnings'])} 条告警" if result["warnings"] else ""))
         _report(self, "INFO", message)
         return {"FINISHED"}
+
+
+class GK_OT_ReportCopy(bpy.types.Operator):
+    """把『上次导出报告』整份复制成文本(剪贴板 + 文本编辑器 + 控制台)。
+
+    用户 2026-10-05 第二十三轮:"导出报告可视化"。出问题时他要发出来,
+    所以三处都给:剪贴板(直接粘)、文本编辑器(长的能慢慢看)、
+    控制台(无头 / 剪贴板不可用时靠它)。
+    """
+
+    bl_idname = "gk.export_report_copy"
+    bl_label = "复制导出报告"
+    bl_description = ("把上次导出的报告(错误 / 警告 / 怎么修)复制成纯文本 —— "
+                      "直接粘出来就能发")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        report = export_report.load(getattr(context, "scene", None))
+        text = export_report.report_text(report)
+        copied = False
+        try:
+            context.window_manager.clipboard = text
+            copied = True
+        except Exception:                                 # noqa: BLE001
+            pass
+        _open_in_text_editor(context, text, "导出报告")
+        print(text)
+        self.report({"INFO"}, "导出报告已复制到剪贴板(也放进文本编辑器)"
+                    if copied else "导出报告已打印到控制台(剪贴板不可用)")
+        return {"FINISHED"}
+
+
+class GK_OT_ReportFocus(bpy.types.Operator):
+    """跳到报告里那条问题说的节点(选中 + 视图定位)。"""
+
+    bl_idname = "gk.export_report_focus"
+    bl_label = "定位到出问题的节点"
+    bl_description = "在节点编辑器里选中并聚焦报告里提到的那个节点"
+    bl_options = {"REGISTER"}
+
+    node_name: StringProperty(name="节点名", default="")
+
+    def execute(self, context):
+        wanted = str(self.node_name or "").strip()
+        if not wanted:
+            self.report({"WARNING"}, "报告里这条没说节点名")
+            return {"CANCELLED"}
+        # ── 在哪张图里找 ────────────────────────────────────────────────
+        # 先看用户正开着的那张,找不到就在**所有**游戏逻辑图里找 ——
+        # 报告可能是上一次会话导的,那时开着的图不一定是现在这张。
+        # 比较用**名字**(Blender 的 ID 包装对象别拿 in / == 当可靠判断)。
+        trees = []
+        current = _tree_of(self, context)
+        if current is not None:
+            trees.append(current)
+        seen = {tree.name for tree in trees}
+        for group in bpy.data.node_groups:
+            if group.name in seen:
+                continue
+            if getattr(group, "bl_idname", "") != "GKGameLogicTree":
+                continue
+            trees.append(group)
+        for tree in trees:
+            node = tree.nodes.get(wanted)
+            if node is None:
+                continue
+            for other in tree.nodes:
+                other.select = False
+            node.select = True
+            tree.nodes.active = node
+            try:
+                bpy.ops.node.view_selected()
+            except Exception:                             # noqa: BLE001
+                pass          # 无头 / 不在节点编辑器里:选中就够了
+            self.report({"INFO"}, f"已定位到节点『{wanted}』")
+            return {"FINISHED"}
+        self.report({"WARNING"},
+                    f"图里找不到节点『{wanted}』—— 可能改名或删掉了"
+                    f"(报告是那次导出时记的)")
+        return {"CANCELLED"}
 
 
 class GK_OT_Preview(bpy.types.Operator):
@@ -1024,15 +1448,80 @@ def curve_object_items(_self=None, _context=None):
     return items
 
 
+def asset_name_items(_self=None, _context=None):
+    """场景里所有**静态资产**的名字(给『资产_创建实例』挑资产用)。
+
+    顺带把"摆了几份"写进列表 —— 用户 2026-10-05:"给实例添加显示多少在
+    场景中这样的显示信息"。挑的时候一眼就知道这个资产现在场上有几份。
+    """
+    items = []
+    try:
+        from . import asset_export
+        assets = asset_export.collect_assets(bpy.context.scene)
+    except Exception:                                     # noqa: BLE001
+        assets = {}
+    for name in sorted(assets):
+        entry = assets[name]
+        count = len(entry.get("members") or [])
+        note = f"场景里共 {count} 份"
+        if entry.get("source") is None:
+            note += "(⚠ 没有本体:先取消一份的『作为实例』)"
+        items.append((name, f"{name}({count} 份)", note, "ASSET_MANAGER", 0))
+    if not items:
+        items.append(("", "(还没有资产)",
+                      "选中模型 -> 『游戏物理』面板 -> 填『资产名』",
+                      "ERROR", 0))
+    return items
+
+
+class GK_OT_PickAsset(bpy.types.Operator):
+    """挑一个静态资产(名字写回节点上的『资产名』)。"""
+
+    bl_idname = "gk.pick_asset"
+    bl_label = "选资产"
+    bl_description = "把场景里的一个静态资产填到这个节点上"
+    bl_property = "asset_name"      # 弹出搜索框时默认聚焦这个
+
+    node_name: StringProperty(name="节点", default="")
+    asset_prop: StringProperty(name="属性名", default="gk_asset")
+    asset_name: EnumProperty(name="资产", items=asset_name_items)
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        prop_name = self.asset_prop or "gk_asset"
+        if node is None or not hasattr(node, prop_name):
+            self.report({"WARNING"}, "没找到目标节点(或它没有该资产栏位)")
+            return {"CANCELLED"}
+        if not self.asset_name:
+            self.report({"WARNING"}, "场景里还没有静态资产 —— "
+                                     "选中模型,在『游戏物理』面板填『资产名』")
+            return {"CANCELLED"}
+        setattr(node, prop_name, self.asset_name)
+        self.report({"INFO"}, f"资产 -> {self.asset_name}")
+        return {"FINISHED"}
+
+
 class GK_OT_PickCurve(bpy.types.Operator):
-    """挑一条曲线当相机的运镜轨道(照 UPBGE 那种原生选择器的体验)。"""
+    """挑一条曲线(照 UPBGE 那种原生选择器的体验)。
+
+    ── 为什么带 `curve_prop`(用户 2026-10-04 第十二轮)──────────────
+    一个节点上可能有**好几条**曲线栏位:相机_切换 的过渡曲线 / 运镜轨道、
+    时间轴 的进度曲线 / 每条轨道的曲线 / 曲线轨道。按钮上写清楚写回哪个
+    属性,就不用为每个栏位各写一个算子。
+    """
 
     bl_idname = "gk.pick_curve"
     bl_label = "选曲线"
-    bl_description = "把这条曲线设为相机的运镜轨道"
+    bl_description = "把这条曲线设为当前栏位的曲线"
     bl_property = "curve_name"      # 弹出搜索框时默认聚焦这个
 
     node_name: StringProperty(name="节点", default="")
+    curve_prop: StringProperty(name="属性名", default="gk_curve")
     curve_name: EnumProperty(name="曲线", items=curve_object_items)
 
     def invoke(self, context, _event):
@@ -1042,15 +1531,276 @@ class GK_OT_PickCurve(bpy.types.Operator):
     def execute(self, context):
         tree = props.current_tree(context)
         node = tree.nodes.get(self.node_name) if tree is not None else None
-        if node is None or not hasattr(node, "gk_curve"):
-            self.report({"WARNING"}, "没找到目标节点")
+        prop_name = self.curve_prop or "gk_curve"
+        if node is None or not hasattr(node, prop_name):
+            self.report({"WARNING"}, "没找到目标节点(或这个节点没有该曲线栏位)")
             return {"CANCELLED"}
         if not self.curve_name:
             self.report({"WARNING"}, "场景里还没有曲线物体")
             return {"CANCELLED"}
-        node.gk_curve = self.curve_name
-        self.report({"INFO"}, f"运镜轨道 -> {self.curve_name}")
+        setattr(node, prop_name, self.curve_name)
+        self.report({"INFO"}, f"曲线 -> {self.curve_name}")
         return {"FINISHED"}
+
+
+class GK_OT_PreviewCameraPath(bpy.types.Operator):
+    """**真预览**:在视口里把相机沿曲线(或过渡)跑一遍。
+
+    ── 为什么要有它(用户 2026-10-04 第十二轮)──────────────────────
+    用户原话:"现在设计的这个预览不了 —— 想要做的曲线运动动画的话,
+    还要在节点里连一大堆,那么这个怎么设计更好"。
+    光在节点里填一个曲线名字,用户没法知道镜头到底怎么飞。所以这里
+    **模态**地把相机跑一遍,所见即所得。
+
+    三种情况都认:
+      * 『相机_路径』:沿它选的那条曲线走一遍(勾了循环就一直走)
+      * 『相机_切换』+『沿曲线运镜』:从当前机位沿轨道飞到目标机位
+      * 『相机_切换』只填了『过渡』:走直线,但**按你选的曲线缓动**
+
+    跑完 / 按 Esc 之后,相机的位置朝向、以及"当前活动相机"都会**还原**,
+    不会改坏场景,也不会产生任何游戏代码。
+    """
+
+    bl_idname = "gk.preview_camera_path"
+    bl_label = "预览运镜"
+    bl_description = "在视口里把相机沿曲线跑一遍(Esc 取消;跑完自动还原)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+
+    # ---- 工具 ----
+    @staticmethod
+    def _ease(preset, t):
+        """档位 -> 缓动比例(和 Godot 的 TRANS/EASE 用同一套公式)。"""
+        import math
+        t = max(0.0, min(1.0, t))
+        if preset == "EASE_IN":
+            return 1.0 - math.cos(t * math.pi / 2.0)
+        if preset == "EASE_OUT":
+            return math.sin(t * math.pi / 2.0)
+        if preset == "EASE_IN_OUT":
+            return -(math.cos(math.pi * t) - 1.0) / 2.0
+        if preset == "BACK":
+            c1, c3 = 1.70158, 2.70158
+            s = t - 1.0
+            return 1.0 + c3 * s * s * s + c1 * s * s
+        if preset == "BOUNCE":
+            n1, d1 = 7.5625, 2.75
+            if t < 1.0 / d1:
+                return n1 * t * t
+            if t < 2.0 / d1:
+                t -= 1.5 / d1
+                return n1 * t * t + 0.75
+            if t < 2.5 / d1:
+                t -= 2.25 / d1
+                return n1 * t * t + 0.9375
+            t -= 2.625 / d1
+            return n1 * t * t + 0.984375
+        return t
+
+    @staticmethod
+    def _sample_ease(points, t):
+        """一维曲线的 [0,1] 采样(点在采样时已经归一化过,见 curve_assets)。"""
+        if not points:
+            return t
+        t = max(0.0, min(1.0, t))
+        for index in range(len(points) - 1):
+            t0, v0 = points[index]
+            t1, v1 = points[index + 1]
+            if t <= t1 or index == len(points) - 2:
+                span = t1 - t0
+                ratio = 0.0 if span <= 1e-9 else (t - t0) / span
+                return v0 + (v1 - v0) * ratio
+        return points[-1][1]
+
+    @staticmethod
+    def _sample_path(points, t):
+        """三维轨道按**点数**等距插值(采样时已经等距,见 curve_assets)。"""
+        if len(points) < 2:
+            return points[0] if points else (0.0, 0.0, 0.0)
+        t = max(0.0, min(1.0, t))
+        scaled = t * (len(points) - 1)
+        index = int(scaled)
+        index = min(index, len(points) - 2)
+        ratio = scaled - index
+        a, b = points[index], points[index + 1]
+        return tuple(a[i] + (b[i] - a[i]) * ratio for i in range(3))
+
+    def _target_camera(self, scene, node):
+        """节点上选的相机(留空 = 场景的当前活动相机)。"""
+        raw = str(getattr(node, "gk_target", "") or "").strip()
+        objects = getattr(bpy.data, "objects", None)
+        if raw and raw != "__self__" and objects is not None:
+            found = objects.get(raw) if hasattr(objects, "get") else None
+            if found is not None and getattr(found, "type", "") == "CAMERA":
+                return found
+            if found is not None:
+                self.report({"WARNING"}, f"节点上的『相机』是 {raw},它不是相机物体")
+        return getattr(scene, "camera", None)
+
+    def invoke(self, context, _event):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        if node is None:
+            self.report({"WARNING"}, "没找到节点 —— 先在节点编辑器里选中它再点预览")
+            return {"CANCELLED"}
+        scene = context.scene
+        camera = self._target_camera(scene, node)
+        if camera is None:
+            self.report({"WARNING"}, "没有可预览的相机 —— 给节点选一台相机,"
+                                     "或者先设一台当前相机(小键盘 0)")
+            return {"CANCELLED"}
+
+        # ---- 这次要跑什么 ----
+        self._points = []
+        self._ease_points = []
+        self._preset = str(getattr(node, "gk_blend_trans", "LINEAR") or "LINEAR")
+        self._duration = 2.5
+        self._loop = False
+        self._look_forward = False
+        self._look_target = None
+        curve_name = ""
+        path_name = ""
+        if node.bl_idname == "GKNodeCameraPath":
+            curve_name = str(getattr(node, "gk_curve", "") or "").strip()
+            self._loop = bool(getattr(node, "gk_loop", False))
+            speed = float(getattr(node, "gk_speed", 0.0) or 0.0)
+            self._duration = 3.0 if speed <= 0.0 else min(
+                10.0, 100.0 / max(speed, 1.0))
+            mode = str(getattr(node, "gk_look_mode", "FORWARD"))
+            self._look_forward = mode == "FORWARD"
+            if mode == "TARGET":
+                raw = str(getattr(node, "gk_look_target", "") or "").strip()
+                objects = getattr(bpy.data, "objects", None)
+                if raw and objects is not None and hasattr(objects, "get"):
+                    self._look_target = objects.get(raw)
+        else:
+            # 相机_切换:运镜轨道优先;没有轨道就按"过渡秒数"走直线
+            if str(getattr(node, "gk_path_mode", "DIRECT")) == "CURVE":
+                path_name = str(getattr(node, "gk_path_curve", "") or "").strip()
+            blend = float(getattr(node, "gk_blend", 0.0) or 0.0)
+            self._duration = max(0.5, min(10.0, blend if blend > 0 else 2.5))
+            if self._preset == "CUSTOM":
+                self._ease_points = curve_assets.sample_ease_curve(
+                    str(getattr(node, "gk_blend_curve", "") or "").strip()) or []
+            self._path_mode = True
+        if path_name:
+            self._points = curve_assets.sample_path_points(path_name)
+            if len(self._points) < 2:
+                self.report({"WARNING"}, f"曲线『{path_name}』采不到点 —— "
+                                         f"确认它是曲线物体,而且有至少两个点")
+                return {"CANCELLED"}
+        elif curve_name:
+            self._points = curve_assets.sample_path_points(curve_name)
+            if len(self._points) < 2:
+                self.report({"WARNING"}, f"曲线『{curve_name}』采不到点 —— "
+                                         f"确认它是曲线物体,而且有至少两个点")
+                return {"CANCELLED"}
+        elif node.bl_idname == "GKNodeCameraPath":
+            self.report({"WARNING"}, "这条『相机_路径』还没选曲线 —— "
+                                     "点节点上的『选曲线』挑一条")
+            return {"CANCELLED"}
+
+        # ---- 起点:当前活动相机(和它不同的话) ----
+        self._scene = scene
+        self._camera = camera
+        self._saved_camera = getattr(scene, "camera", None)
+        self._saved_matrix = camera.matrix_world.copy()
+        self._start_matrix = None
+        self._start_quat = None
+        if node.bl_idname != "GKNodeCameraPath" and self._saved_camera is not None \
+                and self._saved_camera is not camera:
+            self._start_matrix = self._saved_camera.matrix_world.copy()
+        if self._start_matrix is not None:
+            self._start_quat = self._start_matrix.to_quaternion()
+        self._end_quat = camera.matrix_world.to_quaternion()
+        # 让视口切到这台相机 —— 否则用户什么都看不到
+        scene.camera = camera
+
+        self._start_time = time.monotonic()
+        self._hold_until = None
+        self._timer = context.window_manager.event_timer_add(
+            1.0 / 60.0, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        if context.area is not None:
+            context.area.header_text_set(
+                "预览运镜中…(按 Esc 取消;跑完自动还原相机位置)")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        import mathutils
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            self._restore(context)
+            return {"CANCELLED"}
+        if event.type != "TIMER":
+            return {"RUNNING_MODAL"}
+        elapsed = time.monotonic() - self._start_time
+        raw = elapsed / max(self._duration, 0.001)
+        if raw >= 1.0 and not self._loop:
+            # 到点后**停一下**让用户看清最后一帧,再还原(直接还原的话
+            # 最后一帧一闪而过,等于没看到终点机位)
+            if self._hold_until is None:
+                self._hold_until = time.monotonic() + 0.6
+            if time.monotonic() >= self._hold_until:
+                self._restore(context)
+                self.report({"INFO"}, "预览完成(相机位置已还原)")
+                return {"FINISHED"}
+            raw = 1.0
+        else:
+            raw = raw % 1.0 if self._loop else min(raw, 1.0)
+        if self._ease_points:
+            t = self._sample_ease(self._ease_points, raw)
+        else:
+            t = self._ease(self._preset, raw)
+
+        matrix = self._camera.matrix_world.copy()
+        # 位置:有轨道就走轨道;没轨道但从另一台相机切过来 -> 直线插值
+        if self._points:
+            position = mathutils.Vector(self._sample_path(self._points, t))
+        elif self._start_matrix is not None:
+            position = self._start_matrix.translation.lerp(
+                self._saved_matrix.translation, t)
+        else:
+            position = self._camera.matrix_world.translation
+        # 朝向:能插值就插值(从旧机位转到目标机位),否则沿轨道看前方/看向目标
+        look = None
+        if self._start_quat is not None:
+            look = self._start_quat.slerp(
+                self._end_quat, max(0.0, min(t, 1.0))).to_matrix().to_4x4()
+        elif self._look_forward and self._points:
+            ahead = mathutils.Vector(
+                self._sample_path(self._points, min(t + 0.03, 1.0)))
+            delta = ahead - position
+            if delta.length > 0.001:
+                look = delta.to_track_quat("-Z", "Y").to_matrix().to_4x4()
+        elif self._look_target is not None \
+                and getattr(self._look_target, "location", None) is not None:
+            delta = self._look_target.matrix_world.translation - position
+            if delta.length > 0.001:
+                look = delta.to_track_quat("-Z", "Y").to_matrix().to_4x4()
+        if look is None:
+            look = matrix   # 不改朝向(『不改朝向』档)
+        look.translation = position
+        self._camera.matrix_world = look
+        if context.area is not None:
+            context.area.tag_redraw()
+        return {"RUNNING_MODAL"}
+
+    def _restore(self, context):
+        if context.area is not None:
+            context.area.header_text_set(None)
+        try:
+            context.window_manager.event_timer_remove(self._timer)
+        except Exception:
+            pass
+        try:
+            self._camera.matrix_world = self._saved_matrix
+            if self._scene is not None:
+                self._scene.camera = self._saved_camera
+        except Exception:
+            gk_log.exception("预览运镜还原相机时出错")
+        if context.area is not None:
+            context.area.tag_redraw()
 
 
 class GK_OT_CaptureKey(bpy.types.Operator):
@@ -1291,9 +2041,14 @@ class GK_OT_ExportAssets(bpy.types.Operator):
         # 这里只负责"取参数 + 报告结果"。
         # 抽出去的原因:"运行前自动导出"要用同一套流程,
         # 抄一份必然走偏(顺序、材质引用这些细节很容易漏)。
+        #
+        # ── 多场景(用户 2026-10-04)──────────────────────────────────
+        # 一个 .blend 里可以有好几个 Blender 场景(关卡1 / 关卡2 / ...)。
+        # export_all_scenes 会遍历它们,每个场景各导一张 .tscn ——
+        # 只有一棵场景时行为和以前完全一样(仍是 World.tscn)。
         try:
-            outcome = asset_export.export_assets_pipeline(
-                scene, directory,
+            outcome = asset_export.export_all_scenes(
+                directory,
                 dimension=settings.get("dimension", "3"),
                 script_name=LAST_EXPORT.get("script_name") or None,
             )
@@ -1315,25 +2070,45 @@ class GK_OT_ExportAssets(bpy.types.Operator):
         written = outcome.get("written", [])
         asset_export.ensure_project_file(directory)
 
-        if not LAST_EXPORT.get("script_name"):
+        if not outcome.get("single") and not LAST_EXPORT.get("script_name"):
+            # 多场景时可能看到"还没导出过脚本"的告警 —— 那不算问题:
+            # 每个场景的逻辑图是这次导出时**自动**导出的。
+            pass
+        elif not LAST_EXPORT.get("script_name"):
             _report(self, "WARNING",
                     "还没有导出过脚本，先点『导出为 Godot 脚本』才能把逻辑挂到模型上")
 
         bounds = asset_export.object_bounds(objects)
         size = bounds["size"] if bounds else (0, 0, 0)
         elapsed = time.time() - started
-        _report(self, "INFO",
-                f"已导出 {len(objects)} 个网格、{outcome['materials']} 个材质、"
-                f"{outcome['bodies']} 个碰撞体、{outcome['cameras']} 个相机、"
-                f"{outcome['lights']} 盏灯"
-                f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}，"
-                f"耗时 {elapsed:.1f} 秒）")
+        if outcome.get("single"):
+            _report(self, "INFO",
+                    f"已导出 {len(objects)} 个网格、{outcome['materials']} 个材质、"
+                    f"{outcome['bodies']} 个碰撞体、{outcome['cameras']} 个相机、"
+                    f"{outcome['lights']} 盏灯"
+                    f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}，"
+                    f"耗时 {elapsed:.1f} 秒）")
+        else:
+            done = [e for e in outcome.get("scenes", []) if e["ok"]]
+            names = "、".join(f"{e['scene']}→{e['scene_name']}.tscn" for e in done)
+            _report(self, "INFO",
+                    f"已导出 {len(done)}/{len(outcome.get('scenes', []))} 个场景:"
+                    f"{names}（主场景 {outcome.get('main_scene', '')}，"
+                    f"耗时 {elapsed:.1f} 秒）")
         for path in written:
             # 防御:written 里理论上不该有 None,但一旦混进来,
             # `os.path.basename(None)` 会崩,而且崩在"报告结果"这一步 ——
             # 用户看到的是一堆 traceback 而不是真正的错误原因(实测踩过)。
             if path:
                 gk_log.info(f"写入 {os.path.basename(str(path))}")
+        # 旧文件清理(第十三轮)要说出来 —— 删了东西却不说,用户会以为
+        # "我的文件怎么没了"。没删就不提。
+        deleted = outcome.get("deleted", [])
+        if deleted:
+            _report(self, "INFO",
+                    f"已清理 {len(deleted)} 个上一次导出留下的旧文件:"
+                    + "、".join(deleted[:6])
+                    + ("…(详见导出日志)" if len(deleted) > 6 else ""))
         return {"FINISHED"}
 
 
@@ -1580,10 +2355,10 @@ class GK_OT_OpenGodot(bpy.types.Operator):
             except Exception as exc:
                 _report(self, "WARNING", f"自动导出脚本失败(继续运行): {exc}")
 
-        # 3) 导出场景 / 模型 / 材质
+        # 3) 导出场景 / 模型 / 材质(多场景时每个 Blender 场景各导一张 .tscn)
         try:
-            outcome = asset_export.export_assets_pipeline(
-                context.scene, directory,
+            outcome = asset_export.export_all_scenes(
+                directory,
                 dimension=exporter.build_settings(context.scene).get("dimension", "3"),
                 script_name=script_name,
             )
@@ -1744,6 +2519,10 @@ class GK_OT_ResetSettings(bpy.types.Operator):
 
 GK_CLASSES = (
     GK_OT_AddNode,
+    GK_OT_AddCommentBox,
+    # 变量集中面板:查找引用 + 放取/设节点
+    GK_OT_VarFindRefs,
+    GK_OT_VarMakeNode,
     GK_OT_StarterGraph,
     GK_OT_AutoLink,
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
@@ -1755,11 +2534,16 @@ GK_CLASSES = (
     GK_OT_CaptureKey,
     # 挑一条曲线当运镜轨道(『相机_路径』用)
     GK_OT_PickCurve,
+    # 挑一个静态资产(『资产_创建实例』用;列表里带"共几份")
+    GK_OT_PickAsset,
+    # 真预览:把相机沿曲线跑一遍(所见即所得,不产生游戏代码)
+    GK_OT_PreviewCameraPath,
     # 动作分类标签(给动作打"静止/移动/攻击…",导出时按分类成表)
     GK_OT_TagAnimCategory,
     # 碰撞体可视化(像 UPBGE 那样能在视口里看到碰撞范围)
     GK_OT_ShowCollision,
     GK_OT_HideCollision,
+    GK_OT_PreviewColliders,
     # 让 Blender 预览贴近 Godot 的渲染(色调映射/背景/环境光)
     GK_OT_MatchGodotLook,
     GK_OT_RestoreLook,
@@ -1776,6 +2560,9 @@ GK_CLASSES = (
     GK_OT_ExportAssets,
     GK_OT_SyncFaceAngle,
     GK_OT_Preview,
+    # 导出报告(第二十三轮):复制成文本 / 定位到出问题的节点
+    GK_OT_ReportCopy,
+    GK_OT_ReportFocus,
     GK_OT_OpenExportFolder,
     GK_OT_SelectNode,
     GK_OT_ResetSettings,
@@ -1794,4 +2581,5 @@ def on_register():
 def on_unregister():
     _unregister_handlers()
     LAST_EXPORT.clear()
+    export_report.clear()
     RECENT_NODES.clear()

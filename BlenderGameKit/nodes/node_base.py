@@ -122,6 +122,29 @@ def _is_plain_node_path(text):
     return True
 
 
+def safe_function_name(text, fallback="my_function"):
+    """函数声明里的名字 -> 合法的 GDScript 函数名(用户 2026-10-05)。
+
+    ── 为什么必须转一道(踩过的坑,和变量名同一族)────────────────────
+    `snake_case` 会把**非 ASCII 字符整个压掉**:『治疗』『扣血』都会变成
+    空 -> 落回 fallback —— 于是**两个中文函数名生成同一个 `func`**,
+    Godot 直接报
+        Parse Error: Function "my_function()" has already been defined
+    整个脚本加载不了。所以这里压完之后按需挂一段**稳定摘要**,
+    保证「不同声明名 -> 不同函数名」。
+    """
+    import zlib
+    base = snake_case(str(text or ""), "")
+    if not base:
+        base = fallback
+    # 名字里本来就有非 ASCII 的,压完可能撞车 -> 挂 8 位摘要区分
+    raw = str(text or "")
+    if any(ord(char) > 127 for char in raw):
+        digest = zlib.crc32(raw.encode("utf-8")) & 0xFFFFFFFF
+        return f"{base}_{digest:08x}"
+    return base
+
+
 def gd_node_path(raw):
     """把节点的目标值转换成 GDScript 里的节点访问表达式。"""
     text = (raw or "").strip()
@@ -239,6 +262,25 @@ def draw_target_picker(node, layout, prop="gk_target"):
     op = row.operator("gk.pick_target", text="", icon="TRIA_DOWN")
     op.node_name = node.name
     op.prop_name = prop
+
+
+def inline_prop_entries(node):
+    """节点体上要**自动画出来**的参数:返回 (属性名, 类型, 标签) 列表。
+
+    ── 用户 2026-10-04:「参数直接画在节点体上」────────────────────
+    节点声明的参数(gk_prop_defs)以前只有**手写了 draw_buttons** 的节点
+    才看得到;没写的那几个(『打印_输出』的文本、『等待_秒』的真实时间…)
+    参数是"隐身"的,用户根本不知道能改。
+    所以基类给个兜底:没重写 draw_buttons 的节点,自动把声明的参数画出来。
+    抽成纯函数是为了能离线测(离线桩没有 layout,画不了 UI)。
+    """
+    result = []
+    for entry in getattr(node, "gk_prop_defs", ()) or ():
+        name = entry[0]
+        kind = entry[1] if len(entry) > 1 else "string"
+        label = entry[3] if len(entry) > 3 else ""
+        result.append((name, kind, label))
+    return result
 
 
 # ==========================================================================
@@ -653,7 +695,28 @@ if _USE_BPY_BASE:
 
         # ---- UI ----
         def draw_buttons(self, context, layout):
-            pass
+            """节点体上直接画出声明的参数(用户 2026-10-04)。
+
+            ── 只在**没有重写** draw_buttons 的节点上生效 ──────────────
+            重写了 draw_buttons 的节点(HUD、相机、动画…那一大批)自己
+            已经把手上的参数画好了,基类这份不会跑,也就不会重复。
+            没重写的那几个原来自动"隐身",现在补上。
+
+            节点引用(『相机』『目标』这类)要用带下拉的选择器,不能拿裸
+            文本框画,所以单独走 draw_target_picker。
+            """
+            for name, kind, label in inline_prop_entries(self):
+                try:
+                    if kind == "node":
+                        draw_target_picker(self, layout, name)
+                    else:
+                        layout.prop(self, name, text=label)
+                except Exception:
+                    # 画不出来不能让整个节点编辑器崩掉,退化成一行标签
+                    try:
+                        layout.label(text=label or name)
+                    except Exception:
+                        pass
 
         def draw_buttons_ext(self, context, layout):
             box = layout.box()

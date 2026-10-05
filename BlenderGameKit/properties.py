@@ -6,6 +6,7 @@ from bpy.props import (
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
+    IntProperty,
     PointerProperty,
     StringProperty,
 )
@@ -33,6 +34,14 @@ BASE_CLASSES = (
     ("RigidBody2D", "2D 刚体 RigidBody2D", "用物理引擎驱动的 2D 刚体"),
     ("StaticBody3D", "3D 静态碰撞体 StaticBody3D", "不动的地形 / 墙 / 地板"),
     ("StaticBody2D", "2D 静态碰撞体 StaticBody2D", "不动的 2D 地形"),
+    # ── 会动的平台 / 载具(用户 2026-10-05 第三十轮)────────────────
+    # Godot 里"站上去会被带走"的平台必须是 AnimatableBody:被脚本/时间轴
+    # 每帧挪位置时,它的**速度**会传给站在上面的角色;StaticBody 是"瞬移",
+    # 角色只会留在原地(平台从脚下溜走)。见探针"移动平台"工位。
+    ("AnimatableBody3D", "3D 动画平台 AnimatableBody3D",
+     "会动的平台 / 载具:站上去跟着走(时间轴或脚本移动它)"),
+    ("AnimatableBody2D", "2D 动画平台 AnimatableBody2D",
+     "会动的 2D 平台:站上去跟着走"),
     ("Area3D", "3D 触发区 Area3D", "只检测重叠、不阻挡(拾取物 / 伤害区)"),
     ("Area2D", "2D 触发区 Area2D", "只检测重叠、不阻挡"),
     ("Node3D", "3D 空节点 Node3D", "没有物理的 3D 容器节点"),
@@ -47,6 +56,8 @@ BASE_CLASS_AUTO = "auto"
 BODY_TYPE_TO_BASE_CLASS = {
     "StaticBody3D": "StaticBody3D",
     "StaticBody2D": "StaticBody2D",
+    "AnimatableBody3D": "AnimatableBody3D",
+    "AnimatableBody2D": "AnimatableBody2D",
     "RigidBody3D": "RigidBody3D",
     "RigidBody2D": "RigidBody2D",
     "CharacterBody3D": "CharacterBody3D",
@@ -129,6 +140,10 @@ COLLISION_SHAPES = (
     ("sphere", "球 Sphere", "圆球(道具、球体角色)"),
     ("capsule", "胶囊 Capsule", "人形角色(推荐)"),
     ("cylinder", "圆柱 Cylinder", "柱子、树干"),
+    # 凸包(用户本轮选的"手动选凸包"):按网格真实外形生成 ——
+    # 盒子会"切角"、球会"漏边"的不规则模型(石头 / 雕像)用它。
+    # 自动模式**不会**选它(行为可预期),只在这个下拉里手动选。
+    ("convex", "凸包 Convex", "按网格真实外形(只有 3D;不规则模型:石头 / 雕像)"),
 )
 
 # 碰撞层:Godot 里 1..32 层,用位掩码表示。这里给几个常用预设。
@@ -253,9 +268,40 @@ class GKObjectSettings(bpy.types.PropertyGroup):
         description="只检测重叠、不阻挡(碰到就知道,但穿得过去)",
         default=False,
     )
+    # ── 子物体碰撞块(用户本轮选的方案:"头/身/腿各摆一个")────────────
+    # 勾上后这个物体**不出现在游戏画面里**(网格不导出),它的形状
+    # 合并进**父物体**的碰撞体 —— 人形角色摆三个胶囊就是"头/身/腿"。
+    # 为什么做成子物体而不是面板里填数字:视口里直接拖着摆,所见即所得;
+    # 碰撞块自己还能用『碰撞形状』下拉 + 实时线框预览微调。
+    collision_piece: BoolProperty(
+        name="作为父级的碰撞块",
+        description="不出现在游戏画面里;形状合并进父物体的碰撞体"
+                    "(人形:头/身/腿各摆一个)。需要挂在别的网格物体下面",
+        default=False,
+    )
     script_target: BoolProperty(
         name="挂游戏逻辑脚本",
         description="把节点图导出的脚本挂到这个物体上",
+        default=False,
+    )
+    # ── 静态资产(用户 2026-10-05 第十四轮:"游戏静态资产设计")─────────
+    # 一个模型只导一次,场景里可以摆很多份:填同一个『资产名』的物体
+    # 属于同一个资产;**本体**(不勾"作为实例")负责定义模型,
+    # **实例**在导出的场景里各自带一份网格 + 自己的碰撞体。
+    #
+    # 为什么用物体属性而不是"另建一个资产库":
+    # 用户选的就是这条 —— 选中谁就填谁,不用维护两份对应关系;
+    # 复制物体时属性跟着复制,把"作为实例"勾上就是新的一份实例。
+    asset_name: StringProperty(
+        name="资产名",
+        description=("留空 = 普通物体。填了名字就属于这个『资产』:\n"
+                     "一个物体当本体(定义模型),其它同名的当实例"),
+        default="",
+    )
+    asset_instance: BoolProperty(
+        name="作为实例",
+        description=("勾上 = 这份只是引用:导出时复用本体的模型\n"
+                     "(本体 = 同一个资产名里没勾的那一个)"),
         default=False,
     )
 
@@ -263,6 +309,167 @@ class GKObjectSettings(bpy.types.PropertyGroup):
 def physics_of(obj):
     """安全地取物体上的物理设置(没有就返回 None)。"""
     return getattr(obj, "gk_physics", None)
+
+
+def fx_of(obj):
+    """安全地取物体上的粒子发射器设置(没有就返回 None)。"""
+    return getattr(obj, "gk_fx", None)
+
+
+# 调试面板能用的按键(值 = Godot 里的按键常量名,导出时直接用)。
+# 只给这几个:"不常用的功能键 + 反引号",免得和游戏自己的操作抢键。
+DEBUG_KEYS = (
+    ("F1", "F1", ""),
+    ("F2", "F2", ""),
+    ("F3", "F3", ""),
+    ("F4", "F4", ""),
+    ("F8", "F8", ""),
+    ("`", "`(数字 1 左边那个)", "键盘左上角,游戏里几乎不会用到"),
+)
+
+# 粒子类型(用户 2026-10-05 第二十一轮:"面板可切,默认 GPU")。
+#
+# 为什么两套都要:GPUParticles 效果全、参数多(Godot 默认推荐),
+# 但**老显卡 / 兼容渲染器**环境下有风险;CPUParticles 是纯 CPU 计算,
+# 在哪都能跑(代价是粒子多了会吃帧)。让用户在物体上自己选,
+# 导出侧按选择生成不一样的节点 —— 两边都验过。
+FX_TYPES = (
+    ("gpu", "GPU 粒子 GPUParticles",
+     "GPU 加速、效果全(颜色渐变 / 大小曲线都在材质里);Godot 默认推荐"),
+    ("cpu", "CPU 粒子 CPUParticles",
+     "纯 CPU 计算,兼容性最好(老显卡 / 兼容渲染器都能跑);参数略少"),
+)
+
+
+class GKObjectFx(bpy.types.PropertyGroup):
+    """挂在**每个物体**上的粒子发射器设置(需求 5,2026-10-05 第二十一轮)。
+
+    ── 为什么 Blender 侧只做"标记 + 参数"──────────────────────────
+    Blender 的粒子系统**完全导不进 glTF**(规范里根本没有粒子),
+    就算硬导 Godot 也不认。所以这一套的正确分工是:
+
+        Blender 侧:这个物体是个发射器 + 参数是多少(就是这里)
+        导出时    :生成 Godot 的 GPUParticles3D / CPUParticles3D + 材质/贴图
+        运行时    :『特效_播放』『特效_停止』『特效_爆发』三个节点控制它
+
+    物体**是不是网格都行**(空物体也能当发射器:只标位置和方向)。
+    """
+
+    enabled: BoolProperty(
+        name="作为粒子发射器",
+        description="导出成 Godot 的粒子节点(位置 / 旋转跟着这个物体)",
+        default=False,
+    )
+    particle_type: EnumProperty(
+        name="粒子类型",
+        description="GPU 效果全、CPU 兼容好;不确定就用默认的 GPU",
+        items=FX_TYPES,
+        default="gpu",
+    )
+    hide_mesh: BoolProperty(
+        name="不显示本体网格",
+        description="勾上 = 这个物体只当发射器标记,自己的网格不导出"
+                    "(适合在空中摆一个小方块当喷点)",
+        default=False,
+    )
+    auto_play: BoolProperty(
+        name="自动播放",
+        description="勾上 = 游戏一开始就在喷;不勾 = 要靠『特效_播放』才动",
+        default=True,
+    )
+    amount: IntProperty(
+        name="数量",
+        description="同时活着的粒子上限(火苗 16~32;烟雾/雨可以几百)",
+        default=16, min=1, max=4096,
+    )
+    lifetime: FloatProperty(
+        name="生命周期(秒)",
+        description="一个粒子从出生到消失活多久",
+        default=1.2, min=0.05, soft_max=10.0,
+    )
+    one_shot: BoolProperty(
+        name="一次性",
+        description="勾上 = 喷一轮就停(受击火花 / 爆炸);不勾 = 一直循环喷",
+        default=False,
+    )
+    preprocess: FloatProperty(
+        name="预发射(秒)",
+        description="开场的『提前量』—— 勾了它,进游戏时火已经烧起来了,"
+                    "不用等一圈(循环效果填一整个生命周期左右)",
+        default=0.0, min=0.0, soft_max=10.0,
+    )
+    explosiveness: FloatProperty(
+        name="爆发度",
+        description="0 = 粒子在生命周期里平均散开;1 = 一出生全喷出来"
+                    "(一次性冲击 / 爆炸建议拉到 1)",
+        default=0.0, min=0.0, max=1.0,
+    )
+    randomness: FloatProperty(
+        name="随机度",
+        description="越大越乱(速度 / 角度各有差异,不然像印刷出来的)",
+        default=0.3, min=0.0, max=1.0,
+    )
+    speed: FloatProperty(
+        name="初速(米/秒)",
+        description="粒子出生时的速度(火苗 1~2;喷泉 / 冲击可以 5 以上)",
+        default=1.0, min=0.0, soft_max=30.0,
+    )
+    direction: FloatVectorProperty(
+        name="方向",
+        description="喷射方向(按**这个物体自己的旋转**算:把物体转 45°,"
+                    "斜着喷的火就是它)。默认朝上 = Z+",
+        size=3, subtype="XYZ", default=(0.0, 0.0, 1.0),
+    )
+    spread: FloatProperty(
+        name="扩散角(度)",
+        description="0 = 一条直线喷;90 = 一个半球;180 = 四面八方",
+        default=25.0, min=0.0, max=180.0,
+    )
+    gravity: FloatProperty(
+        name="重力",
+        description="正数 = 往下坠(雨 / 火花);负数 = 往上飘(烟 / 火苗);0 = 不受重力",
+        default=0.0, soft_min=-30.0, soft_max=30.0,
+    )
+    radius: FloatProperty(
+        name="发射半径",
+        description="0 = 从一个点喷;大于 0 = 在这个半径的球内随机出生"
+                    "(火盆 / 大范围烟雾)",
+        default=0.0, min=0.0, soft_max=10.0,
+    )
+    start_color: FloatVectorProperty(
+        name="起始颜色",
+        description="粒子出生时的颜色(第 4 个分量是透明度)",
+        size=4, subtype="COLOR", default=(1.0, 0.75, 0.35, 1.0),
+        min=0.0, max=1.0,
+    )
+    end_color: FloatVectorProperty(
+        name="结束颜色",
+        description="消失时的颜色 —— 想『淡出』就把透明度拉到 0",
+        size=4, subtype="COLOR", default=(1.0, 0.15, 0.02, 0.0),
+        min=0.0, max=1.0,
+    )
+    start_size: FloatProperty(
+        name="起始大小(米)",
+        description="粒子出生时多大(用物体材质贴图时,这就是那张贴图的实际尺寸)",
+        default=0.2, min=0.0, soft_max=5.0,
+    )
+    end_size: FloatProperty(
+        name="结束大小(米)",
+        description="消失时多大;0 = 缩没了(火苗的常见做法)",
+        default=0.0, min=0.0, soft_max=5.0,
+    )
+    local_coords: BoolProperty(
+        name="局部坐标",
+        description="勾上 = 粒子跟着物体动(角色身上的火花);"
+                    "不勾 = 喷出去就留在世界里(地上的烟 / 火)",
+        default=True,
+    )
+    additive: BoolProperty(
+        name="叠加发光",
+        description="勾上 = 颜色相加、越亮越白(火 / 光 / 魔法);"
+                    "不勾 = 正常透明度混合(烟 / 尘 / 水)",
+        default=False,
+    )
 
 
 class GKSceneSettings(bpy.types.PropertyGroup):
@@ -293,6 +500,19 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="生成的 .tscn 里根节点的名字",
         default="Player",
     )
+    # ── 本场景用哪棵游戏逻辑图(用户 2026-10-04)─────────────────────
+    # 一个 .blend 里可以有好几个 Blender 场景(关卡1 / 关卡2 / ...),
+    # 每个场景导出成自己的一张 .tscn。但"场景"和"节点图"之间原本没有
+    # 绑定关系 —— 导出时只能靠"当前节点编辑器里打开的那棵",多场景时
+    # 必然搞不清。这里显式绑定:某个场景用哪棵图。
+    #   留空 = 自动:如果整个 .blend 只有一棵游戏逻辑图,就用它
+    #          (单场景项目行为完全不变);有多棵又没选 -> 导出时告警跳过。
+    logic_tree: StringProperty(
+        name="逻辑图",
+        description=("这个场景用哪棵『游戏逻辑』节点图。"
+                     "留空 = 自动(只有一棵图时就用它)"),
+        default="",
+    )
     export_tunables: BoolProperty(
         name="暴露可调参数",
         description="把未连线的数值(速度 / 跳跃力度)生成为 @export，可在 Godot 检查器里调手感",
@@ -308,12 +528,24 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="在侧栏显示最近一次导出的日志",
         default=True,
     )
-    # ── 主相机(用户第 25 轮)────────────────────────────────────────
-    # 整局游戏**默认用哪台相机**。留空 = 自动:
+    # ── 上帝摄像机(用户 2026-10-04)────────────────────────────────
+    # 原来这里是一个"主相机"下拉 + 拾取按钮。用户的原话:
+    # "把现在的那个侧边栏的主摄像机改成其他要用的或者删了"。
+    # 选定的方案:改成**上帝摄像机开关** —— 常驻一台自由飞行相机,
+    # 运行时按 Tab 在"玩家相机 / 上帝摄像机"之间来回切。
+    # 这台相机**独立于玩家相机**,不走物理(WASD 平移 / 空格上升 /
+    # Shift 下降 / 鼠标转视角,可穿墙),用来像虚幻 5 的上帝视角那样
+    # 满地跑着看这一关做得对不对。
+    god_camera: BoolProperty(
+        name="上帝摄像机", default=False,
+        description=("常驻一台自由飞行相机(独立于玩家相机)。"
+                     "运行时按 Tab 切换;WASD 平移 / 空格上升 / Shift 下降 / "
+                     "鼠标转视角,不受碰撞"))
+    # ── 主相机(留作自动解析用,侧栏不再单列一行)────────────────────
+    # 整局游戏默认用哪台相机。留空 = 自动:
     #   1) 用 Blender 视口当前那台(scene.camera —— 就是你按小键盘 0 看的那台)
     #   2) 没有就取场景里第一台 Camera
     #   3) 一台都没有 -> 运行时造一台自由飞行观察机(见 codegen)
-    # 场景里有多台相机却没明确选时,导出会提示一句"建议指定主相机"。
     main_camera: StringProperty(
         name="主相机",
         description="游戏默认用哪台相机;留空 = 跟着 Blender 视口的当前相机",
@@ -329,6 +561,31 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         name="运行日志", default=False,
         description="玩游戏时每秒在 Godot 控制台打一行状态(位置/速度/相机),排查用")
 
+    # ── 游戏内调试面板(用户 2026-10-05 第二十二轮:"调试体验")─────────
+    # 『运行日志』是往控制台打一行行字;这个是**玩的时候能看**的一块 HUD:
+    # 按一个键弹出,显示 FPS / 相机 / 脚本宿主的位置速度在地面 /
+    # 变量实时值(『变量』框里勾了『监视』的那些)/ 最近 20 条打印;
+    # 另一个键把全部内容复制到剪贴板 —— 直接粘出来就能查。
+    #
+    # 面板由**环境脚本**(每张 .tscn 一份)生成,所以没有角色的场景也能用;
+    # 变量和日志来自各自的游戏逻辑脚本(运行时按名字读)。
+    debug_panel: BoolProperty(
+        name="调试面板", default=False,
+        description="游戏里按一个键弹出调试 HUD:FPS / 状态 / 变量实时值 / 最近日志,"
+                    "可一键复制(粘贴出来就能排查)")
+    debug_key: EnumProperty(
+        name="面板键",
+        description="按它弹出 / 收起调试面板",
+        items=DEBUG_KEYS,
+        default="F1",
+    )
+    debug_copy_key: EnumProperty(
+        name="复制键",
+        description="按它把调试面板的全部内容复制到剪贴板(也打到控制台)",
+        items=DEBUG_KEYS,
+        default="F2",
+    )
+
     show_export_settings: BoolProperty(
         name="展开导出设置", default=False,
         description="侧栏『导出设置』默认收起 —— 那几项开一次就不用再动")
@@ -340,6 +597,15 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     toon_materials: BoolProperty(
         name="卡通材质", default=True,
         description="导出时把材质转成卡通风格(关掉 = 原样导出,便于核对细节)")
+
+    # ── 卡通跟随场景光照(用户 2026-10-04 第八轮:"导出有光照残留")──────
+    # 卡通 shader 是 unshaded,但它**自己按 light_dir 画色阶**;导出脚本默认
+    # 每物理帧把场景里的平行光同步进去 —— 于是场景有太阳时,模型身上会出现
+    # 明暗带状,用户看成"光照残留"。默认**关** = 真正的二次元平涂;
+    # 想要"转太阳、阴影跟着转"的效果再打开。
+    toon_follow_light: BoolProperty(
+        name="卡通跟随场景光照", default=False,
+        description="卡通材质是否跟着场景里的平行光画明暗(关掉 = 全平涂)")
 
     output_dir: StringProperty(
         name="导出目录",
@@ -441,6 +707,238 @@ class GKLogicPort(bpy.types.PropertyGroup):
         description="写给自己看的备注(不影响导出)",
         default="",
     )
+
+
+class GKLogicVariable(bpy.types.PropertyGroup):
+    """一张**游戏逻辑图**里预先声明的一个变量(用户 2026-10-04)。
+
+    ── 为什么要有它(而不是继续隐式声明)────────────────────────────
+    玩法图的变量原来是**隐式声明**的:第一次『变量_设置』写它,就自动
+    成为成员变量,类型和初值都从那一刻的连线/默认值现推。带来的问题:
+      * "这张图里到底有哪些变量、各是什么类型"只能一个个节点翻;
+      * 同一个变量在两处被写得类型不一致时,导出只给一条告警,很容易漏;
+      * 想给变量一个明确的初始值,得指望"第一个写它的节点"恰好写对。
+
+    现在可以在侧栏**一处声明**(名字 + 类型 + 初值),节点上从下拉里挑。
+    没声明过的变量仍然照旧能自动建 —— 老图一个字都不用改。
+    """
+    var_name: StringProperty(
+        name="变量名",
+        description="导出成 GDScript 的成员变量名(中文会被转成合法的英文名)",
+        default="新变量",
+    )
+    var_type: EnumProperty(
+        name="类型",
+        description="这个变量存什么",
+        items=(("bool", "布尔", "真/假 —— 可以直接当判断条件"),
+               ("int", "整数", ""),
+               ("float", "浮点", ""),
+               ("string", "文本", ""),
+               ("vector", "向量", "Vector3")),
+        default="float",
+    )
+    default_value: StringProperty(
+        name="初值",
+        description="游戏开始时这个变量的值",
+        default="0",
+    )
+    comment: StringProperty(
+        name="说明",
+        description="写给自己看的备注(不影响导出)",
+        default="",
+    )
+    # ── 调试面板要看哪个变量(用户 2026-10-05 第二十二轮)─────────────
+    # 勾上的变量会出现在**游戏内调试面板**里(实时值)。
+    # 一个都不勾 = 面板显示**脚本里所有**变量(新项目先这样看一遍最省事)。
+    watch: BoolProperty(
+        name="监视",
+        description="调试面板里实时显示它的值;不勾就不显示它"
+                    "(图里**实际用到**的变量和对外端口总会显示)",
+        default=True,
+    )
+    # ── 变量的"实现"(用户 2026-10-05 第十七轮:需求 1 剩的那半)────────
+    # 照 UE5 那种:变量可以绑定 getter / setter。
+    # 读这个变量时走 getter(计算出来的值),写它时走 setter(顺带做别的事)。
+    # 例:`血量` 的 getter 是"计算血量"、setter 是"受伤扣血" ——
+    # 图里照样用『变量_读取』『变量_设置』,生成出来却是函数调用。
+    getter: StringProperty(
+        name="读取时调用",
+        description=("读这个变量时改调这个函数(留空 = 直接读变量)。"
+                     "函数要**无参数、有返回值**(类型和变量一致)"),
+        default="",
+    )
+    setter: StringProperty(
+        name="写入时调用",
+        description=("写这个变量时改调这个函数(留空 = 直接赋值)。"
+                     "函数要**正好一个参数**"),
+        default="",
+    )
+
+
+def variable_implementations(tree):
+    """读出变量的"实现"绑定:{变量名: {"getter": 函数名, "setter": 函数名}}。
+
+    ── 为什么要单独一张表(用户 2026-10-05)──────────────────────────
+    『变量_读取』『变量_设置』和代码生成都要查它(一处声明、两处一致)。
+    只收非空的绑定 —— 没绑定的变量照旧是普通成员变量,老图产物一个字符不变。
+    """
+    out = {}
+    for var in (getattr(tree, "gk_vars", None) or ()):
+        name = str(getattr(var, "var_name", "") or "").strip()
+        if not name:
+            continue
+        getter = str(getattr(var, "getter", "") or "").strip()
+        setter = str(getattr(var, "setter", "") or "").strip()
+        if getter or setter:
+            out[name] = {"getter": getter, "setter": setter,
+                         "type": str(getattr(var, "var_type", "") or "")}
+    return out
+
+
+def _on_function_decl_changed(self, _context):
+    """函数声明改了 -> 图里引用它的节点要**重长引脚**(用户 2026-10-05)。
+
+    参数从 1 个改成 3 个时,『函数_调用』上的参数框必须跟着变 ——
+    不重长的话用户"改了声明却看不到变化",以为没生效(和『定时_时间轴』
+    改轨道数要立刻长引脚同一个道理)。
+    """
+    tree = getattr(self, "id_data", None)
+    for node in getattr(tree, "nodes", ()) or ():
+        if getattr(node, "bl_idname", "") not in ("GKNodeFunctionCall",
+                                                  "GKNodeFunctionDefine"):
+            continue
+        builder = getattr(node, "build_sockets", None)
+        if callable(builder):
+            try:
+                builder()
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+class GKLogicFunction(bpy.types.PropertyGroup):
+    """一张**游戏逻辑图**里预先声明的一个函数(用户 2026-10-05 第十七轮)。
+
+    ── 为什么要有它(用户原话)──────────────────────────────────────
+    "查看函数,自定义函数,折叠函数等" —— 现在整张图只能生成固定的
+    `_ready` / `_physics_process`,想复用一段逻辑只能**复制节点**。
+
+    有了它就能一处声明、多处调用:声明处写名字 / 返回类型 / 参数,
+    图里放『函数_定义』接函数体、放『函数_调用』去调用。
+    调用点的参数引脚会按这里的声明**自动长出来**。
+
+    ── 参数怎么写 ──────────────────────────────────────────────────
+    `参数` 一栏用「名字:类型」写,逗号(中英文都认)或分号分隔,比如:
+
+        hp:float, amount:float
+
+    留空 = 无参数。类型不认识时会退回 float 并给一条导出告警。
+    """
+    func_name: StringProperty(
+        name="函数名",
+        description="导出成 GDScript 的函数名(中文会被压成合法英文名)",
+        default="新函数",
+        update=_on_function_decl_changed,
+    )
+    return_type: EnumProperty(
+        name="返回",
+        description="这个函数返回什么;『无』= 只做事不给值",
+        items=(("void", "无返回", "只做事,不给值(最常用)"),
+               ("bool", "布尔", ""),
+               ("int", "整数", ""),
+               ("float", "浮点", ""),
+               ("string", "文本", ""),
+               ("vector", "向量", "Vector3")),
+        default="void",
+        update=_on_function_decl_changed,
+    )
+    params: StringProperty(
+        name="参数",
+        description="『名字:类型』,逗号分隔。例:hp:float, amount:float(留空 = 无参数)",
+        default="",
+        update=_on_function_decl_changed,
+    )
+    comment: StringProperty(
+        name="说明",
+        description="写给自己看的备注(不影响导出)",
+        default="",
+    )
+
+
+# 函数参数里能写的类型(写别的会退回 float + 一条告警)
+FUNCTION_PARAM_TYPES = {
+    "bool": "bool", "int": "int", "float": "float", "string": "String",
+    "vector": "Vector3", "vector3": "Vector3", "vector2": "Vector2",
+    "node": "Node", "text": "String",
+}
+# 显示层用:枚举 id -> GDScript 类型(和 GKLogicFunction.return_type 对应)
+FUNCTION_RETURN_TYPES = {
+    "void": "", "bool": "bool", "int": "int", "float": "float",
+    "string": "String", "vector": "Vector3",
+}
+
+
+def parse_function_params(text):
+    """把『参数』那一栏的文本解析成 [(名字, GDScript 类型)]。
+
+    认 `,` `;` `，` `；` 四种分隔;每一项形如 `hp:float`。
+    名字缺类型 -> float;类型不认识 -> float(由导出那边给告警)。
+    返回 [(名字, 类型, 是否认得这个类型)] —— 第三项给告警用。
+    """
+    out = []
+    text = str(text or "")
+    for chunk in text.replace("，", ",").replace("；", ";") \
+            .replace(";", ",").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if ":" in item:
+            name, raw_type = item.split(":", 1)
+        elif "：" in item:
+            name, raw_type = item.split("：", 1)
+        else:
+            name, raw_type = item, ""
+        name = name.strip()
+        if not name:
+            continue
+        kind = raw_type.strip().lower()
+        known = True
+        if not kind:
+            kind = "float"
+        if kind not in FUNCTION_PARAM_TYPES:
+            known = False
+            kind = "float"
+        out.append((name, FUNCTION_PARAM_TYPES[kind], known))
+    return out
+
+
+def tree_functions(tree):
+    """读出这张图声明的所有函数:{名字: {"return": 类型, "params": [(名, 类型)]}}。
+
+    ── 为什么从这里统一取(用户 2026-10-05 第十七轮)────────────────
+    『函数_定义』『函数_调用』两个节点和代码生成都查这一张表 ——
+    一处声明、三处一致。名字重复时**只保留第一个**(导出时会另外给告警,
+    否则 Godot 会因为同名函数拒绝整个脚本)。
+    """
+    out = {}
+    for item in (getattr(tree, "gk_funcs", None) or ()):
+        name = str(getattr(item, "func_name", "") or "").strip()
+        if not name or name in out:
+            continue
+        params = []
+        bad_types = []
+        for param_name, param_type, known in parse_function_params(
+                getattr(item, "params", "")):
+            params.append((param_name, param_type))
+            if not known:
+                bad_types.append(param_name)
+        out[name] = {
+            "return": FUNCTION_RETURN_TYPES.get(
+                str(getattr(item, "return_type", "void") or "void"), ""),
+            "params": params,
+            "comment": str(getattr(item, "comment", "") or ""),
+            "bad_types": bad_types,
+        }
+    return out
 
 
 def make_node_picker(prop_name):
@@ -627,6 +1125,67 @@ def event_summary(tree):
     return events, statements
 
 
+# ==========================================================================
+# 变量集中视图(用户 2026-10-04)
+# ==========================================================================
+# 玩法图里的变量是**隐式声明**的 —— 第一次用『变量_设置』写它就自动成为
+# 成员变量(见 codegen.context.declare_var),没有一个"变量表"能看。
+# 于是用户问:"图里到底有哪些变量?谁在读、谁在写?"只能一个个节点翻。
+# 这两个纯函数把**所有变量节点的引用**汇总出来,给侧栏面板用。
+#
+# 判"读/写"靠节点的 bl_idname:写节点的类型是固定的,其余当读。
+_VAR_WRITER_NODES = {"GKNodeSetVar", "GKNodeAnimSetVar"}
+
+
+def _node_var_names(node):
+    """一个节点引用的变量 -> [(名字, 角色)],角色是 'set' 或 'get'。
+
+    一张『变量_设置』卡片能写多个变量(gk_var_name / gk_var_name_2 …),
+    所以要把所有槽位都扫一遍。
+    """
+    role = "set" if getattr(node, "bl_idname", "") in _VAR_WRITER_NODES else "get"
+    out = []
+    name = str(getattr(node, "gk_var_name", "") or "").strip()
+    if name:
+        out.append((name, role))
+    if getattr(node, "bl_idname", "") == "GKNodeSetVar":
+        for slot in range(2, 7):     # SET_VAR_SLOTS
+            extra = str(getattr(node, f"gk_var_name_{slot}", "") or "").strip()
+            if extra:
+                out.append((extra, "set"))
+    return out
+
+
+def variable_references(tree):
+    """汇总一张图里所有变量的引用:返回 [(名字, 写它的节点, 读它的节点), ...]。
+
+    按变量名排序 —— 面板上一行一个变量,点一下就能选中所有引用它的节点
+    (虚幻蓝图 Find References 的那一步)。
+    """
+    table = {}
+    for node in getattr(tree, "nodes", ()) or ():
+        for name, role in _node_var_names(node):
+            entry = table.setdefault(name, {"set": [], "get": []})
+            # 同一节点在两个槽位填了同名变量时只算一次(用身份比较,
+            # Blender 的节点包装对象不能拿 `in` / `==` 当可靠判断)
+            if not any(existing is node for existing in entry[role]):
+                entry[role].append(node)
+    return [(name, table[name]["set"], table[name]["get"])
+            for name in sorted(table)]
+
+
+def nodes_for_variable(tree, var_name):
+    """图里所有读到/写到 var_name 的节点(按节点顺序去重)。"""
+    want = str(var_name or "").strip()
+    if not want:
+        return []
+    hits = []
+    for node in getattr(tree, "nodes", ()) or ():
+        if any(name == want for name, _role in _node_var_names(node)):
+            hits.append(node)
+    return hits
+
+
 def default_output_dir():
     """已废弃的兜底目录。
 
@@ -650,5 +1209,5 @@ def default_output_dir():
 # 注意:这几个 PropertyGroup 只在这里**注册类**;真正挂到
 # Scene.gk_settings / Object.gk_physics 上的动作在
 # __init__.register() 里做 —— 那边能保证"所有类都注册完了"再挂。
-GK_CLASSES = (GKSceneSettings, GKObjectSettings, GKAnimVariable,
-              GKLogicPort)
+GK_CLASSES = (GKSceneSettings, GKObjectSettings, GKObjectFx, GKAnimVariable,
+              GKLogicPort, GKLogicVariable, GKLogicFunction)

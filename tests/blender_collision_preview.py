@@ -296,6 +296,84 @@ def main():
               not any(o.get(ops.PREVIEW_MARK) and o.parent is ball
                       for o in scene.objects))
 
+    # ---- 9. 预览=导出:线框要落在物体身上(本轮大修)----
+    #
+    # 以前预览线框被画在**世界原点** —— 父级逆矩阵把物体自己的位置
+    # 抵消掉了,物体一挪位置就完全对不上。测试里的物体都在原点,
+    # 所以一直没暴露。现在线框直接用世界坐标(和导出同一套计算)。
+    ops._remove_previews(scene)
+    ball.gk_physics.collision_shape = "auto"
+    ball.location = (7.0, 0.0, 0.0)
+    bpy.context.view_layer.update()
+    bpy.ops.gk.show_collision(target_all=True)
+    ball_preview = next((o for o in scene.objects
+                         if o.get(ops.PREVIEW_MARK) and o.parent is ball), None)
+    check("挪过位置的物体也有线框", ball_preview is not None)
+    if ball_preview is not None:
+        world = [tuple(ball_preview.matrix_world @ vert.co)
+                 for vert in ball_preview.data.vertices]
+        xs = [point[0] for point in world]
+        check("线框落在物体身上(不是世界原点)",
+              abs(min(xs) - 6.4) < 0.05 and abs(max(xs) - 7.6) < 0.05,
+              f"x 范围 {min(xs):.3f}..{max(xs):.3f}(期望 6.4..7.6)")
+    ball.location = (0.0, 0.0, 0.0)
+    ops._remove_previews(scene)
+
+    # ---- 10. 子物体碰撞块:预览整组一起画 ----
+    #
+    # 勾『作为父级的碰撞块』的小方块并入宿主的线框(人形头/身/腿);
+    # 它自己**不单独**生成线框,也不单独生成碰撞体。
+    ops._remove_previews(scene)
+    pillar = bpy.data.objects.get("Pillar")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    piece_mesh = bpy.data.meshes.new("PieceMesh")
+    bm.to_mesh(piece_mesh)
+    bm.free()
+    piece = bpy.data.objects.new("头块", piece_mesh)
+    scene.collection.objects.link(piece)
+    piece.parent = pillar
+    piece.matrix_parent_inverse = pillar.matrix_world.inverted()
+    piece.location = (0.0, 1.2, 0.0)          # 摆在柱子上方一点
+    piece.gk_physics.collision_piece = True
+    bpy.context.view_layer.update()
+    view_layer.objects.active = pillar
+    bpy.ops.gk.show_collision(target_all=False)
+    singles = [o for o in scene.objects if o.get(ops.PREVIEW_MARK)]
+    check("只生成 1 个线框(碰撞块跟着宿主)", len(singles) == 1, str(len(singles)))
+    if singles:
+        ys = [vert.co[1] for vert in singles[0].data.vertices]
+        check("宿主线框里带上了碰撞块(整体一起画)", max(ys) > 1.0,
+              f"y max={max(ys):.3f}(柱子胶囊只有 ±0.4)")
+    # 碰撞块的网格不该进 glb(它在游戏里只是"看不见的碰撞形状")
+    piece_glb, piece_ok, _piece_msg = asset_export.export_scene_glb(
+        directory, "PieceCheck")
+    if piece_ok:
+        gltf = read_glb_json(piece_glb)
+        node_names = [n.get("name", "") for n in gltf.get("nodes", [])]
+        check("碰撞块的网格没进 glb", "头块" not in node_names,
+              str(node_names[:10]))
+    else:
+        check("碰撞块 glb 导出成功", False, str(_piece_msg))
+    ops._remove_previews(scene)
+
+    # ---- 11. 凸包:导出认、预览也认(手动选『凸包』)----
+    slab = bpy.data.objects.get("Slab")
+    slab.gk_physics.collision_shape = "convex"
+    bpy.context.view_layer.update()
+    built = asset_export.build_collision(slab, True, slab.gk_physics)
+    check("凸包:导出用 ConvexPolygonShape3D + 点集",
+          built is not None and "ConvexPolygonShape3D" in built["sub_resource"]
+          and "PackedVector3Array(" in built["sub_resource"],
+          str(built and built.get("shape")))
+    wire = asset_export.collision_preview_mesh(slab, True, slab.gk_physics)
+    check("凸包:线框有点有边",
+          wire is not None and len(wire["verts"]) >= 4
+          and len(wire["edges"]) >= 6,
+          f"{len(wire['verts']) if wire else 0} 点")
+    slab.gk_physics.collision_shape = "auto"
+    bpy.context.view_layer.update()
+
     ball.gk_physics.collision_shape = "auto"
     ops._remove_previews(scene)
 

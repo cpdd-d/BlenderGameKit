@@ -615,4 +615,8 @@ DEMO_README = """# BlenderGameKit 2D 示例工程
 
 
 if __name__ == "__main__":
+    # 允许把示例生成到别处:godot_verify.ps1 的门禁跑在 _dist\godot_e2e,
+    # 免得每跑一次测试就把 examples/demo_2d 这批**已入库**的文件改一遍。
+    if len(sys.argv) > 1:
+        OUT_DIR = os.path.abspath(sys.argv[1])
     sys.exit(main())

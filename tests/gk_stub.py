@@ -110,6 +110,53 @@ class StubPort:
         self.comment = ""
 
 
+class StubVariable:
+    """一个侧栏声明的变量(名字 / 类型 / 初值 / 实现)。"""
+
+    def __init__(self):
+        self.var_name = "变量"
+        self.var_type = "float"
+        self.default_value = "0"
+        self.comment = ""
+        # 变量的"实现"(UE5 的 getter/setter;用户 2026-10-05 第十七轮)
+        self.getter = ""
+        self.setter = ""
+
+
+class StubVarCollection(list):
+    """桩里的变量声明集合(模仿 Blender 的 CollectionProperty 三件套)。"""
+
+    def add(self):
+        var = StubVariable()
+        self.append(var)
+        return var
+
+    def remove(self, index):
+        del self[index]
+
+
+class StubFunc:
+    """一个函数声明(名字 / 返回 / 参数)—— 对应 GKLogicFunction。"""
+
+    def __init__(self):
+        self.func_name = "新函数"
+        self.return_type = "void"
+        self.params = ""
+        self.comment = ""
+
+
+class StubFuncCollection(list):
+    """桩里的函数声明集合(模仿 CollectionProperty 三件套)。"""
+
+    def add(self):
+        func = StubFunc()
+        self.append(func)
+        return func
+
+    def remove(self, index):
+        del self[index]
+
+
 class StubNodeTree:
     def __init__(self, name="GameLogic"):
         self.name = name
@@ -117,10 +164,19 @@ class StubNodeTree:
         self.links = []
         # 对外端口(逻辑图的"真接口")—— 桩里也要有,否则校验那条路测不到
         self.gk_ports = StubPortCollection()
+        # 侧栏声明的变量(名字/类型/初值)—— 同上面的理由
+        self.gk_vars = StubVarCollection()
+        # 侧栏声明的函数(名字/返回/参数)—— 用户 2026-10-05 第十七轮
+        self.gk_funcs = StubFuncCollection()
         self.gk_enabled = True
 
     def new_node(self, node_class, name=None, location=(0.0, 0.0), **props):
         node = node_class()
+        # 节点要能顺着 id_data 找到自己所属的树(函数节点靠它查声明)
+        try:
+            node.id_data = self
+        except Exception:                                 # noqa: BLE001
+            pass
         if name:
             node.name = name
         node.location = location

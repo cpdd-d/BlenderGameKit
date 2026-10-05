@@ -7,9 +7,12 @@
 
 import os
 import re
+import shutil
 import sys
+import tempfile
 import types
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -20,7 +23,9 @@ import gk_stub  # noqa: E402
 gk_stub.install()
 ADDON = gk_stub.load_addon(os.path.join(ROOT, "BlenderGameKit"))
 
-from BlenderGameKit import codegen  # noqa: E402
+from BlenderGameKit import (blender_adapter, codegen, exporter, models, paths,  # noqa: E402
+                            project)
+from BlenderGameKit.nodes import node_base as NB  # noqa: E402
 from BlenderGameKit.nodes import nodes as NN  # noqa: E402
 
 V2 = dict(dimension="2", base_class="CharacterBody2D")
@@ -365,11 +370,13 @@ class TestTargets(Base):
 
         用户真跑报告:脚本挂在『碰撞代理』物体上,而相机是它的**兄弟节点**,
         `$"侧视机位"` 报 `Node not found` -> 『相机_切换』整段失效。
-        现在生成的是 `_gk_ref(self, "名字")`:先按路径找,再全树按名字找。
+        现在生成的是 `_gk_ref_typed(self, "名字", "类型")`:先在全树里找
+        **类型对得上**的那个(同名节点常常有两个:网格 + 碰撞代理),
+        找不到再退回 `_gk_ref` 的按名字查找。
         """
-        for name, script in (
-                ("GKNodeCameraSetCurrent", "相机_切换"),
-                ("GKNodeSetVelocity", "移动_设置速度")):
+        for name, script, gd_type in (
+                ("GKNodeCameraSetCurrent", "相机_切换", "Camera3D"),
+                ("GKNodeSetVelocity", "移动_设置速度", "Node")):
             tree = make_tree()
             event = tree.new_node(NN.GKNodeOnReady, "准备")
             node = tree.new_node(getattr(NN, name), script,
@@ -378,9 +385,11 @@ class TestTargets(Base):
             gk_stub.connect(tree, event, "执行", printer, "执行")
             gk_stub.connect(tree, event, "执行", node, "执行")
             code, _w = gen(tree, V3)
-            self.assertIn('_gk_ref(self, "某物")', code)
+            self.assertIn(f'_gk_ref_typed(self, "某物", "{gd_type}")', code)
             self.assertNotIn('$"某物"', code)
             self.assertIn("func _gk_ref(host: Node, wanted: String)", code)
+            self.assertIn("func _gk_ref_typed(host: Node, wanted: String, "
+                          "type_name: String) -> Node:", code)
 
     def test_other_node_becomes_onready(self):
         tree = make_tree()
@@ -389,7 +398,26 @@ class TestTargets(Base):
         gk_stub.connect(tree, event, "执行", velocity, "执行")
         code, _ = gen(tree, V2)
         self.assertIn("@onready var", code)
-        self.assertIn('_gk_ref(self, "Player")', code)
+        self.assertIn('_gk_ref_typed(self, "Player", "Node")', code)
+
+    def test_destroy_also_clears_same_named_mesh(self):
+        """『实例_销毁』要连"同名网格"一起清。
+
+        导出后一个物体常常是两个节点:网格在 glb 实例里、碰撞代理在
+        Colliders 下。只 free 代理的话物体还在画面上 ——
+        实测:金币吃掉后还杵在原地(只有代理消失了)。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        free = tree.new_node(NN.GKNodeQueueFree, "销毁", gk_target="金币1")
+        gk_stub.connect(tree, event, "执行", free, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_free_with_visual(node: Node) -> void:", code)
+        self.assertIn("_gk_free_with_visual(", code)
+        self.assertIn('find_children(str(node.name), "MeshInstance3D"', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
 
     def test_animation_player_default(self):
         """留空时用**运行时查找**,不能写死 `$AnimationPlayer`。
@@ -585,6 +613,47 @@ class TestDisplayNodes(Base):
         self.assertIn("self.process_mode = Node.PROCESS_MODE_DISABLED", code)
         self.assertIn("self.process_mode = Node.PROCESS_MODE_INHERIT", code)
         self.assert_indent_sane(code)
+
+    def test_set_collision_toggles_shapes(self):
+        """『物理_启用碰撞』:切的是碰撞形状的 disabled,而且是 deferred。
+
+        用户 2026-10-05。Godot 4 的 CollisionObject3D **没有**布尔 disabled
+        (实测:StaticBody3D 只有 disable_mode),所以只能切 CollisionShape;
+        逻辑常在 _physics_process 里跑,直接改会报
+        "Can't change this state while flushing queries" —— 必须 set_deferred。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        off = tree.new_node(NN.GKNodeSetCollision, "关碰撞",
+                            gk_target="金币1", gk_enable=False)
+        gk_stub.connect(tree, event, "执行", off, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_set_collision(node: Node, on: bool) -> void:", code)
+        self.assertIn("_gk_set_collision(", code)
+        self.assertIn(", false)", code)
+        # 两种形状都要覆盖(2D / 3D),而且一律 deferred
+        self.assertIn('"CollisionShape3D"', code)
+        self.assertIn('"CollisionShape2D"', code)
+        self.assertIn('shape.set_deferred("disabled", not on)', code)
+        # 网格 / 碰撞代理是**两个同名节点** —— 名字找到的往往是网格,
+        # 所以还要把 CollisionObject3D 那个同名节点一起算上
+        self.assertIn('"CollisionObject3D"', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_set_collision_pin_overrides_property(self):
+        """『启用』接了线就以线为准(和别的参数引脚一个规矩)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        flag = tree.new_node(NN.GKNodeConstBool, "真", gk_value=True)
+        node = tree.new_node(NN.GKNodeSetCollision, "开碰撞",
+                             gk_target="门", gk_enable=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        gk_stub.connect(tree, flag, "值", node, "启用")
+        code, _warnings = gen(tree, V3)
+        self.assertIn("_gk_set_collision(", code)
+        self.assertRegex(code, r"_gk_set_collision\([^,]+, true\)")
 
     def test_camera_set_current(self):
         tree = make_tree()
@@ -1041,7 +1110,11 @@ class TestUiNodes(Base):
         gk_stub.connect(tree, event, "执行", node, "执行")
         code, warnings = gen(tree, V2)
         self.assertEqual(warnings, [], warnings)
-        self.assertIn("_gk_find_widget(self, \"提示\")", code)
+        self.assertIn("_gk_find_widget(\"提示\")", code)
+        # 辅助函数不能带没用上的参数 —— Godot 会报 UNUSED_PARAMETER
+        # (用户实测:调试器『错误』页里挂着两条,就是这个)
+        self.assertIn("func _gk_find_widget(widget_name: String) -> Control:", code)
+        self.assertNotIn("host: Node, widget_name", code)
         self.assertIn(".visible = false", code)
         # 找不到控件要给告警，而不是静默什么都不做
         self.assertIn("push_warning(", code)
@@ -1737,6 +1810,58 @@ class TestGravityAndCamera(Base):
         self.assertIn(".velocity.z = ", code)
         self.assertNotIn(".velocity.y = ", code)
 
+    def test_move_follow_camera_transforms_by_camera(self):
+        """勾『随相机朝向』:方向按当前相机的水平朝向变换(第三人称)。
+
+        回归(用户 2026-10-04):不勾时 `velocity.x = _dir.x`、
+        `velocity.z = -_dir.z` 写死在世界轴上 —— 转视角后按 W 还是往
+        原来的方向走,方向感错位。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=6.0)
+        move.gk_keep_y = True
+        move.gk_follow_camera = True
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual([w for w in warnings if "基类已从" not in str(w)], [],
+                         warnings)
+        # 自动用当前相机,并按它的水平基向量(前 / 右)变换
+        self.assertIn("_gk_resolve_camera(self)", code)
+        self.assertIn("global_transform.basis.z", code)
+        self.assertIn("global_transform.basis.x", code)
+        self.assertIn(".velocity.x = ", code)
+        self.assertIn(".velocity.z = ", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_move_reference_pin_beats_camera_toggle(self):
+        """『参考系』引脚优先:接了节点就按它变换,不再回退到当前相机。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        ref = tree.new_node(NN.GKNodeGetNode, "参考", gk_path="侧视机位")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        move.gk_follow_camera = True          # 有引脚时这个应被忽略
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, ref, "节点", move, "参考系")
+        code, _ = gen(tree, V3)
+        self.assertIn("is Node3D", code)
+        self.assertIn("global_transform.basis.z", code)
+        self.assertNotIn("_gk_resolve_camera(self)", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_move_follow_camera_ignored_in_2d(self):
+        """2D 没有"绕角色转的视角",勾了也不该生成 3D 基向量代码。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        move.gk_follow_camera = True
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("global_transform", code)
+        self.assertNotIn("is Node3D", code)
+
     def test_camera_follow_auto_finds_camera(self):
         """相机留空时自动找，并且不告警刷屏(这个节点每帧都在跑)。"""
         tree = make_tree()
@@ -1782,6 +1907,47 @@ class TestGravityAndCamera(Base):
         self.assertEqual(warnings, [], warnings)
         self.assertIn("call_deferred", code)
         self.assertIn("reload_current_scene", code)
+
+
+class TestChangeScene(Base):
+    """『场景_切换关卡』(用户 2026-10-04:吃完全部金币 -> 转场 -> 换关)。"""
+
+    def _tree(self, path="res://scenes/关卡2.tscn"):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeChangeScene, "切到第二关",
+                             gk_scene_path=path)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        return tree, node
+
+    def test_switches_deferred_to_target_scene(self):
+        tree, _node = self._tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 必须延到帧末换场景(和重载场景同一个坑)
+        self.assertIn("call_deferred", code)
+        self.assertIn("change_scene_to_file", code)
+        self.assertIn("res://scenes/关卡2.tscn", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_empty_path_warns_and_emits_nothing(self):
+        tree, _node = self._tree(path="")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("没填目标场景" in str(w) for w in warnings), warnings)
+        self.assertNotIn("change_scene_to_file", code)
+
+    def test_non_res_path_warns(self):
+        """填了相对路径要提醒 —— change_scene_to_file 只认 res:// 或绝对路径。"""
+        tree, _node = self._tree(path="scenes/关卡2.tscn")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("res://" in str(w) for w in warnings), warnings)
+
+    def test_path_with_quote_is_escaped(self):
+        """路径带引号也必须生成合法 GDScript(否则整段代码语法错误)。"""
+        tree, _node = self._tree(path='res://scenes/a"b.tscn')
+        code, _warnings = gen(tree, V3)
+        self.assertIn('\\"', code)
 
 
 class TestNodeMenu(Base):
@@ -2006,8 +2172,9 @@ class TestInputActions(Base):
         self.assertIn("var is_hurt: bool", code)
         self.assertIn("is_hurt = true", code)
         self.assertNotIn("is_hurt = 1.0", code)
-        # 告警要说人话:告诉用户接『常量_布尔』,而不是让他去改变量名
-        self.assertTrue(any("常量_布尔" in w for w in warnings), warnings)
+        # 产物对就行 —— 这种明确转换**不用**再告警(第二十四轮:虚惊,
+        # 见 TestDeclaredVariables.test_declared_bool_written_with_number_is_quiet)
+        self.assertEqual(warnings, [], warnings)
         self.assert_no_chinese_identifiers(code)
 
     def test_set_var_flow_fans_out_to_several_branches(self):
@@ -2196,6 +2363,95 @@ class TestCameraFollowDim(Base):
             code, _ = gen(self._tree(distance), V3)
             self.assert_no_chinese_identifiers(code)
             self.assert_indent_sane(code)
+
+
+class TestGodCamera(Base):
+    """上帝摄像机(用户 2026-10-04:像虚幻 5 那样自由飞着看这一关)。
+
+    ── 第二轮改了什么(用户实测反馈)──────────────────────────────
+    第一版把上帝机写进**角色脚本**里,实测两个问题:
+      * 场景里没有角色(纯场景测试)就没有那个脚本 —— 上帝机跟着不存在:
+        "在没有角色的测试里动不了,鼠标也无法控制视角旋转";
+      * 飞相机时角色照样跟着 WASD 走:"上帝视角还会影响角色移动"。
+
+    现在:上帝机本体由**环境脚本**生成(每张 .tscn 都有,见
+    asset_export.ENVIRONMENT_SCRIPT 的 god_camera 段);角色脚本只留
+    `_gk_god_camera_active()` 守卫 —— 上帝视角期间移动 / 跳跃 / 鼠标
+    位移都让给上帝机。环境脚本那侧的测试见 TestEnvironmentGodCamera。
+    """
+
+    def _tree(self):
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=6.0)
+        gk_stub.connect(tree, ev, "执行", move, "执行")
+        return tree
+
+    def test_off_by_default(self):
+        """默认关闭时一行都不生成 —— 不能污染普通导出。"""
+        code, _ = gen(self._tree(), V3)
+        self.assertNotIn("_gk_god_camera_active", code)
+        self.assertNotIn("_gk_fly_cam", code)
+        self.assertNotIn("上帝摄像机", code)
+
+    def test_on_only_gates_control_no_fly_camera(self):
+        """开着时:角色脚本里**不再内嵌**上帝机,只留守卫。
+
+        上帝机本体已搬到环境脚本 —— 角色脚本里再有一份的话,没有角色的
+        场景依然没有它(用户实测的那个 bug),而有了角色的场景会有两台。
+        """
+        code, warns = gen(self._tree(), dict(V3, god_camera=True))
+        self.assertEqual(warns, [], warns)
+        self.assertIn("func _gk_god_camera_active() -> bool:", code)
+        self.assertIn('is_in_group("gk_god_camera")', code)
+        # 上帝视角期间:WASD 推出来的方向直接抹成零(角色原地不动)
+        self.assertIn("if _gk_god_camera_active():", code)
+        self.assertIn("= Vector3.ZERO", code)
+        self.assertNotIn("_gk_fly_cam", code)
+        self.assertNotIn("KEY_TAB", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_jump_uses_single_line_guard(self):
+        """跳跃要挡 —— 用**单行** if,不能把整段包进块里。
+
+        踩过的坑:『方向』引脚取输入的那几行是固定缩进写出来的,包块会让
+        它们不跟着缩进,Godot 报 `Expected indented block after "if" block`
+        (实测:导出的关卡1脚本直接解析失败)。
+        """
+        tree = make_tree()
+        ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        jump = tree.new_node(NN.GKNodeJump, "跳跃")
+        gk_stub.connect(tree, ev, "执行", jump, "执行")
+        code, _ = gen(tree, dict(V3, god_camera=True))
+        self.assertIn("if not _gk_god_camera_active(): self.velocity.y = jump_force",
+                      code)
+        self.assert_indent_sane(code)
+
+    def test_no_guard_when_off(self):
+        """开关关着时:移动方向那两行守卫一个字都不能多。"""
+        code, _ = gen(self._tree(), V3)
+        self.assertNotIn("_gk_god_camera_active", code)
+        self.assertIn("= (", code)
+
+    def test_mouse_delta_gated_while_flying(self):
+        """上帝视角期间游戏这边不攒鼠标位移(那会儿鼠标是转上帝机的)。"""
+        def build():
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            printer = tree.new_node(NN.GKNodePrint, "打印")
+            motion = tree.new_node(NN.GKNodeMouseMotion, "鼠标移动量")
+            gk_stub.connect(tree, motion, "移动量", printer, "内容")
+            gk_stub.connect(tree, event, "执行", printer, "执行")
+            return tree
+
+        plain, _ = gen(build(), V3)
+        self.assertIn("if event is InputEventMouseMotion:", plain)
+        self.assertNotIn("_gk_god_camera_active", plain)
+
+        gated, _ = gen(build(), dict(V3, god_camera=True))
+        self.assertIn("if event is InputEventMouseMotion "
+                      "and not _gk_god_camera_active():", gated)
 
 
 class TestMoveSpeedDimension(Base):
@@ -2637,6 +2893,228 @@ class TestDynamicPins(Base):
     def test_no_chinese_identifiers_in_switch_names(self):
         code, _ = self._build_switch(5, {"3": "三"})
         self.assert_no_chinese_identifiers(code)
+
+
+class TestInlineProps(Base):
+    """参数直接画在节点体上(用户 2026-10-04)。
+
+    节点声明的参数(gk_prop_defs)以前只有**手写了 draw_buttons** 的节点
+    才看得到 —— 没写的那批(『打印_输出』的文本、『等待_秒』的真实时间…)
+    参数是"隐身"的。基类现在给兜底:没重写 draw_buttons 的节点,自动把
+    声明的参数画出来。这里测"要画哪些参数"这份清单(UI 画不出来,离线
+    桩没有 layout)。
+    """
+
+    def test_inline_entries_cover_declared_props(self):
+        node = make_tree().new_node(NN.GKNodePrint, "打印")
+        names = [name for name, _kind, _label in NB.inline_prop_entries(node)]
+        self.assertIn("gk_text", names)
+
+    def test_inline_entries_keep_kind_and_label(self):
+        node = make_tree().new_node(NN.GKNodeForLoop, "循环")
+        entries = {name: (kind, label)
+                   for name, kind, label in NB.inline_prop_entries(node)}
+        self.assertEqual(entries["gk_index_name"], ("string", "索引变量"))
+
+    def test_node_reference_prop_uses_picker_kind(self):
+        """节点引用要用带下拉的选择器,所以 kind 必须还是 'node'。"""
+        node = make_tree().new_node(NN.GKNodeAnimStop, "停止")
+        kinds = {name: kind for name, kind, _ in NB.inline_prop_entries(node)}
+        self.assertEqual(kinds.get("gk_player"), "node")
+
+    def test_auto_draw_only_when_not_overridden(self):
+        """重写了 draw_buttons 的节点自己画参数,基类兜底不参与(不会重复画)。"""
+        # 『打印_输出』没有自己的 draw_buttons -> 走基类兜底
+        self.assertNotIn("draw_buttons", NN.GKNodePrint.__dict__)
+        # 『移动_按方向』自己画了(随相机朝向那个勾) -> 不受兜底影响
+        self.assertIn("draw_buttons", NN.GKNodeMoveDirection.__dict__)
+
+
+class TestVariablePanel(Base):
+    """变量集中面板(用户 2026-10-04):扫描图里的变量引用,点一下高亮。
+
+    玩法图的变量是隐式声明的(第一次『变量_设置』就自动建),没有一张
+    表能看"有哪些变量、谁读谁写"。这里测扫描结果(UI 画不出来,离线桩
+    没有 layout)。
+    """
+
+    def test_collects_readers_and_writers(self):
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "写生命", gk_var_name="hp")
+        tree.new_node(NN.GKNodeGetVar, "读生命", gk_var_name="hp")
+        tree.new_node(NN.GKNodeGetVar, "读分数", gk_var_name="score")
+        refs = {name: (len(sets), len(gets))
+                for name, sets, gets in props.variable_references(tree)}
+        self.assertEqual(refs["hp"], (1, 1), refs)
+        self.assertEqual(refs["score"], (0, 1), refs)
+
+    def test_multi_slot_set_counts_each_variable(self):
+        """一张『变量_设置』卡片能写多个变量,每个都要被收进表里。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "多变量", gk_var_name="hp",
+                      gk_var_count=3, gk_var_name_2="mp", gk_var_name_3="exp")
+        refs = {name: (len(sets), len(gets))
+                for name, sets, gets in props.variable_references(tree)}
+        self.assertEqual(refs["hp"], (1, 0), refs)
+        self.assertEqual(refs["mp"], (1, 0), refs)
+        self.assertEqual(refs["exp"], (1, 0), refs)
+
+    def test_nodes_for_variable_lists_all_refs(self):
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "写", gk_var_name="hp")
+        tree.new_node(NN.GKNodeGetVar, "读", gk_var_name="hp")
+        tree.new_node(NN.GKNodeGetVar, "别的", gk_var_name="score")
+        hits = props.nodes_for_variable(tree, "hp")
+        self.assertEqual([node.name for node in hits], ["写", "读"])
+
+    def test_empty_name_is_ignored(self):
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "空名", gk_var_name="")
+        self.assertEqual(props.variable_references(tree), [])
+
+
+class TestDeclaredVariables(Base):
+    """侧栏声明的变量(用户 2026-10-04):名字/类型/初值一处定,节点里挑。
+
+    声明过的变量在遍历节点**之前**就定好类型和初值,后面第一个
+    『变量_设置』复用这份声明;没声明过的仍然隐式自动建(老图不变)。
+    """
+
+    def _declare(self, tree, name, var_type="float", default="0"):
+        tree.gk_vars.add()
+        var = tree.gk_vars[len(tree.gk_vars) - 1]
+        var.var_name = name
+        var.var_type = var_type
+        var.default_value = default
+        return var
+
+    def test_declared_type_and_initial_win(self):
+        tree = make_tree()
+        self._declare(tree, "hp", "float", "42.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        setter = tree.new_node(NN.GKNodeSetVar, "写血", gk_var_name="hp",
+                               gk_value=100.0)
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var hp: float = 42.0", code)
+        self.assertIn("hp = 100.0", code)
+        # 声明只生成一份(节点不该把类型/初值再声明一遍)
+        self.assertEqual(code.count("var hp:"), 1, code)
+
+    def test_unused_declaration_is_still_emitted(self):
+        """声明了但图里没人用 —— 也要生成成员变量(它就是"一处定义")。"""
+        tree = make_tree()
+        self._declare(tree, "score", "int", "0")
+        code, _warnings = gen(tree, V3)
+        self.assertIn("var score: int = 0", code)
+
+    def test_bool_default_zero_is_coerced(self):
+        """初值框默认是 0 —— 声明布尔时忘了改,也不能生成 `bool = 0`。"""
+        tree = make_tree()
+        self._declare(tree, "win", "bool", "0")
+        code, _warnings = gen(tree, V3)
+        self.assertIn("var win: bool = false", code)
+
+    def test_string_initial_gets_quotes(self):
+        tree = make_tree()
+        self._declare(tree, "player_name", "string", "小明")
+        code, _warnings = gen(tree, V3)
+        self.assertIn('var player_name: String = "小明"', code)
+
+    def test_declared_bool_written_with_number_is_quiet(self):
+        """声明成布尔、节点却填数字 -> 直接写成 true,不再告警(第二十四轮)。
+
+        ── 这条测试的立场变过一次 ──────────────────────────────────
+        以前这里断言"必须告警",理由是"提醒用户去接『常量_布尔』"。
+        做小游戏示例时发现那是**虚惊**:数字框只能填数字,写布尔变量
+        本来就只能这么写,生成器也早就正确转成 `= true` —— 一条示例里
+        五处这样的写法就刷出五条告警,而新的『导出报告』会把这些告警
+        摆在最显眼的位置(第二十三轮),等于把"没有问题"报成问题。
+
+        所以现在:这种**明确**的转换安静地做掉(产物一样),真对不上的
+        类型(文本 -> 整数)仍然告警 —— 见 TestSetVarNumericCoercion。
+        """
+        tree = make_tree()
+        self._declare(tree, "win", "bool", "false")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        setter = tree.new_node(NN.GKNodeSetVar, "写", gk_var_name="win",
+                               gk_value=1.0)
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("win = true", code)
+
+    def test_empty_name_is_skipped(self):
+        tree = make_tree()
+        self._declare(tree, "", "float", "0")
+        code, _warnings = gen(tree, V3)
+        self.assertNotIn("# ---- 成员变量 ----", code)
+
+    def test_declaration_is_reported_in_notes(self):
+        tree = make_tree()
+        self._declare(tree, "hp", "float", "1.0")
+        gen(tree, V3)
+        notes = " ".join(getattr(codegen, "last_notes", []) or [])
+        self.assertIn("声明变量", notes, notes)
+
+
+class TestSocketTypeHint(Base):
+    """通配引脚的自动类型提示(用户 2026-10-04)。
+
+    「任意值」引脚是灰的万能接口,以前看不出线上跑的是数值还是文本。
+    现在沿连线解析出具体类型,写进引脚标签、并按类型上色。
+    """
+
+    def test_linked_input_resolves_upstream_type(self):
+        from BlenderGameKit import gk_sockets as S
+        tree = make_tree()
+        const = tree.new_node(NN.GKNodeConstFloat, "常量")
+        setvar = tree.new_node(NN.GKNodeSetVar, "设置", gk_var_name="hp")
+        gk_stub.connect(tree, const, "值", setvar, "值")
+        socket = setvar.inputs.get("值")
+        self.assertEqual(socket.bl_idname, "GKSocketAny")
+        self.assertEqual(S.resolved_type_label(socket), "数值")
+        self.assertEqual(S.socket_caption(socket, "值"), "值 (数值)")
+
+    def test_any_output_follows_downstream(self):
+        """输出引脚自身没有类型,靠下游那个具体引脚判定。"""
+        from BlenderGameKit import gk_sockets as S
+        tree = make_tree()
+        getvar = tree.new_node(NN.GKNodeGetVar, "取", gk_var_name="hp")
+        vector = tree.new_node(NN.GKNodeVectorMake, "向量")
+        gk_stub.connect(tree, getvar, "值", vector, "X")
+        self.assertEqual(S.resolved_type_label(getvar.outputs.get("值")), "数值")
+
+    def test_any_to_any_leaves_hint_empty(self):
+        """两端都是通配、又没有声明类型时不瞎标(宁可留空)。"""
+        from BlenderGameKit import gk_sockets as S
+        tree = make_tree()
+        getvar = tree.new_node(NN.GKNodeGetVar, "取", gk_var_name="hp")
+        setvar = tree.new_node(NN.GKNodeSetVar, "设", gk_var_name="hp")
+        gk_stub.connect(tree, getvar, "值", setvar, "值")
+        self.assertEqual(S.resolved_type_label(setvar.inputs.get("值")), "")
+
+    def test_declared_variable_type_is_used(self):
+        """没有连线时,退回读变量在树里声明的类型(动画树变量)。"""
+        import types
+        from BlenderGameKit import gk_sockets as S
+        tree = make_tree()
+        node = tree.new_node(NN.GKNodeAnimGetVar, "取变量", gk_var_name="hp")
+        node.id_data = types.SimpleNamespace(gk_variables=[
+            types.SimpleNamespace(var_name="hp", var_type="bool")])
+        self.assertEqual(S.resolved_type_label(node.outputs.get("值")), "布尔")
+
+    def test_non_any_caption_is_untouched(self):
+        """普通引脚已经有颜色/形状说明类型,不加文字噪音。"""
+        from BlenderGameKit import gk_sockets as S
+        tree = make_tree()
+        const = tree.new_node(NN.GKNodeConstFloat, "常量")
+        self.assertEqual(S.socket_caption(const.outputs.get("值"), "值"), "值")
 
 
 class TestAnimationNameSources(Base):
@@ -3932,6 +4410,51 @@ class TestCameraSuite(Base):
         self.assertNotIn("intersect_ray", code)
         self.assertNotIn("_gk_spring_pos", code)
 
+    def test_two_spring_arms_keep_separate_state(self):
+        """两根弹簧臂各管一台相机 —— 成员变量必须按节点分开。
+
+        用户 2026-10-04:"俯视图……动不了" —— 给俯瞰机位加了第二根杆子。
+        变量不带后缀时两根杆子共用 `_gk_spring_pos` / `_gk_spring_ready`
+        这一批状态,每帧轮流覆盖:第一根把相机摆好,第二根接着在**它**的
+        结果上继续 lerp,两台相机都被拖成中间值。这里断言第二根杆子拿到
+        独立的一份状态(`_2` 后缀)。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        side = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂",
+                             gk_target="示例角色", gk_camera="侧视机位",
+                             gk_arm=5.0, gk_pitch=12.0)
+        top = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂俯瞰",
+                            gk_target="示例角色", gk_camera="俯瞰机位",
+                            gk_arm=16.0, gk_pitch=80.0)
+        gk_stub.connect(tree, event, "执行", side, "执行")
+        gk_stub.connect(tree, side, "完成", top, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 第一根用原名字,第二根带 _2 后缀 —— 两份状态互不覆盖
+        self.assertIn("_gk_spring_pos:", code)
+        self.assertIn("_gk_spring_pos_2:", code)
+        self.assertIn("_gk_spring_ready_2", code)
+        # 两台相机各自被摆一次
+        self.assertIn("相机_俯瞰机位", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_spring_arm_pitch_yaw_sign(self):
+        """俯仰/偏航取负 —— "视角旋转逻辑颠倒"的修复不能回退。
+
+        `Basis.from_euler(Vector3(p, y, 0)).z` 的 y 分量是 `-sin(p)`:
+        填正值相机跑到枢轴**下方**;yaw 正向在 Godot 里是逆时针(左转),
+        鼠标右移给正值会变成"往右转视角、画面往左"。所以两个都取负。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        arm = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂",
+                            gk_target="示例角色", gk_camera="侧视机位",
+                            gk_arm=5.0, gk_pitch=12.0)
+        gk_stub.connect(tree, event, "执行", arm, "执行")
+        code, _warnings = gen(tree, V3)
+        self.assertIn("-deg_to_rad(12.0), _gk_yaw, 0.0)", code)
+
     def test_camera_status_outputs(self):
         """『相机_取状态』:名字 / 位置 / 朝向 / 视野 / 开着吗。"""
         tree = make_tree()
@@ -4174,6 +4697,479 @@ class TestTimelineAndCamera(Base):
                          ["进入", "进入 2", "进入 3", "进入 4"])
         # 老文件里接在『进入』上的线不会因为改名而断
         self.assertEqual(node.inputs[0].name, "进入")
+
+
+class TestCurveAndTimeline(Base):
+    """第十二轮:过渡曲线(缓动档位 / 自定义曲线)、沿曲线运镜、时间轴。
+
+    曲线在 Blender 里是**真实物体**,离线测试里没有 —— 所以采样那层
+    用 mock 打桩,验的是"拿到曲线数据之后生成成什么"。
+    """
+
+    # ---- 曲线资产的纯函数 ----
+    def test_curve_tres_zero_tangent_must_be_float(self):
+        """平坦段的切线必须写成 `0.0` 而不是 `0`。
+
+        ── 这条是真 Godot 抓出来的(2026-10-04)────────────────────
+        写成 `0` 时 .tres 里是 INT,Godot 装载 Curve 时报
+            Condition "p_input[i + 2].get_type() != Variant::FLOAT" is true
+        整条曲线静默变成"全是 0"的直线(采样恒为 0)。
+        """
+        from BlenderGameKit import curve_assets
+        points = [(0.0, 0.0), (0.5, 0.0), (1.0, 1.0)]
+        text = curve_assets.curve_tres_text(points)
+        self.assertIn("point_count = 3", text)
+        self.assertIn('type="Curve"', text)
+        self.assertIn("Vector2(0, 0), 0.0, 0.0, 1, 1", text)
+        # 平坦段(斜率 0)也不能漏出裸的 int
+        self.assertNotIn(", 0, 0, 1, 1", text.replace(", 0.0, 0.0, 1, 1", ""))
+
+    def test_curve3d_tres_format(self):
+        from BlenderGameKit import curve_assets
+        text = curve_assets.curve3d_tres_text([(0, 0, 0), (0, 2, 3), (4, 1, 6)])
+        self.assertIn('type="Curve3D"', text)
+        self.assertIn("PackedVector3Array(", text)
+        self.assertIn("4, 1, 6", text)
+        self.assertIn("point_count = 3", text)
+        # 每个点三组(入柄 / 出柄 / 位置)—— 3 点共 9 组 27 个数
+        body = text.split("PackedVector3Array(", 1)[1].split(")", 1)[0]
+        self.assertEqual(len(body.split(",")), 27)
+
+    def test_curve_file_name_is_stable_and_unique(self):
+        """文件名必须稳定(脚本里写死的路径)而且不撞名(中文会压成下划线)。"""
+        from BlenderGameKit import curve_assets
+        self.assertEqual(curve_assets.curve_file_name("运镜曲线"),
+                         curve_assets.curve_file_name("运镜曲线"))
+        self.assertNotEqual(curve_assets.curve_file_name("运镜曲线"),
+                            curve_assets.curve_file_name("角色曲线"))
+        self.assertTrue(curve_assets.curve_res_path("运镜曲线")
+                        .startswith("res://curves/"))
+
+    def test_curve_points_convert_to_godot_axes(self):
+        """曲线采样出来的点必须换成 Godot 坐标(Blender Z-up -> Godot Y-up)。
+
+        不换的话"在视口里画的轨道"和"游戏里跑的轨道"不是同一条
+        (高度跑到另一个轴上)——『相机_路径』一直潜着的 bug。
+        """
+        from BlenderGameKit import curve_assets
+        self.assertEqual(curve_assets._to_godot_points([(1.0, 2.0, 3.0)]),
+                         [(1.0, 3.0, -2.0)])
+
+    def test_curve_files_skip_empty(self):
+        from BlenderGameKit import curve_assets
+        files = curve_assets.curve_files("D:/tmp", {
+            "好曲线": {"kind": "Curve", "points": [(0.0, 0.0), (1.0, 1.0)]},
+            "空曲线": {"kind": "Curve", "points": []},
+        })
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0][0], "好曲线")
+
+    # ---- L1:过渡曲线档位 ----
+    def test_camera_switch_ease_preset(self):
+        """『过渡曲线』选了缓出 -> 过渡比例过一遍 _gk_ease(引擎档位)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "推镜",
+                               gk_target="特写机位", gk_blend=0.8,
+                               gk_blend_trans="EASE_OUT")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ease(", code)
+        self.assertIn("Tween.TRANS_SINE, Tween.EASE_OUT", code)
+        self.assertIn("Tween.interpolate_value", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_camera_switch_linear_keeps_old_code(self):
+        """线性档(默认)= 老图产物一字不变:不该出现 _gk_ease。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "切镜头",
+                               gk_target="主相机", gk_blend=0.5)
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, _w = gen(tree, V3)
+        self.assertNotIn("_gk_ease", code)
+        self.assertIn("var _gk_ct: float = clampf(1.0 - _gk_cam_blend_left",
+                      code)
+
+    def test_camera_ease_applies_for_second_switch(self):
+        """两台『相机_切换』:后面那台的过渡曲线也必须生效。
+
+        ── 为什么(真写出来的坑)──────────────────────────────────────
+        每帧推进的那段钩子**只生成一次**。第一版"要不要过缓动"只看第一个
+        节点:先遇到一台匀速的,后面那台"回弹"就**静默不生效** ——
+        用户会以为"我选了曲线但没用"。现在后遇到的缓动节点会把钩子升级。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeCameraSetCurrent, "第一台",
+                              gk_target="机位A", gk_blend=0.5)
+        second = tree.new_node(NN.GKNodeCameraSetCurrent, "第二台",
+                               gk_target="机位B", gk_blend=0.5,
+                               gk_blend_trans="BACK")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Tween.TRANS_BACK", code)
+        # 两台各自的档位都写在切换那一刻(成员变量,谁切谁覆盖)
+        self.assertIn("_gk_cam_trans = Tween.TRANS_LINEAR", code)
+        self.assertIn("_gk_cam_trans = Tween.TRANS_BACK", code)
+
+    def test_camera_switch_custom_curve_without_pick_warns(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "推镜",
+                               gk_target="特写机位", gk_blend=0.6,
+                               gk_blend_trans="CUSTOM", gk_blend_curve="")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("自定义" in w for w in warnings), warnings)
+
+    def test_camera_switch_custom_curve_loads_resource(self):
+        """选了自定义曲线 -> 生成 load(res://curves/...),并登记要写的资源。"""
+        from BlenderGameKit import curve_assets
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "推镜",
+                               gk_target="特写机位", gk_blend=0.6,
+                               gk_blend_trans="CUSTOM",
+                               gk_blend_curve="缓动曲线")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        fake = [(i / 3.0, (i / 3.0) ** 2) for i in range(4)]
+        with mock.patch.object(curve_assets, "curve_exists", lambda _n: True), \
+                mock.patch.object(curve_assets, "sample_ease_curve",
+                                  lambda _n, samples=32: fake), \
+                mock.patch.object(curve_assets, "curve_dimensions",
+                                  lambda _n: "2D"):
+            result = codegen.generate_result(tree, V3)
+        code = result.code
+        self.assertEqual(result.warnings, [], result.warnings)
+        self.assertIn("func _gk_curve_load(path: String) -> Curve:", code)
+        self.assertIn("func _gk_curve_res(path: String) -> Resource:", code)
+        self.assertIn('res://curves/', code)
+        self.assertIn("_gk_cam_ease_curve = _gk_curve_load(", code)
+        self.assertIn("_gk_ease(", code)
+        # 资源内容也带出来了(导出时写 .tres)
+        self.assertIn("缓动曲线", result.curve_assets)
+        self.assertEqual(result.curve_assets["缓动曲线"]["kind"], "Curve")
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_spring_arm_lag_curve(self):
+        """弹簧臂的跟随比例也能过曲线(回弹 = 过冲一点的弹簧感)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        arm = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂",
+                            gk_target="角色", gk_camera="侧视机位",
+                            gk_lag=8.0, gk_lag_trans="BACK")
+        gk_stub.connect(tree, event, "执行", arm, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Tween.TRANS_BACK", code)
+        self.assertIn(".lerp(_gk_want, _gk_ease(", code)
+
+    def test_spring_arm_default_lag_untouched(self):
+        """没动『跟随曲线』-> 老图那行一字不变。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        arm = tree.new_node(NN.GKNodeCameraSpringArm, "弹簧臂",
+                            gk_target="角色", gk_lag=8.0)
+        gk_stub.connect(tree, event, "执行", arm, "执行")
+        code, _w = gen(tree, V3)
+        self.assertIn("clampf(8.0 * get_physics_process_delta_time(), 0.0, 1.0))",
+                      code)
+        self.assertNotIn("_gk_ease", code)
+
+    # ---- L3:沿曲线运镜 ----
+    def test_camera_switch_along_curve(self):
+        from BlenderGameKit import curve_assets
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "开场运镜",
+                               gk_target="特写机位", gk_blend=2.0,
+                               gk_path_mode="CURVE", gk_path_curve="运镜轨道")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        fake = [(0.0, 0.0, 0.0), (1.0, 2.0, 0.0), (3.0, 0.0, 1.0)]
+        with mock.patch.object(curve_assets, "curve_exists", lambda _n: True), \
+                mock.patch.object(curve_assets, "sample_path_points",
+                                  lambda _n, samples=48: fake), \
+                mock.patch.object(curve_assets, "curve_dimensions",
+                                  lambda _n: "3D"):
+            result = codegen.generate_result(tree, V3)
+        code = result.code
+        self.assertEqual(result.warnings, [], result.warnings)
+        self.assertIn("func _gk_curve3d_load(path: String) -> Curve3D:", code)
+        self.assertIn("_gk_cam_fly_curve = _gk_curve3d_load(", code)
+        self.assertIn("_gk_cam_fly_len = _gk_cam_fly_curve.get_baked_length()", code)
+        # 位置 = 曲线上的点(改的是插值后 Transform3D 的 origin);
+        # ⚠ 曲线点**必须在 _gk_xf 同一层**取 —— 早先把 `_gk_fly` 声明在
+        # `if 有曲线:` 块里、块外再用,Godot 直接解析失败(真导出抓到的)
+        self.assertIn("_gk_xf.origin = _gk_cam_fly_curve.sample_baked(", code)
+        self.assertNotIn("var _gk_fly:", code)
+        # 朝向还是从旧机位平滑转到目标机位(位置走曲线,朝向走插值)
+        self.assertIn("interpolate_with(", code)
+        self.assertEqual(result.curve_assets["运镜轨道"]["kind"], "Curve3D")
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_camera_switch_along_curve_missing_warns(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "开场运镜",
+                               gk_target="特写机位", gk_blend=2.0,
+                               gk_path_mode="CURVE", gk_path_curve="不存在")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("找不到" in w for w in warnings), warnings)
+
+    # ---- 时间轴 ----
+    def _timeline_tree(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "开场")
+        timeline = tree.new_node(NN.GKNodeTimeline, "开门", **props)
+        printer = tree.new_node(NN.GKNodePrint, "更新时")
+        printer.gk_text = "tick"
+        done = tree.new_node(NN.GKNodePrint, "结束时")
+        done.gk_text = "done"
+        gk_stub.connect(tree, event, "执行", timeline, "执行")
+        gk_stub.connect(tree, timeline, "更新", printer, "执行")
+        gk_stub.connect(tree, timeline, "已结束", done, "执行")
+        return tree, timeline
+
+    def test_timeline_basic_update_and_finished(self):
+        tree, _timeline = self._timeline_tree(gk_time=0.5, gk_mode="ONCE",
+                                              gk_track_count=2)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 状态变量(每节点一份)、进度推进、Alpha
+        self.assertIn("var _gk_tl_time: float", code)
+        self.assertIn("_gk_tl_play = true", code)
+        self.assertIn("_gk_tl_time += delta", code)
+        self.assertIn("var _gk_tl_raw: float = clampf(_gk_tl_time / 0.5",
+                      code)
+        self.assertIn("_gk_tl_alpha = _gk_tl_raw", code)
+        # 轨道值 = 从 + (到 - 从) * 进度
+        self.assertIn("_gk_tl_tr1 = 0.0 + (1.0 - 0.0) * _gk_tl_raw", code)
+        self.assertIn("_gk_tl_tr2 = 0.0 + (1.0 - 0.0) * _gk_tl_raw", code)
+        # 更新 / 已结束 各自是一个函数,由每帧钩子调用
+        self.assertIn("func _gk_timeline_tick() -> void:", code)
+        self.assertIn("func _gk_timeline_done() -> void:", code)
+        self.assertIn('print("tick")', code)
+        self.assertIn('print("done")', code)
+        # 挂在 _process(画面的事用渲染帧)
+        process = code.split("func _process", 1)[1].split("func ", 1)[0]
+        self.assertIn("_gk_timeline_tick()", process)
+        self.assertIn("_gk_tl_play = false", code)
+        self.assertIn("_gk_tl_done = true", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_timeline_loop_and_pingpong(self):
+        tree, _t = self._timeline_tree(gk_time=1.0, gk_mode="LOOP")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("fmod(_gk_tl_time, 1.0)", code)
+        self.assertNotIn("_gk_tl_done = true", code)
+
+        tree2, _t2 = self._timeline_tree(gk_time=1.0, gk_mode="PINGPONG")
+        code2, warnings2 = gen(tree2, V3)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn("_gk_tl_dir = -1.0", code2)
+        self.assertIn("_gk_tl_time += _gk_tl_dir * delta", code2)
+
+    def test_timeline_replay_pin_shares_one_start_block(self):
+        """『重播』入口:和『执行』一样从头开始,整段只生成一遍。
+
+        用户 2026-10-05:"给『定时_时间轴』加一个『重播』执行口" ——
+        以前一个输入引脚只能接一条线,想重播就得拿变量绕一圈。
+        两个入口**不能**各生成一遍:每帧钩子会跑两次(时间轴双倍速),
+        分支函数还会重名(Godot 拒绝整个脚本)。
+        """
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧", gk_order=0)
+        key = tree.new_node(NN.GKNodeKey, "按R", gk_key="R", gk_action="replay")
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        timeline = tree.new_node(NN.GKNodeTimeline, "开场", gk_time=1.0)
+        tick = tree.new_node(NN.GKNodePrint, "更新时")
+        tick.gk_text = "tick"
+        gk_stub.connect(tree, ready, "执行", timeline, "执行")
+        gk_stub.connect(tree, timeline, "更新", tick, "执行")
+        gk_stub.connect(tree, physics, "执行", branch, "执行")
+        gk_stub.connect(tree, key, "结果", branch, "条件")
+        gk_stub.connect(tree, branch, "是", timeline, "重播")
+
+        code, warnings = gen(tree, V3)
+        # 关键:不能报"同时被两个事件引用" —— 那是给"抢同一个入口"用的
+        self.assertEqual(warnings, [], warnings)
+        # 启动函数 / 每帧钩子 / 分支函数都只有一份
+        self.assertEqual(code.count("func _gk_timeline_play() -> void:"), 1)
+        self.assertEqual(code.count("func _gk_timeline_tick() -> void:"), 1)
+        self.assertEqual(code.count("_gk_tl_time += delta"), 1)
+        # 两个入口都调同一个启动函数(准备里一次 + 按键分支里一次)
+        self.assertEqual(code.count("_gk_timeline_play()"), 3)
+        self.assertIn("Input.is_action_pressed(ACTION_REPLAY)", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_timeline_repeat_modes(self):
+        """『重复触发时』三档(用户 2026-10-06:"想让它先放完再重复")。
+
+        以前只有一种行为:触发就从 0 重播;想"等播完再放"得在图上连一堆判断。
+        现在:重播 / 等播完再重播(排队) / 播的时候忽略。
+        """
+        # 默认 = 重播:老图产物一个字符都不变(没有 guard、没有 pending)
+        tree, _t = self._timeline_tree(gk_time=1.0)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_tl_pending", code)
+        # 启动函数的第一句就是"时间归零"(没有被 guard 拦住的可能)
+        self.assertIn("func _gk_timeline_play() -> void:\n    _gk_tl_time = 0.0",
+                      code)
+
+        # 排队:播放中触发只记一笔,播完那一刻再放一遍
+        tree2, _t2 = self._timeline_tree(gk_time=1.0, gk_repeat="QUEUE")
+        code2, warnings2 = gen(tree2, V3)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn("var _gk_tl_pending: bool = false", code2)
+        self.assertIn("_gk_tl_pending = true", code2)
+        # 启动函数被 guard 拦住(播放中触发先 return)
+        self.assertIn("func _gk_timeline_play() -> void:\n    if _gk_tl_play:",
+                      code2)
+        # 播完那一段里要有"排队就再来一遍"
+        self.assertIn("if _gk_tl_pending:", code2)
+        self.assertIn("        _gk_timeline_play()", code2)
+        self.assert_no_chinese_identifiers(code2)
+        self.assert_indent_sane(code2)
+
+        # 忽略:播放中触发直接 return,没有 pending 变量
+        tree3, _t3 = self._timeline_tree(gk_time=1.0, gk_repeat="IGNORE")
+        code3, warnings3 = gen(tree3, V3)
+        self.assertEqual(warnings3, [], warnings3)
+        self.assertIn("func _gk_timeline_play() -> void:\n    if _gk_tl_play:",
+                      code3)
+        self.assertNotIn("_gk_tl_pending", code3)
+        self.assert_indent_sane(code3)
+
+    def test_timeline_queue_with_loop_gets_note(self):
+        """循环 / 往返模式没有"播完"那一刻 -> 排队降级成忽略,并给一条说明。"""
+        tree, _t = self._timeline_tree(gk_time=1.0, gk_mode="LOOP",
+                                       gk_repeat="QUEUE")
+        result = codegen.generate_result(tree, V3)
+        self.assertTrue(any("等播完再重播" in note for note in result.notes),
+                        result.notes)
+        self.assertNotIn("_gk_tl_pending", result.code)
+
+    def test_timeline_track_pins_follow_count(self):
+        node = make_tree().new_node(NN.GKNodeTimeline, "时间轴",
+                                    gk_track_count=4)
+        names = [socket.name for socket in node.outputs]
+        self.assertIn("轨道1值", names)
+        self.assertIn("轨道4值", names)
+        node.gk_track_count = 1
+        node.build_sockets()
+        names = [socket.name for socket in node.outputs]
+        self.assertIn("轨道1值", names)
+        self.assertNotIn("轨道2值", names)
+
+    def test_timeline_two_nodes_keep_separate_state(self):
+        """两条时间轴各管各的状态(同一个变量名会被互相覆盖)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "开场")
+        first = tree.new_node(NN.GKNodeTimeline, "第一条", gk_time=1.0)
+        second = tree.new_node(NN.GKNodeTimeline, "第二条", gk_time=2.0)
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "已结束", second, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var _gk_tl_time: float", code)
+        self.assertIn("var _gk_tl_2_time: float", code)
+        self.assertIn("_gk_tl_2_time += delta", code)
+
+    def test_timeline_outputs_readable_elsewhere(self):
+        """Alpha / 已结束吗 / 轨道值 / 曲线位置 能在别处读到。"""
+        tree, timeline = self._timeline_tree(gk_time=1.0, gk_track_count=1)
+        event = tree.new_node(NN.GKNodeOnReady, "检查")
+        branch = tree.new_node(NN.GKNodeBranch, "结束了吗")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, timeline, "已结束吗", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        gk_stub.connect(tree, timeline, "Alpha", printer, "内容")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("if _gk_tl_done:", code)
+        self.assertIn("print(_gk_tl_alpha)", code)
+
+    def test_timeline_alpha_curve_from_blender(self):
+        """时间轴的进度曲线:导出成 Curve 资源,运行时 sample。"""
+        from BlenderGameKit import curve_assets
+        tree, _t = self._timeline_tree(gk_time=1.0, gk_curve="开门曲线")
+        fake = [(0.0, 0.0), (0.5, 0.9), (1.0, 1.0)]
+        with mock.patch.object(curve_assets, "curve_exists", lambda _n: True), \
+                mock.patch.object(curve_assets, "sample_ease_curve",
+                                  lambda _n, samples=32: fake), \
+                mock.patch.object(curve_assets, "curve_dimensions",
+                                  lambda _n: "2D"):
+            result = codegen.generate_result(tree, V3)
+        code = result.code
+        self.assertEqual(result.warnings, [], result.warnings)
+        self.assertIn("_gk_tl_alpha = _gk_ease(_gk_tl_raw, 0, 0, "
+                      "_gk_curve_load(", code)
+        self.assertIn("开门曲线", result.curve_assets)
+
+    def test_timeline_path_curve_outputs_position(self):
+        """『曲线轨道』:3D 曲线 -> 每帧输出曲线上的位置。"""
+        from BlenderGameKit import curve_assets
+        tree, _t = self._timeline_tree(gk_time=2.0,
+                                       gk_path_curve="轨道曲线")
+        fake = [(0.0, 0.0, 0.0), (1.0, 3.0, 2.0)]
+        with mock.patch.object(curve_assets, "curve_exists", lambda _n: True), \
+                mock.patch.object(curve_assets, "sample_path_points",
+                                  lambda _n, samples=48: fake), \
+                mock.patch.object(curve_assets, "curve_dimensions",
+                                  lambda _n: "3D"):
+            result = codegen.generate_result(tree, V3)
+        code = result.code
+        self.assertEqual(result.warnings, [], result.warnings)
+        self.assertIn("_gk_tl_fly = _gk_curve3d_load(", code)
+        self.assertIn("_gk_tl_path = _gk_tl_fly.sample_baked(", code)
+        self.assertEqual(result.curve_assets["轨道曲线"]["kind"], "Curve3D")
+
+    def test_export_writes_curve_tres(self):
+        """导出时必须真的把 curves/*.tres 写出来(脚本引用了它们)。"""
+        from BlenderGameKit import curve_assets
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "开场运镜",
+                               gk_target="特写机位", gk_blend=2.0,
+                               gk_path_mode="CURVE", gk_path_curve="运镜轨道")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        directory = tempfile.mkdtemp(prefix="gk_curve_export_")
+        fake = [(0.0, 0.0, 0.0), (1.0, 2.0, 0.0)]
+        try:
+            with mock.patch.object(curve_assets, "curve_exists",
+                                   lambda _n: True), \
+                    mock.patch.object(curve_assets, "sample_path_points",
+                                      lambda _n, samples=48: fake), \
+                    mock.patch.object(curve_assets, "curve_dimensions",
+                                      lambda _n: "3D"):
+                result = exporter.export_tree(
+                    tree, {"output_dir": directory, "dimension": "3",
+                           "base_class": "CharacterBody3D"}, write_scene=False)
+            self.assertTrue(result["ok"], result)
+            written = [os.path.basename(path) for path in result["written"]]
+            self.assertIn(curve_assets.curve_file_name("运镜轨道"), written)
+            path = os.path.join(directory, curve_assets.CURVES_DIR,
+                                curve_assets.curve_file_name("运镜轨道"))
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn('type="Curve3D"', text)
+            self.assertIn("PackedVector3Array(", text)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 class TestAnimChain(Base):
@@ -4949,6 +5945,3577 @@ class TestAnimTreeVariables(Base):
 def nn_base_statement():
     from BlenderGameKit.nodes import node_base as NB
     return NB.GKStatementNode
+
+
+class TestExportTransaction(Base):
+    """导出的事务性 / 结果对象 / 目录校验 / 输入动作计数。
+
+    背景(GPT 审查 / 用户 2026-10-04):
+      * 导出原来不是原子的:写脚本 -> 改 project.godot -> 写场景,
+        中途失败会留下"脚本是新的、场景是旧的"这种半成品;
+      * 生成结果靠 codegen 的模块级全局变量传递,失败时读到上一次的旧值;
+      * set_input_actions 返回去重前的数量,日志和实际写入对不上。
+    """
+
+    def _make_tree(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        return tree
+
+    def _temp_project(self):
+        """建一个最小的 Godot 工程目录(含 project.godot)。"""
+        directory = tempfile.mkdtemp(prefix="gk_export_test_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        with open(os.path.join(directory, "project.godot"), "w",
+                  encoding="utf-8") as handle:
+            handle.write('config_version=5\n\n[application]\n'
+                         'config/name="t"\n\n[rendering]\nrenderer="x"\n')
+        return directory
+
+    def test_generate_result_returns_object(self):
+        """新入口返回 CodegenResult,输入动作随返回值走(不再只靠全局)。"""
+        tree = self._make_tree()
+        result = codegen.generate_result(tree, V3)
+        self.assertIsInstance(result, codegen.CodegenResult)
+        self.assertIn("func _ready", result.code)
+        self.assertEqual(list(result.warnings), [])
+        self.assertIsInstance(list(result.input_actions), list)
+
+    def test_export_settings_model_round_trip(self):
+        """ExportSettings 归一化 dict:已知字段变属性,未知字段不丢。"""
+        opts = models.ExportSettings.from_dict(
+            {"output_dir": "D:/proj", "write_scene": True,
+             "baseclass": "typo", "custom_key": 7})
+        self.assertEqual(opts.output_dir, "D:/proj")
+        self.assertTrue(opts.write_scene)
+        # 拼错的字段不会变成属性,而是留在 extra 里(不静默当默认值用)
+        self.assertFalse(hasattr(opts, "baseclass"))
+        self.assertEqual(opts.extra["baseclass"], "typo")
+        back = opts.to_dict()
+        self.assertEqual(back["output_dir"], "D:/proj")
+        self.assertEqual(back["custom_key"], 7)
+
+    def test_diagnostic_renders_message_and_hint(self):
+        """Diagnostic 能摊平成一行,也能区分错误级别。"""
+        item = models.Diagnostic(level="warning", code="MISSING_PROJECT_FILE",
+                                 message="没有 project.godot",
+                                 hint="先创建项目")
+        self.assertIn("没有 project.godot", item.render())
+        self.assertIn("先创建项目", item.render())
+        self.assertFalse(item.is_error())
+        self.assertTrue(models.Diagnostic(level="error").is_error())
+        self.assertEqual(models.render_warnings([item, "裸字符串"]),
+                         [item.render(), "裸字符串"])
+
+    def test_generate_result_matches_legacy_signature(self):
+        """旧的 generate() 仍然返回 (code, warnings),兼容未迁移的调用方。"""
+        tree = self._make_tree()
+        code, warnings = codegen.generate(tree, V3)
+        self.assertIn("func _ready", code)
+        self.assertEqual(list(warnings), [])
+
+    def test_set_input_actions_returns_deduped_count(self):
+        """重复动作只算一次,ui_* 内置动作不计入数量。"""
+        directory = self._temp_project()
+        count = project.set_input_actions(
+            directory,
+            ["jump", "jump", "move_left", "ui_accept", "move_left"])
+        # 去重 + 过滤 ui_accept 之后是 {jump, move_left} 两个
+        self.assertEqual(count, 2)
+        with open(os.path.join(directory, "project.godot"),
+                  encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("jump=", text)
+        self.assertIn("move_left=", text)
+        self.assertNotIn("ui_accept=", text)
+
+    def test_validate_output_dir_rejects_a_file(self):
+        """导出目录指向一个**文件**时必须拒绝,而不是照着往里写。"""
+        directory = tempfile.mkdtemp(prefix="gk_vdir_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        a_file = os.path.join(directory, "not_a_dir.txt")
+        with open(a_file, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        ok, message = exporter.validate_output_dir(a_file)
+        self.assertFalse(ok)
+        self.assertIn("文件", message)
+        ok2, path2 = exporter.validate_output_dir(directory)
+        self.assertTrue(ok2)
+        self.assertEqual(path2, os.path.abspath(directory))
+
+    def test_export_tree_dry_run_writes_nothing(self):
+        """dry-run 只算清单,不落任何文件。"""
+        directory = self._temp_project()
+        with mock.patch.object(exporter.gk_log, "info"):
+            result = exporter.export_tree(
+                self._make_tree(),
+                {"output_dir": directory, "write_scene": True, "dry_run": True},
+                write_scene=True)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result.get("dry_run"))
+        self.assertEqual(result["written"], [])
+        self.assertTrue(result["manifest"])
+        # 磁盘上一个 .gd / .tscn 都不该出现
+        for _root, _dirs, files in os.walk(directory):
+            self.assertFalse([f for f in files if f.endswith((".gd", ".tscn"))],
+                             files)
+
+    def test_export_tree_rolls_back_on_failure(self):
+        """中途失败必须回滚:脚本和场景都不能留下半成品。"""
+        directory = self._temp_project()
+        project_file = os.path.join(directory, "project.godot")
+        with open(project_file, encoding="utf-8") as handle:
+            before = handle.read()
+
+        with mock.patch.object(exporter.project, "set_main_scene",
+                               side_effect=RuntimeError("boom")), \
+                mock.patch.object(exporter.gk_log, "exception"), \
+                mock.patch.object(exporter.gk_log, "error"):
+            result = exporter.export_tree(
+                self._make_tree(),
+                {"output_dir": directory, "write_scene": True},
+                write_scene=True)
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stage"], "设主场景")
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(result["written"], [])
+        # 清单里那两个文件虽然写过,但已被回滚删除
+        for path in result["manifest"]:
+            if path.endswith((".gd", ".tscn")):
+                self.assertFalse(os.path.exists(path), path)
+        with open(project_file, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    # ── 导出契约测试(GPT 审查第 8 条)──────────────────────────────
+    # 这些不测"某段代码长什么样",而是测**对外承诺**:反复导出结果一致、
+    # extends 与场景类型永远一致、用户已有的 project.godot 配置不被破坏、
+    # res:// 路径统一可加载。任何一条破了,用户的工程就会莫名其妙跑不起来。
+
+    def test_repeated_export_is_consistent(self):
+        """同一个图导出两次,落盘内容必须完全一致(幂等)。"""
+        directory = self._temp_project()
+        options = {"output_dir": directory, "write_scene": True}
+
+        def snapshot(paths):
+            data = {}
+            for path in paths:
+                with open(path, encoding="utf-8") as handle:
+                    data[path] = handle.read()
+            return data
+
+        first = exporter.export_tree(self._make_tree(), options,
+                                     write_scene=True)
+        self.assertTrue(first["ok"], first)
+        before = snapshot(first["written"])
+
+        second = exporter.export_tree(self._make_tree(), options,
+                                      write_scene=True)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["written"], first["written"])
+        self.assertEqual(snapshot(second["written"]), before)
+
+    def test_extends_matches_scene_node_type(self):
+        """`.gd` 的 extends 与 `.tscn` 里节点的 type 必须是同一个值。
+
+        不一致时 Godot 直接报
+        『Script inherits from native type 'X', so it can't be assigned
+         to an object of type: 'Y'』,整个场景加载失败。
+        """
+        directory = self._temp_project()
+        result = exporter.export_tree(
+            self._make_tree(),
+            {"output_dir": directory, "write_scene": True, "node_name": "Player",
+             "base_class": "CharacterBody3D"},
+            write_scene=True)
+        self.assertTrue(result["ok"], result)
+        script_path = os.path.join(directory, "scripts", result["script_name"])
+        scene_path = os.path.join(directory, "scenes", "Player.tscn")
+        with open(script_path, encoding="utf-8") as handle:
+            code = handle.read()
+        with open(scene_path, encoding="utf-8") as handle:
+            scene = handle.read()
+        match = re.search(r"^extends\s+(\w+)", code, re.MULTILINE)
+        self.assertIsNotNone(match, code)
+        self.assertIn(f'type="{match.group(1)}"', scene)
+
+    def test_export_preserves_user_project_settings(self):
+        """导出只动输入映射 / 主场景,用户自己写的段落原样保留。"""
+        directory = self._temp_project()
+        project_file = os.path.join(directory, "project.godot")
+        with open(project_file, "a", encoding="utf-8") as handle:
+            handle.write('\n[gk_user]\ncustom_marker="keep"\n')
+        result = exporter.export_tree(
+            self._make_tree(),
+            {"output_dir": directory, "write_scene": True},
+            write_scene=True)
+        self.assertTrue(result["ok"], result)
+        with open(project_file, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn('custom_marker="keep"', text)
+        self.assertIn("config_version=5", text)
+
+    def test_scene_uses_uniform_res_paths(self):
+        """场景里的资源引用必须是 `res://` 开头、正斜杠,否则 Godot 加载不到。"""
+        directory = self._temp_project()
+        result = exporter.export_tree(
+            self._make_tree(),
+            {"output_dir": directory, "write_scene": True, "node_name": "Hero"},
+            write_scene=True)
+        self.assertTrue(result["ok"], result)
+        scene_path = os.path.join(directory, "scenes", "Hero.tscn")
+        with open(scene_path, encoding="utf-8") as handle:
+            scene = handle.read()
+        paths = re.findall(r'path="([^"]+)"', scene)
+        self.assertTrue(paths, scene)
+        for item in paths:
+            self.assertTrue(item.startswith("res://"), item)
+            self.assertNotIn("\\", item)
+
+    def test_export_reports_structured_diagnostics(self):
+        """缺 project.godot 时:既有结构化诊断(code),也有摊平后的文本。"""
+        directory = tempfile.mkdtemp(prefix="gk_noproj_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        result = exporter.export_tree(self._make_tree(),
+                                      {"output_dir": directory})
+        self.assertTrue(result["ok"], result)
+        codes = [item.code for item in result["diagnostics"]]
+        self.assertIn("NO_PROJECT_FILE", codes)
+        self.assertTrue(any("project.godot" in text for text in result["warnings"]),
+                        result["warnings"])
+
+
+class TestOldFileCleanup(Base):
+    """第十三轮:导出旧文件清理(.gk_generated 清单 + 内容认领)。
+
+    ── 为什么必须胆小(两条真踩过的坑)────────────────────────────
+    旧残留会让项目以很难懂的方式坏掉:同名材质盖掉新的("东墙变红"),
+    旧脚本带着同一个 class_name 让 Godot 报 `Class "X" already exists`
+    (整个工程跑不起来)。所以清理既要做,又必须**只删自己写过的文件**。
+    """
+
+    def _project(self):
+        """一个最小工程目录:插件那几个子目录 + project.godot。"""
+        directory = tempfile.mkdtemp(prefix="gk_clean_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        for folder in ("scripts", "scenes", "art", "materials", "shaders",
+                       "curves"):
+            os.makedirs(os.path.join(directory, folder), exist_ok=True)
+        with open(os.path.join(directory, "project.godot"), "w",
+                  encoding="utf-8") as handle:
+            handle.write('config_version=5\n\n[application]\nconfig/name="t"\n')
+        return directory
+
+    def _write(self, directory, relative, text="x"):
+        path = os.path.join(directory, relative.replace("/", os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    # ---- 清单本身 ----
+    def test_manifest_round_trip(self):
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        path = gf.write_manifest(directory, ["scripts/a.gd", "art/x.glb"])
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(gf.read_manifest(directory),
+                         ["art/x.glb", "scripts/a.gd"])
+        # 清单是 JSON、带生成者标记(用户能看出这是什么)
+        with open(path, encoding="utf-8") as handle:
+            self.assertIn("BlenderGameKit", handle.read())
+
+    def test_manifest_does_not_collide_with_project_marker(self):
+        """清单文件不能和『主场景标记』抢名字(真撞过一次)。
+
+        `.gk_generated` 是 project/metadata 用来记"主场景是插件设的哪一个"
+        的;第一版清单也用了这个名字,两边互相覆盖 —— 表现是"导出后主场景
+        突然乱指"。
+        """
+        from BlenderGameKit import generated_files as gf
+        from BlenderGameKit import project as project_mod
+        directory = self._project()
+        # 假装 metadata 写过自己的标记
+        with open(os.path.join(directory, ".gk_generated"), "w",
+                  encoding="utf-8") as handle:
+            handle.write('{"main_scene": "res://scenes/World.tscn"}')
+        self.assertNotEqual(gf.MANIFEST_NAME, ".gk_generated")
+        self.assertEqual(gf.read_manifest(directory), [])
+        gf.write_manifest(directory, ["scripts/a.gd"])
+        # 两边的文件互不影响
+        with open(os.path.join(directory, ".gk_generated"),
+                  encoding="utf-8") as handle:
+            self.assertIn("World.tscn", handle.read())
+        self.assertEqual(gf.read_manifest(directory), ["scripts/a.gd"])
+        self.assertTrue(hasattr(project_mod, "set_main_scene"))
+
+    def test_relative_paths_keep_original_case(self):
+        """相对路径必须保留原始大小写(踩过的坑,真删过文件)。
+
+        Windows 比较路径要用 normcase,但**算相对路径**用 normcase 过的东西
+        会把 `scenes/World.tscn` 变成 `scenes/world.tscn` —— 和磁盘上的
+        名字对不上,清理就把刚写好的主场景当"旧文件"删了。
+        """
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        target = self._write(directory, "scenes/World.tscn", "x")
+        self.assertEqual(gf.relative_files(directory, [target]),
+                         ["scenes/World.tscn"])
+        # 不在项目里的路径直接丢掉
+        outside = self._write(tempfile.mkdtemp(prefix="gk_out_"), "a.gd", "x")
+        self.assertEqual(gf.relative_files(directory, [outside]), [])
+
+    def test_references_ignore_prose(self):
+        """`res://` 后面跟着注释文字时不能当成路径抓进来。"""
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        script = self._write(
+            directory, "scripts/game_logic.gd",
+            "# 由 BlenderGameKit 自动生成\n"
+            '## 形如 "Ball=res://materials/Ballmat.tres|Floor=res://x.tres"\n'
+            "## 竖线在 res://路径里都不会出现,安全。\n"
+            'const C := preload("res://curves/curve_1a2b3c4d.tres")\n')
+        found = gf.referenced_files(
+            directory, gf.relative_files(directory, [script]))
+        self.assertIn("materials/Ballmat.tres", found)
+        self.assertIn("curves/curve_1a2b3c4d.tres", found)
+        for bad in found:
+            self.assertTrue(bad.lower().endswith((".gd", ".tscn", ".tres",
+                                                  ".glb", ".png")), bad)
+            self.assertNotIn("路径", bad)
+
+    def test_collider_dims_ignore_vector3_prefix(self):
+        """碰撞体尺寸要从 `Vector3(...)` 里读 —— "Vector3" 的 3 不算数。
+
+        ── 这条是假告警的根因(示例导出时抓到的)────────────────────
+        第一版直接 findall 数字,`Vector3(26, 0.4, 26)` 被读成
+        [3, 26, 0.4] —— 于是地面被报成"碰撞体 (26, 3, 0.4) 和网格对不上",
+        给一堆完全正常的物体刷假告警(导出结果一直是对的)。
+        """
+        from BlenderGameKit import asset_export as ae
+        box = ('[sub_resource type="BoxShape3D" id="shape"]\n'
+               'size = Vector3(26.000000, 0.400000, 26.000000)')
+        self.assertEqual(ae._collider_dims(box), [26.0, 26.0, 0.4])
+        capsule = ('[sub_resource type="CapsuleShape3D" id="shape"]\n'
+                   'radius = 0.500000\nheight = 1.600000')
+        # 半径 0.5 -> 直径 1.0;高 1.6(比直径大,所以取 1.6)
+        self.assertEqual(ae._collider_dims(capsule), [1.6, 1.0, 1.0])
+        sphere = ('[sub_resource type="SphereShape3D" id="shape"]\n'
+                  'radius = 0.300000')
+        self.assertEqual(ae._collider_dims(sphere), [0.6, 0.6, 0.6])
+
+    def test_manifest_broken_file_is_ignored(self):
+        """清单坏了/被删了都不能把导出搞崩 —— 当成"没有清单"。"""
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        with open(gf.manifest_path(directory), "w", encoding="utf-8") as handle:
+            handle.write("{ 这不是 json")
+        self.assertEqual(gf.read_manifest(directory), [])
+
+    def test_stale_files_diff(self):
+        from BlenderGameKit import generated_files as gf
+        stale = gf.stale_files(None, current=["scripts/a.gd"],
+                               previous=["scripts/a.gd", "scripts/b.gd"])
+        self.assertEqual(stale, ["scripts/b.gd"])
+
+    # ---- 内容认领:什么算"插件生成的" ----
+    def test_is_generated_file_markers(self):
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        ours = self._write(directory, "scripts/game_logic.gd",
+                           "# 由 BlenderGameKit 自动生成，请勿手动修改\n"
+                           "extends CharacterBody3D\n")
+        theirs = self._write(directory, "scripts/我自己写的.gd",
+                             "extends Node\n# 手写脚本\n")
+        mat = self._write(directory, "materials/material.tres",
+                          '[gd_resource type="ShaderMaterial" format=3]\n'
+                          '[ext_resource type="Shader" '
+                          'path="res://shaders/gk_toon.gdshader" id="1"]\n')
+        curve = self._write(directory, "curves/curve_1a2b3c4d.tres",
+                            '[gd_resource type="Curve" format=3]\n')
+        scene = self._write(directory, "scenes/World.tscn",
+                            "; 由 BlenderGameKit 自动生成\n"
+                            '[gd_scene load_steps=1 format=3]\n')
+        png = self._write(directory, "art/skin.png", "not really a png")
+        self.assertTrue(gf.is_generated_file(ours))
+        self.assertTrue(gf.is_generated_file(mat))
+        self.assertTrue(gf.is_generated_file(curve))
+        self.assertTrue(gf.is_generated_file(scene))
+        self.assertFalse(gf.is_generated_file(theirs))
+        # 认不出内容的(二进制贴图)不认领 —— 不冒险
+        self.assertFalse(gf.is_generated_file(png))
+
+    def test_scan_adopts_legacy_files(self):
+        """老工程(还没有清单)第一次导出:带标记的旧文件要被认领。"""
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        self._write(directory, "scripts/旧逻辑.gd",
+                    "# 由 BlenderGameKit 自动生成\n")
+        self._write(directory, "scripts/用户脚本.gd", "extends Node\n")
+        found = gf.scan_generated_files(directory)
+        self.assertIn("scripts/旧逻辑.gd", found)
+        self.assertNotIn("scripts/用户脚本.gd", found)
+
+    # ---- 删除:三条安全规则 ----
+    def test_cleanup_deletes_only_listed_and_keeps_user_files(self):
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        old = self._write(directory, "materials/旧材质.tres",
+                          '[ext_resource path="res://shaders/gk_toon.gdshader"]')
+        user = self._write(directory, "materials/用户自己的.tres",
+                           '[gd_resource type="StandardMaterial3D" format=3]')
+        fresh = self._write(directory, "scripts/game_logic.gd",
+                            "# 由 BlenderGameKit 自动生成\n")
+        # 上一轮写了 旧材质 + game_logic
+        gf.write_manifest(directory, gf.relative_files(
+            directory, [old, fresh, user]))
+        # 这一轮只写了 game_logic(旧材质不再需要)
+        deleted = gf.cleanup_after_export(directory, [fresh])
+        self.assertEqual(deleted, ["materials/旧材质.tres"])
+        self.assertFalse(os.path.exists(old))
+        # 用户自己的文件绝不能被删(它**不在**上一轮清单里)
+        self.assertTrue(os.path.exists(user))
+        self.assertTrue(os.path.exists(fresh))
+        # 新清单里没有旧材质,但有这一轮写的东西
+        manifest = gf.read_manifest(directory)
+        self.assertNotIn("materials/旧材质.tres", manifest)
+        self.assertIn("scripts/game_logic.gd", manifest)
+
+    def test_removable_path_guards(self):
+        """清单被人手改过也不能删到项目外面 / 关键文件。"""
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        for bad in ("../outside.txt", "scripts/../../x.txt", "project.godot",
+                    "scripts/.hidden", "根目录文件.txt", "scripts/a/b.gd",
+                    "docs/readme.md"):
+            self.assertIsNone(gf.removable_path(directory, bad), bad)
+
+    def test_cleanup_survives_missing_files(self):
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        gf.write_manifest(directory, ["materials/已经没了.tres"])
+        self.assertEqual(gf.cleanup_after_export(directory, []), [])
+        self.assertEqual(gf.read_manifest(directory), [])
+
+    # ---- 接到导出流程上:全成功才清 ----
+    def _fake_export(self, directory, failing):
+        """用假场景跑一遍 export_all_scenes(不碰真 bpy)。
+
+        failing=True 时让第二个场景的流水线报错 —— 用来验证
+        "一半失败就不清理"(否则会把这一版该写、还没写的文件删掉)。
+        """
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import exporter as ex
+        scenes = [types.SimpleNamespace(name="关卡1"),
+                  types.SimpleNamespace(name="关卡2")]
+
+        def fake_pipeline(scene, directory, dimension="3", script_name=None,
+                          scene_name="World"):
+            written = [self._write(directory, f"materials/{scene_name}_m.tres",
+                                   "gk_toon shader")] if not (
+                failing and scene.name == "关卡2") else []
+            return {"written": written, "warnings": [], "materials": 1,
+                    "bodies": 0, "cameras": 0, "lights": 0,
+                    "error": "故意失败" if (failing and scene.name == "关卡2")
+                             else None}
+
+        patches = [
+            mock.patch.object(ex, "exportable_scenes", lambda: scenes),
+            mock.patch.object(ex, "resolve_scene_tree",
+                              lambda scene: (None, "没有逻辑图")),
+            mock.patch.object(ae, "_activate_scene", lambda scene: None),
+            mock.patch.object(ae, "_active_scene", lambda: None),
+            mock.patch.object(ae, "_safe_scene_name", lambda name: name),
+            mock.patch.object(ae, "export_assets_pipeline", fake_pipeline),
+            mock.patch.object(ae.gk_log, "info"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return ae.export_all_scenes(directory, dimension="3")
+
+    def test_full_export_cleans_and_records(self):
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        # 上一轮的残留:一个不再被写的旧材质(带标记 -> 会被认领)
+        stale = self._write(directory, "materials/关卡1_旧.tres",
+                            "gk_toon shader")
+        gf.write_manifest(directory, ["materials/关卡1_旧.tres"])
+        result = self._fake_export(directory, failing=False)
+        self.assertIsNone(result["error"], result)
+        self.assertIn("materials/关卡1_旧.tres", result["deleted"])
+        self.assertFalse(os.path.exists(stale))
+        manifest = gf.read_manifest(directory)
+        self.assertIn("materials/关卡1_m.tres", manifest)
+        self.assertIn("materials/关卡2_m.tres", manifest)
+
+    def test_partial_failure_does_not_clean(self):
+        """一半场景失败时**不清理**:那些文件是"还没写完",不是"旧文件"。"""
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        stale = self._write(directory, "materials/关卡1_旧.tres",
+                            "gk_toon shader")
+        gf.write_manifest(directory, ["materials/关卡1_旧.tres"])
+        result = self._fake_export(directory, failing=True)
+        self.assertEqual(result["deleted"], [])
+        self.assertTrue(os.path.exists(stale))
+        # 清单也没被改写(还是上一轮那份)
+        self.assertEqual(gf.read_manifest(directory),
+                         ["materials/关卡1_旧.tres"])
+
+
+class TestColliderSyncAndGodGuard(Base):
+    """第十四轮:碰撞代理跟随 + 上帝视角期间相机过渡暂停(用户实测反馈)。"""
+
+    def test_camera_blend_pauses_in_god_view(self):
+        """开了上帝摄像机时,过渡要加"上帝机在用就不推进"的守卫。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "推镜",
+                               gk_target="特写机位", gk_blend=1.5)
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, warnings = gen(tree, dict(V3, god_camera=True))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_god_camera_active()", code)
+        self.assertIn("if _gk_cam_blend_left > 0.0 "
+                      "and not _gk_god_camera_active():", code)
+
+    def test_camera_blend_has_no_guard_without_god_camera(self):
+        """没开上帝机时不能加那句 —— 那个函数根本不会生成(会解析失败)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "推镜",
+                               gk_target="特写机位", gk_blend=1.5)
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, _w = gen(tree, V3)
+        self.assertNotIn("_gk_god_camera_active", code)
+        self.assertIn("if _gk_cam_blend_left > 0.0:", code)
+
+    def test_environment_script_syncs_colliders(self):
+        """环境脚本里要有"碰撞代理跟着网格走"的那套(门才挡得住人)。"""
+        from BlenderGameKit import asset_export as ae
+        script = ae.ENVIRONMENT_SCRIPT
+        self.assertIn("var _gk_body_links: Array = []", script)
+        self.assertIn("func _gk_link_colliders() -> void:", script)
+        self.assertIn("func _gk_sync_colliders() -> void:", script)
+        # 配对是 deferred(那时 glb 内部的网格才进树)+ 每物理帧同步
+        self.assertIn("_gk_link_colliders.call_deferred()", script)
+        self.assertIn("_gk_sync_colliders()", script)
+        # 全树找 Colliders 容器(嵌套场景 / 多关卡也成立)
+        self.assertIn('find_children("Colliders", "Node", true, false)', script)
+
+    def test_environment_script_syncs_both_ways(self):
+        """第二十五轮:**谁动了谁说了算** —— 两个方向都要能同步。
+
+        只做"网格 -> 代理"的话,用 velocity + move_and_slide 推着走的道具
+        (追人的敌人)每帧都会被拽回原处:实测探针里
+        `chaser_at=(0.0, 0.7, -2.5)` 一直不动,而速度明明是 2.2。
+        """
+        from BlenderGameKit import asset_export as ae
+        script = ae.ENVIRONMENT_SCRIPT
+        # 配对时记下上一帧的两边变换(第 3、4 个元素)
+        self.assertIn("mesh.global_transform, body.global_transform])", script)
+        # 网格动了 -> 代理跟上;代理自己动了 -> 把网格拉过来
+        self.assertIn("if mesh_now != pair[2]:", script)
+        self.assertIn("body.global_transform = mesh_now", script)
+        self.assertIn("elif body_now != pair[3]:", script)
+        self.assertIn("mesh.global_transform = body_now", script)
+
+
+class TestStaticAssets(Base):
+    """第十五轮:静态资产(资产名 + 实例化导出 + 面板定位)。"""
+
+    class _Physics:
+        def __init__(self, asset="", instance=False, enabled=True):
+            self.asset_name = asset
+            self.asset_instance = instance
+            self.enabled = enabled
+
+    class _Obj:
+        def __init__(self, name, asset="", instance=False, enabled=True):
+            self.name = name
+            self.type = "MESH"
+            self.gk_physics = TestStaticAssets._Physics(asset, instance, enabled)
+
+    def _scene(self, objects):
+        return types.SimpleNamespace(objects=objects)
+
+    def test_collect_groups_by_asset_name(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene([
+            self._Obj("树_本体", "树"),
+            self._Obj("树_实例1", "树", instance=True),
+            self._Obj("树_实例2", "树", instance=True),
+            self._Obj("石头", "石头"),
+            self._Obj("普通物体"),
+        ])
+        assets = ae.collect_assets(scene)
+        self.assertEqual(sorted(assets), sorted(["树", "石头"]))
+        self.assertEqual(assets["树"]["source"].name, "树_本体")
+        self.assertEqual(len(assets["树"]["members"]), 3)
+        self.assertEqual(assets["石头"]["source"].name, "石头")
+
+    def test_instance_without_source_warns(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene([self._Obj("树A", "树", instance=True)])
+        assets = ae.collect_assets(scene)
+        self.assertIsNone(assets["树"]["source"])
+        warnings = ae.validate_assets(scene)
+        self.assertTrue(any("没有本体" in w for w in warnings), warnings)
+
+    def test_multiple_sources_warn(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene([self._Obj("树A", "树"), self._Obj("树B", "树")])
+        warnings = ae.validate_assets(scene)
+        self.assertTrue(any("多个本体" in w for w in warnings), warnings)
+
+    def test_asset_model_names_are_unique(self):
+        """两个中文名的资产不能写成同一个 glb(否则互相覆盖)。"""
+        from BlenderGameKit import asset_export as ae
+        first = ae.asset_model_name("树")
+        second = ae.asset_model_name("石头")
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, ae.asset_model_name("树"))       # 稳定
+        self.assertTrue(first.startswith("asset_"))
+        # 多场景带场景前缀(两关的同名资产不会互相覆盖)
+        self.assertNotEqual(ae.asset_model_name("树", "关卡1"),
+                            ae.asset_model_name("树", "关卡2"))
+
+    def test_env_script_applies_material_to_all_copies(self):
+        """同名节点有多个时(资产摆多份),材质要**全部**挂上。"""
+        from BlenderGameKit import asset_export as ae
+        script = ae.ENVIRONMENT_SCRIPT
+        self.assertIn("var targets: Array = []", script)
+        self.assertIn("for target in targets:", script)
+        self.assertNotIn("node = candidate\n\t\t\tbreak", script)
+
+    def test_asset_materials_make_it_into_the_table(self):
+        """资产(本体 + 实例)的材质必须进材质表。
+
+        实测漏过一次:资产的网格在自己的 glb 里、世界 glb 刻意不含它们,
+        于是 write_world_scene 里"按世界 glb 网格名过滤"的循环扫不到 ——
+        三份『树』全是 glb 自带的素白 PBR 材质,探针报 materials=0。
+        """
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene([
+            self._Obj("树_本体", "树"),
+            self._Obj("树_实例1", "树", instance=True),
+        ])
+        materials_map = {"树_本体": ("树_本体材质", "material_tree.tres")}
+        with mock.patch.object(ae, "glb_scene_nodes",
+                               return_value={"meshes": {"树_本体": {}}}):
+            table = ae.asset_material_files("proj", scene, {"树": "asset_树"},
+                                            materials_map, {})
+        # 键 = 资产 glb 里的网格节点名(= 本体名):运行时一条挂上全部实例
+        self.assertEqual(table, {"树_本体": "material_tree.tres"})
+
+    def test_asset_without_source_or_material_is_silent(self):
+        """没有本体 / 材质表里查不到时,不抛错也不写空条目。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene([self._Obj("树_实例1", "树", instance=True)])
+        with mock.patch.object(ae, "glb_scene_nodes",
+                               return_value={"meshes": {"树_本体": {}}}):
+            table = ae.asset_material_files("proj", scene, {"树": "asset_树"},
+                                            {}, {})
+        self.assertEqual(table, {})
+
+    def test_codegen_map_carries_glb_and_collision(self):
+        """『资产_创建实例』要的表:资产名 -> glb 路径 + 碰撞参数。
+
+        这些数必须和 .tscn 里那份碰撞体**同源**(都走 build_collision),
+        各算一遍迟早会算出两个大小。
+        """
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        source = self._Obj("树_本体", "树")
+        scene = self._scene([source, self._Obj("树_实例1", "树", instance=True)])
+        built = {"shape": "box", "dims": (1.0, 2.0, 1.0), "radius": 0.5,
+                 "height": 2.0, "layer": "1", "mask": "1"}
+        with mock.patch.object(ae, "build_collision", return_value=built):
+            table = ae.asset_codegen_map(scene, "3", {"树": "asset_树"})
+        info = table["树"]
+        self.assertEqual(info["path"], "res://art/asset_树.glb")
+        self.assertEqual(info["shape"], 0)          # box -> 0
+        self.assertEqual(info["dims"], (1.0, 2.0, 1.0))
+        self.assertEqual(info["radius"], 0.5)
+        self.assertEqual(info["height"], 2.0)
+
+    def test_codegen_map_marks_missing_collision(self):
+        """本体选了『碰撞形状 = 无』-> shape = -1(运行时只建网格)。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene([self._Obj("石头_本体", "石头")])
+        with mock.patch.object(ae, "build_collision", return_value=None):
+            table = ae.asset_codegen_map(scene, "3", {"石头": "asset_石头"})
+        self.assertEqual(table["石头"]["shape"], -1)
+
+    # ---- 碰撞形状的"智能推荐"(用户 2026-10-06:"正方体对角穿模")----
+    @staticmethod
+    def _mesh_obj(name, points, faces=None):
+        """造一个带网格数据的假物体(圆度只看顶点 + **面中心**)。
+
+        `points` = 顶点坐标;`faces` = 面中心坐标(和 Blender 的
+        `mesh.polygons[i].center` 一个意思。**不能省** ——
+        Blender 默认正方体只有 8 个顶点,全在角上,只看顶点会误判成球)。
+        """
+        class _Vertex:
+            def __init__(self, co):
+                self.co = co
+
+        class _Polygon:
+            def __init__(self, center):
+                self.center = center
+
+        class _Mesh:
+            def __init__(self, verts, polys):
+                self.vertices = verts
+                self.polygons = polys
+
+        class _Obj:
+            def __init__(self, verts, polys):
+                self.name = name
+                self.type = "MESH"
+                self.data = _Mesh(verts, polys)
+                self.gk_physics = None
+
+            @property
+            def dimensions(self):
+                return (2.0, 2.0, 2.0)
+
+        return _Obj([_Vertex(p) for p in points],
+                    [_Polygon(c) for c in (faces or [])])
+
+    # Blender 默认正方体:8 个角 + 6 个面中心(边长 2,中心在原点)
+    _CUBE_POINTS = ([(x, y, z) for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)]
+                    + [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
+                       (0, 0, 1), (0, 0, -1)])
+
+    def test_roundness_tells_cube_from_sphere(self):
+        """圆度:球 ≈ 1.0,正方体(含面中心)≈ 0.58 —— "对角穿模"的判据。"""
+        import math
+        from BlenderGameKit import asset_export as ae
+        ratio_cube = ae.mesh_roundness(self._mesh_obj("方块", self._CUBE_POINTS))
+        self.assertLess(ratio_cube, 0.7)
+        # 球:顶点和面中心都在半径上
+        sphere_points = []
+        sphere_faces = []
+        for i in range(24):
+            for j in range(12):
+                theta = math.pi * i / 24.0
+                phi = 2.0 * math.pi * j / 12.0
+                sphere_points.append((math.sin(theta) * math.cos(phi),
+                                      math.sin(theta) * math.sin(phi),
+                                      math.cos(theta)))
+                sphere_faces.append((math.sin(theta + 0.06) * math.cos(phi + 0.1),
+                                     math.sin(theta + 0.06) * math.sin(phi + 0.1),
+                                     math.cos(theta + 0.06)))
+        ratio_sphere = ae.mesh_roundness(
+            self._mesh_obj("球", sphere_points, sphere_faces))
+        self.assertGreater(ratio_sphere, 0.95)
+
+    def test_bare_cube_without_face_centers_is_not_sphere(self):
+        """只有 8 个顶点的正方体也不能判成球(真 Blender 上就是这样)。
+
+        这是第一版的坑:只看顶点 -> 8 个角到中心等距 -> 圆度 1.0 ->
+        判成球 -> 正方体的角全漏在碰撞体外面(用户报的"对角穿模")。
+        """
+        from BlenderGameKit import asset_export as ae
+        corners = [(x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+        ratio = ae.mesh_roundness(self._mesh_obj("光板方块", corners))
+        # 只有角时圆度会很高 —— 但**没有面中心数据**时不硬判成球:
+        # 面中心是 Blender 一定会给的,取不到就该退回盒子(在下面那条路)
+        self.assertGreater(ratio, 0.9)
+
+    def test_cube_gets_box_collider(self):
+        """正方体 -> 盒子(**不是**球):球内切在立方体里,八个角会漏出来。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("方块", self._CUBE_POINTS)
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 0.0)}):
+            shape = ae.guess_collision_shape(obj, True)
+        self.assertEqual(shape, "box")
+
+    def test_shape_falls_back_to_box_without_mesh(self):
+        """没有网格数据(离线桩 / 空网格)-> 退回盒子(包得住整个模型)。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("空", [])
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (1.0, 1.0, 1.0),
+                                             "center": (0.0, 0.0, 0.0)}):
+            self.assertEqual(ae.guess_collision_shape(obj, True), "box")
+
+    # ---- 碰撞系统打磨(本轮:偏移 / 碰撞块 / 凸包 / 预览=导出)----
+
+    @staticmethod
+    def _plain_physics(**kwargs):
+        """假物理设置(默认 = 出厂状态;可改任意字段)。"""
+        values = {"collision_shape": "auto", "shape_size": (0.0, 0.0, 0.0),
+                  "collision_layer": "1", "collision_mask": "1",
+                  "is_trigger": False, "body_type": "StaticBody3D",
+                  "collision_piece": False}
+        values.update(kwargs)
+        return types.SimpleNamespace(**values)
+
+    def test_collision_offset_points_to_bbox_center(self):
+        """碰撞偏移 = 包围盒中心 − 物体原点(Godot 轴序)。
+
+        脚底原点的模型(大量导入模型如此)靠它把形状抬到模型中心;
+        ⚠ 这个数以前只躺在返回值里**没人用** —— 生成的 .tscn 里
+        Collision 节点上没有 position,"站不住"的老修复被漏掉了。
+        """
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("脚底方块", self._CUBE_POINTS)
+        obj.gk_physics = self._plain_physics()
+        obj.matrix_world = types.SimpleNamespace(
+            translation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0))
+        # 原点在 (0,0,0),包围盒中心在 (0,0,1) 上方 -> Godot 偏移 (0,1,0)
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 1.0)}):
+            built = ae.build_collision(obj, True, obj.gk_physics)
+        self.assertEqual(built["offset"], (0.0, 1.0, 0.0))
+        self.assertIn("position = Vector3(0.000000, 1.000000, 0.000000)",
+                      built["node"])
+
+    def test_position_line_zero_and_nonzero(self):
+        """全零偏移 -> 不写 position(老产物不变);非零 -> Vector3/Vector2。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertIsNone(ae._position_line((0.0, 0.0, 0.0), True))
+        self.assertIsNone(ae._position_line(None, True))
+        self.assertEqual(ae._position_line((1.5, -0.5, 2.0), True),
+                         "position = Vector3(1.500000, -0.500000, 2.000000)")
+        self.assertEqual(ae._position_line((1.5, -0.5, 0.0), False),
+                         "position = Vector2(1.500000, -0.500000)")
+
+    def test_collision_piece_helpers(self):
+        """碰撞块三件套:标记 / 找宿主(跨层级)/ 列块(所有层级)。"""
+        from BlenderGameKit import asset_export as ae
+        host = self._Obj("角色")
+        empty = types.SimpleNamespace(name="空物体", type="EMPTY",
+                                      parent=host, children=[])
+        head = self._Obj("头")
+        head.gk_physics.collision_piece = True
+        head.parent = empty
+        empty.children = [head]
+        body = self._Obj("身")
+        body.gk_physics.collision_piece = True
+        body.parent = host
+        host.children = [empty, body]
+
+        self.assertTrue(ae.is_collision_piece(head))
+        self.assertFalse(ae.is_collision_piece(host))
+        # 宿主跳过中转的空物体 / 别的碰撞块
+        self.assertIs(ae.collision_owner(head), host)
+        self.assertIs(ae.collision_owner(body), host)
+        self.assertIsNone(ae.collision_owner(host))
+        # 列块按名字排序(导出稳定):头 / 身
+        self.assertEqual([p.name for p in ae.collision_pieces(host)],
+                         ["头", "身"])
+
+    def test_pieces_become_extra_shapes_in_asset_table(self):
+        """asset_shape_entries:本体一条 + 每个碰撞块一条(偏移相对本体)。
+
+        运行时"创建实例"靠这张表造碰撞 —— 和 .tscn 那份同源,
+        不会出现"本体能挡人、生成的这份穿过去"。
+        """
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        host = self._mesh_obj("角色", self._CUBE_POINTS)
+        host.gk_physics = self._plain_physics()
+        head = self._mesh_obj("头", self._CUBE_POINTS)
+        head.gk_physics = self._plain_physics(collision_piece=True)
+        head.parent = host
+        host.children = [head]
+
+        def bounds_for(objects, local=False):
+            obj = objects[0]
+            if obj is host:
+                return {"size": (2.0, 2.0, 2.0), "center": (0.0, 0.0, 0.0)}
+            # 头:**局部**中心是它自己的原点(形状尺寸用),**世界**中心在
+            # z=2(碰撞块的偏移用,偏移 = 世界中心 − 宿主原点)。
+            # 第二十八轮起同一个函数会按 local 被问两种语义。
+            return {"size": (1.0, 1.0, 1.0),
+                    "center": (0.0, 0.0, 0.0) if local else (0.0, 0.0, 2.0)}
+
+        with mock.patch.object(ae, "object_bounds", side_effect=bounds_for):
+            entries = ae.asset_shape_entries(host, True)
+        self.assertEqual(len(entries), 2)
+        # 本体:盒子(2×2×2 的三边接近 + 圆度假设为盒子)偏移 0
+        self.assertEqual(entries[0]["kind"], 0)
+        self.assertEqual(entries[0]["offset"], (0.0, 0.0, 0.0))
+        # 头在 Blender 的 z=2(上方)-> Godot 偏移 (0, 2, 0)
+        self.assertEqual(entries[1]["kind"], 0)
+        self.assertEqual(entries[1]["offset"], (0.0, 2.0, 0.0))
+
+    def test_convex_shape_builds_points(self):
+        """凸包:sub_resource 是 ConvexPolygonShape3D,点集 = 世界凸包换算。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("石头", self._CUBE_POINTS)
+        obj.gk_physics = self._plain_physics(collision_shape="convex")
+        hull = [(x, y, z) for x in (-1.0, 1.0) for y in (-1.0, 1.0)
+                for z in (0.0, 2.0)]           # 一条边贴地的"石头"
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 1.0)}), \
+                mock.patch.object(ae, "convex_points", return_value=hull):
+            built = ae.build_collision(obj, True, obj.gk_physics)
+        self.assertEqual(built["shape"], "convex")
+        self.assertIn("ConvexPolygonShape3D", built["sub_resource"])
+        numbers = built["sub_resource"].split("PackedVector3Array(")[1] \
+            .rstrip(")").split(", ")
+        self.assertEqual(len(numbers), 24)     # 8 个点 × 3
+        # 点相对包围盒中心:z=0 的点在 Godot 里 y=-1,z=2 -> y=+1
+        self.assertIn("-1.000000", numbers)
+        self.assertIn("1.000000", numbers)
+        self.assertEqual(len(built["points"]), 8)
+        self.assertEqual(len(built["points_bl"]), 8)
+
+    def test_convex_falls_back_to_box_without_hull(self):
+        """算不出凸包(离线桩 / 空网格)-> 退回盒子,不生成非法形状。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("石头", self._CUBE_POINTS)
+        obj.gk_physics = self._plain_physics(collision_shape="convex")
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 0.0)}), \
+                mock.patch.object(ae, "convex_points", return_value=[]):
+            built = ae.build_collision(obj, True, obj.gk_physics)
+        self.assertEqual(built["shape"], "box")
+        self.assertIn("BoxShape3D", built["sub_resource"])
+
+    def test_preview_matches_export_sizes(self):
+        """预览=导出:线框的半尺寸和导出参数一一对应(本轮大修)。
+
+        以前三处不一致:位置(画在世界原点)、尺寸(自动模式乱用手填)、
+        轴向(半径取了 x/z)。现在预览从 build_collision 取数,必须一致。
+        """
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("方块", self._CUBE_POINTS)
+        obj.gk_physics = self._plain_physics(collision_shape="box",
+                                             shape_size=(3.0, 5.0, 7.0))
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 0.0)}):
+            built = ae.build_collision(obj, True, obj.gk_physics)
+            wire = ae.collision_preview_mesh(obj, True, obj.gk_physics)
+        # 手填尺寸是 Godot 轴序(X=宽, Y=高, Z=深):线框换回 Blender
+        # 半边长应该是 (3/2, 7/2, 5/2)
+        xs = [v[0] for v in wire["verts"]]
+        ys = [v[1] for v in wire["verts"]]
+        zs = [v[2] for v in wire["verts"]]
+        self.assertAlmostEqual(max(xs), 1.5, places=4)
+        self.assertAlmostEqual(max(ys), 3.5, places=4)     # Blender y ← 深
+        self.assertAlmostEqual(max(zs), 2.5, places=4)     # Blender z ← 高
+        # 导出那份:BoxShape3D size = (3, 5, 7)
+        self.assertIn("size = Vector3(3.000000, 5.000000, 7.000000)",
+                      built["sub_resource"])
+
+    def test_preview_ignores_manual_size_in_auto_mode(self):
+        """『自动』下导出忽略手填尺寸 —— 预览也必须忽略(以前它俩打架)。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("方块", self._CUBE_POINTS)
+        obj.gk_physics = self._plain_physics(collision_shape="auto",
+                                             shape_size=(9.0, 9.0, 9.0))
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 0.0)}), \
+                mock.patch.object(ae, "mesh_roundness", return_value=0.58):
+            built = ae.build_collision(obj, True, obj.gk_physics)
+            wire = ae.collision_preview_mesh(obj, True, obj.gk_physics)
+        self.assertEqual(built["shape"], "box")
+        self.assertIn("size = Vector3(2.000000, 2.000000, 2.000000)",
+                      built["sub_resource"])
+        xs = [abs(v[0]) for v in wire["verts"]]
+        self.assertAlmostEqual(max(xs), 1.0, places=4)     # 不是 4.5(9/2)
+
+    def test_preview_sits_at_object_position(self):
+        """线框要落在物体身上(世界坐标)—— 以前画在世界原点,挪了就错。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("方块", self._CUBE_POINTS)
+        obj.gk_physics = self._plain_physics()
+        obj.matrix_world = ((1, 0, 0, 7.0), (0, 1, 0, 0.0),
+                            (0, 0, 1, 0.0), (0, 0, 0, 1))
+        # ⚠ 第二十八轮起碰撞形状用**局部**包围盒(朝向由节点 transform 带),
+        # 所以桩里中心给 (0,0,0)(相对物体原点),位置由 matrix_world 提供
+        with mock.patch.object(ae, "object_bounds",
+                               return_value={"size": (2.0, 2.0, 2.0),
+                                             "center": (0.0, 0.0, 0.0)}), \
+                mock.patch.object(ae, "mesh_roundness", return_value=0.58):
+            wire = ae.collision_preview_mesh(obj, True, obj.gk_physics)
+        xs = [v[0] for v in wire["verts"]]
+        self.assertAlmostEqual(min(xs), 6.0, places=4)
+        self.assertAlmostEqual(max(xs), 8.0, places=4)
+
+    def test_preview_merges_pieces(self):
+        """宿主预览 = 自己的形状 + 所有碰撞块(整组一起画)。"""
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        host = self._mesh_obj("角色", self._CUBE_POINTS)
+        host.gk_physics = self._plain_physics()
+        host.matrix_world = ((1, 0, 0, 0.0), (0, 1, 0, 0.0),
+                             (0, 0, 1, 0.0), (0, 0, 0, 1))
+        head = self._mesh_obj("头", self._CUBE_POINTS)
+        head.gk_physics = self._plain_physics(collision_piece=True)
+        head.parent = host
+        head.matrix_world = ((1, 0, 0, 0.0), (0, 1, 0, 0.0),
+                             (0, 0, 1, 2.0), (0, 0, 0, 1))
+        host.children = [head]
+
+        def bounds_for(objects, local=False):
+            obj = objects[0]
+            if obj is host:
+                return {"size": (2.0, 2.0, 2.0), "center": (0.0, 0.0, 0.0)}
+            # 头:**局部**中心是它自己的原点(形状尺寸用),**世界**中心在
+            # z=2(碰撞块的偏移用,偏移 = 世界中心 − 宿主原点)。
+            # 第二十八轮起同一个函数会按 local 被问两种语义。
+            return {"size": (1.0, 1.0, 1.0),
+                    "center": (0.0, 0.0, 0.0) if local else (0.0, 0.0, 2.0)}
+
+        with mock.patch.object(ae, "object_bounds", side_effect=bounds_for), \
+                mock.patch.object(ae, "mesh_roundness", return_value=0.58):
+            wire = ae.collision_preview_mesh(host, True, host.gk_physics)
+        # 宿主盒子 8 顶点 + 头(能自动判出来时至少 8 个)
+        self.assertGreaterEqual(len(wire["verts"]), 16)
+        zs = [v[2] for v in wire["verts"]]                 # Blender 里"上"是 z
+        self.assertAlmostEqual(max(zs), 2.5, places=4)     # 头在 z=2 上方
+        # 头自己的线框(单独预览碰撞块时)= 只有它那 8 个点
+        with mock.patch.object(ae, "object_bounds", side_effect=bounds_for), \
+                mock.patch.object(ae, "mesh_roundness", return_value=0.58):
+            head_wire = ae.collision_preview_mesh(head, True, head.gk_physics)
+        self.assertLess(len(head_wire["verts"]), len(wire["verts"]))
+
+    # ---- 运行时创建 / 销毁(用户 2026-10-05)----
+    _TREE_INFO = {"path": "res://art/asset_树.glb", "shape": 0,
+                  "dims": (1.0, 2.0, 1.0), "radius": 0.5, "height": 2.0,
+                  "layer": 1, "mask": 1,
+                  # 形状表(本轮:多碰撞体 + 凸包)—— 真实导出由
+                  # asset_export.asset_shape_entries 生成,这里照抄一份
+                  "shapes": [{"kind": 0, "dims": (1.0, 2.0, 1.0),
+                              "radius": 0.5, "height": 2.0,
+                              "offset": (0.0, 0.0, 0.0)}]}
+
+    def test_asset_spawn_uses_export_table(self):
+        """『资产_创建实例』查导出给的资产表 -> 一行调用 + 那个 helper。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        spawn = tree.new_node(NN.GKNodeAssetSpawn, "种树", gk_asset="树",
+                              gk_x=1.0, gk_y=0.0, gk_z=2.0)
+        gk_stub.connect(tree, ready, "执行", spawn, "执行")
+        options = dict(V3)
+        options["assets"] = {"树": dict(self._TREE_INFO)}
+        code, warnings = gen(tree, options)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_spawn_asset(", code)
+        self.assertIn('"res://art/asset_树.glb"', code)
+        self.assertIn("Vector3(1.0, 0.0, 2.0)", code)
+        self.assertIn("BoxShape3D.new()", code)
+        # 形状表(本轮):调用里要带上"要造哪些碰撞形状"的字典数组
+        self.assertIn('"kind": 0', code)
+        self.assertIn('"dims": Vector3(1.0, 2.0, 1.0)', code)
+        self.assertIn('"offset": Vector3(0.0, 0.0, 0.0)', code)
+        self.assertIn("solid.collision_layer = layer", code)
+        self.assertIn("get_tree().current_scene.add_child(", code)
+        # glb 根节点里烘焙的"本体世界变换"必须就地抵消
+        self.assertIn("placed.transform = placed.transform.affine_inverse()",
+                      code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_asset_spawn_without_collision_flag(self):
+        """勾掉『带碰撞』-> 空形状表,只建网格(不加碰撞体)。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        spawn = tree.new_node(NN.GKNodeAssetSpawn, "种草", gk_asset="树",
+                              gk_solid=False)
+        gk_stub.connect(tree, ready, "执行", spawn, "执行")
+        options = dict(V3)
+        options["assets"] = {"树": dict(self._TREE_INFO)}
+        code, _warnings = gen(tree, options)
+        self.assertIn(", [], ", code)
+        self.assertIn("if not shapes.is_empty():", code)
+
+    def test_asset_spawn_warns_on_unknown_name(self):
+        """资产名写错 -> 告警里点名 + 列出可用的(而不是生成空路径)。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        spawn = tree.new_node(NN.GKNodeAssetSpawn, "种树", gk_asset="草")
+        gk_stub.connect(tree, ready, "执行", spawn, "执行")
+        options = dict(V3)
+        options["assets"] = {"树": dict(self._TREE_INFO)}
+        code, warnings = gen(tree, options)
+        self.assertTrue(any("草" in w and "树" in w for w in warnings), warnings)
+        self.assertNotIn("_gk_spawn_asset(", code)
+
+    def test_destroy_accepts_spawned_instance(self):
+        """『实例_销毁』的『目标』引脚接上『实例』-> 直接 free 那个节点。
+
+        ── 为什么走另一条路 ──────────────────────────────────────────
+        填『目标』的那种要"连同名网格一起清"(网格和碰撞代理是两个节点);
+        而运行时生成的实例自带网格,**直接 free** 就行 ——
+        按名字清反而会连坐删掉场景里同名的东西。
+        """
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        spawn = tree.new_node(NN.GKNodeAssetSpawn, "种树", gk_asset="树")
+        destroy = tree.new_node(NN.GKNodeQueueFree, "销毁")
+        gk_stub.connect(tree, ready, "执行", spawn, "执行")
+        gk_stub.connect(tree, spawn, "完成", destroy, "执行")
+        gk_stub.connect(tree, spawn, "实例", destroy, "目标")
+        options = dict(V3)
+        options["assets"] = {"树": dict(self._TREE_INFO)}
+        code, warnings = gen(tree, options)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("is_instance_valid(", code)
+        self.assertIn(".queue_free()", code)
+        # 这条路不该动用"按名字清网格"的 helper
+        self.assertNotIn("_gk_free_with_visual", code)
+
+
+class TestFunctions(Base):
+    """第十七轮:自定义函数 / 调用(用户:"查看函数,自定义函数,折叠函数")。"""
+
+    def _declare(self, tree, name, return_type="void", params=""):
+        func = tree.gk_funcs.add()
+        func.func_name = name
+        func.return_type = return_type
+        func.params = params
+        return func
+
+    def test_params_parser(self):
+        """『参数』一栏的文本解析:中英文逗号/分号都认,类型不认识就退回浮点。"""
+        from BlenderGameKit import properties as props
+        parsed = props.parse_function_params("hp:float, amount:bool;name:String")
+        self.assertEqual(parsed, [("hp", "float", True), ("amount", "bool", True),
+                                  ("name", "String", True)])
+        # 只写名字 -> 浮点;类型写错 -> 浮点 + 标记"不认识"
+        self.assertEqual(props.parse_function_params("速度"),
+                         [("速度", "float", True)])
+        self.assertEqual(props.parse_function_params("x:xyz"),
+                         [("x", "float", False)])
+
+    def test_function_name_is_stable_and_unique(self):
+        """中文函数名要映射成**稳定且互不相同**的 GDScript 函数名。
+
+        踩过的坑和变量名同一族:`snake_case` 会把中文整个压掉,
+        『治疗』『扣血』都变成 my_function -> Godot 报"函数已定义"。
+        """
+        from BlenderGameKit.nodes.node_base import safe_function_name
+        first = safe_function_name("治疗")
+        second = safe_function_name("扣血")
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, safe_function_name("治疗"))     # 稳定
+        self.assertEqual(safe_function_name("heal_player"), "heal_player")
+
+    def _function_tree(self, **props):
+        tree = make_tree()
+        define = tree.new_node(NN.GKNodeFunctionDefine, "定义_治疗")
+        define.gk_func_name = "治疗"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        call = tree.new_node(NN.GKNodeFunctionCall, "调用_治疗")
+        call.gk_func_name = "治疗"
+        body = tree.new_node(NN.GKNodePrint, "治疗中")
+        body.gk_text = "heal"
+        gk_stub.connect(tree, define, "执行", body, "执行")
+        gk_stub.connect(tree, event, "执行", call, "执行")
+        return tree, define, call, body
+
+    def test_define_and_call(self):
+        tree, _define, _call, _body = self._function_tree()
+        self._declare(tree, "治疗", "void", "")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        name = "治疗_"                       # 中文名 -> 名字 + 摘要后缀
+        self.assertIn(f"func {name}", code)
+        self.assertIn('print("heal")', code)
+        # 定义一处 + 调用一处(无返回值时不生成结果变量)
+        self.assertEqual(code.count(name), 2, code)
+        self.assertNotIn("_gk_fres", code)
+
+    def test_params_become_formals_and_arguments(self):
+        """声明里的参数 -> 定义处是形参、调用处是实参,而且**都不生成成员变量**。"""
+        tree, _define, call, body = self._function_tree()
+        self._declare(tree, "治疗", "void", "hp:float")
+        # 声明改了 -> 节点要重长引脚(真实环境靠属性的 update 回调;
+        # 桩里没有回调,手动调一次,和用户点完放大镜之后的状态一致)
+        call.build_sockets()
+        # 函数体里读参数(读的应该是形参,不是成员变量)
+        read = tree.new_node(NN.GKNodeGetVar, "读血量", gk_var_name="hp")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        printer.gk_text = "x"
+        gk_stub.connect(tree, read, "值", printer, "内容")
+        gk_stub.connect(tree, body, "完成", printer, "执行")
+        # 调用处:给参数引脚接一个常量
+        value = tree.new_node(NN.GKNodeConstFloat, "血量", gk_value=3.0)
+        gk_stub.connect(tree, value, "值", call, "hp")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 形参在签名里
+        self.assertIn("hp: float", code)
+        # 参数**不**生成成员变量(生成的话每个函数都往脚本顶部塞一个同名成员)
+        self.assertNotIn("var hp:", code)
+        # 调用处传的是接上来的实参
+        self.assertIn("(3.0)", code)
+
+    def test_return_value(self):
+        """声明了返回类型 -> 末尾 return,调用处拿到『结果』。"""
+        tree, define, call, _body = self._function_tree()
+        self._declare(tree, "治疗", "float", "")
+        # 返回值接一个常量
+        value = tree.new_node(NN.GKNodeConstFloat, "返回值", gk_value=1.5)
+        gk_stub.connect(tree, value, "值", define, "返回")
+        out = tree.new_node(NN.GKNodePrint, "打印结果")
+        out.gk_text = "x"
+        gk_stub.connect(tree, call, "结果", out, "内容")
+        gk_stub.connect(tree, call, "完成", out, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("-> float:", code)
+        self.assertIn("return 1.5", code)
+        self.assertIn("var _fres", code)      # 返回值的临时变量(_ 开头 = 不刷未使用告警)
+
+    def test_undeclared_function_warns(self):
+        """名字没声明过 -> 明确告警,不生成猜出来的调用。"""
+        tree, _define, call, _body = self._function_tree()
+        # 故意不声明
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("治疗" in w and "声明" in w for w in warnings), warnings)
+        self.assertNotIn("func 治疗", code)
+
+    def test_duplicate_definition_warns(self):
+        """同一个函数定义两次 -> 告警并只留第一个(Godot 不允许同名函数)。"""
+        tree, define, _call, _body = self._function_tree()
+        self._declare(tree, "治疗", "void", "")
+        second = tree.new_node(NN.GKNodeFunctionDefine, "定义_治疗2")
+        second.gk_func_name = "治疗"
+        extra = tree.new_node(NN.GKNodePrint, "第二份")
+        extra.gk_text = "dup"
+        gk_stub.connect(tree, second, "执行", extra, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("两次" in w for w in warnings), warnings)
+        self.assertEqual(code.count("func 治疗_"), 1)
+
+    # ---- 变量的"实现"(UE5 的 getter/setter,2026-10-05 第十七轮)----
+    def _impl_tree(self, getter="", setter=""):
+        """一张图:声明变量 hp(可绑 getter/setter)+ 读它 + 写它。"""
+        tree = make_tree()
+        var = tree.gk_vars.add()
+        var.var_name = "hp"
+        var.var_type = "float"
+        var.default_value = "0"
+        var.getter = getter
+        var.setter = setter
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        writer = tree.new_node(NN.GKNodeSetVar, "扣血", gk_var_name="hp")
+        reader = tree.new_node(NN.GKNodeGetVar, "读血量", gk_var_name="hp")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        printer.gk_text = "x"
+        gk_stub.connect(tree, event, "执行", writer, "执行")
+        gk_stub.connect(tree, writer, "完成", printer, "执行")
+        gk_stub.connect(tree, reader, "值", printer, "内容")
+        return tree
+
+    def test_getter_replaces_read(self):
+        """变量绑了 getter -> 读它的地方变成**函数调用**。"""
+        tree = self._impl_tree(getter="计算血量")
+        self._declare(tree, "计算血量", "float", "")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("计算血量_", code)                  # 中文名带摘要
+        self.assertIn("print(计算血量_", code)            # 读变量 -> 调 getter
+
+    def test_setter_replaces_write(self):
+        """变量绑了 setter -> 写它的地方变成**函数调用**(传最终值)。"""
+        tree = self._impl_tree(setter="扣血")
+        self._declare(tree, "扣血", "void", "amount:float")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("扣血_", code)
+        self.assertNotIn("hp = ", code)
+
+    def test_impl_with_undeclared_function_falls_back(self):
+        """绑定的函数没声明过 -> 明确告警 + 退回直接读写(不生成野调用)。"""
+        tree = self._impl_tree(getter="没声明过", setter="也没声明")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("没声明过" in w for w in warnings), warnings)
+        self.assertTrue(any("也没声明" in w for w in warnings), warnings)
+        self.assertIn("hp = ", code)                      # 退回直接赋值
+        self.assertNotIn("没声明过(", code)
+
+    def test_setter_needs_exactly_one_param(self):
+        """setter 参数不是正好一个 -> 告警并退回直接赋值。"""
+        tree = self._impl_tree(setter="扣血")
+        self._declare(tree, "扣血", "void", "")          # 0 个参数
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("正好一个参数" in w for w in warnings), warnings)
+        self.assertIn("hp = ", code)
+
+    def test_no_binding_keeps_old_output(self):
+        """没绑定的变量照旧是成员变量(老图产物一个字符不变)。"""
+        tree = self._impl_tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var hp: float", code)
+        self.assertIn("hp = ", code)
+
+
+class TestDiagnostics(Base):
+    """结构化诊断:校验类告警既有 code,又不破坏 warnings 的字符串接口。"""
+
+    def test_codegen_exposes_structured_diagnostics(self):
+        """基类是 StaticBody3D 却用了『移动_按方向』-> 报 BASE_CLASS_MISMATCH。
+
+        老接口必须不变:`generate()` / `result.warnings` 仍然全是字符串
+        (UI 和大量测试都这么用),结构化对象单独放在 `result.diagnostics`。
+        """
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧", gk_order=0)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+
+        result = codegen.generate_result(
+            tree, {"dimension": "3", "base_class": "StaticBody3D"})
+        codes = [item.code for item in result.diagnostics]
+        self.assertIn("BASE_CLASS_MISMATCH", codes)
+        self.assertTrue(all(isinstance(w, str) for w in result.warnings),
+                        result.warnings)
+        self.assertTrue(any("move_and_slide" in w for w in result.warnings),
+                        result.warnings)
+
+    def test_generate_keeps_string_warnings(self):
+        """旧入口 `generate()` 继续返回 (代码, 字符串告警列表)。"""
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧", gk_order=0)
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动")
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        code, warnings = codegen.generate(
+            tree, {"dimension": "3", "base_class": "StaticBody3D"})
+        self.assertIsInstance(code, str)
+        self.assertTrue(all(isinstance(w, str) for w in warnings), warnings)
+
+
+class TestPaths(unittest.TestCase):
+    """路径工具(纯标准库)—— res:// 归一化与目录穿越防护。"""
+
+    def test_normalize_dir_empty_and_absolute(self):
+        self.assertEqual(paths.normalize_dir(""), "")
+        self.assertEqual(paths.normalize_dir("   "), "")
+        directory = tempfile.mkdtemp(prefix="gk_paths_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.assertEqual(paths.normalize_dir(directory), os.path.abspath(directory))
+
+    def test_to_res_path_variants(self):
+        # 相对路径 -> 补前缀;反斜杠被统一成正斜杠
+        self.assertEqual(paths.to_res_path("scripts/player.gd"),
+                         "res://scripts/player.gd")
+        self.assertEqual(paths.to_res_path("scripts\\player.gd"),
+                         "res://scripts/player.gd")
+        # 已经是 res:// 的只做规范化,不重复加前缀
+        self.assertEqual(paths.to_res_path("res://scripts/player.gd"),
+                         "res://scripts/player.gd")
+        self.assertEqual(paths.to_res_path(""), "")
+        # 给 root 时,root 内的绝对路径被转成相对 root
+        root = tempfile.mkdtemp(prefix="gk_res_")
+        self.addCleanup(shutil.rmtree, root, True)
+        inside = os.path.join(root, "scenes", "Main.tscn")
+        self.assertEqual(paths.to_res_path(inside, root), "res://scenes/Main.tscn")
+
+    def test_safe_join_project_blocks_traversal(self):
+        root = tempfile.mkdtemp(prefix="gk_join_")
+        self.addCleanup(shutil.rmtree, root, True)
+        joined = paths.safe_join_project(root, "scripts", "player.gd")
+        self.assertEqual(joined,
+                         os.path.join(os.path.abspath(root), "scripts", "player.gd"))
+        # 目录穿越必须被拦下,而不是写到项目外面
+        with self.assertRaises(ValueError):
+            paths.safe_join_project(root, "..", "outside.txt")
+        with self.assertRaises(ValueError):
+            paths.safe_join_project(root, os.path.abspath(os.sep), "etc", "passwd")
+
+    def test_addon_package_strips_one_level(self):
+        """插件根模块名:普通 addon 与扩展两种加载方式都要算对。
+
+        算错的后果是偏好设置类注册不上、且 `preferences()` 永远返回 None
+        —— 面板里改的东西全不生效(用户 2026-10-04 的实际症状)。
+        """
+        self.assertEqual(
+            blender_adapter.addon_package("BlenderGameKit.project"),
+            "BlenderGameKit")
+        self.assertEqual(
+            blender_adapter.addon_package(
+                "bl_ext.user_default.blender_game_kit.project"),
+            "bl_ext.user_default.blender_game_kit")
+        # 已经是根(没有点)时原样返回
+        self.assertEqual(blender_adapter.addon_package("BlenderGameKit"),
+                         "BlenderGameKit")
+        self.assertEqual(blender_adapter.addon_package(""),
+                         "BlenderGameKit")
+
+    def test_validate_project_dir_rejects_a_file(self):
+        directory = tempfile.mkdtemp(prefix="gk_pdir_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        a_file = os.path.join(directory, "not_a_dir.txt")
+        with open(a_file, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        ok, reason = paths.validate_project_dir(a_file)
+        self.assertFalse(ok)
+        self.assertIn("文件", reason)
+        self.assertFalse(paths.validate_project_dir("")[0])
+        ok2, path2 = paths.validate_project_dir(directory)
+        self.assertTrue(ok2)
+        self.assertEqual(path2, os.path.abspath(directory))
+
+
+class TestMultiScene(Base):
+    """一个 .blend 里多个 Blender 场景各导一张 .tscn(用户 2026-10-04)。"""
+
+    class _Tree:
+        def __init__(self, name, bl_idname="GKGameLogicTree"):
+            self.name = name
+            self.bl_idname = bl_idname
+
+    class _Scene:
+        def __init__(self, name, logic_tree="", has_group=True):
+            self.name = name
+            self.gk_settings = (types.SimpleNamespace(logic_tree=logic_tree)
+                                if has_group else None)
+
+    class _Groups(list):
+        """同时支持遍历和 .get(name) —— 模拟 bpy.data.node_groups。"""
+
+        def get(self, name, default=None):
+            for group in self:
+                if getattr(group, "name", "") == name:
+                    return group
+            return default
+
+    def _patch_data(self, node_groups=(), scenes=()):
+        import bpy
+        bpy.data = types.SimpleNamespace(
+            node_groups=self._Groups(node_groups), scenes=list(scenes))
+        self.addCleanup(lambda: delattr(bpy, "data"))
+
+    def test_safe_scene_name_keeps_chinese(self):
+        from BlenderGameKit import asset_export
+        self.assertEqual(asset_export._safe_scene_name("关卡2"), "关卡2")
+        self.assertEqual(asset_export._safe_scene_name("关卡 2*"), "关卡_2")
+        self.assertEqual(asset_export._safe_scene_name(""), "Scene")
+
+    def test_env_script_is_per_scene(self):
+        """每个 .tscn 一份环境脚本 —— materials 默认值才自包含(方案 ②a)。
+
+        以前所有场景共写 scripts/gk_environment.gd,默认值只剩"最后导出的
+        那个场景"的材质;其余场景全靠各自 .tscn 节点的 materials= 覆盖才对。
+        """
+        from BlenderGameKit import asset_export
+        # 主包装场景保持历史文件名,单场景项目的产物不变
+        self.assertEqual(asset_export.env_script_rel("World"),
+                         os.path.join("scripts", "gk_environment.gd"))
+        # 其它场景各带后缀,互不覆盖
+        self.assertEqual(asset_export.env_script_rel("关卡2"),
+                         os.path.join("scripts", "gk_environment_关卡2.gd"))
+        self.assertNotEqual(asset_export.env_script_rel("关卡1"),
+                            asset_export.env_script_rel("关卡2"))
+
+    def test_env_script_res_uses_forward_slashes(self):
+        from BlenderGameKit import asset_export
+        self.assertEqual(asset_export.env_script_res("World"),
+                         "res://scripts/gk_environment.gd")
+        self.assertEqual(asset_export.env_script_res("关卡2"),
+                         "res://scripts/gk_environment_关卡2.gd")
+
+    def test_material_names_do_not_collide_across_scenes(self):
+        """材质文件名也要带场景前缀 —— 否则两关的 .tres 互相覆盖。
+
+        实测(用户 2026-10-04):关卡2 的 `material_4.tres`(第二关角色,红)
+        把关卡1 的 `material_4.tres`(东墙,灰)**盖掉** ——
+        用户看到的画面是"关卡示例的东墙莫名变成红色"。
+        """
+        from BlenderGameKit import asset_export
+        # 演示关里的材质名是中文 —— safe_name 压不出东西,全都回退到
+        # `material`,再靠去重加 _2(就是"两关都写 material_4.tres"的来源)
+        names = asset_export._unique_file_names(["东墙材质", "第二关角色材质"],
+                                                prefix="关卡1_")
+        self.assertEqual(names["东墙材质"], "关卡1_material")
+        self.assertEqual(names["第二关角色材质"], "关卡1_material_2")
+        # 单场景不加前缀,老项目产物逐字不变
+        self.assertEqual(asset_export._unique_file_names(["东墙材质"]),
+                         {"东墙材质": "material"})
+        self.assertEqual(asset_export._scene_prefix("World"), "")
+        self.assertEqual(asset_export._scene_prefix("关卡2"), "关卡2_")
+
+    def test_game_logic_trees_only_logic_and_sorted(self):
+        trees = [self._Tree("B图"), self._Tree("A图"),
+                 self._Tree("动画图", "GKAnimationTree")]
+        self._patch_data(node_groups=trees)
+        names = [t.name for t in exporter.game_logic_trees()]
+        self.assertEqual(names, ["A图", "B图"])
+
+    def test_single_tree_is_auto_used(self):
+        tree = self._Tree("玩家逻辑")
+        self._patch_data(node_groups=[tree])
+        got, why = exporter.resolve_scene_tree(self._Scene("关卡1"))
+        self.assertIs(got, tree)
+        self.assertIn("自动", why)
+
+    def test_explicit_selection_wins(self):
+        a, b = self._Tree("A"), self._Tree("B")
+        self._patch_data(node_groups=[a, b])
+        scene = self._Scene("关卡2", logic_tree="B")
+        got, why = exporter.resolve_scene_tree(scene)
+        self.assertIs(got, b)
+        self.assertIn("指定", why)
+
+    def test_multiple_trees_without_selection_warns(self):
+        self._patch_data(node_groups=[self._Tree("A"), self._Tree("B")])
+        got, why = exporter.resolve_scene_tree(self._Scene("关卡1"))
+        self.assertIsNone(got)
+        self.assertIn("没选", why)
+
+    def test_missing_selection_reports_reason(self):
+        self._patch_data(node_groups=[self._Tree("A")])
+        got, why = exporter.resolve_scene_tree(self._Scene("关卡1", logic_tree="B"))
+        self.assertIsNone(got)
+        self.assertIn("不存在", why)
+
+    def test_project_main_scene_reader(self):
+        from BlenderGameKit import asset_export
+        directory = tempfile.mkdtemp(prefix="gk_main_")
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.assertEqual(asset_export._project_main_scene(directory), "")
+        with open(os.path.join(directory, "project.godot"), "w",
+                  encoding="utf-8") as handle:
+            handle.write('[application]\nrun/main_scene="res://scenes/关卡1.tscn"\n')
+        self.assertEqual(asset_export._project_main_scene(directory),
+                         "res://scenes/关卡1.tscn")
+
+    def test_export_all_scenes_without_scenes_errors(self):
+        from BlenderGameKit import asset_export
+        self._patch_data(scenes=[])
+        out = asset_export.export_all_scenes(tempfile.mkdtemp(prefix="gk_ms_"))
+        self.assertIsNotNone(out["error"])
+        self.assertEqual(out["scenes"], [])
+
+
+class _PresetTree:
+    """给预设用的"bpy 味道"的桩。
+
+    presets 走的是 bpy 那套 API(`tree.nodes.new("GKNodeXxx")` /
+    `tree.links.new(出, 入)`),而 gk_stub 的桩是 `new_node(类)` /
+    `connect(...)`。这里薄薄包一层,两边都能用 —— 顺带保证预设真的
+    只用 bpy 支持的那套写法(不然真 Blender 里会炸)。
+    """
+
+    def __init__(self, name):
+        self.tree = gk_stub.StubNodeTree(name)
+        self.name = self.tree.name
+        self.gk_ports = self.tree.gk_ports
+        self.nodes = _NodeMaker(self.tree)
+        self.links = _LinkMaker(self.tree)
+
+    def __iter__(self):
+        return iter(self.tree.nodes)
+
+    def __len__(self):
+        return len(self.tree.nodes)
+
+
+class _NodeMaker:
+    """`tree.nodes`:`new(kind)` 建节点,同时还能像列表一样遍历 / 取长度。"""
+
+    def __init__(self, tree):
+        self._tree = tree
+
+    def new(self, kind):
+        return self._tree.new_node(getattr(NN, kind))
+
+    def __iter__(self):
+        return iter(self._tree.nodes)
+
+    def __len__(self):
+        return len(self._tree.nodes)
+
+
+class _LinkMaker:
+    """`tree.links`:`new(出, 入)` 连线,同样能遍历 / 取长度。"""
+
+    def __init__(self, tree):
+        self._tree = tree
+
+    def new(self, source, target):
+        link = gk_stub.StubLink(source, target)
+        source.links.append(link)
+        target.links.append(link)
+        self._tree.links.append(link)
+        return link
+
+    def __iter__(self):
+        return iter(self._tree.links)
+
+    def __len__(self):
+        return len(self._tree.links)
+
+
+class TestCharacterPreset(Base):
+    """预设:一键生成第三人称角色(用户 2026-10-04 第六条的中间那块)。"""
+
+    def _logic_tree(self, **params):
+        from BlenderGameKit import presets
+        tree = _PresetTree("角色逻辑(预设)")
+        presets.build_logic_tree(tree, presets.defaults(**params))
+        return tree
+
+    def test_generated_logic_script_really_runs(self):
+        """生成的图交给 codegen —— 出来的脚本要有"能跑起来"的那几样。"""
+        tree = self._logic_tree()
+        code, warnings = codegen.generate(tree.tree, dict(V3, god_camera=True))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.mouse_mode = Input.MOUSE_MODE_CAPTURED", code)
+        self.assertIn("move_and_slide()", code)
+        self.assertIn("Input.is_action_just_pressed(ACTION_JUMP)", code)
+        self.assertIn("_gk_spring", code)          # 弹簧臂
+        self.assertIn("_gk_mouse_delta", code)     # 鼠标转视角
+        # 端口变量名会被 snake_case 规范化(『位置X』->『位置x』)
+        self.assertIn("var 输出_位置x: float", code)
+        self.assertIn("输出_在地面", code)
+        # 端口和『变量_设置』必须是**同一个**变量(别名命中),不能各声明一份
+        self.assertNotIn("\nvar 位置x: float\n", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_params_reach_the_graph(self):
+        """速度 / 跳跃强度 / 灵敏度要真的填进节点(不然预设就没意义)。"""
+        from BlenderGameKit import presets
+        tree = self._logic_tree(move_speed=9.0, jump_force=3.5,
+                                camera_side="跟随相机")
+        by_name = {node.name: node for node in tree.tree.nodes}
+        self.assertEqual(by_name["移动_按方向"].gk_speed, 9.0)
+        self.assertEqual(by_name["起跳"].gk_jump_force, 3.5)
+        self.assertEqual(by_name["灵敏度"].gk_a, presets.DEFAULT_PARAMS["sensitivity"])
+        self.assertEqual(by_name["弹簧臂(第三人称)"].gk_camera, "跟随相机")
+
+    def test_anim_tree_has_three_states_and_start(self):
+        from BlenderGameKit import presets
+        tree = _PresetTree("角色动作(预设)")
+        presets.build_anim_tree(tree, presets.defaults())
+        kinds = [node.bl_idname for node in tree.tree.nodes]
+        self.assertIn("GKNodeAnimEntry", kinds)        # 开始口
+        self.assertIn("GKNodeAnimLocomotion", kinds)   # 移动状态判断
+        for want in ("状态_待机", "状态_跑步", "状态_跳跃"):
+            self.assertIn(want, [node.name for node in tree.tree.nodes], want)
+        # 5 条转场:idle<->run、idle/run->jump、jump->idle
+        self.assertEqual(kinds.count("GKNodeAnimTransition"), 5)
+
+    def test_names_come_from_params(self):
+        """动画名 / 树名跟着参数走(用户在自己的模型上用同一个预设)。"""
+        from BlenderGameKit import presets
+        tree = _PresetTree("角色动作(预设)")
+        presets.build_anim_tree(tree, presets.defaults(
+            anim_idle="Idle", anim_run="Run", anim_jump="Jump"))
+        names = [node.name for node in tree.tree.nodes]
+        for want in ("状态_Idle", "状态_Run", "状态_Jump"):
+            self.assertIn(want, names, want)
+
+
+class TestMultiSceneScriptNames(Base):
+    """多场景:每关的逻辑脚本必须**分开命名**(用户 2026-10-04)。
+
+    ── 为什么(实测踩过)────────────────────────────────────────────
+    脚本名默认取节点树名,而 `safe_file_name` 会把中文压成空 -> 回退
+    `game_logic.gd`。两关的树都落到这个名字时,后导出的那份**覆盖**前一份:
+    关卡1 的 .tscn 挂着『玩家逻辑』,跑起来却是关卡2 的脚本
+    (用户实测:"在第二场景里按 Esc 无法退出"就是这一族问题的表现)。
+    """
+
+    def test_override_wins(self):
+        from BlenderGameKit import exporter
+        _code, _w, name, _a, _d = exporter.generate_code_result(
+            make_tree(), dict(V3, script_name="game_logic_关卡2"))
+        self.assertEqual(name, "game_logic_关卡2.gd")
+
+    def test_without_override_still_falls_back(self):
+        """没传名字时行为不变:树名压不出东西就用 game_logic.gd。"""
+        from BlenderGameKit import exporter
+        _code, _w, name, _a, _d = exporter.generate_code_result(
+            make_tree(), dict(V3))
+        self.assertEqual(name, "game_logic.gd")
+
+
+class TestToonLightFollow(Base):
+    """①A / ②b:卡通默认全平涂 + 清掉老 shader 的遗留参数(用户 2026-10-04)。"""
+
+    def test_default_is_flat(self):
+        """场景没设过这个属性 = 不跟随场景光照(不加明暗带 = 平涂)。"""
+        from BlenderGameKit import asset_export
+        scene = types.SimpleNamespace(gk_settings=types.SimpleNamespace())
+        self.assertFalse(asset_export._toon_follow_light(scene))
+
+    def test_opt_in_follows_scene_light(self):
+        from BlenderGameKit import asset_export
+        scene = types.SimpleNamespace(
+            gk_settings=types.SimpleNamespace(toon_follow_light=True))
+        self.assertTrue(asset_export._toon_follow_light(scene))
+
+    def test_env_script_default_line_is_placeholder(self):
+        """导出时 follow_scene_light 的默认值由场景设置决定,不再是写死的 true。"""
+        from BlenderGameKit import asset_export
+        text = asset_export.render_env_script(
+            camera_name="Cam", fov="70.0", follow_scene_light="false")
+        self.assertIn("follow_scene_light: bool = false", text)
+        self.assertNotIn("follow_scene_light: bool = true", text)
+
+    def test_toon_template_drops_stale_uniforms(self):
+        """②b:老 `light()` 版才有的 4 个 uniform 已从材质模板清掉。"""
+        from BlenderGameKit import asset_export
+        for stale in ("toon_exposure", "light_map_mix",
+                      "shadow_strength", "backlight_amount"):
+            self.assertNotIn(f"shader_parameter/{stale}",
+                             asset_export.TOON_MATERIAL_TEMPLATE, stale)
+
+    def test_flat_actually_zeroes_the_light(self):
+        """关掉开关时必须**显式**把明暗关死 —— 只"不喂光"不够。
+
+        用户实测:"阴影不正常"(脸上一片紫)。原因就是第一版只做了
+        "不更新",shader 里 light_dir 还有内置默认方向,照样画色阶。
+        """
+        from BlenderGameKit import asset_export
+        text = asset_export.render_env_script(
+            camera_name="Cam", fov="70.0", follow_scene_light="false")
+        self.assertIn("func _apply_flat() -> void:", text)
+        self.assertIn('set_shader_parameter("light_dir", Vector3.ZERO)', text)
+        self.assertIn('set_shader_parameter("ambient", 1.0)', text)
+        # 平涂要走"没有光"那条路,所以这一步必须在 _apply_materials 里真的被调
+        self.assertIn("if not follow_scene_light:", text)
+
+
+class TestEnvironmentGodCamera(Base):
+    """上帝摄像机在**环境脚本**里(用户 2026-10-04 第二轮)。
+
+    为什么必须搬:上帝机原来由角色脚本生成 —— 场景里没有角色就没有脚本,
+    上帝机跟着消失("在没有角色的测试里动不了,鼠标也转不了视角")。
+    环境脚本每张 .tscn 都有一份,还没有角色也能飞。
+    """
+
+    def _env(self, god="true", follow="false"):
+        from BlenderGameKit import asset_export
+        return asset_export.render_env_script(
+            camera_name="Cam", fov="70.0",
+            follow_scene_light=follow, god_camera=god)
+
+    def test_env_script_carries_the_god_camera(self):
+        text = self._env(god="true")
+        self.assertIn("god_camera: bool = true", text)
+        self.assertIn('add_to_group("gk_god_camera")', text)
+        self.assertIn("KEY_TAB", text)
+        self.assertIn("global_position +=", text)
+        # 编辑器里不能造(Tab 是编辑器自己的快捷键,而且会凭空多一台相机)
+        self.assertIn("Engine.is_editor_hint()", text)
+
+    def test_god_camera_off_by_default(self):
+        text = self._env(god="false")
+        self.assertIn("god_camera: bool = false", text)
+
+    def test_mouse_look_has_its_own_delta(self):
+        """上帝机用自己的鼠标位移 —— 复用游戏逻辑那份会被"先清零"卡死。"""
+        text = self._env(god="true")
+        self.assertIn("func _input(event: InputEvent) -> void:", text)
+        self.assertIn("_gk_god_look += event.relative", text)
+        self.assertIn("_gk_god_look = Vector2.ZERO", text)
+
+    def test_god_camera_forces_environment_node(self):
+        """开关开着时,即使场景里没相机/灯/材质,也要生成 Environment 节点。
+
+        不然环境脚本不存在 —— 上帝机跟着不存在(刚修掉的那个 bug)。
+        """
+        from BlenderGameKit import asset_export
+        scene = types.SimpleNamespace(
+            objects=[], camera=None, render=None,
+            gk_settings=types.SimpleNamespace(god_camera=True))
+        text, files, _cam = asset_export.build_environment_nodes(scene, True)
+        self.assertIn('[node name="Environment"', text)
+        script = files[asset_export.env_script_rel("World")]
+        self.assertIn("god_camera: bool = true", script)
+
+        # 开关关着时行为不变:没活干就不生成(老项目的产物一字不变)
+        off = types.SimpleNamespace(
+            objects=[], camera=None, render=None,
+            gk_settings=types.SimpleNamespace(god_camera=False))
+        text_off, files_off, _cam = asset_export.build_environment_nodes(off, True)
+        self.assertEqual(text_off, "")
+        self.assertEqual(files_off, {})
+
+
+class TestTriggerNodes(Base):
+    """触发器节点:进入/离开区域、碰撞体触发、定时触发(用户 2026-10-04 第 6 条)。"""
+
+    def _trigger(self, cls, node_name, **props):
+        tree = make_tree()
+        trigger = tree.new_node(cls, node_name, **props)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="触发")
+        gk_stub.connect(tree, trigger, "执行", printer, "执行")
+        return tree, trigger, printer
+
+    def test_area_entered_connects_body_entered(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnAreaEntered, "进入区域",
+                                     gk_area="金币1")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [])
+        # 回调搭在 Node3D 上、信号连接补进 _ready
+        self.assertIn("func _gk_on_area_entered(_body: Node3D) -> void:", code)
+        self.assertIn('.body_entered.connect(_gk_on_area_entered)', code)
+        self.assertIn("is_connected(_gk_on_area_entered)", code)
+        self.assertIn('print("触发")', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_area_exited_uses_body_exited(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnAreaExited, "离开区域",
+                                     gk_area="边界区")
+        code, _ = gen(tree, V3)
+        self.assertIn("func _gk_on_area_exited(_body: Node3D) -> void:", code)
+        self.assertIn(".body_exited.connect(", code)
+
+    def test_collision_trigger_uses_area_entered(self):
+        tree, _t, _p = self._trigger(NN.GKNodeCollisionTrigger, "碰撞体触发",
+                                     gk_area="拾取区")
+        code, _ = gen(tree, V3)
+        self.assertIn("func _gk_on_collision(_area: Area3D) -> void:", code)
+        self.assertIn(".area_entered.connect(", code)
+
+    def test_without_area_warns_and_skips(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnAreaEntered, "进入区域")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("没有指定" in str(w) for w in warnings), warnings)
+        # 绝不能生成 `self.body_entered` —— 那是静态类型错误,整个脚本过不了
+        self.assertNotIn("self.body_entered", code)
+        self.assertNotIn("_gk_on_area_entered", code)
+
+    def test_body_filter_adds_name_guard(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnAreaEntered, "进入区域",
+                                     gk_area="金币1", gk_filter="示例角色")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [])
+        # 过滤用到了形参 -> 名字不带下划线前缀
+        self.assertIn("func _gk_on_area_entered(body: Node3D) -> void:", code)
+        self.assertIn('String(body.name) != "示例角色"', code)
+
+    def test_dimension_two_uses_node2d_and_area2d(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnAreaEntered, "进入区域",
+                                     gk_area="金币1")
+        code, _ = gen(tree, V2)
+        self.assertIn("_body: Node2D", code)
+        tree2, _t2, _p2 = self._trigger(NN.GKNodeCollisionTrigger, "碰撞体触发",
+                                        gk_area="拾取区")
+        code2, _ = gen(tree2, V2)
+        self.assertIn("_area: Area2D", code2)
+
+    def test_timer_creates_one_shot_timer(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnTimer, "定时触发",
+                                     gk_seconds=2.5, gk_repeat=False)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [])
+        self.assertIn("func _gk_on_timer() -> void:", code)
+        self.assertIn("Timer.new()", code)
+        self.assertIn("wait_time = 2.5", code)
+        self.assertIn("one_shot = true", code)
+        self.assertIn("autostart = true", code)
+        self.assertIn(".timeout.connect(_gk_on_timer)", code)
+        self.assert_indent_sane(code)
+
+    def test_timer_repeat_is_not_one_shot(self):
+        tree, _t, _p = self._trigger(NN.GKNodeOnTimer, "定时触发",
+                                     gk_seconds=1.0, gk_repeat=True)
+        code, _ = gen(tree, V3)
+        self.assertIn("one_shot = false", code)
+
+    def test_two_triggers_get_distinct_functions(self):
+        """两个同类型的触发器不能合并成一个函数(各自的连接、各自的链)。"""
+        tree = make_tree()
+        a = tree.new_node(NN.GKNodeOnAreaEntered, "进A", gk_area="金币1")
+        b = tree.new_node(NN.GKNodeOnAreaEntered, "进B", gk_area="金币2")
+        pa = tree.new_node(NN.GKNodePrint, "打印A", gk_text="A")
+        pb = tree.new_node(NN.GKNodePrint, "打印B", gk_text="B")
+        gk_stub.connect(tree, a, "执行", pa, "执行")
+        gk_stub.connect(tree, b, "执行", pb, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [])
+        self.assertIn("_gk_on_area_entered", code)
+        self.assertIn("_gk_on_area_entered_2", code)
+        self.assertIn('print("A")', code)
+        self.assertIn('print("B")', code)
+
+    def test_trigger_nodes_are_events(self):
+        for cls in (NN.GKNodeOnAreaEntered, NN.GKNodeOnAreaExited,
+                    NN.GKNodeCollisionTrigger, NN.GKNodeOnTimer):
+            self.assertTrue(getattr(cls, "gk_is_event", False), cls)
+            self.assertEqual(cls.gk_category, "事件")
+
+
+# ==========================================================================
+# 粒子特效(需求 5,2026-10-05 第二十一轮)
+# ==========================================================================
+class _FxMatrix:
+    """假 matrix_world:支持 matrix[i][j] 和 matrix.translation。"""
+
+    def __init__(self, rows=None, position=(1.0, 2.0, 3.0)):
+        self._rows = rows or [[1.0, 0.0, 0.0],
+                              [0.0, 1.0, 0.0],
+                              [0.0, 0.0, 1.0]]
+        self.translation = types.SimpleNamespace(
+            x=position[0], y=position[1], z=position[2])
+
+    def __getitem__(self, index):
+        return self._rows[index]
+
+
+class TestParticleFx(Base):
+    """Blender 侧参数 -> .tscn 粒子节点(属性名对着 Godot 4.7 存的参考场景抄的)。
+
+    开发时踩到三个"凭印象写就会错"的点,这几条测试就是钉它们的:
+      * `randomness` 在**节点**上,材质上没有这个属性;
+      * CPU 的缩放曲线要 `Curve`,GPU 的要 `CurveTexture`;
+      * CPU 的颜色渐变要 `Gradient`,GPU 的要 `GradientTexture1D`。
+    """
+
+    class _Fx:
+        def __init__(self, **values):
+            self.enabled = True
+            self.particle_type = "gpu"
+            self.hide_mesh = False
+            self.auto_play = True
+            self.amount = 16
+            self.lifetime = 1.2
+            self.one_shot = False
+            self.preprocess = 0.0
+            self.explosiveness = 0.0
+            self.randomness = 0.3
+            self.speed = 1.0
+            self.direction = (0.0, 0.0, 1.0)
+            self.spread = 25.0
+            self.gravity = 0.0
+            self.radius = 0.0
+            self.start_color = (1.0, 0.75, 0.35, 1.0)
+            self.end_color = (1.0, 0.15, 0.02, 0.0)
+            self.start_size = 0.2
+            self.end_size = 0.0
+            self.local_coords = True
+            self.additive = False
+            for key, value in values.items():
+                setattr(self, key, value)
+
+    class _Obj:
+        def __init__(self, name="火把", kind="MESH", basis=None):
+            self.name = name
+            self.type = kind
+            self.matrix_world = _FxMatrix(basis)
+            self.data = types.SimpleNamespace(materials=[])
+            self.gk_physics = None
+            self.gk_fx = None
+
+        def get(self, key, default=None):
+            """真物体的自定义属性接口(collect_emitters 用它跳过预览物)。"""
+            return default
+
+        def keys(self):
+            return []
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _subs(self, built):
+        return "\n".join(built["sub_resources"])
+
+    def _nodes(self, built):
+        return "\n".join(built["node_lines"])
+
+    def test_emitter_3d_gpu_scene_text(self):
+        from BlenderGameKit import asset_export as ae
+        built = ae.build_emitter(self._Obj(), self._Fx(), True, uid=0,
+                                 texture_id="fx_tex0", parent="Particles")
+        self.assertEqual(built["node_type"], "GPUParticles3D")
+        subs = self._subs(built)
+        self.assertIn('[sub_resource type="ParticleProcessMaterial" id="fx0_proc"]', subs)
+        self.assertIn('scale_curve = SubResource("fx0_scale")', subs)
+        self.assertIn('color_ramp = SubResource("fx0_ramp")', subs)
+        self.assertIn('gradient = SubResource("fx0_grad")', subs)
+        self.assertIn('curve = SubResource("fx0_curve")', subs)
+        self.assertIn("point_count = 2", subs)         # Godot 存 Curve 的写法
+        # 画什么 / 怎么画:广告牌 + 无光照 + 吃粒子颜色 + 贴图
+        self.assertIn('albedo_texture = ExtResource("fx_tex0")', subs)
+        self.assertIn("vertex_color_use_as_albedo = true", subs)
+        self.assertIn("billboard_mode = 1", subs)
+        self.assertIn("shading_mode = 0", subs)
+        nodes = self._nodes(built)
+        self.assertIn('[node name="火把" type="GPUParticles3D" parent="Particles"]', nodes)
+        self.assertIn('process_material = SubResource("fx0_proc")', nodes)
+        self.assertIn('draw_pass_1 = SubResource("fx0_mesh")', nodes)
+        self.assertIn('material_override = SubResource("fx0_draw")', nodes)
+        self.assertIn("emitting = true", nodes)
+        self.assertIn("amount = 16", nodes)
+        self.assertIn("transform = Transform3D(", nodes)
+
+    def test_emitter_direction_and_gravity_axis_conversion(self):
+        """方向 / 重力要按 glTF 的 Y-up 换轴 —— 不换的话火苗横着喷。"""
+        from BlenderGameKit import asset_export as ae
+        built = ae.build_emitter(self._Obj(), self._Fx(), True, uid=0,
+                                 texture_id="t", parent=".")
+        self.assertIn("direction = Vector3(0.000000, 1.000000, 0.000000)",
+                      self._subs(built))
+        # Blender 的"前"(+Y)-> Godot 的"前"(-Z)
+        forward = ae.build_emitter(
+            self._Obj(), self._Fx(direction=(0.0, 1.0, 0.0)), True, uid=1,
+            texture_id="t", parent=".")
+        self.assertIn("direction = Vector3(0.000000, 0.000000, -1.000000)",
+                      self._subs(forward))
+        # 重力:正数 = 往下(Blender 的"下"是 -Z,Godot 的"下"是 -Y)
+        heavy = ae.build_emitter(self._Obj(), self._Fx(gravity=9.8), True,
+                                 uid=2, texture_id="t", parent=".")
+        self.assertIn("gravity = Vector3(0, -9.800000, 0)", self._subs(heavy))
+
+    def test_emitter_2d_uses_screen_direction(self):
+        """2D:方向按"屏幕上的上"来(Godot 的 y 向下),重力同向换算。"""
+        from BlenderGameKit import asset_export as ae
+        built = ae.build_emitter(self._Obj(), self._Fx(gravity=9.8), False,
+                                 uid=0, texture_id="fx_tex0",
+                                 parent="Particles")
+        self.assertEqual(built["node_type"], "GPUParticles2D")
+        subs = self._subs(built)
+        self.assertIn("particle_flag_disable_z = true", subs)
+        self.assertIn("direction = Vector3(0.000000, -1.000000, 0.000000)", subs)
+        self.assertIn("gravity = Vector2(0, 9.800000)", subs)
+        nodes = self._nodes(built)
+        self.assertIn('[node name="火把" type="GPUParticles2D" parent="Particles"]', nodes)
+        self.assertIn('texture = ExtResource("fx_tex0")', nodes)
+        self.assertIn("position = Vector2(1.000000, 2.000000)", nodes)
+        # 2D 没有"画什么网格"那一套(draw_pass_1 是 3D 专用)
+        self.assertNotIn("draw_pass_1", nodes)
+
+    def test_emitter_2d_additive_gets_canvas_material(self):
+        """2D 叠加发光:节点材质用 CanvasItemMaterial 的 ADD 混合。"""
+        from BlenderGameKit import asset_export as ae
+        built = ae.build_emitter(self._Obj(), self._Fx(additive=True), False,
+                                 uid=0, texture_id="t", parent=".")
+        subs = self._subs(built)
+        self.assertIn('[sub_resource type="CanvasItemMaterial" id="fx0_canvas"]',
+                      subs)
+        self.assertIn("blend_mode = 1", subs)
+        self.assertIn('material = SubResource("fx0_canvas")', self._nodes(built))
+
+    def test_emitter_cpu_uses_inline_params(self):
+        """CPU 粒子:参数在节点上,渐变给 Gradient、曲线给 Curve。"""
+        from BlenderGameKit import asset_export as ae
+        built = ae.build_emitter(
+            self._Obj(), self._Fx(particle_type="cpu"), True, uid=0,
+            texture_id="t", parent=".")
+        self.assertEqual(built["node_type"], "CPUParticles3D")
+        subs = self._subs(built)
+        self.assertNotIn("ParticleProcessMaterial", subs)
+        self.assertIn('[sub_resource type="Curve" id="fx0_curve"]', subs)
+        self.assertNotIn("CurveTexture", subs)
+        nodes = self._nodes(built)
+        self.assertIn('[node name="火把" type="CPUParticles3D"', nodes)
+        self.assertIn('scale_amount_curve = SubResource("fx0_curve")', nodes)
+        self.assertIn('color_ramp = SubResource("fx0_grad")', nodes)
+        self.assertIn('mesh = SubResource("fx0_mesh")', nodes)
+        self.assertIn("scale_amount_min = 0.200000", nodes)
+        self.assertNotIn("process_material", nodes)
+
+    def test_emitter_constant_size_skips_curve(self):
+        """起终大小一样时不写曲线(省一组没人用的资源)。"""
+        from BlenderGameKit import asset_export as ae
+        built = ae.build_emitter(self._Obj(),
+                                 self._Fx(start_size=0.5, end_size=0.5),
+                                 True, uid=0, texture_id="t", parent=".")
+        subs = self._subs(built)
+        self.assertNotIn('type="Curve"', subs)
+        self.assertNotIn("scale_curve", subs)
+        self.assertIn("scale_min = 0.500000", subs)
+
+    def test_emitter_basis_and_body_attach(self):
+        """朝向按 Y-up 换轴、列优先写;挂物理体下时不重复写位置。"""
+        from BlenderGameKit import asset_export as ae
+        # 绕 Blender X 轴转 90°:Godot 基应当是
+        #   x=(1,0,0) y=(0,0,1) z=(0,-1,0) —— 按列优先落成这 9 个数
+        rows = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+        built = ae.build_emitter(self._Obj(basis=rows), self._Fx(), True,
+                                 uid=0, texture_id="t",
+                                 parent="Colliders/火把", attach_to_body=True)
+        nodes = self._nodes(built)
+        self.assertIn(
+            "transform = Transform3D(1.000000, 0.000000, 0.000000, "
+            "0.000000, 0.000000, -1.000000, "
+            "0.000000, 1.000000, 0.000000, "
+            "0.000000, 0.000000, 0.000000)", nodes)
+        # 挂物理体下 = 位置由 body 说了算,粒子节点不该再写一遍世界坐标
+        self.assertNotIn("2.000000, 3.000000", nodes)
+
+    def test_emitter_identity_transform_is_not_written(self):
+        """没转没挪的发射器不写 transform(文件干净)。"""
+        from BlenderGameKit import asset_export as ae
+        obj = self._Obj()
+        obj.matrix_world = _FxMatrix(position=(0.0, 0.0, 0.0))
+        built = ae.build_emitter(obj, self._Fx(), True, uid=0, texture_id="t",
+                                 parent=".")
+        self.assertNotIn("transform =", self._nodes(built))
+
+    def test_default_particle_texture_is_a_real_png(self):
+        """内置默认贴图必须是真 PNG(2D 粒子没贴图什么都画不出来)。"""
+        from BlenderGameKit import asset_export as ae
+        data = ae.fx_default_png()
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn(b"IHDR", data[:32])
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        self.assertEqual((width, height), (64, 64))
+        self.assertGreater(len(data), 200)
+
+    def test_texture_file_uses_material_image_when_it_exists(self):
+        """贴图走现有链路:物体材质里有贴图就用它,没有才用内置那张。"""
+        from BlenderGameKit import asset_export as ae
+        image = types.SimpleNamespace(name="fire.png", size=(64, 64))
+        source = types.SimpleNamespace(type="TEX_IMAGE", image=image)
+        socket = types.SimpleNamespace(
+            is_linked=True, links=[types.SimpleNamespace(from_node=source)])
+        bsdf = types.SimpleNamespace(
+            type="BSDF_PRINCIPLED",
+            inputs=types.SimpleNamespace(get=lambda name: socket))
+        material = types.SimpleNamespace(
+            name="火材质", use_nodes=True,
+            node_tree=types.SimpleNamespace(nodes=[bsdf]))
+        obj = self._Obj()
+        obj.data = types.SimpleNamespace(materials=[material])
+
+        bpy_stub = bpy_module()
+        old_data = getattr(bpy_stub, "data", None)
+        try:
+            setattr(bpy_stub, "data", types.SimpleNamespace(
+                images=types.SimpleNamespace(
+                    get=lambda name: image if name == "fire.png" else None)))
+            self.assertEqual(ae.fx_texture_file(obj), "fire_png.png")
+            # 给了导出目录但文件**不在** -> 退回内置那张
+            # (宁可粒子是白点,也不能让 .tscn 引用不存在的资源)
+            self.assertEqual(ae.fx_texture_file(obj, "不存在的目录"),
+                             ae.FX_DEFAULT_TEXTURE)
+        finally:
+            if old_data is not None:
+                setattr(bpy_stub, "data", old_data)
+        # 没材质的物体直接吃内置那张
+        self.assertEqual(ae.fx_texture_file(self._Obj()),
+                         ae.FX_DEFAULT_TEXTURE)
+
+    def test_collect_emitters_filters_and_codegen_map(self):
+        from BlenderGameKit import asset_export as ae
+        scene = types.SimpleNamespace(objects=[])
+        for name, kind, enabled, particle in (
+                ("火把", "MESH", True, "gpu"),
+                ("烟", "EMPTY", True, "cpu"),
+                ("普通", "MESH", False, "gpu")):
+            obj = self._Obj(name, kind)
+            obj.gk_fx = self._Fx(enabled=enabled, particle_type=particle)
+            scene.objects.append(obj)
+        emitters = ae.collect_emitters(scene)
+        self.assertEqual([obj.name for obj, _fx in emitters], ["火把", "烟"])
+        table = ae.fx_codegen_map(scene, "3")
+        self.assertEqual(table["火把"]["node_type"], "GPUParticles3D")
+        self.assertEqual(table["烟"]["node_type"], "CPUParticles3D")
+        two_d = ae.fx_codegen_map(scene, "2")
+        self.assertEqual(two_d["烟"]["node_type"], "CPUParticles2D")
+
+    def test_fx_nodes_are_registered_in_menu(self):
+        for cls in (NN.GKNodeFxPlay, NN.GKNodeFxStop, NN.GKNodeFxBurst):
+            self.assertEqual(cls.gk_category, "特效")
+            self.assertIn("特效", NN.CATEGORY_ORDER)
+
+    # ---- 代码生成:『特效_播放』『特效_停止』『特效_爆发』----
+    def _fx_tree(self, kind, target="火把", options=None):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(kind, "特效", gk_target=target)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        return tree, node, dict(V3, fx=options if options is not None else {
+            "火把": {"node_type": "GPUParticles3D"}})
+
+    def test_fx_play_generates_typed_reference(self):
+        tree, _node, options = self._fx_tree(NN.GKNodeFxPlay)
+        code, warnings = gen(tree, options)
+        self.assertEqual(warnings, [], warnings)
+        # 目标类型必须是**具体粒子类** —— 声明成 Node 会编译不过
+        self.assertIn('@onready var 特效_火把: GPUParticles3D = '
+                      '_gk_ref_typed(self, "火把", "GPUParticles3D")', code)
+        self.assertIn("特效_火把.emitting = true", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_fx_stop_generates_false(self):
+        tree, _node, options = self._fx_tree(NN.GKNodeFxStop)
+        code, warnings = gen(tree, options)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("特效_火把.emitting = false", code)
+
+    def test_fx_burst_restarts(self):
+        """爆发 = restart() + emitting = true(一次性发射器再放一轮)。"""
+        tree, _node, options = self._fx_tree(NN.GKNodeFxBurst)
+        code, warnings = gen(tree, options)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("特效_火把.restart()", code)
+        self.assertIn("特效_火把.emitting = true", code)
+        self.assert_indent_sane(code)
+
+    def test_fx_uses_cpu_type_from_table(self):
+        """面板上选了 CPU -> 生成的类型也跟着是 CPUParticles3D。"""
+        tree, _node, options = self._fx_tree(NN.GKNodeFxPlay, options={
+            "火把": {"node_type": "CPUParticles3D"}})
+        code, warnings = gen(tree, options)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(": CPUParticles3D = ", code)
+
+    def test_fx_warns_when_target_is_not_an_emitter(self):
+        """目标不是发射器(或忘了勾)时必须告警,而不是生成幽灵引用。"""
+        tree, _node, options = self._fx_tree(NN.GKNodeFxPlay, options={})
+        code, warnings = gen(tree, options)
+        self.assertTrue(any("粒子发射器" in w for w in warnings), warnings)
+        self.assertNotIn(".emitting = true", code)
+
+    def test_fx_warns_on_self_target(self):
+        """目标选『自身』时也告警(脚本挂在角色上,它不是发射器)。"""
+        tree, _node, options = self._fx_tree(NN.GKNodeFxPlay,
+                                             target=NB.TARGET_SELF)
+        code, warnings = gen(tree, options)
+        self.assertTrue(any("自身" in w for w in warnings), warnings)
+        self.assertNotIn(".emitting = true", code)
+
+
+# ==========================================================================
+# 游戏内调试面板(2026-10-05 第二十二轮:"调试体验")
+# ==========================================================================
+class TestDebugPanel(Base):
+    """三块:环境脚本(面板本体)/ 代码生成(日志缓冲)/ 『监视』开关。
+
+    ── 为什么变量和日志都"运行时按名字读",导出侧不准备表 ──────────────
+    面板是环境脚本的一部分(每张 .tscn 一份),而变量属于游戏逻辑脚本。
+    导出侧准备表的话,"变量_设置"运行时新建的变量就漏了;改成运行时枚举
+    宿主节点的 `PROPERTY_USAGE_SCRIPT_VARIABLE` + 读 `_gk_debug_logs`,
+    面板天然跟着脚本走(见 asset_export 里那一节说明)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_env_script_has_the_panel(self):
+        from BlenderGameKit import asset_export as ae
+        text = ae.render_env_script(
+            debug_panel="true", debug_key="KEY_F1", debug_copy_key="KEY_F2",
+            debug_watch="金币数|血量")
+        self.assertIn("var debug_panel: bool = true", text)
+        self.assertIn('var debug_watch: String = "金币数|血量"', text)
+        self.assertIn("const _GK_DBG_KEY := KEY_F1", text)
+        self.assertIn("const _GK_DBG_COPY_KEY := KEY_F2", text)
+        self.assertIn("func _gk_dbg_setup() -> void:", text)
+        self.assertIn("func _gk_dbg_tick(delta: float) -> void:", text)
+        # 复制:剪贴板 + 控制台(无头环境没有剪贴板,靠控制台那份)
+        self.assertIn("DisplayServer.clipboard_set(text)", text)
+        self.assertIn("DisplayServer.FEATURE_CLIPBOARD", text)
+        # 默认收起(按键才出来)、编辑器里不造
+        self.assertIn("label.visible = false", text)
+        self.assertIn("if debug_panel and not Engine.is_editor_hint():", text)
+        # 两处钩子真的调了(tick 在物理帧、setup 在 _ready)
+        self.assertIn("_gk_dbg_tick(delta)", text)
+        self.assertIn("_gk_dbg_setup()", text)
+        # 变量:内部变量不上面板;勾了监视时只显示那几个
+        self.assertIn('if vname.begins_with("_gk_"):', text)
+        self.assertIn('if not watch.is_empty() and not '
+                      'watch.split("|").has(vname):', text)
+        # 状态行:位置 / 速度 / 在地面都在
+        self.assertIn("is_on_floor()", text)
+        self.assertIn("Engine.get_frames_per_second()", text)
+
+    def test_env_script_panel_is_off_by_default(self):
+        from BlenderGameKit import asset_export as ae
+        text = ae.render_env_script()
+        self.assertIn("var debug_panel: bool = false", text)
+        self.assertIn("var debug_watch: String = \"\"", text)
+
+    def test_env_fields_render_without_missing_keys(self):
+        """_env_fields 出来的字段必须能把模板完整渲染出来(加字段别漏一处)。"""
+        from BlenderGameKit import asset_export as ae
+        scene = types.SimpleNamespace(gk_settings=types.SimpleNamespace(
+            debug_panel=True, debug_key="F8", debug_copy_key="`"))
+        fields = ae._env_fields(scene, camera_name="Cam", fov=70.0)
+        self.assertEqual(fields["debug_panel"], "true")
+        self.assertEqual(fields["debug_key"], "KEY_F8")
+        self.assertEqual(fields["debug_copy_key"], "KEY_QUOTELEFT")
+        text = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        self.assertIn("const _GK_DBG_KEY := KEY_F8", text)
+
+    def test_key_constants_fall_back(self):
+        """认不出来的按键要退回默认(NOT 生成一个不存在的常量 -> 编译不过)。"""
+        from BlenderGameKit import asset_export as ae
+        odd = types.SimpleNamespace(gk_settings=types.SimpleNamespace(
+            debug_key="F12"))
+        self.assertEqual(ae._debug_key_const(odd), "KEY_F1")
+        self.assertEqual(ae.DEBUG_KEY_CONSTS["`"], "KEY_QUOTELEFT")
+
+    def test_watch_text_keeps_only_checked_variables(self):
+        """竖线串只收勾了的变量;引号 / 竖线要清掉(它进字符串字面量)。"""
+        from BlenderGameKit import asset_export as ae
+        tree = types.SimpleNamespace(gk_vars=[
+            types.SimpleNamespace(var_name="金币数", watch=True),
+            types.SimpleNamespace(var_name="血量", watch=False),
+            types.SimpleNamespace(var_name='a"b|c', watch=True),
+        ])
+        scene = types.SimpleNamespace(gk_settings=types.SimpleNamespace())
+        with mock.patch("BlenderGameKit.exporter.resolve_scene_tree",
+                        return_value=(tree, "")):
+            self.assertEqual(ae._debug_watch_text(scene), "金币数|abc")
+
+    def test_watch_text_includes_used_variables_and_ports(self):
+        """图里**用到**的变量 + 对外端口也要进列表(不然面板上就是漏的)。"""
+        from BlenderGameKit import asset_export as ae
+        tree = types.SimpleNamespace(
+            gk_vars=[types.SimpleNamespace(var_name="金币数", watch=True),
+                     types.SimpleNamespace(var_name="血量", watch=False)],
+            gk_ports=[types.SimpleNamespace(port_name="视角偏航", direction="out"),
+                      types.SimpleNamespace(port_name="外来输入", direction="in")],
+            nodes=[])
+        scene = types.SimpleNamespace(gk_settings=types.SimpleNamespace())
+        with mock.patch("BlenderGameKit.exporter.resolve_scene_tree",
+                        return_value=(tree, "")), \
+                mock.patch("BlenderGameKit.properties.variable_references",
+                           return_value=[("血量", [], []), ("移动速度", [], [])]):
+            text = ae._debug_watch_text(scene)
+        # 勾了监视的声明变量 + 图里用到的 + 输出端口;重复的只留一次,
+        # 输入端口不上(它由别的图给,不是这张图的输出)
+        self.assertEqual(text, "金币数|血量|移动速度|输出_视角偏航")
+
+    def test_watch_text_empty_means_show_all(self):
+        from BlenderGameKit import asset_export as ae
+        scene = types.SimpleNamespace(gk_settings=types.SimpleNamespace())
+        with mock.patch("BlenderGameKit.exporter.resolve_scene_tree",
+                        return_value=(None, "")):
+            self.assertEqual(ae._debug_watch_text(scene), "")
+        tree = types.SimpleNamespace(gk_vars=[])
+        with mock.patch("BlenderGameKit.exporter.resolve_scene_tree",
+                        return_value=(tree, "")):
+            self.assertEqual(ae._debug_watch_text(scene), "")
+
+    # ---- 代码生成:开着面板才有日志缓冲 ----
+    def _print_tree(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="金币 +1")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        return tree
+
+    def test_debug_panel_adds_log_buffer(self):
+        tree = self._print_tree()
+        code, warnings = gen(tree, dict(V3, debug_panel=True))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var _gk_debug_logs: Array = []", code)
+        self.assertIn("func _gk_debug_log_append(text: String) -> void:", code)
+        # 『打印_输出』:控制台照打,同一句话再进面板
+        self.assertIn('print("金币 +1")', code)
+        self.assertIn('_gk_debug_log_append("金币 +1")', code)
+        # 只留最近 20 条(面板也就显示这么多)
+        self.assertIn("while _gk_debug_logs.size() > 20:", code)
+        self.assert_indent_sane(code)
+
+    def test_debug_panel_off_keeps_old_output(self):
+        """不开面板 -> 生成的代码里一个日志字符都不出现(老图产物不动)。"""
+        tree = self._print_tree()
+        code, _warnings = gen(tree, V3)
+        self.assertNotIn("_gk_debug_logs", code)
+        self.assertNotIn("_gk_debug_log_append", code)
+        self.assertIn('print("金币 +1")', code)
+
+
+# ==========================================================================
+# 导出报告(2026-10-05 第二十三轮:"导出报告可视化")
+# ==========================================================================
+class TestExportReport(Base):
+    """结构化诊断 -> 报告(排序 / 去重 / 截断)-> 纯文本 + 级别统计。
+
+    诊断在导出结果里是**对象**(`models.Diagnostic`,带 hint / node_name),
+    而 `warnings` 是它们**摊平后的字符串**(见 models.Diagnostic.render)——
+    所以报告必须按文本去重,否则同一条会同时以"对象"和"字符串"进两遍。
+    """
+
+    class _Scene:
+        """假场景:只要 `scene[key] = ...` 和 `scene.get(key)` 两个口。"""
+
+        def __init__(self):
+            self.data = {}
+
+        def __setitem__(self, key, value):
+            self.data[key] = value
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+    def _result(self):
+        from BlenderGameKit import models
+        diagnostic = models.Diagnostic(
+            level="warning", code="ANIM_TARGET_MISMATCH",
+            message="动画『走路』不在『身体』上",
+            hint="检查节点上的『动画播放器』是否指向了带这个动画的物体",
+            node_name="动画_走路")
+        return {
+            "ok": True, "script_name": "game_logic.gd", "directory": "D:/proj",
+            "lines": 120, "elapsed_ms": 35.5, "written": ["a.tscn", "b.gd"],
+            "diagnostics": [diagnostic],
+            # ⚠ 摊平后的那条也在 warnings 里(导出流程就是这么做的)
+            "warnings": [diagnostic.render(), "这些网格没有材质: 地面"],
+            "notes": ["参考: 导出目录 D:/proj"],
+        }
+
+    def test_build_dedupes_and_orders(self):
+        from BlenderGameKit import export_report as er
+        report = er.build(self._result())
+        messages = [item["message"] for item in report["items"]]
+        # 结构化那条不能出现两次(对象一次 + 摊平字符串一次)
+        self.assertEqual(messages.count("动画『走路』不在『身体』上"), 1)
+        self.assertIn("这些网格没有材质: 地面", messages)
+        self.assertIn("参考: 导出目录 D:/proj", messages)
+        # 提示排在最后(警告在前面)
+        levels = [item["level"] for item in report["items"]]
+        order = {"error": 0, "warning": 1, "info": 2}
+        self.assertEqual(levels, sorted(levels, key=lambda l: order[l]))
+
+    def test_build_keeps_hint_and_node(self):
+        from BlenderGameKit import export_report as er
+        report = er.build(self._result())
+        item = next(i for i in report["items"]
+                    if i["code"] == "ANIM_TARGET_MISMATCH")
+        self.assertIn("动画播放器", item["hint"])
+        self.assertEqual(item["node_name"], "动画_走路")
+
+    def test_build_truncates_and_reports_dropped(self):
+        from BlenderGameKit import export_report as er
+        result = self._result()
+        result["warnings"] = [f"第 {index} 条问题" for index in range(80)]
+        report = er.build(result)
+        self.assertEqual(len(report["items"]), er.MAX_ITEMS)
+        self.assertEqual(report["dropped"], 82 - er.MAX_ITEMS)   # 80 + 诊断 + 提示
+
+    def test_counts_and_items_of(self):
+        from BlenderGameKit import export_report as er
+        report = er.build(self._result())
+        errors, warnings, infos = er.counts(report)
+        self.assertEqual((errors, warnings, infos), (0, 2, 1))
+        self.assertEqual(len(er.items_of(report, "warning")), 2)
+
+    def test_text_has_state_hint_and_node(self):
+        from BlenderGameKit import export_report as er
+        text = er.report_text(er.build(self._result()))
+        self.assertIn("导出报告", text)
+        self.assertIn("怎么修:", text)
+        self.assertIn("相关节点: 动画_走路", text)
+        self.assertIn("game_logic.gd", text)
+        self.assertIn("个警告", text)
+        # 空报告也不能崩(面板第一次打开时就是这条路)
+        self.assertIn("还没有导出过", er.report_text({}))
+
+    def test_record_persists_into_scene(self):
+        """报告要能写进 .blend(场景属性),清掉内存还能读回来。"""
+        from BlenderGameKit import export_report as er
+        scene = self._Scene()
+        er.clear()
+        er.record(scene, self._result())
+        self.assertIn(er.PERSIST_KEY, scene.data)
+        er.clear()
+        loaded = er.load(scene)
+        self.assertEqual(loaded["script_name"], "game_logic.gd")
+        self.assertTrue(loaded["items"])
+        # 报告是 JSON 存的:条目里不能混进不能序列化的东西
+        import json
+        json.dumps(scene.data[er.PERSIST_KEY], ensure_ascii=False)
+        er.clear()
+
+    def test_report_operators_are_in_the_class_list(self):
+        """两个新算子必须在 GK_CLASSES 里 —— 漏了按钮就是静默不工作。
+
+        ⚠ 离线桩里的 bpy 没有 `app.handlers`,`operator_io` 导不进来
+        (它模块级就有 `@bpy.app.handlers.persistent`),所以这一条直接查
+        **源码文本**:注册清单和 bl_idname 都得在。
+        (真 Blender 那边冒烟会真的调这两个算子,两道锁一起上。)
+        """
+        source = open(os.path.join(ROOT, "BlenderGameKit", "operator_io.py"),
+                      encoding="utf-8").read()
+        self.assertIn('bl_idname = "gk.export_report_copy"', source)
+        self.assertIn('bl_idname = "gk.export_report_focus"', source)
+        # 带逗号 + 换行 = 只匹配元组里的那一条(class 定义行没有逗号)
+        self.assertIn("GK_OT_ReportCopy,\n", source)
+        self.assertIn("GK_OT_ReportFocus,\n", source)
+
+    def test_load_empty_without_report(self):
+        from BlenderGameKit import export_report as er
+        er.clear()
+        self.assertEqual(er.load(self._Scene()), {})
+        # 坏 JSON 也不能崩(手改过 .blend / 老版本存的)
+        scene = self._Scene()
+        scene[er.PERSIST_KEY] = "{不是 json"
+        self.assertEqual(er.load(scene), {})
+
+
+# ==========================================================================
+# 『变量_设置』写回**声明过**的变量:数值 / 整数 / 真假之间的转换要安静
+# ==========================================================================
+class TestOnreadyTypeUpgrade(Base):
+    """同一个物体被两种"类型需求"引用时,声明要取**更具体**的那个(第二十四轮)。
+
+    踩过:敌人先被『移动_设置位置』引用(hint=节点 -> Node),再被『进入区域』
+    引用(hint=area -> Area3D)。`add_onready` 只按**路径**去重,于是第二次
+    直接复用那个 Node 类型的变量,生成
+
+        if 节点_敌1 != null and 节点_敌1.body_entered...
+
+    而运行时它就是 **MeshInstance3D**(网格那个同名节点):
+
+        Invalid access to property or key 'body_entered' on a base object
+        of type 'MeshInstance3D'
+
+    **触发器整个失效**(敌人撞了不扣血)—— 小游戏示例的探针抓到的。
+    修复:类型只往**具体**方向升(Node -> Area3D 可以,反过来不行)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_area_type_wins_over_plain_node(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeSetPosition, "挪敌人",
+                             gk_target="敌1", gk_x=1.0)
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        tree.new_node(NN.GKNodeOnAreaEntered, "撞到敌1",
+                      gk_area="敌1", gk_filter="小玩家")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 引用只声明一次(不是两个变量),但类型是更具体的 Area3D
+        self.assertIn(': Area3D = _gk_ref_typed(self, "敌1", "Area3D")', code)
+        self.assertEqual(code.count('_gk_ref_typed(self, "敌1"'), 1)
+        # 触发器接的是**这个**变量(类型对了,body_entered 才存在)
+        self.assertIn(".body_entered.connect(", code)
+        self.assertNotIn(": Node = _gk_ref_typed(self, \"敌1\"", code)
+
+    def test_plain_node_request_keeps_the_specific_type(self):
+        """反过来(先 Area3D 后 Node)不能把类型降回 Node。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        tree.new_node(NN.GKNodeOnAreaEntered, "撞到敌1",
+                      gk_area="敌1", gk_filter="小玩家")
+        move = tree.new_node(NN.GKNodeSetPosition, "挪敌人",
+                             gk_target="敌1", gk_x=1.0)
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(': Area3D = _gk_ref_typed(self, "敌1", "Area3D")', code)
+
+
+class TestSetVarNumericCoercion(Base):
+    """第二十四轮(做小游戏示例时踩到)。
+
+    『数学_运算』天生吐 float,而『变量』框里声明的可能是 int / bool ——
+    生成器**已经**会补 `int(...)` / `true`(产物能跑),但同时还报
+    "变量同时被当成 X 和 Y,请改用不同的变量名" —— 那句会把人指到
+    错的地方(变量名根本没问题)。现在这种**明确**的转换不再告警;
+    真对不上的类型(文本 -> 整数)仍然告警。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _declare(self, tree, name, var_type, default="0"):
+        tree.gk_vars.add()
+        var = tree.gk_vars[len(tree.gk_vars) - 1]
+        var.var_name = name
+        var.var_type = var_type
+        var.default_value = default
+        return var
+
+    def test_int_variable_from_math_is_quiet(self):
+        tree = make_tree()
+        self._declare(tree, "金币数", "int", "0")
+        event = self._ready(tree)
+        math = tree.new_node(NN.GKNodeMath, "加一", gk_op="ADD", gk_b=1.0)
+        read = tree.new_node(NN.GKNodeGetVar, "读", gk_var_name="金币数")
+        setter = tree.new_node(NN.GKNodeSetVar, "记", gk_var_name="金币数")
+        gk_stub.connect(tree, read, "值", math, "A")
+        gk_stub.connect(tree, math, "结果", setter, "值")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("金币数 = int((", code)
+
+    def test_bool_variable_from_number_literal_is_quiet(self):
+        tree = make_tree()
+        self._declare(tree, "结束", "bool", "false")
+        event = self._ready(tree)
+        setter = tree.new_node(NN.GKNodeSetVar, "标记", gk_var_name="结束",
+                               gk_value=1.0)
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("结束 = true", code)
+
+    def test_bool_variable_from_connected_number_keeps_the_value(self):
+        """接了线的时候**不能**把表达式丢掉 —— 以前会生成恒 false。"""
+        tree = make_tree()
+        self._declare(tree, "结束", "bool", "false")
+        self._declare(tree, "金币数", "float", "0")
+        event = self._ready(tree)
+        read = tree.new_node(NN.GKNodeGetVar, "读金币", gk_var_name="金币数")
+        setter = tree.new_node(NN.GKNodeSetVar, "标记", gk_var_name="结束")
+        gk_stub.connect(tree, read, "值", setter, "值")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 『变量_读取』的输出是"任意值",线上推不出类型 -> 用 bool() 显式转;
+        # 关键是**表达式不许被丢掉**(以前会生成恒 false)
+        self.assertIn("结束 = bool(金币数)", code)
+        self.assertNotIn("结束 = false", code)
+
+    def test_real_type_conflict_still_warns(self):
+        """真对不上的类型(文本 -> 整数)仍然要告警,不能一起静音。"""
+        tree = make_tree()
+        self._declare(tree, "金币数", "int", "0")
+        event = self._ready(tree)
+        text = tree.new_node(NN.GKNodeConstText, "字", gk_value="你好")
+        setter = tree.new_node(NN.GKNodeSetVar, "记", gk_var_name="金币数")
+        gk_stub.connect(tree, text, "值", setter, "值")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("金币数" in w for w in warnings), warnings)
+
+
+class TestRound25GameplayPieces(Base):
+    """第二十五轮:补小游戏示例暴露的四个"做游戏常用件"。
+
+    * 『移动_朝向目标』—— 追人的敌人 / 跟随的宠物(不用自己拼方向)
+    * 『变量_增减』    —— 拾取 +1 / 扣血 -1(不用拼三个节点)
+    * 『流程_冷却』    —— 无敌帧 / 防连发(用户原话:"重复触发时它会重复
+                          开始动画,如果我想让它先放完再重复")
+    * 『文本_数字』    —— HUD 上的 3 不能显示成 3.0(Godot 的 str(3.0))
+    """
+
+    def _declare(self, tree, name, var_type="float", default="0"):
+        tree.gk_vars.add()
+        var = tree.gk_vars[len(tree.gk_vars) - 1]
+        var.var_name = name
+        var.var_type = var_type
+        var.default_value = default
+        return var
+
+    def _declare_func(self, tree, name, return_type="void", params=""):
+        tree.gk_funcs.add()
+        func = tree.gk_funcs[len(tree.gk_funcs) - 1]
+        func.func_name = name
+        func.return_type = return_type
+        func.params = params
+        return func
+
+    # ---- ① 移动_朝向目标 ----
+
+    def _chase_tree(self, goal="小玩家", **props):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveToward, "追", gk_goal=goal,
+                             gk_speed=3.0, **props)
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        return tree, move
+
+    def test_chase_3d_walks_toward_goal(self):
+        tree, move = self._chase_tree(gk_stop_distance=1.0)
+        move.gk_target = "追击者"
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assert_no_chinese_identifiers(code)
+        # 位置读取复用『取值_位置』那个 helper(Node3D 才有的成员不能直接调)
+        self.assertIn("func _gk_global_position_3d(host: Node) -> Vector3:", code)
+        # 『谁走』用 **CharacterBody** 类型取 —— 取成 Node 的话
+        # `.velocity` / `.move_and_slide()` 会被 Godot 静态检查拒绝
+        self.assertIn(': CharacterBody3D = _gk_ref_typed(self, "追击者", "CharacterBody3D")',
+                      code)
+        self.assertRegex(code, r"if _goal_dist\d+ <= 1\.0:")
+        self.assertRegex(code, r"节点_追击者\.velocity = _to_goal\d+\.normalized\(\)"
+                                r" \* chase_speed")
+        # 速度没连线 -> 生成可在检查器里调的 @export
+        self.assertIn("@export var chase_speed: float = 3.0", code)
+        self.assertIn("节点_追击者.velocity = Vector3.ZERO", code)
+        self.assertIn("节点_追击者.move_and_slide()", code)
+
+    def test_chase_speed_can_come_from_a_node(self):
+        """速度接了线 -> 用图里算出来的值(不暴露成检查器参数)。"""
+        tree, move = self._chase_tree()
+        speed = tree.new_node(NN.GKNodeConstFloat, "速度", gk_value=4.5)
+        gk_stub.connect(tree, speed, "值", move, "速度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("@export var chase_speed", code)
+        self.assertRegex(code, r"\.normalized\(\) \* 4\.5")
+
+    def test_chase_2d_uses_vector2_and_turn(self):
+        tree, _move = self._chase_tree(gk_turn=True)
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("Vector2.ZERO", code)
+        self.assertRegex(code,
+                         r"\.rotation = atan2\(_to_goal\d+\.y, _to_goal\d+\.x\)")
+
+    def test_chase_3d_turn_flattens_y_before_look_at(self):
+        """目标在头顶正上方时 look_at 会报"up 和方向重合" -> 只按水平方向转。"""
+        tree, _move = self._chase_tree(gk_turn=True)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(
+            code, r"if absf\(_to_goal\d+\.x\) \+ absf\(_to_goal\d+\.z\) > 0\.001:")
+        self.assertRegex(code, r"\.look_at\(_here\d+ \+ Vector3\(")
+        self.assertIn("Vector3.UP", code)
+
+    def test_chase_goal_pin_beats_the_property(self):
+        """『目标』引脚接了东西就以引脚为准(运行时实例走这条)。"""
+        tree, move = self._chase_tree()
+        getter = tree.new_node(NN.GKNodeGetNode, "取追踪点", gk_path="追踪点")
+        gk_stub.connect(tree, getter, "节点", move, "目标")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("追踪点", code)
+        self.assertNotIn("小玩家", code)
+
+    def test_chase_without_goal_warns_and_skips(self):
+        tree, _move = self._chase_tree(goal="")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("不知道往哪走" in w for w in warnings), warnings)
+        self.assertNotIn("velocity", code)
+        self.assertNotIn("move_and_slide", code)
+
+    def test_chase_speed_clamped_in_3d(self):
+        """和『移动_按方向』同一个坑:300 在 3D 里是 300 米/秒。"""
+        tree, move = self._chase_tree()
+        move.gk_speed = 300.0
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("速度" in w for w in warnings), warnings)
+        self.assertIn("@export var chase_speed: float = 50", code)
+        self.assertNotIn("300", code)
+
+    def test_chase_needs_character_body(self):
+        """基类不是 CharacterBody 时要报出来 —— 否则 Godot 加载脚本才报。"""
+        tree, _move = self._chase_tree()
+        needed, _why = codegen.required_base_class(
+            tree, {"dimension": "3", "base_class": "StaticBody3D"})
+        self.assertEqual(needed, "CharacterBody3D")
+        result = codegen.generate_result(
+            tree, {"dimension": "3", "base_class": "StaticBody3D"})
+        codes = [item.code for item in result.diagnostics]
+        self.assertIn("BASE_CLASS_MISMATCH", codes)
+        self.assertTrue(any("移动_朝向目标" in w for w in result.warnings),
+                        result.warnings)
+
+    # ---- ② 变量_增减 ----
+
+    def test_add_var_on_int_counts_up(self):
+        tree = make_tree()
+        self._declare(tree, "金币数", "int", "0")
+        event = tree.new_node(NN.GKNodeOnAreaEntered, "碰到金币",
+                              gk_area="金币1", gk_filter="小玩家")
+        add = tree.new_node(NN.GKNodeAddVar, "金币+1", gk_var_name="金币数",
+                            gk_amount=1.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        # int 变量 + 浮点表达式 -> 显式 int(...)(和小游戏示例里那句一样)
+        self.assertIn("金币数 = int((金币数 + 1.0))", code)
+
+    def test_add_var_on_float_subtracts(self):
+        tree = make_tree()
+        self._declare(tree, "血量", "float", "3.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "血量-1", gk_var_name="血量",
+                            gk_amount=-1.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("血量 = (血量 + -1.0)", code)
+        self.assertNotIn("int((", code)
+
+    def test_add_var_new_value_output_is_the_variable(self):
+        """『新值』= 加完之后的值 —— 接出去比较不用再挂一个『变量_读取』。"""
+        tree = make_tree()
+        self._declare(tree, "金币数", "int", "0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "金币+1", gk_var_name="金币数",
+                            gk_amount=1.0)
+        compare = tree.new_node(NN.GKNodeCompare, "够5个了吗", gk_op="GE", gk_b="5")
+        branch = tree.new_node(NN.GKNodeBranch, "赢了吗")
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        gk_stub.connect(tree, add, "新值", compare, "A")
+        gk_stub.connect(tree, compare, "结果", branch, "条件")
+        gk_stub.connect(tree, add, "完成", branch, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("(金币数 >= 5)", code)
+        self.assertIn("金币数 = int((金币数 + 1.0))", code)
+
+    def test_add_var_on_bool_is_skipped(self):
+        tree = make_tree()
+        self._declare(tree, "结束", "bool", "false")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "加一", gk_var_name="结束")
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("只能给" in w for w in warnings), warnings)
+        self.assertIsNone(re.search(r"^结束 = ", code, re.M))
+
+    def test_add_var_without_name_is_skipped(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "没填名字", gk_var_name="")
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("没有填变量名" in w for w in warnings), warnings)
+        self.assertNotIn("+= ", code)
+
+    def test_add_var_uses_setter_when_bound(self):
+        """变量绑了 setter -> 走 setter(和『变量_设置』同一条路)。"""
+        tree = make_tree()
+        var = self._declare(tree, "hp", "float", "100")
+        var.setter = "扣血"
+        self._declare_func(tree, "扣血", "void", "amount:float")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "扣血", gk_var_name="hp",
+                            gk_amount=-10.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(code, r"扣血_[0-9a-f]{8}\(\(hp \+ -10\.0\)\)")
+        self.assertNotIn("hp = ", code)
+
+    # ---- ③ 流程_冷却 ----
+
+    def test_cooldown_splits_ready_and_waiting(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnAreaEntered, "撞到敌1",
+                              gk_area="敌1", gk_filter="小玩家")
+        cooldown = tree.new_node(NN.GKNodeCooldown, "受伤冷却", gk_seconds=2.0)
+        damage = tree.new_node(NN.GKNodePrint, "扣血", gk_text="扣血")
+        waiting = tree.new_node(NN.GKNodePrint, "无敌中", gk_text="无敌中")
+        gk_stub.connect(tree, event, "执行", cooldown, "执行")
+        gk_stub.connect(tree, cooldown, "可以", damage, "执行")
+        gk_stub.connect(tree, cooldown, "还在冷却", waiting, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        # 初值 -999999 = 第一次一定放行(游戏刚开始时钟才几十毫秒)
+        self.assertIn("var _gk_cd_ticks: int = -999999", code)
+        self.assertRegex(
+            code,
+            r"if Time\.get_ticks_msec\(\) - _gk_cd_ticks >= int\(\(2\.0\) \* 1000\.0\):")
+        self.assertRegex(
+            code,
+            r"if Time[^\n]*:\n\s+_gk_cd_ticks = Time\.get_ticks_msec\(\)\n"
+            r"\s+print\(\"扣血\"\)")
+        self.assertRegex(code, r"else:\n\s+print\(\"无敌中\"\)")
+
+    def test_two_cooldowns_keep_separate_state(self):
+        """两个冷却门各管各的(同一个变量的话第二个每帧覆盖第一个)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeCooldown, "冷却A")
+        second = tree.new_node(NN.GKNodeCooldown, "冷却B")
+        print_a = tree.new_node(NN.GKNodePrint, "打印A", gk_text="A")
+        print_b = tree.new_node(NN.GKNodePrint, "打印B", gk_text="B")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "可以", print_a, "执行")
+        gk_stub.connect(tree, print_a, "完成", second, "执行")
+        gk_stub.connect(tree, second, "可以", print_b, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var _gk_cd_ticks: int = -999999", code)
+        self.assertIn("var _gk_cd_ticks_2: int = -999999", code)
+        self.assertEqual(code.count("Time.get_ticks_msec() - _gk_cd_ticks_2"), 1)
+
+    def test_cooldown_without_wait_branch_has_no_else(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        cooldown = tree.new_node(NN.GKNodeCooldown, "冷却")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="过")
+        gk_stub.connect(tree, event, "执行", cooldown, "执行")
+        gk_stub.connect(tree, cooldown, "可以", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('print("过")', code)
+        self.assertNotIn("else:", code)
+        self.assertNotIn("pass", code)
+
+    # ---- ④ 文本_数字 ----
+
+    def test_number_text_keeps_hud_clean(self):
+        tree = make_tree()
+        self._declare(tree, "血量", "float", "3.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        read = tree.new_node(NN.GKNodeGetVar, "读血量", gk_var_name="血量")
+        number = tree.new_node(NN.GKNodeNumberText, "血量文字")
+        join = tree.new_node(NN.GKNodeTextJoin, "拼", gk_a="血量 ")
+        label = tree.new_node(NN.GKNodeUiText, "血量HUD", gk_text="血量 3")
+        gk_stub.connect(tree, read, "值", number, "数值")
+        gk_stub.connect(tree, number, "文字", join, "乙")
+        gk_stub.connect(tree, join, "结果", label, "文字")
+        gk_stub.connect(tree, event, "执行", label, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("func _gk_num_text(value: float) -> String:", code)
+        self.assertIn("if is_equal_approx(value, roundf(value)):", code)
+        self.assertIn("return str(int(roundf(value)))", code)
+        self.assertIn("return str(snappedf(value, 0.01))", code)
+        self.assertIn("_gk_num_text(血量)", code)
+
+    def test_number_text_helper_emitted_once(self):
+        """两个『文本_数字』共用同一份 helper(不然 Godot 报函数重名)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeNumberText, "数字1", gk_value=1.0)
+        second = tree.new_node(NN.GKNodeNumberText, "数字2", gk_value=2.0)
+        label_a = tree.new_node(NN.GKNodeUiText, "标签A")
+        label_b = tree.new_node(NN.GKNodeUiText, "标签B")
+        gk_stub.connect(tree, first, "文字", label_a, "文字")
+        gk_stub.connect(tree, second, "文字", label_b, "文字")
+        gk_stub.connect(tree, event, "执行", label_a, "执行")
+        gk_stub.connect(tree, label_a, "完成", label_b, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("func _gk_num_text"), 1)
+        self.assertIn("_gk_num_text(1.0)", code)
+        self.assertIn("_gk_num_text(2.0)", code)
+
+
+class TestRound26CommonPieces(Base):
+    """第二十六轮:把"做游戏常用件"再补一批。
+
+    * 『移动_朝向目标』 —— 『加速』平滑加减速 + 『到达』数据输出
+    * 『变量_增减』     —— 『限制范围』(血量/金币别再扣成负数)
+    * 『流程_冷却』     —— 『每几次放行一次』(>1 才生成计数器,老图产物不变)
+    * 『特效_闪红』     —— 受击整模型染色(3D material_override / 2D modulate)
+    * 『界面_飘字』     —— 拾取 +1 / 受伤 -1 的世界飘字(不占 HUD)
+    """
+
+    def _declare(self, tree, name, var_type="float", default="0"):
+        tree.gk_vars.add()
+        var = tree.gk_vars[len(tree.gk_vars) - 1]
+        var.var_name = name
+        var.var_type = var_type
+        var.default_value = default
+        return var
+
+    def _chase_tree(self, goal="小玩家", **props):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveToward, "追", gk_goal=goal,
+                             gk_speed=3.0, **props)
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        return tree, move
+
+    # ---- ① 移动_朝向目标:加速 + 到达 ----
+
+    def test_chase_has_arrive_output_pin(self):
+        _tree, move = self._chase_tree()
+        self.assertIn("到达", [socket.name for socket in move.outputs])
+
+    def test_chase_accel_smooths_velocity(self):
+        """『加速』> 0 -> velocity 走 move_toward(不再瞬起瞬停)。"""
+        tree, move = self._chase_tree(gk_accel=8.0)
+        move.gk_target = "追击者"
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertRegex(
+            code,
+            r"节点_追击者\.velocity = 节点_追击者\.velocity\.move_toward\(")
+        self.assertIn("8.0 * get_physics_process_delta_time()", code)
+        # 目标速度还是"方向 × 速度",停下时喂 ZERO
+        self.assertRegex(code, r"_wanted\d+ = _to_goal\d+\.normalized\(\) \* chase_speed")
+        self.assertIn("Vector3.ZERO", code)
+        # 老的瞬时赋值那句不该再出现
+        self.assertNotRegex(code, r"节点_追击者\.velocity = _to_goal\d+\.normalized\(\)")
+
+    def test_chase_without_accel_keeps_instant_start(self):
+        """默认『加速』= 0:老图产物不变(直接赋值,不出现 move_toward)。"""
+        tree, _move = self._chase_tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("move_toward", code)
+
+    def test_chase_arrive_output_is_self_contained(self):
+        """『到达』输出在别处被读时要能自己算(不靠语句里的临时变量)。"""
+        tree, move = self._chase_tree(gk_stop_distance=1.5)
+        move.gk_target = "追击者"
+        branch = tree.new_node(NN.GKNodeBranch, "到了吗")
+        arrived = tree.new_node(NN.GKNodePrint, "到了", gk_text="到了")
+        gk_stub.connect(tree, move, "到达", branch, "条件")
+        gk_stub.connect(tree, move, "完成", branch, "执行")
+        gk_stub.connect(tree, branch, "是", arrived, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertRegex(
+            code,
+            r"if \(\(_gk_global_position_3d\(节点_小玩家\) - "
+            r"_gk_global_position_3d\(节点_追击者\)\)\.length\(\) <= 1\.5\):")
+        # 条件那句必须是自包含的(不能出现语句里那个临时变量)
+        condition = [line for line in code.splitlines() if "<= 1.5):" in line]
+        self.assertTrue(condition, code)
+        self.assertNotIn("_goal_dist", condition[0])
+
+    def test_chase_arrive_output_without_goal_is_false(self):
+        """没选『目标』时『到达』给 false(语句那边已经告警,不再刷一条)。"""
+        tree, move = self._chase_tree(goal="")
+        branch = tree.new_node(NN.GKNodeBranch, "到了吗")
+        gk_stub.connect(tree, move, "到达", branch, "条件")
+        gk_stub.connect(tree, move, "完成", branch, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertIn("if false:", code)
+        self.assertTrue(any("不知道往哪走" in w for w in warnings), warnings)
+
+    # ---- ② 变量_增减:限制范围 ----
+
+    def test_add_var_clamps_int(self):
+        tree = make_tree()
+        self._declare(tree, "金币数", "int", "0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "金币+1", gk_var_name="金币数",
+                            gk_amount=1.0, gk_clamp=True, gk_min=0.0, gk_max=5.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        # int 变量的 int(...) 自动补在 clampf 外面
+        self.assertIn("金币数 = int(clampf((金币数 + 1.0), 0.0, 5.0))", code)
+
+    def test_add_var_clamps_float_hp(self):
+        tree = make_tree()
+        self._declare(tree, "血量", "float", "3.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "血量-1", gk_var_name="血量",
+                            gk_amount=-1.0, gk_clamp=True, gk_min=0.0, gk_max=3.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("血量 = clampf((血量 + -1.0), 0.0, 3.0)", code)
+        self.assertNotIn("int(clampf", code)
+
+    def test_add_var_without_clamp_keeps_old_line(self):
+        tree = make_tree()
+        self._declare(tree, "血量", "float", "3.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "血量-1", gk_var_name="血量",
+                            gk_amount=-1.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("血量 = (血量 + -1.0)", code)
+        self.assertNotIn("clampf", code)
+
+    def test_add_var_clamp_min_above_max_warns(self):
+        """最小 > 最大 = 填反了 -> 告警(夹完恒等于最小值)。"""
+        tree = make_tree()
+        self._declare(tree, "血量", "float", "3.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        add = tree.new_node(NN.GKNodeAddVar, "扣血", gk_var_name="血量",
+                            gk_amount=-1.0, gk_clamp=True, gk_min=5.0, gk_max=1.0)
+        gk_stub.connect(tree, event, "执行", add, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("还大" in w for w in warnings), warnings)
+        self.assertIn("clampf((血量 + -1.0), 5.0, 1.0)", code)
+
+    # ---- ③ 流程_冷却:每几次放行一次 ----
+
+    def test_cooldown_every_n_adds_counter(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        cooldown = tree.new_node(NN.GKNodeCooldown, "每两次", gk_seconds=0.5,
+                                 gk_every=2)
+        printer = tree.new_node(NN.GKNodePrint, "过", gk_text="过")
+        gk_stub.connect(tree, event, "执行", cooldown, "执行")
+        gk_stub.connect(tree, cooldown, "可以", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("var _gk_cd_count: int = 0", code)
+        self.assertRegex(code, r"_gk_cd_count \+= 1")
+        self.assertRegex(
+            code,
+            r"if Time\.get_ticks_msec\(\) - _gk_cd_ticks >= int\(\(0\.5\) "
+            r"\* 1000\.0\) and _gk_cd_count % 2 == 0:")
+
+    def test_cooldown_every_one_keeps_old_output(self):
+        """默认 1 = 老行为:不生成计数器行(老图产物逐字不变)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        cooldown = tree.new_node(NN.GKNodeCooldown, "冷却", gk_seconds=2.0)
+        printer = tree.new_node(NN.GKNodePrint, "过", gk_text="过")
+        gk_stub.connect(tree, event, "执行", cooldown, "执行")
+        gk_stub.connect(tree, cooldown, "可以", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_cd_count", code)
+        self.assertIn("if Time.get_ticks_msec() - _gk_cd_ticks >= "
+                      "int((2.0) * 1000.0):", code)
+
+    def test_two_cooldowns_keep_separate_counters(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeCooldown, "冷却A", gk_every=2)
+        second = tree.new_node(NN.GKNodeCooldown, "冷却B", gk_every=3)
+        printer = tree.new_node(NN.GKNodePrint, "过", gk_text="过")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "可以", second, "执行")
+        gk_stub.connect(tree, second, "可以", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_cd_count % 2 == 0", code)
+        self.assertIn("_gk_cd_count_2 % 3 == 0", code)
+
+    # ---- ④ 特效_闪红 ----
+
+    def test_flash_red_3d_covers_meshes_and_restores(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        flash = tree.new_node(NN.GKNodeFlashRed, "受伤闪红", gk_time=0.25)
+        gk_stub.connect(tree, event, "执行", flash, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assert_no_chinese_identifiers(code)
+        self.assertIn("func _gk_flash_3d(node: Node, color: Color, "
+                      "seconds: float) -> void:", code)
+        self.assertIn("BaseMaterial3D.SHADING_MODE_UNSHADED", code)
+        # 整棵网格盖上去 + 时间到了恢复(恢复前先比对是不是自己那个材质)
+        self.assertIn("(item as MeshInstance3D).material_override = mat", code)
+        self.assertIn("(item as MeshInstance3D).material_override = olds[index]", code)
+        self.assertIn("tween_callback(func() -> void:", code)
+        self.assertIn("_gk_flash_3d(self, Color(1.0, 0.25, 0.25, 1.0), 0.25)", code)
+
+    def test_flash_red_helper_emitted_once(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeFlashRed, "闪A")
+        second = tree.new_node(NN.GKNodeFlashRed, "闪B", gk_target="敌1")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("func _gk_flash_3d"), 1)
+        self.assertIn("_gk_flash_3d(节点_敌1, Color(", code)
+
+    def test_flash_red_2d_uses_modulate(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        flash = tree.new_node(NN.GKNodeFlashRed, "受击闪红")
+        gk_stub.connect(tree, event, "执行", flash, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("func _gk_flash_2d(node: Node, color: Color, "
+                      "seconds: float) -> void:", code)
+        self.assertIn("(item as CanvasItem).modulate = color", code)
+        self.assertIn("(item as CanvasItem).modulate = olds[index]", code)
+        self.assertNotIn("material_override", code)
+
+    # ---- ⑤ 界面_飘字 ----
+
+    def test_float_text_3d_creates_billboard_label(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        floating = tree.new_node(NN.GKNodeFloatText, "金币飘字",
+                                 gk_target="金币1", gk_prefix="+", gk_value=1.0)
+        gk_stub.connect(tree, event, "执行", floating, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assert_no_chinese_identifiers(code)
+        self.assertIn("func _gk_float_text_3d(anchor: Node, text: String, "
+                      "color: Color, seconds: float, rise: float) -> void:", code)
+        self.assertIn("Label3D.new()", code)
+        self.assertIn("BaseMaterial3D.BILLBOARD_ENABLED", code)
+        self.assertIn("tween_callback(label.queue_free)", code)
+        # 文字 = 前缀 + 数字(整数不带 .0);飘完自己删
+        self.assertIn('_gk_float_text_3d(节点_金币1, "+" + _gk_num_text(1.0), '
+                      'Color(1.0, 0.9, 0.35, 1.0), 0.8, 1.2)', code)
+        self.assertIn("func _gk_num_text(value: float) -> String:", code)
+
+    def test_float_text_shares_num_text_helper(self):
+        """和『文本_数字』共用同一个 helper(各生成一份 Godot 报函数重名)。"""
+        tree = make_tree()
+        self._declare(tree, "血量", "float", "3.0")
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        read = tree.new_node(NN.GKNodeGetVar, "读血量", gk_var_name="血量")
+        number = tree.new_node(NN.GKNodeNumberText, "血量文字")
+        damage = tree.new_node(NN.GKNodeConstFloat, "伤害", gk_value=25.0)
+        floating = tree.new_node(NN.GKNodeFloatText, "受伤飘字", gk_target="敌1",
+                                 gk_prefix="-")
+        hud = tree.new_node(NN.GKNodeUiText, "血量HUD")
+        gk_stub.connect(tree, read, "值", number, "数值")
+        gk_stub.connect(tree, number, "文字", hud, "文字")
+        gk_stub.connect(tree, damage, "值", floating, "数值")
+        gk_stub.connect(tree, event, "执行", hud, "执行")
+        gk_stub.connect(tree, hud, "完成", floating, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertEqual(code.count("func _gk_num_text"), 1)
+        self.assertIn("_gk_num_text(血量)", code)
+        self.assertIn('_gk_float_text_3d(节点_敌1, "-" + _gk_num_text(25.0), ',
+                      code)
+
+    def test_float_text_2d_creates_label(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        floating = tree.new_node(NN.GKNodeFloatText, "受伤飘字",
+                                 gk_prefix="-", gk_value=1.0)
+        gk_stub.connect(tree, event, "执行", floating, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("func _gk_float_text_2d(anchor: Node, text: String, "
+                      "color: Color, seconds: float, rise: float) -> void:", code)
+        self.assertIn("Label.new()", code)
+        self.assertIn('add_theme_font_size_override("font_size", 32)', code)
+        self.assertIn('_gk_float_text_2d(self, "-" + _gk_num_text(1.0), ', code)
+        self.assertNotIn("Label3D", code)
+
+
+class TestRound27AnimationRepeat(Base):
+    """第二十七轮:"先放完再重复"一键化 + 动画播放器填物体名的那条路。
+
+    * 『动画_播放』的『重复触发时』(= 老『混合模式』)选项改名说清楚:
+      『从头重播』/『先放完再说(在播就跳过)』—— 后者就是"先放完再重复";
+    * 修一个运行时断链的 bug:『动画播放器』填了**物体名**时,那个物体不是
+      AnimationPlayer(glTF 把播放器放在模型实例内部),以前直接拿它当
+      播放器用 -> 运行时报 "Nonexistent function 'has_animation' in base
+      'Area3D'" 且整条链断掉。现在从那个物体开始查。
+    """
+
+    def _play_tree(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        play = tree.new_node(NN.GKNodePlayAnim, "播放", gk_anim_name="抖动",
+                             gk_player="", **props)
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        return tree, play
+
+    def test_repeat_option_keys_stay_compatible(self):
+        """选项的**键**不能改(RENAME 会让老 .blend 里的值对不上)。"""
+        from BlenderGameKit.nodes import nodes as NN
+
+        spec = next(entry for entry in NN.GKNodePlayAnim.gk_prop_defs
+                    if entry[0] == "gk_blend_mode")
+        label = spec[3]
+        items = spec[5]
+        self.assertEqual([item[0] for item in items], ["REPLACE", "CONTINUE"])
+        self.assertEqual(label, "重复触发时")
+        labels = [item[1] for item in items]
+        self.assertTrue(any("先放完" in text for text in labels), labels)
+
+    def test_replace_restarts_every_trigger(self):
+        """默认『从头重播』:老行为一个字不变(没有跳过守卫)。"""
+        tree, _play = self._play_tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("current_animation !=", code)
+        self.assertIn(".play(_anim", code)
+
+    def test_continue_skips_while_playing(self):
+        """『先放完再说』:正在播同名动画就跳过(不打断当前这一轮)。"""
+        tree, _play = self._play_tree(gk_blend_mode="CONTINUE")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertRegex(code, r"if _ap\d+\.current_animation != _anim\d+ "
+                               r"or not _ap\d+\.is_playing\(\):")
+        # 播放/接线都要在跳过守卫**里面**(被跳过时不重播、也不重接信号)
+        play_line = next(line for line in code.splitlines()
+                         if ".play(" in line and "current_animation" not in line)
+        guard = next(line for line in code.splitlines()
+                     if "current_animation !=" in line)
+        play_indent = len(play_line) - len(play_line.lstrip(" "))
+        guard_indent = len(guard) - len(guard.lstrip(" "))
+        self.assertEqual(play_indent, guard_indent + 4,
+                         f"播放没在守卫里面: {play_line!r}")
+
+    def test_named_player_goes_through_the_finder(self):
+        """填了物体名 -> 从那个物体开始**找**播放器(不能直接当播放器用)。"""
+        tree, _play = self._play_tree()
+        _play.gk_player = "敌1"
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_find_animation_player(anim_敌1)", code)
+        self.assertIn("func _gk_find_animation_player(host: Node) -> Node:", code)
+        # 不能再生成"把物体本身当播放器"的那种引用
+        self.assertNotRegex(code, r"var _ap\d+ := 节点_敌1$")
+        self.assertNotRegex(code, r"var _ap\d+ := anim_敌1$")
+
+
+class TestRound28PhysicsPush(Base):
+    """第二十八轮:『推开刚体』—— Godot 的运动学角色**不会**推刚体。
+
+    ── 为什么这是"物理加固"里的第一件事 ──────────────────────────
+    角色是 CharacterBody(运动学体):`move_and_slide()` 撞到刚体只会贴着
+    滑走,不给它任何力。不加这一段,用户看到的就是"箱子焊在地上推不动",
+    而他会以为是碰撞体没做对。生成的冲量 = 推力 × 帧时长 × 质量
+    (持续施加『推力』牛顿),方向取碰撞法线的**水平**反向。
+    """
+
+    def _move_tree(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        # 速度给 6(3D 里的合理值)—— 300 会触发"3D 速度太大"那条告警
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=6.0,
+                             **props)
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        return tree, move
+
+    def test_push_off_keeps_old_output(self):
+        """默认不勾:老图产物一个字不变(没有碰撞循环)。"""
+        tree, _move = self._move_tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("get_slide_collision", code)
+
+    def test_push_generates_horizontal_impulse(self):
+        tree, _move = self._move_tree(gk_push_bodies=True, gk_push_force=45.0)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertRegex(code, r"for _push\d+ in self\.get_slide_collision_count\(\):")
+        self.assertRegex(code, r"var _hit\d+ := self\.get_slide_collision\(_push\d+\)")
+        self.assertIn("is RigidBody3D:", code)
+        self.assertIn("apply_central_impulse(", code)
+        self.assertIn("45.0 * get_physics_process_delta_time()", code)
+        self.assertIn("as RigidBody3D).mass", code)
+        # Y 分量要丢掉 —— 不然会把箱子往地里/天上按
+        self.assertRegex(code, r"Vector3\(-_hit\d+\.get_normal\(\)\.x, 0\.0, "
+                               r"-_hit\d+\.get_normal\(\)\.z\)")
+
+    def test_push_happens_after_move_and_slide(self):
+        """必须在 move_and_slide() **之后** —— 那时才有碰撞可查。"""
+        tree, _move = self._move_tree(gk_push_bodies=True)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertLess(code.index(".move_and_slide()"),
+                        code.index("get_slide_collision_count()"))
+
+    def test_push_2d_uses_rigidbody2d(self):
+        tree, _move = self._move_tree(gk_push_bodies=True)
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("is RigidBody2D:", code)
+        self.assertNotIn("RigidBody3D", code)
+
+
+class TestRound29StepUp(Base):
+    """第二十九轮:『上台阶』—— Godot 的运动学角色**不会**自动上台阶。
+
+    `move_and_slide()` 撞到 0.35 米的台阶只会贴着前脸滑走,玩家看到的
+    就是"一堵墙"。『上台阶高度』> 0 时生成"三关探测":
+      ① 前面被**竖着的**东西挡住(坡面不算 —— 不然上坡一蹦一蹦);
+      ② 抬到该高度再往前是通的(台阶更高就会撞上 -> 仍然挡住);
+      ③ 落点下面有地(不对着悬崖抬腿)。
+    三个都过了才平移过去。默认 0 时**一个字都不生成** —— 老图产物不变。
+    """
+
+    def _move_tree(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=6.0,
+                             gk_keep_y=True, **props)
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        return tree, move
+
+    def test_step_off_keeps_old_output(self):
+        """默认 0(不填):老图产物一个字不变(没有 test_move)。"""
+        tree, _move = self._move_tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("test_move", code)
+        self.assertNotIn("KinematicCollision", code)
+
+    def test_step_generates_three_gates(self):
+        """填了高度 -> 三关探测 + 平移过去(不是硬挤)。"""
+        tree, _move = self._move_tree(gk_step_height=0.5)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("self.is_on_floor()", code)
+        self.assertRegex(code, r"var _step_col\d+ := KinematicCollision3D\.new\(\)")
+        # ① 被挡住的得是**竖面**(absf(法线.y) < 0.5)—— 坡面不抬腿
+        self.assertRegex(code, r"if self\.test_move\(self\.global_transform, "
+                               r"_step_fwd\d+, _step_col\d+\) and "
+                               r"absf\(_step_col\d+\.get_normal\(\)\.y\) < 0\.5:")
+        # ② 抬起来的路通(斜着上去)
+        self.assertIn("Vector3.UP * 0.5 + _step_fwd", code)
+        # ③ 抬起来之后**还得走得动** —— 胶囊尖从高台阶旁擦过去的
+        # "假台阶"就靠这一关挡住(不然顶着高墙原地一蹦一蹦)
+        self.assertRegex(code, r"if not self\.test_move\(_step_ahead\d+, "
+                               r"_step_fwd\d+\):")
+        # ④ 落点有地(比现在高 ≥5 厘米)且是**平面**
+        self.assertIn("Vector3.DOWN * 0.45", code)
+        self.assertRegex(code, r"var _step_land\d+ := KinematicCollision3D\.new\(\)")
+        self.assertRegex(code, r"_step_land\d+\.get_normal\(\)\.y >= 0\.5")
+        self.assertRegex(code, r"self\.global_position \+= _step_lift\d+")
+        # 必须排在 move_and_slide() 之后 —— 滑不过去才轮到抬腿
+        self.assertLess(code.index(".move_and_slide()"), code.index("test_move("))
+
+    def test_step_2d_uses_vector2(self):
+        tree, _move = self._move_tree(gk_step_height=0.5)
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("KinematicCollision2D.new()", code)
+        self.assertIn("Vector2.UP * 0.5", code)
+        self.assertNotIn("KinematicCollision3D", code)
+
+
+class TestRound30Vehicles(Base):
+    """第三十轮:移动平台(AnimatableBody)+ 可驾驶载具(上/下车/驾驶)。
+
+    ── 两条主线 ────────────────────────────────────────────────────
+    ① **站上去跟着走**:平台必须是 AnimatableBody —— 被脚本/时间轴
+       每帧挪位置时它的**速度**会传给站在上面的角色;StaticBody 是
+       "瞬移",角色只会留在原地(平台从脚下溜走)。
+    ② **可驾驶**:上/下车/驾驶三个节点靠载具**自己身上**的
+       `set_meta("gk_driving")` 互通(不用摆变量,摆两辆车也不串);
+       驾驶 = 沿车头前进/后退 + A/D 转车头 + **每帧把角色钉回座位**
+       (镜头 / 距离判定 / 触发区都认角色位置,所以它们自动跟着车走)。
+    """
+
+    def _tree(self):
+        """物理帧 → 移动(角色)→ 驾驶;按 E:在开吗? 是 = 下车,否 = 上车。
+
+        ⚠ 『否』口只能挂在**里层**(先判"按了 E 吗")—— 挂在外层的
+        条件里的话,"没按 E"的帧也会走 否(上车),刚下车就被塞回座位
+        (探针实测抓到的)。
+        """
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动",
+                             gk_speed=6.0, gk_keep_y=True)
+        drive = tree.new_node(NN.GKNodeDriveVehicle, "驾驶",
+                              gk_vehicle="载具", gk_speed=10.0)
+        enter = tree.new_node(NN.GKNodeEnterVehicle, "上车", gk_vehicle="载具")
+        leave = tree.new_node(NN.GKNodeExitVehicle, "下车", gk_vehicle="载具")
+        key = tree.new_node(NN.GKNodeKey, "E键", gk_key="E",
+                            gk_action="key_e", gk_trigger="JUST")
+        pressed = tree.new_node(NN.GKNodeBranch, "按了E?")
+        driving = tree.new_node(NN.GKNodeBranch, "在开吗?")
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        gk_stub.connect(tree, move, "完成", drive, "执行")
+        gk_stub.connect(tree, key, "结果", pressed, "条件")
+        gk_stub.connect(tree, drive, "完成", pressed, "执行")
+        gk_stub.connect(tree, pressed, "是", driving, "执行")
+        gk_stub.connect(tree, drive, "驾驶中", driving, "条件")
+        gk_stub.connect(tree, driving, "是", leave, "执行")
+        gk_stub.connect(tree, driving, "否", enter, "执行")
+        return tree, enter, drive, leave
+
+    def test_animatable_body_maps_to_itself(self):
+        """『游戏物理』新类型 -> 节点/脚本基类都是 AnimatableBody。"""
+        from BlenderGameKit import properties as props
+        self.assertEqual(props.BODY_TYPE_TO_BASE_CLASS["AnimatableBody3D"],
+                         "AnimatableBody3D")
+        self.assertEqual(props.BODY_TYPE_TO_BASE_CLASS["AnimatableBody2D"],
+                         "AnimatableBody2D")
+        physics = types.SimpleNamespace(is_trigger=False,
+                                        body_type="AnimatableBody3D")
+        self.assertEqual(props.resolve_base_class(None, None, physics, "3"),
+                         "AnimatableBody3D")
+        # 2D 项目里选了 3D 类型 -> 自动纠正(不然 Godot 拒绝加载场景)
+        self.assertEqual(props.resolve_base_class(None, None, physics, "2"),
+                         "AnimatableBody2D")
+
+    def test_enter_puts_rider_on_the_seat(self):
+        tree, _enter, _drive, _leave = self._tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        # 状态写在**载具自己身上** —— 三个节点靠它互通
+        self.assertIn('set_meta("gk_driving", true)', code)
+        self.assertIn('set_meta("gk_seat", Vector3(0.0, 1.2, 0.0))', code)
+        self.assertIn(".visible = false", code)
+        self.assertIn("_gk_set_collision(self, false)", code)
+        self.assertIn(".global_transform * Vector3(0.0, 1.2, 0.0)", code)
+        # 『上车距离』= 3 -> 离得够近才上得去(不然在地图另一头也能瞬移上车)
+        self.assertIn(".length() <= 3.0:", code)
+
+    def test_enter_without_vehicle_warns(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        enter = tree.new_node(NN.GKNodeEnterVehicle, "上车")      # 没选载具
+        gk_stub.connect(tree, event, "执行", enter, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("载具" in str(w) for w in warnings), warnings)
+        self.assertNotIn("set_meta", code)
+
+    def test_exit_restores_the_rider(self):
+        tree, _enter, _drive, _leave = self._tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('set_meta("gk_driving", false)', code)
+        self.assertIn(".global_transform * Vector3(2.0, 0.5, 0.0)", code)
+        self.assertIn(".visible = true", code)
+        self.assertIn("_gk_set_collision(self, true)", code)
+
+    def test_drive_guarded_by_state_and_pins_seat(self):
+        tree, _enter, _drive, _leave = self._tree()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        # 没人在开就什么都不做
+        self.assertRegex(code, r'if 载具_\S+\.get_meta\("gk_driving", false\):')
+        # 车感:W/S 沿车头、A/D 转车头
+        # ⚠ `rotation.y` 是弧度,『转向速度』填的是度/秒 —— 少一层
+        # deg_to_rad 车会疯狂打转(探针实测:每帧转 1.4 弧度)
+        self.assertIn(".rotation.y -= deg_to_rad(", code)
+        self.assertRegex(code, r"\.velocity\.x = _drive_fwd\d+\.x \* _drive\d+\.z "
+                               r"\* 10\.0")
+        self.assertRegex(code, r"\.velocity\.z = _drive_fwd\d+\.z \* _drive\d+\.z "
+                               r"\* 10\.0")
+        # 每帧把角色钉回座位(读载具身上那份座位)
+        self.assertRegex(code, r'self\.global_position = 载具_\S+\.global_transform '
+                               r'\* \(载具_\S+\.get_meta\("gk_seat", Vector3\.ZERO\) '
+                               r'as Vector3\)')
+        # 「驾驶中」输出 = 自包含表达式(接『如果_否则』用)——
+        # 分支那边也生成了同一句
+        self.assertGreaterEqual(code.count('get_meta("gk_driving", false)'), 2)
+        # 钉座位必须排在角色移动**之后**(不然会被角色的移动覆盖)
+        pin = code.index('self.global_position = 载具_载具.global_transform * (')
+        self.assertLess(code.index("self.move_and_slide()"), pin)
+
+    def test_drive_2d_uses_vector2(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        drive = tree.new_node(NN.GKNodeDriveVehicle, "驾驶2", gk_vehicle="车2")
+        gk_stub.connect(tree, physics, "执行", drive, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn('.get_meta("gk_seat", Vector2.ZERO) as Vector2', code)
+        self.assertIn(".velocity.x = _drive", code)
+        self.assertNotIn("rotation.y", code)      # 2D 没有"打方向盘"
 
 
 if __name__ == "__main__":

@@ -10,11 +10,15 @@
 param(
     [string]$Godot = "D:\godot\Godot_v4.7.2-stable_win64_console.exe",
     [string]$Root = "D:\BlenderGameKit",
-    [int]$Frames = 180
+    [int]$Frames = 180,
+    # 生成到哪个目录。默认 examples\demo_2d(可展示的示例工程);
+    # 一键门禁(build_and_test.ps1)会传 _dist\godot_e2e,把产物隔离在
+    # gitignore 里,不弄脏已入库的示例。
+    [string]$OutDir = ""
 )
 
 $ErrorActionPreference = "Continue"
-$project = Join-Path $Root "examples\demo_2d"
+if ($OutDir) { $project = $OutDir } else { $project = Join-Path $Root "examples\demo_2d" }
 
 function Step($text) {
     Write-Output ""
@@ -27,14 +31,16 @@ if (-not (Test-Path $Godot)) {
     Write-Output "跳过:找不到 Godot ($Godot)"
     exit 0
 }
-if (-not (Test-Path $project)) {
+# 指定了 -OutDir 就是临时产物目录,下面第 1 步会重新生成它,
+# 不需要(也不该)预先存在。只有默认的展示工程才要求已生成过。
+if (-not $OutDir -and -not (Test-Path $project)) {
     Write-Output "跳过:找不到示例工程，请先运行 scripts\make_demo.py"
     exit 1
 }
 
 # ---------- 1. 重新生成示例工程 ----------
 Step "1/4 生成示例工程"
-& python (Join-Path $Root "scripts\make_demo.py") 2>&1 |
+& python (Join-Path $Root "scripts\make_demo.py") $project 2>&1 |
     Select-String -Pattern "已生成|脚本行数|告警" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "生成示例失败"; exit 1 }
 

@@ -97,8 +97,10 @@ def main():
     check("按 C / V 两个键都进了输入映射",
           "ACTION_VIEW_TOP" in code and "ACTION_VIEW_SIDE" in code)
     check("两台相机都生成了引用(侧视 + 俯瞰,带兜底查找)",
-          '_gk_ref(self, "侧视机位")' in code
-          and '_gk_ref(self, "俯瞰机位")' in code)
+          # 按类型找(用户 2026-10-04):同名节点常常有两个(网格 + 碰撞代理),
+          # 只按名字找会把网格当成相机
+          '_gk_ref_typed(self, "侧视机位"' in code
+          and '_gk_ref_typed(self, "俯瞰机位"' in code)
     check("相机切换带过渡(丝滑推镜)", "interpolate_with" in code
           or "make_current" in code)
     check("方向输入用了捕获的 WASD",

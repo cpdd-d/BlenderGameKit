@@ -51,6 +51,7 @@ class RecordingLayout:
 
     def __init__(self):
         self.calls = []
+        self.operator_names = []      # 画出来的按钮 idname(第一段参数)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -58,6 +59,8 @@ class RecordingLayout:
 
         def recorder(*args, **kwargs):
             self.calls.append(name)
+            if name == "operator" and args:
+                self.operator_names.append(str(args[0]))
             return self
         return recorder
 
@@ -149,6 +152,48 @@ def main():
             check(f"{class_name}.draw() 跑通", False,
                   f"{type(exc).__name__}: {exc}")
             traceback.print_exc()
+
+    # ---- 2b. 带**导出报告**时面板也要画得出来(第二十三轮)----
+    # 报告盒子是这次新加的:它画消息 / "怎么修" / 定位按钮,
+    # 还自己折行(Blender 的 label 不换行)。空报告那条路上面已经跑过了,
+    # 这里塞一份**有错误 + 长消息 + 节点名**的报告再画一遍。
+    print("=" * 72)
+    print("2b. 有导出报告时的面板 draw()")
+    print("=" * 72)
+    try:
+        # 插件在 Blender 里是 bl_ext.<仓库>.<包名>,直接 import 会 ModuleNotFoundError
+        export_report = import_module(f"{module_name}.export_report")
+        models = import_module(f"{module_name}.models")
+        export_report.record(scene, {
+            "ok": False, "error": "写 .tscn 失败: 权限不足(这是一个很长的" 
+                                  "错误消息,用来验证面板里的手动折行)",
+            "stage": "写场景", "script_name": "game_logic.gd",
+            "directory": "D:/proj", "lines": 120, "elapsed_ms": 35.5,
+            "written": ["a"],
+            "diagnostics": [models.Diagnostic(
+                level="warning", code="ANIM_TARGET_MISMATCH",
+                message="动画『走路』不在『身体』上 —— 这个模型里没有这个动作",
+                hint="检查节点上的『动画播放器』是否指向了带这个动画的物体",
+                node_name="动画_走路")],
+            "warnings": ["这些网格没有材质: 地面"],
+            "notes": ["参考: 无"],
+        })
+        panel = getattr(ui, "GK_PT_Main", None)
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        panel.draw(holder, FakeContext(cube, scene))
+        check("有报告时 GK_PT_Main.draw() 跑通", True)
+        # 复制 / 定位两个按钮都要画出来
+        names = [call for call in layout.operator_names]
+        check("报告盒子画出了『复制报告』和『定位』按钮",
+              "gk.export_report_copy" in names
+              and "gk.export_report_focus" in names,
+              str(sorted(set(names))))
+        export_report.clear()
+    except Exception as exc:
+        check("有报告时 GK_PT_Main.draw() 跑通", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
 
     # ---- 3. 面板里的按钮必须画出来 ----
     #
