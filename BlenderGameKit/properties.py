@@ -1176,7 +1176,16 @@ def event_summary(tree):
 # 这两个纯函数把**所有变量节点的引用**汇总出来,给侧栏面板用。
 #
 # 判"读/写"靠节点的 bl_idname:写节点的类型是固定的,其余当读。
-_VAR_WRITER_NODES = {"GKNodeSetVar", "GKNodeAnimSetVar"}
+# ── 『变量_增减』也是"写"(第三十三轮整理示例时补的)───────────────────
+# 它以前被当成"读",于是小游戏示例的『血量』在引用区显示成"设 0 · 读 4" ——
+# 明明是四个『变量_增减』在扣血,面板却说没人写过它。用户看到的是
+# "这个变量没人写,怎么还会变?",而答案是面板数错了。
+_VAR_WRITER_NODES = {"GKNodeSetVar", "GKNodeAnimSetVar", "GKNodeAddVar"}
+
+# 写变量、但属性名不叫 `gk_var_name` 的节点:{bl_idname: (属性名, 角色)}。
+# 『存档_读取到变量』把存档里的值读进 `gk_var` 这个变量 —— 它是**写方**
+# (同『变量_设置』),不扫的话它写的变量在引用区里根本不存在。
+_VAR_OTHER_PROPS = {"GKNodeSaveGet": (("gk_var", "set"),)}
 
 
 def _node_var_names(node):
@@ -1185,16 +1194,21 @@ def _node_var_names(node):
     一张『变量_设置』卡片能写多个变量(gk_var_name / gk_var_name_2 …),
     所以要把所有槽位都扫一遍。
     """
-    role = "set" if getattr(node, "bl_idname", "") in _VAR_WRITER_NODES else "get"
+    kind = getattr(node, "bl_idname", "")
+    role = "set" if kind in _VAR_WRITER_NODES else "get"
     out = []
     name = str(getattr(node, "gk_var_name", "") or "").strip()
     if name:
         out.append((name, role))
-    if getattr(node, "bl_idname", "") == "GKNodeSetVar":
+    if kind == "GKNodeSetVar":
         for slot in range(2, 7):     # SET_VAR_SLOTS
             extra = str(getattr(node, f"gk_var_name_{slot}", "") or "").strip()
             if extra:
                 out.append((extra, "set"))
+    for prop, prop_role in _VAR_OTHER_PROPS.get(kind, ()):
+        extra = str(getattr(node, prop, "") or "").strip()
+        if extra:
+            out.append((extra, prop_role))
     return out
 
 
@@ -1226,6 +1240,48 @@ def nodes_for_variable(tree, var_name):
         if any(name == want for name, _role in _node_var_names(node)):
             hits.append(node)
     return hits
+
+
+# 『引用区』里给"名字和对外端口同名"的那批引用用的固定组名(第三十三轮)。
+# 端口本质就是脚本变量(`输出_<名字>`,见 codegen._emit_logic_ports),
+# 图里用『变量_读取/设置』填端口名是**正常接法** —— 说它"未声明"是错的。
+PORT_REF_GROUP = "对外端口"
+
+
+def reference_groups(tree):
+    """『引用区』按分组排好的行:[(组名, [(名字, 写它的节点, 读它的节点), …]), …]。
+
+    ── 排布规矩(第三十三轮整理现有示例时定的)────────────────────────
+      * 用户给变量填的分组 —— 按**声明区那套顺序**(逻辑图里摆放的顺序),
+        没出现在声明区的组按第一次引用出现;
+      * 『对外端口』—— 引用的名字和声明过的端口同名(它们不是"未声明");
+        固定排在用户分组**之后**、未分组之前;
+      * 未分组(空串)排最后。
+
+    纯函数:UI 只负责照这个顺序画折叠盒子(离线测试直接调它)。
+    """
+    usages = variable_references(tree)
+    group_of = logic_var_group_of(tree)
+    ports = {str(getattr(port, "port_name", "") or "").strip()
+             for port in (getattr(tree, "gk_ports", None) or ())}
+    buckets = {}
+    for name, sets, gets in usages:
+        group = str(group_of.get(name, "") or "").strip()
+        if not group and name in ports:
+            group = PORT_REF_GROUP
+        buckets.setdefault(group, []).append((name, sets, gets))
+    # 组名顺序:先按声明区(用户摆的顺序),再补上只在此处出现的组
+    ordered_names = [name for name, _ in logic_var_groups(tree) if name]
+    ordered_names += [name for name in buckets
+                      if name and name not in ordered_names
+                      and name != PORT_REF_GROUP]
+    ordered = [(name, buckets[name]) for name in ordered_names
+               if name in buckets and name != PORT_REF_GROUP]
+    if PORT_REF_GROUP in buckets:
+        ordered.append((PORT_REF_GROUP, buckets[PORT_REF_GROUP]))
+    if "" in buckets:
+        ordered.append(("", buckets[""]))
+    return ordered
 
 
 def default_output_dir():

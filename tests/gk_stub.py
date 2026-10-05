@@ -118,6 +118,10 @@ class StubVariable:
         self.var_type = "float"
         self.default_value = "0"
         self.comment = ""
+        # 分组 / 监视(第三十二、三十三轮)—— 和真属性面板同名字段,
+        # 离线跑的示例脚本(2D 示例 / 平台跳跃)才敢直接往声明里填这两栏。
+        self.group = ""
+        self.watch = True
         # 变量的"实现"(UE5 的 getter/setter;用户 2026-10-05 第十七轮)
         self.getter = ""
         self.setter = ""

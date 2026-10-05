@@ -104,6 +104,21 @@ def make_player_sprite(width=32, height=48):
 def build_graph():
     tree = gk_stub.StubNodeTree("玩家角色")
 
+    # ---- 变量声明(第三十三轮:用『变量分组』把示例整理干净)----------
+    # health / score 原来只在图里**隐式使用**(第一次『变量_设置』写它就
+    # 自动建成成员变量),侧栏『变量』框里看到的是"未声明"。这里补上声明:
+    # 名字 / 类型 / 初值 / 说明 / 分组一处说清(初值和『每当_准备』里
+    # 那两个 Set 一致,行为一个字不变 —— 只是 Godot 里多了初值)。
+    for name, initial, comment, group in (
+            ("health", "3.0", "生命值(被子弹打中 -1,归零就发 died)", "战斗"),
+            ("score", "0.0", "分数(按 J 攻击命中 +1)", "进度")):
+        var = tree.gk_vars.add()
+        var.var_name = name
+        var.var_type = "float"
+        var.default_value = initial
+        var.comment = comment
+        var.group = group
+
     # ---- _ready:走一遍"设置变量" ----
     ready = tree.new_node(NN.GKNodeOnReady, "开始")
     # 一张卡片设两个变量(第四轮:仿蓝图 Set 节点,每个值引脚可接不同节点)

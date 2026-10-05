@@ -177,7 +177,15 @@ def _stmt_save_get(ctx, node, indent):
     path = ctx.declare_var("_gk_save_path", "String")
     slot = getattr(node, "gk_slot", "save1")
     key = ctx.input_string(node, "键名", "")
-    var_name = ctx.declare_var(getattr(node, "gk_var", "value"), "Variant")
+    # ── 类型"不表态"(不是 Variant)—— 第三十三轮整理示例时踩到的 ──────
+    # 存档里的值可能是任意类型,所以**没人声明时**按 Variant 生成
+    # (`ctx.vars` 里存 None,写出来就是 Variant,见 generator 的成员变量段)。
+    # 但把它硬说成 "Variant" 会和用户**声明过的类型**打架:平台跳跃示例
+    # 声明 best_score 是 float,导出就多一条
+    #   "变量『best_score』同时被当成 float 和 Variant 使用,请改用不同的变量名"
+    # —— 指点用户去改一个根本没问题的变量名。传 None = "我没意见",
+    # 有声明就用声明的,没声明仍然是 Variant。
+    var_name = ctx.declare_var(getattr(node, "gk_var", "value"), None)
     default = gd_literal(node.input_value(ctx, "默认值", 0.0))
     ctx.add_line(indent, f"{var_name} = {data}.get({key}, {default})")
     ctx.read_vars.add(var_name)

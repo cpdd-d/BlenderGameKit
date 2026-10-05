@@ -1750,24 +1750,24 @@ def _draw_variable_box(layout, context):
     if not usages:
         box.label(text="图里还没有节点用到变量", icon="INFO")
     else:
-        group_of = props.logic_var_group_of(tree)
-        buckets = {}
-        for entry in usages:
-            buckets.setdefault(group_of.get(entry[0], ""), []).append(entry)
-        ordered = [(name, rows) for name, rows in buckets.items() if name]
-        if "" in buckets:
-            ordered.append(("", buckets[""]))
-        for group_name, rows_in_group in ordered:
+        # 分组排布(含『对外端口』那组)在 properties.reference_groups 里,
+        # 这里只负责画 —— 面板按分组重排过之后,这里的顺序也不能自己另搞一套。
+        for group_name, rows_in_group in props.reference_groups(tree):
             label = (f"{group_name} ({len(rows_in_group)})" if group_name
                      else f"未分组 ({len(rows_in_group)})")
+            # 『对外端口』那组:端口就是脚本变量(输出_<名字>),用不同的图标,
+            # 也不标"未声明" —— 图里引用端口名是正常接法(第三十三轮)。
+            is_ports = group_name == props.PORT_REF_GROUP
             sub, opened = collapsible_box(box, f"varrefs:{group_name}", label,
-                                          "SORTALPHA")
+                                          "PLUGIN" if is_ports else "SORTALPHA")
             if not opened:
                 continue
             for name, sets, gets in rows_in_group:
                 row = sub.row(align=True)
                 if name in declared_names:
                     row.label(text=name, icon="SORTALPHA")
+                elif is_ports:
+                    row.label(text=name, icon="PLUGIN")
                 else:
                     row.label(text=f"{name} · 未声明", icon="ERROR")
                 row.label(text=f"设 {len(sets)} · 读 {len(gets)}")

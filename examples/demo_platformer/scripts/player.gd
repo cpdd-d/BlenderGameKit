@@ -27,10 +27,10 @@ const ACTION_JUMP := "jump"
 @export var jump_force: float = 560.0  # 移动_跳跃 · 强度
 
 # ---- 成员变量 ----
+var score: float = 0.0
+var best_score: float = 0.0
 var _gk_save_data: Dictionary
 var _gk_save_path: String
-var best_score: Variant
-var score: float
 var _gk_ui_layer: CanvasLayer
 var _gk_ui_root: Control
 var _gk_ui_操作提示: Label
@@ -80,7 +80,7 @@ func _ready() -> void:
         _gk_ui_重开按钮 = Button.new()
         _gk_ui_重开按钮.name = "重开按钮"
         _gk_ui_重开按钮.mouse_filter = Control.MOUSE_FILTER_STOP
-        _gk_ui_重开按钮.pressed.connect(gk_on_button)
+        _gk_ui_重开按钮.pressed.connect(gk_on_重开按钮)
         _gk_ui_root.add_child(_gk_ui_重开按钮)
     _gk_ui_重开按钮.position = Vector2(ui_x_4, ui_y_4)
     _gk_ui_重开按钮.size = Vector2(128.0, 36.0)
@@ -172,7 +172,7 @@ func _gk_delete_save(slot: String) -> void:
     DirAccess.remove_absolute(path)
 
 
-func gk_on_button() -> void:
+func gk_on_重开按钮() -> void:
     restart_game()
 
 
@@ -189,7 +189,7 @@ func _gk_ensure_ui(host: Node) -> void:
         _gk_ui_layer.add_child(_gk_ui_root)
 
 
-func _gk_find_widget(host: Node, widget_name: String) -> Control:
+func _gk_find_widget(widget_name: String) -> Control:
     if _gk_ui_layer == null:
         return null
     var found := _gk_ui_layer.find_child(widget_name, true, false)

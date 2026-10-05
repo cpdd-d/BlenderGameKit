@@ -324,6 +324,26 @@ def build_logic_tree():
     tree = bpy.data.node_groups.new("角色游戏逻辑", "GKGameLogicTree")
     tree.use_fake_user = True      # 同动画树:没有用户就会被存盘丢掉
 
+    # ---- 变量声明(第三十三轮:用『变量分组』把示例整理干净)----------
+    # 这三个原来只在图里**隐式使用**(第一次『变量_设置』写它就自动建成
+    # 成员变量),侧栏『变量』框里看到的是一堆"未声明"。这里补上声明 ——
+    # 名字 / 类型 / 初值 / 说明 / 分组一处说清,侧栏按组折叠显示。
+    #
+    # ⚠ is_hurt / is_attacking 在**动画树的变量面板**里也有一份(动画状态
+    #   自己维护它们)。两边同名、同类型、同初值,生成出来还是同一个变量;
+    #   玩法图这份只是让引用区认得出"它声明过"。
+    # ⚠ combo_ready 只在这张图里(演示"一张卡片设两个变量")。
+    for name, initial, comment, group in (
+            ("is_hurt", "false", "受击期间为真(动画树用它当转场条件)", "状态"),
+            ("is_attacking", "false", "攻击期间为真(动画树里自己维护)", "状态"),
+            ("combo_ready", "false", "连段窗口(演示一张卡片设两个变量)", "状态")):
+        var = tree.gk_vars.add()
+        var.var_name = name
+        var.var_type = "bool"
+        var.default_value = initial
+        var.comment = comment
+        var.group = group
+
     # ---- 玩法图:一进游戏就启动状态机 + 摆好机位 ----
     ready = tree.nodes.new("GKNodeOnReady")
     ready.location = (-400.0, 200.0)

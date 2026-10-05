@@ -28,8 +28,8 @@ const ACTION_JUMP := "jump"
 @export var flash_time: float = 0.3  # 屏幕_闪白 · 时长
 
 # ---- 成员变量 ----
-var score: float
-var health: float
+var health: float = 3.0
+var score: float = 0.0
 var _gk_follow_cam: Node
 var _gk_follow_look: Node
 var state: String
@@ -170,7 +170,7 @@ func _gk_ensure_ui(host: Node) -> void:
         _gk_ui_layer.add_child(_gk_ui_root)
 
 
-func _gk_find_widget(host: Node, widget_name: String) -> Control:
+func _gk_find_widget(widget_name: String) -> Control:
     if _gk_ui_layer == null:
         return null
     var found := _gk_ui_layer.find_child(widget_name, true, false)

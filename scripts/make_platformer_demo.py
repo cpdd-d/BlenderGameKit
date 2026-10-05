@@ -129,6 +129,22 @@ def make_coin_sprite(size=16):
 def build_graph():
     tree = gk_stub.StubNodeTree("玩家")
 
+    # ---- 变量声明(第三十三轮:用『变量分组』把示例整理干净)----------
+    # score / best_score 原来只在图里**隐式使用**:score 由『变量_设置』
+    # 第一次写它时自动建(best_score 由『存档_读取到变量』建),
+    # 侧栏『变量』框里看到的是"未声明"。这里补上声明 —— 名字 / 类型 /
+    # 初值 / 说明 / 分组一处说清,末尾那截手写补充(见 HANDWRITTEN_TAIL)
+    # 直接引用的就是这两个成员变量,一个名字都不用改。
+    for name, initial, comment, group in (
+            ("score", "0.0", "当前分数(吃一枚金币 +10)", "进度"),
+            ("best_score", "0.0", "历史最高分(存在存档 best 里)", "存档")):
+        var = tree.gk_vars.add()
+        var.var_name = name
+        var.var_type = "float"
+        var.default_value = initial
+        var.comment = comment
+        var.group = group
+
     cmt = tree.new_node(NN.GKNodeComment, "注释A")
     cmt.gk_text = ("【1】准备:读存档取最高分 -> 建 HUD -> 建重开按钮\n"
                    "连线规则:金色执行线决定先后顺序，灰色线只负责传值")

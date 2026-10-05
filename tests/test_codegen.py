@@ -9613,5 +9613,85 @@ class TestRound32VariableGroups(Base):
         self.assertEqual(before, after)
 
 
+class TestRound33ReferenceGroups(Base):
+    """第三十三轮(整理现有示例):引用区说得对 —— 谁写谁读、端口不算未声明。
+
+    ── 为什么这两处在做示例时被抓出来 ────────────────────────────────
+      * 『变量_增减』以前被算成"读",于是小游戏示例的『血量』显示成
+        "设 0 · 读 4" —— 四个『变量_增减』在扣血,面板却说没人写过它;
+      * 示例里大量用『变量_设置(视角偏航)』这种**端口同名**的写法
+        (端口 = 脚本变量 `输出_视角偏航`),面板却标"未声明" ——
+        用户会去"补声明",而声明出来的其实是**第二个**变量。
+    """
+
+    def test_add_var_counts_as_writer(self):
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeAddVar, "扣血", gk_var_name="血量", gk_amount=-1.0)
+        tree.new_node(NN.GKNodeGetVar, "读血量", gk_var_name="血量")
+        refs = {name: (len(sets), len(gets))
+                for name, sets, gets in props.variable_references(tree)}
+        self.assertEqual(refs["血量"], (1, 1), refs)
+
+    def test_save_get_counts_as_writer(self):
+        """『存档_读取到变量』把值写进 `gk_var` —— 它是写方(属性名不一样)。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSaveGet, "取最高分", gk_key="best_score",
+                      gk_var="best_score", gk_default=0.0)
+        refs = {name: (len(sets), len(gets))
+                for name, sets, gets in props.variable_references(tree)}
+        self.assertEqual(refs["best_score"], (1, 0), refs)
+
+    def test_ports_go_to_their_own_group(self):
+        """端口同名的引用归到『对外端口』组 —— 排在用户分组之后、未分组之前。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "写偏航", gk_var_name="视角偏航")
+        tree.new_node(NN.GKNodeSetVar, "写血量", gk_var_name="血量")
+        tree.new_node(NN.GKNodeGetVar, "读临时", gk_var_name="临时")
+        port = tree.gk_ports.add()
+        port.port_name = "视角偏航"
+        port.port_type = "float"
+        var = tree.gk_vars.add()
+        var.var_name = "血量"
+        var.group = "战斗"
+        groups = props.reference_groups(tree)
+        self.assertEqual([name for name, _ in groups],
+                         ["战斗", props.PORT_REF_GROUP, ""], groups)
+        self.assertEqual([row[0] for row in groups[1][1]], ["视角偏航"])
+
+    def test_declared_var_keeps_its_own_group_even_if_port_same_name(self):
+        """同名又声明了变量:用户填的分组优先(不当成端口那组)。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "写偏航", gk_var_name="视角偏航")
+        port = tree.gk_ports.add()
+        port.port_name = "视角偏航"
+        var = tree.gk_vars.add()
+        var.var_name = "视角偏航"
+        var.group = "视角"
+        groups = props.reference_groups(tree)
+        self.assertEqual([name for name, _ in groups], ["视角"], groups)
+
+    def test_named_groups_follow_declaration_order(self):
+        """有组名的按**声明区那套顺序**排(用户摆的顺序),不按引用出现顺序。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeSetVar, "写血量", gk_var_name="血量")
+        tree.new_node(NN.GKNodeSetVar, "写金币", gk_var_name="金币数")
+        for name, group in (("金币数", "进度"), ("血量", "战斗")):
+            var = tree.gk_vars.add()
+            var.var_name = name
+            var.group = group
+        groups = props.reference_groups(tree)
+        # 引用按名字排序时『血量』在前,但展示要跟声明区一致:进度 -> 战斗
+        self.assertEqual([name for name, _ in groups], ["进度", "战斗"], groups)
+
+    def test_reference_groups_is_empty_without_usages(self):
+        from BlenderGameKit import properties as props
+        self.assertEqual(props.reference_groups(make_tree()), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

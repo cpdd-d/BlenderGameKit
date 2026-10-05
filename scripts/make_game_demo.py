@@ -268,15 +268,23 @@ def _declare_vars(tree):
 
     ⚠ 血量是 **float**:HUD 上要靠『文本_数字』把它显示成"血量 2" ——
     正好是"Godot 的 str(2.0) 是 '2.0'"这个坑的现场。
+
+    ── 分组(第三十三轮)────────────────────────────────────────────
+    『分组』那栏一填,侧栏『变量』框就按组折叠显示(像文件夹):
+        进度(金币数)/ 战斗(血量)/ 流程(结束)
+    只影响面板显示,**不进生成代码** —— 脚本里还是那三个成员变量。
     """
-    for name, kind, initial in (("金币数", "int", "0"),
-                                ("血量", "float", str(float(MAX_HP))),
-                                ("结束", "bool", "false")):
+    for name, kind, initial, comment, group in (
+            ("金币数", "int", "0", "吃到的金币数(收齐 5 枚获胜)", "进度"),
+            ("血量", "float", str(float(MAX_HP)),
+             "剩余血量(被红方块碰到 -1)", "战斗"),
+            ("结束", "bool", "false", "胜负已分(挡住重复判定)", "流程")):
         var = tree.gk_vars.add()
         var.var_name = name
         var.var_type = kind
         var.default_value = initial
-        var.comment = "小游戏状态"
+        var.comment = comment
+        var.group = group
         var.watch = True
 
 
