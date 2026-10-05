@@ -747,6 +747,17 @@ class GKLogicVariable(bpy.types.PropertyGroup):
         description="写给自己看的备注(不影响导出)",
         default="",
     )
+    # ── 分组 / 文件夹(用户 2026-10-06 第三十二轮)───────────────────
+    # 变量一多(几十个)侧栏就是一长条,找东西全靠翻。填同一个组名就归到
+    # 一组,侧栏按组折叠显示;留空 = 未分组(排在最后)。
+    # **只影响面板显示,不影响导出** —— 生成的成员变量名一个字不变。
+    group: StringProperty(
+        name="分组",
+        description=("把变量归到一个分组里(侧栏『变量』框按分组折叠显示)。\n"
+                     "填同一个名字 = 同一组;留空 = 未分组,排在最后。\n"
+                     "只影响面板显示,不影响导出"),
+        default="",
+    )
     # ── 调试面板要看哪个变量(用户 2026-10-05 第二十二轮)─────────────
     # 勾上的变量会出现在**游戏内调试面板**里(实时值)。
     # 一个都不勾 = 面板显示**脚本里所有**变量(新项目先这样看一遍最省事)。
@@ -773,6 +784,37 @@ class GKLogicVariable(bpy.types.PropertyGroup):
                      "函数要**正好一个参数**"),
         default="",
     )
+
+
+def logic_var_groups(tree):
+    """把声明区的变量按『分组』排好:返回 [(组名, [变量, ...]), ...]。
+
+    ── 排布规矩(照"文件夹"的直觉,用户 2026-10-06 第三十二轮)─────────
+      * 有组名的按**第一次出现的顺序**排 —— 不按字母重排(用户摆的顺序
+        就是展示顺序,重新排序会让人找不到刚建的组);
+      * 组名留空的归到最后的『未分组』(这里用空串当组名,调用方自己翻译);
+      * 组里没有变量就不会出现(空组不用手动清理);
+      * **只看显示,不参与导出** —— 返回的就是原来那批变量对象,只是分了堆。
+    """
+    groups = {}
+    for var in (getattr(tree, "gk_vars", None) or ()):
+        name = str(getattr(var, "group", "") or "").strip()
+        groups.setdefault(name, []).append(var)
+    out = [(name, items) for name, items in groups.items() if name]
+    loose = groups.get("", [])
+    if loose:
+        out.append(("", loose))
+    return out
+
+
+def logic_var_group_of(tree):
+    """{变量名: 组名} —— 给『引用区』按同一套分组显示用(未分组是空串)。"""
+    out = {}
+    for var in (getattr(tree, "gk_vars", None) or ()):
+        name = str(getattr(var, "var_name", "") or "").strip()
+        if name:
+            out[name] = str(getattr(var, "group", "") or "").strip()
+    return out
 
 
 def variable_implementations(tree):

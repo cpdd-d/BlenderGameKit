@@ -9557,5 +9557,61 @@ class TestRound30Vehicles(Base):
                       'and not _gk_god_camera_active():', gated)
 
 
+class TestRound32VariableGroups(Base):
+    """第三十二轮:变量**分组 / 文件夹**(侧栏『变量』框按分组折叠显示)。
+
+    ── 排布规矩(都从"文件夹"的直觉来)──────────────────────────────
+      * 有组名的按**第一次出现的顺序**排 —— 不重排(用户摆的顺序就是
+        展示顺序,按字母重排会让人找不到刚建的组);
+      * 组名留空的归到**最后**的『未分组』(内部用空串表示);
+      * 组里没变量就不出现(空组不用手动清理);
+      * **只影响显示**:分组不进生成代码(成员变量名一个字不变)。
+    """
+
+    @staticmethod
+    def _tree(*pairs):
+        """(名字, 分组) 列表 -> 假的 logic tree(只要有 gk_vars 就行)。"""
+        return types.SimpleNamespace(gk_vars=[
+            types.SimpleNamespace(var_name=name, group=group)
+            for name, group in pairs])
+
+    def test_named_groups_keep_first_seen_order(self):
+        from BlenderGameKit import properties as props
+        tree = self._tree(("血量", "战斗"), ("金币", "进度"), ("攻击", "战斗"))
+        groups = props.logic_var_groups(tree)
+        self.assertEqual([name for name, _ in groups], ["战斗", "进度"])
+        self.assertEqual([v.var_name for v in groups[0][1]], ["血量", "攻击"])
+        self.assertEqual([v.var_name for v in groups[1][1]], ["金币"])
+
+    def test_ungrouped_goes_last_and_lookup_matches(self):
+        from BlenderGameKit import properties as props
+        tree = self._tree(("血量", "战斗"), ("临时", ""), ("分数", "战斗"))
+        groups = props.logic_var_groups(tree)
+        self.assertEqual([name for name, _ in groups], ["战斗", ""])
+        self.assertEqual([v.var_name for v in groups[-1][1]], ["临时"])
+        self.assertEqual(props.logic_var_group_of(tree),
+                         {"血量": "战斗", "临时": "", "分数": "战斗"})
+
+    def test_empty_groups_disappear(self):
+        from BlenderGameKit import properties as props
+        self.assertEqual(len(props.logic_var_groups(self._tree(("血量", "战斗")))),
+                         1)
+        self.assertEqual(props.logic_var_groups(self._tree()), [])
+
+    def test_group_does_not_change_generated_code(self):
+        """分组只影响面板:换组前后生成的脚本**逐字一样**。"""
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        setter = tree.new_node(NN.GKNodeSetVar, "设置", gk_var_name="血量")
+        gk_stub.connect(tree, physics, "执行", setter, "执行")
+        decl = types.SimpleNamespace(var_name="血量", var_type="float",
+                                     default_value="0", group="")
+        tree.gk_vars = [decl]
+        before, _ = gen(tree, V3)
+        decl.group = "战斗"
+        after, _ = gen(tree, V3)
+        self.assertEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

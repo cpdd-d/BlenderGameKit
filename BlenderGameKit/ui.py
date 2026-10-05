@@ -1533,6 +1533,9 @@ class GK_OT_LogicVarAdd(bpy.types.Operator):
     bl_description = "在当前逻辑图里声明一个变量(名字 / 类型 / 初值)"
     bl_options = {"REGISTER", "UNDO"}
 
+    # 从**哪个分组**的『＋』按的(第三十二轮):新变量直接落进那个组
+    group: StringProperty(name="分组", default="")
+
     def execute(self, context):
         tree = _logic_tree_of(context)
         if tree is None:
@@ -1545,8 +1548,10 @@ class GK_OT_LogicVarAdd(bpy.types.Operator):
             name = f"新变量{index}"
         var = tree.gk_vars.add()
         var.var_name = name
+        var.group = str(self.group or "")
         tree.gk_var_index = len(tree.gk_vars) - 1
-        self.report({"INFO"}, f"声明了变量『{name}』—— 节点上点放大镜挑它")
+        where = f"(分组『{var.group}』)" if var.group else ""
+        self.report({"INFO"}, f"声明了变量『{name}』{where} —— 节点上点放大镜挑它")
         return {"FINISHED"}
 
 
@@ -1559,13 +1564,24 @@ class GK_OT_LogicVarRemove(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     index: IntProperty(name="第几个", default=0)
+    # 按名字删(第三十二轮):面板现在按分组重排过,列表下标不再等于
+    # `gk_vars` 里的下标 —— 传名字更稳,顺带也修掉"删错一个"的隐患
+    var_name: StringProperty(name="变量名", default="")
 
     def execute(self, context):
         tree = _logic_tree_of(context)
-        if tree is None or not (0 <= self.index < len(tree.gk_vars)):
+        if tree is None:
             return {"CANCELLED"}
-        name = str(tree.gk_vars[self.index].var_name)
-        tree.gk_vars.remove(self.index)
+        index = int(self.index)
+        if self.var_name:
+            for slot, var in enumerate(tree.gk_vars):
+                if str(var.var_name) == self.var_name:
+                    index = slot
+                    break
+        if not (0 <= index < len(tree.gk_vars)):
+            return {"CANCELLED"}
+        name = str(tree.gk_vars[index].var_name)
+        tree.gk_vars.remove(index)
         tree.gk_var_index = max(0, min(int(tree.gk_var_index),
                                        len(tree.gk_vars) - 1))
         self.report({"INFO"}, f"删了变量声明『{name}』")
@@ -1608,11 +1624,73 @@ class GK_OT_PickVar(bpy.types.Operator):
 
     def draw(self, context):
         tree = props.current_tree(context)
-        for var in (getattr(tree, "gk_vars", ()) or ()):
-            op = self.layout.operator("gk.pick_var", text=str(var.var_name))
-            op.node_name = self.node_name
-            op.slot = self.slot
-            op.choice = str(var.var_name)
+        if tree is None:
+            return
+        # 按分组显示(第三十二轮):组名做小标题,变量排在它下面
+        for group_name, vars_in_group in props.logic_var_groups(tree):
+            self.layout.label(text=group_name or "未分组", icon="FILE_FOLDER")
+            for var in vars_in_group:
+                op = self.layout.operator("gk.pick_var",
+                                          text="    " + str(var.var_name))
+                op.node_name = self.node_name
+                op.slot = self.slot
+                op.choice = str(var.var_name)
+
+
+def _draw_declared_var_rows(layout, tree, index, var):
+    """一个**已声明变量**的全部行(名字 / 取设 / 初值 / 说明 / 监视 / 分组 / 实现)。
+
+    抽成函数是为了**按分组**排(第三十二轮):每组一个可折叠盒子,盒子里
+    还是这些行,一个控件都没变。『删除』按**名字**传 —— 面板重排过之后,
+    列表下标不再等于 `gk_vars` 里的下标。
+    """
+    row = layout.row(align=True)
+    row.prop(var, "var_name", text="")
+    row.prop(var, "var_type", text="")
+    get = row.operator("gk.var_make_node", text="取")
+    get.var_name = str(var.var_name)
+    get.make_set = False
+    put = row.operator("gk.var_make_node", text="设")
+    put.var_name = str(var.var_name)
+    put.make_set = True
+    remove = row.operator("gk.logic_var_remove", text="", icon="X")
+    remove.var_name = str(var.var_name)
+    detail = layout.row(align=True)
+    detail.prop(var, "default_value", text="初值")
+    detail.prop(var, "comment", text="", icon="INFO")
+    # 监视开关(第二十二轮):勾上的变量进**游戏内调试面板**。
+    # 一个都不勾 = 面板显示脚本里全部变量(见 GKLogicVariable.watch)。
+    detail.prop(var, "watch", text="", toggle=True,
+                icon="HIDE_OFF" if getattr(var, "watch", True)
+                else "HIDE_ON")
+    # ── 分组(第三十二轮)────────────────────────────────────────────
+    # 填同一个名字就归到一组,留空 = 未分组(排在最后)。只影响显示。
+    detail.prop(var, "group", text="", icon="FILE_FOLDER")
+    # ── 变量的"实现"(用户 2026-10-05:照 UE5 的 getter/setter)────────
+    # 读 / 写这个变量时改调的函数。绑了之后图里照样用『变量_读取』
+    # 『变量_设置』,生成出来却是函数调用 —— "读的时候要算一下"
+    # 就不用每个读取点各连一遍。
+    impl = layout.row(align=True)
+    getter = str(getattr(var, "getter", "") or "")
+    setter = str(getattr(var, "setter", "") or "")
+    pick = impl.operator("gk.var_bind_impl", text="读→" + (getter or "变量"),
+                         icon="TRIA_RIGHT")
+    pick.slot = index
+    pick.which = "getter"
+    pick = impl.operator("gk.var_bind_impl", text="写→" + (setter or "变量"),
+                         icon="TRIA_LEFT")
+    pick.slot = index
+    pick.which = "setter"
+    declared_funcs = props.tree_functions(tree)
+    for label, bound in (("读取时调用", getter), ("写入时调用", setter)):
+        if bound and bound not in declared_funcs:
+            layout.label(text=f"⚠ {label}的『{bound}』没有声明过 —— "
+                              f"导出时会改回直接用变量", icon="ERROR")
+        elif bound and label == "写入时调用":
+            params = declared_funcs.get(bound, {}).get("params") or []
+            if len(params) != 1:
+                layout.label(text=f"⚠ setter『{bound}』要正好 1 个参数"
+                                  f"(现在 {len(params)} 个)", icon="ERROR")
 
 
 def _draw_variable_box(layout, context):
@@ -1636,79 +1714,73 @@ def _draw_variable_box(layout, context):
     if not opened:
         return
 
-    # ---- 声明区:一处定好名字 / 类型 / 初值,节点上从下拉里挑 ----
+    # ---- 声明区(第三十二轮:按『分组』折叠显示,像文件夹)────────────
     if not declared:
         box.label(text="声明一个变量,节点上就能从下拉里挑名字", icon="INFO")
-    for index, var in enumerate(declared):
-        row = box.row(align=True)
-        row.prop(var, "var_name", text="")
-        row.prop(var, "var_type", text="")
-        get = row.operator("gk.var_make_node", text="取")
-        get.var_name = str(var.var_name)
-        get.make_set = False
-        put = row.operator("gk.var_make_node", text="设")
-        put.var_name = str(var.var_name)
-        put.make_set = True
-        remove = row.operator("gk.logic_var_remove", text="", icon="X")
-        remove.index = index
-        detail = box.row(align=True)
-        detail.prop(var, "default_value", text="初值")
-        detail.prop(var, "comment", text="", icon="INFO")
-        # 监视开关(第二十二轮):勾上的变量进**游戏内调试面板**。
-        # 一个都不勾 = 面板显示脚本里全部变量(见 GKLogicVariable.watch)。
-        detail.prop(var, "watch", text="", toggle=True,
-                    icon="HIDE_OFF" if getattr(var, "watch", True)
-                    else "HIDE_ON")
-        # ── 变量的"实现"(用户 2026-10-05:照 UE5 的 getter/setter)────────
-        # 读 / 写这个变量时改调的函数。绑了之后图里照样用『变量_读取』
-        # 『变量_设置』,生成出来却是函数调用 —— "读的时候要算一下"
-        # 就不用每个读取点各连一遍。
-        impl = box.row(align=True)
-        getter = str(getattr(var, "getter", "") or "")
-        setter = str(getattr(var, "setter", "") or "")
-        pick = impl.operator("gk.var_bind_impl", text="读→" + (getter or "变量"),
-                             icon="TRIA_RIGHT")
-        pick.slot = index
-        pick.which = "getter"
-        pick = impl.operator("gk.var_bind_impl", text="写→" + (setter or "变量"),
-                             icon="TRIA_LEFT")
-        pick.slot = index
-        pick.which = "setter"
-        declared_funcs = props.tree_functions(tree)
-        for label, bound in (("读取时调用", getter), ("写入时调用", setter)):
-            if bound and bound not in declared_funcs:
-                box.label(text=f"⚠ {label}的『{bound}』没有声明过 —— "
-                               f"导出时会改回直接用变量", icon="ERROR")
-            elif bound and label == "写入时调用":
-                params = declared_funcs.get(bound, {}).get("params") or []
-                if len(params) != 1:
-                    box.label(text=f"⚠ setter『{bound}』要正好 1 个参数"
-                                   f"(现在 {len(params)} 个)", icon="ERROR")
-    box.operator("gk.logic_var_add", text="声明一个变量", icon="ADD")
+    # 删 / 绑实现要的下标:按名字查(面板按分组重排过,不能拿遍历顺序当下标)
+    index_of = {}
+    for slot, var in enumerate(declared):
+        index_of.setdefault(str(var.var_name), slot)
+    for group_name, vars_in_group in props.logic_var_groups(tree):
+        label = (f"{group_name} ({len(vars_in_group)})" if group_name
+                 else f"未分组 ({len(vars_in_group)})")
+
+        def _add_here(header, group_name=group_name):
+            """组标题右边的『＋』:新变量直接落进这一组。"""
+            op = header.operator("gk.logic_var_add", text="", icon="ADD")
+            op.group = group_name
+
+        sub, opened = collapsible_box(box, f"vargroup:{group_name}", label,
+                                      "FILE_FOLDER", header_extra=_add_here)
+        if not opened:
+            continue
+        for var in vars_in_group:
+            _draw_declared_var_rows(sub, tree,
+                                    index_of.get(str(var.var_name), 0), var)
+    add = box.operator("gk.logic_var_add", text="声明一个变量", icon="ADD")
+    add.group = ""            # 不选组直接加 = 未分组
     if declared:
+        box.label(text="『分组』那一栏填同一个名字就归到一组(只影响显示)",
+                  icon="FILE_FOLDER")
         box.label(text="『读→/写→』= 读写这个变量时改调的函数(UE5 的 getter/setter)",
                   icon="INFO")
 
-    # ---- 引用区:图里谁读谁写;没声明的名字标出来 ----
+    # ---- 引用区:图里谁读谁写;没声明的名字标出来(跟着同一套分组显示)----
     box.separator()
     if not usages:
         box.label(text="图里还没有节点用到变量", icon="INFO")
-    for name, sets, gets in usages:
-        row = box.row(align=True)
-        if name in declared_names:
-            row.label(text=name, icon="SORTALPHA")
-        else:
-            row.label(text=f"{name} · 未声明", icon="ERROR")
-        row.label(text=f"设 {len(sets)} · 读 {len(gets)}")
-        find = row.operator("gk.var_find_refs", text="", icon="VIEWZOOM")
-        find.var_name = name
-        get = row.operator("gk.var_make_node", text="取", icon="CHECKBOX_DEHLT")
-        get.var_name = name
-        get.make_set = False
-        put = row.operator("gk.var_make_node", text="设", icon="CHECKBOX_HLT")
-        put.var_name = name
-        put.make_set = True
-    if usages:
+    else:
+        group_of = props.logic_var_group_of(tree)
+        buckets = {}
+        for entry in usages:
+            buckets.setdefault(group_of.get(entry[0], ""), []).append(entry)
+        ordered = [(name, rows) for name, rows in buckets.items() if name]
+        if "" in buckets:
+            ordered.append(("", buckets[""]))
+        for group_name, rows_in_group in ordered:
+            label = (f"{group_name} ({len(rows_in_group)})" if group_name
+                     else f"未分组 ({len(rows_in_group)})")
+            sub, opened = collapsible_box(box, f"varrefs:{group_name}", label,
+                                          "SORTALPHA")
+            if not opened:
+                continue
+            for name, sets, gets in rows_in_group:
+                row = sub.row(align=True)
+                if name in declared_names:
+                    row.label(text=name, icon="SORTALPHA")
+                else:
+                    row.label(text=f"{name} · 未声明", icon="ERROR")
+                row.label(text=f"设 {len(sets)} · 读 {len(gets)}")
+                find = row.operator("gk.var_find_refs", text="", icon="VIEWZOOM")
+                find.var_name = name
+                get = row.operator("gk.var_make_node", text="取",
+                                   icon="CHECKBOX_DEHLT")
+                get.var_name = name
+                get.make_set = False
+                put = row.operator("gk.var_make_node", text="设",
+                                   icon="CHECKBOX_HLT")
+                put.var_name = name
+                put.make_set = True
         box.label(text="点放大镜选中所有引用该变量的节点", icon="INFO")
 
 

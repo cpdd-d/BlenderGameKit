@@ -876,6 +876,44 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 变量分组 / 文件夹(第三十二轮)----
+    # 真 Blender 里:给几个变量填『分组』 -> 排布按"第一次出现的顺序"、
+    # 未分组排在最后;而且分组**不进生成代码**(同一张图换个组,产物逐字一样)。
+    try:
+        props_mod = import_module(f"{module_name}.properties")
+        r32_tree = bpy.data.node_groups.new("变量分组冒烟", "GKGameLogicTree")
+        r32_tree.use_fake_user = True
+        for r32_name, r32_group in (("血量", "战斗"), ("金币", "进度"),
+                                    ("攻击", "战斗"), ("临时", "")):
+            r32_var = r32_tree.gk_vars.add()
+            r32_var.var_name = r32_name
+            r32_var.group = r32_group
+        r32_groups = props_mod.logic_var_groups(r32_tree)
+        check("变量分组:第一次出现的顺序 + 未分组排最后",
+              [name for name, _ in r32_groups] == ["战斗", "进度", ""]
+              and [v.var_name for v in r32_groups[0][1]] == ["血量", "攻击"],
+              str([name for name, _ in r32_groups]))
+        # 生成物不受分组影响
+        r32_event = r32_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r32_set = r32_tree.nodes.new("GKNodeSetVar")
+        r32_set.name = "写血量"
+        r32_set.gk_var_name = "血量"
+        r32_tree.links.new(r32_event.outputs["执行"], r32_set.inputs["执行"])
+        r32_before, _r32_w1 = codegen.generate(r32_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        r32_tree.gk_vars[0].group = "换个组"
+        r32_after, _r32_w2 = codegen.generate(r32_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("变量分组:只影响显示(生成物逐字不变)",
+              r32_before == r32_after,
+              f"{len(r32_before)} vs {len(r32_after)} 字符")
+        bpy.data.node_groups.remove(r32_tree)
+    except Exception as exc:
+        check("变量分组 / 文件夹", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 导出报告(用户 2026-10-05 第二十三轮:"导出报告可视化")----
     # 真 Blender 里验四件事:
     #   ① remember_export 顺手把**结构化报告**记进 .blend(清掉内存还能读回);
