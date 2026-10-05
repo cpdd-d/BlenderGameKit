@@ -7728,6 +7728,28 @@ class TestEnvironmentGodCamera(Base):
         text = self._env(god="false")
         self.assertIn("god_camera: bool = false", text)
 
+    def test_god_camera_reuses_and_restores_on_reload(self):
+        """重开(R)/换场景之后:① 复用旧的那台 ② 把镜头还给玩家相机。
+
+        ── 用户 2026-10-06 实测 ────────────────────────────────────
+        "完成目标后按 R 重开,移动输入失效"。根因:上帝机挂在 `/root` 上,
+        场景重载**清不掉它**,重载那一瞬间"当前相机"是空的,它就顺手接管了
+        画面 —— 角色的移动守卫(`_gk_god_camera_active()`)以为还在上帝视角,
+        把 WASD 方向清零(探针实测:重开后 `velocity` 恒为 0)。
+        另外每按一次 R 还会多造一台(没人复用)。
+        """
+        text = self._env(god="true")
+        # ① 先找现成的(gk_god_camera 组里那台),找得到就复用
+        self.assertIn('is_in_group("gk_god_camera")', text)
+        # ② 把镜头交还给本场景自己的相机
+        self.assertIn("func _gk_god_restore_camera() -> void:", text)
+        self.assertIn("_gk_god_restore_camera()", text)
+        # ⚠ 只有"当前正用着上帝机"才交还 —— 不然会把开场运镜刚切好的
+        # 特写机位抢回侧视机位(曲线示例探针当场抓到)
+        self.assertIn("if not (_gk_god_cam as Camera3D).is_current():", text)
+        # 整个上帝机由 `god_camera` 开关在运行时把关(关着的项目不会造/不会切)
+        self.assertIn("if god_camera and not Engine.is_editor_hint():", text)
+
     def test_mouse_look_has_its_own_delta(self):
         """上帝机用自己的鼠标位移 —— 复用游戏逻辑那份会被"先清零"卡死。"""
         text = self._env(god="true")
@@ -9516,6 +9538,23 @@ class TestRound30Vehicles(Base):
         self.assertIn('.get_meta("gk_seat", Vector2.ZERO) as Vector2', code)
         self.assertIn(".velocity.x = _drive", code)
         self.assertNotIn("rotation.y", code)      # 2D 没有"打方向盘"
+
+    def test_drive_stands_down_in_god_view(self):
+        """上车后按 Tab 进上帝视角,不该还能开车(用户 2026-10-06 实测)。
+
+        上帝视角里 WASD 是**飞相机**的 —— 角色移动早有这个守卫,驾驶节点
+        之前漏了。没开上帝摄像机的项目不生成这一截(不会引用不存在的函数)。
+        """
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        drive = tree.new_node(NN.GKNodeDriveVehicle, "驾驶", gk_vehicle="载具")
+        gk_stub.connect(tree, physics, "执行", drive, "执行")
+        plain, _ = gen(tree, V3)
+        self.assertIn('if 载具_载具.get_meta("gk_driving", false):', plain)
+        self.assertNotIn("_gk_god_camera_active", plain)
+        gated, _ = gen(tree, dict(V3, god_camera=True))
+        self.assertIn('if 载具_载具.get_meta("gk_driving", false) '
+                      'and not _gk_god_camera_active():', gated)
 
 
 if __name__ == "__main__":

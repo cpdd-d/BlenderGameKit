@@ -75,6 +75,8 @@ var hud_ok := false
 var clean_text := false            # HUD 上没有 ".0"(『文本_数字』)
 var win_ok := false
 var reload_ok := false
+var move_start := Vector3.ZERO
+var vel_max := 0.0
 var chase_ok := false              # 敌2 真的在靠近
 var cooldown_ok := false           # 一波接触里只掉一次血
 # 第二十六轮的反馈特效(每帧采样):
@@ -302,6 +304,14 @@ func _on_anim_started(_name: String) -> void:
 ## ── 为什么这一步放在重载之后 ────────────────────────────────────
 ## 前面那条时间线用掉了 11 秒,阶段安排已经排满;重开之后世界是干净的,
 ## 正好单独测这一段(而且 `elapsed` / `anim_starts` 都从 0 重新开始)。
+func _cam_name() -> String:
+	"""当前视口相机的名字(+ 是不是上帝机)—— 排查"移动被清零"用。"""
+	var cam := get_viewport().get_camera_3d()
+	if cam == null:
+		return "<none>"
+	return str(cam.name) + ("|god" if cam.is_in_group("gk_god_camera") else "")
+
+
 func _after_reload(delta: float) -> void:
 	if phase == 0 and elapsed >= 0.8:
 		phase = 1
@@ -340,6 +350,34 @@ func _after_reload(delta: float) -> void:
 		print("DEMO_ANIM ok=", anim_ok, " triggers=", spam_sent,
 			" plays_during_spam=", spam_plays, " total_plays=", total,
 			" now=", anim_player.current_animation if anim_player != null else "<none>")
+		# ── 第三十一轮补:重开之后**移动输入还得能用** ─────────────────
+		# 用户报的:"完成目标后按 R 重开,移动输入失效"。放在动画测试**之后**
+		# (动画那条按时间是掐着秒数的,插在前面会把它的计数带歪)。
+		# 按 W 1 秒,角色得真的走过去;顺便打印视角偏航 / 速度 ——
+		# "没动"(速度 0)和"方向错了"(走了但方向不对)一眼能分开。
+		phase = 5
+		elapsed = 0.0
+		vel_max = 0.0
+		if host != null:
+			move_start = host.global_position
+		_send_key(KEY_W, true)
+	elif phase == 5:
+		if host != null:
+			vel_max = maxf(vel_max, host.velocity.length())
+		if elapsed < 1.0:
+			return
+		_send_key(KEY_W, false)
+		var walked := 0.0
+		var look: Variant = null
+		if host != null:
+			walked = host.global_position.distance_to(move_start)
+			look = host.get("输出_视角偏航")
+		# ⚠ 判据用**速度**不是位移:出生点附近可能站着敌人(走着撞上就停,
+		# 位移会很小) —— 输入到底有没有到移动节点,看速度最直接
+		# (用户报的失效就是"速度恒为 0")。
+		print("DEMO_MOVE_AFTER ok=", vel_max >= 3.0, " vel_max=", "%.2f" % vel_max,
+			" walked=", "%.2f" % walked, " yaw=", look,
+			" w_held=", Input.is_action_pressed("move_up"), " cam=", _cam_name())
 		print("DEMO_DONE")
 		set_physics_process(false)
 
@@ -520,7 +558,9 @@ def run_godot(godot):
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     run = subprocess.run([godot, "--headless", "--path", OUT,
-                          "--quit-after", "2400"],
+                          # ⚠ 重开之后还多了一段"按 W 走 1 秒"(第三十一轮
+                          # 补的:重开后移动输入失效),多加一截余量
+                          "--quit-after", "2700"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -593,6 +633,10 @@ def main():
     if not re.search(r"DEMO_RELOAD ok=true", text):
         print("✗ 按 R 没有把这一关重开干净:",
               [line for line in text.splitlines() if "DEMO_RELOAD" in line])
+        ok = False
+    if not re.search(r"DEMO_MOVE_AFTER ok=true", text):
+        print("✗ 重开之后移动输入失效(按 W 走不动):",
+              [line for line in text.splitlines() if "DEMO_MOVE_AFTER" in line])
         ok = False
     if not re.search(r"DEMO_FX flash=true restored=true "
                      r"float_coin=true float_hurt=true", text):

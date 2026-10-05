@@ -480,7 +480,14 @@ def _stmt_drive_vehicle(ctx, node, indent):
     temp = ctx.new_temp("drive")
     fwd = ctx.new_temp("drive_fwd")
     seat_type = "Vector2" if ctx.dim == 2 else "Vector3"
-    ctx.add_line(indent, f'if {vehicle}.get_meta("gk_driving", false):')
+    # 上帝视角期间不驾驶(用户 2026-10-06 实测:"上车后按 Tab 进上帝视角,
+    # 还能控制车辆移动")—— 那时 WASD 是**飞相机**的。和角色移动同一个守卫:
+    # 没开上帝摄像机的项目不生成这一截(不会引用不存在的函数)。
+    if _god_camera_on(ctx):
+        ctx.add_line(indent, f'if {vehicle}.get_meta("gk_driving", false) '
+                             f'and not _gk_god_camera_active():')
+    else:
+        ctx.add_line(indent, f'if {vehicle}.get_meta("gk_driving", false):')
     ctx.add_line(indent + 1, f"var {temp} := ({direction}).normalized()")
     # 重力先累加,再把水平分量**盖掉** —— 和角色那套同一个套路,不然
     # move_and_slide() 会把刚加上的重力当"撞墙"清零。

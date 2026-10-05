@@ -574,13 +574,23 @@ func _gk_god_setup() -> void:
 	var root := _scene_root()
 	if root == null or root.get_tree() == null:
 		return
-	var cam := Camera3D.new()
-	cam.name = "上帝摄像机"
-	# 分组:角色的游戏逻辑靠它判断"现在是不是上帝视角",
-	# 是的话就把移动 / 跳跃让出来(用户:上帝视角不该影响角色移动)。
-	# **不能**用名字判断 —— 用户可能改节点名。
-	cam.add_to_group("gk_god_camera")
-	root.get_tree().root.add_child(cam)
+	# ── 先把**已经有的**那台找回来(第三十一轮,用户实测)────────────────
+	# 上帝机挂在 `/root` 上,场景重载(R 键重开 / 切关卡回来)**清不掉它** ——
+	# 不找回来就会每按一次 R 多造一台;而且旧那台可能还占着"当前相机"。
+	var cam: Camera3D = null
+	for found in root.get_tree().root.get_children():
+		if found is Camera3D and (found as Camera3D).is_in_group("gk_god_camera"):
+			cam = found as Camera3D
+			break
+	if cam == null:
+		cam = Camera3D.new()
+		cam.name = "上帝摄像机"
+		# 分组:角色的游戏逻辑靠它判断"现在是不是上帝视角",
+		# 是的话就把移动 / 跳跃让出来(用户:上帝视角不该影响角色移动)。
+		# **不能**用名字判断 —— 用户可能改节点名。
+		cam.add_to_group("gk_god_camera")
+		root.get_tree().root.add_child(cam)
+	_gk_god_cam = cam
 	var from := _find_camera()
 	if from != null and from != cam:
 		cam.global_transform = from.global_transform
@@ -591,10 +601,34 @@ func _gk_god_setup() -> void:
 	else:
 		cam.global_position = Vector3(0.0, 8.0, 12.0)
 		cam.look_at(Vector3.ZERO, Vector3.UP)
-	_gk_god_cam = cam
-	# 场景里一台别的相机都没有 -> 直接接管画面,否则按 F5 是一片黑
+	# ── 重开/换场景必须回到**普通视角**(第三十一轮,用户实测)──────────
+	# 重载那一瞬间"当前相机"是空的,上帝机顺手就接管了画面 —— 角色的移动
+	# 守卫看到"当前相机是上帝机"就以为还在上帝视角,**按 W 走不动**
+	# (实测:重开后 velocity 恒为 0)。上帝视角是临时的,所以这里明确把
+	# 镜头交还给本场景自己的相机;场景里**一台别的相机都没有**时,才让
+	# 上帝机顶着(否则按 F5 一片黑)。
+	_gk_god_restore_camera()
 	if get_viewport().get_camera_3d() == null:
 		cam.make_current()
+
+
+## 把镜头交还给本场景自己的相机 —— **只在当前正用着上帝机时才交还**。
+## ── 为什么必须这么保守(第三十一轮实测)────────────────────────────
+## 第一版不看状态、上来就把镜头交给"第一台别的相机" —— 结果把开场运镜
+## 刚切好的特写机位抢回了侧视机位(曲线示例的探针当场抓住:
+## `DEMO ... cam=侧视机位`,运镜白播)。所以:不是上帝机在用,就一律不碰。
+func _gk_god_restore_camera() -> void:
+	if _gk_god_cam == null or not is_instance_valid(_gk_god_cam):
+		return
+	if not (_gk_god_cam as Camera3D).is_current():
+		return
+	var root := _scene_root()
+	if root == null:
+		return
+	for found in root.find_children("*", "Camera3D", true, false):
+		if found != _gk_god_cam:
+			(found as Camera3D).make_current()
+			return
 
 
 ## Tab:在『玩家相机』和『上帝摄像机』之间来回切。

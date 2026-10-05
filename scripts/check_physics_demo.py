@@ -72,6 +72,13 @@ const STATION_DEFS := [
 ]
 const SPAWN_Z := 6.0
 const GROUND_Y := 0.9
+# ── 传送之后先等相机追上,再按 W(用户 2026-10-06)────────────────────
+# 测试场开着『随相机朝向』(按 W = 往镜头前方走)。弹簧臂的相机是
+# **每帧 look_at(角色)**、而相机位置带平滑 —— 角色被传送到工位时
+# 相机还在后面追,那一瞬间它"回头看着新位置",偏航是斜的(实测 -30°~-74°),
+# 按 W 会斜着走过去、蹭着障碍物滑开(斜方块/窄缝/推箱子全都会歪)。
+# 等 1.2 秒:平滑是"每秒跟手 8 倍",1.2 秒后残差 ~0.01%,偏航回正。
+const SETTLE := 1.2
 const DIAMOND_CENTER := Vector3(14.0, 1.0, -3.0)
 
 var station_index := -1
@@ -87,6 +94,7 @@ var min_dist := 99.0
 var box_start_z := 0.0
 var rays_done := false
 var first_vel_done := false
+var walk_started := false
 var min_y := 0.0
 var plat_min_x := 0.0
 var plat_max_x := 0.0
@@ -97,6 +105,8 @@ var vcar_exit := Vector3.ZERO
 var vyaw0 := 0.0
 var vsteer := false
 var vyaw := 0.0
+var vgod_car := Vector3.ZERO
+var vgod_drift := 0.0
 var vgap_max := 0.0
 var vdrove := 0.0
 var vback_gap := 0.0
@@ -195,7 +205,11 @@ func _physics_process(delta: float) -> void:
 		return
 	station_time += delta
 	var position := host.global_position
-	if not first_vel_done and station_time >= 0.15:
+	if not walk_started and String(STATION_DEFS[station_index].get("keys", "W")) == "W":
+		if station_time >= SETTLE:
+			walk_started = true
+			_send_key(KEY_W, true)
+	if not first_vel_done and station_time >= SETTLE + 0.15:
 		first_vel_done = true
 		print("PHYS_VEL key=", STATION_DEFS[station_index]["key"],
 			" vel=", host.velocity, " cam_yaw=", _camera_yaw())
@@ -214,7 +228,7 @@ func _physics_process(delta: float) -> void:
 	if STATION_DEFS[station_index]["kind"] == "platform" and platform != null:
 		plat_min_x = minf(plat_min_x, platform.global_position.x)
 		plat_max_x = maxf(plat_max_x, platform.global_position.x)
-	if station_time >= float(STATION_DEFS[station_index]["walk"]):
+	if station_time >= float(STATION_DEFS[station_index]["walk"]) + SETTLE:
 		_finish_station()
 
 
@@ -252,9 +266,31 @@ func _vehicle_step(delta: float) -> void:
 			_send_key(KEY_W, false)
 			vdrove = vstart.distance_to(vehicle.global_position)
 			vyaw = absf(vehicle.rotation.y - vyaw0)
-			_send_key(KEY_E, true)
-			vphase = 3
+			# ── 上帝视角里不该还能开车(用户 2026-10-06 实测)─────────
+			# 按 Tab 切上帝机,再按住 W 半秒:那时 WASD 是**飞相机**的,
+			# 车一步都不该动(驾驶节点现在也有上帝守卫)。测完 Tab 切回来。
+			vgod_car = vehicle.global_position
+			_send_key(KEY_TAB, true)
+			vphase = 5
 			vtime = 0.0
+	elif vphase == 5:
+		if vtime >= 0.3:
+			_send_key(KEY_TAB, false)
+			_send_key(KEY_W, true)
+			vphase = 6
+			vtime = 0.0
+	elif vphase == 6:
+		if vtime >= 0.5:
+			_send_key(KEY_W, false)
+			vgod_drift = vgod_car.distance_to(vehicle.global_position)
+			_send_key(KEY_TAB, true)      # 切回玩家相机
+			vphase = 7
+			vtime = 0.0
+	elif vphase == 7 and vtime >= 0.3:
+		_send_key(KEY_TAB, false)
+		_send_key(KEY_E, true)        # 下车
+		vphase = 3
+		vtime = 0.0
 	elif vphase == 3 and vtime >= 0.4:
 		_send_key(KEY_E, false)
 		vback_gap = host.global_position.distance_to(vehicle.global_position)
@@ -273,14 +309,15 @@ func _vehicle_step(delta: float) -> void:
 func _finish_vehicle() -> void:
 	# 上车了(meta) + 车真开出去了 + 角色一路被钉在座位上(ride_gap)
 	# + 下车后角色在车外 + 控制权回到角色(walked)+ 车没被"偷开"(drift)
+	# + 上帝视角里按 W **车不能动**(god_drift,用户 2026-10-06 实测的那条)
 	var ok := (vmeta and vdrove >= 5.0 and vgap_max <= 0.8
 		and vback_gap >= 1.5 and vwalked >= 1.0 and vdrift <= 0.3
-		and vyaw >= 0.3 and vyaw <= 1.2)
+		and vyaw >= 0.3 and vyaw <= 1.2 and vgod_drift <= 0.2)
 	station_time = -1.0
 	print("PHYS_vehicle ok=%s drove=%.2f ride_gap=%.2f back_gap=%.2f "
 		% [ok, vdrove, vgap_max, vback_gap]
-		+ "walked=%.2f drift=%.2f steer=%.2f meta=%s"
-		% [vwalked, vdrift, vyaw, vmeta])
+		+ "walked=%.2f drift=%.2f steer=%.2f god_drift=%.2f meta=%s"
+		% [vwalked, vdrift, vyaw, vgod_drift, vmeta])
 
 
 func _start_station(index: int) -> void:
@@ -301,6 +338,12 @@ func _start_station(index: int) -> void:
 			vehicle.global_position.z)
 	host.global_position = start
 	host.velocity = Vector3.ZERO
+	# ── 把视角偏航钉回 0(用户 2026-10-06)─────────────────────────
+	# 测试场开了『随相机朝向』(按 W = 往镜头前方走,手感才对);探针要的
+	# 是**确定的世界 -Z**,所以每个工位开始时把偏航清零 —— 相机相对的方向
+	# 变换之后就退化成世界轴,九个工位的判据全都不变。
+	# (弹簧臂读的就是这个端口变量;不在这一帧清,传送后它会带着旧偏航。)
+	host.set("输出_视角偏航", 0.0)
 	min_z = start.z
 	max_y = start.y
 	min_y = start.y
@@ -315,6 +358,7 @@ func _start_station(index: int) -> void:
 	plat_max_x = plat_min_x
 	vphase = 0
 	vtime = 0.0
+	walk_started = false
 	vstart = vehicle.global_position if vehicle != null else Vector3.ZERO
 	vcar_exit = vstart
 	vgap_max = 0.0
@@ -322,10 +366,12 @@ func _start_station(index: int) -> void:
 	vback_gap = 0.0
 	vwalked = 0.0
 	vdrift = 0.0
+	vgod_car = Vector3.ZERO
+	vgod_drift = 0.0
 	vmeta = false
-	# 平台 / 载具工位**不按 W**(它们自己安排按键)
-	if String(spec.get("keys", "W")) == "W":
-		_send_key(KEY_W, true)
+	# 平台 / 载具工位**不按 W**;其余工位的 W 在 _physics_process 里
+	# **等相机追上之后**才按(见 SETTLE 的说明)—— 这里不能提前按,
+	# 否则方向还是斜的(实测:斜方块会被蹭着滑过去)。
 	print("PHYS_START key=", spec["key"], " t=", "%.2f" % elapsed,
 		" at=", start)
 
@@ -437,10 +483,9 @@ def run_godot(godot):
     run = subprocess.run([godot, "--headless", "--path", OUT,
                           # ⚠ 无头模式下主循环跑得比物理快(~160 fps),而
                           # `--quit-after` 数的是**主循环次数** —— 2400 次
-                          # 只够 ~15 秒的物理时间。九个工位现在要 ~26 秒
-                          # (平台 3.4 + 载具 ~3.3 是第三十轮新加的),
-                          # 给足余量。
-                          "--quit-after", "6200"],
+                          # 只够 ~15 秒的物理时间。九个工位现在要 ~34 秒
+                          # (每站还先等 1.2 秒让相机追上),给足余量。
+                          "--quit-after", "9000"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -510,7 +555,8 @@ def main():
                 ('set_meta("gk_driving"', "载具状态写在车自己身上"),
                 ("rotation.y -= ", "A/D 转车头"),
                 ("_gk_set_collision(", "上/下车开关角色碰撞"),
-                ("gk_seat", "座位(钉住角色)")):
+                ("gk_seat", "座位(钉住角色)"),
+                ("_gk_resolve_camera(self)", "移动方向跟着相机朝向")):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: {needle}")
                 ok = False
