@@ -18,6 +18,7 @@ scripts/make_demo_level.py 建好并指好逻辑图『关卡2逻辑』)。插件
 本脚本**不再**手写补第二关场景文件。
 """
 
+import glob
 import os
 import re
 import shutil
@@ -193,12 +194,138 @@ func _physics_process(delta: float) -> void:
 			set_physics_process(false)
 '''
 
+PROBE2_GD = '''extends Node
+
+# 第二关的运行时探针(第三十五轮)。用户的实测回归:
+#   "在关卡示例中完成任务后打开第二关,移动 / 视角 / 上帝摄像机切换 /
+#    ESC 退出等失效"
+# 根因那版已经查实:第二关当年是当**通关页**做的 —— 图里只接了标题 +
+# 两个按键,角色没配移动 / 跳跃 / 相机,上帝机开关还写着 False。
+# 现在它由**角色预设**生成,这一趟就是钉住这件事:
+#   * 按 W 要**走得动**(不是站在地上不动);
+#   * 按 C / V 要切得动**机位**(第二关有侧视 + 俯瞰两台);
+#   * 按 Tab 要出得来**上帝机**(它由环境脚本造,god_camera 开着才有)。
+# (Esc 退出不能在这里按 —— 它会把游戏关掉、探针也跟着停;
+#  那条只做生成物层面的断言,见 check_level_example 的静态检查。)
+
+var world: Node = null
+var host: CharacterBody3D = null
+var elapsed := 0.0
+var phase := 0
+var t := 0.0
+
+var start := Vector3.ZERO
+var walked := 0.0
+var cam_top := false
+var cam_back := false
+var god_on := false
+var god_off := false
+
+
+func _ready() -> void:
+	world = load("res://scenes/关卡2.tscn").instantiate()
+	add_child(world)
+	var players := world.find_children("第二关角色", "CharacterBody3D", true, false)
+	if not players.is_empty():
+		host = players[0] as CharacterBody3D
+	print("LEVEL2_GAME player=", host != null,
+		" side_cam=", world.find_children("第二关机位", "Camera3D", true, false).size(),
+		" top_cam=", world.find_children("第二关俯瞰", "Camera3D", true, false).size())
+
+
+func _send_key(code: int, pressed: bool) -> void:
+	var event := InputEventKey.new()
+	event.keycode = code
+	event.physical_keycode = code
+	event.pressed = pressed
+	Input.parse_input_event(event)
+
+
+func _camera_name() -> String:
+	var cam := get_viewport().get_camera_3d()
+	return String(cam.name) if cam != null else ""
+
+
+func _god_current() -> bool:
+	var cam := get_viewport().get_camera_3d()
+	return cam != null and cam.is_in_group("gk_god_camera")
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	if host == null:
+		return
+	t += delta
+	if phase == 0:
+		# 等场景稳下来(材质 / 上帝机都是 call_deferred 挂的)
+		if t > 1.2:
+			start = host.global_position
+			_send_key(KEY_W, true)
+			phase = 1
+			t = 0.0
+	elif phase == 1:
+		if t > 1.0:
+			_send_key(KEY_W, false)
+			walked = start.distance_to(host.global_position)
+			_send_key(KEY_C, true)          # 切俯瞰
+			phase = 2
+			t = 0.0
+	elif phase == 2:
+		if t > 0.2:
+			_send_key(KEY_C, false)
+			phase = 3
+			t = 0.0
+	elif phase == 3:
+		# 等过渡走完再看当前相机是谁(『相机_切换』是带过渡的)
+		if t > 1.2:
+			cam_top = "俯瞰" in _camera_name()
+			_send_key(KEY_V, true)          # 切回侧视
+			phase = 4
+			t = 0.0
+	elif phase == 4:
+		if t > 0.2:
+			_send_key(KEY_V, false)
+			phase = 5
+			t = 0.0
+	elif phase == 5:
+		if t > 1.2:
+			cam_back = "机位" in _camera_name()
+			_send_key(KEY_TAB, true)        # 上帝机
+			phase = 6
+			t = 0.0
+	elif phase == 6:
+		if t > 0.3:
+			_send_key(KEY_TAB, false)
+			god_on = _god_current()
+			phase = 7
+			t = 0.0
+	elif phase == 7:
+		# ⚠ 松开和再按必须**跨帧**(踩过的坑:同一帧里"松了就按",环境脚本
+		# 那次"松"看不见 —— `_gk_god_tab_held` 还停在按下状态,第二次 Tab
+		# 被当成"按住不放"吞掉,切回玩家相机就没发生)。
+		if t > 0.3:
+			_send_key(KEY_TAB, true)
+			phase = 8
+			t = 0.0
+	elif phase == 8:
+		if t > 0.3:
+			_send_key(KEY_TAB, false)
+			god_off = not _god_current()
+			var ok := (walked >= 1.0 and cam_top and cam_back
+				and god_on and god_off)
+			print("LEVEL2_WALK ok=", ok, " walked=", "%.2f" % walked,
+				" cam_top=", cam_top, " cam_back=", cam_back,
+				" god=", god_on, "/", god_off)
+			print("LEVEL2_DONE")
+			set_physics_process(false)
+'''
+
 PROBE_TSCN = '''; 探针(临时文件,不写回示例)
 [gd_scene load_steps=2 format=3]
 
-[ext_resource type="Script" path="res://probe.gd" id="1_probe"]
+[ext_resource type="Script" path="res://{stem}.gd" id="1_probe"]
 
-[node name="LevelRideProbe" type="Node"]
+[node name="{node}" type="Node"]
 script = ExtResource("1_probe")
 '''
 
@@ -211,43 +338,41 @@ def _probe_line(text, prefix):
     return "没找到那一行"
 
 
-def run_ride_probe():
-    """真 Godot 里跑一遍:坐电梯被抬上去 + 上车开一段再下车。
+def _run_probe(stem, script_text, node_name, quit_after):
+    """把一份探针脚本塞进工程副本里无头跑一遍,返回 Godot 的输出。
 
-    ── 为什么还要在**关卡里**再跑一遍 ────────────────────────────────
-    物理测试场已经证明"平台带人 / 车能开"本身没问题;这里验的是**接进
-    关卡之后**还成立:电梯的时间轴和关卡自己的逻辑(金币/HUD/相机)一起
-    跑、驾驶节点接在角色移动后面、按 E 的两层分支没被别的东西抢走。
-
-    找不到 Godot 或没导出过可玩工程时返回空列表(只打一句"跳过")——
+    ── 两个探针共用这一段(第三十五轮抽出来的)──────────────────────
+    拷工程 → 写脚本 + 场景 → 把主场景临时指过去 → `--import` → 无头跑。
+    坐电梯/开车那个(L2)和第二关那个(L2 的回归)走的是同一条流水线。
+    找不到 Godot / 没导出过可玩工程时返回空串(调用方只打一句"跳过")——
     和别的自查脚本一个规矩:没有 Godot 不算失败。
     """
     godot = os.environ.get("GK_GODOT", GODOT_DEFAULT)
     if not os.path.isdir(GAME_PROJECT_DIR):
-        print("[INFO] 没有可玩工程(先跑 make_demo_level.py)—— 坐电梯/开车跳过")
-        return []
+        print("[INFO] 没有可玩工程(先跑 make_demo_level.py)—— 运行时探针跳过")
+        return ""
     if not os.path.isfile(godot):
-        print(f"[INFO] 找不到 Godot({godot})—— 坐电梯/开车跳过")
-        return []
+        print(f"[INFO] 找不到 Godot({godot})—— 运行时探针跳过")
+        return ""
     if os.path.isdir(PROBE_DIR):
         shutil.rmtree(PROBE_DIR)
     shutil.copytree(GAME_PROJECT_DIR, PROBE_DIR,
                     ignore=shutil.ignore_patterns(".godot", "*.import"))
-    with open(os.path.join(PROBE_DIR, "probe.gd"), "w",
+    with open(os.path.join(PROBE_DIR, f"{stem}.gd"), "w",
               encoding="utf-8", newline="\n") as handle:
-        handle.write(PROBE_GD)
-    with open(os.path.join(PROBE_DIR, "probe.tscn"), "w",
+        handle.write(script_text)
+    with open(os.path.join(PROBE_DIR, f"{stem}.tscn"), "w",
               encoding="utf-8", newline="\n") as handle:
-        handle.write(PROBE_TSCN)
+        handle.write(PROBE_TSCN.format(stem=stem, node=node_name))
     project_file = os.path.join(PROBE_DIR, "project.godot")
     with open(project_file, "r", encoding="utf-8") as handle:
         text = handle.read()
     text = re.sub(r'run/main_scene="[^"]*"',
-                  'run/main_scene="res://probe.tscn"', text)
-    if "res://probe.tscn" not in text:
+                  f'run/main_scene="res://{stem}.tscn"', text)
+    if f"res://{stem}.tscn" not in text:
         text = text.replace("[application]",
                             "[application]\n\n"
-                            'run/main_scene="res://probe.tscn"')
+                            f'run/main_scene="res://{stem}.tscn"')
     with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
 
@@ -255,18 +380,34 @@ def run_ride_probe():
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     # ⚠ 无头模式主循环比物理快,`--quit-after` 数的是主循环次数:
-    # 这段探针要等电梯、坐上去、再开一段车,给足余量。
+    # 探针要等电梯 / 走一段路 / 切几次机位,给足余量。
     run = subprocess.run([godot, "--headless", "--path", PROBE_DIR,
-                          "--quit-after", "4500"],
+                          "--quit-after", str(quit_after)],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     out = (run.stdout or "") + (run.stderr or "")
     for line in out.splitlines():
-        if "LEVEL_" in line or "SCRIPT ERROR" in line or "Parse Error" in line:
+        # LEVEL_ / LEVEL2_ 都落在这个前缀里
+        if "LEVEL" in line or "SCRIPT ERROR" in line or "Parse Error" in line:
             print("    " + line.strip())
     if "SCRIPT ERROR" in out or "Parse Error" in out:
-        return [("关卡运行时探针跑起来了(没有脚本/解析错误)", False,
-                 "见上面的输出")]
+        print("✗ 探针里有脚本 / 解析错误:", [
+            line.strip() for line in out.splitlines()
+            if "SCRIPT ERROR" in line or "Parse Error" in line][:3])
+    return out
+
+
+def run_ride_probe():
+    """真 Godot 里跑一遍:坐电梯被抬上去 + 上车开一段再下车。
+
+    ── 为什么还要在**关卡里**再跑一遍 ────────────────────────────────
+    物理测试场已经证明"平台带人 / 车能开"本身没问题;这里验的是**接进
+    关卡之后**还成立:电梯的时间轴和关卡自己的逻辑(金币/HUD/相机)一起
+    跑、驾驶节点接在角色移动后面、按 E 的两层分支没被别的东西抢走。
+    """
+    out = _run_probe("probe", PROBE_GD, "LevelRideProbe", 4500)
+    if not out:
+        return []
     return [
         ("坐电梯被抬上去(角色升高 ≈ 电梯升高,间距不变)",
          "LEVEL_LIFT ok=true" in out, _probe_line(out, "LEVEL_LIFT")),
@@ -274,6 +415,27 @@ def run_ride_probe():
          "LEVEL_CAR ok=true" in out, _probe_line(out, "LEVEL_CAR")),
         ("探针跑完(电梯 + 载具都测到)", "LEVEL_RIDE_DONE" in out,
          _probe_line(out, "LEVEL_GAME")),
+    ]
+
+
+def run_level2_probe():
+    """真 Godot 里走一遍**第二关**(第三十五轮:用户实测的回归)。
+
+    那一版的第二关是当"通关页"做的 —— 角色没配移动 / 相机,上帝机开关
+    还写着 False;"切到第二关后移动 / 视角 / 上帝摄像机切换 / ESC 全失效"
+    就是这么来的。现在它由**角色预设**生成,这一趟在真 Godot 里钉住:
+    W 走得动、C / V 切得动机位、Tab 出得来上帝机。
+    """
+    out = _run_probe("probe2", PROBE2_GD, "Level2Probe", 3000)
+    if not out:
+        return []
+    return [
+        ("第二关的角色能走动(按 W 位移 ≥ 1 米)",
+         "LEVEL2_WALK ok=true" in out, _probe_line(out, "LEVEL2_WALK")),
+        ("第二关的机位切得动(C 切俯瞰 / V 切回)+ 上帝机切得进切得出",
+         "LEVEL2_WALK ok=true" in out and "cam_top=true cam_back=true" in out,
+         _probe_line(out, "LEVEL2_WALK")),
+        ("第二关探针跑完", "LEVEL2_DONE" in out, _probe_line(out, "LEVEL2_GAME")),
     ]
 
 
@@ -485,6 +647,67 @@ def main():
         check(f"场景文件已生成(scenes/{level_name}.tscn)",
               os.path.isfile(scene_file), scene_file)
 
+    # ── 第二关(第三十五轮:用户实测"切到第二关后移动 / 视角 / 上帝机 /
+    #    ESC 全失效")────────────────────────────────────────────────────
+    # 那一版的第二关是当**通关页**做的:图里只有标题 + 两个按键,角色没配
+    # 移动 / 跳跃 / 相机,上帝机开关还写着 False —— 用户看到的"全失效"就是
+    # 这个。现在它由**角色预设**生成(见 make_demo_level.build_second_logic),
+    # 下面这些断言就是钉住这件事:Blender 侧(图 + 设置)→ 生成物 → 真 Godot。
+    scene2 = bpy.data.scenes.get("关卡2")
+    names2 = {obj.name for obj in scene2.objects} if scene2 is not None else set()
+    check("第二关有两台机位(侧视 + 俯瞰)",
+          {"第二关机位", "第二关俯瞰"} <= names2, str(sorted(names2)))
+    settings2 = getattr(scene2, "gk_settings", None) if scene2 is not None else None
+    check("第二关开着『上帝摄像机』(关着的话 Tab 没反应)",
+          bool(getattr(settings2, "god_camera", False)),
+          str(getattr(settings2, "god_camera", None)))
+    check("第二关的类名是 Level2Player(和第一关 LevelPlayer 不能重名)",
+          str(getattr(settings2, "class_name", "")) == "Level2Player",
+          str(getattr(settings2, "class_name", "")))
+
+    logic2 = bpy.data.node_groups.get("关卡2逻辑")
+    kinds2 = [n.bl_idname for n in logic2.nodes] if logic2 is not None else []
+    check("第二关逻辑图有移动 + 跳跃节点(角色走得动)",
+          {"GKNodeMoveDirection", "GKNodeJump"} <= set(kinds2),
+          str(sorted(set(kinds2))))
+    check("第二关逻辑图有相机套件(弹簧臂 + C/V 切换机位)",
+          {"GKNodeCameraSpringArm", "GKNodeCameraSetCurrent"} <= set(kinds2),
+          str(sorted(set(kinds2))))
+    check("第二关按 E 回第一关(场景_切换关卡)",
+          "GKNodeChangeScene" in kinds2 and "GKNodeQuitGame" in kinds2,
+          str(sorted(set(kinds2))))
+
+    # 生成物:第二关的脚本 / 环境脚本里,那些代码真的在
+    scripts_dir2 = os.path.join(LEVEL_PROJECT_DIR, "scripts")
+    logic2_files = [path for path in glob.glob(os.path.join(scripts_dir2, "*.gd"))
+                    if "关卡2" in os.path.basename(path)
+                    and not os.path.basename(path).startswith("gk_environment")]
+    if not logic2_files:
+        check("第二关的脚本已生成(scripts/*关卡2*.gd)", False, scripts_dir2)
+    else:
+        with open(logic2_files[0], encoding="utf-8") as handle:
+            code2 = handle.read()
+        check("第二关脚本是角色脚本(extends CharacterBody3D)",
+              "extends CharacterBody3D" in code2, logic2_files[0])
+        check("第二关的移动方向跟着相机(不是世界轴死方向)",
+              "_gk_resolve_camera(self)" in code2)
+        check("第二关的上帝机守卫在(上帝视角期间角色让位)",
+              "if _gk_god_camera_active():" in code2
+              and "if not _gk_god_camera_active():" in code2)
+        check("第二关按 E 能回第一关(change_scene + 关卡1.tscn)",
+              "change_scene_to_file" in code2 and "关卡1.tscn" in code2)
+        check("第二关 Esc 退出接上了", "get_tree().quit()" in code2)
+    env2_file = os.path.join(scripts_dir2, "gk_environment_关卡2.gd")
+    if os.path.isfile(env2_file):
+        with open(env2_file, encoding="utf-8") as handle:
+            env2_code = handle.read()
+        check("第二关的环境脚本开着上帝机 + 带时停",
+              "god_camera: bool = true" in env2_code
+              and "const _GK_TIME_STOP_KEY := KEY_T" in env2_code)
+    else:
+        check("第二关的环境脚本已生成(scripts/gk_environment_关卡2.gd)",
+              False, env2_file)
+
     # ── 关卡1 的 .tscn 里:电梯/载具的体类型 + 网格跟着碰撞体 ──────────
     level_tscn = os.path.join(LEVEL_PROJECT_DIR, "scenes", "关卡1.tscn")
     if os.path.isfile(level_tscn):
@@ -504,6 +727,10 @@ def main():
     # ---- 运行时探针:真 Godot 里坐一次电梯、开一段车(第三十一轮)----
     probe_results = run_ride_probe()
     for name, ok, detail in probe_results:
+        check(name, ok, detail)
+
+    # ---- 运行时探针:真 Godot 里走一遍第二关(第三十五轮)----------
+    for name, ok, detail in run_level2_probe():
         check(name, ok, detail)
 
     passed = sum(1 for _n, ok, _d in RESULTS if ok)

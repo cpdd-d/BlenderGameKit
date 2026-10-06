@@ -315,7 +315,7 @@ def _extend_graph(tree, coins, enemies):
     # ---- ① 启动:操作提示 + 目标 + HUD + 敌人巡逻开始 ----
     hint = _add(tree, "GKNodeUiText", "操作提示", -300.0, 980.0,
                 gk_text=("WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / "
-                         "E 拍敌1 / R 重开 / Tab 上帝机 / F1 调试面板"),
+                         "E 拍敌1 / R 重开 / Tab 上帝机(T 时停)/ F1 调试面板"),
                 gk_x=18.0, gk_y=18.0, gk_size=18)
     goal = _add(tree, "GKNodeUiText", "目标提示", -300.0, 800.0,
                 gk_text=(f"目标:收齐 {COIN_GOAL} 枚金币;红方块碰到会扣血"

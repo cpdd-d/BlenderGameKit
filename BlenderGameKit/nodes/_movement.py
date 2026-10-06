@@ -440,6 +440,13 @@ class GKNodeDriveVehicle(B.GKStatementNode):
         ("gk_target", "node", TARGET_SELF, "角色", "坐在车上的角色(每帧钉在座位上)"),
         ("gk_speed", "float", 10.0, "速度", "米/秒;W 前进、S 后退"),
         ("gk_turn_speed", "float", 120.0, "转向速度", "度/秒;A / D 转车头"),
+        # ── 『推开刚体』(用户 2026-10-06 实测:"上车后推不动箱子")─────────
+        # 和『移动_按方向』同一个坑:CharacterBody 是运动学体,撞到刚体只
+        # 会"贴着滑走"。默认**开** —— 车比人重,推不动反而是意外。
+        ("gk_push_bodies", "bool", True, "推开刚体",
+         "开车撞到刚体箱子时把它推开(和角色那套一个原理)"),
+        ("gk_push_force", "float", 80.0, "推力",
+         "推开刚体的力(牛顿);车比人重,默认 80"),
     )
     gk_outputs = (S.pin(FLOW, "完成"), S.pin(BOOL, "驾驶中", False),)
 
@@ -453,3 +460,7 @@ class GKNodeDriveVehicle(B.GKStatementNode):
         row = layout.row(align=True)
         row.label(text="角色")
         B.draw_target_picker(self, row, "gk_target")
+        row = layout.row(align=True)
+        row.prop(self, "gk_push_bodies", text="推开刚体", toggle=True)
+        if getattr(self, "gk_push_bodies", True):
+            row.prop(self, "gk_push_force", text="推力")

@@ -181,7 +181,8 @@ extends Node
 ## ── 上帝摄像机(关卡测试)──────────────────────────────────────────
 ## 场景设置里开了『上帝摄像机』时,这里常驻一台自由飞行相机:
 ## 运行时按 Tab 在"玩家相机 / 上帝摄像机"之间切;上帝机忽略碰撞、
-## WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角。
+## WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角;上帝视角里按 T
+## 还可以**时停**(冻住世界,只留上帝机飞 —— 第三十五轮)。
 ##
 ## ── 为什么放在环境脚本里,而不是角色的游戏逻辑里(用户 2026-10-04)──
 ## 游戏逻辑脚本挂在角色身上 —— 场景里**没有角色**就没有它,上帝机也跟着
@@ -197,6 +198,7 @@ var _gk_materials: Array = []
 var _gk_god_cam: Camera3D = null
 var _gk_god_player_cam: Camera3D = null
 var _gk_god_tab_held: bool = false
+var _gk_time_stop_held: bool = false
 var _gk_god_look: Vector2 = Vector2.ZERO
 var _gk_mouse_was: int = -1
 
@@ -226,6 +228,15 @@ var _gk_mouse_was: int = -1
 
 const _GK_DBG_KEY := {debug_key}            # 弹出 / 收起面板
 const _GK_DBG_COPY_KEY := {debug_copy_key}  # 复制全部内容
+
+## ── 上帝视角里的"时停"(第三十五轮,用户 2026-10-06)────────────────────
+## "在上帝摄像机时,可以添加时停的功能" —— 上帝视角里按这个键冻住 / 解冻
+## 世界:场景动画、物理、角色逻辑全停,只有上帝机还能飞(环境脚本在
+## god_camera 场景里设了 PROCESS_MODE_ALWAYS),方便停住画面看细节。
+##
+## 解冻**不挑视角**(切回玩家相机才发现还冻着,照样按得开);离开上帝机
+## 也会自动解冻(见 _gk_god_toggle)。两者都是"别把自己锁在冻住的世界里"。
+const _GK_TIME_STOP_KEY := {time_stop_key}
 
 var _gk_dbg_label: Label = null
 var _gk_dbg_visible := false
@@ -259,6 +270,11 @@ func _ready() -> void:
 	# 编辑器里**不造**(脚本是 @tool,编辑器里也会 _ready)—— 造了会在
 	# 编辑器场景里凭空多一台相机,还会抢编辑器视口。
 	if god_camera and not Engine.is_editor_hint():
+		# ── 时停(第三十五轮):"冻住世界"必须留一条活口 ──────────────
+		# 时停是用 `get_tree().paused` 冻的 —— 整个世界都停了,谁来解冻?
+		# 环境脚本(和上帝机)必须**暂停也照跑**,否则按 T 冻住之后
+		# 按什么都没反应,只剩强退(实测过这种"把自己锁死"的设计)。
+		process_mode = Node.PROCESS_MODE_ALWAYS
 		_gk_god_setup.call_deferred()
 	# 调试面板(第二十二轮):和上帝机一样,编辑器里不造 ——
 	# 造了在编辑器场景里会凭空多一块文字面板。面板节点不依赖整棵树建好
@@ -498,6 +514,10 @@ func _physics_process(delta: float) -> void:
 	# 编辑器里 Tab 是切视角的快捷键,不能让它去切上帝机
 	if god_camera and not Engine.is_editor_hint():
 		_gk_god_tick(delta)
+		# 时停(第三十五轮):**冻住之后**这一句还得跑 —— 要不谁来解冻。
+		# 它排在 _gk_god_tick 后面:Tab 切走的那一刻先解冻(见 _gk_god_toggle),
+		# 这一帧的 T 状态不会再把它冻回去。
+		_gk_time_stop_tick()
 	# 调试面板(第二十二轮):按键 / 刷新都在这里(和上帝机同一个节奏)
 	if debug_panel and not Engine.is_editor_hint():
 		_gk_dbg_tick(delta)
@@ -653,6 +673,12 @@ func _gk_god_toggle() -> void:
 		return
 	if _gk_god_cam.is_current():
 		# 正在用上帝机 -> 切回玩家相机(优先记下来的那台)
+		# 时停也跟着结束(第三十五轮):离开上帝机就该回到能玩的状态 ——
+		# "在上帝机里冻住看细节"这个用法到切走为止,不然玩家会看着一个
+		# 冻住的画面按什么都没有反应。
+		if get_tree() != null and get_tree().paused:
+			get_tree().paused = false
+			print("[GK] 时停:关(离开上帝机)")
 		if _gk_god_player_cam != null and is_instance_valid(_gk_god_player_cam):
 			_gk_god_player_cam.make_current()
 		else:
@@ -713,6 +739,42 @@ func _gk_god_tick(delta: float) -> void:
 		fly -= Vector3.UP
 	if fly != Vector3.ZERO:
 		_gk_god_cam.global_position += fly.normalized() * 8.0 * delta
+
+
+## ── 时停(第三十五轮,用户 2026-10-06:"在上帝摄像机时可以添加时停")──
+## 按 `_GK_TIME_STOP_KEY`(默认 T)把整个世界冻住 —— 物理、场景动画、
+## 角色逻辑全停(`get_tree().paused`),只有上帝机还能飞:停住画面绕着看
+## 细节,再按一下接着玩。
+##
+## ── 两条守卫都是"别把自己锁死"────────────────────────────────────
+## 1. **开**只认上帝视角:正在用玩家相机时按 T 不该把游戏冻住
+##    (那时按键是给角色用的,冻住会让人以为"操作失灵了")。
+## 2. **关**不挑视角:切回玩家相机之后发现还冻着,照样按得开 ——
+##    否则就只剩"必须切回上帝机才能解冻"这一条死路。
+## 另外切回玩家相机时也自动解冻(见 _gk_god_toggle),一个是兜底一个是明路。
+##
+## ── 为什么用 Input.is_key_pressed 而不是 is_action_just_pressed ──────
+## 游戏逻辑那套输入是节点自己的(暂停后不跑);T 是**环境脚本**的键,
+## 和 Tab 同一个套路:自己记"上一帧按没按",暂停不暂停都能读。
+func _gk_time_stop_tick() -> void:
+	var tree := get_tree()
+	if tree == null:
+		return
+	if not Input.is_key_pressed(_GK_TIME_STOP_KEY):
+		_gk_time_stop_held = false
+		return
+	if _gk_time_stop_held:
+		return
+	_gk_time_stop_held = true
+	if tree.paused:
+		tree.paused = false
+		print("[GK] 时停:关")
+		return
+	var god_on := (_gk_god_cam != null and is_instance_valid(_gk_god_cam)
+		and _gk_god_cam.is_current())
+	if god_on:
+		tree.paused = true
+		print("[GK] 时停:开(再按一下继续)")
 
 
 ## 上帝机的鼠标位移**单独**攒一份。
@@ -820,7 +882,8 @@ func _gk_dbg_text() -> String:
 		var god_on := false
 		if _gk_god_cam != null and is_instance_valid(_gk_god_cam):
 			god_on = _gk_god_cam.is_current()
-		lines.append("上帝摄像机:%s(按 Tab 切)" % ("开" if god_on else "关"))
+		lines.append("上帝摄像机:%s(按 Tab 切 · 按 %s 时停)" % [
+			"开" if god_on else "关", _gk_dbg_key_name(_GK_TIME_STOP_KEY)])
 	var watch := debug_watch.strip_edges()
 	if not watch.is_empty():
 		lines.append("显示这几项:%s" % watch.replace("|", "、"))
@@ -977,6 +1040,7 @@ ENV_SCRIPT_DEFAULTS = dict(
     follow_scene_light="false", god_camera="false",
     debug_panel="false", debug_watch="",
     debug_key="KEY_F1", debug_copy_key="KEY_F2",
+    time_stop_key="KEY_T",
     nav_bake="false",
 )
 
@@ -1324,6 +1388,9 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
         debug_watch=_debug_watch_text(scene),
         debug_key=_debug_key_const(scene, "debug_key", "F1"),
         debug_copy_key=_debug_key_const(scene, "debug_copy_key", "F2"),
+        # 时停键(第三十五轮):先给个常量 —— 和调试面板那两个键同一个
+        # 套路,以后想变成场景设置只要在这儿读 settings 就行。
+        time_stop_key="KEY_T",
         nav_bake="true" if _nav_on(scene) else "false",
     )
 

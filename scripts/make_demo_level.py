@@ -336,7 +336,8 @@ def build_logic(player, coins, goal, elevator=None, vehicle=None):
     # gk_anchor 那个属性 —— 我一开始猜错了名字)。
     hud_hint = add("GKNodeUiText", "HUD提示", -500.0, 300.0,
                    gk_control="", gk_text=("WASD 移动 · 空格 跳 · 鼠标转视角 · "
-                                           "滚轮 缩放 · C/V 切视角 · E 上/下车"),
+                                           "滚轮 缩放 · C/V 切视角 · E 上/下车 · "
+                                           "Tab 上帝机(T 时停)"),
                    gk_x=20.0, gk_y=56.0, gk_size=15)
     tree.links.new(ready.outputs["执行"], lock.inputs["执行"])
     tree.links.new(lock.outputs["完成"], setup.inputs["执行"])
@@ -693,59 +694,74 @@ def build_logic(player, coins, goal, elevator=None, vehicle=None):
     return tree
 
 
-def build_second_logic():
-    """第二关(『关卡2』场景)的逻辑图『关卡2逻辑』。
+def build_second_logic(scene, player):
+    """第二关的逻辑:角色预设(移动 / 跳跃 / 相机)+ 回第一关 + Esc 退出。
 
-    比第一关简单得多 —— 第二关只是"证明关卡真的切过来了":
-        * 每当_准备:屏幕上一行标题(按 E 回第一关 / 按 Esc 退出)
-        * 每当_物理帧:按 E(Just) -> 切回 `res://scenes/关卡1.tscn`
-        * 每当_物理帧:按 Esc(Just) -> 退出游戏
-    链接风格和第一关的 `build_logic` 完全一致(事件『执行』-> 语句『执行』,
-    条件走『结果』->『条件』,分支『是』-> 下一条语句)。
+    ── 为什么改成"角色预设"(用户 2026-10-06 实测报的)────────────────
+    第二关当年是当**通关页**做的:一棵只有标题 + 两个按键的图,角色也没配
+    移动 —— 所以切过来之后"移动 / 视角 / 上帝机 / Esc 全失效"(实测确认:
+    角色在场景里是个 StaticBody,图里也没有任何移动节点;上帝机开关还写死
+    False)。现在直接拿**角色预设**(和物理测试场同一套)生成,再把
+    "按 E 回第一关 / 按 Esc 退出"两条接上去 —— 第二关是一张真能走的关卡。
     """
-    old = bpy.data.node_groups.get("关卡2逻辑")
-    if old is not None:
-        bpy.data.node_groups.remove(old)
-    tree = bpy.data.node_groups.new("关卡2逻辑", "GKGameLogicTree")
-    # 没有用户的节点图存盘时会被丢掉,必须 use_fake_user(同『玩家逻辑』)
-    tree.use_fake_user = True
+    from BlenderGameKit import presets
+
+    logic, _anim, notes = presets.create_character_preset(
+        scene, character=player,
+        logic_name="关卡2逻辑",
+        class_name="Level2Player",
+        with_animation=False,
+        with_godot_camera=True,          # Tab 上帝机(第二关也要能飞着看)
+        camera_side="第二关机位", camera_top="第二关俯瞰",
+    )
+    for note in notes:
+        log(f"关卡2 预设: {note}")
 
     def add(kind, name, x, y, **props):
-        node = tree.nodes.new(kind)
+        node = logic.nodes.new(kind)
         node.name = name
         node.location = (x, y)
         for key, value in props.items():
             setattr(node, key, value)
         return node
 
-    # ---- 每当_准备:一行标题 ----
-    ready = add("GKNodeOnReady", "每当_准备", -1400.0, 500.0)
-    title = add("GKNodeUiText", "第二关标题", -1100.0, 500.0,
-                gk_control="", gk_text="第二关 —— 按 E 回第一关,按 Esc 退出",
-                gk_x=20.0, gk_y=18.0, gk_size=22)
-    tree.links.new(ready.outputs["执行"], title.inputs["执行"])
+    def link(source, source_pin, target, target_pin):
+        logic.links.new(source.outputs[source_pin], target.inputs[target_pin])
+
+    # ---- 标题(挂在预设的『设定初始视野』后面,链子不断)----
+    ready_tail = logic.nodes.get("设定初始视野")
+    title = add("GKNodeUiText", "第二关标题", -600.0, 500.0,
+                gk_control="",
+                gk_text=("第二关 —— 这里也能走动了:WASD / 空格 / 鼠标转视角 / "
+                         "C·V 切机位 / Tab 上帝机(T 时停);"
+                         "按 E 回第一关,按 Esc 退出"),
+                gk_x=20.0, gk_y=18.0, gk_size=20)
+    if ready_tail is not None:
+        link(ready_tail, "完成", title, "执行")
 
     # ---- 每当_物理帧:按 E 回第一关 / 按 Esc 退出 ----
-    physics = add("GKNodeOnPhysicsProcess", "每当_物理帧", -1400.0, 0.0)
+    physics = logic.nodes.get("每当_物理帧")
 
-    back_key = add("GKNodeKey", "按键E", -1400.0, -260.0,
+    back_key = add("GKNodeKey", "按键E", -400.0, -1600.0,
                    gk_key="E", gk_action="back_level", gk_trigger="JUST")
-    back_branch = add("GKNodeBranch", "如果_否则", -1000.0, -260.0)
-    back_scene = add("GKNodeChangeScene", "切回第一关", -700.0, -260.0,
+    back_branch = add("GKNodeBranch", "如果_否则", -180.0, -1600.0)
+    back_scene = add("GKNodeChangeScene", "切回第一关", 60.0, -1600.0,
                      gk_scene_path=FIRST_LEVEL_RES)
-    tree.links.new(physics.outputs["执行"], back_branch.inputs["执行"])
-    tree.links.new(back_key.outputs["结果"], back_branch.inputs["条件"])
-    tree.links.new(back_branch.outputs["是"], back_scene.inputs["执行"])
+    link(physics, "执行", back_branch, "执行")
+    link(back_key, "结果", back_branch, "条件")
+    link(back_branch, "是", back_scene, "执行")
 
-    quit_key = add("GKNodeKey", "按键Esc", -1400.0, -520.0,
+    quit_key = add("GKNodeKey", "按键Esc", -400.0, -1800.0,
                    gk_key="ESC", gk_action="quit_game", gk_trigger="JUST")
-    quit_branch = add("GKNodeBranch", "如果_否则", -1000.0, -520.0)
-    do_quit = add("GKNodeQuitGame", "退出游戏", -700.0, -520.0)
-    tree.links.new(physics.outputs["执行"], quit_branch.inputs["执行"])
-    tree.links.new(quit_key.outputs["结果"], quit_branch.inputs["条件"])
-    tree.links.new(quit_branch.outputs["是"], do_quit.inputs["执行"])
+    quit_branch = add("GKNodeBranch", "如果_否则", -180.0, -1800.0)
+    do_quit = add("GKNodeQuitGame", "退出游戏", 60.0, -1800.0)
+    link(physics, "执行", quit_branch, "执行")
+    link(quit_key, "结果", quit_branch, "条件")
+    link(quit_branch, "是", do_quit, "执行")
 
-    return tree
+    log(f"关卡2 逻辑:共 {len(logic.nodes)} 个节点 / {len(logic.links)} 条连线"
+        f"(移动 / 跳跃 / 相机 / 上帝机 + 回第一关 + Esc 退出)")
+    return logic
 
 
 def write_export_settings(scene, player):
@@ -759,8 +775,8 @@ def write_export_settings(scene, player):
     物体**(`scene.objects`)。用 `bpy.data.objects` 会连另一关的一起改 ——
     给『第二关角色』勾 script_target 时,`else` 分支会把『示例角色』顺手
     改成 StaticBody3D,第一关的角色就站不住了。
-    场景级设置(class_name / 上帝摄像机)同理:第二关的
-    `build_second_level()` 已经写好(Level2Player、不开上帝摄像机),
+    场景级设置(class_name / 上帝摄像机)同理:**关卡1 在这里写全**,
+    关卡2 的 `build_second_level()` 自己写好(Level2Player、开上帝摄像机),
     这里**不要覆盖**,否则会被第一关的 LevelPlayer 顶掉。
     """
     # 场景级设置:只给第一关写全;第二关交给 build_second_level()。
@@ -832,7 +848,9 @@ def build_second_level():
         # 同名 class_name 只能有一个,重了会报
         # "Class 'LevelPlayer' hides a global script class"。
         ("class_name", "Level2Player"),
-        ("god_camera", False),
+        # 上帝摄像机(用户 2026-10-06 实测:"切到第二关后 Tab 失效")——
+        # 当年第二关是"通关页"所以关着,现在它也照样开着。
+        ("god_camera", True),
     ))
 
     # 一块地面 + 两道矮墙(别让角色掉出去;第二关不再放金币 / 高台)
@@ -846,12 +864,21 @@ def build_second_level():
              scene=scene)
 
     # 相机(要在 objects.new 时就把 Camera 数据给对,见 build_cameras 的说明)
+    # 两台:角色预设要一台第三人称侧视 + 一台俯瞰(C / V 切换用)
     cam_data = bpy.data.cameras.new("第二关机位数据")
     cam_data.lens = 50.0
     camera = bpy.data.objects.new("第二关机位", cam_data)
     scene.collection.objects.link(camera)
     camera.location = (0.0, -16.0, 6.0)
     camera.rotation_euler = (math.radians(68.0), 0.0, 0.0)
+    scene.camera = camera
+
+    top_data = bpy.data.cameras.new("第二关俯瞰数据")
+    top_data.lens = 50.0
+    top = bpy.data.objects.new("第二关俯瞰", top_data)
+    scene.collection.objects.link(top)
+    top.location = (0.0, 0.0, 24.0)
+    top.rotation_euler = (0.0, 0.0, 0.0)
 
     # 阳光
     light_data = bpy.data.lights.new("第二关Sun数据", type="SUN")
@@ -866,7 +893,7 @@ def build_second_level():
                       (0.85, 0.35, 0.35, 1.0), scene=scene)
     player.location = (0.0, -6.0, 0.9)
 
-    build_second_logic()
+    build_second_logic(scene, player)
     return scene, player
 
 

@@ -3091,7 +3091,8 @@ class GK_PT_Main(bpy.types.Panel):
                            if getattr(o, "type", "") == "CAMERA"]
                 if getattr(settings, "god_camera", False):
                     box.label(text="运行时按 Tab 切换玩家相机 / "
-                                   "上帝摄像机(WASD + 空格/Shift + 鼠标)",
+                                   "上帝摄像机(WASD + 空格/Shift + 鼠标;"
+                                   "上帝视角按 T 时停)",
                               icon="INFO")
                 elif not cameras:
                     box.label(text="场景里没有相机 —— 运行时会自动造一台观察机",

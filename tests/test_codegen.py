@@ -7757,6 +7757,27 @@ class TestEnvironmentGodCamera(Base):
         self.assertIn("_gk_god_look += event.relative", text)
         self.assertIn("_gk_god_look = Vector2.ZERO", text)
 
+    def test_time_stop_key_freezes_and_unfreezes(self):
+        """时停(第三十五轮,用户:"在上帝摄像机时可以添加时停")。
+
+        按 T 把世界冻住(`tree.paused`),再按一下解冻 —— 冻住时场景动画 /
+        物理 / 角色逻辑全停,只有上帝机还能飞。两条守卫都要在:
+          * 环境脚本自己 PROCESS_MODE_ALWAYS —— 不然冻住之后没人读按键,
+            "按 T 解冻"永远不会发生(把自己锁在冻住的世界里);
+          * **开**只认上帝视角(玩家相机时按 T 不该冻住游戏),
+            **关**不挑视角 + 离开上帝机自动解冻(兜底)。
+        """
+        text = self._env(god="true")
+        self.assertIn("const _GK_TIME_STOP_KEY := KEY_T", text)
+        self.assertIn("func _gk_time_stop_tick() -> void:", text)
+        self.assertIn("tree.paused = true", text)
+        self.assertIn("tree.paused = false", text)
+        self.assertIn("process_mode = Node.PROCESS_MODE_ALWAYS", text)
+        # 开只认上帝视角
+        self.assertIn("and _gk_god_cam.is_current())", text)
+        # 离开上帝机就解冻(不然玩家看着一个冻住的画面按什么都没反应)
+        self.assertIn("时停:关(离开上帝机)", text)
+
     def test_god_camera_forces_environment_node(self):
         """开关开着时,即使场景里没相机/灯/材质,也要生成 Environment 节点。
 

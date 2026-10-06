@@ -508,6 +508,11 @@ def _stmt_drive_vehicle(ctx, node, indent):
         ctx.add_line(indent + 1, f"{vehicle}.velocity.x = {fwd}.x * {temp}.z * {speed}")
         ctx.add_line(indent + 1, f"{vehicle}.velocity.z = {fwd}.z * {temp}.z * {speed}")
     ctx.add_line(indent + 1, f"{vehicle}.move_and_slide()")
+    # 『推开刚体』(用户 2026-10-06 实测:"上车后推不动箱子")—— 和角色那套
+    # 同一个坑、同一段代码:运动学体撞刚体只会滑走,得自己施冲量。
+    # 必须放在 move_and_slide() 之后(那之后才有 get_slide_collision 可查)。
+    if bool(getattr(node, "gk_push_bodies", False)):
+        _push_rigid_bodies(ctx, node, vehicle, indent + 1)
     ctx.add_line(indent + 1,
                  f"{who}.global_position = {vehicle}.global_transform * "
                  f'({vehicle}.get_meta("gk_seat", {seat_type}.ZERO) as {seat_type})')

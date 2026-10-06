@@ -27,13 +27,17 @@
     时间轴往返推着走)移动时角色要**被带走**(位移对得上);要是
     StaticBody("瞬移"),角色留在原地、还会掉到地上;
   * **载具**(第三十轮):E 上车 → W 开 1.5 秒(角色全程钉在座位上)→
-    E 下车 → W 还能走(控制权交还角色)、车不跟着跑;
+    E 下车 → W 还能走(控制权交还角色)、车不跟着跑;车头顶着
+    『车头箱子』—— 车必须**把它推开**(第三十五轮:用户实测
+    "上车后推不动箱子");上帝视角里按 W 车不许动,
+    按 T **时停**(世界冻住 / 上帝机照飞 / 再按一下解冻);
   * **绕墙追击**(第三十四轮):玩家站在墙这头不动,墙那头的『追踪者』
     由『移动_寻路』驱动 —— 必须**从墙端绕过来**(横向绕出 ≥ 2.8 米)
     并追上玩家;直线追只会在墙前贴住。顺带验导航网格真的烤出来了。
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -55,6 +59,7 @@ static var run_count := 0
 var world: Node = null
 var host: CharacterBody3D = null
 var box: RigidBody3D = null
+var carbox: RigidBody3D = null
 var platform: Node3D = null
 var vehicle: CharacterBody3D = null
 var chaser: CharacterBody3D = null
@@ -125,6 +130,15 @@ var vstand := Vector3.ZERO
 var vwalked := 0.0
 var vdrift := 0.0
 var vmeta := false
+var carbox_start_z := 0.0      # 车头箱子:开工位时的 z(推没推开看它)
+var vpushed := 0.0
+# 时停采样(第三十五轮)
+var vstop_on := false          # 按 T 之后 `tree.paused` 真的变真了吗
+var vstop_off := false         # 再按一下真的解冻了吗
+var vstop_fly := 0.0           # 冻住期间上帝机飞了多远(必须照飞)
+var vstop_world := 0.0         # 冻住期间世界动了多远(必须冻住)
+var vstop_plat := Vector3.ZERO
+var vstop_cam := Vector3.ZERO
 # 第十工位(第三十四轮:寻路)采样
 var nav_polys := 0            # 导航网格烤出来多少个多边形(0 = 没烤成)
 var nav_arrived := false      # 追踪者最后有没有贴到玩家
@@ -136,6 +150,11 @@ var nav_min_dist := 99.0
 
 func _ready() -> void:
 	run_count += 1
+	# ── 探针自己必须"暂停也照跑"(第三十五轮)──────────────────────────
+	# 时停那一段会把整个场景树冻住(tree.paused)—— 探针要是跟着停,
+	# 就永远看不到"解冻"了(卡在 phase 8 里,后面全不打印)。
+	# 它不是游戏的一部分,是观察者,所以设成 ALWAYS。
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	world = load("res://scenes/World.tscn").instantiate()
 	add_child(world)
 	var players := world.find_children("小玩家", "CharacterBody3D", true, false)
@@ -144,6 +163,9 @@ func _ready() -> void:
 	var boxes := world.find_children("箱子", "RigidBody3D", true, false)
 	if not boxes.is_empty():
 		box = boxes[0] as RigidBody3D
+	var car_boxes := world.find_children("车头箱子", "RigidBody3D", true, false)
+	if not car_boxes.is_empty():
+		carbox = car_boxes[0] as RigidBody3D
 	var platforms := world.find_children("移动平台", "AnimatableBody3D", true, false)
 	if not platforms.is_empty():
 		platform = platforms[0] as Node3D
@@ -161,7 +183,8 @@ func _ready() -> void:
 		if mesh != null:
 			nav_polys = mesh.get_polygon_count()
 	print("DEMO_GAME run=", run_count, " player=", host != null,
-		" box=", box != null, " platform=", platform != null,
+		" box=", box != null, " carbox=", carbox != null,
+		" platform=", platform != null,
 		" vehicle=", vehicle != null, " chaser=", chaser != null,
 		" nav_polys=", nav_polys,
 		" bodies=", world.find_children("Colliders", "Node3D", true, false).size())
@@ -181,6 +204,14 @@ func _camera_yaw() -> String:
 	if cameras.is_empty():
 		return "<no-camera>"
 	return "%.2f" % (cameras[0] as Camera3D).rotation_degrees.y
+
+
+## 上帝机在哪(时停那段要看它"冻着也照飞")—— 按分组找,不认名字。
+func _god_camera_position() -> Vector3:
+	for node in get_tree().root.find_children("*", "Camera3D", true, false):
+		if node.is_in_group("gk_god_camera"):
+			return (node as Camera3D).global_position
+	return Vector3.ZERO
 
 
 ## 从某个高度朝 -Z 打一条射线(打多碰撞体的三块 / 两条缝)。
@@ -299,6 +330,11 @@ func _vehicle_step(delta: float) -> void:
 			_send_key(KEY_W, false)
 			vdrove = vstart.distance_to(vehicle.global_position)
 			vyaw = absf(vehicle.rotation.y - vyaw0)
+			# ── 车头箱子(第三十五轮,用户实测:"上车后推不动箱子")──────
+			# 车头正前方摆着『车头箱子』—— 车开出去必须先把它顶开;
+			# 推不动的话车会被它挡在路上(vdrove 也够不到 5)。
+			if carbox != null:
+				vpushed = carbox_start_z - carbox.global_position.z
 			# ── 上帝视角里不该还能开车(用户 2026-10-06 实测)─────────
 			# 按 Tab 切上帝机,再按住 W 半秒:那时 WASD 是**飞相机**的,
 			# 车一步都不该动(驾驶节点现在也有上帝守卫)。测完 Tab 切回来。
@@ -316,6 +352,36 @@ func _vehicle_step(delta: float) -> void:
 		if vtime >= 0.5:
 			_send_key(KEY_W, false)
 			vgod_drift = vgod_car.distance_to(vehicle.global_position)
+			# ── 时停(第三十五轮,用户:"在上帝摄像机时可以添加时停")────
+			# 上帝视角里按 T = 冻住世界。冻住之后**上帝机还得能飞**
+			# (环境脚本设了 PROCESS_MODE_ALWAYS —— 探针自己也设了,
+			# 见 _ready);世界那边(平台由时间轴推着走)必须**一动不动**。
+			# 这一段的顺序:T 冻 → 按 W 飞 0.4 秒 → 量三件事 → T 解冻。
+			vstop_plat = platform.global_position if platform != null else Vector3.ZERO
+			_send_key(KEY_T, true)
+			vphase = 8
+			vtime = 0.0
+	elif vphase == 8:
+		if vtime >= 0.15:
+			_send_key(KEY_T, false)
+			vstop_on = get_tree().paused
+			vstop_cam = _god_camera_position()
+			_send_key(KEY_W, true)        # 冻着也要能飞
+			vphase = 9
+			vtime = 0.0
+	elif vphase == 9:
+		if vtime >= 0.4:
+			_send_key(KEY_W, false)
+			vstop_fly = vstop_cam.distance_to(_god_camera_position())
+			if platform != null:
+				vstop_world = vstop_plat.distance_to(platform.global_position)
+			_send_key(KEY_T, true)        # 解冻
+			vphase = 10
+			vtime = 0.0
+	elif vphase == 10:
+		if vtime >= 0.15:
+			_send_key(KEY_T, false)
+			vstop_off = not get_tree().paused
 			_send_key(KEY_TAB, true)      # 切回玩家相机
 			vphase = 7
 			vtime = 0.0
@@ -365,14 +431,22 @@ func _finish_vehicle() -> void:
 	# 上车了(meta) + 车真开出去了 + 角色一路被钉在座位上(ride_gap)
 	# + 下车后角色在车外 + 控制权回到角色(walked)+ 车没被"偷开"(drift)
 	# + 上帝视角里按 W **车不能动**(god_drift,用户 2026-10-06 实测的那条)
+	# + 车头箱子**被推开**(pushed,用户实测:"上车后推不动箱子")
+	# + 时停三件事:按 T 真的冻上 / 再按真的解冻 / 冻着上帝机照飞、
+	#   世界一动不动(第三十五轮)
 	var ok := (vmeta and vdrove >= 5.0 and vgap_max <= 0.8
 		and vback_gap >= 1.5 and vwalked >= 1.0 and vdrift <= 0.3
-		and vyaw >= 0.3 and vyaw <= 1.2 and vgod_drift <= 0.2)
+		and vyaw >= 0.3 and vyaw <= 1.2 and vgod_drift <= 0.2
+		and vpushed >= 0.5
+		and vstop_on and vstop_off and vstop_fly >= 1.0
+		and vstop_world <= 0.15)
 	station_time = -1.0
 	print("PHYS_vehicle ok=%s drove=%.2f ride_gap=%.2f back_gap=%.2f "
 		% [ok, vdrove, vgap_max, vback_gap]
 		+ "walked=%.2f drift=%.2f steer=%.2f god_drift=%.2f meta=%s"
-		% [vwalked, vdrift, vyaw, vgod_drift, vmeta])
+		% [vwalked, vdrift, vyaw, vgod_drift, vmeta]
+		+ " pushed=%.2f stop=%s/%s fly=%.2f frozen=%.2f"
+		% [vpushed, vstop_on, vstop_off, vstop_fly, vstop_world])
 
 
 func _start_station(index: int) -> void:
@@ -398,15 +472,17 @@ func _start_station(index: int) -> void:
 	host.global_position = start
 	host.velocity = Vector3.ZERO
 	if kind == "nav":
-		# 开门:追踪者开始追(变量在图里,默认关着 —— 不然它会跟着玩家
-		# 跑遍前九个工位,把那些判据全搅乱)
+		# 追击怎么开:图里那句话是"走进『追击触发区』就置真"(人玩也生效)
+		# —— 探针把玩家**传送进触发区**里,Area3D 的 body_entered 下一帧
+		# 就会把『追击开关』打开,和玩家自己走进去走的是同一条链。
+		# (第三十四轮这里是探针直接 `host.set("追击开关", true)` 的 ——
+		#  那是"只有探针能开追"的漏洞,用户实测:自己玩追踪者一动不动。)
 		if chaser != null:
 			nav_prev = chaser.global_position
 		nav_around = 0.0
 		nav_path = 0.0
 		nav_min_dist = 99.0
 		nav_arrived = false
-		host.set("追击开关", true)
 	# ── 把视角偏航钉回 0(用户 2026-10-06)─────────────────────────
 	# 测试场开了『随相机朝向』(按 W = 往镜头前方走,手感才对);探针要的
 	# 是**确定的世界 -Z**,所以每个工位开始时把偏航清零 —— 相机相对的方向
@@ -423,6 +499,12 @@ func _start_station(index: int) -> void:
 	first_vel_done = false
 	min_dist = 99.0
 	box_start_z = box.global_position.z if box != null else 0.0
+	carbox_start_z = carbox.global_position.z if carbox != null else 0.0
+	vpushed = 0.0
+	vstop_on = false
+	vstop_off = false
+	vstop_fly = 0.0
+	vstop_world = 0.0
 	plat_min_x = platform.global_position.x if platform != null else 0.0
 	plat_max_x = plat_min_x
 	vphase = 0
@@ -610,7 +692,8 @@ def main():
             ("narrow", "窄缝卡住了"),
             ("thin", "薄墙被穿透了"),
             ("platform", "平台没把人带走(平台从脚下溜走 / 人掉下去了)"),
-            ("vehicle", "上/下车或驾驶不对(没开出去 / 人没跟着 / 下车后车被偷开)"),
+            ("vehicle", "上/下车或驾驶不对(没开出去 / 人没跟着 / 下车后车被偷开"
+                        " / 车撞箱子推不动 / 时停开不了或解不开)"),
             ("nav", "追踪者没绕墙追到人(导航网格没烤出来 / 绕不过去 / 贴不上)")):
         if not re.search(rf"PHYS_{key} ok=true", text):
             print(f"✗ {why}:",
@@ -650,6 +733,7 @@ def main():
             scene_text = handle.read()
         for needle, why in (
                 ('[node name="箱子" type="RigidBody3D"', "刚体箱子"),
+                ('[node name="车头箱子" type="RigidBody3D"', "车头箱子(车推箱子)"),
                 ('[node name="移动平台" type="AnimatableBody3D" '
                  'parent="Colliders"]', "移动平台是 AnimatableBody"),
                 ('[node name="载具" type="CharacterBody3D" '
@@ -696,6 +780,26 @@ def main():
     else:
         print("✗ 没找到主场景:", world_tscn)
         ok = False
+
+    # ── 时停(第三十五轮):环境脚本里真的生成出来了 ─────────────────
+    # 时停 / 上帝机都长在**环境脚本**里(不是角色的游戏逻辑)—— 上面那些
+    # PHYS_vehicle 的断言验的是"现象",这里顺手锁一下"那一截代码真的在",
+    # 免得哪天模板改了字段名、探针却因为降级路径静默放过。
+    env_files = glob.glob(os.path.join(OUT, "scripts", "gk_environment*.gd"))
+    if not env_files:
+        print("✗ 没找到环境脚本(上帝机 / 时停都在里面)")
+        ok = False
+    else:
+        with open(env_files[0], "r", encoding="utf-8") as handle:
+            env_code = handle.read()
+        for needle, why in (
+                ("const _GK_TIME_STOP_KEY := KEY_T", "时停键(默认 T)"),
+                ("func _gk_time_stop_tick()", "时停逻辑"),
+                ("process_mode = Node.PROCESS_MODE_ALWAYS",
+                 "环境脚本暂停也照跑(不设的话冻住就解不开了)")):
+            if needle not in env_code:
+                print(f"✗ 环境脚本里没有{why}: {needle}")
+                ok = False
 
     print("CHECK_PHYSICS_DEMO=" + ("OK" if ok else "FAIL"))
     return 0 if ok else 1

@@ -15,7 +15,7 @@
 | **窄缝** | 1.4 米宽的缝(角色 1.0 宽) | 能穿过去,不卡住 |
 | **薄墙** | 0.25 米厚的墙 | 全速撞 2.5 秒**不穿透** |
 | **移动平台** | 时间轴(PINGPONG)横着推的 AnimatableBody 平台 | 站上去**被带着走**(位移 = 平台位移)—— StaticBody 是"瞬移",人会留在原地 |
-| **载具** | CharacterBody 车 + E 上下车 + W/S 前后 · A/D 转车头 | 上车后角色被钉在座位上跟着车走;下车后角色能走、车不跟着跑 |
+| **载具** | CharacterBody 车 + E 上下车 + W/S 前后 · A/D 转车头 + 车头顶箱子 | 上车后角色被钉在座位上跟着车走;车能**把前面的箱子顶开**;下车后角色能走、车不跟着跑;上帝视角里按 W 车不许动、按 T 时停 |
 | **绕墙追击** | 『移动_寻路』追墙那头的玩家(第三十四轮) | **绕过墙**追到人(从墙端过去)—— 直线追会贴墙卡住 |
 
 跑法:
@@ -212,6 +212,11 @@ def build_scene():
     vehicle_x = STATION_X[8]
     vehicle = make_box("载具", (3.0, 4.0, 1.2), (vehicle_x, 1.0, 0.6),
                        (0.75, 0.4, 0.3, 1.0))
+    # 车头前方的刚体箱子(用户 2026-10-06:"上车后推不动箱子")——
+    # 车头 = Godot 的 -Z = Blender 的 +Y:箱子摆在车开出去的路上
+    # (Blender y=8 → Godot z=-8),车得**把它顶开**才走得远。
+    car_box = make_box("车头箱子", (1.2, 1.2, 1.2), (vehicle_x, 8.0, 0.6),
+                       (0.85, 0.75, 0.3, 1.0))
 
     # ── ⑩ 绕墙追击(第三十四轮:寻路)──────────────────────────────
     # 墙在 Godot z=0(Blender y=0),追踪者在 Godot z=-2(Blender y=+2),
@@ -221,6 +226,11 @@ def build_scene():
              (nav_x, 0.0, NAV_WALL_HEIGHT / 2.0), wall_color)
     chaser = make_box("追踪者", (1.2, 1.2, 1.6), (nav_x, 2.0, 0.8),
                       (0.85, 0.35, 0.9, 1.0))
+    # 触发区(用户 2026-10-06 实测:"绕墙追击未生效")—— 当年只有**探针**
+    # 会把『追击开关』置真,人自己玩的时候没人打开它。现在墙这头铺一块
+    # 薄板:走上去(= 探针把玩家传送进来)就开始追 —— 人玩也生效。
+    make_box("追击触发区", (NAV_WALL_SPAN + 1.0, 4.0, 0.12), (nav_x, -2.0, 0.06),
+             (0.55, 0.35, 0.65, 1.0))
 
     player = make_box(PLAYER, (1.0, 1.0, 1.8),
                       (STATION_X[0], PLAYER_START_Y, PLAYER_Z),
@@ -234,10 +244,11 @@ def build_scene():
                 (math.radians(25.0), 0.0, 0.0))
     scene.camera = side
     make_sun()
-    return scene, player, box, body, (head, legs), platform, vehicle, chaser
+    return scene, player, box, body, (head, legs), platform, vehicle, chaser, car_box
 
 
-def write_physics(scene, player, box, body, pieces, platform, vehicle, chaser):
+def write_physics(scene, player, box, body, pieces, platform, vehicle, chaser,
+                  car_box):
     """物理类型:全部静态障碍 + 一个刚体箱子 + 角色;碰撞块挂到宿主上。"""
     for obj in scene.objects:
         physics = getattr(obj, "gk_physics", None)
@@ -253,6 +264,12 @@ def write_physics(scene, player, box, body, pieces, platform, vehicle, chaser):
             physics.script_target = True
         elif obj is box:
             # 刚体:会被『推开刚体』推着走(质量 2,推起来更"沉")
+            physics.body_type = "RigidBody3D"
+            physics.dimension = "3"
+            physics.mass = BOX_MASS
+        elif obj is car_box:
+            # 车头前方那个箱子:『载具_驾驶』的『推开刚体』推它 ——
+            # 用户实测"上车后推不动箱子",这个工位专门盯这件事。
             physics.body_type = "RigidBody3D"
             physics.dimension = "3"
             physics.mass = BOX_MASS
@@ -272,6 +289,13 @@ def write_physics(scene, player, box, body, pieces, platform, vehicle, chaser):
             # 世界 glb 里,和碰撞代理按名字配对(和小游戏示例的敌2 同款)。
             physics.body_type = "CharacterBody3D"
             physics.dimension = "3"
+        elif obj.name == "追击触发区":
+            # 触发区(第三十四轮):只检测重叠、**不阻挡** —— 铺在墙这头,
+            # 走上去就把『追击开关』置真。设成 StaticBody 会变成一块
+            # 0.12 米的小台阶挡脚(而且不会触发)。
+            physics.body_type = "Area3D"
+            physics.dimension = "3"
+            physics.is_trigger = True
         elif obj in pieces:
             # 『作为父级的碰撞块』:网格不进 glb,形状并进宿主
             physics.body_type = "StaticBody3D"
@@ -312,11 +336,11 @@ def build_graph(scene, player):
 def _add_nav_station(tree, physics):
     """第 ⑩ 工位(第三十四轮):追玩家的人 —— 它要**绕墙**才能碰到人。
 
-    ── 为什么要有『追击开关』──────────────────────────────────────
-    追踪者一进游戏就追的话,它会跟着玩家跑遍前九个工位,把推箱子 / 窄缝 /
-    载具那些判据全搅乱(探针是**按物理现象**断言的)。所以默认关着,
-    探针开始第 ⑩ 工位时把变量置真(`host.set("追击开关", true)`)——
-    这比"按时间/坐标判断"稳,也不会让别的工位受一点影响。
+    ── 追击怎么开始(用户 2026-10-06 实测:"绕墙追击未生效")──────────
+    第一版只有**探针**会把『追击开关』置真 —— 人自己走到那一站,追踪者
+    一动不动。现在墙这头铺了一块触发区(`追击触发区`):走上去就开追
+    (探针把玩家传送进去,走的是同一条链)。追踪者一进游戏就追是不行的:
+    它会跟着玩家跑遍前九个工位,把推箱子 / 窄缝 / 载具那些判据全搅乱。
 
     ── 为什么用『移动_寻路』而不是『移动_朝向目标』──────────────────
     直线追的结果是**贴着墙原地蹭**(走到墙前就停住)——那正是这一轮要
@@ -326,8 +350,13 @@ def _add_nav_station(tree, physics):
     var.var_name = "追击开关"
     var.var_type = "bool"
     var.default_value = "false"
-    var.comment = "第 ⑩ 工位:让『追踪者』开始追(探针置真)"
+    var.comment = "第 ⑩ 工位:让『追踪者』开始追(走进追击触发区置真)"
     var.group = "测试场"
+
+    trigger = _add(tree, "GKNodeOnAreaEntered", "走进追击触发区", -560.0, 1320.0,
+                   gk_area="追击触发区", gk_filter=PLAYER)
+    turn_on = _add(tree, "GKNodeSetVar", "开启追击", -300.0, 1320.0,
+                   gk_var_name="追击开关", gk_value=True)
 
     read = _add(tree, "GKNodeGetVar", "读追击开关", 200.0, 1520.0,
                 gk_var_name="追击开关")
@@ -335,10 +364,11 @@ def _add_nav_station(tree, physics):
     chase = _add(tree, "GKNodeNavigate", "追踪者绕墙追人", 600.0, 1520.0,
                  gk_target="追踪者", gk_goal=PLAYER, gk_speed=NAV_CHASE_SPEED,
                  gk_stop_distance=NAV_STOP, gk_turn=True, gk_accel=8.0)
+    _link(tree, trigger, "执行", turn_on, "执行")
     _link(tree, physics, "执行", branch, "执行")
     _link(tree, read, "值", branch, "条件")
     _link(tree, branch, "是", chase, "执行")
-    log("测试场:⑩ 追踪者(『移动_寻路』绕墙,探针用『追击开关』开门)已接好")
+    log("测试场:⑩ 追踪者(『移动_寻路』绕墙;走进追击触发区开追)已接好")
 
 
 def _add_field_extras(tree):
@@ -441,7 +471,7 @@ def _hint_chain(tree, physics):
     """提示文字 + Esc 退出(探针不看这些,人在 Godot 里看)。"""
     hint = _add(tree, "GKNodeUiText", "操作提示", -300.0, 980.0,
                 gk_text=("WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / "
-                         "Tab 上帝机 / E 上·下车 / Esc 退出 —— "
+                         "Tab 上帝机(T 时停) / E 上·下车 / Esc 退出 —— "
                          "十个工位摆在 +Y 方向"),
                 gk_x=18.0, gk_y=18.0, gk_size=18)
     goal = _add(tree, "GKNodeUiText", "工位说明", -300.0, 820.0,
@@ -477,8 +507,9 @@ def main():
     from BlenderGameKit import asset_export, project
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    scene, player, box, body, pieces, platform, vehicle, chaser = build_scene()
-    write_physics(scene, player, box, body, pieces, platform, vehicle, chaser)
+    scene, player, box, body, pieces, platform, vehicle, chaser, car_box = build_scene()
+    write_physics(scene, player, box, body, pieces, platform, vehicle, chaser,
+                  car_box)
     build_graph(scene, player)
     settings = scene.gk_settings
     settings.god_camera = True
