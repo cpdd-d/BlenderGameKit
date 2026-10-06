@@ -117,7 +117,8 @@ def build_report(context=None):
               if getattr(g, "bl_idname", "") in ("GKGameLogicTree",
                                                  "GKAnimationTree",
                                                  "GKGameAiTree",
-                                                 "GKUiDesignTree")]
+                                                 "GKUiDesignTree",
+                                                 "GKDisplayTree")]
     if not groups:
         add("  (一张都没有 —— 节点图可能在存盘时丢了,见 README『use_fake_user』)")
     for group in groups:

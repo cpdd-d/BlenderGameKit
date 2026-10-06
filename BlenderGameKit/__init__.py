@@ -76,6 +76,9 @@ _SUBMODULES = (
     "nodes._containers",
     "nodes._functions",
     "nodes._ai",
+    # 显示设置卡(第四十二轮:『游戏显示』树)—— 也必须在这张表里,
+    # 否则重载后这 4 张卡会从 ALL_CLASSES 里整批消失(和 _fx 那次同一个坑)
+    "nodes._displayset",
     "nodes.nodes",
     "nodes",
     # codegen 主体按领域拆成 10 个模块(纯搬运)。顺序 = 依赖顺序:

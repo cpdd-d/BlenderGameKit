@@ -145,8 +145,9 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
     ├── node_base.py            节点基类、声明式属性、桩环境支持
     ├── nodes.py                门面:合并下面各领域模块的命名空间
     └── _events.py / _flow.py / _movement.py / _animation.py /
-        _instances.py / _variables.py / _input.py / _expressions.py /
-        _display.py / _containers.py       ★ 128 个节点按领域拆分
+        _instances.py / _fx.py / _variables.py / _input.py /
+        _expressions.py / _display.py / _containers.py /
+        _functions.py / _ai.py / _displayset.py   ★ 节点按领域拆分
 
 docs/
 ├── Blender与Godot互通.md       资产管线 + 脚本搭载 + C++ GDExtension
@@ -279,7 +280,7 @@ func _physics_process(delta: float) -> void:
 
 ---
 
-## 节点一览(174 个)
+## 节点一览(178 个)
 
 | 分类 | 节点 |
 |---|---|
@@ -289,6 +290,7 @@ func _physics_process(delta: float) -> void:
 | **动画** | ▸ **播放**:动画_播放、动画_状态机、动画_运行状态、动画_是否在播、动画_播放完成、动画_暂停/继续、动画_停止、动画_设播放速度、动画_时长、动画_切换状态、动画_设混合参数<br>▸ **骨骼**:骨骼_取数据、骨骼_设置、骨骼_跟随视角 |
 | **动画系统**<br>(在「游戏动画」图里) | 动画_开始、动画_结束、动画_状态、动画_转场、动画判断_移动状态、动画_取变量、动画_设变量 |
 | **AI**<br>(在「游戏AI」图里) | AI_状态、AI_转场、AI_看得见、AI_启用 |
+| **显示设置**<br>(在「游戏显示」图里) | 显示_碰撞线框、显示_调试面板、显示_画面风格、显示_视口预览 —— 四张**设置卡**,卡上改的就是当前场景的显示设置(物理线框 / 调试面板 / 卡通材质 / 视口预览开关) |
 | **实例** | 实例_生成、实例_销毁、实例_重载场景、取值_获取节点、取值_是否在地面 |
 | **变量** | 变量_设置、变量_读取 |
 | **信号** | 信号_发出、信号_连接 |

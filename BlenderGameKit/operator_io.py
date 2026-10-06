@@ -256,6 +256,7 @@ def node_tree_error(cls, tree):
         "GKAnimationTree": "动画树(『游戏动画』)",
         "GKUiDesignTree": "界面设计图(『游戏界面』)",
         "GKGameAiTree": "AI 图(『游戏AI』)",
+        "GKDisplayTree": "显示设置图(『游戏显示』)",
     }
     names = [label_of[kind] for kind in kinds if kind in label_of]
     where = " / ".join(names) if names else "游戏逻辑树"
@@ -267,6 +268,9 @@ def node_tree_error(cls, tree):
     elif "GKGameAiTree" in kinds:
         hint = ("侧栏『游戏逻辑』面板 -> 『游戏AI』-> "
                 "点『打开/新建 AI 图』")
+    elif "GKDisplayTree" in kinds:
+        hint = ("侧栏『游戏逻辑』面板 -> 『游戏显示设置』-> "
+                "点『打开/新建显示设置图』")
     else:
         hint = "请切到游戏逻辑图"
     return (f"『{getattr(cls, 'bl_label', cls)}』是{where}里的节点,"

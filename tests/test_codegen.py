@@ -524,9 +524,11 @@ class TestNodeLibrary(unittest.TestCase):
     def test_statement_nodes_have_flow_in(self):
         """语句节点必须有一个执行输入引脚。
 
-        例外:`GKNodeAnimState`(动画状态)—— 它是**动画树**里的节点,
-        不是执行流的一环。它只有"条件"输入,靠条件为真被激活,
-        没有也不需要执行引脚。
+        例外一:动画树里的卡片(`GKNodeAnimState` / `GKNodeAnimTransition` /
+        `GKNodeAnimEntry`)—— 它们**动画树**里的节点,不是执行流的一环。
+        例外二:『游戏显示』设置图的四张**设置卡**(第四十二轮)——
+        它们不是逻辑,是场景显示设置的控制台(卡上的开关直接改场景设置),
+        所以一个引脚都没有。
         """
         from BlenderGameKit import gk_sockets as S
         from BlenderGameKit.nodes import node_base as NB
@@ -535,6 +537,7 @@ class TestNodeLibrary(unittest.TestCase):
         #  `GKNodeAnimEntry` 是**开始口** —— 它只有条件,本身就是源头)
         no_flow = {"GKNodeAnimState", "GKNodeAnimTransition",
                    "GKNodeAnimEntry"}
+        no_flow |= set(NN.DISPLAY_CARD_IDS)
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
                 continue
@@ -11236,6 +11239,110 @@ class TestRound41Ai(Base):
         # 行为作用在那个物体上(不是 self)
         self.assertIn("敌人.velocity", code)
         self.assertIn("敌人.move_and_slide()", code)
+
+
+class TestRound42Display(Base):
+    """第四十二轮:『游戏显示』设置图(物理线框 / 调试面板 / 画面风格 /
+    视口预览)。
+
+    用户原话:"添加游戏显示设置编辑器,整合如物理显示等的排列,不然不好找";
+    动工前在四个形态里点了**新节点树类型**。这张图不是逻辑图,而是一张
+    **设置控制台**:卡上的开关直接读写**当前场景**的 GKSceneSettings
+    (写透)——
+      * 所以四个节点一个引脚都没有,也不参与代码生成;
+      * 所以摘要 / 缺卡这些逻辑必须是纯函数,离线就能验(就是这些用例)。
+    """
+
+    def test_card_list_matches_classes(self):
+        """DISPLAY_CARD_IDS 和真正登记的四个类对得上(防改名 / 漏登记)。"""
+        from BlenderGameKit import properties as props
+        self.assertEqual(len(NN.DISPLAY_CARD_IDS), 4)
+        for blob in NN.DISPLAY_CARD_IDS:
+            cls = getattr(NN, blob, None)
+            self.assertIsNotNone(cls, f"DISPLAY_CARD_IDS 里的 {blob} 没定义")
+            self.assertEqual(cls.bl_idname, blob)
+            # 设置卡不是执行流的一环:一个引脚都没有
+            self.assertEqual(list(cls.gk_inputs), [], blob)
+            self.assertEqual(list(cls.gk_outputs), [], blob)
+            self.assertTrue(props.node_fits_tree(cls, "GKDisplayTree"))
+
+    def test_display_cards_tree_scope(self):
+        from BlenderGameKit import properties as props
+        # 四张卡只属于『游戏显示』图
+        for blob in NN.DISPLAY_CARD_IDS:
+            cls = getattr(NN, blob)
+            for other in ("GKGameLogicTree", "GKAnimationTree",
+                          "GKUiDesignTree", "GKGameAiTree"):
+                self.assertFalse(props.node_fits_tree(cls, other),
+                                 f"{cls.bl_label} 不该出现在 {other} 里")
+        # 玩法图的动作节点进不了显示图(菜单和 poll 两层都不给)
+        self.assertFalse(props.node_fits_tree(NN.GKNodeMoveDirection,
+                                              "GKDisplayTree"))
+        # 动画树 / AI 树的取值节点也不该混进来
+        self.assertFalse(props.node_fits_tree(NN.GKNodeConstFloat,
+                                              "GKDisplayTree"))
+
+    def test_display_menu_lists_only_cards(self):
+        from BlenderGameKit import properties as props
+        labels = [cls.bl_label
+                  for _cat, items in props.node_menu_entries("GKDisplayTree")
+                  for cls in items]
+        for wanted in ("显示_碰撞线框", "显示_调试面板", "显示_画面风格",
+                       "显示_视口预览"):
+            self.assertIn(wanted, labels)
+        self.assertNotIn("移动_按方向", labels)
+        # 反过来:玩法图的菜单里不该冒出设置卡
+        logic_labels = [cls.bl_label
+                        for _cat, items
+                        in props.node_menu_entries("GKGameLogicTree")
+                        for cls in items]
+        self.assertNotIn("显示_碰撞线框", logic_labels)
+
+    def test_missing_display_cards(self):
+        """缺卡统计:侧栏『补齐』按它找缺哪张(纯读 nodes 的 bl_idname)。"""
+        tree = gk_stub.StubNodeTree("游戏显示")
+        self.assertEqual(NN.missing_display_cards(tree),
+                         list(NN.DISPLAY_CARD_IDS))
+        for blob in NN.DISPLAY_CARD_IDS[:2]:
+            tree.new_node(getattr(NN, blob))
+        self.assertEqual(NN.missing_display_cards(tree),
+                         list(NN.DISPLAY_CARD_IDS[2:]))
+        # 补满之后没有缺的
+        for blob in NN.DISPLAY_CARD_IDS[2:]:
+            tree.new_node(getattr(NN, blob))
+        self.assertEqual(NN.missing_display_cards(tree), [])
+
+    def test_display_settings_rows(self):
+        """侧栏摘要是**纯读值**的:喂假设置对象就能算,不能抛异常。"""
+        import types as _types
+        settings = _types.SimpleNamespace(
+            debug_panel=True, debug_key="F1", debug_copy_key="F2",
+            debug_runtime=False, toon_materials=True, toon_follow_light=False)
+        rows = NN.display_settings_rows(settings)
+        self.assertEqual([row[0] for row in rows],
+                         ["调试面板", "运行日志", "画面风格"])
+        self.assertTrue(rows[0][2])
+        self.assertIn("F1", rows[0][1])
+        self.assertIn("F2", rows[0][1])
+        self.assertFalse(rows[1][2])
+        self.assertIn("全平涂", rows[2][1])
+
+        # 关掉卡通 = 原样导出 PBR;打开跟随光照 = 明暗跟着太阳
+        settings.toon_materials = False
+        rows = NN.display_settings_rows(settings)
+        self.assertIn("PBR", rows[2][1])
+        self.assertFalse(rows[2][2])
+        settings.toon_materials = True
+        settings.toon_follow_light = True
+        rows = NN.display_settings_rows(settings)
+        self.assertIn("明暗跟随太阳", rows[2][1])
+
+        # 缺属性的裸对象(老 .blend / 桩环境)也要有兜底,不能抛异常
+        rows = NN.display_settings_rows(object())
+        self.assertEqual(len(rows), 3)
+        self.assertFalse(rows[0][2])
+        # 设置对象本身拿不到(None)= 空摘要,面板自己去报错
+        self.assertEqual(NN.display_settings_rows(None), [])
 
 
 if __name__ == "__main__":

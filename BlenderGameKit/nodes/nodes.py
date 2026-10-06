@@ -24,6 +24,7 @@ from . import _display
 from . import _containers
 from . import _functions
 from . import _ai
+from . import _displayset
 
 
 def _merge_namespaces(*modules):
@@ -36,7 +37,7 @@ def _merge_namespaces(*modules):
 
 _merge_namespaces(_common, _events, _flow, _movement, _animation,
                   _instances, _fx, _variables, _input, _expressions,
-                  _display, _containers, _functions, _ai)
+                  _display, _containers, _functions, _ai, _displayset)
 del _merge_namespaces
 
 
@@ -110,7 +111,7 @@ ALL_CLASSES = tuple(CLASSES)
 # "添加节点"菜单里的分类排列顺序
 CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "实例", "特效", "变量", "函数", "信号", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "音效", "存档", "界面",
-                  "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用", "动画(旧)")
+                  "屏幕效果", "显示设置", "射线", "定时", "列表", "字典", "时间", "实用", "动画(旧)")
 
 # ── 二级子分类 ──────────────────────────────────────────────────────────
 # 用户 2026-10-03(对着 UPBGE 的截图):"输入里分类键盘、鼠标、手柄,

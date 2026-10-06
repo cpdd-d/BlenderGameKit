@@ -82,6 +82,22 @@ class FakeContext:
         return getattr(bpy.context, name)
 
 
+class FakeNodeContext(FakeContext):
+    """带 space_data 的上下文 —— 给"按当前树画"的面板用。
+
+    『游戏显示』面板(第四十二轮)按 `space_data.tree_type` / `edit_tree`
+    取当前树;后台模式没有真节点编辑器,所以这里造一个最小替身。
+    """
+
+    def __init__(self, obj, scene, tree):
+        super().__init__(obj, scene)
+        self.space_data = type("S", (), {
+            "tree_type": getattr(tree, "bl_idname", ""),
+            "edit_tree": tree,
+            "node_tree": tree,
+        })()
+
+
 def main():
     module_name = find_addon()
     if not check("找到插件", module_name, "未安装"):
@@ -133,6 +149,9 @@ def main():
         # 视口侧栏的「Godot 观感」面板 —— 它读 context.scene,
         # 而且会去调 godot_look 的 describe(),少一个函数就整块消失。
         ("GK_PT_GodotLook", cube),
+        # 『游戏显示』设置图的侧栏面板(第四十二轮)—— 没有节点编辑器上下文时
+        # 它应该走"没有显示设置图"的早退分支,同样不许抛异常。
+        ("GK_PT_DisplayTree", cube),
     ]
     for class_name, target in cases:
         panel = getattr(ui, class_name, None)
@@ -203,7 +222,9 @@ def main():
     print("3. 关键按钮真的画出来了吗")
     print("=" * 72)
     for class_name, target, wanted in (
-            ("GK_PT_ObjectPhysics", cube, ("gk.show_collision",)),
+            # 碰撞线框那几个按钮第四十二轮搬到『游戏显示』图里了,
+            # 物体面板现在常驻的是"再加一份实例"(静态资产)。
+            ("GK_PT_ObjectPhysics", cube, ("gk.add_asset_instance",)),
             ("GK_PT_Main", cube, ("gk.open_godot", "gk.export_assets")),
             # 观感面板要有开关和还原两个按钮
             ("GK_PT_GodotLook", cube,
@@ -225,6 +246,51 @@ def main():
         # 只测"不抛异常"不够:draw 半路 return 也不抛异常,但按钮同样没有。
         check(f"{class_name} 画出了按钮", button_count >= len(wanted),
               f"operator 调用次数={button_count},期望至少 {len(wanted)}")
+
+    # ---- 4. 『游戏显示』设置图的面板(第四十二轮)----
+    # 带真树时才画按钮:缺卡 -> 『补齐』;补齐后 -> 『回到游戏逻辑』。
+    # 顺便把"卡片的 draw_buttons 也要能画完"一起验了 —— 设置卡就是这张图的
+    # 全部内容,卡片画一半报错的话(第三十九轮那种),用户看到的是"没作用"。
+    print("=" * 72)
+    print("4. 『游戏显示』面板 + 四张设置卡")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟显示42", "GKDisplayTree")
+        tree.nodes.new("GKNodeDisplayCollision")
+        panel = getattr(ui, "GK_PT_DisplayTree", None)
+        if panel is None:
+            check("GK_PT_DisplayTree 存在", False, "类找不到")
+        else:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, tree))
+            names = list(layout.operator_names)
+            check("『游戏显示』面板缺卡时画出『补齐』按钮",
+                  "gk.display_fill_cards" in names, str(sorted(set(names))))
+
+            ui._fill_display_cards(tree)
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, tree))
+            names = list(layout.operator_names)
+            check("『游戏显示』面板补齐后不再提示,回到游戏逻辑一直在",
+                  "gk.display_fill_cards" not in names
+                  and "gk.switch_tree" in names, str(sorted(set(names))))
+
+        # 四张卡的 draw_buttons 都要能画完(画一半崩了 = 卡片"没作用")
+        card_error = ""
+        for card in tree.nodes:
+            try:
+                card.draw_buttons(bpy.context, RecordingLayout())
+            except Exception as exc:                      # noqa: BLE001
+                card_error = (f"{getattr(card, 'bl_label', '?')}: "
+                              f"{type(exc).__name__}: {exc}")
+                break
+        check("四张设置卡的 draw_buttons 都能画完", not card_error, card_error)
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『游戏显示』面板", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
 
     addon_utils.disable(module_name, default_set=True)
     return 0

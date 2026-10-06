@@ -1167,6 +1167,105 @@ def main():
         check("第四十一轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 显示设置图(第四十二轮:『游戏显示』)----
+    # ① 第五种节点树类型注册上了,新建时四张设置卡一张不少(fake user 也在);
+    # ② 玩法节点进不了显示图、设置卡进不了玩法图(Blender 侧 poll 把关);
+    # ③ 卡上的开关是**写透**场景设置:只有一处真相(改场景 -> 摘要跟着变);
+    # ④ 四张卡的 draw_buttons 都能画完(第三十九轮"卡片画一半就报错"的坑);
+    # ⑤ 老入口真的搬走了:侧栏导出盒 / 物体面板的『视口预览』盒里那几行都不在了。
+    try:
+        from importlib import import_module
+        import inspect
+        r42_ui = import_module(f"{module_name}.ui")
+
+        r42_tree = r42_ui._new_display_tree()
+        r42_names = [getattr(node, "bl_idname", "") for node in r42_tree.nodes]
+        check("显示:第五种图类型注册成功,新建带齐四张设置卡",
+              getattr(r42_tree, "bl_idname", "") == "GKDisplayTree"
+              and r42_names == list(node_lib.DISPLAY_CARD_IDS)
+              and bool(getattr(r42_tree, "use_fake_user", False)),
+              str(r42_names))
+        check("显示:四张卡补不重复(全都还在时不加)",
+              node_lib.missing_display_cards(r42_tree) == []
+              and r42_ui._fill_display_cards(r42_tree) == 0)
+
+        # 玩法节点进不了显示图 / 设置卡进不了玩法图(poll 把关)
+        r42_before = len(r42_tree.nodes)
+        try:
+            r42_tree.nodes.new("GKNodeMoveDirection")
+            r42_move_blocked = False
+        except RuntimeError:
+            r42_move_blocked = True
+        check("显示:玩法节点进不了显示图(Blender 侧把关)",
+              r42_move_blocked and len(r42_tree.nodes) == r42_before)
+        r42_logic = bpy.data.node_groups.new("显示玩法冒烟42", "GKGameLogicTree")
+        try:
+            r42_logic.nodes.new("GKNodeDisplayCollision")
+            r42_card_blocked = False
+        except RuntimeError:
+            r42_card_blocked = True
+        check("显示:设置卡进不了玩法图(不会污染代码生成)",
+              r42_card_blocked and len(r42_logic.nodes) == 0)
+
+        # 写透:卡上读写的就是场景设置本身(改场景 -> 摘要跟着变,没有第二份值)
+        r42_settings = bpy.context.scene.gk_settings
+        r42_rows = node_lib.display_settings_rows(r42_settings)
+        check("显示:侧栏摘要读的是场景设置(三项都在)",
+              [row[0] for row in r42_rows]
+              == ["调试面板", "运行日志", "画面风格"])
+        r42_old_toon = bool(getattr(r42_settings, "toon_materials", True))
+        r42_old_follow = bool(getattr(r42_settings, "toon_follow_light", False))
+        r42_settings.toon_materials = True
+        r42_settings.toon_follow_light = True
+        r42_rows = node_lib.display_settings_rows(r42_settings)
+        check("显示:改场景设置 -> 摘要立刻反映(写透,不用点应用)",
+              "明暗跟随太阳" in r42_rows[2][1] and bool(r42_rows[2][2]))
+        r42_settings.toon_materials = r42_old_toon
+        r42_settings.toon_follow_light = r42_old_follow
+
+        # 卡片 draw_buttons 都要能画完
+        class _R42Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r42_draw_ok = True
+        r42_draw_error = ""
+        for r42_card in r42_tree.nodes:
+            try:
+                r42_card.draw_buttons(bpy.context, _R42Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r42_draw_ok = False
+                r42_draw_error = (f"{getattr(r42_card, 'bl_label', '?')}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("显示:四张卡的 draw_buttons 都能画完", r42_draw_ok,
+              r42_draw_error)
+
+        r42_panels = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]
+        check("显示:侧栏面板已注册", "GK_PT_DisplayTree" in r42_panels,
+              str(r42_panels)[:200])
+
+        # 老入口真的搬走了(用户选的"完全搬走"):侧栏导出盒不再画
+        # 预览碰撞体 / 调试面板 / 卡通材质,物体面板不再画碰撞线框按钮。
+        r42_export_src = inspect.getsource(r42_ui.GK_PT_Main.draw)
+        r42_obj_src = inspect.getsource(r42_ui.GK_PT_ObjectPhysics.draw)
+        check("显示:老入口搬走了(侧栏 / 物体面板都不再画那些开关)",
+              "gk.preview_colliders" not in r42_export_src
+              and "gk.debug_panel" not in r42_export_src
+              and "toon_materials" not in r42_export_src
+              and "gk.show_collision" not in r42_obj_src)
+
+        bpy.data.node_groups.remove(r42_logic)
+        bpy.data.node_groups.remove(r42_tree)
+    except Exception as exc:
+        check("第四十二轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
     # Godot 的运动学角色**不会**自动上台阶(0.35 米在它眼里就是堵墙)。
     # 填了高度才生成"三关探测"(被竖面挡住 / 抬起来的路通 / 落点有地),

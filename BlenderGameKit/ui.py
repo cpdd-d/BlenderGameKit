@@ -139,7 +139,8 @@ class GK_OT_SwitchTree(bpy.types.Operator):
         if current is not None and current_kind in ("GKGameLogicTree",
                                                     "GKAnimationTree",
                                                     "GKUiDesignTree",
-                                                    "GKGameAiTree"):
+                                                    "GKGameAiTree",
+                                                    "GKDisplayTree"):
             _LAST_TREE[current_kind] = current
 
         wanted = self.target
@@ -159,6 +160,9 @@ class GK_OT_SwitchTree(bpy.types.Operator):
             elif wanted == "GKGameAiTree":
                 # 顺手搭一个"巡逻 -> 追击 -> 回到巡逻"的骨架(见 _new_ai_tree)
                 tree = _new_ai_tree()
+            elif wanted == "GKDisplayTree":
+                # 顺手把四张设置卡摆好(见 _new_display_tree)
+                tree = _new_display_tree()
             elif wanted == "GKAnimationTree":
                 # 顺手放个起始状态,免得面对空图不知道从哪下手
                 tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
@@ -920,6 +924,173 @@ class GK_OT_OpenAiTree(bpy.types.Operator):
         space.tree_type = "GKGameAiTree"
         space.node_tree = tree
         return {"FINISHED"}
+
+
+# ==========================================================================
+# 第五种节点树:『游戏显示』设置图(第四十二轮)
+# ==========================================================================
+# 用户原话:"添加游戏显示设置编辑器,整合如物理显示等的排列,不然不好找";
+# 动工前在四个形态里点了**新节点树类型**(和游戏逻辑 / 动画 / 界面 / AI
+# 同一个机制:注册 bpy.types.NodeTree 就自动出现在编辑器类型菜单里)。
+#
+# 这张图不是逻辑图,是一张**设置控制台**:四张卡各管一类显示设置
+# (物理线框 / 调试面板 / 画面风格 / 视口预览)。卡上的开关**直接读写
+# 当前场景的设置**(写透)—— 不存在"忘了点应用",老工程也不用迁移。
+class GKDisplayTree(bpy.types.NodeTree):
+    """游戏显示设置图:显示 / 调试 / 画面类开关的分类控制台。"""
+
+    bl_idname = "GKDisplayTree"
+    bl_label = "游戏显示"
+    bl_icon = "HIDE_OFF"
+    bl_description = ("BlenderGameKit 的显示设置图 —— 物理线框 / 调试面板 / "
+                      "画面风格 / 视口预览 四张设置卡摆在这里,"
+                      "卡上改的就是**当前场景**的设置,导出立刻生效")
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        layout.label(text="卡上的开关直接改当前场景的设置,不用点应用",
+                     icon="INFO")
+
+
+def _fill_display_cards(tree):
+    """把缺的设置卡补上(已有的不动)。返回补了几张。"""
+    added = 0
+    for blob in node_lib.missing_display_cards(tree):
+        node = tree.nodes.new(blob)
+        node.location = (0.0, -node_lib.DISPLAY_CARD_GAP
+                         * (len(tree.nodes) - 1))
+        added += 1
+    return added
+
+
+def _new_display_tree():
+    """新建一张显示设置图,顺手把四张设置卡摆成一列。
+
+    照界面设计图"新建时放一个起始控件"的做法 —— 面对一张空图,
+    十个有九个不知道第一个该放什么。
+    """
+    tree = bpy.data.node_groups.new("游戏显示", "GKDisplayTree")
+    # 没有人"引用"它的数据块存盘时会被丢掉(和 AI 图同一个坑),必须 fake user
+    tree.use_fake_user = True
+    _fill_display_cards(tree)
+    return tree
+
+
+class GK_OT_OpenDisplayTree(bpy.types.Operator):
+    """打开显示设置图;没有就新建一张(带四张设置卡)。"""
+
+    bl_idname = "gk.open_display_tree"
+    bl_label = "打开/新建显示设置图"
+    bl_description = ("切到『游戏显示』图(没有就新建一张,"
+                      "带物理线框 / 调试面板 / 画面风格 / 视口预览四张设置卡)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        trees = [g for g in bpy.data.node_groups
+                 if getattr(g, "bl_idname", "") == "GKDisplayTree"]
+        tree = trees[0] if trees else None
+        if tree is None:
+            tree = _new_display_tree()
+            self.report({"INFO"}, f"已新建显示设置图『{tree.name}』")
+
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"},
+                        "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+        space.tree_type = "GKDisplayTree"
+        space.node_tree = tree
+        return {"FINISHED"}
+
+
+class GK_OT_DisplayFillCards(bpy.types.Operator):
+    """把这张显示设置图里缺的设置卡补回来(已有的不动)。"""
+
+    bl_idname = "gk.display_fill_cards"
+    bl_label = "补齐缺失的设置卡"
+    bl_description = "把这张图里还没有的设置卡补上(已有的卡片和位置都不动)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        if tree is None or str(getattr(tree, "bl_idname", "")) != "GKDisplayTree":
+            self.report({"WARNING"}, "请先打开一张『游戏显示』设置图")
+            return {"CANCELLED"}
+        added = _fill_display_cards(tree)
+        if not added:
+            self.report({"INFO"}, "四张设置卡都在,没有缺的")
+        else:
+            self.report({"INFO"}, f"补了 {added} 张设置卡")
+        return {"FINISHED"}
+
+
+class GK_PT_DisplayTree(bpy.types.Panel):
+    """『游戏显示』图的侧栏面板:当前设置摘要 + 补卡 + 回游戏逻辑。"""
+
+    bl_idname = "GK_PT_DisplayTree"
+    bl_label = "游戏显示 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏显示"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return (space is not None
+                and getattr(space, "tree_type", "") == "GKDisplayTree")
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        settings = getattr(context.scene, "gk_settings", None)
+        scene_name = getattr(getattr(context, "scene", None), "name", "?")
+
+        box = layout.box()
+        box.label(text=f"当前场景:{scene_name}", icon="SCENE_DATA")
+        if tree is None:
+            box.label(text="没有显示设置图", icon="INFO")
+            return
+
+        # ---- 当前设置摘要(卡上和这里显示的是同一批值)----
+        rows = node_lib.display_settings_rows(settings)
+        box = layout.box()
+        if rows:
+            box.label(text="本场景当前设置", icon="CHECKMARK")
+            for title, text, on in rows:
+                box.label(text=f"{title}: {text}",
+                          icon="CHECKMARK" if on else "X")
+        else:
+            box.label(text="拿不到场景设置", icon="ERROR")
+
+        # ---- 视口叠加预览:几张图开着 ----
+        preview_trees = [g for g in bpy.data.node_groups
+                         if getattr(g, "bl_idname", "") in ("GKUiDesignTree",
+                                                            "GKGameAiTree")]
+        if preview_trees:
+            on = sum(1 for g in preview_trees
+                     if bool(getattr(g, "gk_preview", True)))
+            box = layout.box()
+            box.label(text=f"视口叠加预览:{on}/{len(preview_trees)} 张开着",
+                      icon="VIEWZOOM")
+            box.label(text="逐张开关在『显示_视口预览』卡上", icon="INFO")
+
+        # ---- 设置卡补齐 ----
+        total = len(node_lib.DISPLAY_CARD_IDS)
+        missing = node_lib.missing_display_cards(tree)
+        box = layout.box()
+        box.label(text=f"设置卡 {total - len(missing)}/{total} 张在图上",
+                  icon="NODETREE" if not missing else "ERROR")
+        if missing:
+            box.operator("gk.display_fill_cards",
+                         text=f"补齐 {len(missing)} 张", icon="ADD")
+        box.label(text="卡上改 = 导出立刻按新值走,不用点应用", icon="INFO")
+        back = box.operator("gk.switch_tree", text="← 回到游戏逻辑",
+                            icon="LOOP_BACK")
+        back.target = "GKGameLogicTree"
 
 
 # ---- AI 图的视口叠加预览(巡逻路线 + 感知范围圈)----------------------
@@ -1849,23 +2020,10 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
                     col.label(text="空物体也能当发射器:只标位置和朝向",
                               icon="INFO")
 
-        # ---- 视口预览 ----
-        # 碰撞体在 Godot 里是运行时的东西,Blender 视口里本来看不见。
-        box = layout.box()
-        box.label(text="视口预览", icon="HIDE_OFF")
-
-        col = box.column(align=True)
-        # 只显示**活动物体**的碰撞盒 —— 多个叠在一起在视口里分不清谁是谁,
-        # 很容易改错尺寸(用户反馈过)。
-        col.label(text="碰撞体（只显示正在看的这个）:")
-        row = col.row(align=True)
-        row.operator("gk.show_collision", text="显示这一个",
-                     icon="SHADING_WIRE")
-        row.operator("gk.hide_collision", text="", icon="X")
-        # 一次性显示全部是给"排查有没有漏设"用的
-        col.operator("gk.show_collision", text="显示全部（排查用）"
-                     ).target_all = True
-        col.label(text="线框自动生成,不会导出", icon="INFO")
+        # ---- 『视口预览』盒第四十二轮搬走了 ----
+        # 碰撞线框的"显示这一个 / 显示全部 / 隐藏"原来在这里,和侧栏导出盒里的
+        # 『预览碰撞体』是两处入口 —— 用户嫌"不好找"。现在统一收进
+        # 『游戏显示』设置图的『显示_碰撞线框』卡上(第四十二轮)。
 
 
 def _draw_body_type(layout, physics, is_3d):
@@ -3256,7 +3414,8 @@ def _draw_tree_list_box(layout, context):
               if getattr(g, "bl_idname", "") in ("GKGameLogicTree",
                                                  "GKAnimationTree",
                                                  "GKUiDesignTree",
-                                                 "GKGameAiTree")]
+                                                 "GKGameAiTree",
+                                                 "GKDisplayTree")]
     if not groups:
         box.label(text="还没有节点图", icon="INFO")
         return
@@ -3270,11 +3429,14 @@ def _draw_tree_list_box(layout, context):
         icon = ("NODETREE" if blob == "GKGameLogicTree"
                 else "ARMATURE_DATA" if blob == "GKAnimationTree"
                 else "TRACKER" if blob == "GKGameAiTree"
+                else "HIDE_OFF" if blob == "GKDisplayTree"
                 else "WINDOW")
         # 勾选框:关掉 = 这张图不参与导出
-        if blob in ("GKUiDesignTree", "GKGameAiTree"):
-            # ── 设计图 / AI 图没有"参与导出"这一说(第四十 / 四十一轮)──
-            # 它们由玩法图按需引用(『界面_套用设计』『AI_启用』)——
+        if blob in ("GKUiDesignTree", "GKGameAiTree", "GKDisplayTree"):
+            # ── 设计图 / AI 图 / 显示设置图没有"参与导出"这一说
+            # (第四十 / 四十一 / 四十二轮)────────────────────────────────
+            # 前两张由玩法图按需引用(『界面_套用设计』『AI_启用』),
+            # 显示设置图更是"写透到场景设置"的控制台 ——
             # 摆一个勾选框不仅含义含糊,`prop()` 还会去读它们**没有**的
             # 属性(画面板时炸)。
             row.label(text=" ")
@@ -3283,7 +3445,8 @@ def _draw_tree_list_box(layout, context):
         op = row.operator("gk.focus_tree", text=group.name, icon=icon)
         op.tree_name = group.name
         kind = {"GKGameLogicTree": "逻辑", "GKAnimationTree": "动画",
-                "GKUiDesignTree": "界面", "GKGameAiTree": "AI"}.get(blob, "图")
+                "GKUiDesignTree": "界面", "GKGameAiTree": "AI",
+                "GKDisplayTree": "显示"}.get(blob, "图")
         row.label(text=f"{kind} · {len(group.nodes)} 节点")
     if disabled:
         box.label(text=f"有 {disabled} 张图已停用(不会导出)", icon="INFO")
@@ -3444,7 +3607,7 @@ class GK_OT_FocusTree(bpy.types.Operator):
             # 时直接塞一张界面设计图进去会被拒(打不开 / 悄悄弹回)。
             kind = str(getattr(group, "bl_idname", ""))
             if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
-                        "GKGameAiTree"):
+                        "GKGameAiTree", "GKDisplayTree"):
                 space.tree_type = kind
             space.pin = True
             space.node_tree = group
@@ -3851,50 +4014,16 @@ class GK_PT_Main(bpy.types.Panel):
             row.scale_y = 1.4
             row.operator("gk.export_script", icon="FILE_TICK")
             row.operator("gk.preview_script", text="", icon="HIDE_OFF")
-            # ── 导出前预览碰撞体(本轮:"预览接进导出")────────────────
-            # 把这次导出会生成的全部碰撞体一次显示成线框 ——
-            # 线框和导出用**同一套计算**,看到的尺寸就是生成出来的尺寸。
-            preview_row = box.row(align=True)
-            preview_row.operator("gk.preview_colliders", icon="SHADING_WIRE")
-            preview_row.operator("gk.hide_collision", text="", icon="X")
 
             if settings is not None:
                 col = box.column(align=True)
                 row = col.row(align=True)
                 row.prop(settings, "write_scene", toggle=True)
-                # 卡通材质开关(用户第 24 轮:"应该加个开关,想看看细节")
-                # —— 关掉后按 Blender 原样导出 PBR 材质,运行画面和预览一致
-                row.prop(settings, "toon_materials", toggle=True)
-                row.prop(settings, "debug_runtime", toggle=True)
                 row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
-                # ── 游戏内调试面板(用户 2026-10-05 第二十二轮:调试体验)────
-                # 『运行日志』只能往控制台打字;这个是**玩的时候能看**的一块
-                # HUD:FPS / 状态 / 变量实时值 / 最近打印,另一个键复制全部。
-                dbg_row = box.row(align=True)
-                dbg_row.prop(settings, "debug_panel", toggle=True, icon="INFO")
-                if getattr(settings, "debug_panel", False):
-                    dbg_row.prop(settings, "debug_key", text="")
-                    dbg_row.prop(settings, "debug_copy_key", text="")
-                    box.label(text="游戏里:左键弹出 / 收起面板,右键把全部内容"
-                                   "复制到剪贴板(也打到控制台)", icon="INFO")
-                    if str(getattr(settings, "dimension", "3")) == "2":
-                        # 面板在**环境脚本**里,而环境脚本目前只给 3D 生成
-                        # (2D 项目没有材质/上帝机那一套)。别让用户开了却没反应。
-                        box.label(text="⚠ 2D 项目暂时没有调试面板(只支持 3D);"
-                                       "先用『运行日志』或『导出诊断信息』",
-                                  icon="ERROR")
-                # 卡通是否跟着场景光照画明暗(用户 2026-10-04:导出有"光照残留")。
-                # 卡通 shader 是 unshaded,但它会自己按 light_dir 画色阶;旧版
-                # 导出脚本默认每物理帧把场景平行光同步进去 —— 场景有太阳时
-                # 模型身上就有明暗带。默认关 = 全平涂。只在开着卡通材质时显示。
-                if getattr(settings, "toon_materials", True):
-                    light_row = box.row(align=True)
-                    light_row.prop(settings, "toon_follow_light", toggle=True,
-                                   icon="LIGHT_SUN")
-                    if getattr(settings, "toon_follow_light", False):
-                        light_row.label(text="明暗跟着场景太阳转", icon="INFO")
-                    else:
-                        light_row.label(text="全平涂(推荐)", icon="CHECKMARK")
+                # ── 这里的四个开关第四十二轮搬走了 ──────────────────────
+                # 预览碰撞体 / 运行日志 / 调试面板 / 卡通材质(含跟随光照)
+                # 全部搬进『游戏显示』设置图(用户:"整合如物理显示等的排列,
+                # 不然不好找")—— 侧栏只留导出流程本身的东西。
                 # 上帝摄像机(用户 2026-10-04:把"主相机"那一行改成这个开关)。
                 # 原来这里是"主相机"下拉 + 拾取按钮 —— 用户的原话是
                 # "改成其他要用的或者删了";改成常驻一台上帝摄像机,
@@ -4041,6 +4170,24 @@ class GK_PT_Main(bpy.types.Panel):
             box.operator("gk.open_ai_tree", text="打开/新建 AI 图",
                          icon="FILE_NEW")
             box.label(text="玩法图放『AI_启用』引用它", icon="INFO")
+
+        # ---- 游戏显示设置(独立那张图,第四十二轮)----
+        box, opened = collapsible_box(layout, "display_settings",
+                                      "游戏显示设置(单独一张图)", "HIDE_OFF")
+        if opened:
+            display_trees = [g for g in bpy.data.node_groups
+                             if getattr(g, "bl_idname", "") == "GKDisplayTree"]
+            if display_trees:
+                for display_tree in display_trees:
+                    box.label(text=f"{display_tree.name}"
+                                   f"  ({len(display_tree.nodes)} 张设置卡)",
+                              icon="HIDE_OFF")
+            else:
+                box.label(text="还没有显示设置图", icon="INFO")
+            box.operator("gk.open_display_tree", text="打开/新建显示设置图",
+                         icon="FILE_NEW")
+            box.label(text="物理线框 / 调试面板 / 画面风格 / 视口预览"
+                           " 都在这张图里", icon="INFO")
 
         # 「动作分类」删掉(用户第 24、25 轮两次点名):
         # 它只是给动作打个标签,而标签现在没有任何地方用到 ——
@@ -4471,6 +4618,7 @@ GK_CLASSES = (
     GKAnimationTree,
     GKUiDesignTree,
     GKGameAiTree,
+    GKDisplayTree,
     # 侧栏里"点一下就跳过去"的两个小算子(节点图总览 / 脚本载体)
     GK_OT_FocusTree,
     GK_OT_FocusObject,
@@ -4501,6 +4649,8 @@ GK_CLASSES = (
     GK_OT_OpenAnimTree,
     GK_OT_OpenUiDesignTree,
     GK_OT_OpenAiTree,
+    GK_OT_OpenDisplayTree,
+    GK_OT_DisplayFillCards,
     GK_OT_SwitchTree,
     GK_OT_AnimVarAdd,
     GK_OT_AnimVarRemove,
@@ -4525,6 +4675,7 @@ GK_CLASSES = (
     GK_PT_AnimTree,
     GK_PT_UiDesign,
     GK_PT_AiDesign,
+    GK_PT_DisplayTree,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,
 ) + tuple(CATEGORY_MENUS)

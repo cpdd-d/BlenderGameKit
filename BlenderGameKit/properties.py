@@ -1031,19 +1031,20 @@ def make_node_picker(prop_name):
 
 
 def current_tree_type(context):
-    """当前节点编辑器在编辑哪一类树 —— 四种之一:
+    """当前节点编辑器在编辑哪一类树 —— 五种之一:
 
         "GKGameLogicTree"  玩法图
         "GKAnimationTree"  动画树(『游戏动画』)
         "GKUiDesignTree"   界面设计图(『游戏界面』,第四十轮)
         "GKGameAiTree"     AI 图(『游戏AI』,第四十一轮)
+        "GKDisplayTree"    显示设置图(『游戏显示』,第四十二轮)
 
     取不到就返回 None。菜单按这个过滤(见 node_menu_entries)。
     """
     space = getattr(context, "space_data", None)
     kind = getattr(space, "tree_type", "") if space is not None else ""
     if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
-                "GKGameAiTree"):
+                "GKGameAiTree", "GKDisplayTree"):
         return kind
     return None
 
@@ -1055,7 +1056,7 @@ def current_tree(context):
     以前这里写死 `tree_type != "GKGameLogicTree"` 就返回 None ——
     于是打开**动画树**时所有面板都以为"没有树",
     用户看到的是空面板(实测:"游戏动画那里什么都没有")。
-    现在四类树都返回,由调用方按需再用 `current_tree_type()` 区分。
+    现在五类树都返回,由调用方按需再用 `current_tree_type()` 区分。
     """
     kind = current_tree_type(context)
     if kind is None:
