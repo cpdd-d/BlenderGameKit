@@ -44,7 +44,7 @@ def _crc(text):
     return f"{zlib.crc32(str(text).encode('utf-8')) & 0xFFFFFFFF:08x}"
 
 
-def _safe_base(name):
+def _safe_base(name, fallback="curve"):
     """文件名里的 ASCII 部分(非 ASCII 一律换成下划线)。
 
     这里**不能**调 exporter.safe_file_name:exporter -> codegen ->
@@ -58,7 +58,7 @@ def _safe_base(name):
     text = "".join(out).strip("_")
     while "__" in text:
         text = text.replace("__", "_")
-    return text if len(text) >= 2 else "curve"
+    return text if len(text) >= 2 else fallback
 
 
 def curve_file_name(name):
@@ -77,6 +77,32 @@ def curve_file_name(name):
 def curve_res_path(name):
     """脚本里引用的 `res://curves/xxx.tres`。"""
     return f"res://{CURVES_DIR}/{curve_file_name(name)}"
+
+
+# ==========================================================================
+# 界面图片:图片名 -> art/ 下的文件名(第三十七轮:UI 设计)
+# ==========================================================================
+# 『界面_图片』和『对话框』的立绘都指向 Blender 里的**图片**(bpy.data.images)。
+# 图片不能直接给 Godot 用,导出时要落盘成 PNG —— 名字必须**两边算得一模一样**:
+# codegen 生成 `res://art/...` 的引用,asset_export 落盘写文件。
+#
+# 和曲线同一个套路(名字压 ASCII + 摘要缀尾):图片名可以是中文,
+# 压成 ASCII 之后『头像』『立绘』会撞成同一个文件名,两张图互相覆盖。
+# 摘要保证稳定 + 唯一(不能用"导出时全局去重" —— 脚本里写死的路径会变)。
+#
+# ⚠ art 目录名和 project.layout.ART_DIR 一致;这里不能 import project
+#   (project -> layout -> 本模块,反着引会成环)。
+IMAGE_ART_DIR = "art"
+
+
+def image_file_name(name):
+    """图片落盘的文件名(导出侧写文件用)。"""
+    return f"ui_{_safe_base(name, 'image')}_{_crc(name)}.png"
+
+
+def image_res_path(name):
+    """脚本里引用的 `res://art/...`(codegen 用;两边共用这一个算法)。"""
+    return f"res://{IMAGE_ART_DIR}/{image_file_name(name)}"
 
 
 # ==========================================================================

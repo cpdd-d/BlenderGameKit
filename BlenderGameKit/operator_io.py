@@ -1543,6 +1543,65 @@ class GK_OT_PickCurve(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def image_items(_self=None, _context=None):
+    """工程里所有**图片**的名字(给『界面_图片』/ 对话框立绘挑图用)。
+
+    顺带把尺寸写进条目说明里 —— 挑了多大一张图一眼能看到
+    (挑完才发现是 4096 的大图,缩放到 HUD 上糊成一团,那种事谁都不想干)。
+    """
+    items = []
+    for image in getattr(bpy.data, "images", ()) or ():
+        name = getattr(image, "name", "")
+        # Render Result / Viewer Node 是渲染输出,不是素材,别列进来
+        if not name or name in {"Render Result", "Viewer Node"}:
+            continue
+        size = getattr(image, "size", None)
+        width = int(size[0]) if size else 0
+        height = int(size[1]) if size else 0
+        hint = f"{width}×{height}" if width else "没有像素数据(检查图片是否丢失)"
+        items.append((name, name, hint, "IMAGE_DATA", 0))
+    if not items:
+        items.append(("", "(工程里还没有图片)",
+                      "先在 Blender 里导入一张:文件 → 导入 → 图像", "ERROR", 0))
+    return items
+
+
+class GK_OT_PickImage(bpy.types.Operator):
+    """挑一张图片(『界面_图片』/『界面_对话框』的立绘)。
+
+    和『选曲线』一模一样的形式:弹出搜索框,挑中的名字写回节点的
+    `gk_image`。导出时那张图会落盘成 `art/ui_xxx.png` 带进 Godot ——
+    所以用户不用自己去拷文件、也不用手敲 res:// 路径。
+    """
+
+    bl_idname = "gk.pick_image"
+    bl_label = "选图片"
+    bl_description = "把这张图片设为当前栏位的图片(导出时会带进 Godot)"
+    bl_property = "image_name"
+
+    node_name: StringProperty(name="节点", default="")
+    image_prop: StringProperty(name="属性名", default="gk_image")
+    image_name: EnumProperty(name="图片", items=image_items)
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        prop_name = self.image_prop or "gk_image"
+        if node is None or not hasattr(node, prop_name):
+            self.report({"WARNING"}, "没找到目标节点(或这个节点没有该图片栏位)")
+            return {"CANCELLED"}
+        if not self.image_name:
+            self.report({"WARNING"}, "工程里还没有可选的图片")
+            return {"CANCELLED"}
+        setattr(node, prop_name, self.image_name)
+        self.report({"INFO"}, f"图片 -> {self.image_name}")
+        return {"FINISHED"}
+
+
 class GK_OT_PreviewCameraPath(bpy.types.Operator):
     """**真预览**:在视口里把相机沿曲线(或过渡)跑一遍。
 
@@ -2536,6 +2595,8 @@ GK_CLASSES = (
     GK_OT_PickCurve,
     # 挑一个静态资产(『资产_创建实例』用;列表里带"共几份")
     GK_OT_PickAsset,
+    # 挑一张图片当界面图片 / 对话框立绘(第三十七轮 UI 设计)
+    GK_OT_PickImage,
     # 真预览:把相机沿曲线跑一遍(所见即所得,不产生游戏代码)
     GK_OT_PreviewCameraPath,
     # 动作分类标签(给动作打"静止/移动/攻击…",导出时按分类成表)

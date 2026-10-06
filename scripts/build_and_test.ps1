@@ -308,6 +308,39 @@ if ($SkipGodot) {
         }
     }
 
+    # 5h. 界面示例(第三十七轮:UI 设计)—— 图片 / 面板 / 对齐 / 设置 /
+    #     对话框 / 暂停菜单都在这条链上。这一层验的是界面这套的整条链路:
+    #     控件建出来 + 图片落盘并加载 + 父控件(显隐跟着走)+ 锚点对齐
+    #     + 运行时改控件 + 对话框逐字/点按 + Esc 暂停/按钮解冻。
+    Write-Output ""
+    $uiDir = Join-Path $Root "examples\demo_ui"
+    $uiMaker = Join-Path $Root "scripts\make_ui_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过界面示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $uiDir)) {
+        Write-Output "跳过界面示例:还没有 examples\demo_ui"
+    } else {
+        $uiLog = & $Blender -b --python $uiMaker 2>&1 | Out-String
+        if ($uiLog -notmatch "已保存") {
+            Write-Host "---- 重建界面示例失败,尾部 20 行 ----"
+            ($uiLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $uiChecker = Join-Path $Root "scripts\check_ui_demo.py"
+            $uiOut = & python $uiChecker --godot $Godot 2>&1 | Out-String
+            $uiOut -split "`n" | Where-Object { $_ -match "^(UI_|CHECK_UI_DEMO|跳过|✗|art/)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($uiOut -match "CHECK_UI_DEMO=OK") {
+                $godotRan += "界面示例"
+            } elseif ($uiOut -match "跳过") {
+                Write-Output "（界面示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

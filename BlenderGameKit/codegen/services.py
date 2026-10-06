@@ -336,13 +336,109 @@ def _ui_root(ctx, indent):
     return layer, root
 
 
+# ── 『对齐』:枚举 id -> Godot 的 Control 预设(第三十七轮)───────────────
+# 默认『左上』= 老行为(X / Y 绝对定位),老图生成的结果一字不变;
+# 其余八种用**锚点预设**,窗口大小一变控件跟着屏幕的角 / 边 / 中心走。
+#
+# 写法是**真 Godot 实测**出来的(1152x648 -> 800x600 对照过坐标):
+#     set_anchors_and_offsets_preset(Control.PRESET_CENTER,
+#         Control.PRESET_MODE_KEEP_SIZE, margin)
+# 居中 = (视口/2 - 尺寸/2),右下 = (视口 - 尺寸 - margin) —— 分毫不差。
+UI_ALIGN_PRESETS = {
+    "TOP_CENTER": "PRESET_CENTER_TOP",
+    "TOP_RIGHT": "PRESET_TOP_RIGHT",
+    "CENTER_LEFT": "PRESET_CENTER_LEFT",
+    "CENTER": "PRESET_CENTER",
+    "CENTER_RIGHT": "PRESET_CENTER_RIGHT",
+    "BOTTOM_LEFT": "PRESET_BOTTOM_LEFT",
+    "BOTTOM_CENTER": "PRESET_CENTER_BOTTOM",
+    "BOTTOM_RIGHT": "PRESET_BOTTOM_RIGHT",
+}
+
+
+def _ui_place(ctx, indent, widget, node, def_x, def_y, size_mode="keep"):
+    """摆一个界面控件:对齐 = 左上时按 X / Y(老行为),否则挂锚点。
+
+    size_mode:
+      * "keep"    —— 用控件**当前尺寸**(按钮 / 进度条 / 图片 / 面板 自己
+                     设过 size,居中的就是"按这个尺寸居中");
+      * "minsize" —— 用**最小尺寸**:Label 的"尺寸"就是文字本身,
+                     刚建出来时它的 size 是 0,用 KeepSize 会挂在锚点上
+                     不居中(锚点的取法就是这样,别弄反)。
+    """
+    align = str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT")
+    if align == "TOP_LEFT" or align not in UI_ALIGN_PRESETS:
+        x = _tunable_number(ctx, node, "X", def_x, "ui_x")
+        y = _tunable_number(ctx, node, "Y", def_y, "ui_y")
+        ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+        return
+    margin = gd_number(float(getattr(node, "gk_margin", 24.0) or 0.0))
+    mode = ("Control.PRESET_MODE_MINSIZE" if size_mode == "minsize"
+            else "Control.PRESET_MODE_KEEP_SIZE")
+    ctx.add_line(indent,
+                 f"{widget}.set_anchors_and_offsets_preset("
+                 f"Control.{UI_ALIGN_PRESETS[align]}, {mode}, {margin})")
+
+
+def _ui_add_to(ctx, indent, widget, node, root, after=None):
+    """把控件挂到父亲下面 —— 『父控件』留空 = 直接挂界面根。
+
+    ── 为什么需要"父控件"(第三十七轮)────────────────────────────────
+    暂停菜单 = 一块底板 + 几个按钮。如果按钮和底板**并列**挂在界面根下,
+    隐藏底板时按钮还留在屏幕上(`visible` 不会往下传 —— 它们不是一家人)。
+    挂成底板的子节点之后,隐藏底板就整块菜单一起消失,这就是 Godot 里
+    "容器"的语义;顺带锚点也变成**相对底板**算,按钮在菜单里居中排。
+
+    没有父控件(或名字填错)时退回挂界面根 + 告警 —— 不静默丢控件。
+    """
+    after = list(after or [])
+    parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
+    if not parent_name:
+        ctx.add_line(indent, f"{root}.add_child({widget})")
+        for line in after:
+            ctx.add_line(indent, line)
+        return
+    var = ctx.new_temp("parent")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(parent_name)})")
+    ctx.add_line(indent, f"if {var} != null:")
+    ctx.add_line(indent + 1, f"{var}.add_child({widget})")
+    for line in after:
+        ctx.add_line(indent + 1, line)
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
+    for line in after:
+        ctx.add_line(indent + 1, line)
+    ctx.add_line(indent + 1,
+                 f'push_warning("找不到父控件『{parent_name}』，'
+                 f'『{node.name}』已挂到界面根下")')
+
+
+def _ui_image_res(value):
+    """界面图片的引用 -> `res://` 路径。
+
+    ── 两套写法 ────────────────────────────────────────────────────
+      * 填 `res://...` -> 原样用(用户自己放进工程的文件);
+      * 填 Blender 里的**图片名**(点『选图片』挑的)-> 导出时会把它存成
+        `art/ui_<名字>_<摘要>.png`,这里算的是同一个文件名。
+    ── 为什么名字尾巴要挂摘要 ──────────────────────────────────────
+    和曲线资源同一个坑:图片名可以是中文,压成 ASCII 之后
+    『头像』和『立绘』会撞成同一个文件名(互相覆盖,两处显示同一张图)。
+    名字算法**两边必须一致**:见 `curve_assets.image_file_name`。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("res://"):
+        return text
+    from .. import curve_assets
+    return curve_assets.image_res_path(text)
+
+
 @stmt_node("GKNodeUiText")
 def _stmt_ui_text(ctx, node, indent):
     _layer, root = _ui_root(ctx, indent)
     widget = ctx.declare_var(f"_gk_ui_{node.name}", "Label", key=node_lib.node_key(node))
     text = ctx.input_string(node, "文字", "")
-    x = _tunable_number(ctx, node, "X", "20.0", "ui_x")
-    y = _tunable_number(ctx, node, "Y", "20.0", "ui_y")
     size = int(getattr(node, "gk_size", 24) or 24)
     color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
 
@@ -355,9 +451,11 @@ def _stmt_ui_text(ctx, node, indent):
                              f"{gd_number(color[2])}, {gd_number(color[3])}))")
     # 文字控件默认不吃鼠标，否则会挡住下面的按钮
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
-    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
-    ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    # 文字先赋值、再摆位:居中用的是"最小尺寸 = 文字大小",
+    # 文字还没填的时候 min size 是 0(摆完再填就偏了)
     ctx.add_line(indent, f"{widget}.text = str({text})")
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0", size_mode="minsize")
 
 
 @stmt_node("GKNodeUiBar")
@@ -365,8 +463,6 @@ def _stmt_ui_bar(ctx, node, indent):
     _layer, root = _ui_root(ctx, indent)
     widget = ctx.declare_var(f"_gk_ui_{node.name}", "ProgressBar", key=node_lib.node_key(node))
     value = ctx.input_number(node, "数值", "100.0")
-    x = _tunable_number(ctx, node, "X", "20.0", "ui_x")
-    y = _tunable_number(ctx, node, "Y", "60.0", "ui_y")
     max_value = gd_number(getattr(node, "gk_max", 100.0))
     width = gd_number(getattr(node, "gk_width", 200.0))
     height = gd_number(getattr(node, "gk_height", 16.0))
@@ -384,9 +480,10 @@ def _stmt_ui_bar(ctx, node, indent):
                              f"{gd_number(color[3])})")
     ctx.add_line(indent + 1, f"{widget}.add_theme_stylebox_override(\"fill\", _fill)")
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
-    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
-    ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    # 尺寸先定、再挂锚点 —— 居中的算法要用到当前尺寸
     ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    _ui_place(ctx, indent, widget, node, "20.0", "60.0")
     # 钳到合法区间:血量变成 -1 或超过上限时进度条会画出诡异的样子
     ctx.add_line(indent, f"{widget}.value = clampf({value}, 0.0, {max_value})")
 
@@ -408,8 +505,6 @@ def _stmt_ui_button(ctx, node, indent):
     # 若共用 gk_on_button 就会有两个同名函数，Godot 直接报重复定义。
     handler = ctx.declare_func_name(f"gk_on_{snake_case(node.name, 'button')}", key=node_lib.node_key(node))
     text = ctx.input_string(node, "文字", "")
-    x = _tunable_number(ctx, node, "X", "100.0", "ui_x")
-    y = _tunable_number(ctx, node, "Y", "200.0", "ui_y")
     width = gd_number(getattr(node, "gk_width", 160.0))
     height = gd_number(getattr(node, "gk_height", 48.0))
 
@@ -419,12 +514,19 @@ def _stmt_ui_button(ctx, node, indent):
     # 按钮必须吃鼠标事件，否则点不动
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
     ctx.add_line(indent + 1, f"{widget}.pressed.connect({handler})")
-    ctx.add_line(indent + 1, f"{root}.add_child({widget})")
-    ctx.add_line(indent, f"{widget}.position = Vector2({x}, {y})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
     ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    _ui_place(ctx, indent, widget, node, "100.0", "200.0")
     ctx.add_line(indent, f"{widget}.text = str({text})")
 
     # 把『点击』出口的后续代码放进一个独立函数
+    #
+    # ⚠ `new_section()` 会换掉写入目标而且**不会自己换回来**(见
+    #   GenContext.capture 的说明)。所以这里必须手动存一份再还回去 ——
+    #   否则『完成』出口那条链(接着建下一个按钮 / 后面的逻辑)会写进
+    #   这个回调段里,而且**在快照之后**写入,等于被静默丢掉。
+    #   实测现场:暂停菜单的三个按钮只建出来第一个,后面的全没了。
+    saved_sink = ctx.sink
     lines = ctx.new_section()
     ctx._active.clear()
     prev_event = ctx._current_event
@@ -433,6 +535,7 @@ def _stmt_ui_button(ctx, node, indent):
     if len(lines) == 0:
         lines.add(1, "pass")
     ctx._current_event = prev_event
+    ctx.sink = saved_sink
     ctx.extra_sections.append({
         "signature": f"func {handler}() -> void:",
         "lines": list(lines.lines),
@@ -457,6 +560,270 @@ def _stmt_ui_hide(ctx, node, indent):
     ctx.add_line(indent, "else:")
     ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
     ctx.need_ui_helpers = True
+
+
+@stmt_node("GKNodeUiImage")
+def _stmt_ui_image(ctx, node, indent):
+    """图片(TextureRect):图标 / 立绘 / logo。
+
+    ── 图片从哪来(第三十七轮)────────────────────────────────────────
+    『图片』填 Blender 里的图片名(『选图片』挑的)-> 导出时存成
+    `art/ui_<名字>_<摘要>.png`(见 asset_export.export_ui_images,
+    文件名算法在 curve_assets.image_file_name,**两边必须一致**);
+    填 `res://...` 则原样用。图片找不到时给告警,不让 load() 静默返回 null。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "TextureRect", key=node_lib.node_key(node))
+    socket = ctx._socket(node, "图片")
+    if socket is not None and getattr(socket, "is_linked", False):
+        # 运行中换图:路径由图里算出来
+        path_expr = ctx.input_string(node, "图片", "")
+    else:
+        raw = str(getattr(node, "gk_image", "") or "").strip()
+        if not raw:
+            ctx.warn(f"『{node.bl_label}』还没选图片 —— 游戏里这一块是空的"
+                     f"(点节点上的『选图片』挑一张)")
+        path_expr = gd_string(_ui_image_res(raw))
+    width = gd_number(getattr(node, "gk_width", 0.0))
+    height = gd_number(getattr(node, "gk_height", 0.0))
+    keep = bool(getattr(node, "gk_keep", True))
+    tint = getattr(node, "gk_tint", (1.0, 1.0, 1.0, 1.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = TextureRect.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    # EXPAND_IGNORE_SIZE:尺寸由我们说了算(不跟着贴图原始大小跑),
+    # 这样"填了宽高"和"用原图大小"两种情况能走同一套代码
+    ctx.add_line(indent + 1, f"{widget}.expand_mode = TextureRect.EXPAND_IGNORE_SIZE")
+    stretch = ("STRETCH_KEEP_ASPECT_CENTERED" if keep else "STRETCH_SCALE")
+    ctx.add_line(indent + 1, f"{widget}.stretch_mode = TextureRect.{stretch}")
+    ctx.add_line(indent + 1, f"{widget}.modulate = Color({gd_number(tint[0])}, "
+                             f"{gd_number(tint[1])}, {gd_number(tint[2])}, "
+                             f"{gd_number(tint[3])})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+
+    tex = ctx.new_temp("ui_tex")
+    w_var = ctx.new_temp("ui_w")
+    h_var = ctx.new_temp("ui_h")
+    ctx.add_line(indent, f"if ResourceLoader.exists({path_expr}):")
+    ctx.add_line(indent + 1, f"{widget}.texture = load({path_expr})")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("找不到界面图片: " + str({path_expr}))')
+    # ── 尺寸:填 0 的那个方向按**原图比例**算 ────────────────────────
+    # 「宽 0 高 0」= 原图大小;只填一边 = 另一边按比例推出来
+    # (比例模式下不会把图拉变形);两边都填了 = 按填的走。
+    ctx.add_line(indent, f"var {tex} := {widget}.texture")
+    ctx.add_line(indent, f"var {w_var} := {width}")
+    ctx.add_line(indent, f"var {h_var} := {height}")
+    ctx.add_line(indent, f"if {tex} != null:")
+    ctx.add_line(indent + 1, f"var _tw := float({tex}.get_width())")
+    ctx.add_line(indent + 1, f"var _th := float({tex}.get_height())")
+    ctx.add_line(indent + 1, f"if {w_var} <= 0.0 and {h_var} <= 0.0:")
+    ctx.add_line(indent + 2, f"{w_var} = _tw")
+    ctx.add_line(indent + 2, f"{h_var} = _th")
+    ctx.add_line(indent + 1, f"elif {w_var} <= 0.0:")
+    if keep:
+        ctx.add_line(indent + 2, f"{w_var} = _tw * ({h_var} / _th) if _th > 0.0 else _tw")
+    else:
+        ctx.add_line(indent + 2, f"{w_var} = _tw")
+    ctx.add_line(indent + 1, f"elif {h_var} <= 0.0:")
+    if keep:
+        ctx.add_line(indent + 2, f"{h_var} = _th * ({w_var} / _tw) if _tw > 0.0 else _th")
+    else:
+        ctx.add_line(indent + 2, f"{h_var} = _th")
+    ctx.add_line(indent, f"{widget}.size = Vector2({w_var}, {h_var})")
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+
+
+@stmt_node("GKNodeUiPanel")
+def _stmt_ui_panel(ctx, node, indent):
+    """半透明底板(菜单背景 / 提示条)。"""
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Panel", key=node_lib.node_key(node))
+    color = getattr(node, "gk_color", (0.06, 0.07, 0.10, 0.72))
+    radius = int(getattr(node, "gk_radius", 12) or 0)
+    width = gd_number(getattr(node, "gk_width", 480.0))
+    height = gd_number(getattr(node, "gk_height", 240.0))
+    bottom = bool(getattr(node, "gk_bottom", True))
+    start_hidden = bool(getattr(node, "gk_start_hidden", False))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = Panel.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, "var _box := StyleBoxFlat.new()")
+    ctx.add_line(indent + 1, f"_box.bg_color = Color({gd_number(color[0])}, "
+                             f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                             f"{gd_number(color[3])})")
+    for corner in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        ctx.add_line(indent + 1, f"_box.corner_radius_{corner} = {radius}")
+    ctx.add_line(indent + 1, f"{widget}.add_theme_stylebox_override(\"panel\", _box)")
+    # 底板不吃鼠标:它是装饰,不该挡住按钮 / 游戏里的点击
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    # 垫底 / 开局藏 都跟着"挂到谁下面"走:有父控件时是相对**兄弟**
+    # 垫底(move_child 只对自家孩子有效,对 root 调会报 not a child)
+    after = []
+    if bottom:
+        after.append(f"{widget}.get_parent().move_child({widget}, 0)")
+    if start_hidden:
+        after.append(f"{widget}.visible = false")
+    _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+
+
+@stmt_node("GKNodeUiSet")
+def _stmt_ui_set(ctx, node, indent):
+    """运行时改控件:位置 / 大小 / 透明度 / 着色 / 文字(勾哪项改哪项)。"""
+    ctx.need_ui_helpers = True
+    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    flags = [bool(getattr(node, key, False)) for key in
+             ("gk_set_pos", "gk_set_size", "gk_set_alpha", "gk_set_color",
+              "gk_set_text")]
+    if not widget_name:
+        ctx.warn(f"『{node.bl_label}』没有填控件名，这一句被跳过了")
+        return
+    if not any(flags):
+        ctx.warn(f"『{node.bl_label}』一项都没勾(位置 / 大小 / 透明度 / 颜色 / "
+                 f"文字)—— 这句什么都不会做")
+        return
+    var = ctx.new_temp("widget")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"if {var} == null:")
+    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.add_line(indent, "else:")
+    body = indent + 1
+    if getattr(node, "gk_set_pos", False):
+        x = _tunable_number(ctx, node, "X", "0.0", "ui_x")
+        y = _tunable_number(ctx, node, "Y", "0.0", "ui_y")
+        ctx.add_line(body, f"{var}.position = Vector2({x}, {y})")
+    if getattr(node, "gk_set_size", False):
+        width = gd_number(getattr(node, "gk_width", 0.0))
+        height = gd_number(getattr(node, "gk_height", 0.0))
+        ctx.add_line(body, f"{var}.size = Vector2({width}, {height})")
+    if getattr(node, "gk_set_color", False):
+        color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+        # 只换 RGB,透明度归『改透明度』那一项管(两项互不打扰)
+        ctx.add_line(body, f"{var}.modulate = Color({gd_number(color[0])}, "
+                           f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                           f"{var}.modulate.a)")
+    if getattr(node, "gk_set_alpha", False):
+        alpha = _tunable_number(ctx, node, "透明度", "1.0", "ui_alpha")
+        ctx.add_line(body, f"{var}.modulate = Color({var}.modulate.r, "
+                           f"{var}.modulate.g, {var}.modulate.b, {alpha})")
+    if getattr(node, "gk_set_text", False):
+        text = ctx.input_string(node, "文字", "")
+        ctx.add_line(body, f"if {var} is Label or {var} is Button:")
+        ctx.add_line(body + 1, f"{var}.text = str({text})")
+        ctx.add_line(body, "else:")
+        ctx.add_line(body + 1, f'push_warning("『{widget_name}』不是文字控件，'
+                               f'『改文字』跳过")')
+
+
+@stmt_node("GKNodeUiPauseGame")
+def _stmt_ui_pause(ctx, node, indent):
+    """暂停 / 继续整个世界(`get_tree().paused`)+ 鼠标 + 菜单显隐。
+
+    ── 为什么暂停菜单能点得动(真 Godot 实测,不是猜的)──────────────
+    `get_tree().paused = true` 之后,按钮的 `pressed` **照样触发**
+    (四种 process_mode 摆法全试过,连默认的 INHERIT 都能点)——
+    因为 GUI 输入是视口在收,不是"节点的每帧处理"。所以暂停菜单
+    用普通『界面_按钮』就能做,不需要额外的 process_mode 设置。
+    ── Esc 热键为什么要走信号 ────────────────────────────────────────
+    暂停之后本脚本的 `_input` / `_physics_process` 都停了 —— 挂在
+    `get_tree().process_frame` 信号上的回调**不受暂停影响**(同样是实测),
+    所以 Esc 由信号回调来读,这是"暂停之后还有人能解冻"的唯一活口。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_pause_helpers = True
+    paused = bool(getattr(node, "gk_pause", True))
+    menu = (getattr(node, "gk_menu", "") or "").strip()
+    mouse = bool(getattr(node, "gk_show_mouse", True))
+    hotkey = bool(getattr(node, "gk_hotkey", True))
+    # 暂停状态的那几个成员变量(只声明一次;名字固定,同图共享)
+    ctx.declare_var("_gk_pause_mouse_was", "int", initial="-1")
+    if hotkey:
+        # 监听用到的两个状态变量只在**勾了热键**时声明 —— 没勾时它们
+        # 是没人读的成员变量(白占一行)
+        ctx.declare_var("_gk_pause_armed", "bool", initial="false")
+        ctx.declare_var("_gk_pause_esc_held", "bool", initial="false")
+        # 热键的默认设置取**第一个勾了 Esc 的**节点(一份图一个热键就够)
+        if not getattr(ctx, "_pause_hotkey_taken", False):
+            ctx._pause_hotkey_taken = True
+            ctx.declare_var("_gk_pause_menu", "String",
+                            initial=gd_string(menu))
+            ctx.declare_var("_gk_pause_show_mouse", "bool",
+                            initial="true" if mouse else "false")
+        ctx.add_line(indent, "_gk_arm_pause_watch(self)")
+        ctx.note(f"『{node.bl_label}』勾了『Esc 也能开关』—— Esc 由它统一"
+                 f"开关暂停,不要再接『输入_按键』(Esc)的线,否则一次按下"
+                 f"会被处理两遍(开了又关)")
+    if not menu:
+        ctx.note(f"『{node.bl_label}』没填『菜单控件』—— 世界会暂停,"
+                 f"但菜单面板不会自动弹出来")
+    action = "true" if paused else "false"
+    mouse_literal = "true" if mouse else "false"
+    ctx.add_line(indent, f"_gk_apply_pause({action}, {gd_string(menu)}, {mouse_literal})")
+
+
+@stmt_node("GKNodeUiDialog")
+def _stmt_ui_dialog(ctx, node, indent):
+    """对话框:显示 + 逐字 + 等"点一下 / 按一下"。
+
+    ── 生成的语句(这里是**阻塞**的)────────────────────────────────
+        _gk_dialog_show(...)           造面板 / 填字 / 开始逐字
+        while not _gk_dialog_clicked:  await ...   # 等第一次点按
+        if _gk_dialog_typing():                      # 还在打字 -> 先补完
+            _gk_dialog_finish()
+            <再等一次点按>
+        _gk_dialog_hide()                            # 关掉,继续后面的逻辑
+
+    `await` 不会打断执行流:后面的节点挂在本节点的『完成』出口上,
+    await 结束后照常续上(和『屏幕_渐变遮罩』同一个套路)。
+    点按在 `_gk_dialog_input_event` 里采集(走 `_input`,**不挑控件**,
+    所以对话框打开时点哪儿、按哪个键都算"下一句")。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_dialog_helpers = True
+    # ── 成员变量 + 点按采集(在**节点遍历阶段**登记)──────────────────
+    # `_input(event)` 的派发表在 generator 里是**早于辅助函数**拼的,
+    # 辅助函数阶段再登记就晚了(派发行里不会出现这个函数名)。
+    ctx.declare_var("_gk_dialog_panel", "Panel")
+    ctx.declare_var("_gk_dialog_name", "Label")
+    ctx.declare_var("_gk_dialog_text", "Label")
+    ctx.declare_var("_gk_dialog_portrait", "TextureRect")
+    ctx.declare_var("_gk_dialog_tween", "Tween")
+    ctx.declare_var("_gk_dialog_clicked", "bool", initial="false")
+    ctx.register_input_handler(
+        "gk_dialog_input_event", reset=False, body=[
+            "    if _gk_dialog_panel == null or not _gk_dialog_panel.visible:",
+            "        return",
+            "    if event is InputEventMouseButton and event.pressed "
+            "and event.button_index == MOUSE_BUTTON_LEFT:",
+            "        _gk_dialog_clicked = true",
+            "    elif event is InputEventKey and event.pressed and not event.echo:",
+            "        _gk_dialog_clicked = true",
+        ])
+    speaker = gd_string(str(getattr(node, "gk_speaker", "") or ""))
+    fallback = str(getattr(node, "gk_text", "") or "")
+    text = ctx.input_string(node, "文字", fallback)
+    portrait = gd_string(_ui_image_res(getattr(node, "gk_image", "")))
+    speed = gd_number(float(getattr(node, "gk_speed", 30.0) or 0.0))
+    width = gd_number(getattr(node, "gk_width", 720.0))
+    height = gd_number(getattr(node, "gk_height", 150.0))
+    margin = gd_number(getattr(node, "gk_margin", 48.0))
+
+    ctx.add_line(indent, f"_gk_dialog_show(self, {speaker}, str({text}), "
+                         f"{speed}, {portrait}, {width}, {height}, {margin})")
+    ctx.add_line(indent, "while not _gk_dialog_clicked:")
+    ctx.add_line(indent + 1, "await get_tree().process_frame")
+    # 打字中先补完:玩家急着看下一句时不用等它一个字一个字蹦
+    ctx.add_line(indent, "if _gk_dialog_typing():")
+    ctx.add_line(indent + 1, "_gk_dialog_finish()")
+    ctx.add_line(indent + 1, "_gk_dialog_clicked = false")
+    ctx.add_line(indent + 1, "while not _gk_dialog_clicked:")
+    ctx.add_line(indent + 2, "await get_tree().process_frame")
+    ctx.add_line(indent, "_gk_dialog_hide()")
 
 
 @stmt_node("GKNodeFloatText")

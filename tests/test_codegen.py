@@ -1098,10 +1098,17 @@ class TestUiNodes(Base):
         # 按钮必须吃鼠标，否则点不动
         self.assertIn("MOUSE_FILTER_STOP", code)
 
-    def test_ui_button_output_not_named_done(self):
-        """出口不能叫『完成』，否则会被自动续接机制提前执行。"""
+    def test_ui_button_has_both_created_and_clicked_outputs(self):
+        """按钮要有两个出口:『完成』(建好了,继续建下一个)+『点击』(玩家点了)。
+
+        回归(第三十七轮):以前只有『点击』一个出口 —— 于是**链上没法
+        接着建第二个按钮**(建暂停菜单时要连建三个,当场报
+        KeyError: key "完成" not found)。现在『完成』只表示"建好了",
+        "点了才走"由独立回调负责,两件事不会混。
+        """
         names = [spec["name"] for spec in NN.GKNodeUiButton.gk_outputs]
-        self.assertNotIn("完成", names, "出口叫『完成』会被 emit_statement 提前续接")
+        self.assertIn("完成", names)
+        self.assertIn("点击", names)
 
     def test_ui_hide_finds_widget_by_name(self):
         tree = make_tree()
@@ -1220,6 +1227,290 @@ class TestUiNodes(Base):
         code, warnings = gen(tree, V2)
         self.assertTrue(any("同时被" in w for w in warnings), warnings)
         self.assertEqual(code.count('print("共用")'), 1, code)
+
+
+class TestUiRound37(Base):
+    """UI 第一版(第三十七轮):对齐 / 图片 / 面板 / 设置 / 暂停 / 对话框。
+
+    这一批的共同约束:**老图的行为一字不变** ——
+    『对齐』默认是左上(和以前一样填 X / Y),只有显式选了别的对齐
+    才改挂锚点。所以每条测试都同时看"新写法在不在"和"老写法有没有被改掉"。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    # ---- 对齐 ----
+    def test_text_align_center_uses_anchor_preset(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiText, "标题", gk_text="暂停",
+                             gk_align="CENTER", gk_margin=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # Label 用 MINSIZE:它的"尺寸"就是文字本身,KeepSize 时是 0,会挂偏
+        self.assertIn("set_anchors_and_offsets_preset(Control.PRESET_CENTER, "
+                      "Control.PRESET_MODE_MINSIZE, 0.0)", code)
+        self.assertNotIn("position = Vector2", code)
+        self.assert_indent_sane(code)
+
+    def test_default_align_keeps_old_position_behaviour(self):
+        """默认(左上)必须还是 `position = Vector2(...)` —— 老图产物不变。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        button = tree.new_node(NN.GKNodeUiButton, "开始", gk_text="开始",
+                               gk_x=100.0, gk_y=200.0)
+        bar = tree.new_node(NN.GKNodeUiBar, "血条", gk_value=1.0)
+        gk_stub.connect(tree, event, "执行", button, "执行")
+        gk_stub.connect(tree, button, "点击", bar, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 老用法:按 X / Y 摆(数字会变成 @export 参数供检查器调,所以断言写法而不是字面值)
+        self.assertIn(".position = Vector2(", code)
+        self.assertNotIn("set_anchors_and_offsets_preset", code)
+
+    def test_bottom_right_align_uses_keep_size(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiButton, "右下", gk_text="右下",
+                             gk_align="BOTTOM_RIGHT", gk_margin=24.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT, "
+                      "Control.PRESET_MODE_KEEP_SIZE, 24.0)", code)
+
+    # ---- 图片 ----
+    def test_ui_image_exports_blender_image_name(self):
+        """Blender 图片名 -> `res://art/ui_<名字>_<摘要>.png`(和导出侧同一算法)。"""
+        from BlenderGameKit import curve_assets
+
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiImage, "图标", gk_image="头像",
+                             gk_width=64.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        expected = curve_assets.image_res_path("头像")
+        self.assertIn(f'"{expected}"', code)
+        self.assertIn("TextureRect.new()", code)
+        self.assertIn("EXPAND_IGNORE_SIZE", code)
+        # 填了宽、高留 0 -> 运行时按原图比例推出来,不能拉变形
+        self.assertIn("STRETCH_KEEP_ASPECT_CENTERED", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_ui_image_name_collision_avoided(self):
+        """两个中文图片名不能算出同一个文件名(否则两张图互相覆盖)。"""
+        from BlenderGameKit import curve_assets
+
+        first = curve_assets.image_file_name("头像")
+        second = curve_assets.image_file_name("立绘")
+        self.assertNotEqual(first, second, "中文图片名压成 ASCII 后撞名了")
+
+    def test_ui_image_without_picture_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiImage, "图标")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("还没选图片" in w for w in warnings), warnings)
+
+    # ---- 面板 ----
+    def test_ui_panel_round_corners_and_bottom(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiPanel, "暂停菜单", gk_radius=16,
+                             gk_width=360.0, gk_height=220.0,
+                             gk_align="CENTER", gk_start_hidden=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Panel.new()", code)
+        self.assertIn("StyleBoxFlat.new()", code)
+        self.assertIn("corner_radius_top_left = 16", code)
+        # 垫底:先加面板后加按钮也不会盖住按钮
+        self.assertIn("move_child(", code)
+        # 暂停菜单开局必须是藏着的
+        self.assertIn(".visible = false", code)
+        # 底板不许吃鼠标(否则挡住按钮 / 游戏点击)
+        self.assertIn("MOUSE_FILTER_IGNORE", code)
+
+    # ---- 设置 ----
+    def test_ui_set_only_touches_checked_items(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiSet, "淡出", gk_widget="提示",
+                             gk_set_alpha=True, gk_alpha=0.3)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("提示")', code)
+        self.assertIn("modulate = Color(", code)
+        # 没勾的项一个字都不能出现
+        self.assertNotIn(".text = str(", code)
+        self.assertNotIn(".size = Vector2(", code)
+
+    def test_ui_set_warns_without_widget_or_flags(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        empty_name = tree.new_node(NN.GKNodeUiSet, "没名字")
+        gk_stub.connect(tree, event, "执行", empty_name, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in w for w in warnings), warnings)
+
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        nothing = tree2.new_node(NN.GKNodeUiSet, "没勾", gk_widget="提示")
+        gk_stub.connect(tree2, event2, "执行", nothing, "执行")
+        _code2, warnings2 = gen(tree2, V2)
+        self.assertTrue(any("一项都没勾" in w for w in warnings2), warnings2)
+
+    # ---- 暂停 ----
+    def test_pause_generates_apply_and_esc_watch(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiPauseGame, "暂停", gk_pause=True,
+                             gk_menu="暂停菜单", gk_hotkey=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_apply_pause(true, "暂停菜单", true)', code)
+        self.assertIn("_gk_arm_pause_watch(self)", code)
+        # 暂停之后本脚本的每帧处理都停了 —— 唯一能读 Esc 的是信号回调
+        self.assertIn("process_frame.connect(_gk_pause_watch)", code)
+        self.assertIn("var _gk_pause_armed: bool = false", code)
+        self.assertIn("var _gk_pause_menu: String = \"暂停菜单\"", code)
+        self.assertIn("tree.paused = paused", code)
+        self.assertIn("Input.MOUSE_MODE_VISIBLE", code)
+        # 鼠标模式要**还原**(暂停前是锁定的,继续后还得是锁定的)
+        self.assertIn("_gk_pause_mouse_was", code)
+        self.assert_indent_sane(code)
+
+    def test_pause_without_hotkey_has_no_watch(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiPauseGame, "继续", gk_pause=False,
+                             gk_hotkey=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn('_gk_apply_pause(false, "暂停菜单", true)', code)
+        self.assertNotIn("_gk_arm_pause_watch", code)
+        self.assertNotIn("func _gk_pause_watch", code)
+
+    def test_pause_hotkey_notes_esc_conflict(self):
+        """勾了 Esc 热键要提示"别再接一条 Esc 输入线"(会被处理两遍)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiPauseGame, "暂停", gk_hotkey=True,
+                             gk_menu="菜单")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        ctx_notes = []
+        original = codegen.context.GenContext.note
+
+        def spy(self, message):
+            ctx_notes.append(str(message))
+            return original(self, message)
+
+        with mock.patch.object(codegen.context.GenContext, "note", spy):
+            gen(tree, V2)
+        self.assertTrue(any("Esc" in text for text in ctx_notes), ctx_notes)
+
+    def test_button_done_chain_survives_callback(self):
+        """按钮『完成』后面的节点必须落在主流程里(不能被回调段吞掉)。
+
+        回归(第三十七轮):按钮 handler 里 `new_section()` 之后没把写入
+        目标换回来,后面那条链会写进回调段、而且在快照之后写入 ——
+        整段**静默消失**(现场:暂停菜单的三个按钮只建出来第一个,
+        敌人巡逻的时间轴也跟着没启动)。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        first = tree.new_node(NN.GKNodeUiButton, "按钮一", gk_text="一")
+        second = tree.new_node(NN.GKNodeUiButton, "按钮二", gk_text="二")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        lines = code.splitlines()
+        ready_at = next(i for i, line in enumerate(lines)
+                        if line.startswith("func _ready"))
+        callback_at = next(i for i, line in enumerate(lines)
+                           if "func gk_on_" in line)
+        second_at = next(i for i, line in enumerate(lines)
+                         if "_gk_ui_按钮二 = Button.new()" in line)
+        self.assertGreater(second_at, ready_at)
+        self.assertLess(second_at, callback_at,
+                        f"第二个按钮被写进回调段(等于丢了):\n{code}")
+
+    # ---- 对话框 ----
+    def test_dialog_blocks_chain_until_clicked(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "开场白", gk_speaker="向导",
+                               gk_text="你好！")
+        printer = tree.new_node(NN.GKNodePrint, "之后", gk_text="对话结束")
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        gk_stub.connect(tree, dialog, "完成", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        lines = code.splitlines()
+        show_at = next(i for i, line in enumerate(lines)
+                       if "_gk_dialog_show(self," in line)
+        wait_at = next(i for i, line in enumerate(lines)
+                       if "while not _gk_dialog_clicked:" in line)
+        hide_at = next(i for i, line in enumerate(lines)
+                       if "_gk_dialog_hide()" in line)
+        print_at = next(i for i, line in enumerate(lines)
+                        if 'print("对话结束")' in line)
+        # 顺序必须是:显示 -> 等点按 -> 关掉 -> 才继续后面的逻辑
+        self.assertLess(show_at, wait_at)
+        self.assertLess(wait_at, hide_at)
+        self.assertLess(hide_at, print_at, f"后面的逻辑不能抢在对话框前面:\n{code}")
+        # 打字中点一下 = 先补完,再点一下才关
+        self.assertIn("if _gk_dialog_typing():", code)
+        self.assertIn("_gk_dialog_finish()", code)
+        # 点按采集走 _input(不挑控件:点哪儿、按哪个键都算下一句)
+        self.assertIn("func gk_dialog_input_event(event: InputEvent) -> void:", code)
+        self.assertIn("gk_dialog_input_event(event)", code)
+        self.assertIn("AUTOWRAP_WORD_SMART", code)
+        self.assert_indent_sane(code)
+
+    def test_dialog_panel_anchored_bottom_center(self):
+        """对话框面板挂"底部居中"锚点 —— 窗口变了对话框跟着走。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "开场白", gk_text="你好",
+                               gk_width=800.0, gk_height=160.0, gk_margin=40.0)
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("Control.PRESET_CENTER_BOTTOM", code)
+        self.assertIn("Control.PRESET_MODE_KEEP_SIZE, margin)", code)
+        self.assertIn('_gk_dialog_show(self, "", str("你好"), 30.0, "", 800.0, 160.0, 40.0)',
+                      code)
+
+    def test_dialog_portrait_reuses_image_export_path(self):
+        from BlenderGameKit import curve_assets
+
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "开场白", gk_text="你好",
+                               gk_image="立绘")
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn(f'"{curve_assets.image_res_path("立绘")}"', code)
+
+    def test_ui_helpers_absent_without_ui_nodes(self):
+        """老约束:没用界面节点时,一个 UI 辅助函数都不许出现。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        for helper in ("_gk_ensure_ui", "_gk_dialog_show", "_gk_apply_pause",
+                       "_gk_find_widget"):
+            self.assertNotIn(helper, code)
 
 
 class TestRaycastNodes(Base):

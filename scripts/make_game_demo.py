@@ -20,6 +20,7 @@
 | **数字转文字**(第二十五轮)| HUD 显示"血量 2"而不是"血量 2.0"(『文本_数字』)|
 | 受伤 | 碰到敌人:血量 -1 + 屏幕闪白 + 相机震动(带打印) |
 | 胜负 | 收齐 5 枚 -> "全部收齐!";血量归零 -> "被抓到了……" |
+| **暂停菜单**(第三十七轮)| 按 **Esc** 弹出"已暂停 + 继续/重开/退出"(世界全停、鼠标放出来);再按 Esc 或点『继续游戏』回到游戏 |
 | 重开 | 按 **R** 重开(『实例_重载场景』)—— 金币、血量、位置全部复位 |
 | 掉出地图 | 掉下去自动送回出生点 |
 | 上帝机 / 调试面板 | **Tab** 自由飞;**F1** 弹调试面板(能看到金币数/血量)、**F2** 复制 |
@@ -315,7 +316,8 @@ def _extend_graph(tree, coins, enemies):
     # ---- ① 启动:操作提示 + 目标 + HUD + 敌人巡逻开始 ----
     hint = _add(tree, "GKNodeUiText", "操作提示", -300.0, 980.0,
                 gk_text=("WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / "
-                         "E 拍敌1 / R 重开 / Tab 上帝机(T 时停)/ F1 调试面板"),
+                         "E 拍敌1 / R 重开 / Esc 暂停 / Tab 上帝机(T 时停)/ "
+                         "F1 调试面板"),
                 gk_x=18.0, gk_y=18.0, gk_size=18)
     goal = _add(tree, "GKNodeUiText", "目标提示", -300.0, 800.0,
                 gk_text=(f"目标:收齐 {COIN_GOAL} 枚金币;红方块碰到会扣血"
@@ -326,6 +328,10 @@ def _extend_graph(tree, coins, enemies):
     hp_hud = _add(tree, "GKNodeUiText", "血量HUD", -300.0, 460.0,
                   gk_text=f"血量 {MAX_HP}", gk_x=18.0, gk_y=120.0, gk_size=24)
     patrol = _patrol_timeline(tree, -300.0, 260.0, enemies[:1])
+    # 暂停菜单(第三十七轮)也挂在开场链上:建菜单 + 挂上 Esc 监听。
+    # ⚠ 必须在**巡逻时间轴之前**(时间轴是往返模式,永远不"完成",
+    # 挂在它后面的话菜单永远建不出来)。
+    menu_panel, menu_arm = _pause_menu(tree, -300.0, -60.0)
     _link(tree, ready_tail, "完成", hint, "执行")
     _link(tree, hint, "完成", goal, "执行")
     # ⚠ 两个 HUD **不能**既挂在开场链上、又挂在物理帧链上 ——
@@ -333,9 +339,10 @@ def _extend_graph(tree, coins, enemies):
     # 另一条会被当成"抢"直接跳过。结果就是:开场链走到一半断了,
     # HUD 和后面的巡逻时间轴**都不生成**(小游戏探针抓到的)。
     # HUD 本来就该每物理帧刷一次,所以只留在物理帧链上(第一帧就会建出来)。
-    _link(tree, goal, "完成", patrol, "执行")
+    _link(tree, goal, "完成", menu_panel, "执行")
+    _link(tree, menu_arm, "完成", patrol, "执行")
 
-    # ---- ② 每物理帧:HUD 刷新 + 掉出地图复位 + 胜负 + R 重开 + Esc 退出 ----
+    # ---- ② 每物理帧:HUD 刷新 + 掉出地图复位 + 胜负 + R 重开 ----
     _refresh_hud(tree, physics, coin_hud, hp_hud, -900.0, -140.0)
     _fall_guard(tree, physics, -900.0, -380.0)
     _win_lose(tree, physics, -900.0, -620.0)
@@ -462,7 +469,13 @@ def _win_lose(tree, physics, x, y):
 
 
 def _restart_and_quit(tree, physics, x, y):
-    """R = 重开(重载场景);Esc = 退出。"""
+    """R = 重开(重载场景)。
+
+    ⚠ **Esc 的线在第三十七轮被拿掉了**:Esc 现在是**暂停**(见
+    `_pause_menu`,由『界面_暂停游戏』的『Esc 也能开关』统一处理)。
+    两处都接 Esc 的话一次按下会被处理两遍(开了又关)—— 退出改到
+    暂停菜单的『退出游戏』按钮上。
+    """
     key_r = _add(tree, "GKNodeKey", "R 键", x, y, gk_key="R",
                  gk_action="key_r", gk_trigger="JUST")
     branch_r = _add(tree, "GKNodeBranch", "按了 R?", x + 220.0, y)
@@ -473,13 +486,80 @@ def _restart_and_quit(tree, physics, x, y):
     _link(tree, physics, "执行", branch_r, "执行")
     _link(tree, branch_r, "是", reload_scene, "执行")
 
-    key_esc = _add(tree, "GKNodeKey", "Esc 键", x, y + 220.0, gk_key="ESC",
-                   gk_action="key_esc", gk_trigger="JUST")
-    branch_esc = _add(tree, "GKNodeBranch", "按了 Esc?", x + 220.0, y + 220.0)
-    quit_game = _add(tree, "GKNodeQuitGame", "退出游戏", x + 440.0, y + 220.0)
-    _link(tree, key_esc, "结果", branch_esc, "条件")
-    _link(tree, physics, "执行", branch_esc, "执行")
-    _link(tree, branch_esc, "是", quit_game, "执行")
+
+def _pause_menu(tree, x, y):
+    """**暂停菜单**(第三十七轮 UI 设计):Esc 一按就弹出来,世界全停。
+
+    ── 怎么搭的(这就是"暂停菜单"的标准接法)──────────────────────
+    1. 一块『界面_面板』当底板:对齐=正中、『开局藏』(不然一进游戏
+       菜单就杵在屏幕上);
+    2. 标题 + 三个『界面_按钮』**挂在底板下面**(『父控件』= 暂停菜单)——
+       这样底板一藏,整块菜单跟着藏(可见性会往下传);
+    3. 一个『界面_暂停游戏』(『暂停』**不勾**、勾『Esc 也能开关』)——
+       开场执行这一次只做两件事:把 Esc 监听挂上、确认现在是"没暂停";
+       **真正的暂停发生在按 Esc 的那一瞬间**(它内部就是开和关的来回切);
+    4. 菜单里的『继续游戏』按钮 -> 再来一个『界面_暂停游戏』(不勾暂停):
+       世界解冻、鼠标锁回去、菜单藏起来。
+       『重开』/『退出』先解除暂停再动手 —— 否则重载出来的新场景还是
+       "暂停着"的,一进去就动不了。
+
+    ── 为什么按钮不接『输入_按键』的 Esc ──────────────────────────
+    暂停之后本脚本的每帧处理全停,读不到按键;按钮的点击**不受暂停影响**
+    (真 Godot 实测),所以"继续"走按钮、"开关"走内部热键,各管一段。
+    """
+    panel = _add(tree, "GKNodeUiPanel", "暂停菜单", x, y,
+                 gk_width=420.0, gk_height=280.0, gk_radius=16,
+                 gk_align="CENTER", gk_start_hidden=True)
+    title = _add(tree, "GKNodeUiText", "暂停标题", x + 280.0, y,
+                 gk_text="已暂停", gk_size=30, gk_align="TOP_CENTER",
+                 gk_margin=26.0, gk_parent_widget="暂停菜单")
+    resume_btn = _add(tree, "GKNodeUiButton", "继续按钮", x + 560.0, y,
+                      gk_text="继续游戏", gk_x=120.0, gk_y=96.0,
+                      gk_width=180.0, gk_height=48.0,
+                      gk_parent_widget="暂停菜单")
+    restart_btn = _add(tree, "GKNodeUiButton", "重开按钮", x + 560.0, y - 220.0,
+                       gk_text="重开这一关", gk_x=120.0, gk_y=158.0,
+                       gk_width=180.0, gk_height=48.0,
+                       gk_parent_widget="暂停菜单")
+    quit_btn = _add(tree, "GKNodeUiButton", "退出按钮", x + 560.0, y - 440.0,
+                    gk_text="退出游戏", gk_x=120.0, gk_y=220.0,
+                    gk_width=180.0, gk_height=48.0,
+                    gk_parent_widget="暂停菜单")
+    # 开场这一次:挂上 Esc 监听 + 确认"没暂停"
+    arm = _add(tree, "GKNodeUiPauseGame", "暂停热键", x + 840.0, y,
+               gk_pause=False, gk_menu="暂停菜单", gk_hotkey=True)
+    _link(tree, panel, "完成", title, "执行")
+    _link(tree, title, "完成", resume_btn, "执行")
+    _link(tree, resume_btn, "完成", restart_btn, "执行")
+    _link(tree, restart_btn, "完成", quit_btn, "执行")
+    _link(tree, quit_btn, "完成", arm, "执行")
+
+    # ① 继续游戏:解除暂停(顺带把菜单藏了、鼠标锁回去)
+    resume = _add(tree, "GKNodeUiPauseGame", "继续游戏", x + 1120.0, y,
+                  gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
+    resume_msg = _add(tree, "GKNodePrint", "回到游戏", x + 1360.0, y,
+                      gk_text="回到游戏")
+    _link(tree, resume_btn, "点击", resume, "执行")
+    _link(tree, resume, "完成", resume_msg, "执行")
+
+    # ② 重开:先解除暂停,再重载场景(不解除的话新场景一进来就是冻结的)
+    reload_pause = _add(tree, "GKNodeUiPauseGame", "重开前解除暂停",
+                        x + 1120.0, y - 220.0, gk_pause=False,
+                        gk_menu="暂停菜单", gk_hotkey=False)
+    reload_menu = _add(tree, "GKNodeReloadScene", "重开(菜单)", x + 1360.0,
+                       y - 220.0, gk_slot="")
+    _link(tree, restart_btn, "点击", reload_pause, "执行")
+    _link(tree, reload_pause, "完成", reload_menu, "执行")
+
+    # ③ 退出游戏(同样先解除暂停,免得"退出动画"在冻结的世界里播不动)
+    quit_pause = _add(tree, "GKNodeUiPauseGame", "退出前解除暂停",
+                      x + 1120.0, y - 440.0, gk_pause=False,
+                      gk_menu="暂停菜单", gk_hotkey=False)
+    quit_menu = _add(tree, "GKNodeQuitGame", "退出(菜单)", x + 1360.0, y - 440.0)
+    _link(tree, quit_btn, "点击", quit_pause, "执行")
+    _link(tree, quit_pause, "完成", quit_menu, "执行")
+    log("暂停菜单:底板 + 标题 + 继续/重开/退出 三个按钮(父控件=暂停菜单)")
+    return panel, arm
 
 
 def _coin_chain(tree, coin_name, index, x, y):

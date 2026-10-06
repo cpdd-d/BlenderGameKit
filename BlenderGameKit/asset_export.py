@@ -4582,6 +4582,71 @@ def export_textures(export_dir, materials):
     return out
 
 
+def ui_image_names(scene):
+    """这个场景的逻辑图里,界面节点引用到的 Blender **图片名**。
+
+    ── 谁在用(第三十七轮:UI 设计)──────────────────────────────────
+    『界面_图片』(图标 / logo)和『界面_对话框』的『立绘』填的是
+    `bpy.data.images` 里的图片名(`res://` 开头的路径原样用,不在这)。
+
+    ── 为什么要按**场景**收 ────────────────────────────────────────
+    一个 .blend 里可以有多个场景(关卡1 / 关卡2),各用各的图;
+    按场景收 = 每个 .tscn 的 art/ 里只放它真正要用的那几张,
+    不会把别的关卡的大图也一起拖进来。
+
+    ── 为什么按 `resolve_scene_tree` 取图 ──────────────────────────
+    和"生成脚本"用的是同一个函数 —— 场景设置里选的那棵逻辑图。
+    两处各选各的话,会出现"脚本里有图片引用、但 PNG 没导出"的
+    Resource not found(材质那次吃过)。
+    """
+    from . import exporter
+
+    tree, _why = exporter.resolve_scene_tree(scene)
+    if tree is None:
+        return []
+    names = []
+    for node in getattr(tree, "nodes", ()) or ():
+        bl_idname = getattr(node, "bl_idname", "")
+        if bl_idname not in ("GKNodeUiImage", "GKNodeUiDialog"):
+            continue
+        raw = str(getattr(node, "gk_image", "") or "").strip()
+        if raw and not raw.startswith("res://") and raw not in names:
+            names.append(raw)
+    return names
+
+
+def export_ui_images(directory, scene):
+    """把界面节点引用的图片落盘成 `art/ui_<名字>_<摘要>.png`。
+
+    返回 [(图片名, 路径)]。文件名算法在 `curve_assets.image_file_name`
+    —— 和生成的脚本里那条 `res://art/...` 引用**共用同一个函数**,
+    两边不会各算一套(曲线 / 材质都吃过"名字对不上"的亏)。
+    """
+    import bpy
+
+    from . import curve_assets
+
+    out = []
+    target_dir = os.path.join(directory, project.ART_DIR)
+    for name in ui_image_names(scene):
+        image = bpy.data.images.get(name)
+        if image is None:
+            gk_log.warn(f"界面图片『{name}』不在工程里(可能被删了),已跳过")
+            continue
+        if image.size[0] == 0 and image.size[1] == 0:
+            gk_log.warn(f"界面图片『{name}』没有像素数据(没打包 / 没加载),已跳过")
+            continue
+        path = os.path.join(target_dir, curve_assets.image_file_name(name))
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            _save_image(image, path)
+        except Exception as exc:                          # noqa: BLE001
+            gk_log.warn(f"界面图片『{name}』导出失败: {exc}")
+            continue
+        out.append((name, path))
+    return out
+
+
 def _save_image(image, path):
     """把 Blender 图像存成 PNG。
 
@@ -5316,6 +5381,16 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         textures = export_textures(directory, used_materials)
         result["written"].extend(path for _n, path in textures)
         result["textures"] = len(textures)
+        # ── 界面图片也要落盘(第三十七轮)──────────────────────────────
+        # 『界面_图片』/ 对话框立绘 引用的图片 -> art/ui_xxx.png。
+        # 不落盘的话生成的脚本里 load("res://art/ui_xxx.png") 会拿到 null
+        # (Godot 只在控制台丢一行 "Resource file not found",画面上就是空的)。
+        # 走**同一个 try**:材质那套失败时(比如 OSError)这里一起跳过,
+        # 不额外制造一条崩溃路径。
+        ui_textures = export_ui_images(directory, scene)
+        if ui_textures:
+            result["written"].extend(path for _n, path in ui_textures)
+            result["textures"] = result["textures"] + len(ui_textures)
     except OSError as exc:
         result["warnings"].append(f"材质生成失败: {exc}")
         materials_map = {}

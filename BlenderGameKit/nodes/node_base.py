@@ -264,6 +264,25 @@ def draw_target_picker(node, layout, prop="gk_target"):
     op.prop_name = prop
 
 
+def draw_ui_align_row(node, layout):
+    """界面控件的『对齐』一行:对齐下拉 + 边距。
+
+    ── 为什么单独抽一个(第三十七轮)──────────────────────────────────
+    文本 / 进度条 / 按钮 / 图片 / 面板 五个节点的对齐栏长得一模一样,
+    各自画一套的话改一处要改五处(前面相机工具栏已经吃过这个亏)。
+    选了『左上(按 X / Y 摆)』时把 X / Y 也画出来 —— 那是老行为,
+    用户不用去别处找;选了别的对齐就只画边距(那时 X / Y 不起作用)。
+    """
+    align = str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT")
+    row = layout.row(align=True)
+    row.prop(node, "gk_align", text="")
+    if align == "TOP_LEFT":
+        row.prop(node, "gk_x", text="X")
+        row.prop(node, "gk_y", text="Y")
+    else:
+        row.prop(node, "gk_margin", text="边距")
+
+
 def inline_prop_entries(node):
     """节点体上要**自动画出来**的参数:返回 (属性名, 类型, 标签) 列表。
 

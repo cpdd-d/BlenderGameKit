@@ -937,6 +937,177 @@ class Generator:
                 "separator": True,
             })
 
+        # ---- 暂停:Esc 监听(第三十七轮)------------------------------
+        # 世界暂停之后本脚本的 _input / _physics_process 全都停了 ——
+        # 挂在 `get_tree().process_frame` 信号上的回调**不受暂停影响**
+        # (信号是直接的方法调用,不走"节点的每帧处理"),这是唯一能在
+        # 暂停期间读到 Esc 的活口。真 Godot 探针验过:暂停 -> Esc -> 解冻。
+        if self.ctx.need_pause_helpers:
+            # Esc 监听只在真的勾了『Esc 也能开关』时才生成 —— 没勾的图里
+            # 那两个函数是死代码(『界面_暂停游戏』本体只需要 _gk_apply_pause)
+            if getattr(self.ctx, "_pause_hotkey_taken", False):
+                sections.append({
+                    "signature": "func _gk_arm_pause_watch(host: Node) -> void:",
+                    "lines": [
+                        "    if _gk_pause_armed:",
+                        "        return",
+                        "    _gk_pause_armed = true",
+                        "    if host.get_tree() != null:",
+                        "        host.get_tree().process_frame.connect(_gk_pause_watch)",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+                sections.append({
+                    "signature": "func _gk_pause_watch() -> void:",
+                    "lines": [
+                        "    var down := Input.is_key_pressed(KEY_ESCAPE)",
+                        "    if down and not _gk_pause_esc_held:",
+                        "        _gk_pause_esc_held = true",
+                        "        var tree := get_tree()",
+                        "        if tree != null:",
+                        "            _gk_apply_pause(not tree.paused, _gk_pause_menu, _gk_pause_show_mouse)",
+                        "    elif not down:",
+                        "        _gk_pause_esc_held = false",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+            sections.append({
+                "signature": "func _gk_apply_pause(paused: bool, menu: String, show_mouse: bool) -> void:",
+                "lines": [
+                    "    var tree := get_tree()",
+                    "    if tree == null:",
+                    "        return",
+                    "    tree.paused = paused",
+                    "    if show_mouse:",
+                    "        if paused:",
+                    "            if _gk_pause_mouse_was < 0:",
+                    "                _gk_pause_mouse_was = Input.mouse_mode",
+                    "            Input.mouse_mode = Input.MOUSE_MODE_VISIBLE",
+                    "        elif _gk_pause_mouse_was >= 0:",
+                    "            Input.mouse_mode = _gk_pause_mouse_was as Input.MouseMode",
+                    "            _gk_pause_mouse_was = -1",
+                    "    if menu != \"\":",
+                    "        var widget := _gk_find_widget(menu)",
+                    "        if widget != null:",
+                    "            widget.visible = paused",
+                    "        else:",
+                    "            push_warning(\"找不到暂停菜单控件: \" + menu)",
+                    "    print(\"[GK] 暂停: \", \"开\" if paused else \"关\")",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 对话框(第三十七轮)----------------------------------------
+        if self.ctx.need_dialog_helpers:
+            sections.append({
+                "signature": ("func _gk_dialog_show(host: Node, speaker: String, body: String, "
+                              "speed: float, portrait: String, width: float, height: float, "
+                              "margin: float) -> void:"),
+                "lines": [
+                    "    _gk_ensure_ui(host)",
+                    "    if _gk_dialog_panel == null:",
+                    "        _gk_dialog_panel = Panel.new()",
+                    "        _gk_dialog_panel.name = \"对话框\"",
+                    "        var box := StyleBoxFlat.new()",
+                    "        box.bg_color = Color(0.05, 0.06, 0.09, 0.85)",
+                    "        box.corner_radius_top_left = 14",
+                    "        box.corner_radius_top_right = 14",
+                    "        box.corner_radius_bottom_left = 14",
+                    "        box.corner_radius_bottom_right = 14",
+                    "        box.border_width_top = 2",
+                    "        box.border_width_bottom = 2",
+                    "        box.border_width_left = 2",
+                    "        box.border_width_right = 2",
+                    "        box.border_color = Color(1.0, 1.0, 1.0, 0.25)",
+                    "        _gk_dialog_panel.add_theme_stylebox_override(\"panel\", box)",
+                    # 面板不吃鼠标:点哪里都算"下一句",别被面板本身拦掉
+                    "        _gk_dialog_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_ui_root.add_child(_gk_dialog_panel)",
+                    "        _gk_dialog_name = Label.new()",
+                    "        _gk_dialog_name.name = \"说话人\"",
+                    "        _gk_dialog_name.add_theme_font_size_override(\"font_size\", 22)",
+                    "        _gk_dialog_name.add_theme_color_override(\"font_color\", Color(1.0, 0.86, 0.45, 1.0))",
+                    "        _gk_dialog_name.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_dialog_panel.add_child(_gk_dialog_name)",
+                    "        _gk_dialog_text = Label.new()",
+                    "        _gk_dialog_text.name = \"正文\"",
+                    "        _gk_dialog_text.add_theme_font_size_override(\"font_size\", 20)",
+                    "        _gk_dialog_text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART",
+                    "        _gk_dialog_text.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_dialog_panel.add_child(_gk_dialog_text)",
+                    "        _gk_dialog_portrait = TextureRect.new()",
+                    "        _gk_dialog_portrait.name = \"立绘\"",
+                    "        _gk_dialog_portrait.expand_mode = TextureRect.EXPAND_IGNORE_SIZE",
+                    "        _gk_dialog_portrait.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED",
+                    "        _gk_dialog_portrait.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_dialog_panel.add_child(_gk_dialog_portrait)",
+                    # 底边居中:窗口变了对话框也跟着走(锚点预设,和界面节点同一套)
+                    "    _gk_dialog_panel.size = Vector2(width, height)",
+                    "    _gk_dialog_panel.set_anchors_and_offsets_preset(",
+                    "        Control.PRESET_CENTER_BOTTOM, Control.PRESET_MODE_KEEP_SIZE, margin)",
+                    "    var pad := 22.0",
+                    "    var has_portrait := false",
+                    "    if portrait != \"\" and ResourceLoader.exists(portrait):",
+                    "        _gk_dialog_portrait.texture = load(portrait)",
+                    "        _gk_dialog_portrait.visible = true",
+                    "        has_portrait = true",
+                    "    else:",
+                    "        _gk_dialog_portrait.visible = false",
+                    "    if has_portrait:",
+                    "        _gk_dialog_portrait.position = Vector2(pad, pad)",
+                    "        _gk_dialog_portrait.size = Vector2(height - pad * 2.0, height - pad * 2.0)",
+                    "    var text_left := pad + (height - pad * 2.0 + pad if has_portrait else 0.0)",
+                    "    _gk_dialog_name.visible = speaker != \"\"",
+                    "    _gk_dialog_name.position = Vector2(text_left, pad * 0.5)",
+                    "    _gk_dialog_text.position = Vector2(text_left, pad + 26.0)",
+                    "    _gk_dialog_text.size = Vector2(width - text_left - pad, height - pad * 2.0 - 26.0)",
+                    "    _gk_dialog_name.text = speaker",
+                    "    _gk_dialog_text.text = body",
+                    "    _gk_dialog_text.visible_characters = 0",
+                    "    if _gk_dialog_tween != null and _gk_dialog_tween.is_valid():",
+                    "        _gk_dialog_tween.kill()",
+                    "    var count := body.length()",
+                    "    if speed > 0.0 and count > 0:",
+                    "        _gk_dialog_tween = _gk_dialog_panel.create_tween()",
+                    "        _gk_dialog_tween.tween_property(_gk_dialog_text, \"visible_characters\", count, float(count) / speed)",
+                    "    else:",
+                    "        _gk_dialog_text.visible_characters = -1",
+                    "    _gk_dialog_panel.visible = true",
+                    "    _gk_dialog_clicked = false",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_dialog_typing() -> bool:",
+                "lines": [
+                    "    return _gk_dialog_tween != null and _gk_dialog_tween.is_valid() and _gk_dialog_tween.is_running()",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_dialog_finish() -> void:",
+                "lines": [
+                    "    if _gk_dialog_tween != null and _gk_dialog_tween.is_valid():",
+                    "        _gk_dialog_tween.kill()",
+                    "    if _gk_dialog_text != null:",
+                    "        _gk_dialog_text.visible_characters = -1",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_dialog_hide() -> void:",
+                "lines": [
+                    "    if _gk_dialog_panel != null:",
+                    "        _gk_dialog_panel.visible = false",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
         # ---- 手柄摇杆死区 ----
         if self.ctx.need_joy_helpers:
             sections.append({

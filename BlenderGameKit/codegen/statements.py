@@ -1401,6 +1401,10 @@ def _stmt_every_seconds(ctx, node, indent):
     ctx.add_line(indent + 1, f"{timer_var}.timeout.connect({handler})")
     ctx.add_line(indent + 1, "self.add_child(" + timer_var + ")")
 
+    # ⚠ 写入目标要**还回去**(见 GenContext.capture 的说明):不还的话,
+    #   这个节点『完成』出口后面的逻辑会写进 timeout 回调段、而且在
+    #   快照之后写入 = 被静默丢掉(和『界面_按钮』同一条坑)。
+    saved_sink = ctx.sink
     lines = ctx.new_section()
     ctx._active.clear()
     prev_event = ctx._current_event
@@ -1409,6 +1413,7 @@ def _stmt_every_seconds(ctx, node, indent):
     if len(lines) == 0:
         lines.add(1, "pass")
     ctx._current_event = prev_event
+    ctx.sink = saved_sink
     ctx.extra_sections.append({
         "signature": f"func {handler}() -> void:",
         "lines": list(lines.lines),

@@ -1010,6 +1010,29 @@ class GKNodeScreenFade(B.GKStatementNode):
 # ==========================================================================
 # 界面
 # ==========================================================================
+# ── 『对齐』:九宫格(第三十七轮,用户 2026-10-06:"进行 UI 的设计")────
+# 以前所有控件都是**左上角绝对像素**(X / Y),窗口一变(全屏 / 换分辨率)
+# 控件就跑到别人家去了。这一栏是屏幕对齐:控件跟着屏幕的角 / 边 / 中心走。
+#
+# 默认还是『左上(填 X / Y)』—— 老图生成的结果**一字不变**;
+# 选了对齐之后 X / Y 就不用了,改用『边距』(贴着屏幕边留多少像素)。
+#
+# ⚠ 枚举 id 必须和 codegen/services.py 的 `UI_ALIGN_PRESETS` 对得上
+#   (对不上会静默退回左上角)。
+UI_ALIGN_ITEMS = (
+    ("TOP_LEFT", "左上(按 X / Y 摆)", "老行为:填 X / Y 的绝对像素,窗口变了不跟着走"),
+    ("TOP_CENTER", "顶部居中", "横向居中、贴着上边"),
+    ("TOP_RIGHT", "右上", "贴右上角"),
+    ("CENTER_LEFT", "左侧居中", "贴着左边、纵向居中"),
+    ("CENTER", "正中", "屏幕正中央"),
+    ("CENTER_RIGHT", "右侧居中", "贴着右边、纵向居中"),
+    ("BOTTOM_LEFT", "左下", "贴左下角"),
+    ("BOTTOM_CENTER", "底部居中", "横向居中、贴着下边(对话框 / 字幕常用)"),
+    ("BOTTOM_RIGHT", "右下", "贴右下角"),
+)
+UI_ALIGN_HELP = "控件挂在屏幕的哪个位置;选了之后 X / Y 就不用了,用『边距』"
+
+
 @N
 class GKNodeUiText(B.GKStatementNode):
     bl_idname = "GKNodeUiText"
@@ -1017,7 +1040,8 @@ class GKNodeUiText(B.GKStatementNode):
     bl_icon = "FONT_DATA"
     gk_category = "界面"
     gk_doc = ("在屏幕上显示一行字(分数 / 提示 / 对话)。UI 层是自动建的，"
-              "不需要你在场景里摆控件；重复调用同一个节点是改文字，不会叠出新的一行")
+              "不需要你在场景里摆控件；重复调用同一个节点是改文字，不会叠出新的一行。"
+              "『对齐』可以把它挂到屏幕的角 / 边 / 正中上 —— 全屏也不跑偏")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "文字", "分数: 0"),
@@ -1027,20 +1051,24 @@ class GKNodeUiText(B.GKStatementNode):
     gk_input_props = {"文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_text", "string", "分数: 0", "文字", "未连线时显示的内容"),
-        ("gk_x", "float", 20.0, "X", "屏幕坐标(左上角为原点)"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标(左上角为原点)；对齐 = 左上时才用它"),
         ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
         ("gk_size", "int", 24, "字号", "像素"),
         ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "文字颜色"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件",
+         "挂到哪个界面控件下面(填那个控件的名字)。留空 = 直接铺在屏幕上;"
+         "挂到面板下面时,面板一藏它就跟着藏,对齐也变成相对面板"),
     )
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_text", text="")
         row = layout.row(align=True)
-        row.prop(self, "gk_x", text="X")
-        row.prop(self, "gk_y", text="Y")
-        row = layout.row(align=True)
         row.prop(self, "gk_size", text="")
         row.prop(self, "gk_color", text="")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
 
 
 @N
@@ -1065,6 +1093,11 @@ class GKNodeUiBar(B.GKStatementNode):
         ("gk_width", "float", 200.0, "宽", "像素"),
         ("gk_height", "float", 16.0, "高", "像素"),
         ("gk_color", "color", (0.85, 0.25, 0.25, 1.0), "颜色", "填充色"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件",
+         "挂到哪个界面控件下面(填那个控件的名字)。留空 = 直接铺在屏幕上;"
+         "挂到面板下面时,面板一藏它就跟着藏,对齐也变成相对面板"),
     )
 
     def draw_buttons(self, context, layout):
@@ -1072,12 +1105,11 @@ class GKNodeUiBar(B.GKStatementNode):
         row.prop(self, "gk_value", text="")
         row.prop(self, "gk_max", text="")
         row = layout.row(align=True)
-        row.prop(self, "gk_x", text="X")
-        row.prop(self, "gk_y", text="Y")
-        row = layout.row(align=True)
         row.prop(self, "gk_width", text="")
         row.prop(self, "gk_height", text="")
-        layout.prop(self, "gk_color", text="")
+        row.prop(self, "gk_color", text="")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
 
 
 @N
@@ -1087,7 +1119,9 @@ class GKNodeUiButton(B.GKStatementNode):
     bl_icon = "PLAY"
     gk_category = "界面"
     gk_doc = ("在屏幕上放一个按钮，点击后沿『点击』出口继续。"
-              "按钮是持久的(不会点一下就消失)，重复调用只改文字")
+              "按钮是持久的(不会点一下就消失)，重复调用只改文字。"
+              "『对齐』= 正中 + 『边距』0 就是屏幕正中央的大按钮(主菜单常用);"
+              "暂停菜单里的『继续 / 重开 / 退出』也是它")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "文字", "开始游戏"),
@@ -1097,24 +1131,35 @@ class GKNodeUiButton(B.GKStatementNode):
     gk_input_props = {"文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_text", "string", "开始游戏", "文字", "按钮上显示的字"),
-        ("gk_x", "float", 100.0, "X", "屏幕坐标"),
+        ("gk_x", "float", 100.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
         ("gk_y", "float", 200.0, "Y", "屏幕坐标"),
         ("gk_width", "float", 160.0, "宽", "像素"),
         ("gk_height", "float", 48.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件",
+         "挂到哪个界面控件下面(填那个控件的名字)。留空 = 直接铺在屏幕上;"
+         "挂到面板下面时,面板一藏它就跟着藏,对齐也变成相对面板"),
     )
-    # 出口故意不叫『完成』:emit_statement 会自动续接『完成』，
-    # 那样按钮还没点就会立刻往下跑。见 _stmt_ui_button 的说明。
-    gk_outputs = (S.pin(FLOW, "点击"),)
+    # ── 两个出口,各管一段(第三十七轮补的 『完成』)─────────────────
+    # 『完成』= **按钮建好了**,接着往下建 / 往下做(和别的语句节点一样);
+    # 『点击』= **玩家点了**才走的那条链(放进独立回调函数)。
+    #
+    # ⚠ 为什么最初只有『点击』:那时 emit_statement 会自动续接名叫『完成』
+    #   的出口,而按旧语义『完成』= "点了" —— 于是按钮刚建出来后面的逻辑
+    #   就直接跑了(比如游戏立刻开始)。现在两个出口分开:
+    #   建按钮 -> 『完成』继续建下一个(菜单要连着建三个按钮就是靠它);
+    #   点击 -> 『点击』走回调。老图接在『点击』上的线完全不受影响。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "点击"),)
 
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_text", text="")
         row = layout.row(align=True)
-        row.prop(self, "gk_x", text="X")
-        row.prop(self, "gk_y", text="Y")
-        row = layout.row(align=True)
         row.prop(self, "gk_width", text="")
         row.prop(self, "gk_height", text="")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
 
 
 @N
@@ -1174,6 +1219,253 @@ class GKNodeFloatText(B.GKStatementNode):
         row.prop(self, "gk_time", text="秒")
         row.prop(self, "gk_rise", text="上飘")
         layout.prop(self, "gk_color", text="")
+
+
+@N
+class GKNodeUiImage(B.GKStatementNode):
+    bl_idname = "GKNodeUiImage"
+    bl_label = "界面_图片"
+    bl_icon = "IMAGE_DATA"
+    gk_category = "界面"
+    gk_doc = ("在屏幕上放一张图片(图标 / 立绘 / logo / 按键提示)。"
+              "点『选图片』从 Blender 里的图片挑一张 —— 导出时会把它存成 "
+              "art/xxx.png 一起带进 Godot(不用你自己拷文件)。"
+              "宽 / 高填 0 = 用原图尺寸;勾着『比例』就按原图比例缩放(不变形)")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "图片", ""),
+    )
+    gk_input_props = {"图片": "gk_image"}
+    gk_prop_defs = (
+        ("gk_image", "string", "", "图片",
+         "Blender 里的图片名(点右边『选图片』挑),或 res:// 路径"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 0.0, "宽", "像素；0 = 用原图宽度"),
+        ("gk_height", "float", 0.0, "高", "像素；0 = 用原图高度"),
+        ("gk_keep", "bool", True, "保持比例",
+         "勾上 = 按原图比例缩放(只填宽 / 只填高时另一项自动算)"),
+        ("gk_tint", "color", (1.0, 1.0, 1.0, 1.0), "着色",
+         "给图乘一个颜色(白 = 原色);第四位是透明度"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件",
+         "挂到哪个界面控件下面(填那个控件的名字)。留空 = 直接铺在屏幕上;"
+         "挂到面板下面时,面板一藏它就跟着藏,对齐也变成相对面板"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_image", text="", icon="IMAGE_DATA")
+        pick = row.operator("gk.pick_image", text="", icon="VIEWZOOM")
+        pick.node_name = self.name
+        pick.image_prop = "gk_image"
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_keep", text="比例", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_tint", text="")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiPanel(B.GKStatementNode):
+    bl_idname = "GKNodeUiPanel"
+    bl_label = "界面_面板"
+    bl_icon = "MOD_OPACITY"
+    gk_category = "界面"
+    gk_doc = ("一块**半透明底**(菜单背景 / 提示条 / 血条底槽)。"
+              "颜色第四位是透明度，『圆角』0 = 直角。"
+              "『垫底』勾着时它永远铺在别的控件下面 —— 先加面板、"
+              "后加按钮也不会把按钮盖住(菜单都这么搭)")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_color", "color", (0.06, 0.07, 0.10, 0.72), "颜色",
+         "底色；第四位是透明度(0.7 左右做菜单底刚好)"),
+        ("gk_radius", "int", 12, "圆角", "像素；0 = 直角"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 480.0, "宽", "像素"),
+        ("gk_height", "float", 240.0, "高", "像素"),
+        ("gk_bottom", "bool", True, "垫底",
+         "勾上 = 永远垫在别的控件下面(菜单底板用这个)"),
+        ("gk_start_hidden", "bool", False, "一开始就藏起来",
+         "勾上 = 建出来是隐藏的(暂停菜单底板必勾 —— 开局不该显示菜单)"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件",
+         "挂到哪个界面控件下面(留空 = 铺在屏幕上)。嵌套面板用得上"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_radius", text="圆角")
+        row = layout.row(align=True)
+        row.prop(self, "gk_bottom", text="垫底", toggle=True)
+        row.prop(self, "gk_start_hidden", text="开局藏", toggle=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiSet(B.GKStatementNode):
+    bl_idname = "GKNodeUiSet"
+    bl_label = "界面_设置"
+    bl_icon = "PREFERENCES"
+    gk_category = "界面"
+    gk_doc = ("运行时改一个**已经建出来的**界面控件:位置 / 大小 / 透明度 / "
+              "着色 / 文字。控件名 = 创建它的那个节点名(和『界面_隐藏控件』"
+              "同一个规则)。\n"
+              "── 每项前面有勾 ──\n"
+              "『改哪几项就勾哪几项』,没勾的一律不碰 —— 所以同一个节点"
+              "可以只改透明度,也可以一次改好几样。\n"
+              "颜色 / 透明度走 `modulate`(整块控件一起染色),"
+              "文字走 Label / 按钮的显示文字。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "X", 0.0),
+        S.pin(FLOAT, "Y", 0.0),
+        S.pin(FLOAT, "透明度", 1.0),
+        S.pin(TEXT, "文字", ""),
+    )
+    gk_input_props = {"X": "gk_x", "Y": "gk_y",
+                      "透明度": "gk_alpha", "文字": "gk_text"}
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名", "要改哪个控件(填创建它的节点名)"),
+        ("gk_set_pos", "bool", False, "改位置", "挪到下面的 X / Y"),
+        ("gk_x", "float", 0.0, "X", "相对它的对齐点(没对齐就是屏幕左上角)"),
+        ("gk_y", "float", 0.0, "Y", ""),
+        ("gk_set_size", "bool", False, "改大小", ""),
+        ("gk_width", "float", 0.0, "宽", "像素"),
+        ("gk_height", "float", 0.0, "高", "像素"),
+        ("gk_set_alpha", "bool", False, "改透明度", "1 = 不透明;0 = 全透明"),
+        ("gk_alpha", "float", 1.0, "透明度", ""),
+        ("gk_set_color", "bool", False, "改颜色", "整块控件乘这个颜色"),
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", ""),
+        ("gk_set_text", "bool", False, "改文字", "只对文字类控件(文本 / 按钮)有效"),
+        ("gk_text", "string", "", "文字", ""),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+        row = layout.row(align=True)
+        row.prop(self, "gk_set_pos", text="位置", toggle=True)
+        if self.gk_set_pos:
+            row.prop(self, "gk_x", text="X")
+            row.prop(self, "gk_y", text="Y")
+        row = layout.row(align=True)
+        row.prop(self, "gk_set_size", text="大小", toggle=True)
+        if self.gk_set_size:
+            row.prop(self, "gk_width", text="宽")
+            row.prop(self, "gk_height", text="高")
+        row = layout.row(align=True)
+        row.prop(self, "gk_set_alpha", text="透明度", toggle=True)
+        if self.gk_set_alpha:
+            row.prop(self, "gk_alpha", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_set_color", text="颜色", toggle=True)
+        if self.gk_set_color:
+            row.prop(self, "gk_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_set_text", text="文字", toggle=True)
+        if self.gk_set_text:
+            row.prop(self, "gk_text", text="")
+
+
+@N
+class GKNodeUiPauseGame(B.GKStatementNode):
+    bl_idname = "GKNodeUiPauseGame"
+    bl_label = "界面_暂停游戏"
+    bl_icon = "PAUSE"
+    gk_category = "界面"
+    gk_doc = ("暂停 / 继续**整个世界**(物理、场景动画、角色逻辑全停 —— "
+              "对应 `get_tree().paused`)。暂停时可以把鼠标放出来、"
+              "把一块『暂停菜单』面板弹出来;继续时自动还原(鼠标收回去、"
+              "菜单藏起来)。\n"
+              "── 暂停菜单怎么搭 ──\n"
+              "①『输入_按键』(Esc、刚按下)→ 『界面_暂停游戏』(勾『暂停』,"
+              "『菜单控件』填 `暂停菜单`);"
+              "② 场景里放一块『界面_面板』(命名成 `暂停菜单`) + 几个"
+              "『界面_按钮』;"
+              "③ 菜单里『继续』按钮 → 再来一个『界面_暂停游戏』(取消勾"
+              "『暂停』)。重开 / 退出就接『实例_重载场景』/『流程_退出游戏』。\n"
+              "── 为什么暂停时按钮还点得动 ──\n"
+              "真 Godot 实测过:世界停了,界面控件的点击**不受影响**"
+              "(和『显示_暂停节点』那种停单个节点不是一回事)。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_pause", "bool", True, "暂停", "勾上 = 暂停世界;取消 = 继续"),
+        ("gk_show_mouse", "bool", True, "放出鼠标",
+         "暂停时显示鼠标(继续时还原成原来的模式 —— 锁定的还是锁定)"),
+        ("gk_menu", "string", "暂停菜单", "菜单控件",
+         "暂停时显示 / 继续时隐藏的控件名(留空 = 不自动显隐)"),
+        ("gk_hotkey", "bool", True, "Esc 也能开关",
+         "按 Esc 直接开关暂停(不用经过按钮);一遍图里只需要一个节点勾它"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_pause", text="暂停世界" if self.gk_pause else "继续游戏",
+                 toggle=True, icon="PAUSE" if self.gk_pause else "PLAY")
+        row.prop(self, "gk_show_mouse", text="鼠标", toggle=True)
+        row.prop(self, "gk_hotkey", text="Esc", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_menu", text="", icon="NODE")
+
+
+@N
+class GKNodeUiDialog(B.GKStatementNode):
+    bl_idname = "GKNodeUiDialog"
+    bl_label = "界面_对话框"
+    bl_icon = "SORTALPHA"
+    gk_category = "界面"
+    gk_doc = ("弹一句话(剧情 / 引导 / NPC 对话):屏幕下方一块面板 + "
+              "说话人 + 正文,**逐字显示**。\n"
+              "── 怎么继续 ──\n"
+              "点一下鼠标 / 按任意键:正在打字就先**补完这一句**;"
+              "打完了再点一下**关掉面板**,沿『完成』继续后面的逻辑"
+              "(所以执行流会在对话框这里**停住**,等玩家看完)。\n"
+              "── 立绘 ──\n"
+              "『立绘』可选(点『选图片』挑一张 Blender 图片,"
+              "导出时跟着带进 Godot);留空就是纯文字对话框。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "文字", "你好，冒险者！"),
+    )
+    gk_input_props = {"文字": "gk_text"}
+    gk_prop_defs = (
+        ("gk_speaker", "string", "", "说话人", "留空 = 不显示名字"),
+        ("gk_text", "string", "你好，冒险者！", "文字", "没接『文字』引脚时显示这句"),
+        ("gk_image", "string", "", "立绘",
+         "可选的半身像 / 头像(Blender 图片名或 res:// 路径)"),
+        ("gk_speed", "float", 30.0, "打字速度", "每秒显示几个字;0 = 直接全显示"),
+        ("gk_width", "float", 720.0, "宽", "面板宽(像素)"),
+        ("gk_height", "float", 150.0, "高", "面板高(像素)"),
+        ("gk_margin", "float", 48.0, "距底边", "面板离屏幕下边多少像素"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_speaker", text="", icon="USER")
+        row.prop(self, "gk_speed", text="字/秒")
+        layout.prop(self, "gk_text", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_image", text="", icon="IMAGE_DATA")
+        pick = row.operator("gk.pick_image", text="", icon="VIEWZOOM")
+        pick.node_name = self.name
+        pick.image_prop = "gk_image"
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_margin", text="距底边")
 
 
 # ==========================================================================

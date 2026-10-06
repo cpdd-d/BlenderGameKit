@@ -91,6 +91,11 @@ var anim_before := 0
 var spam_sent := 0                 # 连按 E 发了几次触发
 var spam_plays := 0
 var anim_ok := false
+# 第三十七轮:暂停菜单(Esc 冻住世界 + 菜单弹出;点『继续游戏』解冻)
+var pause_ok := false
+var pause_resume_ok := false
+var paused_before_resume := false
+var pause_pos := Vector3.ZERO
 var enemy_a_start := Vector3.ZERO
 var chase_start := 0.0
 var hits_before := 0
@@ -107,6 +112,11 @@ const COIN_ORDER := ["金币1", "金币2", "金币4", "金币5", "金币3"]
 
 func _ready() -> void:
 	run_count += 1
+	# ── 探针**暂停也照跑**(第三十七轮)──────────────────────────────
+	# 暂停菜单会把整个世界冻住(get_tree().paused = true)。探针要是跟着停,
+	# 就没有人做后面的检查 / 打印了。界面输入和 SceneTree 的帧信号不受暂停
+	# 影响 —— 这正是"暂停之后按钮还能点"的机制,探针靠它检查暂停状态。
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	world = load("res://scenes/World.tscn").instantiate()
 	add_child(world)
 	for node in world.find_children("*", "", true, false):
@@ -259,6 +269,18 @@ func _send_key(code: int, pressed: bool) -> void:
 	Input.parse_input_event(event)
 
 
+## 在屏幕上点一下(和真人点击走同一条路:视口的 GUI 输入)。
+## 暂停菜单的按钮就是这么点的 —— 世界冻着的时候它照样能收到点击。
+func _click_at(pos: Vector2) -> void:
+	for pressed in [true, false]:
+		var event := InputEventMouseButton.new()
+		event.button_index = MOUSE_BUTTON_LEFT
+		event.pressed = pressed
+		event.position = pos
+		event.global_position = pos
+		get_viewport().push_input(event)
+
+
 ## 离某个点**最远**的那个角落 —— 追击测试用:
 ## 先把角色放远,才能看出敌2 是不是真的在靠近(而不是已经贴着不动了)
 func _far_corner(from: Vector3) -> Vector3:
@@ -378,6 +400,56 @@ func _after_reload(delta: float) -> void:
 		print("DEMO_MOVE_AFTER ok=", vel_max >= 3.0, " vel_max=", "%.2f" % vel_max,
 			" walked=", "%.2f" % walked, " yaw=", look,
 			" w_held=", Input.is_action_pressed("move_up"), " cam=", _cam_name())
+		# ── 第三十七轮:暂停菜单 ────────────────────────────────────────
+		# 按 Esc 应该:整个世界冻住(get_tree().paused = true)+ 菜单弹出来;
+		# 点菜单里的『继续游戏』应该:解冻 + 菜单收回去。
+		# ⚠ 探针自己设了 PROCESS_MODE_ALWAYS —— 不设的话它跟着世界一起停,
+		#   就没人做后面的检查和打印了(这也正是"暂停后按钮还能点"能被
+		#   观察到的前提:界面输入不走节点的每帧处理)。
+		phase = 6
+		elapsed = 0.0
+		# ⚠ 按住**,隔几帧再松**:热键是每帧轮询 `Input.is_key_pressed` 的
+		# (暂停之后读不到事件,只能轮询)—— 同一帧内按下+松开的话,
+		# 轮询永远看不到"按下"这一刻(实测:probe 报 paused=false)。
+		# 真人按键至少几十毫秒(好几帧),轮询抓得到。
+		_send_key(KEY_ESCAPE, true)
+	elif phase == 6 and elapsed >= 0.4:
+		phase = 7
+		_send_key(KEY_ESCAPE, false)
+		var menu := world.find_child("暂停菜单", true, false)
+		var paused: bool = get_tree().paused
+		var menu_on: bool = menu != null and (menu as Control).visible
+		# 记下"冻住那一刻"的位置:解冻后再看它有没有变(证明世界真的停过)
+		if host != null:
+			pause_pos = host.global_position
+		pause_ok = paused and menu_on
+		print("DEMO_PAUSE ok=", pause_ok, " paused=", paused,
+			" menu=", menu_on, " btn=", world.find_child("继续按钮", true, false) != null)
+	elif phase == 7 and elapsed >= 1.0:
+		phase = 8
+		# ⚠ 先记状态再点:按钮的点击是**同步**回调(pressed 信号),
+		# 点下去的同一行里世界就解冻了 —— 顺序反了会读到"已经解冻"。
+		paused_before_resume = get_tree().paused
+		# 点『继续游戏』:按**控件的全球矩形**算点击坐标(和真人点一样)
+		var button := world.find_child("继续按钮", true, false)
+		var center := Vector2.ZERO
+		if button != null:
+			center = (button as Control).get_global_rect().get_center()
+			_click_at(center)
+		print("DEMO_PAUSE_CLICK paused_before=", paused_before_resume,
+			" target=", center)
+	elif phase == 8 and elapsed >= 0.5:
+		phase = 9
+		var menu := world.find_child("暂停菜单", true, false)
+		var still_paused: bool = get_tree().paused
+		var hidden: bool = menu == null or not (menu as Control).visible
+		var moved_again := false
+		if host != null:
+			moved_again = host.global_position.distance_to(pause_pos) < 5.0
+		pause_resume_ok = paused_before_resume and (not still_paused) and hidden
+		print("DEMO_PAUSE_RESUME ok=", pause_resume_ok, " was_paused=", paused_before_resume,
+			" now_paused=", still_paused, " hidden=", hidden,
+			" host_ok=", moved_again)
 		print("DEMO_DONE")
 		set_physics_process(false)
 
@@ -559,8 +631,9 @@ def run_godot(godot):
                    errors="replace")
     run = subprocess.run([godot, "--headless", "--path", OUT,
                           # ⚠ 重开之后还多了一段"按 W 走 1 秒"(第三十一轮
-                          # 补的:重开后移动输入失效),多加一截余量
-                          "--quit-after", "2700"],
+                          # 补的:重开后移动输入失效)、再加"Esc 暂停 ->
+                          # 点继续解冻"(第三十七轮,约 2 秒),多留余量
+                          "--quit-after", "2900"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -647,6 +720,15 @@ def main():
         print("✗ 连按 E 打断了敌1 当前这一轮的动画(『动画_播放』→『先放完再说』):",
               [line for line in text.splitlines() if "DEMO_ANIM" in line])
         ok = False
+    # ── 第三十七轮:暂停菜单 ────────────────────────────────────────
+    if not re.search(r"DEMO_PAUSE ok=true", text):
+        print("✗ 按 Esc 没有冻住世界 / 菜单没弹出来(『界面_暂停游戏』):",
+              [line for line in text.splitlines() if "DEMO_PAUSE " in line])
+        ok = False
+    if not re.search(r"DEMO_PAUSE_RESUME ok=true", text):
+        print("✗ 点『继续游戏』没有解冻 / 菜单没收回去(暂停时按钮点不动?):",
+              [line for line in text.splitlines() if "DEMO_PAUSE_RESUME" in line])
+        ok = False
     if "DEMO_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")
         ok = False
@@ -674,6 +756,12 @@ def main():
                  "扣血 + 夹范围(『变量_增减』)"),
                 ("_gk_num_text(血量)", "HUD 的数字转文字(『文本_数字』)"),
                 ("节点_敌2.move_and_slide()", "追击敌人(『移动_朝向目标』)"),
+                # 第三十七轮:暂停菜单
+                ("_gk_apply_pause(", "暂停 / 继续世界(『界面_暂停游戏』)"),
+                ("process_frame.connect(_gk_pause_watch)",
+                 "Esc 热键挂在帧信号上(暂停也读得到按键)"),
+                ("_gk_ui_继续按钮", "暂停菜单的『继续游戏』按钮"),
+                ("_gk_find_widget(\"暂停菜单\")", "菜单显隐按名字找控件"),
                 # 第二十六轮
                 ("velocity.move_toward(", "追击的平滑加减速(『加速』)"),
                 (".length() <= 1.2", "追击的『到达』输出(判'贴上了')"),

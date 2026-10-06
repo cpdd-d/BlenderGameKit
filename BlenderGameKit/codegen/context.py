@@ -185,6 +185,12 @@ class GenContext:
         self.defined_functions = set()
         # 只有真的用了界面节点才生成 UI 容器辅助函数
         self.need_ui_helpers = False
+        # ── UI 第三十七轮:暂停菜单 / 对话框 ─────────────────────────
+        # 暂停:『界面_暂停游戏』勾了『Esc 也能开关』-> 生成挂
+        # `process_frame` 信号的监听(暂停也照跑,否则按 Esc 解不了冻)
+        self.need_pause_helpers = False
+        # 对话框:生成 _gk_dialog_* 那组辅助函数 + 往 _input 里挂点按采集
+        self.need_dialog_helpers = False
         # 只有真的用了手柄节点才生成摇杆死区辅助函数
         self.need_joy_helpers = False
         # 只有真的用了屏幕滤镜才生成全屏材质辅助函数

@@ -67,6 +67,8 @@ def main():
     codegen = import_module(f"{module_name}.codegen")
     exporter = import_module(f"{module_name}.exporter")
     node_lib = import_module(f"{module_name}.nodes.nodes")
+    # 『选图片』算子的枚举函数(第三十七轮):要验证它真能列出工程里的图
+    operator_io = import_module(f"{module_name}.operator_io")
 
     check(f"节点数量 ({len(node_lib.ALL_CLASSES)})", len(node_lib.ALL_CLASSES) >= 30)
 
@@ -709,6 +711,79 @@ def main():
         bpy.data.node_groups.remove(r27_tree)
     except Exception as exc:
         check("先放完再重复", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- UI 第一版(第三十七轮):对齐 / 图片 / 面板 / 设置 / 暂停 / 对话框 ----
+    # 六个新节点的注册(bl_icon 写错会让整个类注册失败)+ 建图出一次代码。
+    # 选图片的算子在真 Blender 里也要能调起来(枚举里得真有图片)。
+    try:
+        r37_tree = bpy.data.node_groups.new("界面冒烟", "GKGameLogicTree")
+        r37_ready = r37_tree.nodes.new("GKNodeOnReady")
+        r37_panel = r37_tree.nodes.new("GKNodeUiPanel")
+        r37_panel.name = "暂停菜单"
+        r37_panel.gk_align = "CENTER"
+        r37_panel.gk_start_hidden = True
+        # 用前面粒子那一段建的"火光贴图"当界面图片(工程里确实有这张图)
+        r37_image = r37_tree.nodes.new("GKNodeUiImage")
+        r37_image.name = "徽标"
+        r37_image.gk_image = "火光贴图"
+        r37_image.gk_width = 64.0
+        r37_image.gk_parent_widget = "暂停菜单"
+        r37_text = r37_tree.nodes.new("GKNodeUiText")
+        r37_text.name = "提示"
+        r37_text.gk_align = "BOTTOM_CENTER"
+        r37_button = r37_tree.nodes.new("GKNodeUiButton")
+        r37_button.name = "继续按钮"
+        r37_button.gk_parent_widget = "暂停菜单"
+        r37_pause = r37_tree.nodes.new("GKNodeUiPauseGame")
+        r37_pause.name = "暂停热键"
+        r37_pause.gk_pause = False
+        r37_pause.gk_menu = "暂停菜单"
+        r37_pause.gk_hotkey = True
+        r37_dialog = r37_tree.nodes.new("GKNodeUiDialog")
+        r37_dialog.name = "开场白"
+        r37_dialog.gk_text = "你好"
+        r37_set = r37_tree.nodes.new("GKNodeUiSet")
+        r37_set.name = "改文字"
+        r37_set.gk_widget = "提示"
+        r37_set.gk_set_text = True
+        r37_set.gk_text = "好了"
+        for link_pair in (
+                (r37_ready, "执行", r37_panel, "执行"),
+                (r37_panel, "完成", r37_image, "执行"),
+                (r37_image, "完成", r37_text, "执行"),
+                (r37_text, "完成", r37_button, "执行"),
+                (r37_button, "完成", r37_pause, "执行"),
+                (r37_pause, "完成", r37_dialog, "执行"),
+                (r37_dialog, "完成", r37_set, "执行")):
+            r37_tree.links.new(link_pair[0].outputs[link_pair[1]],
+                               link_pair[2].inputs[link_pair[3]])
+        r37_button_out = [socket.name for socket in r37_button.outputs]
+        check("UI:『界面_按钮』两个出口(完成 = 建好了 / 点击 = 点了)",
+              r37_button_out == ["完成", "点击"], str(r37_button_out))
+        check("UI:『界面_面板』的对齐 / 开局藏属性在",
+              r37_panel.gk_align == "CENTER" and r37_panel.gk_start_hidden)
+        r37_code, r37_warnings = codegen.generate(r37_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True,
+        })
+        check("UI:生成代码(锚点 / 图片 / 面板 / 暂停 / 对话框 / 改控件)",
+              "Control.PRESET_CENTER_BOTTOM" in r37_code
+              and "TextureRect.new()" in r37_code
+              and "StyleBoxFlat.new()" in r37_code
+              and "set_anchors_and_offsets_preset(Control.PRESET_CENTER" in r37_code
+              and "_gk_apply_pause(false, \"暂停菜单\", true)" in r37_code
+              and "process_frame.connect(_gk_pause_watch)" in r37_code
+              and "_gk_dialog_show(self," in r37_code
+              and "_gk_find_widget(\"提示\")" in r37_code)
+        check("UI:无告警(有选图片 / 有控件名)", not r37_warnings, str(r37_warnings))
+        # 选图片算子:枚举里必须列得出工程里的图片
+        r37_items = operator_io.image_items(None, None)
+        check("UI:『选图片』算子列得出图片",
+              any(item[0] == "火光贴图" for item in r37_items), str(r37_items)[:120])
+        bpy.data.node_groups.remove(r37_tree)
+    except Exception as exc:
+        check("UI 第一版", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
