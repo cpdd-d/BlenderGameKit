@@ -1469,6 +1469,301 @@ class GKNodeUiDialog(B.GKStatementNode):
 
 
 # ==========================================================================
+# 界面第二版(第三十八轮):列表 / 缓动 / 九宫格 / 输入框 / 焦点
+# ==========================================================================
+# ── 这一批解决什么(用户 2026-10-06:"UI 继续做深")──────────────────
+# 第一版能摆静态控件了,但"一列东西"要靠手填 X / Y 一个个错开,
+# 存档槽 / 设置项 / 背包都做不整齐;而且没有输入框、没有焦点导航、
+# 没有"淡入淡出"这种小动效。这一批补齐这五样。
+#
+# ⚠ 容器会**完全接管**子控件的位置和尺寸(真 Godot 实测:子控件自己设的
+#   position / 锚点会被容器覆盖)—— 所以挂进『界面_列表』的控件由生成器
+#   自动**跳过摆位**,尺寸改用 `custom_minimum_size`。
+@N
+class GKNodeUiList(B.GKStatementNode):
+    bl_idname = "GKNodeUiList"
+    bl_label = "界面_列表"
+    bl_icon = "LINENUMBERS_ON"
+    gk_category = "界面"
+    gk_doc = ("一列(或一行)会自动排队的容器 —— 存档槽 / 设置项 / 背包都靠它。"
+              "把别的界面控件的 **『父控件』填成它的名字**,那些控件就自动"
+              "从上往下排(不用自己填 X / Y 一个个错开)。\n"
+              "── 两种排法 ──\n"
+              "『竖排』勾着 = 从上往下(列表);取消 = 从左往右(工具栏)。\n"
+              "『可滚动』勾着 = 内容超了会出滚动条(鼠标滚轮能滚)。\n"
+              "── 和『界面_列表_填充』的分工 ──\n"
+              "要**能点**的行(存档槽 / 菜单项):自己放『界面_按钮』,"
+              "『父控件』填列表名 —— 每个按钮各接各的点击链;"
+              "只是**显示**的行(排行榜 / 日志):用『界面_列表_填充』"
+              "喂一个文字数组,它按数组建行。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_scroll", "bool", True, "可滚动", "内容超了出滚动条(滚轮能滚)"),
+        ("gk_vertical", "bool", True, "竖排", "取消勾选 = 横排(工具栏那种)"),
+        ("gk_separation", "int", 8, "间距", "行与行之间留多少像素"),
+        ("gk_x", "float", 12.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 60.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 320.0, "宽", "像素"),
+        ("gk_height", "float", 200.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_separation", text="间距")
+        row = layout.row(align=True)
+        row.prop(self, "gk_scroll", text="滚动", toggle=True)
+        row.prop(self, "gk_vertical", text="竖排", toggle=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiListFill(B.GKStatementNode):
+    bl_idname = "GKNodeUiListFill"
+    bl_label = "界面_列表_填充"
+    gk_category = "界面"
+    bl_icon = "LINENUMBERS_ON"
+    gk_doc = ("把一串文字**灌进列表**(排行榜 / 日志 / 道具名)。"
+              "『列表』填『界面_列表』的名字;文字从『内容』引脚接一个"
+              "列表变量(『列表_新建』/『列表_添加』那套)或者写死的"
+              "『文字』(每行一条,用竖线 `|` 分隔)。\n"
+              "每次调用会**先清空旧行再建**,所以每物理帧刷也不会越堆越多。"
+              "注意:这样建出来的行是**文字**(显示用);要能点的行请自己放"
+              "『界面_按钮』(父控件填列表名)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(ANY, "内容", []),
+    )
+    gk_prop_defs = (
+        ("gk_list", "string", "", "列表", "『界面_列表』那个节点的名字"),
+        ("gk_text", "string", "", "文字",
+         "没接『内容』时用它:每行一条,用竖线分隔(如 `第一名|第二名`)"),
+        ("gk_var", "string", "", "变量名",
+         "没接『内容』时也可以填一个**列表变量**的名字(优先于『文字』)"),
+        ("gk_line_height", "float", 0.0, "行高", "像素;0 = 按字体自动"),
+        ("gk_size", "int", 20, "字号", "像素"),
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "行的文字颜色"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_list", text="", icon="LINENUMBERS_ON")
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="", icon="OUTLINER_DATA_GP_LAYER")
+        row.prop(self, "gk_line_height", text="行高")
+        row.prop(self, "gk_size", text="字号")
+        layout.prop(self, "gk_text", text="")
+        layout.prop(self, "gk_color", text="")
+
+
+@N
+class GKNodeUiTween(B.GKStatementNode):
+    bl_idname = "GKNodeUiTween"
+    bl_label = "界面_缓动"
+    bl_icon = "IPO_EASE_IN_OUT"
+    gk_category = "界面"
+    gk_doc = ("把一个界面控件的某个属性**平滑地**推过去 —— 菜单淡入 / "
+              "提示条滑进来 / 按钮弹一下。\n"
+              "『改什么』有:透明度、位置 X / 位置 Y、缩放、宽 / 高。"
+              "勾『等它播完』的话,后面的节点会等动画结束再继续"
+              "(不勾就是**边播边往下走**,适合同时动好几个控件)。\n"
+              "目标控件按**名字**找(创建它的节点名 / 面板名)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "到", 1.0),
+    )
+    gk_input_props = {"到": "gk_to"}
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名", "要动哪个控件(创建它的节点名)"),
+        ("gk_property", "enum", "ALPHA", "改什么", "", (
+            ("ALPHA", "透明度", "0 = 全透明,1 = 不透明(淡入淡出)"),
+            ("POS_X", "位置 X", "横向滑动;相对**现在的位置**(填 +80 往右 80)"),
+            ("POS_Y", "位置 Y", "纵向滑动;同上"),
+            ("SCALE", "缩放", "1 = 原样,1.1 = 放大一点(按钮弹一下)"),
+            ("WIDTH", "宽", "像素"),
+            ("HEIGHT", "高", "像素"),
+        )),
+        ("gk_to", "float", 1.0, "到", "缓动到多少(没接引脚时用)"),
+        ("gk_time", "float", 0.4, "时长", "秒"),
+        ("gk_delay", "float", 0.0, "延迟", "秒;等一会儿再开始"),
+        ("gk_wait", "bool", False, "等它播完", "勾上 = 后面的节点等动画结束再走"),
+        ("gk_trans", "enum", "TRANS_SINE", "曲线", "速度曲线", (
+            ("TRANS_LINEAR", "匀速", ""),
+            ("TRANS_SINE", "正弦(平滑)", ""),
+            ("TRANS_CUBIC", "三次(先慢后快)", ""),
+            ("TRANS_QUAD", "二次", ""),
+            ("TRANS_BACK", "回弹(冲过头再回来)", ""),
+            ("TRANS_BOUNCE", "弹跳", ""),
+            ("TRANS_ELASTIC", "橡皮筋", ""),
+        )),
+        ("gk_ease", "enum", "EASE_OUT", "缓动方式", "", (
+            ("EASE_IN", "慢进", ""),
+            ("EASE_OUT", "慢出", "UI 最常用:起步快、到点前慢下来"),
+            ("EASE_IN_OUT", "两头慢", ""),
+        )),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+        row.prop(self, "gk_property", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_to", text="到")
+        row.prop(self, "gk_time", text="秒")
+        row.prop(self, "gk_delay", text="延迟")
+        row = layout.row(align=True)
+        row.prop(self, "gk_trans", text="")
+        row.prop(self, "gk_ease", text="")
+        row.prop(self, "gk_wait", text="等播完", toggle=True)
+
+
+@N
+class GKNodeUiNinePatch(B.GKStatementNode):
+    bl_idname = "GKNodeUiNinePatch"
+    bl_label = "界面_九宫格"
+    bl_icon = "MESH_GRID"
+    gk_category = "界面"
+    gk_doc = ("**九个切片的底图**:一张小图(比如一圈花边)按四边切好,"
+              "拉多大都不会把边角拉变形 —— 面板 / 按钮 / 标题条的正式做法。\n"
+              "『切片』四个数字 = 上 / 右 / 下 / 左各留多少像素**不拉伸**"
+              "(中间部分拉伸填满)。比如 12 表示四边各 12 像素的花边。\n"
+              "图片和『界面_图片』同一套:点『选图片』挑 Blender 图片,"
+              "导出时自动落盘成 `art/ui_*.png`。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_image", "string", "", "图片", "Blender 图片名(点『选图片』挑)或 res:// 路径"),
+        ("gk_slice", "int", 12, "切片", "四边各留多少像素不拉伸(花边宽度)"),
+        ("gk_x", "float", 12.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 12.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 360.0, "宽", "像素"),
+        ("gk_height", "float", 120.0, "高", "像素"),
+        ("gk_tint", "color", (1.0, 1.0, 1.0, 1.0), "着色", "给图乘一个颜色"),
+        ("gk_bottom", "bool", False, "垫底", "勾上 = 铺在别的控件下面(当底图)"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_image", text="", icon="IMAGE_DATA")
+        pick = row.operator("gk.pick_image", text="", icon="VIEWZOOM")
+        pick.node_name = self.name
+        pick.image_prop = "gk_image"
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_slice", text="切片")
+        row = layout.row(align=True)
+        row.prop(self, "gk_tint", text="")
+        row.prop(self, "gk_bottom", text="垫底", toggle=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiInput(B.GKStatementNode):
+    bl_idname = "GKNodeUiInput"
+    bl_label = "界面_输入框"
+    bl_icon = "GREASEPENCIL"        # 找不到"输入"图标,用铅笔(它就是个写字框)
+    gk_category = "界面"
+    gk_doc = ("一个输入框(昵称 / 聊天 / 存档名)。玩家**按回车**时沿"
+              "『提交』出口继续(真 Godot 实测:回车才触发,点别处失焦"
+              "**不会**误触发);框里的字随时可以用『界面_取文字』读。\n"
+              "『自动聚焦』勾上 = 建出来就选中它(键盘直接能打字);"
+              "否则要用『界面_设焦点』或点一下。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "默认文字", ""),
+    )
+    gk_input_props = {"默认文字": "gk_text"}
+    gk_prop_defs = (
+        ("gk_text", "string", "", "默认文字", "一建出来框里的字(留空 = 只有占位提示)"),
+        ("gk_placeholder", "string", "输入昵称…", "占位提示",
+         "空着的时候显示的灰字"),
+        ("gk_max_length", "int", 24, "最多几个字", "0 = 不限"),
+        ("gk_password", "bool", False, "密码模式", "打进去的字显示成圆点"),
+        ("gk_focus", "bool", False, "自动聚焦", "建出来就选中(键盘直接能打字)"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 240.0, "宽", "像素"),
+        ("gk_height", "float", 40.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+    # 出口叫『提交』(不叫『完成』):emit_statement 会自动续接『完成』,
+    # 那样输入框刚建出来后面的逻辑就跑了。真正的续接在 text_submitted 回调里。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "提交"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_placeholder", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_text", text="")
+        row.prop(self, "gk_max_length", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_password", text="密码", toggle=True)
+        row.prop(self, "gk_focus", text="聚焦", toggle=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiReadText(B.GKExpressionNode):
+    bl_idname = "GKNodeUiReadText"
+    bl_label = "界面_取文字"
+    gk_category = "界面"
+    bl_icon = "FONT_DATA"
+    gk_doc = ("读一个界面控件上的文字(输入框里玩家打的字 / 标签 / 按钮)。"
+              "接到判断或『变量_设置』上就能用,比如"
+              "『如果 昵称 == \"\" 就提示先起名』。")
+    gk_outputs = (S.pin(TEXT, "文字", ""),)
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名", "要读哪个控件(创建它的节点名)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+
+
+@N
+class GKNodeUiFocus(B.GKStatementNode):
+    bl_idname = "GKNodeUiFocus"
+    bl_label = "界面_设焦点"
+    bl_icon = "TRIA_DOWN_BAR"
+    gk_category = "界面"
+    gk_doc = ("把**键盘 / 手柄焦点**放到某个控件上(通常是按钮或输入框)。"
+              "焦点在谁身上:方向键 / 手柄摇杆就能在按钮之间选(真 Godot 实测:"
+              "按钮默认就能被选,自动按**位置**找邻居,不用手接),回车 / A 键"
+              "等于点它。\n"
+              "菜单打开时把它设到『继续游戏』上,手柄用户一进来就能操作;"
+              "框里填空 = 清掉焦点(回到鼠标操作)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "控件名", ""),
+    )
+    gk_input_props = {"控件名": "gk_widget"}
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名",
+         "聚焦哪个控件;留空 = 清掉焦点"),
+        ("gk_focus", "bool", True, "聚焦", "取消勾选 = 清掉焦点"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+        row.prop(self, "gk_focus", text="", toggle=True)
+
+
+# ==========================================================================
 # 射线
 # ==========================================================================
 @N

@@ -786,6 +786,91 @@ def main():
         check("UI 第一版", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- UI 第二版(第三十八轮):列表 / 填充 / 缓动 / 九宫格 / 输入框 / 焦点 ----
+    # 七个新节点都要能注册出来(bl_icon 写错会让整个类注册失败)。
+    # 本轮两条核心约束出码必须看得到:
+    #   ① 列表是两层(ScrollContainer + VBox),子控件由容器排版 ——
+    #      跳过写死的 X / Y,尺寸走 custom_minimum_size(真 Godot 实测);
+    #   ② 输入框的『提交』出口走 text_submitted 独立回调,不在主流程里。
+    try:
+        r38_tree = bpy.data.node_groups.new("界面二冒烟", "GKGameLogicTree")
+        r38_ready = r38_tree.nodes.new("GKNodeOnReady")
+        r38_list = r38_tree.nodes.new("GKNodeUiList")
+        r38_list.name = "存档列表"
+        r38_slot = r38_tree.nodes.new("GKNodeUiButton")
+        r38_slot.name = "存档槽一"
+        r38_slot.gk_parent_widget = "存档列表"
+        r38_slot.gk_x = 99.0
+        r38_slot.gk_y = 99.0
+        r38_fill = r38_tree.nodes.new("GKNodeUiListFill")
+        r38_fill.name = "填日志"
+        r38_fill.gk_list = "存档列表"
+        r38_fill.gk_text = "第一行|第二行"
+        r38_patch = r38_tree.nodes.new("GKNodeUiNinePatch")
+        r38_patch.name = "标题条"
+        r38_patch.gk_image = "火光贴图"
+        r38_patch.gk_slice = 16
+        r38_input = r38_tree.nodes.new("GKNodeUiInput")
+        r38_input.name = "昵称"
+        r38_input.gk_placeholder = "输入昵称"
+        r38_tween = r38_tree.nodes.new("GKNodeUiTween")
+        r38_tween.name = "淡入"
+        r38_tween.gk_widget = "标题条"
+        r38_read = r38_tree.nodes.new("GKNodeUiReadText")
+        r38_read.name = "读昵称"
+        r38_read.gk_widget = "昵称"
+        r38_focus = r38_tree.nodes.new("GKNodeUiFocus")
+        r38_focus.name = "聚焦"
+        r38_focus.gk_widget = "存档槽一"
+        r38_print = r38_tree.nodes.new("GKNodePrint")
+        r38_print.name = "提交打印"
+        r38_print.gk_text = "提交了"
+        for link_pair in (
+                (r38_ready, "执行", r38_list, "执行"),
+                (r38_list, "完成", r38_slot, "执行"),
+                (r38_slot, "完成", r38_fill, "执行"),
+                (r38_fill, "完成", r38_patch, "执行"),
+                (r38_patch, "完成", r38_input, "执行"),
+                (r38_input, "提交", r38_print, "执行"),
+                (r38_input, "完成", r38_tween, "执行"),
+                (r38_tween, "完成", r38_focus, "执行")):
+            r38_tree.links.new(link_pair[0].outputs[link_pair[1]],
+                               link_pair[2].inputs[link_pair[3]])
+        # 取文字是表达式节点(没有执行口),接到打印的『内容』上
+        r38_tree.links.new(r38_read.outputs["文字"], r38_print.inputs["内容"])
+        check("UI2:『界面_输入框』出口是『完成』+『提交』",
+              [socket.name for socket in r38_input.outputs] == ["完成", "提交"],
+              str([socket.name for socket in r38_input.outputs]))
+        r38_code, r38_warnings = codegen.generate(r38_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("UI2:列表两层 + 子控件由容器排版(不写死坐标 / 用 custom_minimum_size)",
+              "ScrollContainer.new()" in r38_code
+              and "VBoxContainer.new()" in r38_code
+              and '_gk_list_body("存档列表")' in r38_code
+              and ".custom_minimum_size = Vector2(160.0, 48.0)" in r38_code
+              and "Vector2(99.0, 99.0)" not in r38_code)
+        check("UI2:列表填充 / 九宫格 / 缓动 / 取文字 / 焦点都出了码",
+              '_gk_list_fill("存档列表", ["第一行", "第二行"]' in r38_code
+              and "NinePatchRect.new()" in r38_code
+              and ".patch_margin_top = 16" in r38_code
+              and '"modulate:a"' in r38_code
+              and '_gk_widget_text("昵称")' in r38_code
+              and '_gk_find_widget("存档槽一")' in r38_code
+              and ".grab_focus()" in r38_code)
+        # 『提交』出口的链(打印『取文字』的结果)必须在独立回调函数里 ——
+        # 在 _ready 之后、且落在 gk_on_昵称_submit 的函数体里
+        r38_submit_at = r38_code.find("func gk_on_昵称_submit")
+        check("UI2:输入框回车走独立回调(提交链不在主流程)",
+              "text_submitted.connect(gk_on_昵称_submit)" in r38_code
+              and r38_submit_at > r38_code.find("func _ready")
+              and 'print(_gk_widget_text("昵称"))' in r38_code[r38_submit_at:])
+        check("UI2:无告警", not r38_warnings, str(r38_warnings))
+        bpy.data.node_groups.remove(r38_tree)
+    except Exception as exc:
+        check("UI 第二版", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
     # Godot 的运动学角色**不会**自动上台阶(0.35 米在它眼里就是堵墙)。
     # 填了高度才生成"三关探测"(被竖面挡住 / 抬起来的路通 / 落点有地),

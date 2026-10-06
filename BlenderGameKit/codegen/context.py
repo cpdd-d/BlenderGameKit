@@ -191,6 +191,14 @@ class GenContext:
         self.need_pause_helpers = False
         # 对话框:生成 _gk_dialog_* 那组辅助函数 + 往 _input 里挂点按采集
         self.need_dialog_helpers = False
+        # ── UI 第二版(第三十八轮)─────────────────────────────────────
+        # 列表:生成 `_gk_list_body()`(找列表里那个**排版的容器** ——
+        # 子控件挂在它上面才排队,挂到滚动容器本身会浮着)
+        self.need_list_helper = False
+        # 列表_填充:生成 `_gk_list_fill()`(清空旧行 + 按数组建 Label)
+        self.need_list_fill_helper = False
+        # 界面_取文字:生成 `_gk_widget_text()`(按名字取控件上的文字)
+        self.need_widget_text_helper = False
         # 只有真的用了手柄节点才生成摇杆死区辅助函数
         self.need_joy_helpers = False
         # 只有真的用了屏幕滤镜才生成全屏材质辅助函数

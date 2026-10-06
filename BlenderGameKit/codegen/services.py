@@ -356,6 +356,44 @@ UI_ALIGN_PRESETS = {
 }
 
 
+def _ui_list_names(ctx):
+    """图里所有『界面_列表』节点的名字(第三十八轮)。
+
+    用来判断"这个控件的父控件是不是一个容器" —— 是的话它由容器排版,
+    生成器**不能再写 position / 锚点**(容器会把它们覆盖掉,真 Godot 实测)。
+    """
+    cache = getattr(ctx, "_ui_list_names", None)
+    if cache is None:
+        cache = set()
+        tree = getattr(ctx, "tree", None)
+        for node in getattr(tree, "nodes", ()) or ():
+            if getattr(node, "bl_idname", "") == "GKNodeUiList":
+                cache.add(str(getattr(node, "name", "")))
+        ctx._ui_list_names = cache
+    return cache
+
+
+def _ui_in_list(ctx, node):
+    """这个控件的『父控件』是不是一个『界面_列表』(容器)。"""
+    parent = str(getattr(node, "gk_parent_widget", "") or "").strip()
+    return bool(parent) and parent in _ui_list_names(ctx)
+
+
+def _ui_size(ctx, indent, widget, node, width, height):
+    """设控件尺寸 —— 普通控件用 `size`,挂在**列表**里的用 `custom_minimum_size`。
+
+    ── 为什么两种都得有(真 Godot 实测)────────────────────────────
+    容器会完全接管子控件的矩形:挂进 VBox 的按钮,自己设的 position /
+    锚点 / size 会被它覆盖(实测:故意设成 (999,999) 也被拉回 (0,0))。
+    容器认的是 **custom_minimum_size** —— 想控制"这一行多高"就填它。
+    """
+    if _ui_in_list(ctx, node):
+        ctx.add_line(indent, f"{widget}.custom_minimum_size = "
+                             f"Vector2({width}, {height})")
+    else:
+        ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+
+
 def _ui_place(ctx, indent, widget, node, def_x, def_y, size_mode="keep"):
     """摆一个界面控件:对齐 = 左上时按 X / Y(老行为),否则挂锚点。
 
@@ -366,6 +404,10 @@ def _ui_place(ctx, indent, widget, node, def_x, def_y, size_mode="keep"):
                      刚建出来时它的 size 是 0,用 KeepSize 会挂在锚点上
                      不居中(锚点的取法就是这样,别弄反)。
     """
+    if _ui_in_list(ctx, node):
+        # 挂在列表(容器)里的控件**由容器排版** —— 写 position / 锚点是白写
+        # (容器会覆盖),写了反而让人以为"填了 X / Y 没生效"是 bug
+        return
     align = str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT")
     if align == "TOP_LEFT" or align not in UI_ALIGN_PRESETS:
         x = _tunable_number(ctx, node, "X", def_x, "ui_x")
@@ -399,7 +441,13 @@ def _ui_add_to(ctx, indent, widget, node, root, after=None):
             ctx.add_line(indent, line)
         return
     var = ctx.new_temp("parent")
-    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(parent_name)})")
+    if parent_name in _ui_list_names(ctx):
+        # 父控件是『界面_列表』-> 要挂到它**里面那个排版的容器**上,
+        # 不是挂到滚动容器本身(挂错的话子控件会浮着不排队)
+        ctx.need_list_helper = True
+        ctx.add_line(indent, f"var {var} := _gk_list_body({gd_string(parent_name)})")
+    else:
+        ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(parent_name)})")
     ctx.add_line(indent, f"if {var} != null:")
     ctx.add_line(indent + 1, f"{var}.add_child({widget})")
     for line in after:
@@ -482,7 +530,7 @@ def _stmt_ui_bar(ctx, node, indent):
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
     _ui_add_to(ctx, indent + 1, widget, node, root)
     # 尺寸先定、再挂锚点 —— 居中的算法要用到当前尺寸
-    ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    _ui_size(ctx, indent, widget, node, width, height)
     _ui_place(ctx, indent, widget, node, "20.0", "60.0")
     # 钳到合法区间:血量变成 -1 或超过上限时进度条会画出诡异的样子
     ctx.add_line(indent, f"{widget}.value = clampf({value}, 0.0, {max_value})")
@@ -515,7 +563,7 @@ def _stmt_ui_button(ctx, node, indent):
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
     ctx.add_line(indent + 1, f"{widget}.pressed.connect({handler})")
     _ui_add_to(ctx, indent + 1, widget, node, root)
-    ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    _ui_size(ctx, indent, widget, node, width, height)
     _ui_place(ctx, indent, widget, node, "100.0", "200.0")
     ctx.add_line(indent, f"{widget}.text = str({text})")
 
@@ -632,7 +680,7 @@ def _stmt_ui_image(ctx, node, indent):
         ctx.add_line(indent + 2, f"{h_var} = _th * ({w_var} / _tw) if _tw > 0.0 else _th")
     else:
         ctx.add_line(indent + 2, f"{h_var} = _th")
-    ctx.add_line(indent, f"{widget}.size = Vector2({w_var}, {h_var})")
+    _ui_size(ctx, indent, widget, node, w_var, h_var)
     _ui_place(ctx, indent, widget, node, "20.0", "20.0")
 
 
@@ -668,7 +716,7 @@ def _stmt_ui_panel(ctx, node, indent):
     if start_hidden:
         after.append(f"{widget}.visible = false")
     _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
-    ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+    _ui_size(ctx, indent, widget, node, width, height)
     _ui_place(ctx, indent, widget, node, "20.0", "20.0")
 
 
@@ -824,6 +872,258 @@ def _stmt_ui_dialog(ctx, node, indent):
     ctx.add_line(indent + 1, "while not _gk_dialog_clicked:")
     ctx.add_line(indent + 2, "await get_tree().process_frame")
     ctx.add_line(indent, "_gk_dialog_hide()")
+
+
+# ==========================================================================
+# 界面第二版(第三十八轮):列表 / 缓动 / 九宫格 / 输入框 / 焦点
+# ==========================================================================
+@stmt_node("GKNodeUiList")
+def _stmt_ui_list(ctx, node, indent):
+    """列表容器:滚动容器 + 里面一个会排队的 VBox / HBox。
+
+    ── 为什么"滚动"和"排版"是两层(真 Godot 实测)──────────────────
+    ScrollContainer 自己**不是**排版的容器(它只负责"内容比它高就出滚动条"),
+    真正的排版是它里面那个 VBoxContainer 干的。所以『界面_列表』建两层:
+        ScrollContainer(名字 = 节点名,别人按名字找它)
+          └── VBoxContainer(名字 = 节点名 + "内容",子控件挂这儿)
+    子控件挂哪一层由 `_gk_list_body()` 决定(见 _ui_add_to)。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    scroll = bool(getattr(node, "gk_scroll", True))
+    vertical = bool(getattr(node, "gk_vertical", True))
+    separation = int(getattr(node, "gk_separation", 8) or 0)
+    width = gd_number(getattr(node, "gk_width", 320.0))
+    height = gd_number(getattr(node, "gk_height", 200.0))
+    inner_type = "VBoxContainer" if vertical else "HBoxContainer"
+    outer_type = "ScrollContainer" if scroll else inner_type
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", outer_type,
+                             key=node_lib.node_key(node))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = {outer_type}.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    if scroll:
+        inner = ctx.declare_var(f"_gk_ui_{node.name}_内容", inner_type,
+                                key=(node_lib.node_key(node), "内容"))
+        ctx.add_line(indent + 1, f"{inner} = {inner_type}.new()")
+        ctx.add_line(indent + 1, f"{inner}.name = {gd_string(node.name + '内容')}")
+        ctx.add_line(indent + 1, f"{inner}.add_theme_constant_override("
+                                 f"\"separation\", {separation})")
+        ctx.add_line(indent + 1, f"{widget}.add_child({inner})")
+        # 滚动容器要**吃掉**滚轮事件(IGNORE 的话鼠标滚轮会穿过去,列表滚不动)
+        ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    else:
+        ctx.add_line(indent + 1, f"{widget}.add_theme_constant_override("
+                                 f"\"separation\", {separation})")
+        # 纯排版容器不吃鼠标:点它空白处应该穿到游戏 / 下面的控件
+        ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "12.0", "60.0")
+
+
+@stmt_node("GKNodeUiListFill")
+def _stmt_ui_list_fill(ctx, node, indent):
+    """把一串东西灌进列表(先清空旧行再建,每帧刷不会越堆越多)。"""
+    ctx.need_ui_helpers = True
+    list_name = (getattr(node, "gk_list", "") or "").strip()
+    if not list_name:
+        ctx.warn(f"『{node.bl_label}』没有填『列表』(哪个列表?)—— 这一句被跳过了")
+        return
+    if list_name not in _ui_list_names(ctx):
+        ctx.warn(f"『{node.bl_label}』的『列表』填的是『{list_name}』,"
+                 f"但图里没有一个叫这个名字的『界面_列表』—— 这一句被跳过了")
+        return
+    socket = ctx._socket(node, "内容")
+    if socket is not None and getattr(socket, "is_linked", False):
+        source = ctx.expr_of(socket)
+    else:
+        var_name = (getattr(node, "gk_var", "") or "").strip()
+        if var_name:
+            source = ctx.declare_var(var_name, "Array")
+            ctx.read_vars.add(source)
+        else:
+            raw = str(getattr(node, "gk_text", "") or "")
+            items = [part.strip() for part in raw.split("|") if part.strip()]
+            source = "[" + ", ".join(gd_string(item) for item in items) + "]"
+    line_height = gd_number(float(getattr(node, "gk_line_height", 0.0) or 0.0))
+    size = int(getattr(node, "gk_size", 20) or 20)
+    color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+    ctx.need_list_helper = True      # _gk_list_fill 内部要用 _gk_list_body
+    ctx.need_list_fill_helper = True
+    helper = ctx.declare_func_name("_gk_list_fill", key="__list_fill__")
+    ctx.add_line(indent, f"{helper}({gd_string(list_name)}, {source}, "
+                         f"{line_height}, {size}, "
+                         f"Color({gd_number(color[0])}, {gd_number(color[1])}, "
+                         f"{gd_number(color[2])}, {gd_number(color[3])}))")
+
+
+@stmt_node("GKNodeUiTween")
+def _stmt_ui_tween(ctx, node, indent):
+    """把一个界面控件的属性缓动过去(菜单淡入 / 提示条滑进来)。"""
+    ctx.need_ui_helpers = True
+    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    if not widget_name:
+        ctx.warn(f"『{node.bl_label}』没有填『控件名』—— 这一句被跳过了")
+        return
+    prop = str(getattr(node, "gk_property", "ALPHA") or "ALPHA")
+    to = ctx.input_number(node, "到", gd_number(getattr(node, "gk_to", 1.0)))
+    time = gd_number(float(getattr(node, "gk_time", 0.4) or 0.0))
+    delay = float(getattr(node, "gk_delay", 0.0) or 0.0)
+    wait = bool(getattr(node, "gk_wait", False))
+    trans = str(getattr(node, "gk_trans", "TRANS_SINE") or "TRANS_SINE")
+    ease = str(getattr(node, "gk_ease", "EASE_OUT") or "EASE_OUT")
+    # 位置 X / Y 是**相对**的(+80 = 往右 80):写法差一点点,见节点说明
+    relative = prop in ("POS_X", "POS_Y")
+    paths = {
+        "ALPHA": "modulate:a",
+        "POS_X": "position:x",
+        "POS_Y": "position:y",
+        "SCALE": "scale:x",
+        "WIDTH": "size:x",
+        "HEIGHT": "size:y",
+    }
+    path = paths.get(prop, "modulate:a")
+
+    var = ctx.new_temp("widget")
+    tween = ctx.new_temp("ui_tween")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"if {var} == null:")
+    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.add_line(indent, "else:")
+    body = indent + 1
+    ctx.add_line(body, f"var {tween} := {var}.create_tween()")
+    ctx.add_line(body, f"{tween}.set_trans(Tween.{trans})")
+    ctx.add_line(body, f"{tween}.set_ease(Tween.{ease})")
+    if delay > 0.0:
+        ctx.add_line(body, f"{tween}.tween_interval({gd_number(delay)})")
+    if relative:
+        axis = "x" if prop == "POS_X" else "y"
+        ctx.add_line(body, f"{tween}.tween_property({var}, \"{path}\", "
+                           f"{var}.position.{axis} + ({to}), {time})")
+    else:
+        ctx.add_line(body, f"{tween}.tween_property({var}, \"{path}\", {to}, {time})")
+    if wait:
+        # 勾了"等它播完":后面的节点等动画结束再走(不勾就边播边往下)
+        ctx.add_line(body, f"await {tween}.finished")
+
+
+@stmt_node("GKNodeUiNinePatch")
+def _stmt_ui_ninepatch(ctx, node, indent):
+    """九宫格底图(九个切片,拉多大都不变形)。"""
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "NinePatchRect",
+                             key=node_lib.node_key(node))
+    raw = str(getattr(node, "gk_image", "") or "").strip()
+    if not raw:
+        ctx.warn(f"『{node.bl_label}』还没选图片 —— 游戏里这块是空的"
+                 f"(点节点上的『选图片』挑一张)")
+    path_expr = gd_string(_ui_image_res(raw))
+    patch = int(getattr(node, "gk_slice", 12) or 0)
+    width = gd_number(getattr(node, "gk_width", 360.0))
+    height = gd_number(getattr(node, "gk_height", 120.0))
+    tint = getattr(node, "gk_tint", (1.0, 1.0, 1.0, 1.0))
+    bottom = bool(getattr(node, "gk_bottom", False))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = NinePatchRect.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    for side in ("left", "top", "right", "bottom"):
+        ctx.add_line(indent + 1, f"{widget}.patch_margin_{side} = {patch}")
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{widget}.modulate = Color({gd_number(tint[0])}, "
+                             f"{gd_number(tint[1])}, {gd_number(tint[2])}, "
+                             f"{gd_number(tint[3])})")
+    after = []
+    if bottom:
+        after.append(f"{widget}.get_parent().move_child({widget}, 0)")
+    _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    ctx.add_line(indent, f"if ResourceLoader.exists({path_expr}):")
+    ctx.add_line(indent + 1, f"{widget}.texture = load({path_expr})")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("找不到界面图片: " + str({path_expr}))')
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "12.0", "12.0")
+
+
+@stmt_node("GKNodeUiInput")
+def _stmt_ui_input(ctx, node, indent):
+    """输入框(LineEdit):回车沿『提交』出口继续。
+
+    ── 为什么出口不叫『完成』 ──────────────────────────────────────
+    和按钮同一个道理:叫『完成』会在输入框刚建出来就往下跑。
+    真正的续接在 `text_submitted` 回调里(真 Godot 实测:**回车**触发、
+    点别处失焦**不**触发)。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "LineEdit",
+                             key=node_lib.node_key(node))
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(node.name, 'input')}_submit", key=node_lib.node_key(node))
+    text = ctx.input_string(node, "默认文字", "")
+    placeholder = gd_string(str(getattr(node, "gk_placeholder", "") or ""))
+    max_length = int(getattr(node, "gk_max_length", 24) or 0)
+    secret = bool(getattr(node, "gk_password", False))
+    focus = bool(getattr(node, "gk_focus", False))
+    width = gd_number(getattr(node, "gk_width", 240.0))
+    height = gd_number(getattr(node, "gk_height", 40.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = LineEdit.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.placeholder_text = {placeholder}")
+    ctx.add_line(indent + 1, f"{widget}.max_length = {max_length}")
+    if secret:
+        ctx.add_line(indent + 1, f"{widget}.secret = true")
+    # 输入框必须吃鼠标 / 键盘,否则点不进去
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    ctx.add_line(indent + 1, f"{widget}.text_submitted.connect({handler})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+    ctx.add_line(indent, f"{widget}.text = str({text})")
+    if focus:
+        ctx.add_line(indent, f"{widget}.grab_focus()")
+
+    saved_sink = ctx.sink
+    lines = ctx.new_section()
+    ctx._active.clear()
+    prev_event = ctx._current_event
+    ctx._current_event = node.name
+    _chain(ctx, node, 1, "提交")
+    if len(lines) == 0:
+        lines.add(1, "pass")
+    ctx._current_event = prev_event
+    ctx.sink = saved_sink
+    ctx.extra_sections.append({
+        "signature": f"func {handler}(_text: String) -> void:",
+        "lines": list(lines.lines),
+        "empty_body": "    pass",
+        "separator": True,
+    })
+
+
+@stmt_node("GKNodeUiFocus")
+def _stmt_ui_focus(ctx, node, indent):
+    """把键盘 / 手柄焦点放到某个控件上(方向键就能选按钮了)。"""
+    ctx.need_ui_helpers = True
+    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    focus = bool(getattr(node, "gk_focus", True))
+    if not widget_name:
+        # 留空 = 清掉焦点(回到鼠标操作)
+        ctx.add_line(indent, "var _gk_focused := get_viewport().gui_get_focus_owner()")
+        ctx.add_line(indent, "if _gk_focused != null:")
+        ctx.add_line(indent + 1, "_gk_focused.release_focus()")
+        return
+    var = ctx.new_temp("widget")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"if {var} == null:")
+    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.add_line(indent, "else:")
+    if focus:
+        ctx.add_line(indent + 1, f"{var}.grab_focus()")
+    else:
+        ctx.add_line(indent + 1, f"{var}.release_focus()")
 
 
 @stmt_node("GKNodeFloatText")

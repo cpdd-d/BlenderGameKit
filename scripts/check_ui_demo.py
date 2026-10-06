@@ -23,6 +23,19 @@
     再点一下关掉,并且**关掉之后才**改"得分"文字(执行流真的停过);
   * **暂停菜单**:Esc -> 世界冻住 + 菜单弹出;点『继续游戏』-> 解冻 +
     菜单收回去(世界冻着的时候按钮照样点得动)。
+
+第二版(第三十八轮)多看五样:
+  * **列表**:暂停菜单里的『存档列表』是 ScrollContainer + VBox 两层,
+    两个存档槽**挂在里层容器里自动从上往下排**(没填 X / Y);
+    点『存档一』-> "得分"变成"读取存档一"(能点的行各接各的链);
+  * **列表_填充**:左下『日志列表』正好三行,文字和图上写的一致
+    (每行一个 Label,先清空再建);
+  * **九宫格**:菜单顶上『标题条』是 NinePatchRect,四边切片 = 14、
+    贴图 64×64,而且是菜单的**第一个子节点**(『垫底』没盖住标题);
+  * **缓动 + 焦点**:对话结束后昵称框淡入(透明度 0.15 -> 1.0),
+    并且**焦点在它身上**(键盘直接能打字);
+  * **输入框**:给框里打"阿飞" + 回车 -> 『界面_取文字』读出来 -> "得分"
+    变成"阿飞"(整条 取文字 -> 改文字 的链路)。
 """
 
 import argparse
@@ -57,6 +70,11 @@ var paused_before := false
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	# ⚠ 无头模式的默认视口只有 64×64:暂停菜单(440×340)会摆到屏幕外面,
+	#   菜单里按钮的点击坐标落在视口之外 —— push_input 打不中(实测:
+	#   点了『继续游戏』游戏没解冻)。先把窗口调成正常分辨率**再**实例化
+	#   世界,界面就按这块屏幕摆。
+	get_window().size = Vector2i(1152, 648)
 	world = load("res://scenes/World.tscn").instantiate()
 	add_child(world)
 	var ui := world.find_child("GKUI", true, false)
@@ -90,27 +108,47 @@ func _physics_process(delta: float) -> void:
 	elif phase == 3 and elapsed >= 1.5:
 		phase = 4
 		_check_dialog_done()
+		# 对话结束后的那两步:输入框淡入 + 焦点交给它(都在 1.4 秒前跑完)
+		_check_focus_and_tween()
 		_send_key(KEY_ESCAPE, true)           # 按住 Esc(热键是每帧轮询的)
-	elif phase == 4 and elapsed >= 2.0:
+	elif phase == 4 and elapsed >= 1.9:
 		phase = 5
 		_send_key(KEY_ESCAPE, false)
 		_check_pause()
-	elif phase == 5 and elapsed >= 2.4:
+		_check_menu_list()                     # 菜单开着,正好看列表 / 九宫格
+	elif phase == 5 and elapsed >= 2.15:
 		phase = 6
+		# 暂停中点击列表里的『存档一』(能点的行各接各的链)
+		var slot := _widget("存档槽一")
+		if slot != null:
+			_click_at(slot.get_global_rect().get_center())
+	elif phase == 6 and elapsed >= 2.45:
+		phase = 7
+		_check_slot_click()
 		paused_before = get_tree().paused
 		var button := _widget("继续按钮")
 		if button != null:
 			_click_at(button.get_global_rect().get_center())
-	elif phase == 6 and elapsed >= 2.9:
-		phase = 7
+	elif phase == 7 and elapsed >= 2.9:
+		phase = 8
 		_check_resume()
+		_check_log_list()                      # 『列表_填充』灌的三行
+		_submit_nickname()                     # 打字 + 回车,交给下一个阶段看
+	elif phase == 8 and elapsed >= 3.4:
+		phase = 9
+		_check_submitted()
 		print("UI_DONE")
 		set_physics_process(false)
+		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
+		# 靠 `--quit-after` 卡帧数容易"还没跑到最后一条就被掐了"(实测)。
+		# --quit-after 留着当安全网(卡死时兜底)。
+		get_tree().quit()
 
 
 func _check_widgets() -> void:
 	var names := ["HUD底", "徽标", "分数", "血条", "底部提示",
-		"暂停菜单", "暂停标题", "继续按钮", "退出按钮"]
+		"暂停菜单", "暂停标题", "继续按钮", "退出按钮",
+		"标题条", "存档列表", "存档槽一", "存档槽二", "日志列表", "昵称"]
 	var missing: Array = []
 	for name in names:
 		if _widget(name) == null:
@@ -216,6 +254,85 @@ func _check_resume() -> void:
 		" was=", paused_before, " now=", paused, " hidden=", hidden)
 
 
+# ── 第三十八轮:列表 / 九宫格 / 缓动 + 焦点 / 输入框 ────────────────
+
+func _check_focus_and_tween() -> void:
+	var field := _widget("昵称") as LineEdit
+	var owner := get_viewport().gui_get_focus_owner()
+	var focus_ok: bool = field != null and owner == field
+	var alpha_ok: bool = field != null and field.modulate.a > 0.95
+	print("UI_FOCUS_TWEEN ok=", focus_ok and alpha_ok,
+		" focus=", owner.name if owner != null else "<none>",
+		" alpha=", field.modulate.a if field != null else -1.0)
+
+
+func _check_menu_list() -> void:
+	# 列表 = 滚动容器 + 里层排版容器;两个槽挂在里层、从上往下排
+	var list := _widget("存档列表")
+	var body: Node = null
+	if list != null and list.get_child_count() > 0:
+		body = list.get_child(0)
+	var slot_one := _widget("存档槽一")
+	var slot_two := _widget("存档槽二")
+	var stacked := false
+	var note := "no slots"
+	if slot_one != null and slot_two != null:
+		stacked = body != null \\
+			and slot_one.get_parent() == body and slot_two.get_parent() == body \\
+			and slot_two.position.y > slot_one.position.y + 10.0 \\
+			and absf(slot_two.position.x - slot_one.position.x) < 1.0
+		note = "one=" + str(slot_one.position) + " two=" + str(slot_two.position) \\
+			+ " body=" + (body.name if body != null else "<none>")
+	print("UI_LIST ok=", list != null and body is VBoxContainer and stacked, " ", note)
+
+	# 九宫格:四边切片都 = 14、贴图 64×64,而且是菜单的**第一个子节点**
+	var bar := _widget("标题条") as NinePatchRect
+	var menu := _widget("暂停菜单")
+	var slices_ok: bool = bar != null and bar.patch_margin_left == 14 \\
+		and bar.patch_margin_top == 14 and bar.patch_margin_right == 14 \\
+		and bar.patch_margin_bottom == 14
+	var tex_ok: bool = bar != null and bar.texture != null \\
+		and int(bar.texture.get_size().x) == 64
+	var behind: bool = menu != null and bar != null and menu.get_child(0) == bar
+	print("UI_NINEPATCH ok=", slices_ok and tex_ok and behind,
+		" slices=", slices_ok, " tex=", tex_ok, " behind=", behind)
+
+
+func _check_slot_click() -> void:
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	print("UI_LIST_CLICK ok=", text == "读取存档一", " score=", text)
+
+
+func _check_log_list() -> void:
+	var list := _widget("日志列表")
+	var body: Node = null
+	if list != null and list.get_child_count() > 0:
+		body = list.get_child(0)
+	var rows: Array = []
+	if body != null:
+		for child in body.get_children():
+			rows.append(child.text if child is Label else str(child))
+	print("UI_LIST_FILL ok=", rows == ["拾取了钥匙", "打开了大门", "抵达终点"],
+		" rows=", rows)
+
+
+func _submit_nickname() -> void:
+	var field := _widget("昵称") as LineEdit
+	if field == null:
+		return
+	field.grab_focus()          # 玩家点一下文本框
+	field.text = "阿飞"
+	_send_key(KEY_ENTER, true)  # 回车提交 -> text_submitted -> 取文字 -> 改"得分"
+	_send_key(KEY_ENTER, false)
+
+
+func _check_submitted() -> void:
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	print("UI_SUBMIT ok=", text == "阿飞", " score=", text)
+
+
 func _send_key(code: int, pressed: bool) -> void:
 	var event := InputEventKey.new()
 	event.keycode = code
@@ -275,8 +392,9 @@ def run_godot(godot):
     subprocess.run([godot, "--headless", "--path", OUT, "--import"],
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
+    # --quit-after 只是安全网:探针查完会自己 quit(见 PROBE_GD 末尾)
     run = subprocess.run([godot, "--headless", "--path", OUT,
-                          "--quit-after", "420"],
+                          "--quit-after", "1800"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -311,6 +429,12 @@ def main():
         (r"UI_DIALOG ok=true", "对话框点按流程不对(补完 / 关掉 / 关掉后才改文字)"),
         (r"UI_PAUSE ok=true", "Esc 没有冻住世界 / 菜单没弹出来"),
         (r"UI_RESUME ok=true", "点『继续游戏』没有解冻 / 菜单没收回去"),
+        (r"UI_LIST ok=true", "列表没建两层 / 存档槽没挂在里层容器里排队"),
+        (r"UI_LIST_CLICK ok=true", "点『存档一』没走进它自己的点击链"),
+        (r"UI_LIST_FILL ok=true", "『列表_填充』没灌出三行日志"),
+        (r"UI_NINEPATCH ok=true", "九宫格切片 / 贴图 / 垫底 不对"),
+        (r"UI_FOCUS_TWEEN ok=true", "输入框没淡入到不透明 / 焦点没落到它身上"),
+        (r"UI_SUBMIT ok=true", "输入框回车提交后『取文字 -> 改文字』没生效"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -335,6 +459,17 @@ def main():
                 ("_gk_dialog_show(", "对话框辅助函数"),
                 ("_gk_apply_pause(", "暂停 / 继续世界"),
                 ("process_frame.connect(_gk_pause_watch)", "Esc 热键(暂停也读得到按键)"),
+                # ---- 第二版(第三十八轮)----
+                ("ScrollContainer.new()", "『界面_列表』的滚动容器"),
+                ("VBoxContainer.new()", "『界面_列表』里层排版的容器"),
+                ("custom_minimum_size", "列表里的控件交给容器排版"),
+                ("_gk_list_fill(", "『界面_列表_填充』"),
+                ("NinePatchRect.new()", "『界面_九宫格』"),
+                ("LineEdit.new()", "『界面_输入框』"),
+                ("text_submitted.connect(", "输入框回车提交"),
+                ("\"modulate:a\"", "『界面_缓动』"),
+                ("_gk_widget_text(", "『界面_取文字』"),
+                ("grab_focus()", "『界面_设焦点』"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")
@@ -342,8 +477,9 @@ def main():
         art = os.path.join(OUT, "art")
         pngs = [name for name in os.listdir(art)
                 if name.startswith("ui_") and name.endswith(".png")] if os.path.isdir(art) else []
-        if not pngs:
-            print("✗ art/ 里没有界面图片(ui_*.png)")
+        # 两张图:徽标 + 九宫格标题条图(各自的摘要不同,不会互相覆盖)
+        if len(pngs) < 2:
+            print(f"✗ art/ 里的界面图片不足两张(徽标 + 标题条图): {pngs}")
             ok = False
         else:
             print(f"art/ 界面图片: {pngs}")

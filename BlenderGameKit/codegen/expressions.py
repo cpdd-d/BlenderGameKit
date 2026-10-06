@@ -799,6 +799,23 @@ def _expr_mouse_position(ctx, node):
     return "get_viewport().get_mouse_position()"
 
 
+@expr_node("GKNodeUiReadText")
+def _expr_ui_read_text(ctx, node):
+    """读界面控件上的文字(第三十八轮:输入框里玩家打的字 / 标签 / 按钮)。
+
+    走一个 `_gk_widget_text(名字)` 辅助函数 —— 不能在表达式里声明
+    `_gk_ui_<名字>` 变量:那个成员变量由**创建它的节点**用具体类型
+    (Label / Button / LineEdit)声明过了,再按 "Control" 声明一遍会撞类型。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_widget_text_helper = True
+    name = (getattr(node, "gk_widget", "") or "").strip()
+    if not name:
+        ctx.warn(f"『{node.bl_label}』没有填控件名 —— 会读到空字符串")
+        return '""'
+    return f"_gk_widget_text({gd_string(name)})"
+
+
 def ensure_mouse_delta(ctx):
     """保证 `_gk_mouse_delta`(这一帧鼠标走了多少像素)存在并会被累积。
 

@@ -24,6 +24,17 @@
 | **界面_暂停游戏** | **Esc** 开关暂停(世界冻住 + 菜单弹出 + 鼠标放出来) |
 | **界面_按钮** | 菜单里的『继续游戏』『退出游戏』—— 暂停的时候照样点得动 |
 
+── 第二版(第三十八轮)新加的五样 ──────────────────────────────
+
+| 用到的 | 在游戏里怎么看 |
+|---|---|
+| **界面_列表** | 暂停菜单里的『存档列表』:两个存档槽**自动从上往下排**(不用手填 X / Y),点哪个读哪档;左下角还有一个『日志列表』 |
+| **界面_列表_填充** | 『日志列表』里那三行日志 —— 一个节点灌一个数组,每行一条 |
+| **界面_九宫格** | 暂停菜单顶上的**标题条**:一张 64×64 的小图,四边不拉伸、中间拉满 —— 拉多宽边框都不变形(切片 = 14) |
+| **界面_输入框** | 左上角那个昵称框:**回车**提交(对话结束后它自动获得焦点,键盘直接能打字),提交后"得分"变成你打的名字 |
+| **界面_缓动** | 输入框淡入(透明度 0.15 -> 1,0.2 秒);**界面_设焦点** 紧接着把焦点放到它身上 |
+| **界面_设焦点** | 对话结束后焦点落在昵称框上 —— 键盘用户不用摸鼠标 |
+
 跑法(Godot):打开 `界面示例_godot` 直接 F5。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ui_demo.py`
 """
@@ -46,6 +57,10 @@ STAGE = "舞台"
 # 导出时靠 `image.save_render` 落盘 —— 这条路正好一起验了。
 LOGO_NAME = "徽标"
 LOGO_SIZE = 128
+# 九宫格标题条的底图(第三十八轮):64×64、边框 14 像素 —— 『切片』填 14
+BAR_NAME = "标题条图"
+BAR_SIZE = 64
+BAR_BORDER = 14
 DIALOG_TEXT = ("欢迎!这是界面示例:图片、血条、对话框和暂停菜单都在这一屏。"
                "点一下继续。")
 
@@ -120,6 +135,40 @@ def make_logo_image():
     return image
 
 
+def make_bar_image():
+    """生成一张 64×64 的标题条底图(深色底 + 一圈亮边框)。
+
+    ── 为什么专门做一张,而不是拿徽标凑(第三十八轮)────────────────
+    九宫格的用法是"四边不拉伸、中间拉满" —— 图本身得是一圈**边框**
+    (四个角有花样、中间是纯色)切片才对得上;拿圆盘图去切,拉出来的
+    四条边会是弧线,一眼假。边框宽度 = 14 像素,正好是节点上『切片』的值。
+    """
+    image = bpy.data.images.get(BAR_NAME)
+    if image is not None:
+        bpy.data.images.remove(image)
+    image = bpy.data.images.new(BAR_NAME, BAR_SIZE, BAR_SIZE, alpha=True)
+    pixels = [0.0] * (BAR_SIZE * BAR_SIZE * 4)
+    for y in range(BAR_SIZE):
+        for x in range(BAR_SIZE):
+            # 到最近一条边的距离:0 = 最外圈
+            edge = min(x, y, BAR_SIZE - 1 - x, BAR_SIZE - 1 - y)
+            if edge < 2:
+                rgba = (0.08, 0.08, 0.12, 1.0)        # 外沿描边
+            elif edge < 5:
+                rgba = (0.55, 0.45, 0.85, 1.0)        # 亮内线(角的"花样")
+            elif edge < BAR_BORDER:
+                rgba = (0.22, 0.19, 0.34, 1.0)        # 边框填充
+            else:
+                rgba = (0.13, 0.14, 0.20, 0.95)       # 中间(拉伸区)
+            index = (y * BAR_SIZE + x) * 4
+            pixels[index:index + 4] = list(rgba)
+    image.pixels = pixels
+    image.pack()
+    log(f"标题条图:{BAR_NAME} {BAR_SIZE}×{BAR_SIZE} 边框 {BAR_BORDER}"
+        f"(程序生成 + 打包)")
+    return image
+
+
 def build_scene():
     scene = clear_scene()
     # ⚠ 必须有**不止一个网格**:整场景只有"角色"一个网格时插件不会生成
@@ -130,6 +179,7 @@ def build_scene():
     stage = make_box(STAGE, (2.0, 2.0, 0.2), (0.0, 0.0, 0.0),
                      (0.20, 0.24, 0.32, 1.0))
     make_logo_image()
+    make_bar_image()
     log(f"场景:背景板 + {STAGE}(挂脚本的载体;这一屏的重点在界面,不在玩法)")
     return scene, stage
 
@@ -226,33 +276,75 @@ def _build_ui_chain(tree, ready):
                gk_value=0.7, gk_max=1.0, gk_width=292.0, gk_height=16.0,
                gk_x=14.0, gk_y=96.0, gk_color=(0.35, 0.85, 0.45, 1.0),
                gk_parent_widget="HUD底")
-    # ── 暂停菜单:底板(正中、开局藏)+ 三个控件挂在它下面 ──────────
+    # ── 暂停菜单:底板(正中、开局藏)+ 控件挂在它下面 ──────────
+    # 菜单里从上往下:标题条(九宫格底图)→ 存档列表(两个槽)→ 两个按钮
     menu = _add(tree, "GKNodeUiPanel", "暂停菜单", 1040.0, 0.0,
-                gk_width=440.0, gk_height=300.0, gk_radius=18,
+                gk_width=440.0, gk_height=340.0, gk_radius=18,
                 gk_align="CENTER", gk_start_hidden=True,
                 gk_color=(0.05, 0.06, 0.09, 0.86))
     title = _add(tree, "GKNodeUiText", "暂停标题", 1300.0, 0.0,
                  gk_text="已暂停", gk_size=30, gk_align="TOP_CENTER",
                  gk_margin=26.0, gk_parent_widget="暂停菜单")
-    resume = _add(tree, "GKNodeUiButton", "继续按钮", 1560.0, 0.0,
-                  gk_text="继续游戏", gk_x=130.0, gk_y=104.0,
+    # 标题条**故意放在标题文字后面建**:勾了『垫底』它会被挪到最下面,
+    # 不会盖住先建好的"已暂停"(这就是垫底存在的意义)
+    title_bar = _add(tree, "GKNodeUiNinePatch", "标题条", 1300.0, -260.0,
+                     gk_image=BAR_NAME, gk_slice=BAR_BORDER,
+                     gk_x=20.0, gk_y=14.0, gk_width=400.0, gk_height=54.0,
+                     gk_bottom=True, gk_parent_widget="暂停菜单")
+    # ── 存档列表:两个槽(按钮)挂进容器,自动从上往下排 ──────────
+    save_list = _add(tree, "GKNodeUiList", "存档列表", 1560.0, 0.0,
+                     gk_x=130.0, gk_y=84.0, gk_width=180.0, gk_height=112.0,
+                     gk_separation=6, gk_parent_widget="暂停菜单")
+    slot_one = _add(tree, "GKNodeUiButton", "存档槽一", 1820.0, 0.0,
+                    gk_text="存档一", gk_width=170.0, gk_height=40.0,
+                    gk_parent_widget="存档列表")
+    slot_two = _add(tree, "GKNodeUiButton", "存档槽二", 1820.0, -200.0,
+                    gk_text="存档二", gk_width=170.0, gk_height=40.0,
+                    gk_parent_widget="存档列表")
+    resume = _add(tree, "GKNodeUiButton", "继续按钮", 2080.0, 0.0,
+                  gk_text="继续游戏", gk_x=130.0, gk_y=206.0,
                   gk_width=180.0, gk_height=48.0,
                   gk_parent_widget="暂停菜单")
-    quit_button = _add(tree, "GKNodeUiButton", "退出按钮", 1560.0, -260.0,
-                       gk_text="退出游戏", gk_x=130.0, gk_y=176.0,
+    quit_button = _add(tree, "GKNodeUiButton", "退出按钮", 2080.0, -260.0,
+                       gk_text="退出游戏", gk_x=130.0, gk_y=262.0,
                        gk_width=180.0, gk_height=48.0,
                        gk_parent_widget="暂停菜单")
-    hotkey = _add(tree, "GKNodeUiPauseGame", "暂停热键", 1840.0, 0.0,
+    # ── 左下角:日志列表(只显示的行,用『列表_填充』灌三行)────────
+    logs = _add(tree, "GKNodeUiList", "日志列表", 2340.0, 0.0,
+                gk_width=260.0, gk_height=120.0, gk_separation=4,
+                gk_align="BOTTOM_LEFT", gk_margin=16.0)
+    fill = _add(tree, "GKNodeUiListFill", "填日志", 2600.0, 0.0,
+                gk_list="日志列表",
+                gk_text="拾取了钥匙|打开了大门|抵达终点",
+                gk_size=20, gk_color=(0.82, 0.86, 0.95, 1.0))
+    # ── 昵称输入框:回车提交,提交后把字写进"得分" ────────────────
+    nickname = _add(tree, "GKNodeUiInput", "昵称", 2860.0, 0.0,
+                    gk_placeholder="输入昵称,回车确认",
+                    gk_x=12.0, gk_y=152.0, gk_width=260.0, gk_height=40.0,
+                    gk_max_length=12)
+    read_name = _add(tree, "GKNodeUiReadText", "读昵称", 3120.0, -120.0,
+                     gk_widget="昵称")
+    write_name = _add(tree, "GKNodeUiSet", "把名字写进得分", 3120.0, 0.0,
+                      gk_widget="分数", gk_set_text=True)
+    hotkey = _add(tree, "GKNodeUiPauseGame", "暂停热键", 3380.0, 0.0,
                   gk_pause=False, gk_menu="暂停菜单", gk_hotkey=True)
-    hint = _add(tree, "GKNodeUiText", "底部提示", 2100.0, 0.0,
-                gk_text="点一下继续对话 / Esc 暂停", gk_size=20,
-                gk_align="BOTTOM_CENTER", gk_margin=28.0)
-    dialog = _add(tree, "GKNodeUiDialog", "开场白", 2360.0, 0.0,
+    hint = _add(tree, "GKNodeUiText", "底部提示", 3640.0, 0.0,
+                gk_text="点一下继续对话 / Esc 暂停 / 对话后在昵称框回车",
+                gk_size=20, gk_align="BOTTOM_CENTER", gk_margin=28.0)
+    dialog = _add(tree, "GKNodeUiDialog", "开场白", 3900.0, 0.0,
                   gk_speaker="向导", gk_text=DIALOG_TEXT,
                   gk_speed=28.0, gk_width=640.0, gk_height=150.0,
                   gk_margin=56.0)
-    after = _add(tree, "GKNodeUiSet", "改分数文字", 2640.0, 0.0,
+    after = _add(tree, "GKNodeUiSet", "改分数文字", 4160.0, 0.0,
                  gk_widget="分数", gk_set_text=True, gk_text="对话结束")
+    # 对话结束后:输入框淡入(缓动) -> 焦点交给它(键盘直接能打字)
+    dim = _add(tree, "GKNodeUiSet", "昵称半透明", 4420.0, 0.0,
+               gk_widget="昵称", gk_set_alpha=True, gk_alpha=0.15)
+    fade_in = _add(tree, "GKNodeUiTween", "淡入昵称", 4680.0, 0.0,
+                   gk_widget="昵称", gk_property="ALPHA", gk_to=1.0,
+                   gk_time=0.2, gk_wait=True)
+    focus_field = _add(tree, "GKNodeUiFocus", "聚焦昵称", 4940.0, 0.0,
+                       gk_widget="昵称")
 
     _link(tree, ready, "执行", hud, "执行")
     _link(tree, hud, "完成", logo, "执行")
@@ -260,24 +352,47 @@ def _build_ui_chain(tree, ready):
     _link(tree, score, "完成", bar, "执行")
     _link(tree, bar, "完成", menu, "执行")
     _link(tree, menu, "完成", title, "执行")
-    _link(tree, title, "完成", resume, "执行")
+    _link(tree, title, "完成", title_bar, "执行")
+    _link(tree, title_bar, "完成", save_list, "执行")
+    _link(tree, save_list, "完成", slot_one, "执行")
+    _link(tree, slot_one, "完成", slot_two, "执行")
+    _link(tree, slot_two, "完成", resume, "执行")
     _link(tree, resume, "完成", quit_button, "执行")
-    _link(tree, quit_button, "完成", hotkey, "执行")
+    _link(tree, quit_button, "完成", logs, "执行")
+    _link(tree, logs, "完成", fill, "执行")
+    _link(tree, fill, "完成", nickname, "执行")
+    _link(tree, nickname, "完成", hotkey, "执行")
     _link(tree, hotkey, "完成", hint, "执行")
     _link(tree, hint, "完成", dialog, "执行")
     _link(tree, dialog, "完成", after, "执行")
+    _link(tree, after, "完成", dim, "执行")
+    _link(tree, dim, "完成", fade_in, "执行")
+    _link(tree, fade_in, "完成", focus_field, "执行")
+
+    # 输入框『提交』(回车):读框里的字 -> 写进"得分"
+    _link(tree, read_name, "文字", write_name, "文字")
+    _link(tree, nickname, "提交", write_name, "执行")
 
     # 菜单里的按钮:先解除暂停,再回到游戏 / 退出
-    back = _add(tree, "GKNodeUiPauseGame", "继续游戏", 1840.0, -260.0,
+    back = _add(tree, "GKNodeUiPauseGame", "继续游戏", 3380.0, -260.0,
                 gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
     _link(tree, resume, "点击", back, "执行")
-    quit_pause = _add(tree, "GKNodeUiPauseGame", "退出前解除暂停", 1840.0, -520.0,
+    quit_pause = _add(tree, "GKNodeUiPauseGame", "退出前解除暂停", 3380.0, -520.0,
                       gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
-    quit_game = _add(tree, "GKNodeQuitGame", "退出(菜单)", 2100.0, -520.0)
+    quit_game = _add(tree, "GKNodeQuitGame", "退出(菜单)", 3640.0, -520.0)
     _link(tree, quit_button, "点击", quit_pause, "执行")
     _link(tree, quit_pause, "完成", quit_game, "执行")
-    log("界面链:面板 -> 图片 -> 文本 -> 进度条 -> 暂停菜单 -> 底部提示 -> 对话框")
-    return after
+    # 存档槽(能点的行):各接各的点击链(这是"列表里放按钮"的正式用法)
+    load_one = _add(tree, "GKNodeUiSet", "读档一", 3640.0, -780.0,
+                    gk_widget="分数", gk_set_text=True, gk_text="读取存档一")
+    load_two = _add(tree, "GKNodeUiSet", "读档二", 3640.0, -1040.0,
+                    gk_widget="分数", gk_set_text=True, gk_text="读取存档二")
+    _link(tree, slot_one, "点击", load_one, "执行")
+    _link(tree, slot_two, "点击", load_two, "执行")
+    log("界面链:面板 -> 图片 -> 文本 -> 进度条 -> 暂停菜单(九宫格标题条 + "
+        "存档列表) -> 日志列表(填充) -> 昵称输入框 -> 提示 -> 对话框 -> "
+        "淡入 + 聚焦")
+    return focus_field
 
 
 def _build_frame_chain(tree, physics):

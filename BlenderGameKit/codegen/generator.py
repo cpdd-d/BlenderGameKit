@@ -921,6 +921,64 @@ class Generator:
                 "empty_body": "    pass",
                 "separator": True,
             })
+            if self.ctx.need_list_helper:
+                sections.append({
+                    # 列表是两层(滚动容器 + 里面排版的 VBox/HBox);
+                    # 子控件得挂**里层**才排队 —— 挂外层会浮着不动
+                    "signature": "func _gk_list_body(list_name: String) -> Control:",
+                    "lines": [
+                        "    var found := _gk_find_widget(list_name)",
+                        "    if found == null:",
+                        "        return null",
+                        "    for child in found.get_children():",
+                        "        if child is VBoxContainer or child is HBoxContainer:",
+                        "            return child as Control",
+                        "    return found",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+            if self.ctx.need_list_fill_helper:
+                sections.append({
+                    # 先清空旧行再建:每帧刷也不会越堆越多。
+                    # remove_child 是**立刻**摘掉(queue_free 要等帧末,
+                    # 那一帧里新旧行会同时占位置,列表看起来在抖)。
+                    "signature": ("func _gk_list_fill(list_name: String, items: Array, "
+                                  "line_height: float, font_size: int, color: Color) -> void:"),
+                    "lines": [
+                        "    var body := _gk_list_body(list_name)",
+                        "    if body == null:",
+                        '        push_warning("找不到列表控件: " + list_name)',
+                        "        return",
+                        "    for child in body.get_children():",
+                        "        body.remove_child(child)",
+                        "        child.queue_free()",
+                        "    for item in items:",
+                        "        var label := Label.new()",
+                        "        label.text = str(item)",
+                        '        label.add_theme_font_size_override("font_size", font_size)',
+                        '        label.add_theme_color_override("font_color", color)',
+                        "        label.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                        "        if line_height > 0.0:",
+                        "            label.custom_minimum_size = Vector2(0.0, line_height)",
+                        "        body.add_child(label)",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+            if self.ctx.need_widget_text_helper:
+                sections.append({
+                    "signature": "func _gk_widget_text(widget_name: String) -> String:",
+                    "lines": [
+                        "    var found := _gk_find_widget(widget_name)",
+                        "    if found == null:",
+                        "        return \"\"",
+                        "    var value: Variant = found.get(\"text\")",
+                        "    return str(value) if value != null else \"\"",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
             sections.append({
                 # 不带 host 参数:它从来没被用过,而 Godot 会把
                 # "参数没用上" 报成 UNUSED_PARAMETER(调试器里一条错误)。

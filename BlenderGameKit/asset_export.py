@@ -4587,7 +4587,9 @@ def ui_image_names(scene):
 
     ── 谁在用(第三十七轮:UI 设计)──────────────────────────────────
     『界面_图片』(图标 / logo)和『界面_对话框』的『立绘』填的是
-    `bpy.data.images` 里的图片名(`res://` 开头的路径原样用,不在这)。
+    `bpy.data.images` 里的图片名(`res://` 开头的路径原样用,不在这);
+    第三十八轮的『界面_九宫格』(标题条底图)也填同一套图片名
+    —— 漏掉它的话图不会落盘,游戏里 load 出来是 null(实测踩过)。
 
     ── 为什么要按**场景**收 ────────────────────────────────────────
     一个 .blend 里可以有多个场景(关卡1 / 关卡2),各用各的图;
@@ -4607,7 +4609,8 @@ def ui_image_names(scene):
     names = []
     for node in getattr(tree, "nodes", ()) or ():
         bl_idname = getattr(node, "bl_idname", "")
-        if bl_idname not in ("GKNodeUiImage", "GKNodeUiDialog"):
+        if bl_idname not in ("GKNodeUiImage", "GKNodeUiDialog",
+                             "GKNodeUiNinePatch"):
             continue
         raw = str(getattr(node, "gk_image", "") or "").strip()
         if raw and not raw.startswith("res://") and raw not in names:

@@ -1509,8 +1509,318 @@ class TestUiRound37(Base):
         gk_stub.connect(tree, event, "执行", printer, "执行")
         code, _ = gen(tree, V2)
         for helper in ("_gk_ensure_ui", "_gk_dialog_show", "_gk_apply_pause",
-                       "_gk_find_widget"):
+                       "_gk_find_widget", "_gk_list_body", "_gk_list_fill",
+                       "_gk_widget_text"):
             self.assertNotIn(helper, code)
+
+
+class TestUiRound38(Base):
+    """界面第二版(第三十八轮):列表 / 列表填充 / 缓动 / 九宫格 / 输入框 / 焦点。
+
+    这一批的共同约束(真 Godot 实测):
+      * **容器会完全接管子控件的位置和尺寸** —— 挂进『界面_列表』的控件
+        必须跳过摆位,尺寸改用 `custom_minimum_size`(写 position 是白写);
+      * 列表是**两层**(ScrollContainer + 里面排版的 VBox/HBox),
+        子控件得挂里层才排队;
+      * 输入框的续接走 `text_submitted` 回调(回车才触发),
+        所以『提交』出口的链必须在**独立函数**里、『完成』出口留在主流程。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    # ---- 列表 ----
+    def test_list_container_two_layers_and_child_layout(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        lst = tree.new_node(NN.GKNodeUiList, "存档列表", gk_width=300.0,
+                            gk_height=240.0, gk_separation=10)
+        button = tree.new_node(NN.GKNodeUiButton, "存档1", gk_text="存档1",
+                               gk_parent_widget="存档列表",
+                               gk_x=99.0, gk_y=99.0)
+        gk_stub.connect(tree, event, "执行", lst, "执行")
+        gk_stub.connect(tree, lst, "完成", button, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 两层:外层滚动容器(名字 = 节点名) + 里层排版的 VBox
+        self.assertIn("ScrollContainer.new()", code)
+        self.assertIn("VBoxContainer.new()", code)
+        self.assertIn('"separation", 10', code)
+        # 子控件挂到**里层**(挂外层会浮着不排队)
+        self.assertIn('_gk_list_body("存档列表")', code)
+        # 列表自己不在容器里 -> 用 size
+        self.assertIn(".size = Vector2(300.0, 240.0)", code)
+        # 列表里的按钮由容器排版:跳过 X / Y,尺寸走 custom_minimum_size
+        self.assertIn(".custom_minimum_size = Vector2(160.0, 48.0)", code)
+        self.assertNotIn("Vector2(99.0, 99.0)", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_list_child_skips_anchor_preset_too(self):
+        """选了对齐也不行:容器里的控件由容器排版,锚点同样是白写。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        lst = tree.new_node(NN.GKNodeUiList, "列表")
+        button = tree.new_node(NN.GKNodeUiButton, "项", gk_text="项",
+                               gk_parent_widget="列表", gk_align="CENTER")
+        gk_stub.connect(tree, event, "执行", lst, "执行")
+        gk_stub.connect(tree, lst, "完成", button, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("set_anchors_and_offsets_preset", code)
+
+    def test_horizontal_list_uses_hbox_and_can_drop_scroll(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        toolbar = tree.new_node(NN.GKNodeUiList, "工具栏", gk_vertical=False,
+                                gk_scroll=False)
+        gk_stub.connect(tree, event, "执行", toolbar, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 不滚动 = 只有一层(直接就是 HBox,不需要外面套滚动容器)
+        self.assertIn("HBoxContainer.new()", code)
+        self.assertNotIn("ScrollContainer.new()", code)
+        # 纯排版容器不吃鼠标:点空白应该穿到游戏 / 下面的控件
+        self.assertIn("Control.MOUSE_FILTER_IGNORE", code)
+
+    def test_list_alone_does_not_need_body_helper(self):
+        """只建一个空列表时不需要 `_gk_list_body`(没子控件要挂里层)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        lst = tree.new_node(NN.GKNodeUiList, "空列表")
+        gk_stub.connect(tree, event, "执行", lst, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_gk_list_body", code)
+
+    # ---- 列表填充 ----
+    def test_list_fill_clears_then_rebuilds_rows(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        lst = tree.new_node(NN.GKNodeUiList, "日志列表")
+        fill = tree.new_node(NN.GKNodeUiListFill, "填日志", gk_list="日志列表",
+                             gk_text="第一名|第二名| 第三名 ")
+        gk_stub.connect(tree, event, "执行", lst, "执行")
+        gk_stub.connect(tree, lst, "完成", fill, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 竖线分隔 + 两头空白去掉
+        self.assertIn('["第一名", "第二名", "第三名"]', code)
+        self.assertIn('_gk_list_fill("日志列表"', code)
+        # 先清空旧行再建(每帧刷不会越堆越多);立刻 remove_child 而不是
+        # 只 queue_free(等帧末的话那一帧新旧行同时占位,列表会抖)
+        self.assertIn("body.remove_child(child)", code)
+        self.assertIn("child.queue_free()", code)
+        self.assertIn("label.text = str(item)", code)
+        self.assert_indent_sane(code)
+
+    def test_list_fill_reads_array_variable(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        lst = tree.new_node(NN.GKNodeUiList, "排行榜")
+        fill = tree.new_node(NN.GKNodeUiListFill, "刷新", gk_list="排行榜",
+                             gk_var="分数榜")
+        gk_stub.connect(tree, event, "执行", lst, "执行")
+        gk_stub.connect(tree, lst, "完成", fill, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var 分数榜: Array", code)
+        self.assertIn('_gk_list_fill("排行榜", 分数榜', code)
+
+    def test_list_fill_warns_on_bad_list_name(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        no_name = tree.new_node(NN.GKNodeUiListFill, "填日志", gk_text="A")
+        gk_stub.connect(tree, event, "执行", no_name, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("没有填『列表』" in w for w in warnings), warnings)
+
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        wrong = tree2.new_node(NN.GKNodeUiListFill, "填日志", gk_list="没有的列表",
+                               gk_text="A")
+        gk_stub.connect(tree2, event2, "执行", wrong, "执行")
+        _code2, warnings2 = gen(tree2, V2)
+        self.assertTrue(any("没有一个叫这个名字" in w for w in warnings2), warnings2)
+
+    # ---- 缓动 ----
+    def test_tween_alpha_absolute_and_wait(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiTween, "淡入", gk_widget="提示",
+                             gk_property="ALPHA", gk_to=1.0, gk_time=0.5,
+                             gk_wait=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('"modulate:a"', code)
+        self.assertIn("Tween.TRANS_SINE", code)
+        self.assertIn("Tween.EASE_OUT", code)
+        # 勾了"等它播完" -> 后面的节点等动画结束再走
+        self.assertIn("await", code)
+        self.assertIn(".finished", code)
+        self.assert_indent_sane(code)
+
+    def test_tween_position_is_relative(self):
+        """位置 X / Y 是**相对**的:写法必须是 `现在的位置 + 位移`。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiTween, "滑入", gk_widget="提示",
+                             gk_property="POS_X", gk_to=80.0, gk_delay=0.2)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('"position:x"', code)
+        self.assertIn(".position.x + (80.0)", code)
+        self.assertIn("tween_interval(0.2)", code)
+        # 没勾"等播完"就不许有 await(边播边往下走)
+        self.assertNotIn("await", code)
+
+    def test_tween_warns_without_widget(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiTween, "淡入")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in w for w in warnings), warnings)
+
+    # ---- 九宫格 ----
+    def test_ninepatch_slices_and_bottom_layer(self):
+        from BlenderGameKit import curve_assets
+
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiNinePatch, "标题条", gk_image="头像",
+                             gk_slice=16, gk_bottom=True, gk_width=400.0,
+                             gk_height=60.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("NinePatchRect.new()", code)
+        for side in ("left", "top", "right", "bottom"):
+            self.assertIn(f".patch_margin_{side} = 16", code)
+        # 垫底:铺到兄弟控件下面
+        self.assertIn("move_child(", code)
+        # 图片路径和『界面_图片』同一套算法(Blender 图片名 -> art/ui_*.png)
+        self.assertIn(f'"{curve_assets.image_res_path("头像")}"', code)
+        self.assertIn("ResourceLoader.exists(", code)
+        self.assert_indent_sane(code)
+
+    def test_ninepatch_image_collected_for_export(self):
+        """九宫格的图片也要进导出清单(漏了它 -> 游戏里标题条是空的)。
+
+        回归(第三十八轮):`ui_image_names` 的白名单只有『界面_图片』和
+        『对话框』,新加的『界面_九宫格』没进去 —— PNG 不落盘,
+        运行时 load 出 null。探针现场:patch_margin 全对、texture = null。
+        """
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import exporter as ex
+
+        tree = make_tree()
+        event = self._ready(tree)
+        bar = tree.new_node(NN.GKNodeUiNinePatch, "标题条", gk_image="标题条图")
+        logo = tree.new_node(NN.GKNodeUiImage, "徽标", gk_image="徽标")
+        dialog = tree.new_node(NN.GKNodeUiDialog, "开场白", gk_text="你好",
+                               gk_image="立绘")
+        raw = tree.new_node(NN.GKNodeUiImage, "外部图", gk_image="res://art/x.png")
+        gk_stub.connect(tree, event, "执行", bar, "执行")
+        gk_stub.connect(tree, bar, "完成", logo, "执行")
+        gk_stub.connect(tree, logo, "完成", dialog, "执行")
+        gk_stub.connect(tree, dialog, "完成", raw, "执行")
+        with mock.patch.object(ex, "resolve_scene_tree",
+                               return_value=(tree, "测试")):
+            names = ae.ui_image_names(object())
+        self.assertIn("标题条图", names)
+        self.assertIn("徽标", names)
+        self.assertIn("立绘", names)
+        # `res://` 开头的路径原样用,不在"要导出的图片名"里
+        self.assertNotIn("res://art/x.png", names)
+
+    def test_ninepatch_without_image_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiNinePatch, "标题条")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("还没选图片" in w for w in warnings), warnings)
+
+    # ---- 输入框 ----
+    def test_ui_input_submit_chain_in_callback(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        field = tree.new_node(NN.GKNodeUiInput, "昵称", gk_placeholder="输入昵称")
+        submit = tree.new_node(NN.GKNodePrint, "提交后", gk_text="提交了")
+        after = tree.new_node(NN.GKNodePrint, "建完继续", gk_text="建完继续")
+        gk_stub.connect(tree, event, "执行", field, "执行")
+        gk_stub.connect(tree, field, "提交", submit, "执行")
+        gk_stub.connect(tree, field, "完成", after, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("LineEdit.new()", code)
+        self.assertIn('placeholder_text = "输入昵称"', code)
+        self.assertIn("text_submitted.connect(", code)
+        # 输入框必须吃鼠标,不然点不进去打不了字
+        self.assertIn("Control.MOUSE_FILTER_STOP", code)
+
+        lines = code.splitlines()
+        cb_at = next(i for i, line in enumerate(lines)
+                     if line.startswith("func gk_on_") and "(_text: String)" in line)
+        submit_at = next(i for i, line in enumerate(lines)
+                         if 'print("提交了")' in line)
+        after_at = next(i for i, line in enumerate(lines)
+                        if 'print("建完继续")' in line)
+        # 『提交』的链在回调函数里(回车才走),『完成』的链留在主流程
+        self.assertGreater(submit_at, cb_at)
+        self.assertLess(after_at, cb_at)
+        # 回调参数没用上要带下划线,否则 Godot 报 UNUSED_PARAMETER
+        self.assertIn("(_text: String)", lines[cb_at])
+        self.assert_indent_sane(code)
+
+    # ---- 取文字 / 设焦点 ----
+    def test_ui_read_text_uses_helper(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        read = tree.new_node(NN.GKNodeUiReadText, "读昵称", gk_widget="昵称")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, read, "文字", printer, "内容")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_widget_text("昵称")', code)
+        self.assertIn("func _gk_widget_text(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_ui_read_text_warns_without_widget(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        read = tree.new_node(NN.GKNodeUiReadText, "读昵称")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, read, "文字", printer, "内容")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in w for w in warnings), warnings)
+
+    def test_ui_focus_grab_and_release(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        grab = tree.new_node(NN.GKNodeUiFocus, "聚焦继续", gk_widget="继续")
+        printer = tree.new_node(NN.GKNodePrint, "后面", gk_text="ok")
+        gk_stub.connect(tree, event, "执行", grab, "执行")
+        gk_stub.connect(tree, grab, "完成", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("继续")', code)
+        self.assertIn(".grab_focus()", code)
+
+        # 留空 = 清掉焦点(回到鼠标操作)
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        clear = tree2.new_node(NN.GKNodeUiFocus, "清焦点", gk_widget="")
+        gk_stub.connect(tree2, event2, "执行", clear, "执行")
+        code2, warnings2 = gen(tree2, V2)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn("gui_get_focus_owner()", code2)
+        self.assertIn("release_focus()", code2)
 
 
 class TestRaycastNodes(Base):
