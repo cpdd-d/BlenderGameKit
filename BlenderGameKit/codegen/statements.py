@@ -678,6 +678,129 @@ def _expr_move_toward_outputs(ctx, node):
     return {"到达": f"(({reader}({goal}) - {reader}({target})).length() <= {stop})"}
 
 
+# ==========================================================================
+# 寻路(第三十四轮:用户选的"敌人会绕墙追你")
+# ==========================================================================
+@stmt_node("GKNodeNavigate")
+def _stmt_navigate(ctx, node, indent):
+    """『移动_寻路』:朝目标走,方向由**导航网格**算(不是直线)。
+
+    ── 为什么直接跟 NavigationServer3D 的路径,不用 NavigationAgent3D ──
+    实测(真 Godot,物理测试场第 ⑩ 工位):服务器的
+    `map_get_path` 给出 10 个点的绕墙路径(从墙端拐过去),
+    但 `NavigationAgent3D.get_next_path_position()` **一直返回它自己的位置** ——
+    因为代理拿"父节点原点"(角色中心 y=0.8)和路径第 0 个点
+    (贴在网格上 y=0.25)比距离:竖直差 0.55 > `path_desired_distance`(0.5),
+    于是它永远"没走到第 0 个点",索引不前进 —— 表现就是敌人一动不动。
+    而把 y 压平之后再比又永远是 0(自己到自己)。
+    自管路径没有这层内部状态:**每帧拿一条路径,盯住第 1 个点**
+    (`_path[0]` 就是自己站的那个点)。代价是每帧一次路径查询,
+    对"几个追人的敌人"这个量级完全够,而且行为完全可预测。
+
+    ── 三层降级(用户视角:少开一个开关不该让游戏坏掉)────────────────
+      1. 场景没勾『寻路』(没有导航网格)-> 直线走(和『移动_朝向目标』一样);
+      2. 路径只有 0/1 个点(网格还没烤完 / 目标不可达)-> 这一帧直线走;
+      3. 2D -> 直线走(2D 的 NavigationRegion2D 还没做,待办里)。
+    ⚠ 后两条**不刷告警**(它们是每帧都可能发生的运行时状态);
+      第一条刷告警 —— 那是"设置漏了",用户该知道。
+    """
+    body_type = "CharacterBody2D" if ctx.dim == 2 else "CharacterBody3D"
+    target = ctx.target_expr(node, "gk_target", hint="节点", node_type=body_type)
+    goal = _move_toward_goal(ctx, node)
+    if goal is None:
+        ctx.warn("『移动_寻路』不知道往哪走 —— 在『目标』里选一个物体,"
+                 "或者把『目标』引脚接到一个节点引用上。这一句跳过")
+        return
+
+    if ctx.dim == 2:
+        ctx.warn("『移动_寻路』这一版只支持 3D —— 2D 里它**退化成直线走**"
+                 "(和『移动_朝向目标』一样)。2D 寻路记在待办里了")
+        nav_ok = False
+    else:
+        nav_ok = bool(getattr(ctx, "nav_enabled", False))
+        if not nav_ok:
+            ctx.warn("『移动_寻路』要用导航网格绕路,但这一关的场景设置里"
+                     "**没勾『寻路』** —— 它现在退化成直线走(和"
+                     "『移动_朝向目标』一样)。想让它绕墙:侧栏『导出脚本』"
+                     "里勾上『寻路』,再重新导出")
+
+    if ctx.dim == 2:
+        speed = _tunable_number(ctx, node, "速度", "300.0", "nav_speed")
+    else:
+        speed = _tunable_number(
+            ctx, node, "速度", "6.0", "nav_speed", clamp_max=50.0,
+            clamp_hint=("『速度』在 3D 里是**米/秒**(追人的敌人一般 2~6);"
+                        "2D 里是像素/秒。"))
+    stop = gd_number(float(getattr(node, "gk_stop_distance", 0.0) or 0.0))
+    turn = bool(getattr(node, "gk_turn", False))
+    accel = float(getattr(node, "gk_accel", 0.0) or 0.0)
+    vector = "Vector2" if ctx.dim == 2 else "Vector3"
+
+    from .expressions import ensure_position_helper
+    reader = ensure_position_helper(ctx)
+
+    here = ctx.new_temp("here")
+    goal_at = ctx.new_temp("nav_goal")
+    diff = ctx.new_temp("to_goal")
+    distance = ctx.new_temp("goal_dist")
+    ctx.add_line(indent, f"var {here} := {reader}({target})")
+    ctx.add_line(indent, f"var {goal_at} := {reader}({goal})")
+    ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
+    ctx.add_line(indent, f"var {distance} := {diff}.length()")
+
+    if nav_ok:
+        path = ctx.new_temp("nav_path")
+        step = ctx.new_temp("nav_step")
+        ctx.add_line(indent, f"var {path} := NavigationServer3D.map_get_path("
+                             f"{target}.get_world_3d().navigation_map, "
+                             f"{here}, {goal_at}, true)")
+        ctx.add_line(indent, f"var {step} := {diff}")
+        # ── 盯住路径的**第 1 个点**(第 0 个点就是自己站的那个)──────────
+        # 只有 0/1 个点 = 网格还没烤完 / 目标不可达 -> 保持直线。
+        ctx.add_line(indent, f"if {path}.size() > 1:")
+        ctx.add_line(indent + 1, f"{step} = {path}[1] - {here}")
+        ctx.add_line(indent, f"{step}.y = 0.0")
+        # 点几乎在脚下(路径只有起点)-> 这一帧直线走,别站着不动
+        ctx.add_line(indent, f"if {step}.length() < 0.05:")
+        ctx.add_line(indent + 1, f"{step} = {diff}")
+        direction = step
+    else:
+        direction = diff
+
+    if accel > 0.0:
+        wanted = ctx.new_temp("wanted")
+        ctx.add_line(indent, f"var {wanted} := {vector}.ZERO")
+        ctx.add_line(indent, f"if {distance} > {stop}:")
+        ctx.add_line(indent + 1, f"{wanted} = {direction}.normalized() * {speed}")
+        ctx.add_line(indent, f"{target}.velocity = {target}.velocity.move_toward("
+                             f"{wanted}, {gd_number(accel)} "
+                             f"* get_physics_process_delta_time())")
+    else:
+        ctx.add_line(indent, f"if {distance} <= {stop}:")
+        ctx.add_line(indent + 1, f"{target}.velocity = {vector}.ZERO")
+        ctx.add_line(indent, "else:")
+        ctx.add_line(indent + 1, f"{target}.velocity = {direction}.normalized() * {speed}")
+    if turn and ctx.dim == 2:
+        ctx.add_line(indent, f"{target}.rotation = atan2({direction}.y, {direction}.x)")
+    if turn and ctx.dim == 3:
+        # 朝向**前进方向**(绕墙时头跟着路转);同样要压平 + 防"方向对不上
+        # up 向量"那个 look_at 报错(和『移动_朝向目标』同一个坑)。
+        ctx.add_line(indent, f"if absf({direction}.x) + absf({direction}.z) > 0.001:")
+        ctx.add_line(indent + 1, f"{target}.look_at({here} + {vector}("
+                                 f"{direction}.x, 0.0, {direction}.z), Vector3.UP)")
+    ctx.add_line(indent, f"{target}.move_and_slide()")
+
+
+@multi_output("GKNodeNavigate")
+def _expr_navigate_outputs(ctx, node):
+    """『移动_寻路』的『到达』输出 —— 和『移动_朝向目标』同一套算法。
+
+    两个节点的『到达』都是"离目标进了『停在多远』"(和走的是不是直线无关):
+    绕路绕到目标旁边也算到达。两处各写一遍的话,以后改口径必然漏一个。
+    """
+    return _expr_move_toward_outputs(ctx, node)
+
+
 @stmt_node("GKNodeJump")
 def _stmt_jump(ctx, node, indent):
     """起跳:竖直速度给一个冲量。

@@ -75,6 +75,11 @@ def build_settings(scene):
         "debug_panel": bool(getattr(props, "debug_panel", False)),
         # 上帝摄像机开关(用户 2026-10-04)
         "god_camera": bool(getattr(props, "god_camera", False)),
+        # 寻路(第三十四轮):『移动_寻路』要知道这一关有没有烤导航网格 ——
+        # 没烤的话它退化成直线走,并在导出报告里提醒一句"场景设置里没勾寻路"
+        # (2D 还没做,同样按"没有"处理)。
+        "nav_enabled": (bool(getattr(props, "nav_enabled", False))
+                        and str(getattr(props, "dimension", "3")) != "2"),
     })
 
     manual = (getattr(props, "output_dir", "") or "").strip()

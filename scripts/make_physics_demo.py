@@ -2,7 +2,7 @@
 
 用户 2026-10-05:"**碰撞体系统的打磨**吧,在与正方体模型对角上重叠会穿模"。
 第十九/二十轮修完了判据和偏移,但**一个真探针都没跑过物理** ——
-这一关就是那件事的"现场":七个工位排成一排,探针在 Godot 里驱动角色
+这一关就是那件事的"现场":十个工位排成一排,探针在 Godot 里驱动角色
 一个个走一遍,有穿模/卡住/推不动就抓出来。
 
 | 工位 | 测什么 | 期望 |
@@ -16,6 +16,7 @@
 | **薄墙** | 0.25 米厚的墙 | 全速撞 2.5 秒**不穿透** |
 | **移动平台** | 时间轴(PINGPONG)横着推的 AnimatableBody 平台 | 站上去**被带着走**(位移 = 平台位移)—— StaticBody 是"瞬移",人会留在原地 |
 | **载具** | CharacterBody 车 + E 上下车 + W/S 前后 · A/D 转车头 | 上车后角色被钉在座位上跟着车走;下车后角色能走、车不跟着跑 |
+| **绕墙追击** | 『移动_寻路』追墙那头的玩家(第三十四轮) | **绕过墙**追到人(从墙端过去)—— 直线追会贴墙卡住 |
 
 跑法:
     blender -b --python scripts\\make_physics_demo.py
@@ -42,7 +43,7 @@ PLAYER_START_Y = -6.0
 PLAYER_Z = 0.9
 # 工位间距(每个工位一个 X,障碍物在 +Y 方向)
 STATION_STEP = 7.0
-STATION_X = [index * STATION_STEP for index in range(9)]
+STATION_X = [index * STATION_STEP for index in range(10)]
 # ⚠ 坐标换算:Godot(x, y, z) = Blender(x, z, -y) —— 所以
 # "在 Godot 里往 -Z 走"(按 W,相机 yaw=0)在 Blender 里就是**往 +Y 走**。
 # 这一关所有障碍物都摆在角色的 +Y 方向,探针只要按 W 就能撞上。
@@ -59,10 +60,35 @@ PLATFORM_TO = 51.0
 PLATFORM_TIME = 2.0        # 单程秒数(往返一轮 4 秒,探针窗口里至少跑完一趟)
 PLATFORM_TOP = 0.4         # 平台高度(上表面 = 这个数)
 VEHICLE_SPEED = 10.0       # 载具速度(米/秒,『载具_驾驶』里填的那个)
+# 第 ⑩ 工位:绕墙追击(第三十四轮:寻路)────────────────────────────
+# 一堵 **5 米宽**的墙把『追踪者』和玩家隔开(玩家在 Godot z=+2,追踪者在
+# z=-2):直线只有 4 米,可中间是墙 —— 想碰到人只能从墙端绕过去。
+NAV_WALL_SPAN = 5.0        # 墙宽(Godot x 方向)
+NAV_WALL_THICK = 0.5       # 墙厚
+NAV_WALL_HEIGHT = 2.2
+NAV_CHASE_SPEED = 4.5      # 追踪者速度(米/秒;绕一圈约 9 米 -> 2 秒多)
+NAV_STOP = 1.2             # 贴到多近算"追上了"
 
 
 def log(message):
     print(f"[物理] {message}")
+
+
+def _apply_settings(scene, pairs):
+    """把一批导出设置写进场景的 gk_settings(缺属性 / 只读就跳过)。
+
+    和 make_demo_level 里那个同款:老版本插件 / 精简环境里某个属性可能
+    不存在,写设置绝不该让整个脚本崩掉。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    if settings is None:
+        return
+    for attr, value in pairs:
+        if hasattr(settings, attr):
+            try:
+                setattr(settings, attr, value)
+            except Exception:                             # noqa: BLE001
+                pass
 
 
 def clear_scene():
@@ -187,6 +213,15 @@ def build_scene():
     vehicle = make_box("载具", (3.0, 4.0, 1.2), (vehicle_x, 1.0, 0.6),
                        (0.75, 0.4, 0.3, 1.0))
 
+    # ── ⑩ 绕墙追击(第三十四轮:寻路)──────────────────────────────
+    # 墙在 Godot z=0(Blender y=0),追踪者在 Godot z=-2(Blender y=+2),
+    # 玩家那一侧是 Godot z=+2 —— 中间的直线被墙挡死(探针把玩家放在那一侧)。
+    nav_x = STATION_X[9]
+    make_box("导航墙", (NAV_WALL_SPAN, NAV_WALL_THICK, NAV_WALL_HEIGHT),
+             (nav_x, 0.0, NAV_WALL_HEIGHT / 2.0), wall_color)
+    chaser = make_box("追踪者", (1.2, 1.2, 1.6), (nav_x, 2.0, 0.8),
+                      (0.85, 0.35, 0.9, 1.0))
+
     player = make_box(PLAYER, (1.0, 1.0, 1.8),
                       (STATION_X[0], PLAYER_START_Y, PLAYER_Z),
                       (0.95, 0.55, 0.25, 1.0))
@@ -199,10 +234,10 @@ def build_scene():
                 (math.radians(25.0), 0.0, 0.0))
     scene.camera = side
     make_sun()
-    return scene, player, box, body, (head, legs), platform, vehicle
+    return scene, player, box, body, (head, legs), platform, vehicle, chaser
 
 
-def write_physics(scene, player, box, body, pieces, platform, vehicle):
+def write_physics(scene, player, box, body, pieces, platform, vehicle, chaser):
     """物理类型:全部静态障碍 + 一个刚体箱子 + 角色;碰撞块挂到宿主上。"""
     for obj in scene.objects:
         physics = getattr(obj, "gk_physics", None)
@@ -232,6 +267,11 @@ def write_physics(scene, player, box, body, pieces, platform, vehicle):
             physics.body_type = "CharacterBody3D"
             physics.dimension = "3"
             physics.asset_name = "载具"
+        elif obj is chaser:
+            # 追踪者(第三十四轮):角色体 + **不**当资产 —— 它的网格留在
+            # 世界 glb 里,和碰撞代理按名字配对(和小游戏示例的敌2 同款)。
+            physics.body_type = "CharacterBody3D"
+            physics.dimension = "3"
         elif obj in pieces:
             # 『作为父级的碰撞块』:网格不进 glb,形状并进宿主
             physics.body_type = "StaticBody3D"
@@ -264,8 +304,41 @@ def build_graph(scene, player):
     physics = _by_name(logic, "每当_物理帧")
     _tune_move_node(logic)
     _add_field_extras(logic)
+    _add_nav_station(logic, physics)
     _hint_chain(logic, physics)
     return logic
+
+
+def _add_nav_station(tree, physics):
+    """第 ⑩ 工位(第三十四轮):追玩家的人 —— 它要**绕墙**才能碰到人。
+
+    ── 为什么要有『追击开关』──────────────────────────────────────
+    追踪者一进游戏就追的话,它会跟着玩家跑遍前九个工位,把推箱子 / 窄缝 /
+    载具那些判据全搅乱(探针是**按物理现象**断言的)。所以默认关着,
+    探针开始第 ⑩ 工位时把变量置真(`host.set("追击开关", true)`)——
+    这比"按时间/坐标判断"稳,也不会让别的工位受一点影响。
+
+    ── 为什么用『移动_寻路』而不是『移动_朝向目标』──────────────────
+    直线追的结果是**贴着墙原地蹭**(走到墙前就停住)——那正是这一轮要
+    给大家看的对比:同一个"追人",一个卡墙、一个绕过去。
+    """
+    var = tree.gk_vars.add()
+    var.var_name = "追击开关"
+    var.var_type = "bool"
+    var.default_value = "false"
+    var.comment = "第 ⑩ 工位:让『追踪者』开始追(探针置真)"
+    var.group = "测试场"
+
+    read = _add(tree, "GKNodeGetVar", "读追击开关", 200.0, 1520.0,
+                gk_var_name="追击开关")
+    branch = _add(tree, "GKNodeBranch", "开始追?", 360.0, 1520.0)
+    chase = _add(tree, "GKNodeNavigate", "追踪者绕墙追人", 600.0, 1520.0,
+                 gk_target="追踪者", gk_goal=PLAYER, gk_speed=NAV_CHASE_SPEED,
+                 gk_stop_distance=NAV_STOP, gk_turn=True, gk_accel=8.0)
+    _link(tree, physics, "执行", branch, "执行")
+    _link(tree, read, "值", branch, "条件")
+    _link(tree, branch, "是", chase, "执行")
+    log("测试场:⑩ 追踪者(『移动_寻路』绕墙,探针用『追击开关』开门)已接好")
 
 
 def _add_field_extras(tree):
@@ -369,11 +442,11 @@ def _hint_chain(tree, physics):
     hint = _add(tree, "GKNodeUiText", "操作提示", -300.0, 980.0,
                 gk_text=("WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / "
                          "Tab 上帝机 / E 上·下车 / Esc 退出 —— "
-                         "九个工位摆在 +Y 方向"),
+                         "十个工位摆在 +Y 方向"),
                 gk_x=18.0, gk_y=18.0, gk_size=18)
     goal = _add(tree, "GKNodeUiText", "工位说明", -300.0, 820.0,
                 gk_text=("工位(从近到远):斜坡 / 台阶 / 对角方块 / 推箱子 / "
-                         "多碰撞体 / 窄缝 / 薄墙 / 移动平台 / 载具"),
+                         "多碰撞体 / 窄缝 / 薄墙 / 移动平台 / 载具 / 绕墙追击"),
                 gk_x=18.0, gk_y=46.0, gk_size=18)
     setup = _by_name(tree, "设定初始视野")
     _link(tree, setup, "完成", hint, "执行")
@@ -404,11 +477,20 @@ def main():
     from BlenderGameKit import asset_export, project
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    scene, player, box, body, pieces, platform, vehicle = build_scene()
-    write_physics(scene, player, box, body, pieces, platform, vehicle)
+    scene, player, box, body, pieces, platform, vehicle, chaser = build_scene()
+    write_physics(scene, player, box, body, pieces, platform, vehicle, chaser)
     build_graph(scene, player)
     settings = scene.gk_settings
     settings.god_camera = True
+    # ── 寻路(第三十四轮)────────────────────────────────────────────
+    # 第 ⑩ 工位靠它绕墙:导出时会写一块 NavigationMesh(只解析静态碰撞体),
+    # 环境脚本启动时烤。参数和角色的碰撞半径对齐(0.5)。
+    _apply_settings(scene, (
+        ("nav_enabled", True),
+        ("nav_agent_radius", 0.5),
+        ("nav_agent_height", 1.8),
+        ("nav_max_slope", 45.0),
+    ))
 
     directory = os.path.join(OUT_DIR, "物理测试场_godot")
     project.create_project(directory, title="物理测试场",

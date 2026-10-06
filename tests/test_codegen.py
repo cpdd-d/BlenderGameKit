@@ -9693,5 +9693,98 @@ class TestRound33ReferenceGroups(Base):
         self.assertEqual(props.reference_groups(make_tree()), [])
 
 
+class TestRound34Navigation(Base):
+    """第三十四轮:寻路 —— 『移动_寻路』让敌人绕开墙追人。
+
+    ── 三层降级(用户视角:少开一个开关不该让游戏坏掉)────────────────
+      1. 场景没勾『寻路』-> 直线走(和『移动_朝向目标』一样)+ 一条告警;
+      2. 代理没准备好 / 目标不可达 -> 这一帧直线走(脚本里有兜底分支);
+      3. 2D -> 直线走(2D 的 NavigationRegion2D 还没做)。
+    前三条都必须**照常移动**,只是方向不算绕路 —— 站着不动是最糟的降级。
+    """
+
+    @staticmethod
+    def _tree(*, goal=""):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        chaser = tree.new_node(NN.GKNodeNavigate, "追玩家", gk_goal=goal,
+                               gk_speed=3.0, gk_stop_distance=1.0)
+        gk_stub.connect(tree, physics, "执行", chaser, "执行")
+        return tree, chaser
+
+    def test_follows_navigation_path(self):
+        """勾了『寻路』:方向来自服务器的**路径第 1 个点**,不是直线。"""
+        tree, _ = self._tree(goal="玩家")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertIn("NavigationServer3D.map_get_path(", code)
+        self.assertIn(".size() > 1:", code)
+        self.assertIn(".move_and_slide()", code)
+        # 兜底分支:路径只有起点(网格没烤完 / 目标不可达)时改走直线
+        self.assertIn("length() < 0.05:", code)
+        # 路点高度要压平(网格贴在碰撞体上表面,不压平会上下拱)
+        self.assertIn(".y = 0.0", code)
+
+    def test_each_node_queries_its_own_path(self):
+        """两个『移动_寻路』节点各查各的路径(不共享任何隐藏状态)。"""
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        first = tree.new_node(NN.GKNodeNavigate, "追A", gk_goal="玩家")
+        second = tree.new_node(NN.GKNodeNavigate, "追B", gk_goal="玩家")
+        gk_stub.connect(tree, physics, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertEqual(code.count("NavigationServer3D.map_get_path("), 2)
+
+    def test_no_scene_switch_falls_back_to_straight(self):
+        """没勾『寻路』:照样走(直线),并在导出报告里说清楚怎么开。"""
+        tree, _ = self._tree(goal="玩家")
+        code, warnings = gen(tree, V3)
+        self.assertNotIn("map_get_path", code)
+        self.assertIn(".move_and_slide()", code)
+        self.assertTrue(any("没勾『寻路』" in text for text in warnings), warnings)
+
+    def test_2d_falls_back_and_warns(self):
+        """2D:这一版没有 2D 寻路 —— 直线走 + 告警,不生成 3D 查询。"""
+        tree, _ = self._tree(goal="玩家")
+        code, warnings = gen(tree, dict(V2, nav_enabled=True))
+        self.assertNotIn("map_get_path", code)
+        self.assertIn(".move_and_slide()", code)
+        self.assertTrue(any("只支持 3D" in text for text in warnings), warnings)
+
+    def test_arrival_output_is_distance_based(self):
+        """『到达』= 离目标进了『停在多远』(和走的是不是直线无关)。"""
+        tree, chaser = self._tree(goal="玩家")
+        branch = tree.new_node(NN.GKNodeBranch, "到了吗")
+        gk_stub.connect(tree, chaser, "到达", branch, "条件")
+        gk_stub.connect(tree, tree.find("物理帧"), "执行", branch, "执行")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertIn("length() <= 1.0", code)
+
+    def test_navmesh_subresource_is_static_collider_only(self):
+        """导航网格只解析**静态碰撞体**(角色/装饰网格不进网格 —— 实测过)。"""
+        from BlenderGameKit import asset_export as export
+        text = export.NAVMESH_SUBRESOURCE.format(radius=0.5, height=1.8,
+                                                 slope=45.0)
+        self.assertIn("geometry_parsed_geometry_type = 1", text)
+        self.assertIn("agent_radius = 0.5", text)
+        self.assertIn("agent_max_slope = 45.0", text)
+
+    def test_scene_switch_reads_and_normalizes(self):
+        """场景设置读出来要夹在合理范围(半径太小 / 坡度 90 度都不行)。"""
+        from BlenderGameKit import asset_export as export
+        settings = types.SimpleNamespace(
+            nav_enabled=True, dimension="3",
+            nav_agent_radius=0.0, nav_agent_height=-1.0, nav_max_slope=120.0)
+        scene = types.SimpleNamespace(gk_settings=settings)
+        self.assertTrue(export._nav_on(scene))
+        values = export._nav_settings(scene)
+        self.assertGreaterEqual(values["radius"], 0.05)
+        self.assertGreaterEqual(values["height"], 0.1)
+        self.assertLessEqual(values["slope"], 89.0)
+        # 2D 场景:开着也当没开(2D 的导航接口还没做)
+        settings.dimension = "2"
+        self.assertFalse(export._nav_on(scene))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

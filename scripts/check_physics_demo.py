@@ -10,7 +10,7 @@
   2. 在副本里加一个探针场景(`probe.gd` + `probe.tscn`),把主场景指过去;
   3. 用 Godot 无头跑,读探针打印的 PHYS_* 行,汇总 PASS / FAIL。
 
-探针查的是**物理现象**(不是代码长什么样):把角色依次传送到七个工位前,
+探针查的是**物理现象**(不是代码长什么样):把角色依次传送到十个工位前,
 按住 W 往 -Z 走(相机 yaw=0,方向是确定的),边走边采样位置:
 
   * **斜坡**:能爬上 20° 的坡(y 升高 ≥ 0.8),不卡在坡脚;
@@ -27,7 +27,10 @@
     时间轴往返推着走)移动时角色要**被带走**(位移对得上);要是
     StaticBody("瞬移"),角色留在原地、还会掉到地上;
   * **载具**(第三十轮):E 上车 → W 开 1.5 秒(角色全程钉在座位上)→
-    E 下车 → W 还能走(控制权交还角色)、车不跟着跑。
+    E 下车 → W 还能走(控制权交还角色)、车不跟着跑;
+  * **绕墙追击**(第三十四轮):玩家站在墙这头不动,墙那头的『追踪者』
+    由『移动_寻路』驱动 —— 必须**从墙端绕过来**(横向绕出 ≥ 2.8 米)
+    并追上玩家;直线追只会在墙前贴住。顺带验导航网格真的烤出来了。
 """
 
 import argparse
@@ -44,7 +47,7 @@ OUT = os.path.join(ROOT, "_dist", "physics_probe")
 
 PROBE_GD = '''extends Node
 
-# 物理测试场的探针:把角色依次送到七个工位前,按住 W 走一遍,
+# 物理测试场的探针:把角色依次送到十个工位前,按住 W 走一遍,
 # 边走边采样"有没有穿模 / 卡住 / 推不动"。结论行统一 PHYS_ 前缀。
 
 static var run_count := 0
@@ -54,9 +57,10 @@ var host: CharacterBody3D = null
 var box: RigidBody3D = null
 var platform: Node3D = null
 var vehicle: CharacterBody3D = null
+var chaser: CharacterBody3D = null
 var elapsed := 0.0
 
-# 七个工位:名字 / x / 走多久 / 判据用哪一套
+# 十个工位:名字 / x / 走多久 / 判据用哪一套
 const STATION_DEFS := [
 	{"key": "slope", "x": 0.0, "walk": 1.8, "kind": "slope"},
 	{"key": "stairs", "x": 7.0, "walk": 2.0, "kind": "stairs"},
@@ -69,6 +73,9 @@ const STATION_DEFS := [
 	# 载具工位由 _vehicle_step 自己按 E / W(keys = "" 起步)。
 	{"key": "platform", "x": 49.0, "walk": 3.4, "kind": "platform", "keys": ""},
 	{"key": "vehicle", "x": 56.0, "walk": 0.0, "kind": "vehicle", "keys": ""},
+	# 第十工位(第三十四轮):绕墙追击 —— 玩家站墙这头不动,追踪者从墙那头
+	# **绕过来**(『移动_寻路』),由 _nav_step 采样。
+	{"key": "nav", "x": 63.0, "walk": 6.0, "kind": "nav", "keys": ""},
 ]
 const SPAWN_Z := 6.0
 const GROUND_Y := 0.9
@@ -80,6 +87,10 @@ const GROUND_Y := 0.9
 # 等 1.2 秒:平滑是"每秒跟手 8 倍",1.2 秒后残差 ~0.01%,偏航回正。
 const SETTLE := 1.2
 const DIAMOND_CENTER := Vector3(14.0, 1.0, -3.0)
+# 绕墙墙工位(第三十四轮):墙在 Godot x=63 / z=0,宽 5 米(和
+# make_physics_demo 的 NAV_WALL_SPAN 对齐,两边一起改)
+const NAV_WALL_X := 63.0
+const NAV_WALL_HALF := 2.5
 
 var station_index := -1
 var station_time := 0.0
@@ -114,6 +125,13 @@ var vstand := Vector3.ZERO
 var vwalked := 0.0
 var vdrift := 0.0
 var vmeta := false
+# 第十工位(第三十四轮:寻路)采样
+var nav_polys := 0            # 导航网格烤出来多少个多边形(0 = 没烤成)
+var nav_arrived := false      # 追踪者最后有没有贴到玩家
+var nav_around := 0.0         # 它离墙中线最远横走了多少(绕墙证据)
+var nav_path := 0.0           # 追踪者走过的路程(采样累加)
+var nav_prev := Vector3.ZERO
+var nav_min_dist := 99.0
 
 
 func _ready() -> void:
@@ -132,9 +150,20 @@ func _ready() -> void:
 	var vehicles := world.find_children("载具", "CharacterBody3D", true, false)
 	if not vehicles.is_empty():
 		vehicle = vehicles[0] as CharacterBody3D
+	var chasers := world.find_children("追踪者", "CharacterBody3D", true, false)
+	if not chasers.is_empty():
+		chaser = chasers[0] as CharacterBody3D
+	# 导航网格烤出来没有(第三十四轮):读区域里那份 mesh 的多边形数 ——
+	# 「.tscn 里写了子资源 + 环境脚本烤成功」两件事一次验完。
+	var regions := world.find_children("Navigation", "NavigationRegion3D", true, false)
+	if not regions.is_empty():
+		var mesh: NavigationMesh = (regions[0] as NavigationRegion3D).navigation_mesh
+		if mesh != null:
+			nav_polys = mesh.get_polygon_count()
 	print("DEMO_GAME run=", run_count, " player=", host != null,
 		" box=", box != null, " platform=", platform != null,
-		" vehicle=", vehicle != null,
+		" vehicle=", vehicle != null, " chaser=", chaser != null,
+		" nav_polys=", nav_polys,
 		" bodies=", world.find_children("Colliders", "Node3D", true, false).size())
 
 
@@ -216,6 +245,10 @@ func _physics_process(delta: float) -> void:
 	if STATION_DEFS[station_index]["kind"] == "vehicle":
 		# 载具工位有自己的时序(等稳 → E 上车 → W 开 → E 下车 → W 走)
 		_vehicle_step(delta)
+		return
+	if STATION_DEFS[station_index]["kind"] == "nav":
+		# 绕墙追击工位(第三十四轮):玩家站着不动,采样的对象是**追踪者**
+		_nav_step(delta)
 		return
 	min_z = minf(min_z, position.z)
 	max_y = maxf(max_y, position.y)
@@ -306,6 +339,28 @@ func _vehicle_step(delta: float) -> void:
 		_finish_vehicle()
 
 
+func _nav_step(delta: float) -> void:
+	# 绕墙追击(第三十四轮):每隔一帧采一次追踪者的位置 ——
+	#   走了多少路(累加)、离墙中线最远横走多少(绕墙的证据)、
+	#   有没有贴到玩家(直线追会在墙前贴住,永远到不了)。
+	if chaser == null:
+		return
+	var here: Vector3 = chaser.global_position
+	nav_path += nav_prev.distance_to(here)
+	nav_prev = here
+	nav_around = maxf(nav_around, absf(here.x - NAV_WALL_X))
+	var dist := here.distance_to(host.global_position)
+	nav_min_dist = minf(nav_min_dist, dist)
+	if dist <= 1.4:
+		nav_arrived = true
+	# ── 时间到就结算(踩过的坑)─────────────────────────────────────
+	# 通用那条结算写在 _physics_process 的**末尾**,而这个工位在中间
+	# `return` 了(和载具工位一样)—— 不在这里自己判一次,这一站永远不会
+	# 结束(实测:探针跑到 96 秒还在采样,D 都没打印出来)。
+	if station_time >= float(STATION_DEFS[station_index]["walk"]) + SETTLE:
+		_finish_station()
+
+
 func _finish_vehicle() -> void:
 	# 上车了(meta) + 车真开出去了 + 角色一路被钉在座位上(ride_gap)
 	# + 下车后角色在车外 + 控制权回到角色(walked)+ 车没被"偷开"(drift)
@@ -336,8 +391,22 @@ func _start_station(index: int) -> void:
 		# 站在车**旁边**(『上车距离』3 米以内),等 _vehicle_step 按 E
 		start = Vector3(vehicle.global_position.x - 2.6, GROUND_Y,
 			vehicle.global_position.z)
+	if kind == "nav":
+		# 站到墙的**这一侧**(Godot z=+2;墙在 z=0、追踪者在 z=-2)——
+		# 玩家不动,就看追踪者绕不绕得过来。
+		start = Vector3(spec["x"], GROUND_Y, 2.0)
 	host.global_position = start
 	host.velocity = Vector3.ZERO
+	if kind == "nav":
+		# 开门:追踪者开始追(变量在图里,默认关着 —— 不然它会跟着玩家
+		# 跑遍前九个工位,把那些判据全搅乱)
+		if chaser != null:
+			nav_prev = chaser.global_position
+		nav_around = 0.0
+		nav_path = 0.0
+		nav_min_dist = 99.0
+		nav_arrived = false
+		host.set("追击开关", true)
 	# ── 把视角偏航钉回 0(用户 2026-10-06)─────────────────────────
 	# 测试场开了『随相机朝向』(按 W = 往镜头前方走,手感才对);探针要的
 	# 是**确定的世界 -Z**,所以每个工位开始时把偏航清零 —— 相机相对的方向
@@ -432,6 +501,15 @@ func _finish_station() -> void:
 			and min_y > GROUND_Y + 0.2)
 		detail = "plat_span=%.2f carried=%.2f min_y=%.2f" % [
 			plat_span, carried, min_y]
+	elif kind == "nav":
+		# 第三十四轮:追踪者必须**从墙端绕过去**才算过 ——
+		#   around ≥ 2.8:墙半宽只有 2.5,超过它 = 真的绕了(直线追最多
+		#     走到墙前 z≈±0.9,横向一步都不会多走);
+		#   arrived:绕完还要**贴上玩家**(直线追在墙前贴住、永远到不了);
+		#   polys > 0:导航网格真的烤出来了(子资源 + 环境脚本两件事)。
+		ok = (nav_polys > 0 and nav_arrived and nav_around >= 2.8)
+		detail = "polys=%d around=%.2f arrived=%s path=%.2f min_dist=%.2f" % [
+			nav_polys, nav_around, nav_arrived, nav_path, nav_min_dist]
 	station_time = -1.0
 	var box_at := box.global_position if box != null else Vector3.ZERO
 	print("PHYS_%s ok=%s %s t=%.2f at=(%.2f,%.2f,%.2f) x_range=[%.2f,%.2f] coll=%d box_z=%.2f"
@@ -481,11 +559,12 @@ def run_godot(godot):
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     run = subprocess.run([godot, "--headless", "--path", OUT,
-                          # ⚠ 无头模式下主循环跑得比物理快(~160 fps),而
-                          # `--quit-after` 数的是**主循环次数** —— 2400 次
-                          # 只够 ~15 秒的物理时间。九个工位现在要 ~34 秒
-                          # (每站还先等 1.2 秒让相机追上),给足余量。
-                          "--quit-after", "9000"],
+                          # ⚠ 无头模式下主循环跑得比物理快,而 `--quit-after`
+                          # 数的是**主循环次数** —— 2400 次只够 ~15 秒的物理
+                          # 时间。十个工位现在要 ~44 秒(每站还先等 1.2 秒让
+                          # 相机追上,⑩ 追人自己跑 ~6 秒;开着寻路后每帧还要
+                          # 喂导航服务器,帧率比原来低)—— 给到 4 倍余量。
+                          "--quit-after", "20000"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -513,7 +592,7 @@ def main():
             print("✗ Godot 里有脚本错误 / 解析错误:", line.strip())
             ok = False
 
-    # ── 七个工位的现象断言 ──────────────────────────────────────────
+    # ── 十个工位的现象断言 ──────────────────────────────────────────
     if not re.search(r"DEMO_GAME run=1 player=true box=true", text):
         print("✗ 开场状态不对(角色 / 刚体箱子 / 碰撞容器):",
               [line for line in text.splitlines() if "DEMO_GAME" in line])
@@ -531,7 +610,8 @@ def main():
             ("narrow", "窄缝卡住了"),
             ("thin", "薄墙被穿透了"),
             ("platform", "平台没把人带走(平台从脚下溜走 / 人掉下去了)"),
-            ("vehicle", "上/下车或驾驶不对(没开出去 / 人没跟着 / 下车后车被偷开)")):
+            ("vehicle", "上/下车或驾驶不对(没开出去 / 人没跟着 / 下车后车被偷开)"),
+            ("nav", "追踪者没绕墙追到人(导航网格没烤出来 / 绕不过去 / 贴不上)")):
         if not re.search(rf"PHYS_{key} ok=true", text):
             print(f"✗ {why}:",
                   [line for line in text.splitlines()
@@ -556,7 +636,8 @@ def main():
                 ("rotation.y -= ", "A/D 转车头"),
                 ("_gk_set_collision(", "上/下车开关角色碰撞"),
                 ("gk_seat", "座位(钉住角色)"),
-                ("_gk_resolve_camera(self)", "移动方向跟着相机朝向")):
+                ("_gk_resolve_camera(self)", "移动方向跟着相机朝向"),
+                ("NavigationServer3D.map_get_path(", "寻路:走的是服务器算的绕墙路径")):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: {needle}")
                 ok = False
@@ -583,6 +664,15 @@ def main():
                 ('[node name="Collision3" type="CollisionShape3D" '
                  'parent="Colliders/拼装人"]',
                  "多碰撞体的第三块"),
+                ('[node name="追踪者" type="CharacterBody3D" '
+                 'parent="Colliders"]', "追踪者是 CharacterBody"),
+                # ── 寻路(第三十四轮):子资源 + 区域节点 + 只解析静态碰撞体 ──
+                ('[sub_resource type="NavigationMesh" id="gk_navmesh"]',
+                 "导航网格子资源"),
+                ("geometry_parsed_geometry_type = 1",
+                 "导航网格只解析静态碰撞体(角色/装饰网格不进网格)"),
+                ('[node name="Navigation" type="NavigationRegion3D" parent="."]',
+                 "导航区节点"),
                 ('[node name="Colliders"', "碰撞代理容器")):
             if needle not in scene_text:
                 print(f"✗ World.tscn 里没有{why}: {needle}")

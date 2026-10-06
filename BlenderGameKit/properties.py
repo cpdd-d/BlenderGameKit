@@ -552,6 +552,33 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         default="",
     )
 
+    # ── 寻路 / 导航网格(第三十四轮)──────────────────────────────────
+    # 用户选的方向:"寻路 / 避障 —— 敌人会绕墙追你"。
+    # 打开后导出的场景里会多一个 NavigationRegion3D(名字 `Navigation`),
+    # 它的**导航网格是游戏启动时烤的**:按场景里的**静态碰撞体**
+    # (地面 / 墙 / 高台 / 树 / 石头 …)生成 —— 角色、载具这些会动的东西
+    # 不会被烤进去(实测:真 Godot 里查过,CharacterBody 不参与)。
+    #
+    # ⚠ 关着时『移动_寻路』会**退化成直线走**(和『移动_朝向目标』一样),
+    #   而不是站着不动 —— 少开一个开关不该让游戏坏掉。
+    nav_enabled: BoolProperty(
+        name="寻路", default=False,
+        description=("在这个场景里烤一块导航网格:『移动_寻路』的角色会绕开"
+                     "墙 / 障碍物走到目标,不再一头撞墙。\n"
+                     "游戏启动时按**静态碰撞体**烤(会动的角色/载具不参与);\n"
+                     "关着 = 『移动_寻路』退化成直线走(和『移动_朝向目标』一样)"))
+    nav_agent_radius: FloatProperty(
+        name="代理半径", default=0.5, min=0.05, max=10.0,
+        description=("寻路的角色有多粗(米)—— 比这更窄的缝它不会钻过去。"
+                     "一般填角色的碰撞半径"))
+    nav_agent_height: FloatProperty(
+        name="代理高度", default=1.8, min=0.1, max=10.0,
+        description="寻路的角色有多高(米)—— 比这更矮的地方(桌子下面)它不走")
+    nav_max_slope: FloatProperty(
+        name="爬坡上限", default=45.0, min=0.0, max=89.0,
+        description=("能爬多陡的坡(度)—— 比这陡的地方不算可走。"
+                     "斜坡要接进寻路就把它调到大于斜坡的角度"))
+
     # ── 运行日志(用户第 29 轮:"角色在掉落,鼠标没反应,其他大概也有问题")──
     # 打开后,生成的脚本**每秒**在 Godot 控制台打一行:
     #   位置 / 速度 / 是否在地面 / 当前相机 / HUD 文本

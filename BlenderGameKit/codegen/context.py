@@ -56,6 +56,10 @@ class GenContext:
         self.dim = 2 if str(self.options.get("dimension", "3")) == "2" else 3
         # 是否把"未连线的数值输入"暴露成 @export 参数(方便在检查器里调手感)
         self.export_tunables = bool(self.options.get("export_tunables", True))
+        # 这一关有没有烤导航网格(第三十四轮:寻路)。
+        # 由 Generator.generate 按 options 覆盖 —— 『移动_寻路』靠它决定
+        # "绕路走"还是"退化成直线走"(没烤网格时不该站着不动)。
+        self.nav_enabled = bool(self.options.get("nav_enabled", False))
 
         self.signals = []          # 要声明的 signal 名
         self.vars = {}             # 变量名 -> 类型

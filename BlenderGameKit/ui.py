@@ -3100,6 +3100,26 @@ class GK_PT_Main(bpy.types.Panel):
                     box.label(text=f"自动:跟着视口当前相机({cameras[0]})",
                               icon="CHECKMARK")
 
+                # ── 寻路 / 导航网格(第三十四轮)────────────────────────
+                # 打开 = 导出的场景里多一块运行时烤的导航网格,
+                # 『移动_寻路』的角色就能绕开墙 / 石头走到目标。
+                nav_row = box.row(align=True)
+                nav_row.prop(settings, "nav_enabled", toggle=True,
+                             icon="TRACKER")
+                if getattr(settings, "nav_enabled", False):
+                    if str(getattr(settings, "dimension", "3")) == "2":
+                        box.label(text="⚠ 2D 寻路还没做(这一版只有 3D)",
+                                  icon="ERROR")
+                    else:
+                        nums = box.row(align=True)
+                        nums.prop(settings, "nav_agent_radius", text="半径")
+                        nums.prop(settings, "nav_agent_height", text="高度")
+                        nums.prop(settings, "nav_max_slope", text="爬坡°")
+                        box.label(text="启动时按静态碰撞体烤网格;改完要重新导出",
+                                  icon="INFO")
+                else:
+                    box.label(text="关着:『移动_寻路』退化成直线走", icon="INFO")
+
         # ---- 模型导出:把 Blender 的网格 / 材质 / 贴图一起带进 Godot ----
         #
         # 材质跟着模型一起导出:没设材质就自动给默认白色。

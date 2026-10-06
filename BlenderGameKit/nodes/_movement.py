@@ -200,6 +200,61 @@ class GKNodeMoveToward(B.GKStatementNode):
 
 
 @N
+class GKNodeNavigate(B.GKStatementNode):
+    bl_idname = "GKNodeNavigate"
+    bl_label = "移动_寻路"
+    bl_icon = "TRACKER"
+    gk_category = "移动"
+    gk_doc = ("**绕开障碍物**走到目标 —— 追人的敌人不再一头撞墙 / 卡在墙角。"
+              "和『移动_朝向目标』的区别只有一个:走路的方向是"
+              "**导航网格**算出来的,**不是**直线。\n"
+              "── 前提 ──\n"
+              "场景设置里要勾上『寻路』(侧栏『导出脚本』那一块)——"
+              "它会在场景里烤一块导航网格(按地面 / 墙 / 台 / 树这些"
+              "静态碰撞体烤,会动的角色 / 载具不参与)。没勾的话这个节点"
+              "**退化成直线走**(和『移动_朝向目标』一样),不会站着不动。\n"
+              "── 参数 ──\n"
+              "『停在多远』= 离目标这么近就刹住;『面向移动方向』= 走的时候"
+              "朝前看(不是看目标 —— 绕墙的时候头跟着路转才自然);"
+              "『加速』= 0 是立刻到速度,填个数就平滑加减速。\n"
+              "『到达』输出 = 已经进了『停在多远』的范围,直接接分支判断"
+              "\"追到了没有\"。"
+              "⚠ 目标在墙那头、又没有路能绕过去时,它会贴着墙停下来(走不通),"
+              "不会穿墙 —— 设计关卡时别把玩家关进走不到的角落")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(OBJECT, "目标", None),
+        S.pin(FLOAT, "速度", 300.0),
+    )
+    gk_input_props = {"速度": "gk_speed"}
+    gk_prop_defs = (
+        ("gk_target", "node", TARGET_SELF, "谁走", "要移动的角色节点"),
+        ("gk_goal", "node", "", "目标", "往谁那儿走(『目标』引脚没接线时用它)"),
+        ("gk_speed", "float", 300.0, "速度",
+         "未连线时的速度(3D 米/秒;2D 像素/秒)"),
+        ("gk_stop_distance", "float", 0.0, "停在多远",
+         "离目标这么近就停下,不再往前挤(0 = 贴上去)"),
+        ("gk_turn", "bool", False, "面向移动方向",
+         "走的时候朝向前进方向(绕墙时头跟着路转)"),
+        ("gk_accel", "float", 0.0, "加速",
+         "0 = 立刻到速度;大于 0 = 平滑加减速(每秒能改变多少速度)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(BOOL, "到达", False),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        B.draw_target_picker(self, row, "gk_target")
+        row.prop(self, "gk_speed", text="")
+        row = layout.row(align=True)
+        row.label(text="目标")
+        B.draw_target_picker(self, row, "gk_goal")
+        row.prop(self, "gk_stop_distance", text="停在多远")
+        row = layout.row(align=True)
+        row.prop(self, "gk_turn", text="面向移动方向", toggle=True)
+        row.prop(self, "gk_accel", text="加速")
+
+
+@N
 class GKNodeJump(B.GKStatementNode):
     bl_idname = "GKNodeJump"
     bl_label = "移动_跳跃"

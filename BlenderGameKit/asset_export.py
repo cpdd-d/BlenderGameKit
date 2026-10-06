@@ -213,6 +213,17 @@ var _gk_mouse_was: int = -1
 ## 只显示这些变量(竖线分隔);留空 = 脚本里所有变量都显示。
 @export var debug_watch: String = "{debug_watch}"
 
+## ── 寻路:启动时烤一块导航网格(第三十四轮)──────────────────────
+## 场景设置里勾了『寻路』时为 true。导航区节点(`Navigation`,
+## 见 .tscn 里的 NavigationRegion3D)的参数由导出写死,这里负责**烤**:
+## 按场景里的**静态碰撞体**(地面 / 墙 / 高台 / 树 / 石头)生成可行走的
+## 多边形 —— 角色、载具这些会动的东西不参与(只解析 StaticBody 的碰撞体,
+## 实测真 Godot:角色站的地方网格是完整的,没有洞)。
+##
+## 烤完之前『移动_寻路』的角色会先**直线走**(降级,不是站着不动):
+## 少一块网格不该让游戏坏掉。
+@export var nav_bake: bool = {nav_bake}
+
 const _GK_DBG_KEY := {debug_key}            # 弹出 / 收起面板
 const _GK_DBG_COPY_KEY := {debug_copy_key}  # 复制全部内容
 
@@ -254,6 +265,11 @@ func _ready() -> void:
 	# (它只是 CanvasLayer + Label),所以不用 call_deferred。
 	if debug_panel and not Engine.is_editor_hint():
 		_gk_dbg_setup()
+	# 寻路:烤导航网格(第三十四轮)。**同步**烤 —— 『移动_寻路』第一帧
+	# 就要用,异步烤会多出几帧"敌人还在直线走"的窗口(降级本来就有,
+	# 但越短越好)。编辑器里不烤(和上面几个开关一致)。
+	if nav_bake and not Engine.is_editor_hint():
+		_gk_bake_navigation()
 
 
 ## 把 Blender 里调好的材质挂到对应的网格上。
@@ -911,6 +927,34 @@ func _scene_root() -> Node:
 	return node
 
 
+## 按静态碰撞体烤一块导航网格(第三十四轮:寻路)。
+##
+## ── 为什么走 NavigationServer3D 的底层 API,不用 region.bake_navigation_mesh()
+## 区域自己的 bake 在"根节点 = 区域"的语义下把**区域自己的子节点**当几何源 ——
+## 而本项目的地面/墙都在场景根下面(不在区域底下),实测烤出来 **0 个多边形**。
+## 底层 API 能**明确指定根节点**(这里给场景根),烤出来的东西才是对的。
+##
+## ── 为什么烤完装一份 duplicate 回去 ──────────────────────────────
+## `region.navigation_mesh = 同一个对象` 会被 setter 早退(它判的是引用相等),
+## 服务器那边拿不到刚烤出来的多边形 —— 换一份新对象才一定会重新上传。
+func _gk_bake_navigation() -> void:
+	var root := _scene_root()
+	if root == null:
+		return
+	var region := root.find_child("Navigation", true, false) as NavigationRegion3D
+	if region == null or region.navigation_mesh == null:
+		print("[GK] 『寻路』开着,但场景里没有 Navigation 节点 —— 重新导出一次")
+		return
+	var navmesh: NavigationMesh = region.navigation_mesh
+	var baked: NavigationMesh = navmesh.duplicate()
+	var source := NavigationMeshSourceGeometryData3D.new()
+	NavigationServer3D.parse_source_geometry_data(baked, source, root)
+	NavigationServer3D.bake_from_source_geometry_data(baked, source)
+	region.navigation_mesh = baked
+	print("[GK] 导航网格已烤:", baked.get_polygon_count(),
+		  " 个多边形(代理半径 ", baked.agent_radius, ")")
+
+
 func _find_camera() -> Camera3D:
 	var root := _scene_root()
 	if root == null:
@@ -933,6 +977,7 @@ ENV_SCRIPT_DEFAULTS = dict(
     follow_scene_light="false", god_camera="false",
     debug_panel="false", debug_watch="",
     debug_key="KEY_F1", debug_copy_key="KEY_F2",
+    nav_bake="false",
 )
 
 
@@ -1114,6 +1159,67 @@ def _god_camera_on(scene):
 
 
 # ==========================================================================
+# 寻路 / 导航网格(第三十四轮:用户选的"敌人会绕墙追你")
+# ==========================================================================
+# 导出的是一块 **运行时烤的** 导航网格:场景里放一个 NavigationRegion3D
+# (名字 `Navigation`),环境脚本启动时按 `NavigationMesh` 的参数把
+# **静态碰撞体**烤成可行走的多边形。
+#
+# ── 为什么按"静态碰撞体"烤(实测三个模式都跑过)───────────────────
+#   * 只按网格实例(0):本项目的网格都在 glb 实例里、和碰撞代理是两棵树,
+#     而且**纯装饰网格**(没有碰撞的)也会被烤进去 —— 不干净;
+#   * 两者都要(2):角色/装饰物都会被烤进网格(实测探针:
+#     环境网格从 20 个多边形变成 26 个,路径开始绕着**角色**走);
+#   * 只按静态碰撞体(1) ✅:地面/墙/高台/树/石头都在 Colliders/ 下有
+#     StaticBody —— 而 CharacterBody(角色/载具)和 RigidBody **不参与**
+#     (实测:角色站的地方网格是完整的,没有洞)。
+NAV_REGION_NAME = "Navigation"
+
+
+def _nav_on(scene):
+    """场景设置:这一关要不要烤导航网格(2D 暂不支持,见下)。"""
+    settings = getattr(scene, "gk_settings", None)
+    if not bool(getattr(settings, "nav_enabled", False)):
+        return False
+    # 2D 的 NavigationRegion2D + NavigationPolygon 接口还没做 ——
+    # 开着也当没开(面板里会提示),免得生成出一块烤不出来的网格。
+    return str(getattr(settings, "dimension", "3")) != "2"
+
+
+def _nav_settings(scene):
+    """导航网格的参数(交给 .tscn 的 NavigationMesh 子资源 + 环境脚本)。"""
+    settings = getattr(scene, "gk_settings", None)
+
+    def number(attr, fallback):
+        try:
+            return float(getattr(settings, attr, fallback))
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "radius": max(0.05, number("nav_agent_radius", 0.5)),
+        "height": max(0.1, number("nav_agent_height", 1.8)),
+        "slope": max(0.0, min(89.0, number("nav_max_slope", 45.0))),
+    }
+
+
+# NavigationMesh 子资源 + 导航区节点。
+#
+# `geometry_parsed_geometry_type = 1` = 只解析**静态碰撞体**(见上面的说明)。
+# `agent_max_climb`(能迈多高)故意留给默认 0.25 —— 和导出的台阶高度同一量级;
+# `cell_size` / `cell_height` 也用默认(0.25 / 0.25),代理高度会被量化到
+# 格子高度(真 Godot 里会打一条无害的提示,不影响结果)。
+NAVMESH_SUBRESOURCE = """[sub_resource type="NavigationMesh" id="gk_navmesh"]
+agent_radius = {radius}
+agent_height = {height}
+agent_max_slope = {slope}
+geometry_parsed_geometry_type = 1"""
+
+NAVIGATION_NODE = """[node name="{name}" type="NavigationRegion3D" parent="."]
+navigation_mesh = SubResource("gk_navmesh")"""
+
+
+# ==========================================================================
 # 游戏内调试面板(用户 2026-10-05 第二十二轮:"调试体验")
 # ==========================================================================
 # 『运行日志』只能往控制台打一行行字;调试面板是**玩的时候能看**的一块 HUD:
@@ -1218,6 +1324,7 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
         debug_watch=_debug_watch_text(scene),
         debug_key=_debug_key_const(scene, "debug_key", "F1"),
         debug_copy_key=_debug_key_const(scene, "debug_copy_key", "F2"),
+        nav_bake="true" if _nav_on(scene) else "false",
     )
 
 
@@ -1722,6 +1829,13 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                          f'path="{env_script_res(scene_name)}" '
                          f'id="env_script"]')
 
+    # ---- 导航网格(第三十四轮:寻路)----
+    # 只是把参数写进子资源;真正"烤"的动作在环境脚本启动时做
+    # (网格要按**导出的碰撞体**烤,导出侧烤不了 —— 见 _nav_on 的说明)。
+    nav = _nav_settings(scene) if _nav_on(scene) else None
+    if nav is not None:
+        sub_resources.append(NAVMESH_SUBRESOURCE.format(**nav))
+
     load_steps = 1 + len(ext_lines) + len(sub_resources)
 
     lines = ["; 由 BlenderGameKit 自动生成,请勿手动修改",
@@ -1985,6 +2099,13 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             lines.extend(block)
             lines.append("")
 
+    # ---- 导航区(第三十四轮:寻路)----
+    # 一块空的 NavigationRegion3D:它的网格在启动时由环境脚本烤出来
+    # (见 _gk_bake_navigation)。放在根下面 = 解析根是场景根。
+    if nav is not None:
+        lines.append(NAVIGATION_NODE.format(name=NAV_REGION_NAME))
+        lines.append("")
+
     if environment:
         lines.append(environment.strip("\n"))
         lines.append("")
@@ -2241,7 +2362,9 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     # 所以开关开着时,即使什么活都没有也要把这个节点写出来。
     # 调试面板(第二十二轮)同理:开着就必须有 Environment 节点,
     # 否则"场景里只有网格"时面板会跟着不存在,而排查恰恰常在这种场景里做。
-    if parts or material_table or _god_camera_on(scene) or _debug_panel_on(scene):
+    # 寻路(第三十四轮)同理:烤导航网格那件事本身就在环境脚本里。
+    if (parts or material_table or _god_camera_on(scene)
+            or _debug_panel_on(scene) or _nav_on(scene)):
         fields = _env_fields(scene, camera_name=camera_name, fov=fov_for_env,
                              material_files=material_files)
         if not parts:
