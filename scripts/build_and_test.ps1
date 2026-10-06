@@ -273,6 +273,39 @@ if ($SkipGodot) {
                 }
             }
         }
+
+        # 5g. 2D 寻路示例(第三十六轮:寻路第二版)—— 俯视 2D 里『移动_寻路』
+        #     真绕开障碍追人。这一层验的是 2D 导出的整条链路:
+        #     NavigationRegion2D + NavigationPolygon 子资源 + 环境脚本的 2D 烘焙
+        #     (碰撞体当**障碍**、先按包围盒算外框)+ 生成脚本的 2D 路径查询。
+        Write-Output ""
+        $nav2dDir = Join-Path $Root "examples\demo_nav2d"
+        $nav2dMaker = Join-Path $Root "scripts\make_nav2d_demo.py"
+        if (-not (Test-Path $Blender)) {
+            Write-Output "跳过 2D 寻路示例:找不到 Blender(示例要先重建才能真跑)"
+        } elseif (-not (Test-Path $nav2dDir)) {
+            Write-Output "跳过 2D 寻路示例:还没有 examples\demo_nav2d"
+        } else {
+            $nav2dLog = & $Blender -b --python $nav2dMaker 2>&1 | Out-String
+            if ($nav2dLog -notmatch "已保存") {
+                Write-Host "---- 重建 2D 寻路示例失败,尾部 20 行 ----"
+                ($nav2dLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                    Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+                $godotOk = $false
+            } else {
+                $nav2dChecker = Join-Path $Root "scripts\check_nav2d_demo.py"
+                $nav2dOut = & python $nav2dChecker --godot $Godot 2>&1 | Out-String
+                $nav2dOut -split "`n" | Where-Object { $_ -match "^(NAV2D|CHECK_NAV2D_DEMO|跳过|✗)" } |
+                    ForEach-Object { Write-Host $_.TrimEnd() }
+                if ($nav2dOut -match "CHECK_NAV2D_DEMO=OK") {
+                    $godotRan += "2D寻路示例"
+                } elseif ($nav2dOut -match "跳过") {
+                    Write-Output "（2D 寻路示例跳过）"
+                } else {
+                    $godotOk = $false
+                }
+            }
+        }
     }
 
     if ($godotSkipped) {

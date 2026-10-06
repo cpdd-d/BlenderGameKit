@@ -658,7 +658,15 @@ def _move_toward_goal(ctx, node):
     raw = str(getattr(node, "gk_goal", "") or "").strip()
     if not raw:
         return None
-    return ctx.target_expr(node, "gk_goal", hint="节点")
+    # ── 2D 的目标引用必须限成 Node2D(第三十六轮,真 Godot 实测)─────────
+    # glb 里有一份**和物体同名**的网格节点(MeshInstance3D),导出后
+    # 它在树里的顺序往往**排在碰撞代理前面**。宽松的 "Node" 类型会让
+    # _gk_ref_typed 命中那个网格 —— 3D 里没事(网格也是 Node3D,位置
+    # 就是物体位置),但 2D 里 MeshInstance3D **不是** Node2D,位置读取
+    # 掉进"返回 (0,0)"的兜底:追踪者被引到原点、一头顶在障碍上
+    # (实测:追了两秒卡死、永远到不了)。
+    return ctx.target_expr(node, "gk_goal", hint="节点",
+                           node_type="Node2D" if ctx.dim == 2 else "")
 
 
 @multi_output("GKNodeMoveToward")
@@ -690,24 +698,27 @@ def _expr_move_toward_outputs(ctx, node):
 def _stmt_navigate(ctx, node, indent):
     """『移动_寻路』:朝目标走,方向由**导航网格**算(不是直线)。
 
-    ── 为什么直接跟 NavigationServer3D 的路径,不用 NavigationAgent3D ──
+    ── 为什么直接跟服务器的路径,不用 NavigationAgent 的路径 ──────────
     实测(真 Godot,物理测试场第 ⑩ 工位):服务器的
     `map_get_path` 给出 10 个点的绕墙路径(从墙端拐过去),
     但 `NavigationAgent3D.get_next_path_position()` **一直返回它自己的位置** ——
-    因为代理拿"父节点原点"(角色中心 y=0.8)和路径第 0 个点
-    (贴在网格上 y=0.25)比距离:竖直差 0.55 > `path_desired_distance`(0.5),
-    于是它永远"没走到第 0 个点",索引不前进 —— 表现就是敌人一动不动。
-    而把 y 压平之后再比又永远是 0(自己到自己)。
-    自管路径没有这层内部状态:**每帧拿一条路径,盯住第 1 个点**
+    代理的内部路径状态和"贴网格的点/父节点原点的高度差"纠缠在一起,
+    调试代价高。自管路径没有这层内部状态:**每帧拿一条路径,盯住第 1 个点**
     (`_path[0]` 就是自己站的那个点)。代价是每帧一次路径查询,
     对"几个追人的敌人"这个量级完全够,而且行为完全可预测。
+    (NavigationAgent 只用来做**避障**:它那套 RVO 整流没法手写,
+    见下面的 _gk_nav_move。)
 
     ── 三层降级(用户视角:少开一个开关不该让游戏坏掉)────────────────
       1. 场景没勾『寻路』(没有导航网格)-> 直线走(和『移动_朝向目标』一样);
-      2. 路径只有 0/1 个点(网格还没烤完 / 目标不可达)-> 这一帧直线走;
-      3. 2D -> 直线走(2D 的 NavigationRegion2D 还没做,待办里)。
-    ⚠ 后两条**不刷告警**(它们是每帧都可能发生的运行时状态);
+      2. 路径只有 0/1 个点(网格还没烤完 / 目标不可达)-> 这一帧直线走。
+    ⚠ 第二条**不刷告警**(它是每帧都可能发生的运行时状态);
       第一条刷告警 —— 那是"设置漏了",用户该知道。
+
+    ── 2D / 3D(第三十六轮)────────────────────────────────────────
+    两个维度走同一套:2D 用 `NavigationServer2D.map_get_path` +
+    `get_world_2d()`,3D 用 3D 版;只有"把路点高度压平"(3D 专有)
+    和"转向写法"不同。
     """
     body_type = "CharacterBody2D" if ctx.dim == 2 else "CharacterBody3D"
     target = ctx.target_expr(node, "gk_target", hint="节点", node_type=body_type)
@@ -718,16 +729,18 @@ def _stmt_navigate(ctx, node, indent):
         return
 
     if ctx.dim == 2:
-        ctx.warn("『移动_寻路』这一版只支持 3D —— 2D 里它**退化成直线走**"
-                 "(和『移动_朝向目标』一样)。2D 寻路记在待办里了")
-        nav_ok = False
+        server = "NavigationServer2D"
+        map_expr = f"{target}.get_world_2d().navigation_map"
     else:
-        nav_ok = bool(getattr(ctx, "nav_enabled", False))
-        if not nav_ok:
-            ctx.warn("『移动_寻路』要用导航网格绕路,但这一关的场景设置里"
-                     "**没勾『寻路』** —— 它现在退化成直线走(和"
-                     "『移动_朝向目标』一样)。想让它绕墙:侧栏『导出脚本』"
-                     "里勾上『寻路』,再重新导出")
+        server = "NavigationServer3D"
+        map_expr = f"{target}.get_world_3d().navigation_map"
+
+    nav_ok = bool(getattr(ctx, "nav_enabled", False))
+    if not nav_ok:
+        ctx.warn("『移动_寻路』要用导航网格绕路,但这一关的场景设置里"
+                 "**没勾『寻路』** —— 它现在退化成直线走(和"
+                 "『移动_朝向目标』一样)。想让它绕墙:侧栏『导出脚本』"
+                 "里勾上『寻路』,再重新导出")
 
     if ctx.dim == 2:
         speed = _tunable_number(ctx, node, "速度", "300.0", "nav_speed")
@@ -739,6 +752,10 @@ def _stmt_navigate(ctx, node, indent):
     stop = gd_number(float(getattr(node, "gk_stop_distance", 0.0) or 0.0))
     turn = bool(getattr(node, "gk_turn", False))
     accel = float(getattr(node, "gk_accel", 0.0) or 0.0)
+    # 避障(第三十六轮):期望速度交给 NavigationAgent,回调拿安全速度。
+    avoid = bool(getattr(node, "gk_avoid", False))
+    avoid_radius = gd_number(max(0.01, float(
+        getattr(node, "gk_avoid_radius", 0.5) or 0.5)))
     vector = "Vector2" if ctx.dim == 2 else "Vector3"
 
     from .expressions import ensure_position_helper
@@ -756,15 +773,18 @@ def _stmt_navigate(ctx, node, indent):
     if nav_ok:
         path = ctx.new_temp("nav_path")
         step = ctx.new_temp("nav_step")
-        ctx.add_line(indent, f"var {path} := NavigationServer3D.map_get_path("
-                             f"{target}.get_world_3d().navigation_map, "
+        ctx.add_line(indent, f"var {path} := {server}.map_get_path("
+                             f"{map_expr}, "
                              f"{here}, {goal_at}, true)")
         ctx.add_line(indent, f"var {step} := {diff}")
         # ── 盯住路径的**第 1 个点**(第 0 个点就是自己站的那个)──────────
         # 只有 0/1 个点 = 网格还没烤完 / 目标不可达 -> 保持直线。
         ctx.add_line(indent, f"if {path}.size() > 1:")
         ctx.add_line(indent + 1, f"{step} = {path}[1] - {here}")
-        ctx.add_line(indent, f"{step}.y = 0.0")
+        if ctx.dim == 3:
+            # 路点高度要压平(网格贴在碰撞体上表面,不压平会上下拱);
+            # 2D 没有"高度"这回事,不压。
+            ctx.add_line(indent, f"{step}.y = 0.0")
         # 点几乎在脚下(路径只有起点)-> 这一帧直线走,别站着不动
         ctx.add_line(indent, f"if {step}.length() < 0.05:")
         ctx.add_line(indent + 1, f"{step} = {diff}")
@@ -772,7 +792,35 @@ def _stmt_navigate(ctx, node, indent):
     else:
         direction = diff
 
-    if accel > 0.0:
+    if avoid:
+        # ── 避障(第三十六轮)─────────────────────────────────────────
+        # 把"期望速度"交给 NavigationAgent:它和附近别的 agent 一起算
+        # RVO,得出的**安全速度**在 velocity_computed 回调里赋值给角色
+        # 并 move_and_slide(回调只接一次,见 _gk_nav_agent)。
+        # 这里自己不再 move —— 交给回调(否则一帧里走两遍)。
+        wanted = ctx.new_temp("wanted")
+        ctx.add_line(indent, f"var {wanted} := {vector}.ZERO")
+        ctx.add_line(indent, f"if {distance} > {stop}:")
+        ctx.add_line(indent + 1,
+                     f"{wanted} = {direction}.normalized() * {speed}")
+        if ctx.dim == 2:
+            ctx.need_nav_avoid_2d = True
+            helper = "_gk_nav_move2d"
+        else:
+            ctx.need_nav_avoid = True
+            helper = "_gk_nav_move"
+        if accel > 0.0:
+            # 平滑:期望速度朝目标速度靠(拿到的是避障后的实际速度,
+            # 正好带一点"被邻居挤住时减下来"的自然)。
+            ctx.add_line(indent, f"{target}.velocity = {target}.velocity.move_toward("
+                                 f"{wanted}, {gd_number(accel)} "
+                                 f"* get_physics_process_delta_time())")
+            wanted_expr = f"{target}.velocity"
+        else:
+            wanted_expr = wanted
+        ctx.add_line(indent, f"{helper}({target}, {wanted_expr}, {goal_at}, "
+                             f"{avoid_radius}, {speed})")
+    elif accel > 0.0:
         wanted = ctx.new_temp("wanted")
         ctx.add_line(indent, f"var {wanted} := {vector}.ZERO")
         ctx.add_line(indent, f"if {distance} > {stop}:")
@@ -793,7 +841,21 @@ def _stmt_navigate(ctx, node, indent):
         ctx.add_line(indent, f"if absf({direction}.x) + absf({direction}.z) > 0.001:")
         ctx.add_line(indent + 1, f"{target}.look_at({here} + {vector}("
                                  f"{direction}.x, 0.0, {direction}.z), Vector3.UP)")
-    ctx.add_line(indent, f"{target}.move_and_slide()")
+    if not avoid:
+        # 避障时移动在回调里做(见 _gk_nav_move),这里不重复走。
+        ctx.add_line(indent, f"{target}.move_and_slide()")
+
+
+@stmt_node("GKNodeRebakeNavigation")
+def _stmt_rebake_navigation(ctx, node, indent):
+    """『移动_重烤导航』:门 / 平台挪了之后重烤一次导航网格。
+
+    真正的活(3D 按静态碰撞体烤 / 2D 算外框再烤)在**环境脚本**里 ——
+    生成脚本这边只把一个转发函数带进公共前缀(按需注入,
+    见 generator 的 _emit_nav_helpers)。
+    """
+    ctx.need_nav_rebake = True
+    ctx.add_line(indent, "_gk_rebake_navigation()")
 
 
 @multi_output("GKNodeNavigate")

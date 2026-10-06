@@ -9764,13 +9764,14 @@ class TestRound34Navigation(Base):
         self.assertIn(".move_and_slide()", code)
         self.assertTrue(any("没勾『寻路』" in text for text in warnings), warnings)
 
-    def test_2d_falls_back_and_warns(self):
-        """2D:这一版没有 2D 寻路 —— 直线走 + 告警,不生成 3D 查询。"""
+    def test_2d_uses_navigation_server2d(self):
+        """2D(第三十六轮):真查 NavigationServer2D 的绕行路径,不再降级直线。"""
         tree, _ = self._tree(goal="玩家")
         code, warnings = gen(tree, dict(V2, nav_enabled=True))
-        self.assertNotIn("map_get_path", code)
+        self.assertIn("NavigationServer2D.map_get_path(", code)
+        self.assertIn(".get_world_2d().navigation_map", code)
         self.assertIn(".move_and_slide()", code)
-        self.assertTrue(any("只支持 3D" in text for text in warnings), warnings)
+        self.assertFalse(any("只支持 3D" in text for text in warnings), warnings)
 
     def test_arrival_output_is_distance_based(self):
         """『到达』= 离目标进了『停在多远』(和走的是不是直线无关)。"""
@@ -9802,9 +9803,109 @@ class TestRound34Navigation(Base):
         self.assertGreaterEqual(values["radius"], 0.05)
         self.assertGreaterEqual(values["height"], 0.1)
         self.assertLessEqual(values["slope"], 89.0)
-        # 2D 场景:开着也当没开(2D 的导航接口还没做)
+        # 2D(第三十六轮):开着就是开着 —— 2D 现在也烤导航多边形
         settings.dimension = "2"
-        self.assertFalse(export._nav_on(scene))
+        self.assertTrue(export._nav_on(scene))
+
+
+class TestRound36NavV2(Base):
+    """第三十六轮:寻路第二版 —— 2D 真寻路 / 避障 / 重烤导航。
+
+    避障为什么用 NavigationAgent:那是引擎的 RVO,手写不出来 ——
+    每帧 set_velocity(期望速度),velocity_computed 回调发回安全速度。
+    实测(真 Godot):3 个敌人同追一点,各自侧移、最小间距 0.8 米、全部到达。
+    """
+
+    @staticmethod
+    def _tree(*, goal="", avoid=False):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        chaser = tree.new_node(NN.GKNodeNavigate, "追玩家", gk_goal=goal,
+                               gk_speed=3.0, gk_stop_distance=1.0,
+                               gk_avoid=avoid, gk_avoid_radius=0.6)
+        gk_stub.connect(tree, physics, "执行", chaser, "执行")
+        return tree, chaser
+
+    def test_avoid_injects_agent_helpers(self):
+        """勾了『避障』:注入 agent 帮助函数(开避障 / 对齐地图 / 回调移动)。"""
+        tree, _ = self._tree(goal="玩家", avoid=True)
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertIn("_gk_nav_move(", code)
+        self.assertIn("func _gk_nav_agent(target: CharacterBody3D", code)
+        # 避障默认是关的 —— 不显式打开时 set_velocity 什么都不做(实测)
+        self.assertIn("agent.avoidance_enabled = true", code)
+        self.assertIn("set_navigation_map(map)", code)
+        # ⚠ 不设 target_position 时避障不工作(实测:安全速度恒 0)
+        self.assertIn("agent.target_position = goal", code)
+        self.assertIn("func _gk_nav_move(target: CharacterBody3D, "
+                      "desired: Vector3, goal: Vector3",
+                      code)
+        # 移动只在回调里做:整份代码里 move_and_slide 恰好一次
+        self.assertEqual(code.count("move_and_slide()"), 1)
+
+    def test_no_avoid_keeps_old_code(self):
+        """没勾『避障』:老代码一字不变,不注入任何 agent 东西。"""
+        tree, _ = self._tree(goal="玩家")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertNotIn("_gk_nav_move", code)
+        self.assertNotIn("NavigationAgent3D", code)
+
+    def test_avoid_2d_uses_agent2d(self):
+        """2D 避障走 NavigationAgent2D(同一套 RVO)。"""
+        tree, _ = self._tree(goal="玩家", avoid=True)
+        code, _ = gen(tree, dict(V2, nav_enabled=True))
+        self.assertIn("_gk_nav_move2d(", code)
+        self.assertIn("NavigationAgent2D", code)
+        self.assertIn("get_world_2d()", code)
+
+    def test_rebake_node_emits_forwarder(self):
+        """『移动_重烤导航』:语句 + 转发到环境脚本的帮助函数。"""
+        tree, _ = self._tree(goal="玩家")
+        physics = tree.find("物理帧")
+        rebake = tree.new_node(NN.GKNodeRebakeNavigation, "重烤")
+        gk_stub.connect(tree, physics, "执行", rebake, "执行")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertIn("_gk_rebake_navigation()", code)
+        self.assertIn('env.has_method("rebake_navigation")', code)
+
+    def test_rebake_helper_only_when_used(self):
+        """没用到『移动_重烤导航』的图不注入转发函数。"""
+        tree, _ = self._tree(goal="玩家")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertNotIn("rebake_navigation", code)
+
+    def test_env_script_has_2d_bake_and_rebake(self):
+        """环境脚本:3D / 2D 两条烘焙路径 + 公开的 rebake_navigation。
+
+        两条实测结论锁在这里:
+          * 2D 烘焙必须先 add_outline 一个"外框"(没有外框 = 0 个多边形);
+          * 烤完要再赋一份 duplicate("第一个地图吞第一次赋值")。
+        """
+        from BlenderGameKit import asset_export as export
+        script = export.render_env_script()
+        self.assertIn("func rebake_navigation() -> void:", script)
+        self.assertIn("func _gk_bake_navigation_3d(", script)
+        self.assertIn("func _gk_bake_navigation_2d(", script)
+        self.assertIn("add_outline(PackedVector2Array(", script)
+        self.assertIn(
+            "NavigationPolygon.PARSED_GEOMETRY_STATIC_COLLIDERS", script)
+        self.assertIn("region.navigation_mesh = baked.duplicate()", script)
+        self.assertIn("region.navigation_polygon = poly.duplicate()", script)
+        # ⚠ 重烤要**等两个物理帧**:门/平台(AnimatableBody3D)的位移
+        # 下一物理步才进物理世界,同帧重烤烤出来的还是老网格(实测)
+        self.assertIn("await get_tree().physics_frame", script)
+        self.assertIn("_gk_bake_navigation()", script)  # _ready 里的启动烘焙
+
+    def test_2d_navpoly_subresource_and_node(self):
+        """2D 导出:NavigationPolygon 子资源 + NavigationRegion2D 节点。"""
+        from BlenderGameKit import asset_export as export
+        text = export.NAVPOLY_SUBRESOURCE.format(radius=8.0)
+        self.assertIn('type="NavigationPolygon"', text)
+        self.assertIn("agent_radius = 8.0", text)
+        self.assertIn("parsed_geometry_type = 1", text)
+        node = export.NAVIGATION_NODE_2D.format(name="Navigation")
+        self.assertIn('type="NavigationRegion2D"', node)
+        self.assertIn('navigation_polygon = SubResource("gk_navpoly")', node)
 
 
 if __name__ == "__main__":

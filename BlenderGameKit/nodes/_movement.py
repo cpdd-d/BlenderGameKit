@@ -220,7 +220,13 @@ class GKNodeNavigate(B.GKStatementNode):
               "『到达』输出 = 已经进了『停在多远』的范围,直接接分支判断"
               "\"追到了没有\"。"
               "⚠ 目标在墙那头、又没有路能绕过去时,它会贴着墙停下来(走不通),"
-              "不会穿墙 —— 设计关卡时别把玩家关进走不到的角落")
+              "不会穿墙 —— 设计关卡时别把玩家关进走不到的角落\n"
+              "── 一群敌人 ──\n"
+              "勾上『避障』:多个追人的敌人会**互相绕开**,不会挤成一团"
+              "(3D / 2D 都支持;单敌人开着也没副作用)。\n"
+              "── 门 / 平台挪了 ──\n"
+              "门升起、平台挪走之后用『移动_重烤导航』重烤一次,别人才知道"
+              "路变了(不然它们还按老路一头撞上去)")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(OBJECT, "目标", None),
@@ -238,6 +244,17 @@ class GKNodeNavigate(B.GKStatementNode):
          "走的时候朝向前进方向(绕墙时头跟着路转)"),
         ("gk_accel", "float", 0.0, "加速",
          "0 = 立刻到速度;大于 0 = 平滑加减速(每秒能改变多少速度)"),
+        # ── 避障(第三十六轮:寻路第二版)────────────────────────────
+        # Godot 的导航避障(NavigationAgent 的 RVO):每个 agent 把自己的
+        # **期望速度**交上去,服务器算出"互相避开邻居之后"的安全速度再回
+        # 回来 —— 一群敌人同追一个目标时各自侧移错开,不叠在一起。
+        # 实测:3 个敌人同追一点,最小间距 0.8 米、全部到达;
+        # 不避障时它们互相顶着走,挤成一团。
+        # 默认关:老图产物一字不变;要多敌人互绕的场景自己勾。
+        ("gk_avoid", "bool", False, "避障",
+         "多个追人的敌人互相绕开、不挤成一团(单敌人开着也没副作用)"),
+        ("gk_avoid_radius", "float", 0.5, "避障半径",
+         "敌人之间保持的间距(米 / 2D 单位):越大离得越开"),
     )
     gk_outputs = (S.pin(FLOW, "完成"), S.pin(BOOL, "到达", False),)
 
@@ -252,6 +269,32 @@ class GKNodeNavigate(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_turn", text="面向移动方向", toggle=True)
         row.prop(self, "gk_accel", text="加速")
+        row = layout.row(align=True)
+        row.prop(self, "gk_avoid", text="避障(互相绕开)", toggle=True)
+        if getattr(self, "gk_avoid", False):
+            row.prop(self, "gk_avoid_radius", text="半径")
+
+
+@N
+class GKNodeRebakeNavigation(B.GKStatementNode):
+    bl_idname = "GKNodeRebakeNavigation"
+    bl_label = "移动_重烤导航"
+    bl_icon = "FILE_REFRESH"
+    gk_category = "移动"
+    gk_doc = ("**重新烤一遍导航网格** —— 门升起来 / 平台挪走 / 静态资产"
+              "搬了之后调用它,『移动_寻路』的角色才会知道路变了"
+              "(不烤的话它们还按老路走,一头撞在新出现的障碍上)。\n"
+              "── 什么时候用 ──\n"
+              "接在『时间轴』播放后 / 触发区的『进入』输出上:门一打开、"
+              "路一打通就重烤一次。\n"
+              "── 成本 ──\n"
+              "重烤要几毫秒 ~ 几十毫秒(按场景大小涨),**别每帧调** ——"
+              "挪完东西烤一次就够。烤好后约三四帧内在服务器生效,"
+              "这期间敌人先按老路走(不会卡死)。\n"
+              "⚠ 只有场景设置里勾了『寻路』并且导出过导航网格时它才有效;"
+              "没勾时它什么都不做(静默跳过)")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_outputs = (S.pin(FLOW, "完成"),)
 
 
 @N

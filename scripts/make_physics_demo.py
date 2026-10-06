@@ -17,6 +17,8 @@
 | **移动平台** | 时间轴(PINGPONG)横着推的 AnimatableBody 平台 | 站上去**被带着走**(位移 = 平台位移)—— StaticBody 是"瞬移",人会留在原地 |
 | **载具** | CharacterBody 车 + E 上下车 + W/S 前后 · A/D 转车头 + 车头顶箱子 | 上车后角色被钉在座位上跟着车走;车能**把前面的箱子顶开**;下车后角色能走、车不跟着跑;上帝视角里按 W 车不许动、按 T 时停 |
 | **绕墙追击** | 『移动_寻路』追墙那头的玩家(第三十四轮) | **绕过墙**追到人(从墙端过去)—— 直线追会贴墙卡住 |
+| **群追避障** | 3 个『群追者』一起追人,每个勾了『避障』(第三十六轮) | 三个人**互相绕开**(不叠成一团)、**都追到**人 —— 没避障时互相顶着走 |
+| **门升起重烤** | 门堵着门洞 → 玩家走进触发区:门升起 + 『移动_重烤导航』(第三十六轮) | 追踪者**从门洞穿过**来(不重烤的话它一直绕墙端 —— 老网格里门还堵着) |
 
 跑法:
     blender -b --python scripts\\make_physics_demo.py
@@ -43,7 +45,7 @@ PLAYER_START_Y = -6.0
 PLAYER_Z = 0.9
 # 工位间距(每个工位一个 X,障碍物在 +Y 方向)
 STATION_STEP = 7.0
-STATION_X = [index * STATION_STEP for index in range(10)]
+STATION_X = [index * STATION_STEP for index in range(12)]
 # ⚠ 坐标换算:Godot(x, y, z) = Blender(x, z, -y) —— 所以
 # "在 Godot 里往 -Z 走"(按 W,相机 yaw=0)在 Blender 里就是**往 +Y 走**。
 # 这一关所有障碍物都摆在角色的 +Y 方向,探针只要按 W 就能撞上。
@@ -68,6 +70,19 @@ NAV_WALL_THICK = 0.5       # 墙厚
 NAV_WALL_HEIGHT = 2.2
 NAV_CHASE_SPEED = 4.5      # 追踪者速度(米/秒;绕一圈约 9 米 -> 2 秒多)
 NAV_STOP = 1.2             # 贴到多近算"追上了"
+# 第 ⑪ 工位:群追(第三十六轮:寻路第二版的避障)────────────────────
+# 3 个追踪者从并排的起点追同一个玩家:勾了『避障』,他们会互相绕开
+# (实测最小间距 ≥ 2×避障半径);不勾的话挤成一团、互相顶着走。
+NAV_SWARM_SPEED = 4.5      # 和 ⑩ 的追踪者同速
+NAV_SWARM_RADIUS = 0.7     # 每个人的避障半径(两人间距 ≈ 1.4 米)
+# 第 ⑫ 工位:门升起 → 重烤导航(第三十六轮:动态障碍)──────────────
+# 两段墙留一个 2.4 米宽的门洞,一扇『门』把洞堵死 —— 追踪者想碰到墙那头的
+# 玩家,只能绕墙端。玩家走进『重烤触发区』之后:门升起 + 重烤一次导航网格
+# —— 追踪者立刻改从门洞穿过来(不重烤的话它永远绕墙端:老网格里门还堵着)。
+NAV_GATE_SPAN = 1.8        # 每侧墙宽(米)
+NAV_GATE_HOLE = 2.4        # 门洞宽(门一样宽,正好堵住)
+NAV_GATE_HEIGHT = 2.2
+NAV_GATE_RISE_Y = 4.6      # 门升起后的 Godot y(地面 0 往上 4.6 米)
 
 
 def log(message):
@@ -232,6 +247,32 @@ def build_scene():
     make_box("追击触发区", (NAV_WALL_SPAN + 1.0, 4.0, 0.12), (nav_x, -2.0, 0.06),
              (0.55, 0.35, 0.65, 1.0))
 
+    # ── ⑪ 群追(第三十六轮:避障)────────────────────────────────────
+    # 三个追踪者并排站在 z=-2 那侧,一起追 z=+2 的玩家。路上没墙 ——
+    # 这一站的看点是**他们互相绕开**(勾了『避障』),而不是绕路。
+    swarm_x = STATION_X[10]
+    for offset, name in ((-1.5, "群追者A"), (0.0, "群追者B"), (1.5, "群追者C")):
+        make_box(name, (1.2, 1.2, 1.6), (swarm_x + offset, 2.0, 0.8),
+                 (0.9, 0.5, 0.4, 1.0))
+    make_box("群追触发区", (3.0, 3.0, 0.12), (swarm_x, -2.0, 0.06),
+             (0.65, 0.45, 0.5, 1.0))
+
+    # ── ⑫ 门升起 → 重烤导航(第三十六轮:动态障碍)────────────────────
+    # 两段墙 + 中间一扇堵死门洞的『门』;追踪者在门那侧,玩家在这侧。
+    # 玩家走进『重烤触发区』:门升起 + 重烤一次 —— 追踪者改走门洞。
+    gate_x = STATION_X[11]
+    gate_offset = NAV_GATE_HOLE / 2.0 + NAV_GATE_SPAN / 2.0
+    for side, name in ((-1.0, "门墙左"), (1.0, "门墙右")):
+        make_box(name, (NAV_GATE_SPAN, NAV_WALL_THICK, NAV_GATE_HEIGHT),
+                 (gate_x + side * gate_offset, 0.0, NAV_GATE_HEIGHT / 2.0),
+                 wall_color)
+    make_box("门", (NAV_GATE_HOLE, NAV_WALL_THICK, NAV_GATE_HEIGHT),
+             (gate_x, 0.0, NAV_GATE_HEIGHT / 2.0), (0.85, 0.65, 0.35, 1.0))
+    make_box("门追踪者", (1.2, 1.2, 1.6), (gate_x, 2.0, 0.8),
+             (0.7, 0.5, 0.85, 1.0))
+    make_box("重烤触发区", (3.0, 3.0, 0.12), (gate_x, -2.0, 0.06),
+             (0.7, 0.55, 0.4, 1.0))
+
     player = make_box(PLAYER, (1.0, 1.0, 1.8),
                       (STATION_X[0], PLAYER_START_Y, PLAYER_Z),
                       (0.95, 0.55, 0.25, 1.0))
@@ -289,6 +330,24 @@ def write_physics(scene, player, box, body, pieces, platform, vehicle, chaser,
             # 世界 glb 里,和碰撞代理按名字配对(和小游戏示例的敌2 同款)。
             physics.body_type = "CharacterBody3D"
             physics.dimension = "3"
+        elif obj.name.startswith("群追者") or obj.name == "门追踪者":
+            # ⑪ / ⑫ 的追踪者(第三十六轮):和 ⑩ 的追踪者同款 ——
+            # 角色体、不当资产。
+            physics.body_type = "CharacterBody3D"
+            physics.dimension = "3"
+        elif obj.name == "门":
+            # ⑫ 的门(第三十六轮):要**被烤进导航网格**(AnimatableBody3D
+            # 属于 StaticBody3D 家族,和墙一样参与烘焙),又要被
+            # 『移动_设置位置』抬起来时**网格跟着走** -> 当资产导出
+            # (Model 子节点复用 glb,和移动平台同一个套路)。
+            physics.body_type = "AnimatableBody3D"
+            physics.dimension = "3"
+            physics.asset_name = "门"
+        elif obj.name in ("群追触发区", "重烤触发区"):
+            # 和『追击触发区』同款:Area3D 只检测重叠、不阻挡
+            physics.body_type = "Area3D"
+            physics.dimension = "3"
+            physics.is_trigger = True
         elif obj.name == "追击触发区":
             # 触发区(第三十四轮):只检测重叠、**不阻挡** —— 铺在墙这头,
             # 走上去就把『追击开关』置真。设成 StaticBody 会变成一块
@@ -329,6 +388,8 @@ def build_graph(scene, player):
     _tune_move_node(logic)
     _add_field_extras(logic)
     _add_nav_station(logic, physics)
+    _add_swarm_station(logic, physics)
+    _add_gate_station(logic, physics)
     _hint_chain(logic, physics)
     return logic
 
@@ -369,6 +430,89 @@ def _add_nav_station(tree, physics):
     _link(tree, read, "值", branch, "条件")
     _link(tree, branch, "是", chase, "执行")
     log("测试场:⑩ 追踪者(『移动_寻路』绕墙;走进追击触发区开追)已接好")
+
+
+def _add_swarm_station(tree, physics):
+    """第 ⑪ 工位(第三十六轮:避障)—— 3 个追踪者一起追,互相绕开。
+
+    ── 避障怎么用 ──────────────────────────────────────────────────
+    每个『移动_寻路』勾上『避障』:期望速度交给引擎的 NavigationAgent,
+    它和邻居一起做 RVO 整流 —— 追同一个玩家的几个人各自侧移、不叠成一团。
+    一个人追的时候开着也没副作用(邻居为空、速度原样通过)。
+
+    ── 为什么也用触发区开追(和 ⑩ 同一个理由)──────────────────────
+    一进游戏就追的话,他们会跟着玩家跑遍前面十个工位,把那些判据全搅乱。
+    """
+    var = tree.gk_vars.add()
+    var.var_name = "群追开关"
+    var.var_type = "bool"
+    var.default_value = "false"
+    var.comment = "第 ⑪ 工位:3 个『群追者』一起开追(走进群追触发区置真)"
+    var.group = "测试场"
+
+    trigger = _add(tree, "GKNodeOnAreaEntered", "走进群追触发区", -560.0, 1660.0,
+                   gk_area="群追触发区", gk_filter=PLAYER)
+    turn_on = _add(tree, "GKNodeSetVar", "开启群追", -300.0, 1660.0,
+                   gk_var_name="群追开关", gk_value=True)
+    read = _add(tree, "GKNodeGetVar", "读群追开关", 200.0, 1860.0,
+                gk_var_name="群追开关")
+    branch = _add(tree, "GKNodeBranch", "开始群追?", 360.0, 1860.0)
+    _link(tree, trigger, "执行", turn_on, "执行")
+    _link(tree, physics, "执行", branch, "执行")
+    _link(tree, read, "值", branch, "条件")
+    previous = branch
+    for index, name in enumerate(("群追者A", "群追者B", "群追者C")):
+        chase = _add(tree, "GKNodeNavigate", f"{name}追人",
+                     600.0 + index * 280.0, 1860.0,
+                     gk_target=name, gk_goal=PLAYER, gk_speed=NAV_SWARM_SPEED,
+                     gk_stop_distance=NAV_STOP, gk_turn=True, gk_accel=8.0,
+                     gk_avoid=True, gk_avoid_radius=NAV_SWARM_RADIUS)
+        _link(tree, previous, "是" if index == 0 else "完成", chase, "执行")
+        previous = chase
+    log("测试场:⑪ 群追者 ×3(『移动_寻路』+『避障』互相绕开)已接好")
+
+
+def _add_gate_station(tree, physics):
+    """第 ⑫ 工位(第三十六轮:动态障碍)—— 门升起 → 重烤导航。
+
+    ── 为什么必须重烤 ──────────────────────────────────────────────
+    导航网格是**启动时**按当时的静态碰撞体烤的。门升起之后,老网格里
+    那扇门还堵在门洞上 —— 追踪者会一直绕墙端。『移动_重烤导航』按
+    **现在**的碰撞体重烤一次,它才知道"洞通了",改走门洞。
+
+    ── 抬门用『移动_设置位置』(不是时间轴)────────────────────────
+    这一站要的是**瞬间**升起(探针等下一帧就能看到),时间轴还得配
+    轨道/时长,没必要。门是当**资产**导出的 —— 碰撞代理挪位置,
+    网格(Model 子节点)跟着走。
+    """
+    var = tree.gk_vars.add()
+    var.var_name = "门追开关"
+    var.var_type = "bool"
+    var.default_value = "false"
+    var.comment = "第 ⑫ 工位:『门追踪者』开追(走进重烤触发区置真)"
+    var.group = "测试场"
+
+    trigger = _add(tree, "GKNodeOnAreaEntered", "走进重烤触发区", -760.0, 2160.0,
+                   gk_area="重烤触发区", gk_filter=PLAYER)
+    turn_on = _add(tree, "GKNodeSetVar", "开启门追", -520.0, 2160.0,
+                   gk_var_name="门追开关", gk_value=True)
+    lift = _add(tree, "GKNodeSetPosition", "升起门", -280.0, 2160.0,
+                gk_target="门", gk_x=STATION_X[11], gk_y=NAV_GATE_RISE_Y,
+                gk_z=0.0)
+    rebake = _add(tree, "GKNodeRebakeNavigation", "重烤导航", -40.0, 2160.0)
+    read = _add(tree, "GKNodeGetVar", "读门追开关", 320.0, 2360.0,
+                gk_var_name="门追开关")
+    branch = _add(tree, "GKNodeBranch", "开始门追?", 480.0, 2360.0)
+    chase = _add(tree, "GKNodeNavigate", "门追踪者穿门", 720.0, 2360.0,
+                 gk_target="门追踪者", gk_goal=PLAYER, gk_speed=NAV_CHASE_SPEED,
+                 gk_stop_distance=NAV_STOP, gk_turn=True)
+    _link(tree, trigger, "执行", turn_on, "执行")
+    _link(tree, turn_on, "完成", lift, "执行")
+    _link(tree, lift, "完成", rebake, "执行")
+    _link(tree, physics, "执行", branch, "执行")
+    _link(tree, read, "值", branch, "条件")
+    _link(tree, branch, "是", chase, "执行")
+    log("测试场:⑫ 门升起 +『移动_重烤导航』(追踪者改走门洞)已接好")
 
 
 def _add_field_extras(tree):
@@ -472,11 +616,12 @@ def _hint_chain(tree, physics):
     hint = _add(tree, "GKNodeUiText", "操作提示", -300.0, 980.0,
                 gk_text=("WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / "
                          "Tab 上帝机(T 时停) / E 上·下车 / Esc 退出 —— "
-                         "十个工位摆在 +Y 方向"),
+                         "十二个工位摆在 +Y 方向"),
                 gk_x=18.0, gk_y=18.0, gk_size=18)
     goal = _add(tree, "GKNodeUiText", "工位说明", -300.0, 820.0,
                 gk_text=("工位(从近到远):斜坡 / 台阶 / 对角方块 / 推箱子 / "
-                         "多碰撞体 / 窄缝 / 薄墙 / 移动平台 / 载具 / 绕墙追击"),
+                         "多碰撞体 / 窄缝 / 薄墙 / 移动平台 / 载具 / 绕墙追击 / "
+                         "群追避障 / 门升起重烤"),
                 gk_x=18.0, gk_y=46.0, gk_size=18)
     setup = _by_name(tree, "设定初始视野")
     _link(tree, setup, "完成", hint, "执行")

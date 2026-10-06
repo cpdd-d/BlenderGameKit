@@ -215,12 +215,16 @@ var _gk_mouse_was: int = -1
 ## 只显示这些变量(竖线分隔);留空 = 脚本里所有变量都显示。
 @export var debug_watch: String = "{debug_watch}"
 
-## ── 寻路:启动时烤一块导航网格(第三十四轮)──────────────────────
+## ── 寻路:启动时烤一块导航网格(第三十四轮;第三十六轮加 2D / 重烤)──
 ## 场景设置里勾了『寻路』时为 true。导航区节点(`Navigation`,
-## 见 .tscn 里的 NavigationRegion3D)的参数由导出写死,这里负责**烤**:
-## 按场景里的**静态碰撞体**(地面 / 墙 / 高台 / 树 / 石头)生成可行走的
-## 多边形 —— 角色、载具这些会动的东西不参与(只解析 StaticBody 的碰撞体,
-## 实测真 Godot:角色站的地方网格是完整的,没有洞)。
+## .tscn 里 3D 是 NavigationRegion3D、2D 是 NavigationRegion2D)的参数
+## 由导出写死,这里负责**烤**:
+##   * 3D:按场景里的**静态碰撞体**(地面 / 墙 / 高台 / 树 / 石头)生成
+##     可行走的多边形 —— 角色、载具这些会动的东西不参与(只解析
+##     StaticBody 的碰撞体,实测真 Godot:角色站的地方网格是完整的);
+##   * 2D:碰撞体按**障碍**解析,先按所有静态碰撞体的包围盒算一个"外框"
+##     再烤(实测:2D 没有外框时烤出来 0 个多边形)。
+## 『移动_重烤导航』节点运行时重烤也走这里(rebake_navigation)。
 ##
 ## 烤完之前『移动_寻路』的角色会先**直线走**(降级,不是站着不动):
 ## 少一块网格不该让游戏坏掉。
@@ -990,23 +994,53 @@ func _scene_root() -> Node:
 	return node
 
 
-## 按静态碰撞体烤一块导航网格(第三十四轮:寻路)。
+## 按静态碰撞体烤一块导航网格(第三十四轮:寻路;第三十六轮加 2D / 重烤)。
 ##
-## ── 为什么走 NavigationServer3D 的底层 API,不用 region.bake_navigation_mesh()
+## ── 为什么走 NavigationServer 的底层 API,不用 region.bake_xxx()
 ## 区域自己的 bake 在"根节点 = 区域"的语义下把**区域自己的子节点**当几何源 ——
 ## 而本项目的地面/墙都在场景根下面(不在区域底下),实测烤出来 **0 个多边形**。
 ## 底层 API 能**明确指定根节点**(这里给场景根),烤出来的东西才是对的。
 ##
-## ── 为什么烤完装一份 duplicate 回去 ──────────────────────────────
-## `region.navigation_mesh = 同一个对象` 会被 setter 早退(它判的是引用相等),
-## 服务器那边拿不到刚烤出来的多边形 —— 换一份新对象才一定会重新上传。
+## ── 为什么烤完要**赋两次**(第三十六轮实测)────────────────────────
+## 进程里"第一个"地图的第一次赋值会被服务器吞掉:烤完等 5 帧查路径
+## 还是空;把同一份网格 duplicate 再赋一次,立刻就有绕墙路径。
+## 第二个地图起一次就够 —— 但多赋一次的代价约等于零,统一赋两次。
 func _gk_bake_navigation() -> void:
 	var root := _scene_root()
 	if root == null:
 		return
 	var region := root.find_child("Navigation", true, false) as NavigationRegion3D
-	if region == null or region.navigation_mesh == null:
-		print("[GK] 『寻路』开着,但场景里没有 Navigation 节点 —— 重新导出一次")
+	if region != null:
+		_gk_bake_navigation_3d(root, region)
+		return
+	var region2 := root.find_child("Navigation", true, false) as NavigationRegion2D
+	if region2 != null:
+		_gk_bake_navigation_2d(root, region2)
+		return
+	print("[GK] 『寻路』开着,但场景里没有 Navigation 节点 —— 重新导出一次")
+
+
+## 重烤(第三十六轮:门 / 平台挪了之后)。
+## 『移动_重烤导航』节点经生成脚本转发到这里;启动时 _ready 里烤的
+## 那次也走同一条路 —— 一个入口,行为一致。
+##
+## ⚠ 为什么**等两个物理帧**再烤(真 Godot 实测):
+## 『移动_设置位置』挪完门之后,如果**同一帧**就重烤,新位置还没进
+## 物理世界 —— 烤出来的还是老网格(门洞照样堵着,角色继续绕墙端)。
+## 实测对照:同帧烤出来 12 个多边形(= 没变,路径绕行 5 个点);
+## 隔 2 帧烤 24 个(= 门洞通了,路径直穿 9 个点)。门/平台是
+## AnimatableBody3D 时尤其明显(位移要等下一个物理步);StaticBody
+## 同帧就生效 —— 但统一等两帧,两种体都稳。
+func rebake_navigation() -> void:
+	await get_tree().physics_frame
+	await get_tree().physics_frame
+	_gk_bake_navigation()
+
+
+## 3D:几何(静态碰撞体)是实体,烘焙器自动把"能站的面"烤成可行走区。
+func _gk_bake_navigation_3d(root: Node, region: NavigationRegion3D) -> void:
+	if region.navigation_mesh == null:
+		print("[GK] Navigation 节点上没有导航网格 —— 重新导出一次")
 		return
 	var navmesh: NavigationMesh = region.navigation_mesh
 	var baked: NavigationMesh = navmesh.duplicate()
@@ -1014,8 +1048,68 @@ func _gk_bake_navigation() -> void:
 	NavigationServer3D.parse_source_geometry_data(baked, source, root)
 	NavigationServer3D.bake_from_source_geometry_data(baked, source)
 	region.navigation_mesh = baked
+	# ⚠ 防"第一个地图吞第一次赋值"(实测):再赋一份同内容
+	region.navigation_mesh = baked.duplicate()
 	print("[GK] 导航网格已烤:", baked.get_polygon_count(),
 		  " 个多边形(代理半径 ", baked.agent_radius, ")")
+
+
+## 2D:碰撞体按**障碍**解析 —— 必须先给一个 outline 当"外框"
+## (实测:没有外框时烤出来 0 个多边形)。外框按场景里所有静态碰撞体
+## 的包围盒往外扩一点算。所以 2D 场景里的障碍物都该有碰撞体;
+## 没有碰撞体 = 没东西可烤(打印一行提示,不报错)。
+func _gk_bake_navigation_2d(root: Node, region: NavigationRegion2D) -> void:
+	if region.navigation_polygon == null:
+		print("[GK] Navigation 节点上没有导航多边形 —— 重新导出一次")
+		return
+	var old: NavigationPolygon = region.navigation_polygon
+	# ── 每次新建一份,不用 duplicate ────────────────────────────────
+	# 外框是加进 outline 列表的,duplicate 会把上一轮的旧外框带过来
+	# (场景挪过之后旧外框和新外框叠在一起,烤出怪多边形)。
+	var poly := NavigationPolygon.new()
+	poly.agent_radius = maxf(old.agent_radius, 0.01)
+	poly.cell_size = clampf(poly.agent_radius * 0.5, 0.25, 8.0)
+	var bounds := Rect2()
+	var found := false
+	for body in root.find_children("*", "StaticBody2D", true, false):
+		for shape_node in body.find_children("*", "CollisionShape2D", true, false):
+			var shape: Shape2D = (shape_node as CollisionShape2D).shape
+			if shape == null:
+				continue
+			var rect := shape.get_rect()
+			var xform := (shape_node as CollisionShape2D).global_transform
+			# ⚠ 四个角必须装进 PackedVector2Array 再循环 —— 写成数组字面量
+			# `for corner in [Vector2(...), ...]` 时 corner 是 Variant,
+			# `var point := xform * corner` 推断不出类型,整个脚本解析失败
+			# (实测:环境脚本一挂,导航没烤 + 上帝机/时停全没了)。
+			var corners := PackedVector2Array([
+					rect.position, rect.position + Vector2(rect.size.x, 0.0),
+					rect.end, Vector2(rect.position.x, rect.end.y)])
+			for corner in corners:
+				var point := xform * corner
+				if not found:
+					bounds = Rect2(point, Vector2.ZERO)
+					found = true
+				else:
+					bounds = bounds.expand(point)
+	if not found:
+		print("[GK] 2D 寻路:场景里没有静态碰撞体 —— 没东西可烤",
+			  "(给墙 / 障碍物加碰撞体;整块地板不用加,地板会被当障碍挖掉)")
+		return
+	bounds = bounds.grow(poly.agent_radius + 1.0)
+	poly.add_outline(PackedVector2Array([bounds.position,
+			Vector2(bounds.end.x, bounds.position.y),
+			bounds.end,
+			Vector2(bounds.position.x, bounds.end.y)]))
+	poly.parsed_geometry_type = NavigationPolygon.PARSED_GEOMETRY_STATIC_COLLIDERS
+	var source := NavigationMeshSourceGeometryData2D.new()
+	NavigationServer2D.parse_source_geometry_data(poly, source, root)
+	NavigationServer2D.bake_from_source_geometry_data(poly, source)
+	region.navigation_polygon = poly
+	# ⚠ 同上:再赋一份(防"第一个地图吞第一次赋值"的同类问题)
+	region.navigation_polygon = poly.duplicate()
+	print("[GK] 2D 导航多边形已烤:", poly.get_polygon_count(),
+		  " 个多边形(代理半径 ", poly.agent_radius, ")")
 
 
 func _find_camera() -> Camera3D:
@@ -1241,17 +1335,17 @@ NAV_REGION_NAME = "Navigation"
 
 
 def _nav_on(scene):
-    """场景设置:这一关要不要烤导航网格(2D 暂不支持,见下)。"""
+    """场景设置:这一关要不要烤导航网格(3D / 2D 都支持,第三十六轮起)。"""
     settings = getattr(scene, "gk_settings", None)
-    if not bool(getattr(settings, "nav_enabled", False)):
-        return False
-    # 2D 的 NavigationRegion2D + NavigationPolygon 接口还没做 ——
-    # 开着也当没开(面板里会提示),免得生成出一块烤不出来的网格。
-    return str(getattr(settings, "dimension", "3")) != "2"
+    return bool(getattr(settings, "nav_enabled", False))
 
 
 def _nav_settings(scene):
-    """导航网格的参数(交给 .tscn 的 NavigationMesh 子资源 + 环境脚本)。"""
+    """导航网格的参数(交给 .tscn 的子资源 + 环境脚本)。
+
+    3D 用半径 / 身高 / 坡度;2D 只用半径(2D 世界没有"高度 / 坡度"这回事),
+    半径单位是**场景单位**(像素世界一般 8~20,米制世界 0.3~0.8)。
+    """
     settings = getattr(scene, "gk_settings", None)
 
     def number(attr, fallback):
@@ -1281,6 +1375,22 @@ geometry_parsed_geometry_type = 1"""
 
 NAVIGATION_NODE = """[node name="{name}" type="NavigationRegion3D" parent="."]
 navigation_mesh = SubResource("gk_navmesh")"""
+
+# ── 2D(第三十六轮:寻路第二版)──────────────────────────────────────
+# 2D 的烘焙语义和 3D **不一样**(官方文档 + 真 Godot 实测):
+# 3D 里碰撞体是"实体",烘焙器自动把能站的面烤成可行走区;2D 里按
+# **障碍**解析 —— 而且**必须先给一个 outline 当外框**(文档原话:
+# "at least one outline needs to be added that defines the outer
+# bounds of the baked area";实测不给外框时烤出来 0 个多边形)。
+# 外框要按**导出后的碰撞体**算,导出侧没有那些数据 —— 所以外框在
+# 运行时由环境脚本按"所有静态碰撞体的包围盒"往外扩一点生成,
+# 子资源里只写参数。
+NAVPOLY_SUBRESOURCE = """[sub_resource type="NavigationPolygon" id="gk_navpoly"]
+agent_radius = {radius}
+parsed_geometry_type = 1"""
+
+NAVIGATION_NODE_2D = """[node name="{name}" type="NavigationRegion2D" parent="."]
+navigation_polygon = SubResource("gk_navpoly")"""
 
 
 # ==========================================================================
@@ -1896,12 +2006,18 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                          f'path="{env_script_res(scene_name)}" '
                          f'id="env_script"]')
 
-    # ---- 导航网格(第三十四轮:寻路)----
+    # ---- 导航网格(第三十四轮;第三十六轮加 2D)----
     # 只是把参数写进子资源;真正"烤"的动作在环境脚本启动时做
     # (网格要按**导出的碰撞体**烤,导出侧烤不了 —— 见 _nav_on 的说明)。
     nav = _nav_settings(scene) if _nav_on(scene) else None
     if nav is not None:
-        sub_resources.append(NAVMESH_SUBRESOURCE.format(**nav))
+        if is_3d:
+            sub_resources.append(NAVMESH_SUBRESOURCE.format(**nav))
+        else:
+            # 2D 的 NavigationPolygon 只要参数;外框由环境脚本按
+            # 导出的静态碰撞体包围盒算(见 NAVPOLY_SUBRESOURCE 的说明)。
+            sub_resources.append(
+                NAVPOLY_SUBRESOURCE.format(radius=nav["radius"]))
 
     load_steps = 1 + len(ext_lines) + len(sub_resources)
 
@@ -2166,11 +2282,15 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             lines.extend(block)
             lines.append("")
 
-    # ---- 导航区(第三十四轮:寻路)----
-    # 一块空的 NavigationRegion3D:它的网格在启动时由环境脚本烤出来
-    # (见 _gk_bake_navigation)。放在根下面 = 解析根是场景根。
+    # ---- 导航区(第三十四轮:寻路;第三十六轮加 2D)----
+    # 一块空的导航区(3D NavigationRegion3D / 2D NavigationRegion2D):
+    # 它的网格在启动时由环境脚本烤出来(见 _gk_bake_navigation)。
+    # 放在根下面 = 解析根是场景根。
     if nav is not None:
-        lines.append(NAVIGATION_NODE.format(name=NAV_REGION_NAME))
+        if is_3d:
+            lines.append(NAVIGATION_NODE.format(name=NAV_REGION_NAME))
+        else:
+            lines.append(NAVIGATION_NODE_2D.format(name=NAV_REGION_NAME))
         lines.append("")
 
     if environment:
@@ -2309,7 +2429,24 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
        老老实实生成一个 Camera3D 和 DirectionalLight3D 节点,
        不然按 F5 是一片灰 —— 这个坑踩过。
     """
-    if scene is None or not is_3d:
+    if scene is None:
+        return "", {}, ""
+    if not is_3d:
+        # ── 2D(第三十六轮:2D 寻路)────────────────────────────────────
+        # 2D 场景也要一份环境脚本 —— **导航烘焙**就在它里面(2D 的碰撞体
+        # 是"障碍"、烘焙前要按导出后的碰撞体包围盒算一个"外框",这两件
+        # 事都只能在运行时做)。相机 / 灯 / 材质那些 3D 内容在 2D 场景里
+        # 没有作用对象;环境脚本里这些分支本来就有"找不到就跳过"的兜底,
+        # 不会报错(探针实测)。
+        # 只有**有活要干**时(寻路 / 上帝机 / 调试面板)才写这个节点。
+        files = {}
+        if (_nav_on(scene) or _god_camera_on(scene)
+                or _debug_panel_on(scene)):
+            fields = _env_fields(scene, camera_name="", fov=_fmt(0.0),
+                                 material_files=material_files)
+            files[env_script_rel(scene_name)] = \
+                ENVIRONMENT_SCRIPT.format(**fields)
+            return ENVIRONMENT_NODE.format(**fields), files, ""
         return "", {}, ""
 
     skip = skip or {}

@@ -3101,7 +3101,7 @@ class GK_PT_Main(bpy.types.Panel):
                     box.label(text=f"自动:跟着视口当前相机({cameras[0]})",
                               icon="CHECKMARK")
 
-                # ── 寻路 / 导航网格(第三十四轮)────────────────────────
+                # ── 寻路 / 导航网格(第三十四轮;第三十六轮加 2D / 重烤)──
                 # 打开 = 导出的场景里多一块运行时烤的导航网格,
                 # 『移动_寻路』的角色就能绕开墙 / 石头走到目标。
                 nav_row = box.row(align=True)
@@ -3109,14 +3109,22 @@ class GK_PT_Main(bpy.types.Panel):
                              icon="TRACKER")
                 if getattr(settings, "nav_enabled", False):
                     if str(getattr(settings, "dimension", "3")) == "2":
-                        box.label(text="⚠ 2D 寻路还没做(这一版只有 3D)",
-                                  icon="ERROR")
+                        # 2D:碰撞体按"障碍物"解析 —— 这是和 3D 最大的差异,
+                        # 用户不看到这句就会把整块地板也烤成不可走区。
+                        nums = box.row(align=True)
+                        nums.prop(settings, "nav_agent_radius", text="半径")
+                        box.label(text="2D 按障碍物烤:给墙 / 箱子加碰撞体,"
+                                       "整块地板不要加", icon="INFO")
+                        box.label(text="启动时烤;门挪了用『移动_重烤导航』重烤",
+                                  icon="INFO")
                     else:
                         nums = box.row(align=True)
                         nums.prop(settings, "nav_agent_radius", text="半径")
                         nums.prop(settings, "nav_agent_height", text="高度")
                         nums.prop(settings, "nav_max_slope", text="爬坡°")
                         box.label(text="启动时按静态碰撞体烤网格;改完要重新导出",
+                                  icon="INFO")
+                        box.label(text="门 / 平台挪了用『移动_重烤导航』重烤",
                                   icon="INFO")
                 else:
                     box.label(text="关着:『移动_寻路』退化成直线走", icon="INFO")

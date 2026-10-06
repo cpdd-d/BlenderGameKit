@@ -250,6 +250,11 @@ class Generator:
             self._emit_god_guard_helper(sections)
         if getattr(self.ctx, "need_camera_query_helper", False):
             self._emit_fly_camera(sections)
+        # ---- 寻路第二版(第三十六轮):避障 / 重烤导航 ----------
+        if (getattr(self.ctx, "need_nav_avoid", False)
+                or getattr(self.ctx, "need_nav_avoid_2d", False)
+                or getattr(self.ctx, "need_nav_rebake", False)):
+            self._emit_nav_helpers(sections)
 
         # ---- 后台每帧行为(相机震动等) ----
         # 挂在 _process 里;已经有 _process 就追加，没有就补一个。
@@ -1354,6 +1359,125 @@ class Generator:
                                "    var cam := get_viewport().get_camera_3d()",
                                "    return cam != null and cam.is_in_group(\"gk_god_camera\")",
                            ])
+
+    def _emit_nav_helpers(self, sections):
+        """『移动_寻路』避障 + 『移动_重烤导航』的运行期帮助(第三十六轮)。
+
+        ── 避障为什么用 NavigationAgent(真 Godot 实测过)──────────────
+        避障是 RVO(一群 agent 互相绕开),手写不出来 —— 交给引擎:
+        每帧把**期望速度** `set_velocity()` 交上去,它在物理步里和邻居
+        一起算,算完通过 `velocity_computed` 信号把**安全速度**送回来。
+        实测:3 个敌人同追一点,各自侧移错开、最小间距 0.8 米、全部到达;
+        不避障时互相顶着走,挤成一团。
+
+        ── 三个坑(都实测过,别改回去)────────────────────────────────
+        1. agent 节点**运行时现造**(幂等复用):导出时不知道谁会用,
+           而且角色网格藏在 glb 实例里、塞不进自定义子节点;
+        2. `avoidance_enabled` 默认是 **false** —— 不显式打开的话
+           `set_velocity` 什么都不做、回调永远不来,角色一动不动(实测);
+        3. 不显式 `set_navigation_map()` 时 agent 可能一直不工作
+           (实测:手动 map_get_path 正常、agent 原地不动;显式设过
+           map 之后一切正常)。这里每帧幂等对齐,贵不了多少。
+        """
+        if getattr(self, "_nav_helpers_emitted", False):
+            return
+        self._nav_helpers_emitted = True
+        if getattr(self.ctx, "need_nav_avoid", False):
+            self._append_block(sections, "_gk_nav_move",
+                               "func _gk_nav_move(target: CharacterBody3D, "
+                               "desired: Vector3, goal: Vector3, radius: float, "
+                               "speed: float) -> void:",
+                               [
+                                   "    # 期望速度交给 agent;真正移动在 _gk_nav_agent 连的回调里",
+                                   "    _gk_nav_agent(target, goal, radius, speed).set_velocity(desired)",
+                               ])
+            self._append_block(sections, "_gk_nav_agent",
+                               "func _gk_nav_agent(target: CharacterBody3D, "
+                               "goal: Vector3, radius: float, "
+                               "speed: float) -> NavigationAgent3D:",
+                               [
+                                   "    var agent := target.get_node_or_null(\"GKNavAgent\") as NavigationAgent3D",
+                                   "    if agent == null:",
+                                   "        agent = NavigationAgent3D.new()",
+                                   "        agent.name = \"GKNavAgent\"",
+                                   "        target.add_child(agent)",
+                                   "        # 回调只接一次:避障算完把安全速度赋值给角色并移动",
+                                   "        agent.velocity_computed.connect(func(safe: Vector3) -> void:",
+                                   "            target.velocity = safe",
+                                   "            target.move_and_slide())",
+                                   "    # 避障默认是关的 —— 不开的话 set_velocity 什么都不做(实测)",
+                                   "    agent.avoidance_enabled = true",
+                                   "    agent.radius = radius",
+                                   "    agent.max_speed = maxf(speed, 0.1)",
+                                   "    # ⚠ target_position 必须设,哪怕路径是我们自己算的:",
+                                   "    #    不设的时候避障**不工作** —— 回调每帧都来、但安全速度",
+                                   "    #    恒为 (0,0,0)(服务器认为这个 agent 没有任务)。",
+                                   "    #    实测:同一个场景只加这一行,3 个 agent 立刻互相绕开。",
+                                   "    agent.target_position = goal",
+                                   "    # agent 的导航地图必须显式对齐 —— 不设时它可能一直不工作(实测)",
+                                   "    var map := target.get_world_3d().navigation_map",
+                                   "    if agent.get_navigation_map() != map:",
+                                   "        agent.set_navigation_map(map)",
+                                   "    return agent",
+                               ])
+        if getattr(self.ctx, "need_nav_avoid_2d", False):
+            self._append_block(sections, "_gk_nav_move2d",
+                               "func _gk_nav_move2d(target: CharacterBody2D, "
+                               "desired: Vector2, goal: Vector2, radius: float, "
+                               "speed: float) -> void:",
+                               [
+                                   "    _gk_nav_agent2d(target, goal, radius, speed).set_velocity(desired)",
+                               ])
+            self._append_block(sections, "_gk_nav_agent2d",
+                               "func _gk_nav_agent2d(target: CharacterBody2D, "
+                               "goal: Vector2, radius: float, "
+                               "speed: float) -> NavigationAgent2D:",
+                               [
+                                   "    var agent := target.get_node_or_null(\"GKNavAgent\") as NavigationAgent2D",
+                                   "    if agent == null:",
+                                   "        agent = NavigationAgent2D.new()",
+                                   "        agent.name = \"GKNavAgent\"",
+                                   "        target.add_child(agent)",
+                                   "        agent.velocity_computed.connect(func(safe: Vector2) -> void:",
+                                   "            target.velocity = safe",
+                                   "            target.move_and_slide())",
+                                   "    agent.avoidance_enabled = true",
+                                   "    agent.radius = radius",
+                                   "    agent.max_speed = maxf(speed, 0.1)",
+                                   "    # ⚠ 同 3D:不设 target_position 时避障不工作(安全速度恒 0)",
+                                   "    agent.target_position = goal",
+                                   "    var map := target.get_world_2d().navigation_map",
+                                   "    if agent.get_navigation_map() != map:",
+                                   "        agent.set_navigation_map(map)",
+                                   "    return agent",
+                               ])
+        if getattr(self.ctx, "need_nav_rebake", False):
+            self._append_block(sections, "_gk_rebake_navigation",
+                               "func _gk_rebake_navigation() -> void:",
+                               [
+                                   "    # 真正干活的在环境脚本(3D 按静态碰撞体烤 / 2D 先算外框)。",
+                                   "    # ⚠ 环境脚本挂在**场景根**下面,本脚本可能挂得更深",
+                                   "    #    (比如 Colliders/小玩家);整个场景还可能被嵌进别的",
+                                   "    #    场景里(探针就是这样,多了一层) —— 直接往上走到顶",
+                                   "    #    再找 \"Environment\" 会走过头(实测:重烤静默跳过)。",
+                                   "    #    所以**沿祖先链逐层找**,谁先有谁算数;最后兜底全树搜。",
+                                   "    var env: Node = null",
+                                   "    var node: Node = self",
+                                   "    while node != null:",
+                                   "        env = node.get_node_or_null(\"Environment\")",
+                                   "        if env != null:",
+                                   "            break",
+                                   "        node = node.get_parent()",
+                                   "    if env == null:",
+                                   "        for found in get_tree().root.find_children(\"Environment\", \"Node\", true, false):",
+                                   "            if found.has_method(\"rebake_navigation\"):",
+                                   "                env = found as Node",
+                                   "                break",
+                                   "    if env != null and env.has_method(\"rebake_navigation\"):",
+                                   "        env.rebake_navigation()",
+                                   "    else:",
+                                   "        push_warning(\"[GK] 没找到环境脚本(Environment)—— 导航重烤跳过\")",
+                               ])
 
     def _emit_fly_camera(self, sections):
         """生成"兜底观察机":场景里**一台相机都没有**时现造一台自由飞行相机。

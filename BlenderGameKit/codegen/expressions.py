@@ -276,8 +276,15 @@ def ensure_position_helper(ctx, prop="global_position"):
         made.add(key)
         if ctx.dim == 2:
             body = [
-                f"    if host is Node2D:",
+                "    if host is Node2D:",
                 f"        return (host as Node2D).{prop}",
+                "    # ⚠ 兜底(第三十六轮,真 Godot 实测):2D 场景里引用可能命中",
+                "    #    glb 内部的 3D 网格(名字和物体一样、排在树前面)—— 它不",
+                "    #    是 Node2D,但它的世界位置就是那个物体在 Blender 里摆的位置,",
+                "    #    取 (x,y) 总比返回 (0,0) 把角色引到原点去强。",
+                "    if host is Node3D:",
+                f"        var _p := (host as Node3D).{prop}",
+                "        return Vector2(_p.x, _p.y)",
                 "    return Vector2.ZERO",
             ]
             ret = "Vector2"

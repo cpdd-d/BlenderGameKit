@@ -10,7 +10,7 @@
   2. 在副本里加一个探针场景(`probe.gd` + `probe.tscn`),把主场景指过去;
   3. 用 Godot 无头跑,读探针打印的 PHYS_* 行,汇总 PASS / FAIL。
 
-探针查的是**物理现象**(不是代码长什么样):把角色依次传送到十个工位前,
+探针查的是**物理现象**(不是代码长什么样):把角色依次传送到十二个工位前,
 按住 W 往 -Z 走(相机 yaw=0,方向是确定的),边走边采样位置:
 
   * **斜坡**:能爬上 20° 的坡(y 升高 ≥ 0.8),不卡在坡脚;
@@ -34,6 +34,12 @@
   * **绕墙追击**(第三十四轮):玩家站在墙这头不动,墙那头的『追踪者』
     由『移动_寻路』驱动 —— 必须**从墙端绕过来**(横向绕出 ≥ 2.8 米)
     并追上玩家;直线追只会在墙前贴住。顺带验导航网格真的烤出来了。
+  * **群追避障**(第三十六轮):3 个『群追者』(勾了『避障』)一起追人 ——
+    三个必须**都到达**、而且两两**不叠在一起**(≥ 1.1 米);避障链路
+    (agent + 回调)断了的话他们会一动不动,一个都到不了。
+  * **门升起重烤**(第三十六轮):门堵着门洞,追踪者原本只能绕墙端;
+    玩家走进触发区(门升起 + 『移动_重烤导航』)之后,它必须**从门洞
+    穿过**(越过 z=0 时仍贴着门中心 ±1.6 米)—— 不重烤的话它一直绕。
 """
 
 import argparse
@@ -81,6 +87,12 @@ const STATION_DEFS := [
 	# 第十工位(第三十四轮):绕墙追击 —— 玩家站墙这头不动,追踪者从墙那头
 	# **绕过来**(『移动_寻路』),由 _nav_step 采样。
 	{"key": "nav", "x": 63.0, "walk": 6.0, "kind": "nav", "keys": ""},
+	# 第十一工位(第三十六轮):群追避障 —— 3 个『群追者』一起追,采样
+	# "两两最小间距 + 到达人数"(避障链路断了他们会一动不动)。
+	{"key": "swarm", "x": 70.0, "walk": 6.0, "kind": "swarm", "keys": ""},
+	# 第十二工位(第三十六轮):门升起重烤 —— 玩家走进触发区抬门+重烤,
+	# 追踪者必须**从门洞穿过来**(由 _rebake_step 采样)。
+	{"key": "rebake", "x": 77.0, "walk": 8.0, "kind": "rebake", "keys": ""},
 ]
 const SPAWN_Z := 6.0
 const GROUND_Y := 0.9
@@ -96,6 +108,11 @@ const DIAMOND_CENTER := Vector3(14.0, 1.0, -3.0)
 # make_physics_demo 的 NAV_WALL_SPAN 对齐,两边一起改)
 const NAV_WALL_X := 63.0
 const NAV_WALL_HALF := 2.5
+# 门洞工位(第三十六轮:门升起重烤)—— 门在 x=77(和 make_physics_demo
+# 的 STATION_X[11] 对齐);"穿门"的判据是 |x-77| ≤ 1.6(绕墙端时 ≈3,
+# 区分得开);GATE_HOLE_X 同时是触发区的中心。
+const GATE_HOLE_X := 77.0
+const GATE_HOLE_HALF := 1.6
 
 var station_index := -1
 var station_time := 0.0
@@ -146,6 +163,19 @@ var nav_around := 0.0         # 它离墙中线最远横走了多少(绕墙证�
 var nav_path := 0.0           # 追踪者走过的路程(采样累加)
 var nav_prev := Vector3.ZERO
 var nav_min_dist := 99.0
+# 第十一工位(第三十六轮:避障)采样 —— 3 个『群追者』
+var swarm: Array = []         # 三个 CharacterBody3D(名字带通配找出来)
+var swarm_min_d := 99.0       # 这一站里两两最小间距(不叠在一起的证据)
+var swarm_arrived := 0        # 同时追到人的人数(峰值;避障断了会是 0)
+# 第十二工位(第三十六轮:门升起重烤)采样
+var gate: Node3D = null            # 『门』的碰撞代理(AnimatableBody3D)
+var gate_chaser: CharacterBody3D = null
+var gate_prev_z := 0.0
+var gate_through := false     # 越过 z=0 时仍贴着门洞(穿门证据)
+var gate_cross_x := 99.0      # 第一次越过 z=0 时离门中心的距离(诊断)
+var gate_rose := 0.0          # 门升起后的高度(『移动_设置位置』执行了)
+var gate_arrived := false
+var dbg_tick := -1            # 诊断打印的秒数游标(每站复位)
 
 
 func _ready() -> void:
@@ -175,6 +205,19 @@ func _ready() -> void:
 	var chasers := world.find_children("追踪者", "CharacterBody3D", true, false)
 	if not chasers.is_empty():
 		chaser = chasers[0] as CharacterBody3D
+	# ⑪/⑫(第三十六轮):『群追者A/B/C』用通配找(不带 * 只能精确匹配);
+	# 『门追踪者』按名字精确找;『门』按 AnimatableBody3D 类型找 ——
+	# 资产导出后 glb 实例**内部**也可能有个叫"门"的网格节点,类型过滤
+	# 才能拿到碰撞代理。
+	var swarm_nodes := world.find_children("群追者*", "CharacterBody3D", true, false)
+	for node in swarm_nodes:
+		swarm.append(node as CharacterBody3D)
+	var gate_chasers := world.find_children("门追踪者", "CharacterBody3D", true, false)
+	if not gate_chasers.is_empty():
+		gate_chaser = gate_chasers[0] as CharacterBody3D
+	var gates := world.find_children("门", "AnimatableBody3D", true, false)
+	if not gates.is_empty():
+		gate = gates[0] as Node3D
 	# 导航网格烤出来没有(第三十四轮):读区域里那份 mesh 的多边形数 ——
 	# 「.tscn 里写了子资源 + 环境脚本烤成功」两件事一次验完。
 	var regions := world.find_children("Navigation", "NavigationRegion3D", true, false)
@@ -280,6 +323,14 @@ func _physics_process(delta: float) -> void:
 	if STATION_DEFS[station_index]["kind"] == "nav":
 		# 绕墙追击工位(第三十四轮):玩家站着不动,采样的对象是**追踪者**
 		_nav_step(delta)
+		return
+	if STATION_DEFS[station_index]["kind"] == "swarm":
+		# 群追避障工位(第三十六轮):采样 3 个『群追者』
+		_swarm_step(delta)
+		return
+	if STATION_DEFS[station_index]["kind"] == "rebake":
+		# 门升起重烤工位(第三十六轮):采样『门追踪者』
+		_rebake_step(delta)
 		return
 	min_z = minf(min_z, position.z)
 	max_y = maxf(max_y, position.y)
@@ -427,6 +478,61 @@ func _nav_step(delta: float) -> void:
 		_finish_station()
 
 
+func _swarm_step(delta: float) -> void:
+	# 群追(第三十六轮:避障):3 个『群追者』追玩家 —— 采"到达人数(峰值)"
+	# 和"两两最小间距"。避障链路(agent + velocity_computed 回调)要是断了,
+	# 他们会**一动不动**(本地 recon 里踩过的失败模式)—— 到达人数恒 0。
+	# 诊断:每秒打一行(开关值 + 三人位置),排障用。
+	var tick := int(station_time)
+	if tick != dbg_tick:
+		dbg_tick = tick
+		var text := "PHYS_DBG swarm t=%d sw=%s" % [tick, host.get("群追开关")]
+		for node in swarm:
+			text += " " + str((node as Node3D).global_position)
+		print(text)
+	var arrived := 0
+	for node in swarm:
+		if (node as Node3D).global_position.distance_to(host.global_position) <= 1.4:
+			arrived += 1
+	swarm_arrived = maxi(swarm_arrived, arrived)
+	var count := swarm.size()
+	for a in range(count):
+		for b in range(a + 1, count):
+			swarm_min_d = minf(swarm_min_d,
+				(swarm[a] as Node3D).global_position.distance_to(
+					(swarm[b] as Node3D).global_position))
+	if station_time >= float(STATION_DEFS[station_index]["walk"]) + SETTLE:
+		_finish_station()
+
+
+func _rebake_step(delta: float) -> void:
+	# 门升起 + 重烤(第三十六轮):采门的高度 + 追踪者的"穿门证据"。
+	# "穿门"= 它从 z<0 那侧越到 z>=0 那侧时,人还在门洞正上方
+	# (|x-77| ≤ 1.6);绕墙端过去的话 x≈74 或 80,一下就区分开了。
+	# 诊断:每秒打一行(开关值 + 门追踪者位置),排障用。
+	var tick := int(station_time)
+	if tick != dbg_tick:
+		dbg_tick = tick
+		print("PHYS_DBG rebake t=", tick, " sw=", host.get("门追开关"),
+			" gate_y=%.2f" % (gate.global_position.y if gate != null else -1.0),
+			" pos=", gate_chaser.global_position if gate_chaser != null else Vector3.ZERO,
+			" vel=", gate_chaser.velocity if gate_chaser != null else Vector3.ZERO)
+	if gate != null:
+		gate_rose = maxf(gate_rose, gate.global_position.y)
+	if gate_chaser != null:
+		var pos := gate_chaser.global_position
+		if gate_prev_z < 0.0 and pos.z >= 0.0 and gate_cross_x > 90.0:
+			gate_cross_x = absf(pos.x - GATE_HOLE_X)
+		if (gate_prev_z < 0.0 and pos.z >= 0.0
+				and absf(pos.x - GATE_HOLE_X) <= GATE_HOLE_HALF):
+			gate_through = true
+		gate_prev_z = pos.z
+		if pos.distance_to(host.global_position) <= 1.4:
+			gate_arrived = true
+	if station_time >= float(STATION_DEFS[station_index]["walk"]) + SETTLE:
+		_finish_station()
+
+
 func _finish_vehicle() -> void:
 	# 上车了(meta) + 车真开出去了 + 角色一路被钉在座位上(ride_gap)
 	# + 下车后角色在车外 + 控制权回到角色(walked)+ 车没被"偷开"(drift)
@@ -469,6 +575,10 @@ func _start_station(index: int) -> void:
 		# 站到墙的**这一侧**(Godot z=+2;墙在 z=0、追踪者在 z=-2)——
 		# 玩家不动,就看追踪者绕不绕得过来。
 		start = Vector3(spec["x"], GROUND_Y, 2.0)
+	if kind == "swarm" or kind == "rebake":
+		# ⑪/⑫(第三十六轮):传送到**触发区板上** —— 走上去会自动开追 /
+		# 抬门 + 重烤,和玩家自己走过去是同一条链。
+		start = Vector3(spec["x"], GROUND_Y, 2.0)
 	host.global_position = start
 	host.velocity = Vector3.ZERO
 	if kind == "nav":
@@ -483,6 +593,19 @@ func _start_station(index: int) -> void:
 		nav_path = 0.0
 		nav_min_dist = 99.0
 		nav_arrived = false
+	if kind == "swarm":
+		# ⑪(第三十六轮):采样清零(位置由 _swarm_step 现采)
+		swarm_min_d = 99.0
+		swarm_arrived = 0
+	if kind == "rebake":
+		# ⑫(第三十六轮):门追踪者的穿越采样清零
+		if gate_chaser != null:
+			gate_prev_z = gate_chaser.global_position.z
+		gate_through = false
+		gate_cross_x = 99.0
+		gate_rose = 0.0
+		gate_arrived = false
+	dbg_tick = -1
 	# ── 把视角偏航钉回 0(用户 2026-10-06)─────────────────────────
 	# 测试场开了『随相机朝向』(按 W = 往镜头前方走,手感才对);探针要的
 	# 是**确定的世界 -Z**,所以每个工位开始时把偏航清零 —— 相机相对的方向
@@ -592,6 +715,25 @@ func _finish_station() -> void:
 		ok = (nav_polys > 0 and nav_arrived and nav_around >= 2.8)
 		detail = "polys=%d around=%.2f arrived=%s path=%.2f min_dist=%.2f" % [
 			nav_polys, nav_around, nav_arrived, nav_path, nav_min_dist]
+		# ⑩ 收尾(第三十六轮):把『追击开关』关掉 —— 不关的话它会跟着
+		# 玩家跑到 ⑪/⑫ 工位,和那边的追踪者搅在一起(探针是观察者,
+		# 直接改脚本变量是它一贯的手法)。
+		host.set("追击开关", false)
+	elif kind == "swarm":
+		# 第三十六轮:三个『群追者』必须**都到达**(避障链路断了他们一动不动),
+		# 且两两不叠(≥ 1.1 米:物理上不穿模的下限)。
+		ok = (nav_polys > 0 and swarm_arrived >= swarm.size()
+			and swarm_min_d >= 1.1)
+		detail = "arrived=%d/%d min_d=%.2f" % [
+			swarm_arrived, swarm.size(), swarm_min_d]
+		host.set("群追开关", false)      # ⑪ 收尾:别跟去 ⑫
+	elif kind == "rebake":
+		# 第三十六轮:门真的升起来了 + 追踪者**从门洞穿过**(这就是
+		# "重烤生效"的行为证据——不重烤它只会绕墙端)、并追到玩家。
+		ok = (nav_polys > 0 and gate_through and gate_arrived
+			and gate_rose >= 4.0)
+		detail = "through=%s cross_x=%.2f risen=%.2f arrived=%s" % [
+			gate_through, gate_cross_x, gate_rose, gate_arrived]
 	station_time = -1.0
 	var box_at := box.global_position if box != null else Vector3.ZERO
 	print("PHYS_%s ok=%s %s t=%.2f at=(%.2f,%.2f,%.2f) x_range=[%.2f,%.2f] coll=%d box_z=%.2f"
@@ -694,7 +836,9 @@ def main():
             ("platform", "平台没把人带走(平台从脚下溜走 / 人掉下去了)"),
             ("vehicle", "上/下车或驾驶不对(没开出去 / 人没跟着 / 下车后车被偷开"
                         " / 车撞箱子推不动 / 时停开不了或解不开)"),
-            ("nav", "追踪者没绕墙追到人(导航网格没烤出来 / 绕不过去 / 贴不上)")):
+            ("nav", "追踪者没绕墙追到人(导航网格没烤出来 / 绕不过去 / 贴不上)"),
+            ("swarm", "群追者没都追到人 / 彼此叠在一起(避障链路断了或没生效)"),
+            ("rebake", "门升起后追踪者没从门洞穿过(重烤没生效 / 门没升起)")):
         if not re.search(rf"PHYS_{key} ok=true", text):
             print(f"✗ {why}:",
                   [line for line in text.splitlines()
