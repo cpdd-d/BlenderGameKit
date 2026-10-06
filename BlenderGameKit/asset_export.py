@@ -184,12 +184,26 @@ extends Node
 ## WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角;上帝视角里按 T
 ## 还可以**时停**(冻住世界,只留上帝机飞 —— 第三十五轮)。
 ##
+## ── 第三十九轮补齐的默认功能(用户要求"默认就该有")──────────────
+##   * **滚轮缩放**:转滚轮改上帝机的视野(FOV 20~110),看细节 / 拉远看全局;
+##   * **F 附身**:接管场景里的角色 —— WASD 直接驱动它走 / 跳,
+##     相机跟在身后(角色自己的输入让位,见 _gk_god_camera_active 守卫),
+##     再按一下 F 放开;
+##   * **ESC 退出游戏**:内置的兜底退出(场景里没把 Esc 用在暂停菜单时
+##     才生效,见 esc_quit)。
+##
 ## ── 为什么放在环境脚本里,而不是角色的游戏逻辑里(用户 2026-10-04)──
 ## 游戏逻辑脚本挂在角色身上 —— 场景里**没有角色**就没有它,上帝机也跟着
 ## 不存在。用户实测:"在没有角色的测试里动不了,鼠标也无法控制视角旋转"
 ## —— 而"飞着看看这一关"恰恰经常是空场景 / 纯场景测试。
 ## 环境脚本每张 .tscn 都有一份、还挂在场景根上,所以把它搬到这里。
 @export var god_camera: bool = {god_camera}
+
+## ── 内置 ESC 退出游戏(第三十九轮)────────────────────────────────
+## 真 = 按 Esc 直接退出游戏。**场景里把 Esc 用在『界面_暂停游戏』的
+## 暂停热键时,导出会把它算成 false**(否则一次按键既暂停又退出,
+## 两个功能互相打架)。所以这里不是"永远抢 Esc",而是"没人用才兜底"。
+@export var esc_quit: bool = {esc_quit}
 
 ## 收集到的卡通材质(供 _update_light 用)。
 var _gk_materials: Array = []
@@ -201,6 +215,15 @@ var _gk_god_tab_held: bool = false
 var _gk_time_stop_held: bool = false
 var _gk_god_look: Vector2 = Vector2.ZERO
 var _gk_mouse_was: int = -1
+## 滚轮攒下的缩放量(_input 里攒,物理帧里消费 —— 和鼠标位移同一个套路)。
+var _gk_god_wheel: float = 0.0
+## 上帝机自己的视野(0 = 还没缩放过,用相机原来的)。
+var _gk_god_fov: float = 0.0
+## 附身(第三十九轮):接管中的角色 + 按键按住标记。
+var _gk_god_possess: Node3D = null
+var _gk_god_possess_held: bool = false
+## ESC 退出的按住标记。
+var _gk_esc_held: bool = false
 
 ## ── 游戏内调试面板(用户 2026-10-05 第二十二轮:"调试体验")──────────
 ## 玩的时候按一个键弹出的一块 HUD:FPS / 相机 / 脚本宿主的位置速度在地面 /
@@ -242,6 +265,18 @@ const _GK_DBG_COPY_KEY := {debug_copy_key}  # 复制全部内容
 ## 也会自动解冻(见 _gk_god_toggle)。两者都是"别把自己锁在冻住的世界里"。
 const _GK_TIME_STOP_KEY := {time_stop_key}
 
+## ── 附身键(第三十九轮,用户 2026-10-06)──────────────────────────
+## "上帝机默认属性功能应有:时停、视角缩放、附身(接管角色控制)" ——
+## 按这个键接管最近的**角色**(挂了游戏逻辑脚本的那个),WASD 直接驱动它,
+## 相机跟到身后;再按一下放开。缩放用鼠标滚轮,不需要按键。
+const _GK_POSSESS_KEY := {possess_key}
+
+## 附身时的移动速度 / 起跳冲量(和『第三人称角色预设』的默认手感对齐:
+## 移动 6 米/秒、起跳 7 米/秒;重力不用常量,用角色自己的
+## `get_gravity()`,这样工程重力设置改了它也跟得上)。
+const _GK_POSSESS_SPEED := 6.0
+const _GK_POSSESS_JUMP := 7.0
+
 var _gk_dbg_label: Label = null
 var _gk_dbg_visible := false
 var _gk_dbg_accum := 0.0
@@ -273,12 +308,14 @@ func _ready() -> void:
 	# 上帝机同理:玩家相机常常藏在 glb 实例内部,现在搜不到它。
 	# 编辑器里**不造**(脚本是 @tool,编辑器里也会 _ready)—— 造了会在
 	# 编辑器场景里凭空多一台相机,还会抢编辑器视口。
-	if god_camera and not Engine.is_editor_hint():
-		# ── 时停(第三十五轮):"冻住世界"必须留一条活口 ──────────────
-		# 时停是用 `get_tree().paused` 冻的 —— 整个世界都停了,谁来解冻?
-		# 环境脚本(和上帝机)必须**暂停也照跑**,否则按 T 冻住之后
-		# 按什么都没反应,只剩强退(实测过这种"把自己锁死"的设计)。
+	# ── "冻住世界"必须留一条活口(第三十五轮时停 / 第三十九轮 ESC 退出)──
+	# 时停是用 `get_tree().paused` 冻的 —— 整个世界都停了,谁来解冻?
+	# 环境脚本(和上帝机)必须**暂停也照跑**,否则按 T 冻住之后
+	# 按什么都没反应,只剩强退(实测过这种"把自己锁死"的设计)。
+	# ESC 退出同理:世界暂停着也得按得应。
+	if (god_camera or esc_quit) and not Engine.is_editor_hint():
 		process_mode = Node.PROCESS_MODE_ALWAYS
+	if god_camera and not Engine.is_editor_hint():
 		_gk_god_setup.call_deferred()
 	# 调试面板(第二十二轮):和上帝机一样,编辑器里不造 ——
 	# 造了在编辑器场景里会凭空多一块文字面板。面板节点不依赖整棵树建好
@@ -515,6 +552,9 @@ func _light_is_on(node: Node) -> bool:
 func _physics_process(delta: float) -> void:
 	_update_light(delta)
 	_gk_sync_colliders()
+	# 内置 ESC 退出(第三十九轮):和上帝机无关,每一帧都要看
+	if esc_quit and not Engine.is_editor_hint():
+		_gk_esc_tick()
 	# 编辑器里 Tab 是切视角的快捷键,不能让它去切上帝机
 	if god_camera and not Engine.is_editor_hint():
 		_gk_god_tick(delta)
@@ -677,6 +717,10 @@ func _gk_god_toggle() -> void:
 		return
 	if _gk_god_cam.is_current():
 		# 正在用上帝机 -> 切回玩家相机(优先记下来的那台)
+		# 附身也跟着结束(第三十九轮):离开上帝机 = 放开角色 ——
+		# 不然角色的 velocity 上还留着"上帝机写的一半速度"。
+		if _gk_god_possess != null:
+			_gk_god_release()
 		# 时停也跟着结束(第三十五轮):离开上帝机就该回到能玩的状态 ——
 		# "在上帝机里冻住看细节"这个用法到切走为止,不然玩家会看着一个
 		# 冻住的画面按什么都没有反应。
@@ -719,6 +763,18 @@ func _gk_god_tick(delta: float) -> void:
 		# 没在用上帝机:位移归零,不然切过去的第一帧视角会先"跳"一下
 		_gk_god_look = Vector2.ZERO
 		return
+	# ── 附身(第三十九轮):F 接管 / 放开 ────────────────────────────
+	if Input.is_key_pressed(_GK_POSSESS_KEY):
+		if not _gk_god_possess_held:
+			_gk_god_possess_held = true
+			if _gk_god_possess == null:
+				_gk_god_possess_begin()
+			else:
+				_gk_god_release()
+	else:
+		_gk_god_possess_held = false
+	# 滚轮缩放(第三十九轮)
+	_gk_god_zoom_tick()
 	# 鼠标转视角(用**自己**累积的那一份,见 _input)
 	if _gk_god_look != Vector2.ZERO:
 		var rot := _gk_god_cam.rotation_degrees
@@ -726,6 +782,12 @@ func _gk_god_tick(delta: float) -> void:
 		rot.x = clampf(rot.x - _gk_god_look.y * 0.25, -89.0, 89.0)
 		_gk_god_cam.rotation_degrees = rot
 		_gk_god_look = Vector2.ZERO
+	# ── 附身中:WASD 驱动的是**角色**,相机只负责跟在身后 ────────────
+	if _gk_god_possess != null and is_instance_valid(_gk_god_possess):
+		_gk_god_possess_tick(delta)
+		return
+	if _gk_god_possess != null:
+		_gk_god_possess = null      # 角色被删了 / 切场景了,自动放手
 	# WASD 平移 + 空格/Shift 升降(**不走碰撞**,想穿墙就穿墙)
 	var fly := Vector3.ZERO
 	var basis := _gk_god_cam.global_transform.basis
@@ -781,6 +843,142 @@ func _gk_time_stop_tick() -> void:
 		print("[GK] 时停:开(再按一下继续)")
 
 
+## ── 滚轮缩放(第三十九轮:用户要的"上帝机默认带视角缩放")──────────
+## 转滚轮改上帝机的**视野**(FOV):往"缩小"方向转 = 拉近看细节,
+## 反方向 = 拉远看全局。范围夹在 20~110 度(再大就鱼眼,再小看不清)。
+##
+## ── 为什么是 FOV 而不是"往前后飞"────────────────────────────────
+## 前后飞用 WASD 就能做;滚轮改 FOV 才是"镜头拉近拉远"(运镜里最常用的
+## 那种),而且**不会**把相机怼进墙里 —— 上帝机本来就不走碰撞,飞太近
+## 会穿模,改 FOV 不会。
+func _gk_god_zoom_tick() -> void:
+	if _gk_god_wheel == 0.0:
+		return
+	# 第一次缩放以相机自己的 FOV 为基准(场景里可能就是 40/75 之类的)
+	if _gk_god_fov <= 0.0:
+		_gk_god_fov = _gk_god_cam.fov
+	_gk_god_fov = clampf(_gk_god_fov - _gk_god_wheel * 4.0, 20.0, 110.0)
+	_gk_god_cam.fov = _gk_god_fov
+	_gk_god_wheel = 0.0
+
+
+## ── 附身(第三十九轮:用户要的"接管角色控制")────────────────────
+## 按 F 接管场景里的角色:WASD 直接驱动它走 / 空格跳,相机跟到身后;
+## 再按 F 放开。角色自己的游戏逻辑此时是**让位**的(它的移动 / 跳跃都用
+## `_gk_god_camera_active()` 判断"现在是不是上帝视角"把自己停了),
+## 所以这里驱动它不会打架。
+##
+## ── 为什么按"角色"找,而不是按名字 / 按第一个 CharacterBody3D ────────
+## 名字用户会改;而"挂了游戏逻辑脚本"这件事有个现成的判据:
+## **`_gk_god_camera_active` 这个方法**(每个导出的角色脚本都有)。
+## 所以优先找有它的节点 = 一定是玩家角色;找不到时(纯场景测试)
+## 退回第一个 CharacterBody3D,好歹能拿它当"可驾驶的东西"推着玩。
+func _gk_find_possess_target() -> Node3D:
+	var root := _scene_root()
+	if root == null:
+		return null
+	var fallback: Node3D = null
+	for found in root.find_children("*", "Node3D", true, false):
+		if found == _gk_god_cam:
+			continue
+		if found.has_method("_gk_god_camera_active"):
+			return found as Node3D
+		if fallback == null and found is CharacterBody3D:
+			fallback = found as Node3D
+	return fallback
+
+
+## 开始附身:把相机挪到角色身后,再锁住鼠标。
+func _gk_god_possess_begin() -> void:
+	var target := _gk_find_possess_target()
+	if target == null:
+		push_warning("[GK] 场景里没有可附身的角色(没有 CharacterBody3D)")
+		return
+	_gk_god_possess = target
+	# 相机跟到角色身后(用当前朝向):后面每帧由 _gk_god_possess_tick 维持
+	_gk_god_cam.global_position = (target.global_position
+		+ Vector3(0.0, 1.6, 0.0)
+		+ _gk_god_cam.global_transform.basis.z * 5.0)
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	print("[GK] 附身:%s(再按一下 F 放开)" % target.name)
+
+
+## 放开附身:角色停在原地,交给它自己的逻辑。
+func _gk_god_release() -> void:
+	var body := _gk_god_possess
+	_gk_god_possess = null
+	if body == null or not is_instance_valid(body):
+		return
+	if body is CharacterBody3D:
+		# 松手就刹住:不刹的话角色会带着"上帝机写的速度"自己滑一段
+		var cb := body as CharacterBody3D
+		cb.velocity.x = 0.0
+		cb.velocity.z = 0.0
+	print("[GK] 放开附身")
+
+
+## 附身中:WASD / 空格驱动角色,相机跟在身后。
+##
+## ── 为什么要 `move_and_slide()` 而不是直接改 global_position ──────
+## 直接改位置会**穿过墙和箱子**(角色自己的碰撞白做了);move_and_slide
+## 走的是角色的碰撞体,和它自己走路一模一样。所以这里只替它写 velocity。
+func _gk_god_possess_tick(delta: float) -> void:
+	var body := _gk_god_possess
+	var basis := _gk_god_cam.global_transform.basis
+	var move := Vector3.ZERO
+	if Input.is_key_pressed(KEY_W):
+		move -= basis.z
+	if Input.is_key_pressed(KEY_S):
+		move += basis.z
+	if Input.is_key_pressed(KEY_A):
+		move -= basis.x
+	if Input.is_key_pressed(KEY_D):
+		move += basis.x
+	move.y = 0.0
+	if move != Vector3.ZERO:
+		move = move.normalized()
+	if body is CharacterBody3D:
+		var cb := body as CharacterBody3D
+		cb.velocity.x = move.x * _GK_POSSESS_SPEED
+		cb.velocity.z = move.z * _GK_POSSESS_SPEED
+		if cb.is_on_floor():
+			if Input.is_key_pressed(KEY_SPACE):
+				cb.velocity.y = _GK_POSSESS_JUMP
+		else:
+			# 重力:附身时角色自己的重力逻辑被守卫停掉了,这里补上 ——
+			# 用**角色自己的** get_gravity(),工程重力设置改了也跟着变
+			# (和角色脚本里 `velocity += get_gravity() * delta` 同一个写法)
+			cb.velocity.y += cb.get_gravity().y * delta
+		cb.move_and_slide()
+		# 面朝走的方向(只转水平朝向,和角色的移动逻辑一个做法)
+		if move != Vector3.ZERO:
+			var look := cb.global_position + move
+			if cb.global_position.distance_to(look) > 0.01:
+				cb.look_at(look, Vector3.UP)
+	else:
+		body.global_position += move * _GK_POSSESS_SPEED * delta
+	# 相机跟在身后上方(位置跟,朝向仍由鼠标控制)
+	var behind := _gk_god_cam.global_transform.basis.z
+	_gk_god_cam.global_position = (body.global_position
+		+ Vector3(0.0, 1.6, 0.0) + behind * 5.0)
+
+
+## ── 内置 ESC 退出(第三十九轮)─────────────────────────────────────
+## 场景里没把 Esc 用在暂停菜单时,按 Esc 直接退出游戏(见 esc_quit)。
+## 和 Tab / T 同一个套路:自己记"上一帧按没按",暂停不暂停都读得到。
+func _gk_esc_tick() -> void:
+	if not Input.is_key_pressed(KEY_ESCAPE):
+		_gk_esc_held = false
+		return
+	if _gk_esc_held:
+		return
+	_gk_esc_held = true
+	print("[GK] ESC:退出游戏")
+	var tree := get_tree()
+	if tree != null:
+		tree.quit()
+
+
 ## 上帝机的鼠标位移**单独**攒一份。
 ##
 ## ── 为什么不复用游戏逻辑那份 `_gk_mouse_delta`(踩过的坑)──────────
@@ -797,6 +995,15 @@ func _input(event: InputEvent) -> void:
 		return
 	if event is InputEventMouseMotion:
 		_gk_god_look += event.relative
+	elif event is InputEventMouseButton:
+		# 滚轮缩放(第三十九轮):和鼠标位移一样,**自己攒一份**,
+		# 物理帧里统一消费 —— 一帧里滚好几格也不会只算最后一格。
+		var wheel := event as InputEventMouseButton
+		if wheel.pressed:
+			if wheel.button_index == MOUSE_BUTTON_WHEEL_UP:
+				_gk_god_wheel -= 1.0
+			elif wheel.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				_gk_god_wheel += 1.0
 
 
 ## ── 调试面板(第二十二轮)─────────────────────────────────────────
@@ -886,8 +1093,12 @@ func _gk_dbg_text() -> String:
 		var god_on := false
 		if _gk_god_cam != null and is_instance_valid(_gk_god_cam):
 			god_on = _gk_god_cam.is_current()
-		lines.append("上帝摄像机:%s(按 Tab 切 · 按 %s 时停)" % [
-			"开" if god_on else "关", _gk_dbg_key_name(_GK_TIME_STOP_KEY)])
+		# 键位提示(第三十九轮补齐:滚轮缩放 / 附身键也一并列出来)
+		lines.append("上帝摄像机:%s(Tab 切 · %s 时停 · 滚轮缩放 · %s 附身%s)" % [
+			"开" if god_on else "关",
+			_gk_dbg_key_name(_GK_TIME_STOP_KEY),
+			_gk_dbg_key_name(_GK_POSSESS_KEY),
+			"中" if _gk_god_possess != null else ""])
 	var watch := debug_watch.strip_edges()
 	if not watch.is_empty():
 		lines.append("显示这几项:%s" % watch.replace("|", "、"))
@@ -1135,6 +1346,8 @@ ENV_SCRIPT_DEFAULTS = dict(
     debug_panel="false", debug_watch="",
     debug_key="KEY_F1", debug_copy_key="KEY_F2",
     time_stop_key="KEY_T",
+    possess_key="KEY_F",
+    esc_quit="true",
     nav_bake="false",
 )
 
@@ -1314,6 +1527,35 @@ def _god_camera_on(scene):
     """
     settings = getattr(scene, "gk_settings", None)
     return bool(getattr(settings, "god_camera", False))
+
+
+def _esc_claimed_by_graph(scene):
+    """图里已经有人管 Esc 了吗(第三十九轮)?管了就轮不到内置的退出。
+
+    ── 为什么环境脚本要问这个 ──────────────────────────────────────
+    环境脚本现在内置了"按 Esc 退出游戏"(用户要的默认功能)。但两种情况下
+    Esc **已经有主**了,内置的必须让位:
+      * 『界面_暂停游戏』勾了『Esc 热键』-> Esc 是暂停 —— 两个都生效的话
+        一次按键既暂停又退出(玩家正在暂停菜单里挑选项,窗口直接没了);
+      * 图里接了『按键』(Esc)-> 用户自己把 Esc 派了活(关卡示例 / 曲线示例 /
+        物理测试场都是"按 Esc 退出游戏"),内置的再抢一遍就成了
+        "抢先退出,把用户接的行为挤掉"。
+    所以:**谁都没用,才兜底**(见 ENVIRONMENT_SCRIPT 的 esc_quit)。
+    """
+    from . import exporter
+
+    tree, _why = exporter.resolve_scene_tree(scene)
+    if tree is None:
+        return False
+    for node in getattr(tree, "nodes", ()) or ():
+        kind = getattr(node, "bl_idname", "")
+        if kind == "GKNodeUiPauseGame":
+            if bool(getattr(node, "gk_hotkey", False)):
+                return True
+        elif kind == "GKNodeKey":
+            if str(getattr(node, "gk_key", "") or "").strip().upper() == "ESC":
+                return True
+    return False
 
 
 # ==========================================================================
@@ -1501,6 +1743,11 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
         # 时停键(第三十五轮):先给个常量 —— 和调试面板那两个键同一个
         # 套路,以后想变成场景设置只要在这儿读 settings 就行。
         time_stop_key="KEY_T",
+        # 附身键(第三十九轮):同样是常量,想改就改这儿。
+        possess_key="KEY_F",
+        # ESC 退出(第三十九轮):**图里没占着 Esc 才生效** ——
+        # 暂停菜单 / 用户自己接的 Esc 都算"有人管了"(见 _esc_claimed_by_graph)。
+        esc_quit="false" if _esc_claimed_by_graph(scene) else "true",
         nav_bake="true" if _nav_on(scene) else "false",
     )
 

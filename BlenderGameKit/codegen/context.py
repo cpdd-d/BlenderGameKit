@@ -1056,7 +1056,7 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
 
     def enter_anim_state_func(self, node, var_name, player_temp, debug=False,
                               finished_var=None, enter_hooks=None,
-                              exit_hooks=None):
+                              exit_hooks=None, speed_func=None):
         """生成/复用一个"进入动画状态"的成员函数,返回它的名字。
 
         ── 为什么抽成一个函数(而不是每处切换内联四行)──────────────
@@ -1092,8 +1092,10 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         """
         enter_hooks = enter_hooks or {}
         exit_hooks = exit_hooks or {}
+        # speed_func 也要进缓存键:同一张图被两台状态机驱动时,
+        # 一台带速度表一台不带,生成出来的函数体是不一样的
         key = (var_name, finished_var, tuple(sorted(enter_hooks.items())),
-               tuple(sorted(exit_hooks.items())))
+               tuple(sorted(exit_hooks.items())), speed_func)
         existing = self.anim_enter_funcs.get(key)
         if existing:
             return existing
@@ -1123,6 +1125,14 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         if finished_var:
             # 进入新状态 = 上一次的"播完"作废,否则会立刻再切一次
             body.append(f'    {finished_var} = ""')
+        # ── 播放速度(第三十九轮)────────────────────────────────────
+        # 状态的『播放速度』填了非 1.0 时,play() 带上它 ——
+        # 有速度表就走 `_gk_anim_speed(状态名)`,没有就还是原来的
+        # `play(名字)`(老图一字不变)。
+        play_line = f"        {player_temp}.play(next_state)"
+        if speed_func:
+            play_line = (f"        {player_temp}.play(next_state, -1.0, "
+                         f"{speed_func}(next_state))")
         body += [
             f"    if {player_temp} == null:",
             # 找不到播放器时也要说一句 —— 否则用户只看到"状态在切、人不动"
@@ -1130,7 +1140,7 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             '动画状态机没法播动画")',
             "        return",
             f"    if {player_temp}.has_animation(next_state):",
-            f"        {player_temp}.play(next_state)",
+            play_line,
             "    else:",
             # 动画名不存在时把**可用清单**打出来 —— 和『动画_播放』同一个做法,
             # 否则用户只知道"没播",不知道模型里到底叫什么

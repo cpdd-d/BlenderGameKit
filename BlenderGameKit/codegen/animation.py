@@ -437,7 +437,98 @@ def _stmt_anim_set_var(ctx, node, indent):
     ctx.add_line(indent, f"{name} = {value_expr}")
 
 
-def _emit_state_hooks(ctx, graph, player_temp):
+@stmt_node("GKNodeAnimParam")
+def _stmt_anim_param(ctx, node, indent):
+    """把整个模型的**形态键**统一设一个值(口型 / 表情)。
+
+    ── 这个节点以前是"死的"(第三十九轮修)────────────────────────────
+    卡片上画着『值』和『形态键序号』,但 codegen 里**从来没有**它的处理
+    函数 —— 用户说的"一部分节点卡片无作用"就是它:拖进图里、连上线,
+    导出后一个字符都不生成,表情参数永远不动。
+
+    Godot 侧就一句 `MeshInstance3D.set_blend_shape_value(序号, 值)`;
+    麻烦的是**找网格**:glTF 导入的网格藏在 `Model/` 实例内部,所以要
+    递归找,找不到再退回整棵场景树(和『动画_播放』找播放器同一个套路)。
+    两个都找不到时**报一次**警告 —— 静默不动是最难查的那种"没反应"。
+    """
+    value = ctx.input_number(node, "值",
+                             gd_number(getattr(node, "gk_value", 1.0)))
+    index = int(getattr(node, "gk_shape_index", 0) or 0)
+    warned = ctx.declare_var("_gk_shape_warned", "bool", initial="false")
+    meshes = ctx.new_temp("shape_meshes")
+    body = ctx.new_temp("shape_mesh")
+    scene_var = ctx.new_temp("shape_host")
+    ctx.add_line(indent, f"var {meshes} := self.find_children("
+                         f"\"*\", \"MeshInstance3D\", true, false)")
+    ctx.add_line(indent, f"if {meshes}.is_empty():")
+    ctx.add_line(indent + 1, f"var {scene_var} := "
+                             f"get_tree().current_scene if get_tree() != null else null")
+    ctx.add_line(indent + 1, f"if {scene_var} != null:")
+    ctx.add_line(indent + 2, f"{meshes} = {scene_var}.find_children("
+                             f"\"*\", \"MeshInstance3D\", true, false)")
+    ctx.add_line(indent, f"if {meshes}.is_empty():")
+    ctx.add_line(indent + 1, f"if not {warned}:")
+    ctx.add_line(indent + 2, f"{warned} = true")
+    ctx.add_line(indent + 2, 'push_warning("[GK] 场景里没有 MeshInstance3D,'
+                             '『动画_设混合参数』改不了形态键")')
+    ctx.add_line(indent, f"for {body} in {meshes}:")
+    ctx.add_line(indent + 1, f"{body}.set_blend_shape_value({index}, {value})")
+
+
+def _anim_speed_func(ctx, graph, node_lib):
+    """"状态名 -> 播放速度"的辅助函数(第三十九轮)。
+
+    ── 为什么做成一个函数(而不是把速度内联进 play 调用)────────────
+    速度是**每个状态各自的**,而 `_gk_anim_enter(next_state)` 里拿到的是
+    一个**状态名的字符串** —— 要按名字取速度,一个 `match` 函数最短:
+
+        func _gk_anim_speed(state_name: String) -> float:
+            match state_name:
+                "run":
+                    return 1.4
+            return 1.0
+
+    ── 为什么全 1.0 时一个字符都不生成 ─────────────────────────────
+    默认就是 1.0(原速)。老图(没人动过速度)必须生成得和以前**一字不差**,
+    所以没有任何非 1.0 的速度时返回 None,调用方退回原来的 `play(名字)`。
+    """
+    speeds = {}
+    for state in graph["states"]:
+        name = node_lib.anim_state_name(state)
+        if not name:
+            continue
+        try:
+            value = float(getattr(state, "gk_speed", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            value = 1.0
+        if abs(value - 1.0) > 1e-9:
+            speeds[name] = value
+    if not speeds:
+        return None
+    key = tuple(sorted(speeds.items()))
+    cache = getattr(ctx, "_anim_speed_funcs", None)
+    if cache is None:
+        cache = {}
+        ctx._anim_speed_funcs = cache
+    if key in cache:
+        return cache[key]
+    func_name = ctx.declare_func_name("_gk_anim_speed", key=key)
+    cache[key] = func_name
+    body = ["    match state_name:"]
+    for name in sorted(speeds):
+        body.append(f"        {gd_string(name)}:")
+        body.append(f"            return {gd_number(speeds[name])}")
+    body.append("    return 1.0")
+    ctx.extra_sections.append({
+        "signature": "func " + func_name + "(state_name: String) -> float:",
+        "lines": body,
+        "empty_body": "    pass",
+        "separator": True,
+    })
+    return func_name
+
+
+def _emit_state_hooks(ctx, graph, player_temp, speed_func=None):
     """给每个"有事要做"的状态生成『进入时』『离开时』函数。
 
     返回 ({状态名: 进入函数名}, {状态名: 离开函数名})。
@@ -480,7 +571,12 @@ def _emit_state_hooks(ctx, graph, player_temp):
                                  f"{layer})")
                     lines.add(1, f"if {temp} != null and "
                                  f"{temp}.has_animation({gd_string(extra)}):")
-                    lines.add(2, f"{temp}.play({gd_string(extra)})")
+                    if speed_func:
+                        # 同时播的那几段跟着**本状态**的速度走
+                        lines.add(2, f"{temp}.play({gd_string(extra)}, -1.0, "
+                                     f"{speed_func}({gd_string(name)}))")
+                    else:
+                        lines.add(2, f"{temp}.play({gd_string(extra)})")
                 if has_enter:
                     _chain(ctx, state, 1, "进入时")
                 if len(lines) == 0:
@@ -691,7 +787,10 @@ def _stmt_anim_tree_ref(ctx, node, indent):
     # ── 为什么不把语句直接内联进 _gk_anim_enter ──────────────────
     # 那几个分支的长度完全由用户的图决定,内联会让"进入状态"这个唯一入口
     # 变成一大坨;拆成函数之后,每个状态自己的逻辑在脚本里也是**分开的一块**。
-    enter_hooks, exit_hooks = _emit_state_hooks(ctx, graph, player_temp)
+    # ── 状态速率(第三十九轮):有状态填了非 1.0 才生成速度函数 ──────
+    speed_func = _anim_speed_func(ctx, graph, node_lib)
+    enter_hooks, exit_hooks = _emit_state_hooks(ctx, graph, player_temp,
+                                                speed_func=speed_func)
 
     debug = bool(getattr(node, "gk_debug_print", False))
     # ── 进入状态统一走一个函数 ──────────────────────────────────────
@@ -701,7 +800,8 @@ def _stmt_anim_tree_ref(ctx, node, indent):
     enter_func = ctx.enter_anim_state_func(node, var_name, player_temp, debug,
                                            finished_var,
                                            enter_hooks=enter_hooks,
-                                           exit_hooks=exit_hooks)
+                                           exit_hooks=exit_hooks,
+                                           speed_func=speed_func)
 
     # 起始状态 = 图里**没有任何边指向**的那个状态(照 UE5 的 Entry 节点);
     # 放了『动画_开始』就以它连的那个为准(显式指定,不用猜)。

@@ -67,6 +67,8 @@ def main():
     codegen = import_module(f"{module_name}.codegen")
     exporter = import_module(f"{module_name}.exporter")
     node_lib = import_module(f"{module_name}.nodes.nodes")
+    # 环境脚本(上帝机)的渲染入口(第三十九轮:验里面真有三样新功能)
+    asset_export = import_module(f"{module_name}.asset_export")
     # 『选图片』算子的枚举函数(第三十七轮):要验证它真能列出工程里的图
     operator_io = import_module(f"{module_name}.operator_io")
 
@@ -869,6 +871,60 @@ def main():
         bpy.data.node_groups.remove(r38_tree)
     except Exception as exc:
         check("UI 第二版", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 上帝机默认功能 + 动画三处修复(第三十九轮)----
+    # ① 环境脚本里真的有三样新功能:滚轮缩放 / F 附身 / 内置 ESC 退出;
+    # ② 动画状态有了『播放速度』属性(节点侧);
+    # ③ 『动画_设混合参数』以前是**死节点**(codegen 里没有它)—— 现在出码;
+    # ④ 『动画判断_移动状态』的两个阈值有了引脚(卡片上改才读得到)。
+    try:
+        r39_env = asset_export.render_env_script(
+            camera_name="Cam", fov="70.0", god_camera="true", esc_quit="true")
+        check("上帝机:滚轮缩放 / F 附身 / 内置 ESC 退出都进了环境脚本",
+              "func _gk_god_zoom_tick() -> void:" in r39_env
+              and "MOUSE_BUTTON_WHEEL_UP" in r39_env
+              and "const _GK_POSSESS_KEY := KEY_F" in r39_env
+              and "func _gk_god_possess_tick(delta: float) -> void:" in r39_env
+              and "func _gk_esc_tick() -> void:" in r39_env
+              and "tree.quit()" in r39_env)
+
+        r39_tree = bpy.data.node_groups.new("动画冒烟39", "GKGameLogicTree")
+        r39_ready = r39_tree.nodes.new("GKNodeOnReady")
+        r39_param = r39_tree.nodes.new("GKNodeAnimParam")
+        r39_param.gk_value = 0.4
+        r39_param.gk_shape_index = 1
+        r39_tree.links.new(r39_ready.outputs["执行"], r39_param.inputs["执行"])
+        r39_code, r39_warnings = codegen.generate(r39_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("动画:『设混合参数』不再是死节点(出 set_blend_shape_value)",
+              "set_blend_shape_value(1, 0.4)" in r39_code
+              and "MeshInstance3D" in r39_code)
+        check("动画:『设混合参数』无告警", not r39_warnings, str(r39_warnings))
+        bpy.data.node_groups.remove(r39_tree)
+
+        r39_anim = bpy.data.node_groups.new("动画树冒烟39", "GKAnimationTree")
+        r39_state = r39_anim.nodes.new("GKNodeAnimState")
+        r39_state.gk_state_name = "run"
+        check("动画:『动画_状态』有『播放速度』(默认 1.0)",
+              hasattr(r39_state, "gk_speed")
+              and abs(float(r39_state.gk_speed) - 1.0) < 1e-6,
+              str(getattr(r39_state, "gk_speed", "<没有这个属性>")))
+        r39_loco = r39_anim.nodes.new("GKNodeAnimLocomotion")
+        r39_pins = [socket.name for socket in r39_loco.inputs]
+        check("动画:『移动状态』有了两个阈值引脚(卡片值才读得到)",
+              "速度阈值" in r39_pins and "跑的速度阈值" in r39_pins,
+              str(r39_pins))
+        # 『同时播 2 / 3』以前**没声明过** —— 卡片画到那一行就报错
+        # (用户说的"一部分节点卡片无作用")。现在必须是真属性。
+        check("动画:『同时播 2 / 3』是真属性(卡片不再画一半报错)",
+              hasattr(r39_state, "gk_anim_action_2")
+              and hasattr(r39_state, "gk_anim_action_3")
+              and getattr(r39_state, "gk_anim_action_2", None) is None)
+        bpy.data.node_groups.remove(r39_anim)
+    except Exception as exc:
+        check("第三十九轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----

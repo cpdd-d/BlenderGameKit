@@ -45,6 +45,7 @@ var arrived := false
 var cheated := false
 var done := false
 var dbg_tick := -1
+var esc_at := -1.0        # 发过 Esc 的时刻(-1 = 还没发)
 
 
 func _ready() -> void:
@@ -83,9 +84,13 @@ func _path_probe() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if done:
-		return
 	elapsed += delta
+	if done:
+		# ESC 发出去了:等 0.6 秒看游戏退没退(退出是帧末生效的)
+		if esc_at > 0.0 and elapsed - esc_at >= 0.6:
+			esc_at = -1.0
+			print("NAV2D_ESC_STILL_RUNNING")
+		return
 	if chaser == null or player == null:
 		if elapsed >= 3.0:
 			done = true
@@ -120,6 +125,16 @@ func _physics_process(delta: float) -> void:
 			" arrived=", arrived, " cheated=", cheated,
 			" t=", "%.2f" % elapsed)
 		print("NAV2D_DONE")
+		# ── 内置 ESC 退出(第三十九轮)────────────────────────────────
+		# 这个场景**没有**接过 Esc,正好验"默认就有":发一次 Esc,
+		# 游戏应该自己退出(环境脚本里那条 `[GK] ESC:退出游戏`)。
+		# 没退的话下一段如实报出来 —— 那说明内置退出没接上。
+		esc_at = elapsed
+		var esc := InputEventKey.new()
+		esc.keycode = KEY_ESCAPE
+		esc.physical_keycode = KEY_ESCAPE
+		esc.pressed = true
+		Input.parse_input_event(esc)
 '''
 
 PROBE_TSCN = '''; 探针(临时文件,不写回示例)
@@ -201,6 +216,13 @@ def main():
         ok = False
     if "NAV2D_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")
+        ok = False
+    # 内置 ESC 退出(第三十九轮):这个场景没接过 Esc —— 按 Esc 就该退出游戏,
+    # 证据是环境脚本那条打印,而且探针**没有**报"还活着"。
+    if "[GK] ESC:退出游戏" not in text or "NAV2D_ESC_STILL_RUNNING" in text:
+        print("✗ 内置 Esc 退出没生效(环境脚本没接上 / Esc 被别的东西抢了):",
+              "esc_log=", "[GK] ESC:退出游戏" in text,
+              "still_running=", "NAV2D_ESC_STILL_RUNNING" in text)
         ok = False
     print("CHECK_NAV2D_DEMO=" + ("OK" if ok else "FAIL"))
     return 0 if ok else 1

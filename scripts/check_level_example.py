@@ -330,6 +330,146 @@ script = ExtResource("1_probe")
 '''
 
 
+PROBE3_GD = '''extends Node
+
+# 上帝机默认功能的运行时探针(第三十九轮,用户 2026-10-06):
+#   滚轮缩放 / F 附身(接管角色) / Tab 切换 / Esc 退出。
+# 结论行统一 LEVEL_ 前缀。
+#
+# ⚠ 最后一步按 Esc 会让**游戏自己退出**(环境脚本内置的)——
+#   所以"退出成功"的证据是控制台那条 `[GK] ESC:退出游戏`,
+#   外加"没有出现 LEVEL_GOD_ESC_STILL_RUNNING"。
+
+var world: Node = null
+var host: CharacterBody3D = null
+var god: Camera3D = null
+var env: Node = null
+var elapsed := 0.0
+var phase := 0
+var t := 0.0
+var fov_before := 0.0
+var fov_after := 0.0
+var host_before := Vector3.ZERO
+var host_after := Vector3.ZERO
+var cam_gap := 0.0
+var god_on := false
+var rounds := 0          # 0 = 还没找齐节点,1 = 报告过失败,2 = 找齐了
+
+
+func _ready() -> void:
+	world = load("res://scenes/关卡1.tscn").instantiate()
+	add_child(world)
+
+
+# ⚠ 上帝机是环境脚本**延迟一帧**造的(call_deferred),_ready 里找它必然
+#   是 null(第一版就这么踩的:探针一路 return,只有一行 ok=false)。
+#   所以每帧找一次,找到为止。
+func _resolve() -> bool:
+	if host == null:
+		var players := world.find_children("示例角色", "CharacterBody3D", true, false)
+		if not players.is_empty():
+			host = players[0] as CharacterBody3D
+	if god == null:
+		var found := get_tree().root.find_children("上帝摄像机", "Camera3D", true, false)
+		if not found.is_empty():
+			god = found[0] as Camera3D
+	if env == null:
+		env = world.find_child("Environment", true, false)
+	return host != null and god != null
+
+
+func _send_key(code: int, pressed: bool) -> void:
+	var event := InputEventKey.new()
+	event.keycode = code
+	event.physical_keycode = code
+	event.pressed = pressed
+	Input.parse_input_event(event)
+
+
+func _send_wheel(up: bool) -> void:
+	var event := InputEventMouseButton.new()
+	event.button_index = MOUSE_BUTTON_WHEEL_UP if up else MOUSE_BUTTON_WHEEL_DOWN
+	event.pressed = true
+	event.position = Vector2(320.0, 240.0)
+	event.global_position = Vector2(320.0, 240.0)
+	get_viewport().push_input(event)
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	t += delta
+	if not _resolve():
+		if rounds == 0:
+			rounds = 1
+			print("LEVEL_GOD_FOUND ok=false host=", host != null,
+				" god=", god != null, " env=", env != null)
+		return
+	if rounds == 1:
+		rounds = 2
+		print("LEVEL_GOD_FOUND ok=true env=", env != null)
+	if phase == 0:
+		if t > 0.4:
+			_send_key(KEY_TAB, true)
+			phase = 1
+			t = 0.0
+	elif phase == 1:
+		if t > 0.2:
+			_send_key(KEY_TAB, false)
+			god_on = god.is_current()
+			fov_before = god.fov
+			# 滚轮往前滚 = 拉近(FOV 变小)
+			_send_wheel(true)
+			_send_wheel(true)
+			_send_wheel(true)
+			phase = 2
+			t = 0.0
+	elif phase == 2:
+		if t > 0.3:
+			fov_after = god.fov
+			print("LEVEL_GOD_ZOOM ok=", god_on and fov_after < fov_before - 1.0,
+				" before=", "%.1f" % fov_before, " after=", "%.1f" % fov_after,
+				" god=", god_on)
+			_send_key(KEY_F, true)
+			phase = 3
+			t = 0.0
+	elif phase == 3:
+		if t > 0.2:
+			_send_key(KEY_F, false)
+			host_before = host.global_position
+			_send_key(KEY_W, true)
+			phase = 4
+			t = 0.0
+	elif phase == 4:
+		if t > 1.2:
+			_send_key(KEY_W, false)
+			host_after = host.global_position
+			cam_gap = god.global_position.distance_to(host.global_position)
+			var moved := host_before.distance_to(host_after)
+			var target := ""
+			if env != null:
+				var who = env.get("_gk_god_possess")
+				target = String(who.name) if who != null else "<none>"
+			print("LEVEL_GOD_POSSESS ok=", moved >= 1.0 and cam_gap <= 12.0,
+				" moved=", "%.2f" % moved, " cam_gap=", "%.2f" % cam_gap,
+				" target=", target)
+			_send_key(KEY_F, true)          # 放开附身
+			phase = 5
+			t = 0.0
+	elif phase == 5:
+		if t > 0.2:
+			_send_key(KEY_F, false)
+			print("LEVEL_GOD_ESC press")
+			_send_key(KEY_ESCAPE, true)
+			phase = 6
+			t = 0.0
+	elif phase == 6:
+		if t > 0.8:
+			# 走到这里 = Esc 没有退出游戏(环境脚本没接上)
+			print("LEVEL_GOD_ESC_STILL_RUNNING")
+			set_physics_process(false)
+'''
+
+
 def _probe_line(text, prefix):
     """从探针输出里挑一行出来(失败时贴进 detail 方便看数)。"""
     for line in text.splitlines():
@@ -436,6 +576,34 @@ def run_level2_probe():
          "LEVEL2_WALK ok=true" in out and "cam_top=true cam_back=true" in out,
          _probe_line(out, "LEVEL2_WALK")),
         ("第二关探针跑完", "LEVEL2_DONE" in out, _probe_line(out, "LEVEL2_GAME")),
+    ]
+
+
+def run_god_probe():
+    """真 Godot 里把上帝机的默认功能走一遍(第三十九轮)。
+
+    用户要的:"时停、视角缩放、附身(接管角色控制)、内置 ESC 退出"。
+    时停在曲线示例的探针里已经钉住了,这里验剩下三样:
+    Tab 切进上帝机 -> 滚轮拉近(FOV 变小)-> F 附身 + W 让角色真的走 ->
+    F 放开 -> Esc 退出游戏(靠 `[GK] ESC:退出游戏` 那条打印判定)。
+    """
+    out = _run_probe("probe3", PROBE3_GD, "LevelGodProbe", 3000)
+    if not out:
+        return []
+    esc_quit = "[GK] ESC:退出游戏" in out
+    still_running = "LEVEL_GOD_ESC_STILL_RUNNING" in out
+    return [
+        ("上帝机:Tab 切得进去 + 滚轮能缩放(FOV 变小)",
+         "LEVEL_GOD_ZOOM ok=true" in out, _probe_line(out, "LEVEL_GOD_ZOOM")),
+        ("上帝机:F 附身接管角色(W 驱动角色走 + 相机跟在身后)",
+         "LEVEL_GOD_POSSESS ok=true" in out,
+         _probe_line(out, "LEVEL_GOD_POSSESS")),
+        # 关卡示例的图里**已经接了** Esc->退出游戏,所以内置的那条会让位
+        # (esc_quit=false,见 TestGodCameraRound39)。这里验的是"按 Esc
+        # 真的退出"(走的哪条路不重要):游戏没退才会打出 STILL_RUNNING。
+        ("上帝机:Esc 能退出游戏(图里接的那条;内置的让位)",
+         (not still_running) and ("LEVEL_GOD_ESC press" in out),
+         "still_running=%s esc_log=%s" % (still_running, esc_quit)),
     ]
 
 
@@ -731,6 +899,10 @@ def main():
 
     # ---- 运行时探针:真 Godot 里走一遍第二关(第三十五轮)----------
     for name, ok, detail in run_level2_probe():
+        check(name, ok, detail)
+
+    # ---- 运行时探针:上帝机默认功能(第三十九轮)--------------------
+    for name, ok, detail in run_god_probe():
         check(name, ok, detail)
 
     passed = sum(1 for _n, ok, _d in RESULTS if ok)

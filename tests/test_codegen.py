@@ -8402,6 +8402,286 @@ class TestEnvironmentGodCamera(Base):
         self.assertEqual(files_off, {})
 
 
+class TestCardPropertiesDeclared(Base):
+    """卡片上引用的属性必须真的声明过(第三十九轮抓到的真 bug)。
+
+    ── 为什么值得一条**全局**测试 ──────────────────────────────────
+    『动画_状态』的 `gk_anim_action_2`(同时播 2)当年**只在 draw_buttons
+    里被引用,从来没进 gk_prop_defs** —— 卡片画到那一行直接 AttributeError,
+    整块卡片画一半就报错(用户原话:"一部分节点卡片无作用"),"同时播"
+    这个功能也跟着不存在。这种"引用了没声明"的错,盯单个节点的测试抓不到,
+    所以这里把**所有节点类**扫一遍。
+    """
+
+    IGNORE = {"gk_doc", "gk_category", "gk_tree_type", "gk_hidden",
+              "gk_order"}
+
+    def test_every_card_property_is_declared(self):
+        import inspect
+        import re as _re
+
+        bad = []
+        for cls in NN.ALL_CLASSES:
+            if not isinstance(cls, type):
+                continue
+            defined = {spec[0] for spec in
+                       (getattr(cls, "gk_prop_defs", ()) or ())}
+            referenced = set()
+            for func_name in ("draw_buttons", "draw_buttons_ext"):
+                func = cls.__dict__.get(func_name)
+                if func is None:
+                    continue
+                try:
+                    source = inspect.getsource(func)
+                except OSError:
+                    continue
+                referenced |= set(_re.findall(r"self\.(gk_[a-z0-9_]+)",
+                                              source))
+            missing = sorted(name for name in referenced - self.IGNORE
+                             if name not in defined
+                             and not hasattr(cls, name))
+            if missing:
+                bad.append((cls.bl_idname, missing))
+        self.assertEqual(bad, [], f"卡片引用了没声明的属性: {bad}")
+
+
+class TestGodCameraRound39(Base):
+    """第三十九轮:上帝机的默认功能补齐(用户 2026-10-06)。
+
+    用户原话:"上帝机默认属性功能应有:时停、视角缩放、附身(接管角色控制)、
+    内置 ESC 退出功能"。时停第三十五轮就有了(这里留一条回归),
+    另外三样是这一轮新加/补齐的。
+    """
+
+    def _env(self, god="true", esc="true"):
+        from BlenderGameKit import asset_export
+        return asset_export.render_env_script(
+            camera_name="Cam", fov="70.0", god_camera=god, esc_quit=esc)
+
+    def test_time_stop_still_there(self):
+        text = self._env()
+        self.assertIn("const _GK_TIME_STOP_KEY := KEY_T", text)
+        self.assertIn("func _gk_time_stop_tick() -> void:", text)
+
+    def test_zoom_with_mouse_wheel(self):
+        """视角缩放 = 滚轮改 FOV(不是往前飞 —— 飞太近会穿模)。"""
+        text = self._env()
+        self.assertIn("MOUSE_BUTTON_WHEEL_UP", text)
+        self.assertIn("MOUSE_BUTTON_WHEEL_DOWN", text)
+        self.assertIn("func _gk_god_zoom_tick() -> void:", text)
+        # FOV 夹在 20~110(再大就鱼眼、再小看不清),而且只在滚轮真动过才写
+        self.assertIn("clampf(_gk_god_fov - _gk_god_wheel * 4.0, 20.0, 110.0)",
+                      text)
+        self.assertIn("_gk_god_cam.fov = _gk_god_fov", text)
+
+    def test_possess_takes_over_character(self):
+        """附身:F 接管角色 —— WASD 驱动**角色**,相机跟在身后。"""
+        text = self._env()
+        self.assertIn("const _GK_POSSESS_KEY := KEY_F", text)
+        self.assertIn("func _gk_god_possess_begin() -> void:", text)
+        self.assertIn("func _gk_god_possess_tick(delta: float) -> void:", text)
+        self.assertIn("func _gk_god_release() -> void:", text)
+        # "角色"的判据 = 挂了游戏逻辑脚本(名字用户会改,不能按名字找)
+        self.assertIn('has_method("_gk_god_camera_active")', text)
+        # 驱动角色走 move_and_slide(直接改坐标会穿过墙)
+        self.assertIn("cb.move_and_slide()", text)
+        # 离开上帝机 / 目标被删了都要自动放手
+        self.assertIn("if _gk_god_possess != null:", text)
+        self.assertIn("放开附身", text)
+
+    def test_esc_quits_and_yields_to_pause_menu(self):
+        """内置 ESC 退出 —— 暂停菜单没占着 Esc 时才生效。"""
+        text = self._env(esc="true")
+        self.assertIn("esc_quit: bool = true", text)
+        self.assertIn("func _gk_esc_tick() -> void:", text)
+        self.assertIn("Input.is_key_pressed(KEY_ESCAPE)", text)
+        self.assertIn("tree.quit()", text)
+        # 世界冻住时也得按得应 —— 环境脚本暂停也照跑
+        self.assertIn("if (god_camera or esc_quit) and not Engine.is_editor_hint():",
+                      text)
+        off = self._env(esc="false")
+        self.assertIn("esc_quit: bool = false", off)
+
+    def _esc_quit_of(self, build):
+        """按给定的图算一遍 esc_quit(环境脚本字段)。"""
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import exporter as ex
+
+        tree = make_tree()
+        build(tree)
+        with mock.patch.object(ex, "resolve_scene_tree",
+                               return_value=(tree, "测试")):
+            return ae._env_fields(object())["esc_quit"]
+
+    def test_esc_quit_yields_when_graph_already_uses_esc(self):
+        """图里已经有人管 Esc -> 内置退出必须让位(一个键不能干两件事)。
+
+        两种情况:『界面_暂停游戏』勾了 Esc 热键(那是暂停);
+        或者用户自己接了『按键』(Esc)(关卡 / 曲线 / 物理三个示例都是
+        "按 Esc 退出游戏",内置的再抢一遍就会把用户接的行为挤掉)。
+        """
+        def pause_hotkey(tree):
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            node = tree.new_node(NN.GKNodeUiPauseGame, "暂停",
+                                 gk_menu="暂停菜单", gk_hotkey=True)
+            gk_stub.connect(tree, event, "执行", node, "执行")
+
+        self.assertEqual(self._esc_quit_of(pause_hotkey), "false")
+
+        def key_esc(tree):
+            # 『输入_按键』是表达式节点(没有执行口),图上放一个就够了 ——
+            # 这里问的是"图里有没有人用 Esc",不看它怎么接
+            tree.new_node(NN.GKNodeKey, "Esc 键", gk_key="ESC",
+                          gk_action="quit_game", gk_trigger="JUST")
+
+        self.assertEqual(self._esc_quit_of(key_esc), "false")
+
+    def test_esc_quit_kept_when_nobody_uses_esc(self):
+        """没人用 Esc -> 内置退出保留(用户要的"默认就有")。"""
+        def other_key(tree):
+            tree.new_node(NN.GKNodeKey, "E 键", gk_key="E",
+                          gk_action="use", gk_trigger="JUST")
+
+        self.assertEqual(self._esc_quit_of(other_key), "true")
+
+        def pause_without_hotkey(tree):
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            node = tree.new_node(NN.GKNodeUiPauseGame, "暂停",
+                                 gk_menu="暂停菜单", gk_hotkey=False)
+            gk_stub.connect(tree, event, "执行", node, "执行")
+
+        self.assertEqual(self._esc_quit_of(pause_without_hotkey), "true")
+
+
+class TestAnimRound39(Base):
+    """第三十九轮:动画三处修复(用户:"无动画速率 / 同时播放 / 卡片无作用")。"""
+
+    def _anim_code(self, anim):
+        """把一张动画树挂进 bpy.data,生成玩法图的代码。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(tree, event, "执行", ref, "执行")
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            return gen(tree, V3)
+        finally:
+            detach_anim_tree(original)
+
+    def _anim(self, speeds=None):
+        """一张两状态(idle -> run)的动画树;speeds 里给状态填速度。
+
+        链路照 UE5:状态 --转到--> 转场『上游』;转场『转到』--> 下一个
+        状态的『进入』;条件接在转场的『条件』上。
+        """
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        loco = anim.new_node(NN.GKNodeAnimLocomotion, "移动状态")
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        run = anim.new_node(NN.GKNodeAnimState, "状态run")
+        run.gk_state_name = "run"
+        trans = anim.new_node(NN.GKNodeAnimTransition, "转场")
+        gk_stub.connect(anim, idle, "转到", trans, "上游")
+        gk_stub.connect(anim, trans, "转到", run, "进入")
+        gk_stub.connect(anim, loco, "地面且移动", trans, "条件")
+        for state in (idle, run):
+            if speeds and state.gk_state_name in speeds:
+                state.gk_speed = speeds[state.gk_state_name]
+        return anim
+
+    def test_state_speed_goes_into_play(self):
+        """状态的『播放速度』要真的进 play() —— 用户说"游戏动画里无动画速率"。
+
+        以前只有『动画_播放』节点能填速度,动画树里的**状态**没有,
+        所以走 / 跑 / 受击无法各用各的速率。
+        """
+        code, warnings = self._anim_code(self._anim({"run": 1.5}))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_anim_speed(state_name: String) -> float:", code)
+        self.assertIn('"run":', code)
+        self.assertIn("return 1.5", code)
+        self.assertIn("_ap0.play(next_state, -1.0, _gk_anim_speed(next_state))",
+                      code)
+        self.assert_indent_sane(code)
+
+    def test_state_speed_default_keeps_old_code(self):
+        """全 1.0(老图)-> 速度函数一个字符都不生成。"""
+        code, warnings = self._anim_code(self._anim())
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_anim_speed", code)
+        self.assertIn("_ap0.play(next_state)", code)
+
+    def test_simultaneous_actions_declared_and_played(self):
+        """『同时播 2 / 3』:属性必须真的声明过,而且真的按层播。
+
+        ── 这是用户说的"同时播放 + 一部分节点卡片无作用"的正主 ──────────
+        那两个属性以前**只在 draw_buttons 里被引用,从来没声明过**:
+        卡片画到"同时播"那一行时 `self.gk_anim_action_2` 直接
+        AttributeError(整块卡片画一半就报错);就算不报错,对着没注册的
+        属性 `row.prop(...)` 也画不出选择器 —— 功能等于不存在。
+        """
+        node_cls = NN.GKNodeAnimState
+        declared = {spec[0] for spec in (node_cls.gk_prop_defs or ())}
+        self.assertIn("gk_anim_action_2", declared,
+                      "『同时播 2』没在 gk_prop_defs 里声明(卡片会报错)")
+        self.assertIn("gk_anim_action_3", declared,
+                      "『同时播 3』没在 gk_prop_defs 里声明")
+
+        # 填了两段 -> 生成层播放器,而且跟着本状态的速度走
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        idle = anim.new_node(NN.GKNodeAnimState, "状态idle")
+        idle.gk_state_name = "idle"
+        idle.gk_anim_action_2 = types.SimpleNamespace(name="嘴形动作")
+        idle.gk_speed = 1.5
+        code, warnings = self._anim_code(anim)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_layer_player(_ap0, 1)", code)
+        self.assertIn('"嘴形动作", -1.0, _gk_anim_speed("idle")', code)
+        self.assert_indent_sane(code)
+
+    def test_blend_shape_node_is_no_longer_dead(self):
+        """『动画_设混合参数』以前是死节点(codegen 里根本没有它)。
+
+        用户说的"一部分节点卡片无作用"就是它:拖进图、连上线,导出后
+        一个字符都没有,表情参数永远不动。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeAnimParam, "嘴形", gk_value=0.5,
+                             gk_shape_index=2)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("set_blend_shape_value(2, 0.5)", code)
+        self.assertIn('"MeshInstance3D"', code)
+        # 找不到网格时报一次(静默不动是最难查的那种"没反应")
+        self.assertIn("_gk_shape_warned", code)
+        self.assert_indent_sane(code)
+
+    def test_locomotion_thresholds_read_from_card(self):
+        """『动画判断_移动状态』卡片上的两个阈值必须真的进生成结果。
+
+        以前只在卡片上画了两个数字框,而 codegen 是按**引脚名**读值的 ——
+        节点上没有这两个引脚,于是改了卡片一点反应都没有(永远 0.1 / 3.0)。
+        """
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        loco = tree.new_node(NN.GKNodeAnimLocomotion, "移动状态",
+                             gk_speed_threshold=0.5, gk_fast_threshold=6.0)
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        gk_stub.connect(tree, physics, "执行", branch, "执行")
+        gk_stub.connect(tree, loco, "在移动", branch, "条件")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        for pin in ("速度阈值", "跑的速度阈值"):
+            self.assertIsNotNone(loco.inputs.get(pin), f"少了引脚 {pin}")
+        self.assertIn("@export var move_threshold: float = 0.5", code)
+        self.assertIn("@export var run_threshold: float = 6.0", code)
+
+
 class TestTriggerNodes(Base):
     """触发器节点:进入/离开区域、碰撞体触发、定时触发(用户 2026-10-04 第 6 条)。"""
 

@@ -219,8 +219,20 @@ class GKNodeAnimLocomotion(B.GKExpressionNode):
         "『在地面』『在移动』『地面且移动』『已离地』『在上升』"
         "『在下落』『速度快』『速度慢』。"
         "『速度阈值』用来区分走和跑")
+    # ── 两个阈值必须是**引脚**(第三十九轮修)───────────────────────────
+    # 以前只在卡片上画了两个数字框,而 codegen 是按**引脚名**去读值的
+    # (`_tunable_number(ctx, node, "速度阈值", …)`)—— 节点上根本没有这
+    # 两个引脚,于是读不到、永远用硬编码的 0.1 / 3.0:
+    # 用户在卡片上把阈值从 0.1 改到 5,导出结果**一点变化都没有**
+    # (这就是"一部分节点卡片无作用"的第二个现场)。
+    # 补上引脚 + `gk_input_props` 之后:卡片上改 = 生成里改;
+    # 想由图算(比如按等级变)还能直接接线。
     gk_inputs = (
+        S.pin(FLOAT, "速度阈值", 0.1),
+        S.pin(FLOAT, "跑的速度阈值", 3.0),
     )
+    gk_input_props = {"速度阈值": "gk_speed_threshold",
+                      "跑的速度阈值": "gk_fast_threshold"}
     gk_prop_defs = (
         ("gk_target", "node", TARGET_SELF, "角色", "要判断的节点"),
         ("gk_speed_threshold", "float", 0.1, "速度阈值",
@@ -318,6 +330,14 @@ class GKNodeAnimState(B.GKStatementNode):
          "这个状态播哪个动作(原生选择器,能搜索)"),
         ("gk_state_name", "string", "idle", "状态名(手填兜底)",
          "没选『动画』时才用它"),
+        # ── 播放速度(第三十九轮,用户 2026-10-06)────────────────────────
+        # 用户反馈原话:"游戏动画里的无动画速率"。以前只有『动画_播放』
+        # 能填速度,动画树里的**状态**没有 —— 走 / 跑 / 受击想快慢不一
+        # 只能靠美术把动作做快,运行时调不了。
+        # 默认 1.0 = 原速:老图(全 1.0)生成结果一字不变。
+        ("gk_speed", "float", 1.0, "播放速度",
+         "1.0 为原速;0.5 = 慢放一半,2.0 = 快一倍。"
+         "状态切换后按这个速度播(『同时播』的那几段也跟着)"),
         # ── 为什么要好几个『进入』(Blender 的硬限制)────────────────────
         # **一个输入引脚只允许一条连线**(踩过的坑,README 第 9 条)。
         # 于是"待机"被 走/跑/跳/受击/攻击 五条转场指着时,只有**最后接的
@@ -335,6 +355,25 @@ class GKNodeAnimState(B.GKStatementNode):
         # 想看完整动作必须同时播。Godot 的 AnimationPlayer 一次只能播一段
         # (`play()` 会顶掉上一段),所以这里按"层"复制出额外的播放器
         # (见 codegen.need_layer_player),两段各播各的,互不干扰。
+        #
+        # ⚠ 第三十九轮补声明(用户原话:"同时播放,且一部分节点卡片无作用")
+        # ─────────────────────────────────────────────────────────────
+        # 这两个属性以前**只在 draw_buttons 里被引用,从来没声明过**:
+        #   * `self.gk_anim_action_2` 一读就 AttributeError —— 而卡片画到
+        #     "同时播" 那一行时**必然**会读(getattr 兜不住的短路写在
+        #     `if extras or self.gk_anim_action_2 is not None`),于是**每个
+        #     状态节点的卡片在 Blender 里都是画一半就报错**,看起来就是
+        #     "卡片没作用";
+        #   * 就算不报错,`row.prop(self, "gk_anim_action_2")` 对着一个
+        #     没注册的属性也画不出选择器 —— "同时播" 这个功能等于不存在。
+        # 现在补成真的 Blender 属性(原生动作选择器),两层意思都修好了。
+        # (tests/test_codegen.py 的 TestCardPropertiesDeclared 会**全局**
+        #  扫这类"卡片引用了没声明",以后不会再漏)
+        ("gk_anim_action_2", "action", None, "同时播 2",
+         "这个状态**同时**播的第二段动画(Godot 一次只能播一段,多出来的"
+         "按层复制播放器;MMD 那种骨骼动作 + 形态键动作分两段的模型就用它)"),
+        ("gk_anim_action_3", "action", None, "同时播 3",
+         "同时播的第三段(一般用不到)"),
     )
 
     def build_sockets(self):
@@ -384,14 +423,17 @@ class GKNodeAnimState(B.GKStatementNode):
         else:
             layout.prop(self, "gk_state_name", text="", icon="SORTALPHA")
         # 同时播的另外几段:填了才画,免得每个状态都顶着两个空框
+        # ⚠ 用 getattr 兜一下:这张卡片以前就因为一个**没声明**的属性
+        #   在画到这儿时整块报错(第三十九轮修的),别再踩第二次。
         extras = self.extra_animation_names()
-        if extras or self.gk_anim_action_2 is not None:
+        if extras or getattr(self, "gk_anim_action_2", None) is not None:
             layout.label(text=f"同时播:{len(extras)} 段", icon="DUPLICATE")
         row = layout.row(align=True)
         row.prop(self, "gk_anim_action_2", text="")
         row.prop(self, "gk_anim_action_3", text="")
         row = layout.row(align=True)
         row.prop(self, "gk_in_count", text="入口")
+        row.prop(self, "gk_speed", text="速度")
         full = all(
             bool(getattr(socket, "is_linked", False))
             for socket in (getattr(self, "inputs", ()) or ()))
