@@ -892,6 +892,376 @@ def action_enum_items(_self=None, _context=None):
     if not entries:
         return [("", "(这个文件里还没有任何动画)", "")]
     return entries
+# ==========================================================================
+# AI 图(『游戏AI』)—— 第四十一轮
+# ==========================================================================
+# 用户原话:"添加游戏AI逻辑编辑器,这样分类开不会后期混乱"。
+# 交互完全照动画树(状态卡 + 转场卡 + 起始状态),区别只在状态里干的事:
+# 动画状态播动画,AI 状态**做行为**(巡逻 / 追击 / 逃跑…)。
+#
+#     玩法图(游戏逻辑)              AI 图(游戏AI)
+#     ┌───────────────┐           ┌──────────────────────────┐
+#     │ 每当_准备      │           │ [AI_状态: 巡逻] 行为=巡逻   │
+#     │  AI_启用 ──────┼── 驱动 ──>│   ├─转场:看见玩家─> [追击]  │
+#     └───────────────┘           │   └─转场:丢失玩家─> [巡逻]  │
+#                                 └──────────────────────────┘
+AI_TREE_ID = "GKGameAiTree"
+AI_STATE_ID = "GKNodeAiState"
+AI_TRANSITION_ID = "GKNodeAiTransition"
+
+# 行为枚举:六个行为覆盖"小怪 / NPC"最常见的全部动作。
+# 这些行为都生成 `velocity + move_and_slide()`(和『移动_朝向目标』同一套),
+# 所以『AI_启用』的『作用在谁』必须是 CharacterBody(3D 角色 / 2D 角色)。
+AI_BEHAVIORS = (
+    ("STAND", "待机", "站着不动(站岗 / 等条件成立)"),
+    ("PATROL", "巡逻", "在『巡逻点 A』和『巡逻点 B』之间来回走"),
+    ("CHASE", "追击", "朝『目标』走过去(追人的敌人)"),
+    ("FLEE", "逃跑", "目标近到『停在多远』以内就往反方向跑"),
+    ("FOLLOW", "跟随", "跟着『目标』走,保持『停在多远』的距离(宠物)"),
+    ("RETURN", "返回", "走回『巡逻点 A』(追丢了回岗位)"),
+)
+
+# 朝向:走的时候头朝哪
+AI_FACINGS = (
+    ("GOAL", "朝目标", "看着目标(巡逻 / 返回时看下一个巡逻点)"),
+    ("MOVE", "朝移动方向", "头跟着路转 —— 绕障碍时比朝目标自然"),
+    ("KEEP", "不转", "自己另外用『移动_设置朝向』控"),
+)
+
+# 『AI_转场』的条件来源:自己写 / 看见目标 / 丢失目标
+AI_COND_SOURCES = ("SEE", "LOST")
+
+
+def ai_tree_items():
+    """给『选…』按钮用的 AI 图清单:(标识, 显示名, 说明)。
+
+    和 `animation_tree_items` / `ui_design_tree_items` 同一套:
+    标识就是树名(空串 = 自动用第一张)。
+    """
+    auto = ("", "自动(用文件里第一张)", "留空就用这张")
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return [auto]
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None) if data is not None else None
+    if groups is None:
+        return [auto]
+    trees = []
+    for group in groups:
+        if getattr(group, "bl_idname", "") != AI_TREE_ID:
+            continue
+        count = len([n for n in (getattr(group, "nodes", ()) or ())
+                     if getattr(n, "bl_idname", "") == AI_STATE_ID])
+        trees.append((str(group.name), f"{group.name}  ({count} 个状态)", "这张 AI 图"))
+    return [auto] + trees
+
+
+def ai_tree_names():
+    """文件里所有 AI 图的名字(不含"自动"那一项)。"""
+    return [item[0] for item in ai_tree_items() if item[0]]
+
+
+def find_ai_tree(name=""):
+    """按名字找一张 AI 图;名字为空就用文件里第一张(找不到返回 None)。
+
+    面板、节点上的预览、代码生成三处都要问"这个节点会用哪张图",
+    判断必须只有一份 —— 和 `find_animation_tree` 同一个理由。
+    """
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return None
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return None
+    wanted = str(name or "")
+    first = None
+    for group in groups:
+        if getattr(group, "bl_idname", "") != AI_TREE_ID:
+            continue
+        if first is None:
+            first = group
+        if wanted and str(getattr(group, "name", "")) == wanted:
+            return group
+    return first if not wanted else None
+
+
+def ai_state_name(node):
+    """一个 AI 状态叫什么(手填的『状态名』)。"""
+    if node is None:
+        return ""
+    return str(getattr(node, "gk_state_name", "") or "").strip()
+
+
+def ai_behavior_label(node):
+    """状态的行为显示名(『巡逻』『追击』…),给告警和面板用。"""
+    behavior = str(getattr(node, "gk_behavior", "PATROL") or "PATROL")
+    for ident, label, _desc in AI_BEHAVIORS:
+        if ident == behavior:
+            return label
+    return behavior
+
+
+def ai_state_nodes(tree):
+    """树里所有『AI_状态』,按画布顺序(上到下、左到右)排。"""
+    nodes = [n for n in (getattr(tree, "nodes", ()) or ())
+             if getattr(n, "bl_idname", "") == AI_STATE_ID]
+    nodes.sort(key=anim_layout_key)
+    return nodes
+
+
+def ai_state_items(tree):
+    """给『选…』按钮用的状态清单:(状态名, 显示名, 说明)。
+
+    和 `animation_tree_states` 同一套 —— 『AI_转场』的『从』/『到』
+    下拉用它(忘了连线时的兜底)。
+    """
+    items = []
+    for state in ai_state_nodes(tree):
+        name = ai_state_name(state)
+        if not name:
+            items.append(("", f"{getattr(state, 'name', '?')}(还没设名字)",
+                          "先在节点上填一个『状态名』"))
+            continue
+        items.append((name, f"{name} · {ai_behavior_label(state)}",
+                      f"节点名 {getattr(state, 'name', '?')}"))
+    return items
+
+
+def ai_transition_is_used(trans):
+    """这条转场用户到底动过没有?
+
+    刚拖进来、什么都没接的『AI_转场』不该刷一堆告警 ——
+    但接了线或选了条件的就说明用户是想用它,那时缺什么必须说清
+    (照 `transition_is_used`)。
+    """
+    for socket_name in ("上游", "条件"):
+        if link_sources(trans, socket_name):
+            return True
+    if link_targets(trans, "转到"):
+        return True
+    if str(getattr(trans, "gk_from_state", "") or "").strip():
+        return True
+    if str(getattr(trans, "gk_to_state", "") or "").strip():
+        return True
+    if str(getattr(trans, "gk_cond_source", "PIN")) != "PIN":
+        return True
+    return False
+
+
+def ai_edge_label(edge):
+    """一条边在面板上怎么念 —— 给用户看的短句。"""
+    kind = edge.get("kind")
+    if kind == "SEE":
+        return "条件:看见目标"
+    if kind == "LOST":
+        return "条件:丢失目标"
+    if kind == "pin":
+        return "条件:接引脚"
+    return "条件:?"
+
+
+def ai_tree_graph(tree):
+    """把一张 AI 图解析成状态图(和 `anim_tree_graph` 同一套形状)。
+
+    返回一个字典:
+        states     [状态节点...]          按画布顺序
+        edges      [边...]
+        entry      起始状态 或 None(没有任何边指向它的那个)
+        orphans    [走不到的状态...]
+        by_name    {状态名: 状态节点}
+        problems   [人话问题...]          导出时逐条变成告警
+
+    每条边:
+        from / to   状态节点
+        transition  『AI_转场』节点
+        kind        pin / SEE / LOST
+        order       优先级排序键(画布上谁在上面谁先判)
+        pin_used    『条件』引脚上到底有没有接线
+        label       给告警用的短名
+
+    ── 和动画树唯一的差别:直连不算数 ──────────────────────────────
+    动画状态直连 = "动画播完就切",有内在时序;AI 状态直连**没有条件**,
+    语义只能是"一到就切走" —— 那没有任何用处,所以这里把它报成问题
+    (说清该用『AI_转场』),而不是生成一条废边。
+    """
+    states = ai_state_nodes(tree)
+    transitions = [n for n in (getattr(tree, "nodes", ()) or ())
+                   if getattr(n, "bl_idname", "") == AI_TRANSITION_ID]
+    problems = []
+
+    # ---- 状态名:必须唯一、必须有 ----
+    by_name = {}
+    for state in states:
+        name = ai_state_name(state)
+        if not name:
+            problems.append(
+                f"状态『{getattr(state, 'name', '?')}』还没有名字 —— "
+                f"在它上面填一个『状态名』(比如 巡逻 / 追击)")
+            continue
+        if name in by_name:
+            problems.append(
+                f"有两个状态都叫『{name}』—— 状态机按名字判断在哪个状态,"
+                f"重名会让其中一个永远进不去。给它们取不同的名字")
+            continue
+        by_name[name] = state
+
+    # ---- 行为参数齐不齐(缺了先说,免得导出后"站着不动"查半天)----
+    for state in states:
+        name = ai_state_name(state) or getattr(state, "name", "?")
+        behavior = str(getattr(state, "gk_behavior", "PATROL") or "PATROL")
+        label = ai_behavior_label(state)
+        if behavior in ("PATROL", "RETURN") and not str(
+                getattr(state, "gk_patrol_a", "") or "").strip():
+            problems.append(
+                f"状态『{name}』的行为是『{label}』,但没填『巡逻点 A』—— "
+                f"它哪儿也不去。在场景里摆两个空物体当巡逻点,再选上")
+        if behavior == "PATROL" and not str(
+                getattr(state, "gk_patrol_b", "") or "").strip():
+            problems.append(
+                f"状态『{name}』没填『巡逻点 B』—— 只在 A 点待着不算巡逻,"
+                f"把它选上(或者把行为改成『返回』/『待机』)")
+        if behavior in ("CHASE", "FOLLOW", "FLEE") and not str(
+                getattr(state, "gk_goal", "") or "").strip():
+            problems.append(
+                f"状态『{name}』的行为是『{label}』,但没选『目标』—— "
+                f"它不知道追谁 / 逃谁。选上玩家(或要跟随的物体)")
+
+    # ---- 边:经过『AI_转场』的正规写法 ----
+    edges = []
+    for trans in transitions:
+        label = getattr(trans, "name", "?")
+        ups = [n for n in link_sources(trans, "上游")
+               if getattr(n, "bl_idname", "") == AI_STATE_ID]
+        dsts = [n for n in link_targets(trans, "转到")
+                if getattr(n, "bl_idname", "") == AI_STATE_ID]
+        other_ups = [n for n in link_sources(trans, "上游")
+                     if getattr(n, "bl_idname", "") != AI_STATE_ID]
+        other_dsts = [n for n in link_targets(trans, "转到")
+                      if getattr(n, "bl_idname", "") != AI_STATE_ID]
+        fallback_from = str(getattr(trans, "gk_from_state", "") or "").strip()
+        fallback_to = str(getattr(trans, "gk_to_state", "") or "").strip()
+        source = ups[0] if ups else by_name.get(fallback_from)
+        target = dsts[0] if dsts else by_name.get(fallback_to)
+
+        if not ai_transition_is_used(trans):
+            continue          # 刚拖进来还没配,不刷告警
+
+        if source is None:
+            if other_ups:
+                problems.append(
+                    f"转场『{label}』的『上游』接的是"
+                    f"『{getattr(other_ups[0], 'bl_label', '?')}』,"
+                    f"不是『AI_状态』—— 它应该接上一个状态的『转到』")
+            else:
+                hint = (f"『从状态』选的是『{fallback_from}』,这张图里没有这个状态"
+                        if fallback_from else
+                        "把上一个状态的『转到』接到它的『上游』,"
+                        "或者在它上面把『从状态』选上")
+                problems.append(
+                    f"转场『{label}』不知道**从哪个状态切过来** —— {hint}")
+        if target is None:
+            if other_dsts:
+                problems.append(
+                    f"转场『{label}』的『转到』接的是"
+                    f"『{getattr(other_dsts[0], 'bl_label', '?')}』,"
+                    f"不是『AI_状态』—— 它应该接下一个状态的『进入』")
+            else:
+                hint = (f"『到状态』选的是『{fallback_to}』,这张图里没有这个状态"
+                        if fallback_to else
+                        "把它连到下一个状态的『进入』,或者在它上面把『到状态』选上")
+                problems.append(f"转场『{label}』不知道**切到哪个状态** —— {hint}")
+
+        source_kind = str(getattr(trans, "gk_cond_source", "PIN") or "PIN")
+        pin_used = bool(link_sources(trans, "条件"))
+        if source_kind == "PIN" and not pin_used:
+            problems.append(
+                f"转场『{label}』没有条件:『条件来源』是『自己写』,但"
+                f"『条件』引脚空着 —— 这条规则不会生效。"
+                f"接一个判断节点上去(比如『AI_看得见』),或者把"
+                f"『条件来源』改成『看见目标』/『丢失目标』")
+        if source_kind in AI_COND_SOURCES and pin_used:
+            problems.append(
+                f"转场『{label}』既接了『条件』引脚,又把『条件来源』选成了"
+                f"『看见 / 丢失目标』—— **以『条件来源』为准**,"
+                f"接的那根线被忽略了")
+        if source_kind in AI_COND_SOURCES and not str(
+                getattr(trans, "gk_goal", "") or "").strip():
+            problems.append(
+                f"转场『{label}』选了『看见 / 丢失目标』但没选『目标』—— "
+                f"看谁?把玩家选上(或者改用『自己写』接『AI_看得见』)")
+
+        if source is None or target is None:
+            continue
+        edges.append({
+            "from": source, "to": target, "transition": trans,
+            "kind": source_kind if source_kind in AI_COND_SOURCES else "pin",
+            "order": anim_layout_key(trans),
+            "pin_used": pin_used,
+            "label": label,
+        })
+
+    # ---- 直连:AI 里没有意义(见函数说明),报清怎么改 ----
+    for state in states:
+        for target in link_targets(state, "转到"):
+            kind_id = getattr(target, "bl_idname", "")
+            if kind_id == AI_TRANSITION_ID:
+                continue
+            if kind_id == AI_STATE_ID:
+                problems.append(
+                    f"状态『{ai_state_name(state) or state.name}』的『转到』"
+                    f"**直连**到了另一个状态 —— AI 状态之间请隔一个"
+                    f"『AI_转场』(它才有条件;直连没有条件,一到就会切走)")
+            else:
+                problems.append(
+                    f"状态『{ai_state_name(state) or state.name}』的『转到』接的是"
+                    f"『{getattr(target, 'bl_label', '?')}』—— "
+                    f"它只能接『AI_转场』")
+
+    # ---- 入口:没有任何一条边指向它的状态 ----
+    targeted = {node_key(edge["to"]) for edge in edges if edge["to"] is not None}
+    named = [s for s in states if ai_state_name(s)]
+    entries = [s for s in named if node_key(s) not in targeted]
+    entry = entries[0] if entries else (named[0] if named else None)
+
+    # ---- 孤立状态:从入口走不到的那些 ----
+    orphans = []
+    if entry is not None:
+        reachable = {node_key(entry)}
+        stack = [entry]
+        while stack:
+            current = stack.pop()
+            current_key = node_key(current)
+            for edge in edges:
+                if node_key(edge["from"]) != current_key:
+                    continue
+                if edge["to"] is None:
+                    continue
+                target_key = node_key(edge["to"])
+                if target_key in reachable:
+                    continue
+                reachable.add(target_key)
+                stack.append(edge["to"])
+        orphans = [s for s in named if node_key(s) not in reachable]
+    if orphans:
+        names = "、".join(ai_state_name(s) for s in orphans[:4])
+        problems.append(
+            f"有 {len(orphans)} 个状态是**孤立**的(从起始状态走不到):({names})"
+            f"—— 它们不会出现在导出的状态机里。用『AI_转场』把它们连起来")
+
+    edges.sort(key=lambda e: (anim_layout_key(e["from"]), e["order"]))
+    return {
+        "states": states,
+        "edges": edges,
+        "entry": entry,
+        "orphans": orphans,
+        "by_name": by_name,
+        "problems": problems,
+    }
+
+
 from ..gk_sockets import ANY, BOOL, COLOR, FLOAT, FLOW, INT, OBJECT, TEXT, VECTOR, VECTOR2
 
 CLASSES = []

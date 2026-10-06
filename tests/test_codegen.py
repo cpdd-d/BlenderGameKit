@@ -10954,5 +10954,289 @@ class TestRound36NavV2(Base):
         self.assertIn('navigation_polygon = SubResource("gk_navpoly")', node)
 
 
+class TestRound41Ai(Base):
+    """第四十一轮:AI 图(『游戏AI』)+ 『AI_启用』那条线。
+
+    用户选的方案(四选一后确认):
+      * **状态机式**(照动画树):『AI_状态』+ 『AI_转场』+ 起始状态
+        = 没有任何转场指到的那个;
+      * 玩法图放一个『AI_启用』引用整张 AI 图(同『动画_状态机』
+        『界面_套用设计』);
+      * 侧栏清单 + 视口叠加预览(巡逻路线 / 感知圈)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        """把 AI 图挂到 bpy.data 上再生成(用完还原,照界面那套)。"""
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _patrol_chase(self, ai):
+        """在 AI 图里搭"巡逻 -> 看见玩家 -> 追击 -> 丢失玩家 -> 巡逻"。
+
+        环用『从』『到』下拉表达(Blender 不许连线成环,见 _new_ai_tree)。
+        """
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL",
+                             gk_patrol_a="点A", gk_patrol_b="点B", gk_speed=3.0,
+                             gk_stop_distance=0.6)
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                            gk_stop_distance=1.2)
+        to_chase = ai.new_node(NN.GKNodeAiTransition, "看见玩家",
+                               gk_cond_source="SEE", gk_goal="玩家",
+                               gk_sight=10.0,
+                               gk_from_state="巡逻", gk_to_state="追击")
+        back = ai.new_node(NN.GKNodeAiTransition, "丢失玩家",
+                           gk_cond_source="LOST", gk_goal="玩家",
+                           gk_sight=10.0,
+                           gk_from_state="追击", gk_to_state="巡逻")
+        return patrol, chase, to_chase, back
+
+    def _enable_tree(self, **props):
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", **props)
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return tree, enable
+
+    # ---- 树类型 / 菜单归属 ----
+    def test_ai_nodes_tree_scope(self):
+        from BlenderGameKit import properties as props
+        # 状态 / 转场:只属于 AI 图
+        for cls in (NN.GKNodeAiState, NN.GKNodeAiTransition):
+            self.assertTrue(props.node_fits_tree(cls, "GKGameAiTree"),
+                            cls.bl_label + " 应该能放进 AI 图")
+            self.assertFalse(props.node_fits_tree(cls, "GKGameLogicTree"),
+                             cls.bl_label + " 不该出现在玩法图菜单里")
+        # 『AI_启用』:玩法图的引用节点(整张 AI 图的入口)
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiEnable, "GKGameLogicTree"))
+        self.assertFalse(props.node_fits_tree(NN.GKNodeAiEnable, "GKGameAiTree"))
+        # 『AI_看得见』:两棵树都能放
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiSee, "GKGameAiTree"))
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiSee, "GKGameLogicTree"))
+        # 拼条件要用的纯取值节点在 AI 树里也开放
+        for cls in (NN.GKNodeConstFloat, NN.GKNodeCompare, NN.GKNodeDistance,
+                    NN.GKNodeGetVar):
+            self.assertTrue(props.node_fits_tree(cls, "GKGameAiTree"),
+                            cls.bl_label + " 应该能放进 AI 图(拼条件)")
+        # 动画树不受影响:它那边的『常量_数值』还在(第三轮踩过的坑别再犯)
+        self.assertTrue(props.node_fits_tree(NN.GKNodeConstFloat,
+                                             "GKAnimationTree"))
+
+    def test_ai_menu_lists_states_only(self):
+        from BlenderGameKit import properties as props
+        labels = [cls.bl_label
+                  for _cat, items in props.node_menu_entries("GKGameAiTree")
+                  for cls in items]
+        self.assertIn("AI_状态", labels)
+        self.assertIn("AI_转场", labels)
+        self.assertIn("AI_看得见", labels)
+        self.assertNotIn("移动_按方向", labels)
+
+    # ---- 状态图解析 ----
+    def test_graph_parses_loop_with_fallbacks(self):
+        lib = NN
+        ai = self._ai_tree()
+        self._patrol_chase(ai)
+        graph = lib.ai_tree_graph(ai)
+        self.assertEqual(len(graph["states"]), 2)
+        self.assertEqual(len(graph["edges"]), 2)
+        self.assertEqual(lib.ai_state_name(graph["entry"]), "巡逻",
+                         "没人指向的状态才是起始状态")
+        self.assertEqual(graph["problems"], [], graph["problems"])
+
+    def test_graph_links_also_count(self):
+        """连线优先:转场用连线接状态,不用下拉也能解析。"""
+        lib = NN
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="STAND")
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="CHASE", gk_goal="玩家")
+        trans = ai.new_node(NN.GKNodeAiTransition, "追",
+                            gk_cond_source="SEE", gk_goal="玩家")
+        gk_stub.connect(ai, patrol, "转到", trans, "上游")
+        gk_stub.connect(ai, trans, "转到", chase, "进入")
+        graph = lib.ai_tree_graph(ai)
+        self.assertEqual(len(graph["edges"]), 1)
+        self.assertEqual(lib.ai_state_name(graph["edges"][0]["from"]), "巡逻")
+        self.assertEqual(lib.ai_state_name(graph["edges"][0]["to"]), "追击")
+        self.assertEqual(graph["problems"], [], graph["problems"])
+
+    def test_graph_reports_missing_params(self):
+        lib = NN
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL")          # 没填巡逻点 A/B
+        ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                    gk_behavior="CHASE")           # 没填目标
+        graph = lib.ai_tree_graph(ai)
+        joined = "\n".join(graph["problems"])
+        self.assertIn("巡逻点 A", joined)
+        self.assertIn("巡逻点 B", joined)
+        self.assertIn("目标", joined)
+
+    def test_graph_reports_direct_link(self):
+        """AI 状态直连没有条件 —— 报问题,让用户改用『AI_转场』。"""
+        lib = NN
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="STAND")
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="STAND")
+        gk_stub.connect(ai, patrol, "转到", chase, "进入")
+        graph = lib.ai_tree_graph(ai)
+        self.assertEqual(graph["edges"], [])
+        self.assertTrue(any("直连" in p for p in graph["problems"]),
+                        graph["problems"])
+
+    # ---- 『AI_启用』生成 ----
+    def test_enable_generates_state_machine(self):
+        ai = self._ai_tree()
+        self._patrol_chase(ai)
+        tree, _ = self._enable_tree()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var ai_state: String", code)
+        # 起始状态:只在"还没进过状态"时设一次(接在每帧链上也安全)
+        self.assertIn("if ai_state.is_empty():", code)
+        self.assertIn('ai_state = "巡逻"', code)
+        # 每帧先执行当前状态的行为(巡逻 / 追击各一段)
+        self.assertIn('if ai_state == "巡逻":', code)
+        self.assertIn('elif ai_state == "追击":', code)
+        self.assertIn("move_and_slide()", code)
+        # 行为写在 _physics_process 里(和移动同拍)
+        self.assertIn("func _physics_process(", code)
+        # 转场:看见 / 丢失目标 -> 距离比较
+        self.assertIn(".length() <= 10.0", code)
+        self.assertIn(".length() > 10.0", code)
+
+    def test_patrol_flips_between_points(self):
+        ai = self._ai_tree()
+        self._patrol_chase(ai)
+        tree, _ = self._enable_tree()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        # 到了哪头就往另一头走(翻面开关存在成员变量里,要跨帧记)
+        self.assertIn("var _gk_ai_patrol_1: bool = false", code)
+        self.assertIn("_gk_ai_patrol_1 = not _gk_ai_patrol_1", code)
+
+    def test_flee_runs_away_from_goal(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "逃", gk_state_name="逃",
+                    gk_behavior="FLEE", gk_goal="玩家", gk_speed=4.0,
+                    gk_stop_distance=3.0)
+        tree, _ = self._enable_tree()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        # 逃跑方向 = 自己 - 目标(和追击相反)
+        self.assertIn(" - _gk_global_position_3d(节点_玩家)", code)
+
+    def test_see_node_pin_condition(self):
+        """『AI_看得见』接在转场条件引脚上:帮函数 + 表达式都要生成。"""
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="STAND")
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="CHASE", gk_goal="玩家")
+        see = ai.new_node(NN.GKNodeAiSee, "看得见吗", gk_goal="玩家",
+                          gk_distance=8.0, gk_angle=90.0)
+        trans = ai.new_node(NN.GKNodeAiTransition, "看见",
+                            gk_from_state="巡逻", gk_to_state="追击")
+        gk_stub.connect(ai, see, "看得见", trans, "条件")
+        tree, _ = self._enable_tree()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ai_can_see_3d(self, 节点_玩家, 8.0, 90.0)", code)
+        self.assertIn("func _gk_ai_can_see_3d(", code)
+        # 3D 用物体前方(-Z)和水平方向比夹角
+        self.assertIn("signed_angle_to(flat, Vector3.UP)", code)
+
+    def test_see_node_2d_uses_rotation(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "说")
+        see = tree.new_node(NN.GKNodeAiSee, "看得见吗", gk_goal="玩家",
+                            gk_distance=200.0, gk_angle=120.0)
+        branch = tree.new_node(NN.GKNodeBranch, "看见?")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, see, "看得见", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("func _gk_ai_can_see_2d(", code)
+        self.assertIn("Vector2.RIGHT.rotated(", code)
+
+    def test_enable_missing_tree_warns(self):
+        tree, _ = self._enable_tree()
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("AI 图" in w for w in warnings), warnings)
+
+    def test_enable_missing_goal_warns(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                    gk_behavior="CHASE")             # 没选目标
+        tree, _ = self._enable_tree()
+        _code, warnings = self._gen_with_ai(ai, tree)
+        self.assertTrue(any("目标" in w for w in warnings), warnings)
+
+    def test_state_var_conflict_warns(self):
+        ai = self._ai_tree()
+        self._patrol_chase(ai)
+        tree = make_tree()
+        event = self._ready(tree)
+        one = tree.new_node(NN.GKNodeAiEnable, "AI一")
+        two = tree.new_node(NN.GKNodeAiEnable, "AI二")
+        gk_stub.connect(tree, event, "执行", one, "执行")
+        gk_stub.connect(tree, one, "完成", two, "执行")
+        _code, warnings = self._gen_with_ai(ai, tree)
+        self.assertTrue(any("互相覆盖" in w for w in warnings), warnings)
+
+    def test_required_base_class_from_ai_tree(self):
+        """AI 图里的行为要 CharacterBody —— validation 必须**先扫出来**定基类。"""
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="STAND")
+        need, why = codegen.required_base_class(ai, {"dimension": "3"})
+        self.assertEqual(need, "CharacterBody3D")
+        self.assertIn("AI", why + "AI")           # 只说"用到了它才有的成员"即可
+        need2, _ = codegen.required_base_class(ai, {"dimension": "2"})
+        self.assertEqual(need2, "CharacterBody2D")
+
+    def test_target_typed_as_character_body(self):
+        """『作用在谁』的 @onready 必须带 CharacterBody 类型。
+
+        不带的话生成 `Node` 类型,`.velocity` / `.move_and_slide()`
+        会被 Godot 静态检查拒绝 —— 整个脚本加载不了(和『移动_朝向目标』
+        同一个坑)。
+        """
+        ai = self._ai_tree()
+        self._patrol_chase(ai)
+        tree, _ = self._enable_tree(gk_target="敌人")
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(": CharacterBody3D", code)
+        # 行为作用在那个物体上(不是 self)
+        self.assertIn("敌人.velocity", code)
+        self.assertIn("敌人.move_and_slide()", code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

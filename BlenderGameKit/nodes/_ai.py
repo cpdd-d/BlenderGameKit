@@ -1,0 +1,333 @@
+"""AI 节点(『游戏AI』树) —— 状态机式 AI:巡逻 / 追击 / 逃跑 / 返回…
+
+第四十一轮(用户:"添加游戏AI逻辑编辑器,这样分类开不会后期混乱")。
+AI 逻辑以前只能拿玩法图的节点硬拼(取值_距离 + 逻辑_比较 + 移动_朝向目标
++ 触发器…),一多就糊在某一张图里。现在照动画树的做法单开一张图:
+
+    玩法图(游戏逻辑)                AI 图(游戏AI)
+    ┌────────────────┐             ┌──────────────────────────────┐
+    │ 每当_准备       │             │ [AI_状态: 巡逻] 行为=巡逻      │
+    │  AI_启用 ───────┼── 驱动 ────>│   ├─转场:看见玩家──> [AI_状态: 追击]
+    └────────────────┘             │   └─转场:丢失玩家──> [AI_状态: 巡逻]
+                                   └──────────────────────────────┘
+
+交互和动画树**一模一样**(状态卡 + 转场卡 + 起始状态 = 谁都没指到的那个),
+用户学过一次就不用再学第二次。区别只在"状态里做的事":动画状态播动画,
+AI 状态**做行为**。
+"""
+
+from ._common import *  # noqa: F401,F403
+
+# AI 树的标识 / 行为枚举都定义在 _common.py(地基先加载,解析函数要用)—— 
+# 这里只写节点类,枚举直接用 _common 的那一份(AI_TREE_ID / AI_BEHAVIORS /
+# AI_FACINGS 由 `from ._common import *` 带进来)。
+
+
+@N
+class GKNodeAiState(B.GKStatementNode):
+    bl_idname = AI_STATE_ID
+    bl_label = "AI_状态"
+    bl_icon = "TRACKER"
+    gk_category = "AI"
+    gk_tree_type = AI_TREE_ID
+    gk_doc = ("一个 AI 状态:『行为』决定它在这个状态里做什么"
+              "(巡逻 / 追击 / 逃跑 / 待机 / 跟随 / 返回)。\n"
+              "左边『进入』接上一个『AI_转场』的『转到』;"
+              "右边『转到』接一个『AI_转场』写“什么条件下切走”。\n"
+              "『进入』没被任何『转到』指到的状态 = **起始状态**(一进游戏就跑它)。\n"
+              "── 作用在谁 ──\n"
+              "AI 控制**『AI_启用』节点上选的那个物体**(默认脚本所在物体)。"
+              "所以这个物体必须是角色体(3D 角色 / 2D 角色),"
+              "行为都是 velocity + move_and_slide 那一套。")
+    gk_inputs = (
+        S.pin(FLOW, "进入"),
+    )
+    gk_outputs = (
+        S.pin(FLOW, "转到"),
+    )
+    gk_prop_defs = (
+        ("gk_state_name", "string", "巡逻", "状态名",
+         "状态机按名字记“现在在哪个状态” —— 每个状态取一个自己认得出的名字"),
+        ("gk_behavior", "enum", "PATROL", "行为",
+         "这个状态里做什么", AI_BEHAVIORS),
+        # ── 目标:追谁 / 逃谁 / 跟随谁 ────────────────────────────────
+        ("gk_goal", "node", "", "目标",
+         "追击 / 逃跑 / 跟随的对象(一般选玩家)。留空 = 不生成这些行为"),
+        # ── 巡逻点:来回走的两头 ──────────────────────────────────────
+        ("gk_patrol_a", "node", "", "巡逻点 A",
+         "巡逻的起点 / 返回的岗位(在场景里摆两个空物体当巡逻点)"),
+        ("gk_patrol_b", "node", "", "巡逻点 B",
+         "巡逻的另一头(不填 = 只在 A 点附近待着)"),
+        ("gk_speed", "float", 3.0, "速度",
+         "移动速度(3D 米/秒,一般 2~6;2D 项目的单位是像素/秒,要填大得多)"),
+        ("gk_stop_distance", "float", 0.6, "停在多远",
+         "巡逻 / 返回:离巡逻点多近算“到了”;"
+         "追击 / 跟随:离目标这么近就停下;"
+         "逃跑:目标进到这个距离以内才开始跑"),
+        ("gk_facing", "enum", "GOAL", "朝向", "走路时头朝哪", AI_FACINGS),
+        # 入口数量:Blender 一个输入引脚只允许一条连线 ——
+        # "巡逻"被好几条转场指着时要多开几个入口(和『动画_状态』同一个做法)
+        ("gk_in_count", "int", 2, "入口数量",
+         "可以接几条转场(Blender 一个输入引脚只允许一条线)", None,
+         {"min": 1, "max": 8}),
+    )
+
+    def build_sockets(self):
+        """按『入口数量』生成进入引脚:进入 / 进入 2 / 进入 3 …。
+
+        第一个仍然叫『进入』—— 老文件里已经接好的线不会断
+        (和『动画_状态』同一个做法)。
+        """
+        count = max(1, min(8, int(getattr(self, "gk_in_count", 2) or 2)))
+        self.inputs.clear()
+        self.inputs.new(S.FLOW[0], "进入")
+        for index in range(1, count):
+            self.inputs.new(S.FLOW[0], f"进入 {index + 1}")
+        self.outputs.clear()
+        for spec in self.gk_outputs:
+            socket = self.outputs.new(spec["kind"][0], spec["name"])
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_state_name", text="", icon="SORTALPHA")
+        layout.prop(self, "gk_behavior", text="")
+        behavior = str(getattr(self, "gk_behavior", "PATROL"))
+
+        # 只画这个行为用得到的参数 —— 六种行为的参数不完全一样,
+        # 全画出来每张卡都是七八行,图一多就糊(用户抱怨过的那种)。
+        if behavior in ("CHASE", "FOLLOW", "FLEE"):
+            row = layout.row(align=True)
+            row.label(text="目标")
+            B.draw_target_picker(self, row, "gk_goal")
+        if behavior in ("PATROL", "RETURN"):
+            row = layout.row(align=True)
+            row.label(text="巡逻点 A")
+            B.draw_target_picker(self, row, "gk_patrol_a")
+            if behavior == "PATROL":
+                row = layout.row(align=True)
+                row.label(text="巡逻点 B")
+                B.draw_target_picker(self, row, "gk_patrol_b")
+        if behavior != "STAND":
+            row = layout.row(align=True)
+            row.prop(self, "gk_speed", text="速度")
+            row.prop(self, "gk_stop_distance", text="停距")
+            layout.prop(self, "gk_facing", text="")
+
+        row = layout.row(align=True)
+        row.prop(self, "gk_in_count", text="入口")
+        full = all(bool(getattr(socket, "is_linked", False))
+                   for socket in (getattr(self, "inputs", ()) or ()))
+        if full and int(getattr(self, "gk_in_count", 2) or 2) < 8:
+            row.label(text="已满,调大再接", icon="ERROR")
+        layout.label(text="转到 -> 接『AI_转场』的『上游』", icon="FORWARD")
+
+
+@N
+class GKNodeAiTransition(B.GKStatementNode):
+    bl_idname = AI_TRANSITION_ID
+    bl_label = "AI_转场"
+    bl_icon = "TRACKING_FORWARDS_SINGLE"
+    gk_category = "AI"
+    gk_tree_type = AI_TREE_ID
+    gk_doc = ("一条 AI 的换状态规则:『条件』为真时,"
+              "从左边连过来的状态切到右边连着的状态。\n"
+              "── 三件事都要有 ──\n"
+              "『上游』接上一个状态的『转到』(忘了接就用下面的『从』下拉选);\n"
+              "『条件』接判断节点的输出,或者把『条件来源』改成"
+              "『看见目标』/『丢失目标』直接填个视野距离;"
+              "『转到』接下一个状态的『进入』(也能用『到』下拉选)。\n"
+              "── 最常用的两条 ──\n"
+              "巡逻 -> 追击:『看见目标』;追击 -> 巡逻:『丢失目标』")
+    gk_inputs = (
+        S.pin(FLOW, "上游"),
+        S.pin(BOOL, "条件", False),
+    )
+    gk_outputs = (
+        S.pin(FLOW, "转到"),
+    )
+    gk_prop_defs = (
+        # ── 条件来源(和『动画_转场』同一套交互)──────────────────────
+        # 蓝图里最常见的 AI 条件就是"看得见 / 看不见目标"。
+        # 为了这个去拉『AI_看得见』再连线,状态一多整张图全是线。
+        # 所以这两个内置在节点上 —— 填个距离就能用。
+        ("gk_cond_source", "enum", "PIN", "条件来源",
+         "『自己写』= 用左边的条件引脚;其它选项都在节点上直接填",
+         (("PIN", "自己写(接引脚)", "想多复杂都行:视野角度、血量、组合条件"),
+          ("SEE", "看见目标", "目标进入『视野距离』就算看见"),
+          ("LOST", "丢失目标", "目标离开『视野距离』就算跟丢"))),
+        ("gk_goal", "node", "", "目标",
+         "『看见目标 / 丢失目标』看的是谁(一般选玩家)"),
+        ("gk_sight", "float", 12.0, "视野距离",
+         "目标和自己的距离小于它 = 看见(米 / 像素)"),
+        # ── 备用下拉:连线忘了也能用(照『动画_转场』)────────────────
+        ("gk_from_state", "string", "", "从状态",
+         "备用:『上游』没接线时用这个(下拉里是这张图的状态)"),
+        ("gk_to_state", "string", "", "到状态",
+         "**推荐**:点右边的下拉从这张图的状态里挑“切到哪个”。"
+         "这样图里不用连回状态的线 —— Blender 不允许环"),
+    )
+
+    def draw_buttons(self, context, layout):
+        source = str(getattr(self, "gk_cond_source", "PIN"))
+        layout.prop(self, "gk_cond_source", text="")
+        # 上游 / 转到:连线优先,下拉兜底(和『动画_转场』同款画法)
+        wired_from = bool(link_sources(self, "上游"))
+        wired_to = bool(link_targets(self, "转到"))
+        if wired_from:
+            layout.label(text="上游 <- 上一个状态的『转到』", icon="CHECKMARK")
+        else:
+            row = layout.row(align=True)
+            row.label(text="上游空着 -> 用『从』兜底", icon="LOOP_BACK")
+            pick = row.operator("gk.pick_ai_state", text="", icon="VIEWZOOM")
+            pick.node_name = self.name
+            pick.prop_name = "gk_from_state"
+            layout.prop(self, "gk_from_state", text="从")
+        if source == "PIN":
+            layout.label(text="条件 <- 接判断节点的输出", icon="LINKED")
+        else:
+            row = layout.row(align=True)
+            row.label(text="目标")
+            B.draw_target_picker(self, row, "gk_goal")
+            layout.prop(self, "gk_sight", text="视野距离")
+            if not str(getattr(self, "gk_goal", "") or "").strip():
+                layout.label(text="! 没选目标,这条不会生效", icon="ERROR")
+        # "线被忽略了"必须画在节点上(踩过:用户接了线却发现不生效)
+        if source != "PIN" and link_sources(self, "条件"):
+            layout.label(text="! 条件引脚接的线被忽略了", icon="ERROR")
+            layout.label(text="   以『条件来源』为准")
+        if wired_to:
+            layout.label(text="转到 -> 下一个状态的『进入』", icon="CHECKMARK")
+        else:
+            row = layout.row(align=True)
+            row.label(text="转到空着 -> 用『到』兜底", icon="FORWARD")
+            pick = row.operator("gk.pick_ai_state", text="", icon="VIEWZOOM")
+            pick.node_name = self.name
+            pick.prop_name = "gk_to_state"
+            layout.prop(self, "gk_to_state", text="到")
+
+
+@N
+class GKNodeAiSee(B.GKExpressionNode):
+    bl_idname = "GKNodeAiSee"
+    bl_label = "AI_看得见"
+    bl_icon = "HIDE_OFF"
+    gk_category = "AI"
+    # 玩法图里也能用(比如"玩家走近 NPC 时提示"),所以两张树都开放
+    gk_tree_type = ("GKGameLogicTree", AI_TREE_ID)
+    gk_doc = ("自己'看得见'目标吗 —— 距离 + 视野角(前方扇区)一起算,"
+              "输出布尔。\n"
+              "『视野距离』= 多远以内算看得见;"
+              "『视野角』= 前方多少度的扇区(0 = 不看角度、360° 全向;"
+              "120 = 正前方 ±60°)。角度用的是'自己'的朝向"
+              "(3D 是物体的前方 -Z;2D 是本地 X 轴)。\n"
+              "和『AI_转场』的『看见目标』快捷的区别:这个多了**视野角**,"
+              "适合'背后看不见、绕到面前才会被发现'的潜行玩法 —— "
+              "把它的输出接到转场的『条件』引脚,条件来源保持『自己写』。")
+    gk_inputs = (
+        S.pin(OBJECT, "目标", None),
+        S.pin(FLOAT, "视野距离", 12.0),
+        S.pin(FLOAT, "视野角", 120.0),
+    )
+    gk_input_props = {"视野距离": "gk_distance", "视野角": "gk_angle"}
+    gk_outputs = (S.pin(BOOL, "看得见", False),)
+    gk_prop_defs = (
+        ("gk_goal", "node", "", "目标",
+         "看谁(『目标』引脚没接线时用它,一般选玩家)"),
+        ("gk_distance", "float", 12.0, "视野距离",
+         "多远以内算看得见(米 / 像素)"),
+        ("gk_angle", "float", 120.0, "视野角",
+         "前方多少度算看得见;0 = 全向(360°,和只看距离一样)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.label(text="目标")
+        B.draw_target_picker(self, row, "gk_goal")
+        row = layout.row(align=True)
+        row.prop(self, "gk_distance", text="距离")
+        row.prop(self, "gk_angle", text="角度")
+        if not str(getattr(self, "gk_goal", "") or "").strip():
+            socket = getattr(self, "inputs", None)
+            socket = socket.get("目标") if socket is not None else None
+            if socket is None or not getattr(socket, "is_linked", False):
+                layout.label(text="! 没选目标", icon="ERROR")
+
+
+@N
+class GKNodeAiEnable(B.GKStatementNode):
+    bl_idname = "GKNodeAiEnable"
+    bl_label = "AI_启用"
+    bl_icon = "AUTOMERGE_ON"
+    gk_category = "AI"
+    gk_doc = ("驱动一张 **AI 图**(在『游戏AI』面板里建)。"
+              "巡逻 / 追击 / 逃跑这些规则全写在 AI 图里,这里只负责启动它 —— "
+              "和『动画_状态机』『界面_套用设计』同一套路,玩法图不会糊。\n"
+              "『树名』留空 = 用文件里第一张 AI 图。\n"
+              "『作用在谁』= AI 控制哪个物体(默认脚本所在物体)。"
+              "**它必须是角色体**(3D 角色 / 2D 角色)—— 行为都是 "
+              "velocity + move_and_slide 那一套。\n"
+              "接在『每当_准备』后面即可;一启动就进入 AI 图的**起始状态**"
+              "(没有任何转场指到的那个状态)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "树名", ""),
+    )
+    gk_input_props = {"树名": "gk_tree_name"}
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_tree_name", "string", "", "树名",
+         "留空 = 用文件里第一张 AI 图(只有一张时不用管)"),
+        ("gk_target", "node", TARGET_SELF, "作用在谁",
+         "AI 控制哪个物体(默认脚本所在物体,一般就是敌人自己)"),
+        ("gk_state_var", "string", "ai_state", "状态变量名",
+         "当前状态存在哪个成员变量里(同一张图多处启用时各取一个名字)"),
+        ("gk_debug_print", "bool", False, "打印状态变化",
+         "勾上后每次切换状态都往 Godot 输出面板打一行,"
+         "用来确认状态机到底有没有在跑"),
+    )
+
+    def draw_buttons(self, context, layout):
+        trees = ai_tree_names()
+        row = layout.row(align=True)
+        if len(trees) <= 1:
+            row.label(text=f"AI 图:{trees[0] if trees else '(还没有)'}",
+                      icon="NODETREE")
+        else:
+            row.prop(self, "gk_tree_name", text="", icon="NODETREE")
+        picker = row.operator("gk.pick_ai_tree", text="", icon="VIEWZOOM")
+        picker.node_name = self.name
+        row = layout.row(align=True)
+        row.label(text="作用在谁")
+        B.draw_target_picker(self, row, "gk_target")
+        layout.prop(self, "gk_debug_print", text="打印状态变化")
+        self._draw_tree_graph(layout)
+
+    def _draw_tree_graph(self, layout):
+        """把这张 AI 图的**状态表**摊在节点上(照『动画_状态机』)。
+
+        用户看不见自己图里的问题就会反复导出试 —— 图和问题直接画在
+        节点上,一眼就能对上。
+        """
+        tree = find_ai_tree(getattr(self, "gk_tree_name", ""))
+        if tree is None:
+            layout.label(text="还没有 AI 图 —— 点『打开/新建 AI 图』",
+                         icon="ERROR")
+            return
+        graph = ai_tree_graph(tree)
+        states = [s for s in graph["states"] if ai_state_name(s)]
+        column = layout.column(align=True)
+        entry = graph["entry"]
+        column.label(text=f"{len(states)} 个状态 / {len(graph['edges'])} 条转场",
+                     icon="TRACKER")
+        for state in states[:8]:
+            name = ai_state_name(state)
+            behavior = ai_behavior_label(state)
+            here = "起始 " if state is entry else "     "
+            icon = "PLAY" if state is entry else "FORWARD"
+            column.label(text=f"{here}{name} · {behavior}", icon=icon)
+        if len(states) > 8:
+            column.label(text=f"     …还有 {len(states) - 8} 个", icon="DOT")
+        for problem in graph["problems"][:3]:
+            column.label(text=short_problem(problem), icon="ERROR")
+        if len(graph["problems"]) > 3:
+            column.label(text=f"…还有 {len(graph['problems']) - 3} 条问题"
+                              f"(见侧栏『游戏AI』)", icon="INFO")

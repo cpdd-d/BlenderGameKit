@@ -117,19 +117,21 @@ def required_base_class(tree, options=None):
     没有 is_on_floor()"就晚了 —— 得整个重生成。
     所以先静态扫一遍节点类型,提前把基类定下来。
 
-    目前只有动画树的『动画判断_移动状态』会提需求(它用
-    `is_on_floor()` / `velocity`,只有 CharacterBody 有)。
-    以后有别的节点提需求,在 `_BASE_CLASS_NEEDS` 里加一条就行。
+    动画树的『动画判断_移动状态』用 `is_on_floor()` / `velocity`,
+    AI 图的『AI_状态』(行为)用 `velocity` / `move_and_slide()` ——
+    两者都只有 CharacterBody 有。以后有别的节点提需求,
+    在 `_BASE_CLASS_NEEDS` 里加一条就行。
     """
     if tree is None:
         return None, ""
     dim = str((options or {}).get("dimension", "3"))
-    # 动画树不在游戏逻辑图里,得单独找出来一起扫
+    # 动画树和 AI 图都不在游戏逻辑图里,得单独找出来一起扫
     trees = [tree]
     try:
         import bpy
         for group in getattr(getattr(bpy, "data", None), "node_groups", ()) or ():
-            if getattr(group, "bl_idname", "") == "GKAnimationTree":
+            if getattr(group, "bl_idname", "") in ("GKAnimationTree",
+                                                   "GKGameAiTree"):
                 trees.append(group)
     except Exception:
         pass
@@ -163,4 +165,13 @@ _BASE_CLASS_NEEDS = {
                                      else "CharacterBody3D"),
     "GKNodeJump": lambda dim: ("CharacterBody2D" if dim == "2"
                                else "CharacterBody3D"),
+    # ── AI 图(第四十一轮)───────────────────────────────────────────
+    # 『AI_状态』的行为(巡逻 / 追击 / 逃跑…)生成 velocity + move_and_slide;
+    # 『AI_启用』是整张图的入口,同样要求作用物体是角色体 ——
+    # 不先扫出来的话,『AI_启用』的『作用在谁』会被 @onready 成 Node,
+    # 生成完才发现 `.velocity` 不存在,Godot 直接拒绝整个脚本。
+    "GKNodeAiState": lambda dim: ("CharacterBody2D" if dim == "2"
+                                  else "CharacterBody3D"),
+    "GKNodeAiEnable": lambda dim: ("CharacterBody2D" if dim == "2"
+                                   else "CharacterBody3D"),
 }

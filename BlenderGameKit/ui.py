@@ -138,7 +138,8 @@ class GK_OT_SwitchTree(bpy.types.Operator):
                    or getattr(space, "node_tree", None))
         if current is not None and current_kind in ("GKGameLogicTree",
                                                     "GKAnimationTree",
-                                                    "GKUiDesignTree"):
+                                                    "GKUiDesignTree",
+                                                    "GKGameAiTree"):
             _LAST_TREE[current_kind] = current
 
         wanted = self.target
@@ -155,6 +156,9 @@ class GK_OT_SwitchTree(bpy.types.Operator):
             if wanted == "GKUiDesignTree":
                 # 顺手放个起始控件(见 _new_ui_design_tree)
                 tree = _new_ui_design_tree()
+            elif wanted == "GKGameAiTree":
+                # 顺手搭一个"巡逻 -> 追击 -> 回到巡逻"的骨架(见 _new_ai_tree)
+                tree = _new_ai_tree()
             elif wanted == "GKAnimationTree":
                 # 顺手放个起始状态,免得面对空图不知道从哪下手
                 tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
@@ -790,6 +794,368 @@ class GK_PT_UiDesign(bpy.types.Panel):
         box = layout.box()
         box.label(text="玩法图放『界面_套用设计』引用本图", icon="INFO")
         box.label(text="点了做什么 -> 『界面_按钮点击』填控件名")
+        row = box.row(align=True)
+        back = row.operator("gk.switch_tree", text="← 回到游戏逻辑",
+                            icon="LOOP_BACK")
+        back.target = "GKGameLogicTree"
+
+
+# ==========================================================================
+# AI 图 —— 第四张节点图(第四十一轮,用户说"添加游戏AI逻辑编辑器")
+# ==========================================================================
+# 用户原话:"添加游戏AI逻辑编辑器,这样分类开不会后期混乱"。
+# 交互完全照动画树(状态卡 + 转场卡 + 起始状态 = 谁都没指到的那个),
+# 区别只在状态里干的事:动画状态播动画,AI 状态**做行为**。
+#
+#     玩法图(游戏逻辑)              AI 图(游戏AI)
+#     ┌───────────────┐           ┌──────────────────────────┐
+#     │ 每当_准备      │           │ [AI_状态: 巡逻] 行为=巡逻   │
+#     │  AI_启用 ──────┼── 驱动 ──>│   ├─转场:看见玩家─> [追击]  │
+#     └───────────────┘           │   └─转场:丢失玩家─> [巡逻]  │
+#                                 └──────────────────────────┘
+class GKGameAiTree(bpy.types.NodeTree):
+    """游戏 AI 节点树:巡逻 / 追击 / 逃跑这些规则画在这里,
+    由玩法图的『AI_启用』节点驱动。"""
+
+    bl_idname = "GKGameAiTree"
+    bl_label = "游戏AI"
+    bl_icon = "TRACKER"
+    bl_description = ("BlenderGameKit 的 AI 图 —— 『AI_状态』(巡逻 / 追击…)"
+                      "和『AI_转场』(看见 / 丢失目标…)摆在这里,"
+                      "玩法图放一个『AI_启用』引用它")
+
+    # ── 视口叠加预览(和界面设计图同一套)─────────────────────────────
+    # 编辑这张图时,3D 视口里画**巡逻路线**和**感知范围圈** ——
+    # 不用导出就能看出"怪会走到哪、看得到多远"。默认开,嫌挡就在侧栏里关。
+    gk_preview: BoolProperty(
+        name="视口预览", default=True,
+        description="编辑这张 AI 图时,在 3D 视口上画巡逻路线和感知范围圈")
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        layout.label(text="AI 规则画这里,玩法图用『AI_启用』引用", icon="INFO")
+
+
+def _new_ai_tree():
+    """新建一张 AI 图,顺手搭一个**能跑的最小 AI**:巡逻 → 看见追 → 追丢回。
+
+    照界面设计图"新建时放一个起始控件"的做法 —— 面对一张空图,
+    十个有九个不知道第一个该放什么。
+
+    ── 为什么这里敢连成"环" ────────────────────────────────────────
+    动画树那边的注释写着"Blender 不允许环,连线连成环会报『链接形式的
+    循环不受支持』" —— 第四十一轮**实测**(Blender 4.5.5):AI 图里
+    连成环没问题,保存 / 重新打开都正常,解析也认(见冒烟测试)。
+    所以这里用连线搭出完整的环 —— 比只用下拉直观得多。
+    『从』『到』下拉仍然支持(见 gk_from_state / gk_to_state):
+    手建转场时忘了连线也能用,两个都填时**连线优先**。
+    """
+    tree = bpy.data.node_groups.new("敌人AI", "GKGameAiTree")
+    # 没有用户引用它的节点树,存盘时会**被直接丢掉**(踩过的坑,见 presets):
+    # 『AI_启用』按**名字**引用它,那不算 Blender 的数据块引用 —— 必须 fake user。
+    tree.use_fake_user = True
+
+    patrol = tree.nodes.new("GKNodeAiState")
+    patrol.name = "巡逻"
+    patrol.location = (-40.0, 0.0)
+    patrol.gk_state_name = "巡逻"
+    patrol.gk_behavior = "PATROL"
+
+    chase = tree.nodes.new("GKNodeAiState")
+    chase.name = "追击"
+    chase.location = (660.0, 0.0)
+    chase.gk_state_name = "追击"
+    chase.gk_behavior = "CHASE"
+
+    to_chase = tree.nodes.new("GKNodeAiTransition")
+    to_chase.name = "看见玩家"
+    to_chase.location = (310.0, 160.0)
+    to_chase.gk_cond_source = "SEE"
+    to_chase.gk_from_state = "巡逻"
+    to_chase.gk_to_state = "追击"
+
+    back = tree.nodes.new("GKNodeAiTransition")
+    back.name = "丢失玩家"
+    back.location = (310.0, -190.0)
+    back.gk_cond_source = "LOST"
+    back.gk_from_state = "追击"
+    back.gk_to_state = "巡逻"
+
+    tree.links.new(patrol.outputs["转到"], to_chase.inputs["上游"])
+    tree.links.new(to_chase.outputs["转到"], chase.inputs["进入"])
+    tree.links.new(chase.outputs["转到"], back.inputs["上游"])
+    tree.links.new(back.outputs["转到"], patrol.inputs["进入"])
+    return tree
+
+
+class GK_OT_OpenAiTree(bpy.types.Operator):
+    """打开 AI 图;没有就新建一张。
+
+    和『打开/新建动画树』『打开/新建界面设计图』同一个理由:
+    它是**另一张节点图**,新手不知道要去节点编辑器的类型下拉里切。
+    """
+
+    bl_idname = "gk.open_ai_tree"
+    bl_label = "打开/新建 AI 图"
+    bl_description = "切到『游戏AI』图(没有就新建一张,带巡逻/追击的起始骨架)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        trees = [g for g in bpy.data.node_groups
+                 if getattr(g, "bl_idname", "") == "GKGameAiTree"]
+        tree = trees[0] if trees else None
+        if tree is None:
+            tree = _new_ai_tree()
+            self.report({"INFO"}, f"已新建 AI 图『{tree.name}』")
+
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"},
+                        "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+        space.tree_type = "GKGameAiTree"
+        space.node_tree = tree
+        return {"FINISHED"}
+
+
+# ---- AI 图的视口叠加预览(巡逻路线 + 感知范围圈)----------------------
+# 挂在 3D 视口上的绘制句柄(注册时加、注销时摘)
+_AI_PREVIEW_HANDLE = []
+
+
+def _ai_preview_tree():
+    """找出正在编辑的 AI 图(没在编辑 / 关了预览就返回 None)。"""
+    context = bpy.context
+    screen = getattr(context, "screen", None)
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") != "NODE_EDITOR":
+            continue
+        for space in getattr(area, "spaces", ()) or ():
+            if getattr(space, "tree_type", "") != "GKGameAiTree":
+                continue
+            tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+            if tree is None or str(getattr(tree, "bl_idname", "")) != "GKGameAiTree":
+                continue
+            if not getattr(tree, "gk_preview", True):
+                continue
+            return tree
+    return None
+
+
+def _ai_preview_anchor(scene):
+    """感知圈画在谁身上:场景里**挂了脚本**的第一个物体(一般就是敌人自己)。
+
+    感知圈是"AI 看得到多远",必须有个中心 —— 而 AI 的"自己"在运行时
+    由『AI_启用』的『作用在谁』决定(玩法图里,这张图上看不到)。
+    常见情况是"敌人自己挂脚本",所以拿第一个挂脚本的物体当示意中心。
+    """
+    try:
+        carriers = exporter.script_targets(scene)
+    except Exception:                                     # noqa: BLE001
+        carriers = []
+    return carriers[0] if carriers else None
+
+
+def _ai_preview_draw():
+    """3D 视口上的 AI 预览(POST_PIXEL 绘制回调)。
+
+    ── 和界面预览的区别 ────────────────────────────────────────────
+    界面预览画在**屏幕空间**(控件框本来就是 2D 的);AI 预览要画
+    **世界空间**的东西(巡逻点在哪、看得到多远),所以先把世界坐标
+    用 `location_3d_to_region_2d` 投影到屏幕上再画。投影不到的点
+    (在相机背后)整段跳过 —— 硬画会出现"线跑到屏幕另一边"的鬼影。
+
+    纪律和界面预览一样:不许抛异常(整段 try)、GPU 状态用完还原。
+    """
+    try:
+        tree = _ai_preview_tree()
+        if tree is None:
+            return
+        context = bpy.context
+        region = getattr(context, "region", None)
+        rv3d = getattr(context, "region_data", None)
+        scene = getattr(context, "scene", None)
+        if region is None or rv3d is None or scene is None:
+            return
+        if region.width < 80 or region.height < 80:
+            return
+        import math
+
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+
+        def project(co):
+            point = location_3d_to_region_2d(region, rv3d, co)
+            if point is None:
+                return None
+            return (float(point.x), float(point.y))
+
+        graph = node_lib.ai_tree_graph(tree)
+        segments = []      # (a, b, color)
+        dots = []          # (point, color)
+
+        # ---- 1) 巡逻路线:A ←→ B(每个"巡逻"行为的状态各画一条)----
+        for state in graph["states"]:
+            if str(getattr(state, "gk_behavior", "") or "") != "PATROL":
+                continue
+            obj_a = bpy.data.objects.get(str(getattr(state, "gk_patrol_a", "") or ""))
+            obj_b = bpy.data.objects.get(str(getattr(state, "gk_patrol_b", "") or ""))
+            if obj_a is None or obj_b is None:
+                continue
+            pa = project(obj_a.matrix_world.translation)
+            pb = project(obj_b.matrix_world.translation)
+            if pa is not None and pb is not None:
+                segments.append((pa, pb, (1.0, 0.85, 0.25, 0.9)))
+            if pa is not None:
+                dots.append((pa, (1.0, 0.85, 0.25, 1.0)))
+            if pb is not None:
+                dots.append((pb, (1.0, 0.85, 0.25, 1.0)))
+
+        # ---- 2) 感知范围圈:中心 = 挂脚本的物体,半径 = 转场的『视野距离』----
+        anchor = _ai_preview_anchor(scene)
+        radii = []
+        for edge in graph["edges"]:
+            if edge.get("kind") in ("SEE", "LOST"):
+                trans = edge.get("transition")
+                sight = float(getattr(trans, "gk_sight", 12.0) or 12.0)
+                if sight > 0.0:
+                    radii.append(sight)
+        if anchor is not None and radii:
+            center = anchor.matrix_world.translation
+            # 2D 项目的世界是 XY 平面,3D 是 XZ 平面 —— 圈要画在地上
+            dimension = str(getattr(getattr(scene, "gk_settings", None),
+                                    "dimension", "3") or "3")
+            radius = radii[0]
+            ring = []
+            steps = 48
+            for index in range(steps + 1):
+                angle = math.tau * index / steps
+                if dimension == "2":
+                    co = (center.x + math.cos(angle) * radius,
+                          center.y + math.sin(angle) * radius, center.z)
+                else:
+                    co = (center.x + math.cos(angle) * radius,
+                          center.y,
+                          center.z + math.sin(angle) * radius)
+                ring.append(project(co))
+            for index in range(steps):
+                a, b = ring[index], ring[index + 1]
+                if a is not None and b is not None:
+                    segments.append((a, b, (0.35, 0.85, 1.0, 0.8)))
+        if not segments and not dots:
+            return
+
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        try:
+            shader.bind()
+            for a, b, color in segments:
+                batch = batch_for_shader(shader, "LINES", {"pos": [a, b]})
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            for point, color in dots:
+                size = 5.0
+                verts = [(point[0] - size, point[1]), (point[0] + size, point[1]),
+                         (point[0], point[1] - size), (point[0], point[1] + size)]
+                batch = batch_for_shader(shader, "LINES", {"pos": verts})
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+        finally:
+            gpu.state.blend_set("NONE")
+    except Exception:                                     # noqa: BLE001
+        # 绘制回调的异常没有任何去处 —— 静默跳过这一帧
+        return
+
+
+def _remove_ai_preview_handler():
+    """摘掉 AI 预览的绘制回调(注销 / 重载时各调一次,重复调没事)。"""
+    import bpy as _bpy
+    while _AI_PREVIEW_HANDLE:
+        handle = _AI_PREVIEW_HANDLE.pop()
+        try:
+            _bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except Exception:                                 # noqa: BLE001
+            pass
+
+
+class GK_PT_AiDesign(bpy.types.Panel):
+    """AI 图专属面板:状态清单 + 问题 + 预览开关 + 用法提示。"""
+
+    bl_idname = "GK_PT_AiDesign"
+    bl_label = "游戏AI (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏AI"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and getattr(space, "tree_type", "") == "GKGameAiTree"
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        if tree is None:
+            layout.label(text="没有 AI 图", icon="INFO")
+            return
+
+        graph = node_lib.ai_tree_graph(tree)
+        states = [s for s in graph["states"] if node_lib.ai_state_name(s)]
+
+        # ---- 概览 ----
+        box = layout.box()
+        box.label(text=f"『{tree.name}』:{len(states)} 个状态 / "
+                       f"{len(graph['edges'])} 条转场", icon="TRACKER")
+        if not states:
+            box.label(text="还没放状态 —— 先加一个『AI_状态』试试", icon="INFO")
+            row = box.row(align=True)
+            row.operator("gk.add_node_menu", text="状态",
+                         icon="ADD").node_type = "GKNodeAiState"
+            row.operator("gk.add_node_menu", text="转场",
+                         icon="ADD").node_type = "GKNodeAiTransition"
+
+        # ---- 状态清单(起始状态标出来)----
+        if states:
+            box = layout.box()
+            box.label(text="状态清单(起始 = 没被转场指到的那个)", icon="LINENUMBERS_ON")
+            entry = graph["entry"]
+            for state in states:
+                row = box.row(align=True)
+                name = node_lib.ai_state_name(state)
+                icon = "PLAY" if state is entry else "FORWARD"
+                row.label(text=f"{name} · {node_lib.ai_behavior_label(state)}",
+                          icon=icon)
+                pick = row.operator("gk.select_node", text="", icon="VIEWZOOM")
+                pick.node_name = name
+
+        # ---- 要处理的事(缺目标 / 缺巡逻点 / 转场没条件…)----
+        if graph["problems"]:
+            box = layout.box()
+            box.label(text=f"{len(graph['problems'])} 条要处理的事", icon="ERROR")
+            for problem in graph["problems"][:6]:
+                box.label(text=node_lib.short_problem(problem, 44), icon="DOT")
+            if len(graph["problems"]) > 6:
+                box.label(text=f"…还有 {len(graph['problems']) - 6} 条"
+                               f"(导出报告里也会说)", icon="INFO")
+
+        # ---- 预览 ----
+        box = layout.box()
+        box.label(text="预览(叠画在 3D 视口上)", icon="VIEWZOOM")
+        row = box.row(align=True)
+        row.prop(tree, "gk_preview", text="", toggle=True)
+        row.label(text="巡逻路线 + 感知范围"
+                  if getattr(tree, "gk_preview", True) else "已关闭")
+        box.label(text="感知圈画在挂了脚本的物体上(半径 = 转场的视野距离)",
+                  icon="INFO")
+
+        # ---- 用法 ----
+        box = layout.box()
+        box.label(text="玩法图放『AI_启用』引用本图", icon="INFO")
         row = box.row(align=True)
         back = row.operator("gk.switch_tree", text="← 回到游戏逻辑",
                             icon="LOOP_BACK")
@@ -2889,7 +3255,8 @@ def _draw_tree_list_box(layout, context):
     groups = [g for g in bpy.data.node_groups
               if getattr(g, "bl_idname", "") in ("GKGameLogicTree",
                                                  "GKAnimationTree",
-                                                 "GKUiDesignTree")]
+                                                 "GKUiDesignTree",
+                                                 "GKGameAiTree")]
     if not groups:
         box.label(text="还没有节点图", icon="INFO")
         return
@@ -2902,19 +3269,21 @@ def _draw_tree_list_box(layout, context):
             disabled += 1
         icon = ("NODETREE" if blob == "GKGameLogicTree"
                 else "ARMATURE_DATA" if blob == "GKAnimationTree"
+                else "TRACKER" if blob == "GKGameAiTree"
                 else "WINDOW")
         # 勾选框:关掉 = 这张图不参与导出
-        if blob == "GKUiDesignTree":
-            # ── 设计图没有"参与导出"这一说(第四十轮)────────────────
-            # 它由玩法图的『界面_套用设计』按需引用 —— 摆一个勾选框
-            # 不仅含义含糊,`prop()` 还会去读它**没有**的属性(画面板时炸)。
+        if blob in ("GKUiDesignTree", "GKGameAiTree"):
+            # ── 设计图 / AI 图没有"参与导出"这一说(第四十 / 四十一轮)──
+            # 它们由玩法图按需引用(『界面_套用设计』『AI_启用』)——
+            # 摆一个勾选框不仅含义含糊,`prop()` 还会去读它们**没有**的
+            # 属性(画面板时炸)。
             row.label(text=" ")
         else:
             row.prop(group, "gk_enabled", text="")
         op = row.operator("gk.focus_tree", text=group.name, icon=icon)
         op.tree_name = group.name
         kind = {"GKGameLogicTree": "逻辑", "GKAnimationTree": "动画",
-                "GKUiDesignTree": "界面"}.get(blob, "图")
+                "GKUiDesignTree": "界面", "GKGameAiTree": "AI"}.get(blob, "图")
         row.label(text=f"{kind} · {len(group.nodes)} 节点")
     if disabled:
         box.label(text=f"有 {disabled} 张图已停用(不会导出)", icon="INFO")
@@ -3074,7 +3443,8 @@ class GK_OT_FocusTree(bpy.types.Operator):
             # Blender 的节点编辑器只认**当前类型**的树:显示着『游戏逻辑』
             # 时直接塞一张界面设计图进去会被拒(打不开 / 悄悄弹回)。
             kind = str(getattr(group, "bl_idname", ""))
-            if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree"):
+            if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
+                        "GKGameAiTree"):
                 space.tree_type = kind
             space.pin = True
             space.node_tree = group
@@ -3654,6 +4024,24 @@ class GK_PT_Main(bpy.types.Panel):
             box.operator("gk.open_ui_design_tree", text="打开/新建界面设计图",
                          icon="FILE_NEW")
 
+        # ---- AI(独立那张图,第四十一轮)----
+        box, opened = collapsible_box(layout, "ai_design",
+                                      "游戏AI(单独一张图)", "TRACKER")
+        if opened:
+            ai_trees = [g for g in bpy.data.node_groups
+                        if getattr(g, "bl_idname", "") == "GKGameAiTree"]
+            if ai_trees:
+                for ai_tree in ai_trees:
+                    count = len([n for n in ai_tree.nodes
+                                 if getattr(n, "bl_idname", "") == "GKNodeAiState"])
+                    box.label(text=f"{ai_tree.name}  ({count} 个状态)",
+                              icon="NODETREE")
+            else:
+                box.label(text="还没有 AI 图", icon="INFO")
+            box.operator("gk.open_ai_tree", text="打开/新建 AI 图",
+                         icon="FILE_NEW")
+            box.label(text="玩法图放『AI_启用』引用它", icon="INFO")
+
         # 「动作分类」删掉(用户第 24、25 轮两次点名):
         # 它只是给动作打个标签,而标签现在没有任何地方用到 ——
         # 占了侧栏一大块,却只显示"未分类 · 待机"这种没用的一行。
@@ -3980,6 +4368,15 @@ def on_register():
     except Exception as exc:                              # pragma: no cover
         gk_log.warn(f"界面预览绘制挂载失败: {exc}")
 
+    # ---- AI 图的视口叠加预览(第四十一轮,同一套)----
+    _remove_ai_preview_handler()
+    try:
+        _AI_PREVIEW_HANDLE.append(
+            bpy.types.SpaceView3D.draw_handler_add(
+                _ai_preview_draw, (), "WINDOW", "POST_PIXEL"))
+    except Exception as exc:                              # pragma: no cover
+        gk_log.warn(f"AI 预览绘制挂载失败: {exc}")
+
     # ---- 自检:确认每个分类子菜单都真的注册上了 ----
     # 动态生成的菜单类很容易因为一个小笔误(非法图标名、bl_idname 重复)
     # 而**静默**注册失败，所以这里主动查一遍并报出来。
@@ -4073,6 +4470,7 @@ GK_CLASSES = (
     GKGameLogicTree,
     GKAnimationTree,
     GKUiDesignTree,
+    GKGameAiTree,
     # 侧栏里"点一下就跳过去"的两个小算子(节点图总览 / 脚本载体)
     GK_OT_FocusTree,
     GK_OT_FocusObject,
@@ -4102,6 +4500,7 @@ GK_CLASSES = (
     diagnostics.GK_OT_DumpDiagnostics,
     GK_OT_OpenAnimTree,
     GK_OT_OpenUiDesignTree,
+    GK_OT_OpenAiTree,
     GK_OT_SwitchTree,
     GK_OT_AnimVarAdd,
     GK_OT_AnimVarRemove,
@@ -4125,14 +4524,16 @@ GK_CLASSES = (
     GK_PT_Main,
     GK_PT_AnimTree,
     GK_PT_UiDesign,
+    GK_PT_AiDesign,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,
 ) + tuple(CATEGORY_MENUS)
 
 
 def on_unregister():
-    # 摘掉界面预览的视口绘制回调(留着的话禁用插件后它还在画)
+    # 摘掉界面预览和 AI 预览的视口绘制回调(留着的话禁用插件后它还在画)
     _remove_ui_preview_handler()
+    _remove_ai_preview_handler()
     # 摘掉菜单回调。按标记摘 —— 这样连以前重载遗留的旧函数也一起清掉,
     # 禁用插件后不会留野回调。
     for target_name in ("NODE_MT_add", "NODE_MT_context_menu"):

@@ -255,6 +255,7 @@ def node_tree_error(cls, tree):
         "GKGameLogicTree": "游戏逻辑树",
         "GKAnimationTree": "动画树(『游戏动画』)",
         "GKUiDesignTree": "界面设计图(『游戏界面』)",
+        "GKGameAiTree": "AI 图(『游戏AI』)",
     }
     names = [label_of[kind] for kind in kinds if kind in label_of]
     where = " / ".join(names) if names else "游戏逻辑树"
@@ -263,6 +264,9 @@ def node_tree_error(cls, tree):
     elif "GKUiDesignTree" in kinds:
         hint = ("侧栏『游戏逻辑』面板 -> 『界面设计』-> "
                 "点『打开/新建界面设计图』")
+    elif "GKGameAiTree" in kinds:
+        hint = ("侧栏『游戏逻辑』面板 -> 『游戏AI』-> "
+                "点『打开/新建 AI 图』")
     else:
         hint = "请切到游戏逻辑图"
     return (f"『{getattr(cls, 'bl_label', cls)}』是{where}里的节点,"
@@ -1406,6 +1410,93 @@ class GK_OT_PickUiDesign(bpy.types.Operator):
         for ident, label, _desc in node_lib.ui_design_tree_items():
             op = self.layout.operator("gk.pick_ui_design", text=label)
             op.node_name = self.node_name
+            op.choice = ident
+
+
+class GK_OT_PickAiTree(bpy.types.Operator):
+    """从列表里挑一张 AI 图填进『AI_启用』。
+
+    和 `GK_OT_PickAnimTree` / `GK_OT_PickUiDesign` 一模一样的一套 ——
+    手打树名打错了只会在导出报告里说"找不到 AI 图",不如直接选。
+    """
+
+    bl_idname = "gk.pick_ai_tree"
+    bl_label = "选择 AI 图"
+    bl_description = "从文件里的 AI 图中挑一张(标签里带状态数量)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    choice: StringProperty(name="AI 图", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or getattr(node, "bl_idname", "") != "GKNodeAiEnable":
+            self.report({"WARNING"}, "没找到『AI_启用』节点")
+            return {"CANCELLED"}
+        # choice 用的就是树名(空 = 自动用第一张)
+        node.gk_tree_name = self.choice
+        self.report({"INFO"}, f"AI 图 -> {self.choice or '自动'}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        for ident, label, _desc in node_lib.ai_tree_items():
+            op = self.layout.operator("gk.pick_ai_tree", text=label)
+            op.node_name = self.node_name
+            op.choice = ident
+
+
+class GK_OT_PickAiState(bpy.types.Operator):
+    """从**这张 AI 图的状态**里挑一个,填进转场的『从』/『到』。
+
+    和 `GK_OT_PickAnimState` 同一套 —— 连线是首选,但手打状态名太容易错,
+    错了同样会静默失效(状态机不动),所以给下拉兜底。
+    """
+
+    bl_idname = "gk.pick_ai_state"
+    bl_label = "选择状态"
+    bl_description = "从这张 AI 图的状态里挑一个(连线优先,这只是兜底)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    prop_name: StringProperty(name="属性", default="gk_from_state")
+    choice: StringProperty(name="状态名", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or not hasattr(node, self.prop_name):
+            self.report({"WARNING"}, "没找到目标节点,状态名没写进去")
+            return {"CANCELLED"}
+        setattr(node, self.prop_name, self.choice)
+        self.report({"INFO"}, f"{self.prop_name} -> {self.choice}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        # 状态在**当前这张树**里找(转场的『从』『到』只能是同一张图的状态)
+        owner = getattr(node, "id_data", None) if node is not None else None
+        for ident, label, description in node_lib.ai_state_items(owner):
+            op = self.layout.operator("gk.pick_ai_state", text=label)
+            op.node_name = self.node_name
+            op.prop_name = self.prop_name
             op.choice = ident
 
 
@@ -2641,6 +2732,9 @@ GK_CLASSES = (
     GK_OT_PickAnimTree,
     # 界面设计图选择器(『界面_套用设计』用,第四十轮)
     GK_OT_PickUiDesign,
+    # AI 图选择器(『AI_启用』用)+ AI 转场的『从』/『到』状态选择器(第四十一轮)
+    GK_OT_PickAiTree,
+    GK_OT_PickAiState,
     # 转场的『从』/『到』状态选择器(忘了连线时的兜底)
     GK_OT_PickAnimState,
     # 按一下键盘就绑定按键(照 UPBGE 的 Press & Choose)

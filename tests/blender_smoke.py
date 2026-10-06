@@ -1027,6 +1027,146 @@ def main():
         check("第四十轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- AI 图 + 『AI_启用』(第四十一轮)----
+    # ① 第四种节点树类型真的注册上了(预览开关都在);
+    # ② 玩法节点进不了 AI 图、AI 节点进不了玩法图(Blender 侧 poll 把关);
+    # ③ "巡逻 ->(看见)-> 追击 ->(丢失)-> 巡逻"的**环**用连线搭 ——
+    #    第四十一轮实测:Blender 4.5.5 允许节点连线成环(保存 / 读回都正常),
+    #    所以默认新建的 AI 图就是连线版;解析走"连线优先";
+    # ④ 『AI_启用』生成:起始状态 / 巡逻翻面 / 追击停距 / 看见-丢失的距离条件;
+    # ⑤ 基类自动推成 CharacterBody3D(AI 行为要 velocity + move_and_slide);
+    # ⑥ 侧栏面板 + 预览回调 + 6 个特效/函数节点在**重载后**还在(见 _SUBMODULES)。
+    try:
+        r41_ai = bpy.data.node_groups.new("AI冒烟41", "GKGameAiTree")
+        check("AI:图类型注册成功(预览开关在)",
+              getattr(r41_ai, "bl_idname", "") == "GKGameAiTree"
+              and bool(getattr(r41_ai, "gk_preview", False)))
+
+        r41_patrol = r41_ai.nodes.new("GKNodeAiState")
+        r41_patrol.name = "巡逻"
+        r41_patrol.gk_state_name = "巡逻"
+        r41_patrol.gk_behavior = "PATROL"
+        r41_patrol.gk_patrol_a = "巡逻点甲"
+        r41_patrol.gk_patrol_b = "巡逻点乙"
+        r41_chase = r41_ai.nodes.new("GKNodeAiState")
+        r41_chase.name = "追击"
+        r41_chase.gk_state_name = "追击"
+        r41_chase.gk_behavior = "CHASE"
+        r41_chase.gk_goal = "玩家"
+
+        r41_see = r41_ai.nodes.new("GKNodeAiTransition")
+        r41_see.name = "看见玩家"
+        r41_see.gk_cond_source = "SEE"
+        r41_see.gk_goal = "玩家"
+        r41_see.gk_sight = 9.0
+        r41_back = r41_ai.nodes.new("GKNodeAiTransition")
+        r41_back.name = "丢失玩家"
+        r41_back.gk_cond_source = "LOST"
+        r41_back.gk_goal = "玩家"
+        r41_back.gk_sight = 9.0
+
+        # 连线搭出完整的环(状态 -> 转场『上游』;转场『转到』-> 状态『进入』)
+        try:
+            r41_ai.links.new(r41_patrol.outputs["转到"],
+                             r41_see.inputs["上游"])
+            r41_ai.links.new(r41_see.outputs["转到"],
+                             r41_chase.inputs["进入"])
+            r41_ai.links.new(r41_chase.outputs["转到"],
+                             r41_back.inputs["上游"])
+            r41_ai.links.new(r41_back.outputs["转到"],
+                             r41_patrol.inputs["进入"])
+            r41_loop_ok = True
+        except RuntimeError:
+            r41_loop_ok = False
+        check("AI:状态连线成环在 Blender 里可行(默认新图就是这么搭的)",
+              r41_loop_ok and len(r41_ai.links) == 4,
+              f"links={len(r41_ai.links)} loop_ok={r41_loop_ok}")
+
+        # 解析(连线优先;下拉一个字没填)
+        r41_graph = node_lib.ai_tree_graph(r41_ai)
+        check("AI:连线版环图解析正确(2 状态 / 2 转场 / 起始 = 巡逻)",
+              len(r41_graph["states"]) == 2
+              and len(r41_graph["edges"]) == 2
+              and node_lib.ai_state_name(r41_graph["entry"]) == "巡逻"
+              and not r41_graph["problems"],
+              f"edges={len(r41_graph['edges'])} "
+              f"problems={r41_graph['problems'][:2]}")
+
+        # 玩法图:『AI_启用』引用这张图
+        r41_tree = bpy.data.node_groups.new("AI玩法冒烟41", "GKGameLogicTree")
+        r41_ready = r41_tree.nodes.new("GKNodeOnReady")
+        r41_enable = r41_tree.nodes.new("GKNodeAiEnable")
+        r41_enable.gk_tree_name = r41_ai.name
+        r41_tree.links.new(r41_ready.outputs["执行"], r41_enable.inputs["执行"])
+
+        r41_code, r41_warnings = codegen.generate(r41_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("AI:『AI_启用』生成状态机 + 行为",
+              'ai_state = "巡逻"' in r41_code
+              and "if ai_state.is_empty():" in r41_code
+              and 'if ai_state == "巡逻":' in r41_code
+              and "_gk_ai_patrol_1 = not _gk_ai_patrol_1" in r41_code
+              and "move_and_slide()" in r41_code,
+              r41_code[-600:])
+        check("AI:看见 / 丢失目标 -> 距离比较(视野距离 9.0)",
+              r41_code.count(".length() <= 9.0") >= 1
+              and r41_code.count(".length() > 9.0") >= 1,
+              r41_code[-600:])
+        check("AI:生成无告警", not r41_warnings, str(r41_warnings)[:300])
+
+        # 基类:validation 静态扫 AI 树(AI_启用 是入口,同样要角色体)
+        r41_need, _r41_why = codegen.required_base_class(
+            r41_tree, {"dimension": "3"})
+        check("AI:基类自动推成 CharacterBody3D(行为要 velocity)",
+              r41_need == "CharacterBody3D", str(r41_need))
+
+        # AI 图里塞不进玩法图的动作节点(poll 把关)
+        r41_before = len(r41_ai.nodes)
+        try:
+            r41_ai.nodes.new("GKNodeMoveDirection")
+            r41_ai_blocked = False
+        except RuntimeError:
+            r41_ai_blocked = True
+        check("AI:玩法节点进不了 AI 图(Blender 侧也把关)",
+              r41_ai_blocked and len(r41_ai.nodes) == r41_before)
+
+        # 玩法图里也塞不进『AI_状态』(它只属于 AI 图)
+        r41_tree_nodes = len(r41_tree.nodes)
+        try:
+            r41_tree.nodes.new("GKNodeAiState")
+            r41_state_blocked = False
+        except RuntimeError:
+            r41_state_blocked = True
+        check("AI:『AI_状态』进不了玩法图",
+              r41_state_blocked and len(r41_tree.nodes) == r41_tree_nodes)
+
+        r41_panels = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]
+        check("AI:侧栏面板已注册", "GK_PT_AiDesign" in r41_panels,
+              str(r41_panels)[:200])
+
+        # 重载不该丢节点:特效 / 函数两批以前漏在 _SUBMODULES 表外,
+        # 重载后从 ALL_CLASSES 里整批消失(第四十一轮抓到,174 -> 168)。
+        # 冒烟本身跑在 enable 触发的重载之后 —— 直接断言它们今天还在。
+        r41_names = [c.bl_idname for c in node_lib.ALL_CLASSES]
+        check("重载后 特效/函数 节点还在(_SUBMODULES 补上了 _fx/_functions)",
+              all(name in r41_names for name in
+                  ("GKNodeFxPlay", "GKNodeFxStop", "GKNodeFlashRed",
+                   "GKNodeFxBurst", "GKNodeFunctionDefine",
+                   "GKNodeFunctionCall")),
+              f"count={len(r41_names)}")
+
+        from importlib import import_module
+        r41_ui = import_module(f"{module_name}.ui")
+        check("AI:预览绘制回调已挂上(注销时会摘掉)",
+              len(r41_ui._AI_PREVIEW_HANDLE) >= 1)
+
+        bpy.data.node_groups.remove(r41_tree)
+        bpy.data.node_groups.remove(r41_ai)
+    except Exception as exc:
+        check("第四十一轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
     # Godot 的运动学角色**不会**自动上台阶(0.35 米在它眼里就是堵墙)。
     # 填了高度才生成"三关探测"(被竖面挡住 / 抬起来的路通 / 落点有地),

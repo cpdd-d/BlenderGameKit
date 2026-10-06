@@ -146,6 +146,12 @@ class GenContext:
         # 动画树(独立那张图)驱动的状态机 —— 同样挂 _physics_process
         self.anim_trees = []
         self.need_anim_tree_process = False
+        # ── AI 图(『游戏AI』,第四十一轮)────────────────────────────
+        # 每台『AI_启用』登记一条:{node, graph, var, self, debug, flip} ——
+        # 由 generator 统一发射到 _physics_process(先行为、后转场),
+        # 和动画树共用"合并进已有的 _physics_process"那套。
+        self.ai_machines = []
+        self.need_ai_process = False
         # 『动画_开始』的开始条件 —— 要在每物理帧判一次"现在能不能开始"
         self.anim_starts = []
         self.need_anim_start_process = False

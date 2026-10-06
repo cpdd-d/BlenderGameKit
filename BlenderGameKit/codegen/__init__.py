@@ -11,6 +11,7 @@
   * `expressions.py` —— 非动画表达式发射器(数学 / 逻辑 / 输入 / 骨骼……)
   * `statements.py`  —— 非动画语句发射器(运动 / 属性 / 射线 / 流程控制……)
   * `animation.py`   —— 动画播放 / 状态机 / 动画树 / 动画变量
+  * `ai.py`          —— AI 图(『游戏AI』)的状态机 + 行为(第四十一轮)
   * `camera.py`      —— 相机套件(切换 / 机位 / 弹簧臂 / 路径 / 跟随)
   * `services.py`    —— 音频 / 存档 / 屏幕 UI 与滤镜
   * `context.py`     —— `CodegenAbort` / `_Statements` / `GenContext`
@@ -35,8 +36,8 @@
 `BlenderGameKit/__init__.py` 的 `_SUBMODULES`)。
 """
 
-from . import (animation, api, camera, context, easing, expressions, generator,
-               literals, registry, services, statements, validation)
+from . import (ai, animation, api, camera, context, easing, expressions,
+               generator, literals, registry, services, statements, validation)
 
 
 def _merge_namespaces(*modules):
@@ -49,7 +50,7 @@ def _merge_namespaces(*modules):
 
 # 按依赖顺序合并(被依赖者在前);`api` 放最后,保证 generate 等对外名字不被覆盖
 _merge_namespaces(literals, registry, easing, statements, camera, expressions,
-                  animation, services, context, generator, validation, api)
+                  animation, ai, services, context, generator, validation, api)
 
 # 清掉合并用的临时名,避免污染 `codegen.` 表面
 del _merge_namespaces

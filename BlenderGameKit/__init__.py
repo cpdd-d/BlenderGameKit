@@ -64,11 +64,18 @@ _SUBMODULES = (
     "nodes._movement",
     "nodes._animation",
     "nodes._instances",
+    # ⚠ _fx / _functions 以前**漏在这张表外面** —— 重载后它们的 @N 不会再跑
+    # (门面 `from . import _fx` 命中 sys.modules 缓存),于是特效节点
+    # (粒子/闪光/闪红)和函数节点从 ALL_CLASSES 里**整批消失**
+    # (第四十一轮跑冒烟时抓到:重载后节点数 174 -> 168)。
+    "nodes._fx",
     "nodes._variables",
     "nodes._input",
     "nodes._expressions",
     "nodes._display",
     "nodes._containers",
+    "nodes._functions",
+    "nodes._ai",
     "nodes.nodes",
     "nodes",
     # codegen 主体按领域拆成 10 个模块(纯搬运)。顺序 = 依赖顺序:
@@ -83,6 +90,7 @@ _SUBMODULES = (
     "codegen.camera",
     "codegen.expressions",
     "codegen.animation",
+    "codegen.ai",
     "codegen.services",
     "codegen.context",
     "codegen.generator",

@@ -10,6 +10,7 @@ from .literals import (EVENT_KINDS, TRIGGER_KINDS, _BANNER, gd_class_name,
 from .registry import _chain, _emit_body, _next_nodes
 from .statements import _emit_logic_ports, _emit_logic_vars
 from .animation import _anim_category_table, _emit_state_graph, _emit_state_transitions
+from .ai import _emit_ai_graph
 from .camera import _path_name
 from .services import _FILTER_SHADER_CONST, _GD_FILTER_SHADER
 from .context import GenContext
@@ -673,7 +674,7 @@ class Generator:
         # 状态切换要跟移动同步判定 —— 放在渲染帧里会出现
         # "人已经走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
         if (self.ctx.need_anim_state_process or self.ctx.need_anim_tree_process
-                or self.ctx.need_anim_start_process):
+                or self.ctx.need_anim_start_process or self.ctx.need_ai_process):
             lines = self.ctx.new_section()
             # ── 开始口:条件成立才开演(每物理帧判一次)────────────────
             for starter in self.ctx.anim_starts:
@@ -710,6 +711,16 @@ class Generator:
                                   machine.get("finished"),
                                   machine.get("finish"),
                                   machine.get("gate"))
+            # ---- AI 状态机(『游戏AI』,第四十一轮)----
+            # 和动画树同一套:每物理帧先执行当前状态的行为,再判转场。
+            # 缩进同样先摆正 —— 转场条件里的表达式节点(『AI_看得见』)
+            # 会就地生成几行代码,落到错误的缩进上就"变量没声明"。
+            for machine in self.ctx.ai_machines:
+                self.ctx._active.clear()
+                self.ctx._current_event = machine["node"].name
+                self.ctx._expr_indent = 1
+                self.ctx._current_indent = 1
+                _emit_ai_graph(self.ctx, 1, machine)
             # ── 并进**已有的** _physics_process,不要另起一个(踩过的坑)──
             # 用户的图里既有『每当_物理帧』又有动画状态机时,这里原来会
             # 再 append 一段 `func _physics_process(_delta)`,于是脚本里

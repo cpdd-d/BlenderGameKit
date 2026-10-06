@@ -341,6 +341,39 @@ if ($SkipGodot) {
         }
     }
 
+    # 5i. AI 示例(第四十一轮:游戏AI)—— 一个会巡逻、会追、追丢了自己回去的敌人。
+    #     这一层验的是 AI 图这套的整条链路:状态机真的在跑(位置在变)、
+    #     『看见目标』切追击(而且真的追近了)、『丢失目标』回巡逻、
+    #     以及生成物里的行为 / 距离条件 / 巡逻折返。
+    Write-Output ""
+    $aiDir = Join-Path $Root "examples\demo_ai"
+    $aiMaker = Join-Path $Root "scripts\make_ai_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过 AI 示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $aiDir)) {
+        Write-Output "跳过 AI 示例:还没有 examples\demo_ai"
+    } else {
+        $aiLog = & $Blender -b --python $aiMaker 2>&1 | Out-String
+        if ($aiLog -notmatch "已保存") {
+            Write-Host "---- 重建 AI 示例失败,尾部 20 行 ----"
+            ($aiLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $aiChecker = Join-Path $Root "scripts\check_ai_demo.py"
+            $aiOut = & python $aiChecker --godot $Godot 2>&1 | Out-String
+            $aiOut -split "`n" | Where-Object { $_ -match "^(AI_|CHECK_AI_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($aiOut -match "CHECK_AI_DEMO=OK") {
+                $godotRan += "AI示例"
+            } elseif ($aiOut -match "跳过") {
+                Write-Output "（AI 示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

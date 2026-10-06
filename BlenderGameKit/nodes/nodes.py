@@ -23,6 +23,7 @@ from . import _expressions
 from . import _display
 from . import _containers
 from . import _functions
+from . import _ai
 
 
 def _merge_namespaces(*modules):
@@ -35,7 +36,7 @@ def _merge_namespaces(*modules):
 
 _merge_namespaces(_common, _events, _flow, _movement, _animation,
                   _instances, _fx, _variables, _input, _expressions,
-                  _display, _containers, _functions)
+                  _display, _containers, _functions, _ai)
 del _merge_namespaces
 
 
@@ -76,10 +77,38 @@ for _cls in CLASSES:
     if _cls.bl_idname in ANIM_TREE_VALUE_NODES:
         _cls.gk_tree_type = BOTH_TREES
 
+
+# ==========================================================================
+# AI 图里能用的"取值"节点 —— 第四十一轮
+# ==========================================================================
+# AI 转场的条件要能就地拼:"血量低于 30% 就逃跑""视线被墙挡住吗"。
+# 判据和动画树一样:**纯取值**(没有执行流、什么时候求值都安全)。
+# AI 比动画多要三样:变量读取(看血量)、位置 / 距离(看多远)、
+# 射线(看视线挡没挡)。
+AI_TREE_VALUE_NODES = ANIM_TREE_VALUE_NODES + (
+    "GKNodeGetVar",          # 变量_读取 —— "血量低于 30% 就逃"
+    "GKNodeDistance",        # 取值_距离
+    "GKNodeGetPosition",     # 取值_位置
+    "GKNodeRaycastCheck",    # 射线_有东西吗 —— 视线遮挡
+)
+
+# 已经在动画树里开放的节点再加 AI 树时必须**三个都保留** ——
+# 直接覆盖成两棵树会把动画树那边的『常量_数值』又关回去(用户 2026-10-03
+# 踩过一次一模一样的坑:动画树里加『常量_数值』直接 RuntimeError)。
+_AI_ONLY_KINDS = ("GKGameLogicTree", "GKGameAiTree")
+_ALL_TREE_KINDS = ("GKGameLogicTree", "GKAnimationTree", "GKGameAiTree")
+
+for _cls in CLASSES:
+    if _cls.bl_idname in AI_TREE_VALUE_NODES:
+        if getattr(_cls, "gk_tree_type", None) == BOTH_TREES:
+            _cls.gk_tree_type = _ALL_TREE_KINDS
+        else:
+            _cls.gk_tree_type = _AI_ONLY_KINDS
+
 ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
-CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "实例", "特效", "变量", "函数", "信号", "输入",
+CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "实例", "特效", "变量", "函数", "信号", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "音效", "存档", "界面",
                   "屏幕效果", "射线", "定时", "列表", "字典", "时间", "实用", "动画(旧)")
 
