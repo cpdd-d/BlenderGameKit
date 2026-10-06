@@ -1823,6 +1823,171 @@ class TestUiRound38(Base):
         self.assertIn("release_focus()", code2)
 
 
+class TestUiDesignTree(Base):
+    """第四十轮:界面设计图(『游戏界面』)+ 套用式那条线。
+
+    用户选的方案:
+      * 设计图只管"长什么样",玩法图的『界面_套用设计』一键建出来;
+      * 界面控件节点**两棵树都能放**(老图一字不变);
+      * 点击行为用『界面_按钮点击』按名字接(控件的名字 = 设计图里的节点名)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _design(self, name="主界面"):
+        design = gk_stub.StubNodeTree(name)
+        design.bl_idname = "GKUiDesignTree"
+        return design
+
+    def _gen_with_design(self, design, tree, design_name=""):
+        """把 design 挂到 bpy.data 上,再跑一次生成(用完还原)。"""
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[design]))
+        try:
+            return gen(tree, V2)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    # ---- 树类型 / 菜单归属 ----
+    def test_ui_widget_nodes_fit_both_trees(self):
+        from BlenderGameKit import properties as props
+        for cls in (NN.GKNodeUiText, NN.GKNodeUiBar, NN.GKNodeUiButton,
+                    NN.GKNodeUiImage, NN.GKNodeUiPanel, NN.GKNodeUiList,
+                    NN.GKNodeUiNinePatch, NN.GKNodeUiInput):
+            self.assertTrue(props.node_fits_tree(cls, "GKUiDesignTree"),
+                            cls.bl_label + " 应该能放进设计图")
+            # 老图不受影响:玩法图照旧能放(用户选的"两棵树都能放")
+            self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"),
+                            cls.bl_label + " 仍然要能放进玩法图")
+        # 动作类不进设计图 —— 它们管"运行时改控件",是玩法图的事
+        self.assertFalse(props.node_fits_tree(NN.GKNodeUiHide, "GKUiDesignTree"))
+        self.assertFalse(props.node_fits_tree(NN.GKNodeUiApplyDesign,
+                                              "GKUiDesignTree"))
+
+    def test_design_tree_menu_lists_only_widgets(self):
+        from BlenderGameKit import properties as props
+        labels = [cls.bl_label
+                  for _cat, items in props.node_menu_entries("GKUiDesignTree")
+                  for cls in items]
+        self.assertIn("界面_文本", labels)
+        self.assertIn("界面_面板", labels)
+        self.assertNotIn("界面_隐藏控件", labels)
+
+    # ---- 『界面_套用设计』----
+    def test_apply_design_builds_widgets_parent_first(self):
+        """父控件必须**先建**:子控件是按名字找父亲挂进去的。"""
+        design = self._design()
+        # 故意把子控件摆在前面 —— 生成时必须自己排回"父先子后"
+        design.new_node(NN.GKNodeUiText, "菜单标题", gk_text="暂停",
+                        gk_parent_widget="暂停菜单")
+        design.new_node(NN.GKNodeUiPanel, "暂停菜单",
+                        gk_width=440.0, gk_height=340.0)
+        tree = make_tree()
+        event = self._ready(tree)
+        apply_node = tree.new_node(NN.GKNodeUiApplyDesign, "套用主界面")
+        gk_stub.connect(tree, event, "执行", apply_node, "执行")
+        code, warnings = self._gen_with_design(design, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ui_暂停菜单", code)
+        self.assertIn("_gk_ui_菜单标题", code)
+        panel_at = code.find("_gk_ui_暂停菜单 = ")
+        child_at = code.find('_gk_find_widget("暂停菜单")')
+        self.assertGreater(panel_at, -1, code)
+        self.assertGreater(child_at, -1, code)
+        self.assertLess(panel_at, child_at,
+                        "父控件必须排在子控件前面:\n" + code)
+
+    def test_apply_design_widget_in_design_tree_list_uses_container(self):
+        """设计图里的『界面_列表』也要被认出来 —— 子控件交给容器排版。
+
+        回归点:列表住在**设计图**里,而父控件判断以前只扫玩法图的节点,
+        不扫的话会多写一堆 position(容器会覆盖,写了白写)。
+        """
+        design = self._design()
+        design.new_node(NN.GKNodeUiList, "设计列表",
+                        gk_width=320.0, gk_height=200.0)
+        design.new_node(NN.GKNodeUiButton, "设计按钮", gk_text="槽",
+                        gk_parent_widget="设计列表")
+        tree = make_tree()
+        event = self._ready(tree)
+        apply_node = tree.new_node(NN.GKNodeUiApplyDesign, "套用主界面")
+        gk_stub.connect(tree, event, "执行", apply_node, "执行")
+        code, warnings = self._gen_with_design(design, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_list_body("设计列表")', code)
+        # 挂进容器的控件用最小尺寸,而不是自己设 size
+        self.assertIn("custom_minimum_size", code)
+
+    def test_apply_design_skips_action_nodes(self):
+        """兜底:设计图里混进动作节点时,『套用设计』不该把它"建出来"。
+
+        真 Blender 里节点基类的 poll 会**直接拒绝**把动作节点放进设计图
+        (冒烟测试锁着这条);桩环境不校验,所以这里再锁一道 codegen 过滤。
+        """
+        design = self._design()
+        design.new_node(NN.GKNodeUiText, "标题", gk_text="标题")
+        design.new_node(NN.GKNodeUiHide, "藏起来", gk_widget="标题")
+        code, warnings = self._gen_with_design(
+            design, self._apply_tree(design))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ui_标题", code)
+        # 『界面_隐藏控件』的产物(.visible = false)不该出现
+        self.assertNotIn(".visible = false", code)
+
+    def _apply_tree(self, design):
+        tree = make_tree()
+        event = self._ready(tree)
+        apply_node = tree.new_node(NN.GKNodeUiApplyDesign, "套用主界面")
+        gk_stub.connect(tree, event, "执行", apply_node, "执行")
+        return tree
+
+    def test_apply_design_without_tree_warns(self):
+        tree = self._apply_tree(None)
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("界面设计图" in w for w in warnings), warnings)
+
+    def test_apply_design_empty_tree_warns(self):
+        design = self._design("空界面")
+        _code, warnings = self._gen_with_design(
+            design, self._apply_tree(design))
+        self.assertTrue(any("没有控件" in w for w in warnings), warnings)
+
+    # ---- 『界面_按钮点击』----
+    def test_on_click_binds_once_and_runs_click_chain(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        click = tree.new_node(NN.GKNodeUiOnClick, "开始按钮点击", gk_widget="开始")
+        printer = tree.new_node(NN.GKNodePrint, "开跑", gk_text="go")
+        gk_stub.connect(tree, event, "执行", click, "执行")
+        gk_stub.connect(tree, click, "点击", printer, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("开始")', code)
+        self.assertIn("is BaseButton", code)
+        # 幂等:接之前先问 is_connected(放每帧的链上也不会越点越多)
+        self.assertIn(".pressed.is_connected(", code)
+        # 点击链在独立回调里(不是接上就立刻跑)
+        lines = code.splitlines()
+        callback_at = next(i for i, line in enumerate(lines) if "func gk_on_" in line)
+        print_at = next(i for i, line in enumerate(lines) if 'print("go")' in line)
+        self.assertGreater(print_at, callback_at, code)
+
+    def test_on_click_without_widget_name_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        click = tree.new_node(NN.GKNodeUiOnClick, "按钮点击", gk_widget="")
+        gk_stub.connect(tree, event, "执行", click, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in w for w in warnings), warnings)
+
+
 class TestRaycastNodes(Base):
     def _ready(self, tree, name="准备"):
         return tree.new_node(NN.GKNodeOnReady, name)

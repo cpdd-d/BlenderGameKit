@@ -36,6 +36,13 @@
     并且**焦点在它身上**(键盘直接能打字);
   * **输入框**:给框里打"阿飞" + 回车 -> 『界面_取文字』读出来 -> "得分"
     变成"阿飞"(整条 取文字 -> 改文字 的链路)。
+
+第四十轮(界面设计图,套用式)再看两样:
+  * **界面_套用设计**:右上角 HUD 的三块(底板 / 标题 / 按钮)**不在玩法图里**,
+    是设计图 `设计_HUD` 摆好后由这一个节点建出来的 —— 探针查三个控件都在、
+    后两个挂在底板上、底板的位置 = "屏幕右上角 + 边距 14"(按视口现算);
+  * **界面_按钮点击**:点『点我』-> "得分"变成"设计按钮被点了"
+    (设计图只管长什么样,行为写在玩法图、按控件名接)。
 """
 
 import argparse
@@ -137,6 +144,10 @@ func _physics_process(delta: float) -> void:
 	elif phase == 8 and elapsed >= 3.4:
 		phase = 9
 		_check_submitted()
+		_design_click()                        # 点设计图里那个按钮(套用式)
+	elif phase == 9 and elapsed >= 3.8:
+		phase = 10
+		_check_design_click()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
@@ -148,7 +159,8 @@ func _physics_process(delta: float) -> void:
 func _check_widgets() -> void:
 	var names := ["HUD底", "徽标", "分数", "血条", "底部提示",
 		"暂停菜单", "暂停标题", "继续按钮", "退出按钮",
-		"标题条", "存档列表", "存档槽一", "存档槽二", "日志列表", "昵称"]
+		"标题条", "存档列表", "存档槽一", "存档槽二", "日志列表", "昵称",
+		"设计底板", "设计标题", "设计按钮"]
 	var missing: Array = []
 	for name in names:
 		if _widget(name) == null:
@@ -206,6 +218,23 @@ func _check_widgets() -> void:
 	var bar := _widget("血条")
 	var alpha_ok := bar != null and absf(bar.modulate.a - 0.6) < 0.02
 	print("UI_SET ok=", alpha_ok, " alpha=", bar.modulate.a if bar != null else -1.0)
+
+	# ── 第四十轮:设计图(套用式)─────────────────────────────────
+	# 右上角 HUD 的三个控件**不在玩法图里**,是『界面_套用设计』从设计图
+	# 建出来的;后两个要挂在底板上(父子关系照设计图里写的)
+	var design_panel := _widget("设计底板")
+	var design_title := _widget("设计标题")
+	var design_btn := _widget("设计按钮")
+	var design_ok := false
+	var design_note := "no widget"
+	if design_panel != null:
+		var dwant := Vector2(view.x - design_panel.size.x - 14.0, 14.0)
+		design_ok = design_title != null and design_btn != null \\
+			and design_title.get_parent() == design_panel \\
+			and design_btn.get_parent() == design_panel \\
+			and design_panel.position.distance_to(dwant) <= 2.0
+		design_note = "panel=" + str(design_panel.position) + " want=" + str(dwant)
+	print("UI_DESIGN ok=", design_ok, " ", design_note)
 
 
 func _start_dialog_sample() -> void:
@@ -333,6 +362,20 @@ func _check_submitted() -> void:
 	print("UI_SUBMIT ok=", text == "阿飞", " score=", text)
 
 
+# ── 第四十轮:设计图里的按钮(行为是玩法图『界面_按钮点击』接的)──────
+
+func _design_click() -> void:
+	var button := _widget("设计按钮")
+	if button != null:
+		_click_at(button.get_global_rect().get_center())
+
+
+func _check_design_click() -> void:
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	print("UI_DESIGN_CLICK ok=", text == "设计按钮被点了", " score=", text)
+
+
 func _send_key(code: int, pressed: bool) -> void:
 	var event := InputEventKey.new()
 	event.keycode = code
@@ -435,6 +478,9 @@ def main():
         (r"UI_NINEPATCH ok=true", "九宫格切片 / 贴图 / 垫底 不对"),
         (r"UI_FOCUS_TWEEN ok=true", "输入框没淡入到不透明 / 焦点没落到它身上"),
         (r"UI_SUBMIT ok=true", "输入框回车提交后『取文字 -> 改文字』没生效"),
+        # ---- 第四十轮:界面设计图(套用式)----
+        (r"UI_DESIGN ok=true", "『界面_套用设计』没把设计图的控件建出来 / 右上角对齐不对"),
+        (r"UI_DESIGN_CLICK ok=true", "点设计图里的按钮没走进『界面_按钮点击』接的链"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -470,6 +516,10 @@ def main():
                 ("\"modulate:a\"", "『界面_缓动』"),
                 ("_gk_widget_text(", "『界面_取文字』"),
                 ("grab_focus()", "『界面_设焦点』"),
+                # ---- 第四十轮:设计图(套用式)----
+                ("_gk_ui_设计底板", "『界面_套用设计』把设计图的控件建进脚本"),
+                ('_gk_find_widget("设计按钮")', "『界面_按钮点击』按名字找按钮"),
+                (".pressed.is_connected(", "按钮点击的幂等接线"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")

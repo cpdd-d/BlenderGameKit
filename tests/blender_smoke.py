@@ -927,6 +927,106 @@ def main():
         check("第三十九轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 界面设计图 + 套用式(第四十轮)----
+    # ① 第三种节点树类型真的注册上了(能在编辑器类型里选、属性都在);
+    # ② 『界面_套用设计』把设计图里的控件全建出来,**父控件排在子控件前面**
+    #    (子控件是按名字找父亲挂进去的 —— 顺序错了会掉到界面根下);
+    # ③ 设计图里被人手塞的动作节点不会被"建出来";
+    # ④ 『界面_按钮点击』的接线是幂等的(is_connected 守卫)。
+    try:
+        r40_design = bpy.data.node_groups.new("界面设计冒烟40", "GKUiDesignTree")
+        check("界面:设计图类型注册成功(预览开关 / 设计分辨率都在)",
+              getattr(r40_design, "bl_idname", "") == "GKUiDesignTree"
+              and bool(getattr(r40_design, "gk_preview", False))
+              and int(getattr(r40_design, "gk_design_width", 0)) == 1152)
+        # 故意先建子控件、后建父控件 —— 生成时必须自己排回"父先子后"
+        r40_title = r40_design.nodes.new("GKNodeUiText")
+        r40_title.name = "冒烟标题"
+        r40_title.gk_text = "标题"
+        r40_title.gk_parent_widget = "冒烟菜单"
+        r40_menu = r40_design.nodes.new("GKNodeUiPanel")
+        r40_menu.name = "冒烟菜单"
+        r40_menu.gk_width = 400.0
+        r40_menu.gk_height = 300.0
+        # 动作节点连**塞**都塞不进设计图 —— 节点基类的 poll 按树类型把关,
+        # 菜单过滤之外还有这一层兜底。
+        r40_before = len(r40_design.nodes)
+        try:
+            r40_design.nodes.new("GKNodeUiHide")
+            r40_blocked = False
+        except RuntimeError:
+            r40_blocked = True
+        check("界面:动作节点进不了设计图(Blender 侧也把关)",
+              r40_blocked and len(r40_design.nodes) == r40_before,
+              f"blocked={r40_blocked} nodes={len(r40_design.nodes)}")
+
+        r40_tree = bpy.data.node_groups.new("界面玩法冒烟40", "GKGameLogicTree")
+        r40_ready = r40_tree.nodes.new("GKNodeOnReady")
+        r40_apply = r40_tree.nodes.new("GKNodeUiApplyDesign")
+        r40_apply.gk_design = r40_design.name
+        r40_tree.links.new(r40_ready.outputs["执行"], r40_apply.inputs["执行"])
+        r40_code, r40_warnings = codegen.generate(r40_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        r40_panel_at = r40_code.find("_gk_ui_冒烟菜单 = ")
+        r40_child_at = r40_code.find('_gk_find_widget("冒烟菜单")')
+        check("界面:『界面_套用设计』把设计图的控件建出来(父先子后)",
+              r40_panel_at > -1 and r40_child_at > -1
+              and r40_panel_at < r40_child_at)
+        check("界面:套用设计无告警", not r40_warnings, str(r40_warnings))
+
+        r40_click = r40_tree.nodes.new("GKNodeUiOnClick")
+        r40_click.gk_widget = "冒烟按钮"
+        r40_tree.links.new(r40_apply.outputs["完成"], r40_click.inputs["执行"])
+        r40_code2, r40_warnings2 = codegen.generate(r40_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("界面:『界面_按钮点击』幂等接线(is_connected 守卫)",
+              ".pressed.is_connected(" in r40_code2
+              and "is BaseButton" in r40_code2)
+        check("界面:按钮点击无告警", not r40_warnings2, str(r40_warnings2))
+
+        r40_panels = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]
+        check("界面:设计图侧栏面板已注册", "GK_PT_UiDesign" in r40_panels,
+              str(r40_panels)[:200])
+
+        # 视口叠加预览:算矩形的那段是纯逻辑,能在这儿直接验
+        # (真正的画由 3D 视口的绘制回调负责 —— 无头模式没有视口可画)
+        from importlib import import_module
+        r40_ui = import_module(f"{module_name}.ui")
+        r40_rects = r40_ui._ui_preview_rects(r40_design)
+        r40_by_name = {item[0]: item for item in r40_rects}
+        # 设计图里就两个控件(标题 + 菜单;动作节点进不来,见上面那条)
+        r40_place_ok = (
+            len(r40_rects) == 2
+            and abs(r40_by_name["冒烟菜单"][3] - 400.0) < 1e-6
+            and abs(r40_by_name["冒烟标题"][1]
+                    - (r40_by_name["冒烟菜单"][1] + r40_title.gk_x)) < 1e-6
+            and abs(r40_by_name["冒烟标题"][2]
+                    - (r40_by_name["冒烟菜单"][2] + r40_title.gk_y)) < 1e-6)
+        check("界面:视口预览的矩形算法(父先子后 + 子控件相对父偏移)",
+              r40_place_ok, str(r40_rects))
+        check("界面:预览绘制回调已挂上(注销时会摘掉)",
+              len(r40_ui._UI_PREVIEW_HANDLE) >= 1)
+        try:
+            import blf
+            import gpu
+            import gpu_extras.batch
+            r40_api_ok = (hasattr(gpu, "shader")
+                          and hasattr(gpu.state, "blend_set")
+                          and hasattr(blf, "draw")
+                          and hasattr(gpu_extras.batch, "batch_for_shader"))
+        except Exception:                                 # noqa: BLE001
+            r40_api_ok = False
+        check("界面:预览用的绘制接口都在(gpu / blf / batch_for_shader)",
+              r40_api_ok)
+
+        bpy.data.node_groups.remove(r40_tree)
+        bpy.data.node_groups.remove(r40_design)
+    except Exception as exc:
+        check("第四十轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
     # Godot 的运动学角色**不会**自动上台阶(0.35 米在它眼里就是堵墙)。
     # 填了高度才生成"三关探测"(被竖面挡住 / 抬起来的路通 / 落点有地),

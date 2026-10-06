@@ -251,9 +251,20 @@ def node_tree_error(cls, tree):
     if props.node_fits_tree(cls, actual):
         return None
     kinds = props.node_tree_kinds(cls)
-    where = "动画树(『游戏动画』)" if "GKAnimationTree" in kinds else "游戏逻辑树"
-    hint = ("侧栏『游戏逻辑』面板 -> 『动画系统』-> 点『打开/新建动画树』"
-            if "GKAnimationTree" in kinds else "请切到游戏逻辑图")
+    label_of = {
+        "GKGameLogicTree": "游戏逻辑树",
+        "GKAnimationTree": "动画树(『游戏动画』)",
+        "GKUiDesignTree": "界面设计图(『游戏界面』)",
+    }
+    names = [label_of[kind] for kind in kinds if kind in label_of]
+    where = " / ".join(names) if names else "游戏逻辑树"
+    if "GKAnimationTree" in kinds:
+        hint = "侧栏『游戏逻辑』面板 -> 『动画系统』-> 点『打开/新建动画树』"
+    elif "GKUiDesignTree" in kinds:
+        hint = ("侧栏『游戏逻辑』面板 -> 『界面设计』-> "
+                "点『打开/新建界面设计图』")
+    else:
+        hint = "请切到游戏逻辑图"
     return (f"『{getattr(cls, 'bl_label', cls)}』是{where}里的节点,"
             f"不能放进当前的图。{hint}")
 
@@ -1353,6 +1364,47 @@ class GK_OT_PickAnimTree(bpy.types.Operator):
     def draw(self, context):
         for ident, label, _desc in node_lib.animation_tree_items():
             op = self.layout.operator("gk.pick_anim_tree", text=label)
+            op.node_name = self.node_name
+            op.choice = ident
+
+
+class GK_OT_PickUiDesign(bpy.types.Operator):
+    """从列表里挑一张界面设计图填进『界面_套用设计』。
+
+    和 `GK_OT_PickAnimTree` 一模一样的一套(见那里的说明)——
+    手打树名打错了只会在导出报告里说"找不到设计图",不如直接选。
+    """
+
+    bl_idname = "gk.pick_ui_design"
+    bl_label = "选择界面设计图"
+    bl_description = "从文件里的界面设计图中挑一张(标签里带控件数量)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    choice: StringProperty(name="设计图", default="")
+
+    def invoke(self, context, event):
+        if self.choice:
+            return self.execute(context)
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if not self.choice:
+            return {"CANCELLED"}
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or not hasattr(node, "gk_design"):
+            self.report({"WARNING"}, "没找到目标节点")
+            return {"CANCELLED"}
+        # choice 用的就是树名(空 = 自动用第一张)
+        node.gk_design = self.choice
+        self.report({"INFO"}, f"界面设计图 -> {self.choice or '自动'}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        for ident, label, _desc in node_lib.ui_design_tree_items():
+            op = self.layout.operator("gk.pick_ui_design", text=label)
             op.node_name = self.node_name
             op.choice = ident
 
@@ -2587,6 +2639,8 @@ GK_CLASSES = (
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
     GK_OT_PickAnimName,
     GK_OT_PickAnimTree,
+    # 界面设计图选择器(『界面_套用设计』用,第四十轮)
+    GK_OT_PickUiDesign,
     # 转场的『从』/『到』状态选择器(忘了连线时的兜底)
     GK_OT_PickAnimState,
     # 按一下键盘就绑定按键(照 UPBGE 的 Press & Choose)

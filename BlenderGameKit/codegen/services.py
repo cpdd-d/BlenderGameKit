@@ -4,7 +4,7 @@ from ..nodes.node_base import TARGET_SELF, gd_node_path, gd_string, snake_case
 from ..nodes import nodes as node_lib
 
 from .literals import gd_literal, gd_number
-from .registry import _chain, _next_nodes, stmt_node
+from .registry import STMT_HANDLERS, _chain, _next_nodes, stmt_node
 from .statements import _tunable_number
 
 
@@ -361,14 +361,20 @@ def _ui_list_names(ctx):
 
     用来判断"这个控件的父控件是不是一个容器" —— 是的话它由容器排版,
     生成器**不能再写 position / 锚点**(容器会把它们覆盖掉,真 Godot 实测)。
+
+    第四十轮起还要扫**被『界面_套用设计』引用进来的设计图** —— 列表住在
+    设计图里(_register_ui_design_tree 登记的),只扫玩法图的话会把挂在
+    设计图列表里的控件当成"自由摆放",白写一堆 position(容器会覆盖)。
     """
     cache = getattr(ctx, "_ui_list_names", None)
     if cache is None:
         cache = set()
-        tree = getattr(ctx, "tree", None)
-        for node in getattr(tree, "nodes", ()) or ():
-            if getattr(node, "bl_idname", "") == "GKNodeUiList":
-                cache.add(str(getattr(node, "name", "")))
+        trees = [getattr(ctx, "tree", None)]
+        trees.extend(getattr(ctx, "_gk_ui_design_trees", ()) or ())
+        for tree in trees:
+            for node in (getattr(tree, "nodes", ()) or ()):
+                if getattr(node, "bl_idname", "") == "GKNodeUiList":
+                    cache.add(str(getattr(node, "name", "")))
         ctx._ui_list_names = cache
     return cache
 
@@ -1124,6 +1130,159 @@ def _stmt_ui_focus(ctx, node, indent):
         ctx.add_line(indent + 1, f"{var}.grab_focus()")
     else:
         ctx.add_line(indent + 1, f"{var}.release_focus()")
+
+
+# ==========================================================================
+# 『界面_套用设计』/『界面_按钮点击』—— 界面设计图那条线(第四十轮)
+# ==========================================================================
+# ── 导出时"设计图怎么变成代码"(用户选的"套用式")───────────────────
+# 玩法图的『界面_套用设计』节点被走到时,生成器**现场把设计图展开**:
+# 把里面每个"控件构建"节点按**父控件依赖**排好序,逐个调用它们各自的
+# 发射器 —— 生成的东西和它们直接待在玩法图里时**一字不差**。
+#
+# 这样做的三个好处:
+#   1. 设计图里的节点不需要自己"被执行" —— 引用它的那一个节点就是入口,
+#      和『动画_状态机』引用动画树完全对称;
+#   2. 生成的代码没有第二套写法:控件还是 `_gk_ui_<节点名>`,
+#      所以玩法图的『界面_隐藏控件』『界面_设置』按名字照样找得到;
+#   3. 老图不受影响 —— 控件节点留在玩法图里生成的结果不变。
+def _ui_builder_idnames():
+    """所有"控件构建"节点的 bl_idname(名单在 nodes/_display.py)。"""
+    cache = getattr(_ui_builder_idnames, "_cache", None)
+    if cache is None:
+        cache = frozenset(cls.bl_idname for cls in node_lib.ALL_CLASSES
+                          if getattr(cls, "gk_ui_builder", False))
+        _ui_builder_idnames._cache = cache
+    return cache
+
+
+def _ui_design_nodes(tree):
+    """设计图里的控件构建节点(保持节点树里的先后顺序)。"""
+    builders = _ui_builder_idnames()
+    return [n for n in (getattr(tree, "nodes", ()) or ())
+            if getattr(n, "bl_idname", "") in builders]
+
+
+def _ui_design_order(nodes):
+    """排成"父控件一定排在子控件前面"(深度优先 + 环保护)。
+
+    ── 为什么必须排序 ──────────────────────────────────────────────
+    生成的是**顺序执行**的代码:`_gk_find_widget(父名)` 在父控件还没
+    建出来时找不到 -> 控件被退回挂在界面根下(有告警,但用户看到的
+    是"明明填了父控件却没进去")。
+    """
+    by_name = {}
+    for node in nodes:
+        by_name.setdefault(str(getattr(node, "name", "")), node)
+    ordered = []
+    done = set()
+    visiting = set()
+
+    def visit(node):
+        key = node_lib.node_key(node)
+        if key in done or key in visiting:
+            return
+        visiting.add(key)
+        parent = by_name.get(str(getattr(node, "gk_parent_widget", "") or "").strip())
+        if parent is not None:
+            visit(parent)
+        visiting.discard(key)
+        done.add(key)
+        ordered.append(node)
+
+    for node in nodes:
+        visit(node)
+    return ordered
+
+
+def _register_ui_design_tree(ctx, tree):
+    """登记"这次导出用到了这张设计图"(『界面_列表』的父控件判断要看它)。"""
+    trees = getattr(ctx, "_gk_ui_design_trees", None)
+    if trees is None:
+        trees = []
+        ctx._gk_ui_design_trees = trees
+    if all(existing is not tree for existing in trees):
+        trees.append(tree)
+
+
+@stmt_node("GKNodeUiApplyDesign")
+def _stmt_ui_apply_design(ctx, node, indent):
+    """『界面_套用设计』:把设计图里摆好的控件一次性建出来。"""
+    raw = str(getattr(node, "gk_design", "") or "").strip()
+    tree = node_lib.find_ui_design_tree(raw)
+    if tree is None:
+        ctx.warn(f"『{node.bl_label}』找不到界面设计图"
+                 f"(填的是『{raw or '自动(第一张)'}』)—— 在侧栏"
+                 f"『游戏界面』面板里点『打开/新建界面设计图』建一张")
+        return
+    widgets = _ui_design_nodes(tree)
+    if not widgets:
+        ctx.warn(f"设计图『{tree.name}』里没有控件(文本 / 按钮 / 面板 / 列表…),"
+                 f"这一句什么都不会建 —— 切到『游戏界面』那张图摆几个控件")
+        return
+    _register_ui_design_tree(ctx, tree)
+    # 外层执行栈要**保住**:『界面_按钮』的发射器生成点击回调时会
+    # `_active.clear()`(那边是故意"换一个执行上下文"),不还原的话
+    # 外层链路的回路保护就没了。
+    saved_active = set(ctx._active)
+    for widget in _ui_design_order(widgets):
+        handler = STMT_HANDLERS.get(getattr(widget, "bl_idname", ""))
+        if handler is None:                               # pragma: no cover
+            continue
+        handler(ctx, widget, indent)
+    ctx._active.clear()
+    ctx._active.update(saved_active)
+
+
+def _ui_click_section(ctx, node, handler):
+    """把『点击』出口那条链收进一个独立回调函数(照『界面_按钮』的做法)。
+
+    ⚠ `new_section()` 换了写入目标而且**不会自己换回来**,所以这里必须
+    手动存一份再还回去(见『界面_按钮』那条踩坑记录);执行栈也一样,
+    回调链按"新上下文"生成,生成完把外层的还原回去。
+    """
+    saved_sink = ctx.sink
+    saved_active = set(ctx._active)
+    lines = ctx.new_section()
+    ctx._active.clear()
+    prev_event = ctx._current_event
+    ctx._current_event = node.name
+    _chain(ctx, node, 1, "点击")
+    if len(lines) == 0:
+        lines.add(1, "pass")
+    ctx._current_event = prev_event
+    ctx._active.clear()
+    ctx._active.update(saved_active)
+    ctx.sink = saved_sink
+    ctx.extra_sections.append({
+        "signature": f"func {handler}() -> void:",
+        "lines": list(lines.lines),
+        "empty_body": "    pass",
+        "separator": True,
+    })
+
+
+@stmt_node("GKNodeUiOnClick")
+def _stmt_ui_on_click(ctx, node, indent):
+    """『界面_按钮点击』:按名字给(设计图里的)按钮接上行为。"""
+    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    if not widget_name:
+        ctx.warn(f"『{node.bl_label}』没有填控件名,这一句被跳过了")
+        return
+    ctx.need_ui_helpers = True
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(widget_name, 'button')}", key=node_lib.node_key(node))
+    var = ctx.new_temp("button")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"if {var} != null and {var} is BaseButton:")
+    # 幂等:放每帧的链上也只接一次(重复 connect 会让点一下跑两遍)
+    ctx.add_line(indent + 1, f"if not {var}.pressed.is_connected({handler}):")
+    ctx.add_line(indent + 2, f"{var}.pressed.connect({handler})")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1,
+                 f'push_warning("找不到按钮『{widget_name}』:先确认设计图里摆了'
+                 f'它,并且之前已经『界面_套用设计』")')
+    _ui_click_section(ctx, node, handler)
 
 
 @stmt_node("GKNodeFloatText")

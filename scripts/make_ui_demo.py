@@ -35,6 +35,14 @@
 | **界面_缓动** | 输入框淡入(透明度 0.15 -> 1,0.2 秒);**界面_设焦点** 紧接着把焦点放到它身上 |
 | **界面_设焦点** | 对话结束后焦点落在昵称框上 —— 键盘用户不用摸鼠标 |
 
+── 第四十轮:界面设计图(套用式)─────────────────────────────
+
+| 用到的 | 在游戏里怎么看 |
+|---|---|
+| **游戏界面(设计图)** | 右上角那块绿色小 HUD —— 它**不在玩法图里摆**,画在一张独立的『游戏界面』节点图里(Blend 里叫 `设计_HUD`) |
+| **界面_套用设计** | 玩法图里就这一个节点:运行时把设计图里的 3 个控件(底板 / 标题 / 按钮)一次建出来 |
+| **界面_按钮点击** | 点右上角『点我』-> "得分"变成"设计按钮被点了"(设计图只管长什么样,点了做什么写在玩法图,按控件名接) |
+
 跑法(Godot):打开 `界面示例_godot` 直接 F5。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ui_demo.py`
 """
@@ -63,6 +71,8 @@ BAR_SIZE = 64
 BAR_BORDER = 14
 DIALOG_TEXT = ("欢迎!这是界面示例:图片、血条、对话框和暂停菜单都在这一屏。"
                "点一下继续。")
+# 第四十轮:界面设计图(『游戏界面』)—— 右上角那块小 HUD 摆在这张**独立图**里
+DESIGN_NAME = "设计_HUD"
 
 
 def log(message):
@@ -223,11 +233,37 @@ def _link(tree, source, source_pin, target, target_pin):
     tree.links.new(source.outputs[source_pin], target.inputs[target_pin])
 
 
+def build_design_tree():
+    """第四十轮:界面设计图 —— 右上角那块小 HUD 摆在这张**独立图**里。
+
+    ── 这就是用户选的"套用式" ─────────────────────────────────────
+    设计图只管"长什么样"(控件、坐标、父子);玩法图里只放一个
+    『界面_套用设计』(见 `_build_ui_chain`),运行时把这三个控件一次建出来。
+    "点了做什么"写在玩法图:`界面_按钮点击` 按控件名接行为。
+    """
+    design = bpy.data.node_groups.new(DESIGN_NAME, "GKUiDesignTree")
+    panel = _add(design, "GKNodeUiPanel", "设计底板", 0.0, 0.0,
+                 gk_width=286.0, gk_height=98.0, gk_radius=12,
+                 gk_align="TOP_RIGHT", gk_margin=14.0,
+                 gk_color=(0.10, 0.22, 0.17, 0.72))
+    text = _add(design, "GKNodeUiText", "设计标题", 300.0, 0.0,
+                gk_text="设计图 HUD", gk_size=22,
+                gk_color=(0.78, 1.0, 0.86, 1.0),
+                gk_x=16.0, gk_y=12.0, gk_parent_widget="设计底板")
+    button = _add(design, "GKNodeUiButton", "设计按钮", 600.0, 0.0,
+                  gk_text="点我", gk_x=16.0, gk_y=48.0,
+                  gk_width=120.0, gk_height=38.0,
+                  gk_parent_widget="设计底板")
+    log(f"设计图『{design.name}』:{len(design.nodes)} 个控件"
+        f"(底板 / 标题 / 按钮,后两个挂在底板上)")
+    return design
+
+
 def build_graph(scene, stage):
     """图:开场把整套界面搭出来 -> 对话框;每物理帧改血条透明度。
 
-    ⚠ 执行流是**一条链**走到头:面板 -> 底板上的控件 -> 暂停菜单 ->
-    菜单里的控件 -> 挂 Esc 热键 -> 底部提示 -> 对话框 -> 改文字。
+    ⚠ 执行流是**一条链**走到头:套用设计图 -> 面板 -> 底板上的控件 ->
+    暂停菜单 -> 菜单里的控件 -> 挂 Esc 热键 -> 底部提示 -> 对话框 -> 改文字。
     顺序不能乱:『父控件』是按名字找的,底板必须先建出来;
     而对话框会**阻塞**这条链(等玩家点),所以它必须放在最后。
     """
@@ -253,15 +289,32 @@ def build_graph(scene, stage):
         raise RuntimeError("角色预设里没有『准备』/『每当_物理帧』节点")
     # 预设建的那条移动链对"只看界面"的示例没意义 —— 但留着也不碍事
     # (WASD 会让舞台挪一挪,正好能看出"世界真的停了")。
-    tail = _build_ui_chain(logic, ready)
+    design = build_design_tree()
+    tail = _build_ui_chain(logic, ready, design)
     _build_frame_chain(logic, physics)
     log(f"界面逻辑:共 {len(logic.nodes)} 个节点 / {len(logic.links)} 条连线"
         f"(界面链尾部: {tail.name})")
     return logic
 
 
-def _build_ui_chain(tree, ready):
-    """开场链:整套界面 + 对话框。返回链尾(便于探针/日志对照)。"""
+def _build_ui_chain(tree, ready, design):
+    """开场链:套用设计图 -> 整套界面 + 对话框。返回链尾(便于探针/日志对照)。
+
+    ── 第四十轮加的"套用式"入口 ────────────────────────────────────
+    `ready -> 套用设计HUD -+-> 设计按钮点击`(只接行为,不建控件)
+                          `+-> HUD底 ...`(原来那条链照旧)
+    一个执行出口接两条线是**故意**的:两条互不依赖(接行为和建界面),
+    生成时按节点在画布上的上下位置依次出码(见 registry._next_nodes)。
+    """
+    # ── 设计图那条线:一个『界面_套用设计』+ 一个『界面_按钮点击』──────
+    apply_design = _add(tree, "GKNodeUiApplyDesign", "套用设计HUD", 0.0, -300.0,
+                        gk_design=design.name)
+    design_click = _add(tree, "GKNodeUiOnClick", "设计按钮点击", 260.0, -300.0,
+                        gk_widget="设计按钮")
+    design_reply = _add(tree, "GKNodeUiSet", "设计按钮回话", 520.0, -300.0,
+                        gk_widget="分数", gk_set_text=True,
+                        gk_text="设计按钮被点了")
+    _link(tree, design_click, "点击", design_reply, "执行")
     hud = _add(tree, "GKNodeUiPanel", "HUD底", 0.0, 0.0,
                gk_width=320.0, gk_height=130.0, gk_radius=14,
                gk_x=12.0, gk_y=12.0,
@@ -346,7 +399,10 @@ def _build_ui_chain(tree, ready):
     focus_field = _add(tree, "GKNodeUiFocus", "聚焦昵称", 4940.0, 0.0,
                        gk_widget="昵称")
 
-    _link(tree, ready, "执行", hud, "执行")
+    _link(tree, ready, "执行", apply_design, "执行")
+    # 一个出口接两条:先接按钮行为,再把整套界面建出来(两条互不依赖)
+    _link(tree, apply_design, "完成", design_click, "执行")
+    _link(tree, apply_design, "完成", hud, "执行")
     _link(tree, hud, "完成", logo, "执行")
     _link(tree, logo, "完成", score, "执行")
     _link(tree, score, "完成", bar, "执行")
@@ -389,7 +445,8 @@ def _build_ui_chain(tree, ready):
                     gk_widget="分数", gk_set_text=True, gk_text="读取存档二")
     _link(tree, slot_one, "点击", load_one, "执行")
     _link(tree, slot_two, "点击", load_two, "执行")
-    log("界面链:面板 -> 图片 -> 文本 -> 进度条 -> 暂停菜单(九宫格标题条 + "
+    log("界面链:套用设计图(右上角 HUD,3 个控件) -> 接设计按钮行为 -> "
+        "面板 -> 图片 -> 文本 -> 进度条 -> 暂停菜单(九宫格标题条 + "
         "存档列表) -> 日志列表(填充) -> 昵称输入框 -> 提示 -> 对话框 -> "
         "淡入 + 聚焦")
     return focus_field

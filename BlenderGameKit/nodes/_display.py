@@ -1764,6 +1764,125 @@ class GKNodeUiFocus(B.GKStatementNode):
 
 
 # ==========================================================================
+# 界面设计图(第四十轮,用户选的"套用式")
+# ==========================================================================
+# 用户原话:"添加游戏界面设计编辑器,方便对UI设计"。
+#
+# ── 做法 ─────────────────────────────────────────────────────────────
+# 照动画树那一套:界面"长什么样"画在**独立一张图**(GKUiDesignTree)里,
+# 玩法图只放一个『界面_套用设计』节点把那张图里摆好的控件**一次性建出来**。
+# 试出来的分工依据是"这个节点会不会**建出**一个控件":
+#     设计图 = 摆控件(文本/按钮/面板/列表/图片…);
+#     玩法图 = 什么时候显示、点了做什么(隐藏/设置/飘字/缓动/对话框…)。
+# 点击行为用『界面_按钮点击』按名字接到设计图里那个按钮上。
+#
+# ── 为什么按钮不给"直接连到设计图里的按钮节点"─────────────────────
+# 设计图的节点在**另一棵树**里,玩法图的执行流够不着它;而把两张图
+# 的执行流接起来(蓝图式)是下一轮的事。所以这一版给出的是
+# "按名字找控件 + 接行为" —— 和『界面_隐藏控件』『界面_设置』
+# 按控件名找控件是同一套做法,一个概念通吃。
+@N
+class GKNodeUiApplyDesign(B.GKStatementNode):
+    bl_idname = "GKNodeUiApplyDesign"
+    bl_label = "界面_套用设计"
+    bl_icon = "NODETREE"
+    gk_category = "界面"
+    gk_doc = ("把一张『游戏界面』设计图里摆好的控件**全部建出来** —— "
+              "玩法图里放这一个节点就够了,不用把十几个控件节点都拖过来。\n"
+              "『设计图』留空 = 用文件里第一张设计图(只有一张时不用管它)。\n"
+              "建出来之后,控件就用它的**节点名**来引用:"
+              "『界面_隐藏控件』『界面_设置』『界面_按钮点击』填那个名字即可。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "设计图", ""),
+    )
+    gk_input_props = {"设计图": "gk_design"}
+    gk_prop_defs = (
+        ("gk_design", "string", "", "设计图",
+         "留空 = 用文件里第一张『游戏界面』设计图"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        trees = ui_design_tree_names()
+        row = layout.row(align=True)
+        if len(trees) <= 1:
+            row.label(text=f"设计图:{trees[0] if trees else '(还没有)'}",
+                      icon="NODETREE")
+        else:
+            row.prop(self, "gk_design", text="", icon="NODETREE")
+        picker = row.operator("gk.pick_ui_design", text="", icon="VIEWZOOM")
+        picker.node_name = self.name
+        if len(trees) > 1:
+            row.label(text=f"(共 {len(trees)} 张)", icon="INFO")
+        # 顺带把"这张图里有什么"报出来 —— 省得切过去数
+        tree = find_ui_design_tree(getattr(self, "gk_design", ""))
+        if tree is None:
+            icon = "ERROR" if trees else "INFO"
+            layout.label(text="还没有界面设计图(侧栏『游戏界面』里建一张)",
+                         icon=icon)
+            return
+        widgets = [str(getattr(n, "name", "?")) for n in tree.nodes
+                   if getattr(n, "gk_ui_builder", False)]
+        if not widgets:
+            layout.label(text=f"『{tree.name}』里还没有控件", icon="ERROR")
+            return
+        head = "、".join(widgets[:4]) + ("…" if len(widgets) > 4 else "")
+        layout.label(text=f"会建出 {len(widgets)} 个控件:{head}", icon="CHECKMARK")
+
+
+@N
+class GKNodeUiOnClick(B.GKStatementNode):
+    bl_idname = "GKNodeUiOnClick"
+    bl_label = "界面_按钮点击"
+    bl_icon = "PLAY"
+    gk_category = "界面"
+    gk_doc = ("按名字找到按钮,给它接上『点击』出口后面这段逻辑 —— "
+              "用来给**设计图**里摆好的按钮接行为(设计图只管长什么样,"
+              "点了做什么写在玩法图里)。\n"
+              "── 和『界面_按钮』的区别 ──\n"
+              "『界面_按钮』是**建按钮 + 点击行为**一把抓(按钮节点在玩法图里);"
+              "这个只**接行为**,不建也不改按钮(按钮来自『界面_套用设计』)。\n"
+              "重复执行也只接一次(不会越点越多次),所以放在每帧的链上也没事。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "控件名", ""),
+    )
+    gk_input_props = {"控件名": "gk_widget"}
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名",
+         "设计图里那个按钮节点的名字(建出来的控件就叫这个名字)"),
+    )
+    # 出口叫『点击』不叫『完成』:和『界面_按钮』同一个道理 ——
+    # 『完成』会被自动续接(接上就立刻跑后面的逻辑),而这里的语义是"点了才走"。
+    gk_outputs = (S.pin(FLOW, "点击"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+        layout.label(text="点了就走『点击』出口", icon="FORWARD")
+
+
+# ── 哪些节点算"控件构建"(设计图里该建什么由它决定)──────────────────
+# 判据:**这个节点会建出一个控件**。动作类(隐藏/设置/飘字/缓动/对话框/
+# 列表_填充/暂停游戏/设焦点/取文字)只管"运行时改已有控件",不进设计图 ——
+# 它们是玩法图的事。
+# 名单写在这里(而不是散在 8 个类上)是因为『界面_套用设计』要按它挑节点:
+# 一个问题只有一处答案,以后加新控件节点只改这一张表。
+UI_DESIGN_BUILDER_NODES = (
+    "GKNodeUiText", "GKNodeUiBar", "GKNodeUiButton", "GKNodeUiImage",
+    "GKNodeUiPanel", "GKNodeUiList", "GKNodeUiNinePatch", "GKNodeUiInput",
+)
+
+for _cls in CLASSES:
+    if _cls.bl_idname in UI_DESIGN_BUILDER_NODES:
+        # 两棵树都能放(老图一字不变,设计图也能摆)—— 用户第 40 轮选的
+        _cls.gk_tree_type = UI_TREES
+        # 『界面_套用设计』按这个标记挑节点,见 codegen.services._ui_design_nodes
+        _cls.gk_ui_builder = True
+
+
+# ==========================================================================
 # 射线
 # ==========================================================================
 @N

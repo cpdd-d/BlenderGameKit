@@ -34,6 +34,10 @@ from .. import gk_sockets as S
 # **纯取值**(没有执行流、随时求值都安全)的节点整类开放给动画树。
 BOTH_TREES = ("GKGameLogicTree", "GKAnimationTree")
 
+# 界面"控件构建"节点的归属(第四十轮):玩法图里照旧能放(老图一字不变),
+# 另外也能放进『游戏界面』设计图 —— 用户选的"两棵树都能放"。
+UI_TREES = ("GKGameLogicTree", "GKUiDesignTree")
+
 
 # ==========================================================================
 # 动作(Action)归属识别 —— "动画名下拉"的地基
@@ -193,6 +197,68 @@ def find_animation_tree(name=""):
     first = None
     for group in groups:
         if getattr(group, "bl_idname", "") != "GKAnimationTree":
+            continue
+        if first is None:
+            first = group
+        if wanted and str(getattr(group, "name", "")) == wanted:
+            return group
+    return first if not wanted else None
+
+
+# ==========================================================================
+# 界面设计图(第四十轮)—— 和动画树同一套"独立画布 + 一个引用节点"的套路
+# ==========================================================================
+# 用户第 40 轮原话:"添加游戏界面设计编辑器,方便对UI设计"。
+# 界面节点以前全挤在玩法图里,菜单一多(文本/按钮/面板/列表/…)玩法图就糊了。
+# 现在照动画树的做法分开:界面"长什么样"画在**独立一张图**里,
+# 玩法图只放一个『界面_套用设计』引用它(见 codegen.services)。
+def ui_design_tree_items():
+    """给『选…』按钮用的界面设计图清单:(标识, 显示名, 说明)。
+
+    和 `animation_tree_items` 同一套:标识就是树名(空串 = 自动用第一张)。
+    """
+    auto = ("", "自动(用文件里第一张)", "留空就用这张")
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return [auto]
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None) if data is not None else None
+    if groups is None:
+        return [auto]
+    trees = []
+    for group in groups:
+        if getattr(group, "bl_idname", "") != "GKUiDesignTree":
+            continue
+        count = len([n for n in (getattr(group, "nodes", ()) or ())
+                     if getattr(n, "gk_ui_builder", False)])
+        trees.append((str(group.name), f"{group.name}  ({count} 个控件)", "这张设计图"))
+    return [auto] + trees
+
+
+def ui_design_tree_names():
+    """文件里所有界面设计图的名字(不含"自动"那一项)。"""
+    return [item[0] for item in ui_design_tree_items() if item[0]]
+
+
+def find_ui_design_tree(name=""):
+    """按名字找一张界面设计图;名字为空就用文件里第一张(找不到返回 None)。
+
+    面板、节点上的预览、代码生成三处都要问"这个引用节点会用哪张图",
+    判断必须只有一份 —— 和 `find_animation_tree` 同一个理由。
+    """
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return None
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return None
+    wanted = str(name or "")
+    first = None
+    for group in groups:
+        if getattr(group, "bl_idname", "") != "GKUiDesignTree":
             continue
         if first is None:
             first = group

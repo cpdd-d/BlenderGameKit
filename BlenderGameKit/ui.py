@@ -137,7 +137,8 @@ class GK_OT_SwitchTree(bpy.types.Operator):
         current = (getattr(space, "edit_tree", None)
                    or getattr(space, "node_tree", None))
         if current is not None and current_kind in ("GKGameLogicTree",
-                                                    "GKAnimationTree"):
+                                                    "GKAnimationTree",
+                                                    "GKUiDesignTree"):
             _LAST_TREE[current_kind] = current
 
         wanted = self.target
@@ -151,7 +152,10 @@ class GK_OT_SwitchTree(bpy.types.Operator):
                     tree = group
                     break
         if tree is None:
-            if wanted == "GKAnimationTree":
+            if wanted == "GKUiDesignTree":
+                # 顺手放个起始控件(见 _new_ui_design_tree)
+                tree = _new_ui_design_tree()
+            elif wanted == "GKAnimationTree":
                 # 顺手放个起始状态,免得面对空图不知道从哪下手
                 tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
                 state = tree.nodes.new("GKNodeAnimState")
@@ -365,6 +369,431 @@ class GK_PT_AnimTree(bpy.types.Panel):
         hint = layout.box()
         hint.label(text="动画图跟着游戏逻辑一起导出", icon="INFO")
         hint.label(text="切到『游戏逻辑』那张图 -> 导出为 Godot 脚本")
+
+
+# ==========================================================================
+# 界面设计图 —— 第三张节点图(第四十轮,用户说"方便对UI设计")
+# ==========================================================================
+# ── 和前两张的关系(用户第 40 轮选的"套用式")──────────────────────
+#     玩法图(游戏逻辑)              界面设计图(游戏界面)
+#     ┌──────────────────┐          ┌─────────────────────────────┐
+#     │ 每当_准备         │          │ [界面_面板 暂停菜单]         │
+#     │  界面_套用设计 ───┼─引用────>│ [界面_文本 标题]  父=暂停菜单│
+#     │  界面_按钮点击    │          │ [界面_按钮 继续]  父=暂停菜单│
+#     └──────────────────┘          └─────────────────────────────┘
+#
+# 设计图里只管"长什么样"(控件、坐标、父子、样式);玩法图里管
+# "什么时候显示 / 点了做什么"。控件引用一律**按名字**
+# (『界面_隐藏控件』『界面_设置』『界面_按钮点击』都填节点名)。
+#
+# 界面节点**两棵树都能放**(老图一字不变)—— 这不是强制迁移,是多一个地方摆。
+class GKUiDesignTree(bpy.types.NodeTree):
+    """游戏界面节点树:控件摆在这里,由玩法图的『界面_套用设计』建出来。"""
+
+    bl_idname = "GKUiDesignTree"
+    bl_label = "游戏界面"
+    bl_icon = "WINDOW"
+    bl_description = ("BlenderGameKit 的界面设计图 —— 控件(文本 / 按钮 / 面板 / "
+                      "列表…)摆在这里,玩法图放一个『界面_套用设计』引用它")
+
+    # ── 视口叠加预览(用户第 40 轮选的"清单 + 视口叠加")───────────────
+    # 编辑这张图时,3D 视口里按屏幕比例把控件画成框 —— 不用导出就能看出
+    # "东西大概摆在哪"。默认开,嫌挡就在侧栏里关掉。
+    gk_preview: BoolProperty(
+        name="视口预览", default=True,
+        description="编辑这张设计图时,在 3D 视口上按屏幕比例叠画控件框")
+
+    # 预览的"屏幕"多大 —— 就是游戏窗口的像素尺寸(和 Godot 工程一致)。
+    # 控件里填的 X / Y / 宽 / 高 都是这个坐标系里的像素。
+    gk_design_width: IntProperty(name="设计宽", default=1152, min=64, max=7680)
+    gk_design_height: IntProperty(name="设计高", default=648, min=64, max=7680)
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        layout.label(text="控件摆这里,玩法图用『界面_套用设计』引用", icon="INFO")
+
+
+def _new_ui_design_tree():
+    """新建一张界面设计图,顺手放一个起始控件。
+
+    照动画树"新建时放一个起始状态"的做法 —— 面对一张空图,
+    十个有九个不知道第一个该放什么。
+    """
+    tree = bpy.data.node_groups.new("主界面", "GKUiDesignTree")
+    title = tree.nodes.new("GKNodeUiText")
+    title.name = "标题"
+    title.location = (0.0, 0.0)
+    title.gk_text = "标题"
+    return tree
+
+
+class GK_OT_OpenUiDesignTree(bpy.types.Operator):
+    """打开界面设计图;没有就新建一张。
+
+    和『打开/新建动画树』同一个理由:设计图是**另一张节点图**,
+    新手不知道要去节点编辑器的类型下拉里切。
+    """
+
+    bl_idname = "gk.open_ui_design_tree"
+    bl_label = "打开/新建界面设计图"
+    bl_description = "切到『游戏界面』设计图(没有就新建一张并放一个起始控件)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        trees = [g for g in bpy.data.node_groups
+                 if getattr(g, "bl_idname", "") == "GKUiDesignTree"]
+        tree = trees[0] if trees else None
+        if tree is None:
+            tree = _new_ui_design_tree()
+            self.report({"INFO"}, f"已新建界面设计图『{tree.name}』")
+
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"},
+                        "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+        space.tree_type = "GKUiDesignTree"
+        space.node_tree = tree
+        return {"FINISHED"}
+
+
+# ── 控件清单的顺序 / 图标(侧栏清单和视口预览共用)────────────────────
+_UI_WIDGET_ICONS = {
+    "GKNodeUiText": "FONT_DATA",
+    "GKNodeUiBar": "COLOR",
+    "GKNodeUiButton": "PLAY",
+    "GKNodeUiImage": "IMAGE_DATA",
+    "GKNodeUiPanel": "MOD_OPACITY",
+    "GKNodeUiList": "LINENUMBERS_ON",
+    "GKNodeUiNinePatch": "MESH_GRID",
+    "GKNodeUiInput": "GREASEPENCIL",
+}
+
+
+def _ui_design_widget_rows(nodes):
+    """控件按父子关系排成 `[(控件, 层级)]`:父母在前、子项缩进。
+
+    ── 为什么不用 id()/is 认同一个节点(踩过的坑)──────────────────────
+    Blender 里 `tree.nodes[i]` 和顺着属性拿到的可能是**两个 Python 包装
+    对象**(见 nodes.node_key 的说明)。所以身份一律走 `node_lib.node_key`,
+    和 codegen 那边同一套判断。
+    """
+    by_name = {}
+    for node in nodes:
+        by_name.setdefault(str(getattr(node, "name", "")), node)
+    children = {}
+    roots = []
+    for node in nodes:
+        parent = by_name.get(str(getattr(node, "gk_parent_widget", "") or "").strip())
+        if parent is not None and node_lib.node_key(parent) != node_lib.node_key(node):
+            children.setdefault(str(getattr(parent, "name", "")), []).append(node)
+        else:
+            roots.append(node)
+
+    rows = []
+
+    def walk(node, depth):
+        rows.append((node, depth))
+        for child in children.get(str(getattr(node, "name", "")), ()):
+            walk(child, depth + 1)
+
+    for node in roots:
+        walk(node, 0)
+    # 环形父子(甲挂乙、乙挂甲)会让两个都进不了 roots —— 兜底补在末尾,
+    # 不能因为用户摆错就"清单里凭空少两个控件"。
+    listed = {node_lib.node_key(node) for node, _depth in rows}
+    for node in nodes:
+        if node_lib.node_key(node) not in listed:
+            rows.append((node, 0))
+    return rows
+
+
+def _ui_preview_size(node):
+    """控件的**大致**尺寸(设计像素)—— 视口预览用。
+
+    文字控件没有宽高(size 就是文字本身),按"字数 × 字号"估一个;
+    图片的"0 = 用原图尺寸"这里拿不到原图,退回 128。
+    """
+    kind = getattr(node, "bl_idname", "")
+    if kind == "GKNodeUiText":
+        size = float(getattr(node, "gk_size", 24) or 24)
+        text = str(getattr(node, "gk_text", "") or "")
+        return (max(60.0, len(text) * size * 1.05), size * 1.4)
+    width = float(getattr(node, "gk_width", 0.0) or 0.0)
+    height = float(getattr(node, "gk_height", 0.0) or 0.0)
+    return (width if width > 0.0 else 128.0,
+            height if height > 0.0 else 128.0)
+
+
+def _ui_preview_rects(tree):
+    """算出每个控件在"设计像素"里的矩形:`[(名字, x, y, 宽, 高, 层级)]`。
+
+    ── 这是**近似**预览(面板上也是这么写的)──────────────────────────
+    * 对齐 = 左上:直接读 X / Y(和生成的代码一致);
+    * 其它对齐:按 Godot 预设的语义在**父控件(或屏幕)矩形**里算 ——
+      "屏幕右上角留 24"这类意图能看出来;
+    * 挂在『界面_列表』里的子控件由容器排版,这里从容器左上角起流水排;
+    * 文字宽度 / 图片原始尺寸拿不到就估,做不到像素级精确 —— 但
+      "谁压住了谁、有没有摆到屏幕外"这些**真正需要看出来的问题**够用。
+    """
+    widgets = [n for n in (getattr(tree, "nodes", ()) or ())
+               if getattr(n, "gk_ui_builder", False)]
+    if not widgets:
+        return []
+    screen_w = float(getattr(tree, "gk_design_width", 1152) or 1152)
+    screen_h = float(getattr(tree, "gk_design_height", 648) or 648)
+    list_names = {}
+    for node in widgets:
+        if getattr(node, "bl_idname", "") == "GKNodeUiList":
+            list_names[str(getattr(node, "name", ""))] = float(
+                getattr(node, "gk_separation", 8) or 8.0)
+
+    rects = {}
+    out = []
+    row_cursor = {}          # 列表容器 -> 下一个子控件排到哪了(竖排)
+    for node, depth in _ui_design_widget_rows(widgets):
+        name = str(getattr(node, "name", ""))
+        width, height = _ui_preview_size(node)
+        parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
+        parent = rects.get(parent_name) or (0.0, 0.0, screen_w, screen_h)
+        px, py, pw, ph = parent
+        align = str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT")
+        margin = float(getattr(node, "gk_margin", 24.0) or 0.0)
+
+        if parent_name in list_names:
+            # 容器排版:从容器左上角往下流水摆(间距照『间距』属性估)
+            separation = list_names[parent_name]
+            cursor = row_cursor.get(parent_name, (px, py))
+            x, y = cursor
+            row_cursor[parent_name] = (x, y + height + separation)
+        elif align == "TOP_LEFT":
+            x = px + float(getattr(node, "gk_x", 20.0) or 0.0)
+            y = py + float(getattr(node, "gk_y", 20.0) or 0.0)
+        elif align == "TOP_CENTER":
+            x, y = px + (pw - width) * 0.5, py + margin
+        elif align == "TOP_RIGHT":
+            x, y = px + pw - width - margin, py + margin
+        elif align == "CENTER_LEFT":
+            x, y = px + margin, py + (ph - height) * 0.5
+        elif align == "CENTER":
+            x, y = px + (pw - width) * 0.5, py + (ph - height) * 0.5
+        elif align == "CENTER_RIGHT":
+            x, y = px + pw - width - margin, py + (ph - height) * 0.5
+        elif align == "BOTTOM_LEFT":
+            x, y = px + margin, py + ph - height - margin
+        elif align == "BOTTOM_CENTER":
+            x, y = px + (pw - width) * 0.5, py + ph - height - margin
+        else:                                        # BOTTOM_RIGHT
+            x, y = px + pw - width - margin, py + ph - height - margin
+
+        rects[name] = (x, y, width, height)
+        out.append((name, x, y, width, height, depth))
+    return out
+
+
+# 预览里每一层的颜色(按层级轮换 —— 一眼看出"这是谁的子控件")
+_UI_PREVIEW_COLORS = (
+    (0.25, 0.58, 0.95, 0.32),
+    (0.30, 0.80, 0.55, 0.32),
+    (0.95, 0.72, 0.25, 0.32),
+    (0.80, 0.45, 0.85, 0.32),
+)
+
+# 挂在 3D 视口上的绘制句柄(注册时加、注销时摘)
+_UI_PREVIEW_HANDLE = []
+
+
+def _ui_preview_tree():
+    """找出正在编辑的界面设计图(没在编辑 / 关了预览就返回 None)。"""
+    context = bpy.context
+    screen = getattr(context, "screen", None)
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") != "NODE_EDITOR":
+            continue
+        for space in getattr(area, "spaces", ()) or ():
+            if getattr(space, "tree_type", "") != "GKUiDesignTree":
+                continue
+            tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+            if tree is None or str(getattr(tree, "bl_idname", "")) != "GKUiDesignTree":
+                continue
+            if not getattr(tree, "gk_preview", True):
+                continue
+            return tree
+    return None
+
+
+def _ui_preview_draw():
+    """3D 视口上的叠加预览(POST_PIXEL 绘制回调)。
+
+    ── 三条纪律 ────────────────────────────────────────────────────
+    1. **不许抛异常**:绘制回调里冒异常会刷满控制台、还会连累别的绘制,
+       所以整段包在 try 里(宁可这一帧不画);
+    2. 不用完的 GPU 状态要还原(blend 模式);
+    3. 只在"正编辑设计图 + 勾了预览"时画 —— 别的场合一帧都不多花。
+    """
+    try:
+        tree = _ui_preview_tree()
+        if tree is None:
+            return
+        region = getattr(bpy.context, "region", None)
+        if region is None or region.width < 80 or region.height < 80:
+            return
+        import blf
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+
+        rw, rh = float(region.width), float(region.height)
+        design_w = float(getattr(tree, "gk_design_width", 1152) or 1152)
+        design_h = float(getattr(tree, "gk_design_height", 648) or 648)
+        scale = min((rw - 48.0) / design_w, (rh - 48.0) / design_h)
+        if scale <= 0.0:
+            return
+        box_w, box_h = design_w * scale, design_h * scale
+        x0 = (rw - box_w) * 0.5
+        y0 = (rh - box_h) * 0.5
+
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        try:
+            # 屏幕框:底色 + 亮边(这就是"游戏窗口"的范围)
+            quad = [(x0, y0), (x0 + box_w, y0), (x0 + box_w, y0 + box_h),
+                    (x0, y0), (x0 + box_w, y0 + box_h), (x0, y0 + box_h)]
+            batch = batch_for_shader(shader, "TRIANGLES", {"pos": quad})
+            shader.bind()
+            shader.uniform_float("color", (0.04, 0.05, 0.08, 0.55))
+            batch.draw(shader)
+            frame = [(x0, y0), (x0 + box_w, y0), (x0 + box_w, y0), (x0, y0 + box_h),
+                     (x0 + box_w, y0 + box_h), (x0, y0 + box_h),
+                     (x0, y0 + box_h), (x0, y0)]
+            batch = batch_for_shader(shader, "LINES", {"pos": frame})
+            shader.bind()
+            shader.uniform_float("color", (0.55, 0.75, 1.0, 0.9))
+            batch.draw(shader)
+
+            # 控件框:按层级分组,一组一次 draw(几十个控件也就几次绘制)
+            buckets = {}
+            labels = []
+            for name, rx, ry, width, height, depth in _ui_preview_rects(tree):
+                left = x0 + rx * scale
+                bottom = y0 + (design_h - ry - height) * scale
+                right = left + width * scale
+                top = bottom + height * scale
+                verts = buckets.setdefault(depth % len(_UI_PREVIEW_COLORS), [])
+                verts.extend(((left, bottom), (right, bottom), (right, top),
+                              (left, bottom), (right, top), (left, top)))
+                labels.append((name, left + 3.0, top + 4.0))
+            for index, verts in buckets.items():
+                batch = batch_for_shader(shader, "TRIANGLES", {"pos": verts})
+                shader.bind()
+                shader.uniform_float("color", _UI_PREVIEW_COLORS[index])
+                batch.draw(shader)
+
+            blf.size(0, 11.0)
+            blf.color(0, 0.95, 0.95, 0.95, 0.9)
+            for name, lx, ly in labels:
+                blf.position(0, lx, ly, 0.0)
+                blf.draw(0, name)
+        finally:
+            gpu.state.blend_set("NONE")
+    except Exception:                                     # noqa: BLE001
+        # 绘制回调的异常没有任何去处 —— 静默跳过这一帧
+        return
+
+
+def _remove_ui_preview_handler():
+    """摘掉视口绘制回调(注销 / 重载时各调一次,重复调没事)。"""
+    import bpy as _bpy
+    while _UI_PREVIEW_HANDLE:
+        handle = _UI_PREVIEW_HANDLE.pop()
+        try:
+            _bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except Exception:                                 # noqa: BLE001
+            pass
+
+
+class GK_PT_UiDesign(bpy.types.Panel):
+    """界面设计图专属面板:控件清单 + 预览开关 + 用法提示。"""
+
+    bl_idname = "GK_PT_UiDesign"
+    bl_label = "游戏界面 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏界面"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and getattr(space, "tree_type", "") == "GKUiDesignTree"
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        if tree is None:
+            layout.label(text="没有界面设计图", icon="INFO")
+            return
+
+        widgets = [n for n in tree.nodes if getattr(n, "gk_ui_builder", False)]
+
+        # ---- 概览 ----
+        box = layout.box()
+        box.label(text=f"『{tree.name}』:{len(widgets)} 个控件", icon="NODETREE")
+        if not widgets:
+            box.label(text="还没摆控件 —— 先加一个『界面_文本』试试",
+                      icon="INFO")
+            row = box.row(align=True)
+            row.operator("gk.add_node_menu", text="文本",
+                         icon="ADD").node_type = "GKNodeUiText"
+            row.operator("gk.add_node_menu", text="面板",
+                         icon="ADD").node_type = "GKNodeUiPanel"
+            row.operator("gk.add_node_menu", text="按钮",
+                         icon="ADD").node_type = "GKNodeUiButton"
+
+        # ---- 控件清单(父 -> 子缩进,游戏里也按这个顺序建)----
+        if widgets:
+            box = layout.box()
+            box.label(text="控件清单(父 → 子)", icon="LINENUMBERS_ON")
+            known = {str(getattr(n, "name", "")) for n in widgets}
+            for widget, depth in _ui_design_widget_rows(widgets):
+                name = str(getattr(widget, "name", ""))
+                parent_name = str(getattr(widget, "gk_parent_widget", "") or "").strip()
+                row = box.row(align=True)
+                icon = _UI_WIDGET_ICONS.get(getattr(widget, "bl_idname", ""), "NODE")
+                if parent_name and parent_name not in known:
+                    # 父控件填了个这张图里没有的名字 -> 生成时会告警 + 挂到根下
+                    icon = "ERROR"
+                row.label(text="    " * depth + name, icon=icon)
+                pick = row.operator("gk.select_node", text="", icon="VIEWZOOM")
+                pick.node_name = name
+            missing = [str(n.name) for n in widgets
+                       if str(getattr(n, "gk_parent_widget", "") or "").strip()
+                       and str(getattr(n, "gk_parent_widget", "") or "").strip() not in known]
+            if missing:
+                box.label(text=f"父控件名字对不上:{'、'.join(missing[:3])}",
+                          icon="ERROR")
+
+        # ---- 预览 ----
+        box = layout.box()
+        box.label(text="预览(叠画在 3D 视口上)", icon="VIEWZOOM")
+        row = box.row(align=True)
+        row.prop(tree, "gk_preview", text="", toggle=True)
+        row.label(text="显示控件框" if getattr(tree, "gk_preview", True) else "已关闭")
+        row = box.row(align=True)
+        row.prop(tree, "gk_design_width", text="宽")
+        row.prop(tree, "gk_design_height", text="高")
+        box.label(text="按这块屏幕的比例画(近似预览)", icon="INFO")
+
+        # ---- 用法 ----
+        box = layout.box()
+        box.label(text="玩法图放『界面_套用设计』引用本图", icon="INFO")
+        box.label(text="点了做什么 -> 『界面_按钮点击』填控件名")
+        row = box.row(align=True)
+        back = row.operator("gk.switch_tree", text="← 回到游戏逻辑",
+                            icon="LOOP_BACK")
+        back.target = "GKGameLogicTree"
 
 
 # ==========================================================================
@@ -2459,23 +2888,33 @@ def _draw_tree_list_box(layout, context):
         return
     groups = [g for g in bpy.data.node_groups
               if getattr(g, "bl_idname", "") in ("GKGameLogicTree",
-                                                 "GKAnimationTree")]
+                                                 "GKAnimationTree",
+                                                 "GKUiDesignTree")]
     if not groups:
         box.label(text="还没有节点图", icon="INFO")
         return
     disabled = 0
     for group in groups:
         row = box.row(align=True)
+        blob = getattr(group, "bl_idname", "")
         enabled = bool(getattr(group, "gk_enabled", True))
         if not enabled:
             disabled += 1
-        icon = "NODETREE" if group.bl_idname == "GKGameLogicTree" \
-            else "ARMATURE_DATA"
+        icon = ("NODETREE" if blob == "GKGameLogicTree"
+                else "ARMATURE_DATA" if blob == "GKAnimationTree"
+                else "WINDOW")
         # 勾选框:关掉 = 这张图不参与导出
-        row.prop(group, "gk_enabled", text="")
+        if blob == "GKUiDesignTree":
+            # ── 设计图没有"参与导出"这一说(第四十轮)────────────────
+            # 它由玩法图的『界面_套用设计』按需引用 —— 摆一个勾选框
+            # 不仅含义含糊,`prop()` 还会去读它**没有**的属性(画面板时炸)。
+            row.label(text=" ")
+        else:
+            row.prop(group, "gk_enabled", text="")
         op = row.operator("gk.focus_tree", text=group.name, icon=icon)
         op.tree_name = group.name
-        kind = "逻辑" if group.bl_idname == "GKGameLogicTree" else "动画"
+        kind = {"GKGameLogicTree": "逻辑", "GKAnimationTree": "动画",
+                "GKUiDesignTree": "界面"}.get(blob, "图")
         row.label(text=f"{kind} · {len(group.nodes)} 节点")
     if disabled:
         box.label(text=f"有 {disabled} 张图已停用(不会导出)", icon="INFO")
@@ -2631,6 +3070,12 @@ class GK_OT_FocusTree(bpy.types.Operator):
         if group is None or space is None:
             return {"CANCELLED"}
         try:
+            # ── 先把编辑器类型切对再塞图(第四十轮)────────────────────
+            # Blender 的节点编辑器只认**当前类型**的树:显示着『游戏逻辑』
+            # 时直接塞一张界面设计图进去会被拒(打不开 / 悄悄弹回)。
+            kind = str(getattr(group, "bl_idname", ""))
+            if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree"):
+                space.tree_type = kind
             space.pin = True
             space.node_tree = group
         except Exception:
@@ -3192,6 +3637,23 @@ class GK_PT_Main(bpy.types.Panel):
             box.operator("gk.open_anim_tree", text="打开/新建动画树",
                          icon="FILE_NEW")
 
+        # ---- 界面设计(独立那张图,第四十轮)----
+        box, opened = collapsible_box(layout, "ui_design",
+                                      "界面设计(单独一张图)", "WINDOW")
+        if opened:
+            design_trees = [g for g in bpy.data.node_groups
+                            if getattr(g, "bl_idname", "") == "GKUiDesignTree"]
+            if design_trees:
+                for design in design_trees:
+                    count = len([n for n in design.nodes
+                                 if getattr(n, "gk_ui_builder", False)])
+                    box.label(text=f"{design.name}  ({count} 个控件)",
+                              icon="NODETREE")
+            else:
+                box.label(text="还没有界面设计图", icon="INFO")
+            box.operator("gk.open_ui_design_tree", text="打开/新建界面设计图",
+                         icon="FILE_NEW")
+
         # 「动作分类」删掉(用户第 24、25 轮两次点名):
         # 它只是给动作打个标签,而标签现在没有任何地方用到 ——
         # 占了侧栏一大块,却只显示"未分类 · 待机"这种没用的一行。
@@ -3507,6 +3969,17 @@ def on_register():
         except Exception as exc:  # pragma: no cover
             gk_log.error(f"挂载 {target_name} 失败: {exc}")
 
+    # ---- 界面设计图的视口叠加预览(第四十轮)----
+    # 先摘旧句柄再挂:重载会留下上一版的回调(行为一样但函数对象已过期),
+    # 不摘的话画两遍。绘制本身有 try 兜底,挂载失败也只是少个预览。
+    _remove_ui_preview_handler()
+    try:
+        _UI_PREVIEW_HANDLE.append(
+            bpy.types.SpaceView3D.draw_handler_add(
+                _ui_preview_draw, (), "WINDOW", "POST_PIXEL"))
+    except Exception as exc:                              # pragma: no cover
+        gk_log.warn(f"界面预览绘制挂载失败: {exc}")
+
     # ---- 自检:确认每个分类子菜单都真的注册上了 ----
     # 动态生成的菜单类很容易因为一个小笔误(非法图标名、bl_idname 重复)
     # 而**静默**注册失败，所以这里主动查一遍并报出来。
@@ -3599,6 +4072,7 @@ def unregister_keymaps():
 GK_CLASSES = (
     GKGameLogicTree,
     GKAnimationTree,
+    GKUiDesignTree,
     # 侧栏里"点一下就跳过去"的两个小算子(节点图总览 / 脚本载体)
     GK_OT_FocusTree,
     GK_OT_FocusObject,
@@ -3627,12 +4101,12 @@ GK_CLASSES = (
     # 诊断信息(用户第 26 轮:出问题时把调试信息发我)
     diagnostics.GK_OT_DumpDiagnostics,
     GK_OT_OpenAnimTree,
+    GK_OT_OpenUiDesignTree,
     GK_OT_SwitchTree,
     GK_OT_AnimVarAdd,
     GK_OT_AnimVarRemove,
     GK_OT_AnimVarMakeNode,
     GK_OT_AnimVarPick,
-    GK_PT_AnimTree,
     GK_OT_AddNodeMenu,
     GK_OT_FindNode,
     GK_MT_AddNodeCategories,
@@ -3649,12 +4123,16 @@ GK_CLASSES = (
     # 侧栏盒子的折叠开关(用户 2026-10-04)
     GK_OT_ToggleSection,
     GK_PT_Main,
+    GK_PT_AnimTree,
+    GK_PT_UiDesign,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,
 ) + tuple(CATEGORY_MENUS)
 
 
 def on_unregister():
+    # 摘掉界面预览的视口绘制回调(留着的话禁用插件后它还在画)
+    _remove_ui_preview_handler()
     # 摘掉菜单回调。按标记摘 —— 这样连以前重载遗留的旧函数也一起清掉,
     # 禁用插件后不会留野回调。
     for target_name in ("NODE_MT_add", "NODE_MT_context_menu"):
