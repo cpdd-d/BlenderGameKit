@@ -1841,11 +1841,13 @@ def main():
         script_path = next((p for p in result["written"] if p.endswith(".gd")),
                            os.path.join(out_dir, "scripts", result["script_name"]))
         check("导出脚本文件", os.path.isfile(script_path), script_path)
-        # 冒烟场景里**没有相机** -> 导出会提示"运行时会造一台自由飞行观察机"。
+        # 冒烟场景里**没有相机** -> 导出会提示"运行时会自动造一台相机"
+        # (2D 造 Camera2D 框住全部物体 / 3D 造自由飞行观察机,第四十六轮分流)。
         # 那是**好消息**(告诉你没相机时也能看见画面),不是错误;
-        # 和"基类自愈"一样属于信息类提示,不该让冒烟失败。
+        # 和"基类自愈"一样属于信息类提示,不该让冒烟失败 —— 按**共同前缀**
+        # 豁免,两种维度的文案都不会顶掉这条断言。
         real_warnings = [w for w in result["warnings"]
-                         if "自由飞行观察机" not in str(w)]
+                         if "场景里一台相机都没有" not in str(w)]
         check("导出时无告警", not real_warnings, str(real_warnings))
 
         # 读回来比对，确认磁盘内容与生成内容一致

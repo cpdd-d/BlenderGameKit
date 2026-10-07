@@ -251,6 +251,13 @@ class Generator:
             self._emit_god_guard_helper(sections)
         if getattr(self.ctx, "need_camera_query_helper", False):
             self._emit_fly_camera(sections)
+        # ---- 2D 兜底相机(第四十六轮)──────────────────────────────────
+        # 2D 场景里**没有相机**时,Godot 停在原点视图(视口左下角是 (0,0),
+        # y 向下)—— 关卡摆在负坐标区就是"运行后一片空 / 视角错乱"
+        # (用户实测:2D 寻路示例)。3D 那边早有兜底(自由飞行观察机),
+        # 2D 这边一直缺 —— 这里补上。有相机的场景一根手指都不动。
+        if getattr(self.ctx, "dim", 3) == 2:
+            self._emit_camera2d_fallback(sections)
         # ---- 寻路第二版(第三十六轮):避障 / 重烤导航 ----------
         if (getattr(self.ctx, "need_nav_avoid", False)
                 or getattr(self.ctx, "need_nav_avoid_2d", False)
@@ -1718,6 +1725,66 @@ class Generator:
                                    "    else:",
                                    "        push_warning(\"[GK] 没找到环境脚本(Environment)—— 导航重烤跳过\")",
                                ])
+
+    def _emit_camera2d_fallback(self, sections):
+        """2D 兜底相机:框住所有 2D 物体的 Camera2D(第四十六轮)。
+
+        ── 为什么必须兜(用户实测)────────────────────────────────────
+        2D 场景里没有相机时,Godot 停在**原点视图** —— 关卡摆在负坐标区
+        就"运行后一片空"。3D 那边早有兜底(自由飞行观察机),2D 这边一直缺。
+
+        幂等:已经有**当前**的 Camera2D 就直接返回(用户自己放了相机时别抢)。
+        """
+        if getattr(self, "_camera2d_emitted", False):
+            return
+        self._camera2d_emitted = True
+        ready = self._section_for(sections, "_ready")
+        if ready is None:
+            ready = {"signature": "func _ready() -> void:",
+                     "lines": [], "empty_body": "    pass", "separator": True}
+            sections.append(ready)
+        # 放在 _ready 最前面:相机先就位,后面那些节点才谈得上"看得见"
+        ready["lines"].insert(0, "    _gk_ensure_camera2d(self)")
+        self._append_block(
+            sections, "_gk_ensure_camera2d",
+            "func _gk_ensure_camera2d(host: Node) -> void:",
+            [
+                "    # 已经有当前 Camera2D 就不动(用户自己放了相机时别抢)",
+                "    if host.get_tree() == null:",
+                "        return",
+                "    for found in host.get_tree().root.find_children(\"*\", \"Camera2D\", true, false):",
+                "        if found is Camera2D and (found as Camera2D).is_current():",
+                "            return",
+                "    # 框住所有 2D 物体:取它们的全局位置算包围盒",
+                "    var min_point := Vector2(INF, INF)",
+                "    var max_point := Vector2(-INF, -INF)",
+                "    var count := 0",
+                "    for node in host.get_tree().root.find_children(\"*\", \"Node2D\", true, false):",
+                "        if node is Camera2D:",
+                "            continue",
+                "        var point := (node as Node2D).global_position",
+                "        min_point = min_point.min(point)",
+                "        max_point = max_point.max(point)",
+                "        count += 1",
+                "    if count == 0:",
+                "        return",
+                "    var cam := Camera2D.new()",
+                "    cam.name = \"GK兜底相机2D\"",
+                "    # ⚠ 还没进树:用 position 摆位(global_position 要有父级才算得准)",
+                "    cam.position = (min_point + max_point) * 0.5",
+                "    # 跨距留 4 米边;缩放 = 视口尺寸 / 跨距,内容全进画面",
+                "    var span := (max_point - min_point) + Vector2(4.0, 4.0)",
+                "    var view := Vector2(host.get_viewport().get_visible_rect().size)",
+                "    if span.x > 0.01 and span.y > 0.01:",
+                "        cam.zoom = (view / span).clamp(Vector2(0.05, 0.05), Vector2(8.0, 8.0))",
+                "    # ⚠ 必须**延后**挂到 root:_ready 里 root 还在装配子节点,",
+                "    #   当场 add_child 会报 \"Parent node is busy setting up children\"",
+                "    #   并且失败 —— 相机没进树,make_current 又跟着报",
+                "    #   \"!enabled || !is_inside_tree()\"(实测踩过,就在这个示例里)",
+                "    host.get_tree().root.add_child.call_deferred(cam)",
+                "    cam.make_current.call_deferred()",
+                "    push_warning(\"[GK] 2D 场景里没有相机 —— 造了一台兜底相机框住全部物体;想自己控镜头就在 Blender 里放一台相机\")",
+            ])
 
     def _emit_fly_camera(self, sections):
         """生成"兜底观察机":场景里**一台相机都没有**时现造一台自由飞行相机。

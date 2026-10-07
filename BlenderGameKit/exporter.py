@@ -692,12 +692,22 @@ def export_tree(tree, settings=None, write_scene=None):
             if cam_name:
                 gk_log.info(f"主相机: {cam_name}({cam_why})")
             else:
-                _note(models.Diagnostic(
-                    level="warning", code="NO_CAMERA",
-                    message=("场景里一台相机都没有 —— 运行时会自动造一台自由飞行"
-                             "观察机(WASD 平移 / 空格上升 / Shift 下降 / 鼠标转视角)。"),
-                    hint="想固定镜头:放一台相机,并把它设为 Blender 视口的"
-                          "当前相机(小键盘 0);也可以打开『上帝摄像机』"))
+                # 2D / 3D 的兜底不一样(第四十六轮):2D 造的是"框住全部
+                # 物体的 Camera2D"(以前没有 → 运行后一片空),3D 才是自由
+                # 飞行观察机 —— 文案跟着维度走,别再让 2D 用户去找 WASD。
+                if str(options.dimension or "3") == "2":
+                    message = ("场景里一台相机都没有 —— 运行时会自动造一台 "
+                               "Camera2D 并**框住全部物体**(2D 场景)。")
+                    hint = ("想自己控镜头:在 Blender 里放一台相机并设为视口"
+                            "当前相机(小键盘 0)")
+                else:
+                    message = ("场景里一台相机都没有 —— 运行时会自动造一台自由"
+                               "飞行观察机(WASD 平移 / 空格上升 / Shift 下降 / "
+                               "鼠标转视角)。")
+                    hint = ("想固定镜头:放一台相机,并把它设为 Blender 视口的"
+                            "当前相机(小键盘 0);也可以打开『上帝摄像机』")
+                _note(models.Diagnostic(level="warning", code="NO_CAMERA",
+                                        message=message, hint=hint))
         except Exception:
             gk_log.exception("检查主相机时出错(继续导出)")
 

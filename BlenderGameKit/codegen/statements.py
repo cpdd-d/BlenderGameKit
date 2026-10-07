@@ -512,7 +512,10 @@ def _stmt_drive_vehicle(ctx, node, indent):
     # 同一个坑、同一段代码:运动学体撞刚体只会滑走,得自己施冲量。
     # 必须放在 move_and_slide() 之后(那之后才有 get_slide_collision 可查)。
     if bool(getattr(node, "gk_push_bodies", False)):
-        _push_rigid_bodies(ctx, node, vehicle, indent + 1)
+        _push_rigid_bodies(
+            ctx, node, vehicle, indent + 1,
+            character_pin=(who if bool(getattr(node, "gk_push_characters", True))
+                           else None))
     ctx.add_line(indent + 1,
                  f"{who}.global_position = {vehicle}.global_transform * "
                  f'({vehicle}.get_meta("gk_seat", {seat_type}.ZERO) as {seat_type})')
@@ -531,7 +534,7 @@ def _expr_drive_outputs(ctx, node):
     return {"驾驶中": f'{vehicle}.get_meta("gk_driving", false)'}
 
 
-def _push_rigid_bodies(ctx, node, target, indent):
+def _push_rigid_bodies(ctx, node, target, indent, character_pin=None):
     """把撞到的刚体推一把(CharacterBody 自己**不会**推刚体)。
 
     ── 为什么必须自己写(实测:推箱子推不动)───────────────────────
@@ -544,6 +547,15 @@ def _push_rigid_bodies(ctx, node, target, indent):
     (= 持续施加『推力』牛顿)。乘质量是为了让轻重箱子**手感一致**
     (重箱子需要更大的力才动)。方向取碰撞法线的水平反向:
     角色往哪推、箱子就往哪走;Y 分量丢掉,免得把箱子往地里/天上按。
+
+    ── `character_pin`:顺带"顶开角色"(第四十六轮)──────────────────
+    用户:"角色上车后与 AI 角色碰撞会弹开 AI";确认的期望是
+    **车能把角色顶开**。实机量到的真相是:两边都是运动学体,
+    `move_and_slide` 互相只会阻挡 —— 撞上去是"双方都顶停",
+    AI 一分钱都推不走(上面那段冲量只对刚体生效,永远不会触发)。
+    所以这里给角色体补一段**每帧限速的位移**:车开过去能把人顶着走,
+    但每帧最多 0.15 米(≈9 m/s),**绝不会弹飞**。
+    `character_pin` = 车上那个人(驾驶员),要跳过 —— 他正被钉在座位上。
     """
     force = gd_number(float(getattr(node, "gk_push_force", 30.0) or 0.0))
     body_type = "RigidBody2D" if ctx.dim == 2 else "RigidBody3D"
@@ -565,6 +577,21 @@ def _push_rigid_bodies(ctx, node, target, indent):
                    f"* ({rigid} as {body_type}).mass")
     ctx.add_line(indent + 2,
                  f"({rigid} as {body_type}).apply_central_impulse({impulse})")
+    if character_pin:
+        char_type = "CharacterBody2D" if ctx.dim == 2 else "CharacterBody3D"
+        shove = ctx.new_temp("shove")
+        ctx.add_line(indent + 1,
+                     f"elif {rigid} is {char_type} and {rigid} != {character_pin}:")
+        if ctx.dim == 2:
+            ctx.add_line(indent + 2, f"var {shove} := -{hit}.get_normal()")
+        else:
+            ctx.add_line(indent + 2,
+                         f"var {shove} := Vector3(-{hit}.get_normal().x, 0.0, "
+                         f"-{hit}.get_normal().z)")
+        cap = gd_number(float(getattr(node, "gk_character_speed", 6.0) or 6.0))
+        ctx.add_line(indent + 2,
+                     f"({rigid} as {char_type}).global_position += {shove} * "
+                     f"minf({cap} * get_physics_process_delta_time(), 0.15)")
 
 
 @stmt_node("GKNodeMoveToward")

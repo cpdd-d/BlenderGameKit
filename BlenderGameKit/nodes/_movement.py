@@ -490,6 +490,14 @@ class GKNodeDriveVehicle(B.GKStatementNode):
          "开车撞到刚体箱子时把它推开(和角色那套一个原理)"),
         ("gk_push_force", "float", 80.0, "推力",
          "推开刚体的力(牛顿);车比人重,默认 80"),
+        # ── 『顶开角色』(第四十六轮,用户实测)────────────────────────
+        # 用户:"上车后与 AI 角色碰撞会弹开 AI";确认的期望是**车能把角色顶开**。
+        # 实测真相:两边都是运动学体,互相只会"顶停"(冲量那套对角色体无效),
+        # 所以这里用**每帧限速的位移**顶开他们 —— 能顶着走,但绝不会弹飞。
+        ("gk_push_characters", "bool", True, "顶开角色",
+         "撞到 AI / 其他角色时把他们顶着走(每帧限速,绝不会弹飞)"),
+        ("gk_character_speed", "float", 6.0, "顶开速度",
+         "顶开角色时的速度上限(米/秒);每帧最多 0.15 米"),
     )
     gk_outputs = (S.pin(FLOW, "完成"), S.pin(BOOL, "驾驶中", False),)
 
@@ -507,3 +515,7 @@ class GKNodeDriveVehicle(B.GKStatementNode):
         row.prop(self, "gk_push_bodies", text="推开刚体", toggle=True)
         if getattr(self, "gk_push_bodies", True):
             row.prop(self, "gk_push_force", text="推力")
+        row = layout.row(align=True)
+        row.prop(self, "gk_push_characters", text="顶开角色", toggle=True)
+        if getattr(self, "gk_push_characters", True):
+            row.prop(self, "gk_character_speed", text="顶开速度")

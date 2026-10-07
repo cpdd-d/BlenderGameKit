@@ -604,17 +604,61 @@ def _ui_preview_rects(tree):
             x, y = px + pw - width - margin, py + ph - height - margin
 
         rects[name] = (x, y, width, height)
-        out.append((name, x, y, width, height, depth))
+        # 第七项把**节点本身**带出去(第四十六轮):预览要按控件自己的
+        # 颜色 / 文字 / 数值画(WYSIWYG),光有矩形不够。
+        # 前六项的顺序保持不动 —— smoke 里的断言按老下标读。
+        out.append((name, x, y, width, height, depth, node))
     return out
 
 
-# 预览里每一层的颜色(按层级轮换 —— 一眼看出"这是谁的子控件")
+# 预览里每一层的颜色(按层级轮换 —— 没设颜色的控件一眼看出"这是谁的子控件")
 _UI_PREVIEW_COLORS = (
     (0.25, 0.58, 0.95, 0.32),
     (0.30, 0.80, 0.55, 0.32),
     (0.95, 0.72, 0.25, 0.32),
     (0.80, 0.45, 0.85, 0.32),
 )
+
+
+def _ui_preview_rect_color(node, depth):
+    """预览里的填充色:**优先用设计图里的颜色**,没设过才按层级配色。
+
+    第四十六轮(用户:"没有预览到实时显示修改UI"):以前不管控件配了什么色,
+    预览一律画"按层级配色的灰框"—— 改了颜色 / 透明度在视口里完全看不出来。
+    现在直接用控件自己的 `gk_color`(太透的给个 0.25 下限,不然看不见)。
+    """
+    raw = getattr(node, "gk_color", None)
+    try:
+        red, green, blue, alpha = (float(raw[0]), float(raw[1]),
+                                   float(raw[2]), float(raw[3]))
+        if alpha < 0.25:
+            alpha = 0.25
+        return (red, green, blue, alpha)
+    except Exception:                                     # noqa: BLE001
+        return _UI_PREVIEW_COLORS[depth % len(_UI_PREVIEW_COLORS)]
+
+
+def _ui_preview_average_color(node):
+    """图片控件的"代表色":采样它那张图(缩略图太贵,取平均色就够认)。
+
+    采样失败(图丢了 / 太大)就给个中性灰 —— 预览不该因此罢工。
+    """
+    try:
+        import bpy
+        image = bpy.data.images.get(str(getattr(node, "gk_image", "") or ""))
+        size = getattr(image, "size", None)
+        if image is None or not size or int(size[0]) == 0:
+            return (0.35, 0.35, 0.40, 0.85)
+        pixels = list(getattr(image, "pixels", ())[:4 * 64])   # 头 16 像素
+        if len(pixels) < 4:
+            return (0.35, 0.35, 0.40, 0.85)
+        count = len(pixels) // 4
+        red = sum(pixels[0::4]) / count
+        green = sum(pixels[1::4]) / count
+        blue = sum(pixels[2::4]) / count
+        return (red, green, blue, 0.85)
+    except Exception:                                     # noqa: BLE001
+        return (0.35, 0.35, 0.40, 0.85)
 
 # 挂在 3D 视口上的绘制句柄(注册时加、注销时摘)
 _UI_PREVIEW_HANDLE = []
@@ -687,29 +731,87 @@ def _ui_preview_draw():
             shader.uniform_float("color", (0.55, 0.75, 1.0, 0.9))
             batch.draw(shader)
 
-            # 控件框:按层级分组,一组一次 draw(几十个控件也就几次绘制)
-            buckets = {}
-            labels = []
-            for name, rx, ry, width, height, depth in _ui_preview_rects(tree):
+            # ── 控件:所见即所得(第四十六轮)────────────────────────────────
+            # 每个控件用**它自己的颜色**填底,再按类型补内容:
+            #   文本 -> 真文字(字号按设计像素 × 屏幕缩放);按钮 -> 居中文字;
+            #   进度条 -> 按『当前值/最大值』画比例;图片 -> 平均色打底;
+            #   非文字控件补一个小名字(方便对着节点找)。
+            # 全部**每帧重读节点值** —— 改设计图里的任何参数,视口这一帧就变。
+            fills = []
+            texts = []
+            bars = []
+            for name, rx, ry, width, height, depth, node in _ui_preview_rects(tree):
                 left = x0 + rx * scale
                 bottom = y0 + (design_h - ry - height) * scale
                 right = left + width * scale
                 top = bottom + height * scale
-                verts = buckets.setdefault(depth % len(_UI_PREVIEW_COLORS), [])
-                verts.extend(((left, bottom), (right, bottom), (right, top),
-                              (left, bottom), (right, top), (left, top)))
-                labels.append((name, left + 3.0, top + 4.0))
-            for index, verts in buckets.items():
+                blob = str(getattr(node, "bl_idname", ""))
+                color = (_ui_preview_average_color(node)
+                         if blob == "GKNodeUiImage"
+                         else _ui_preview_rect_color(node, depth))
+                fills.append((((left, bottom), (right, bottom), (right, top),
+                               (left, bottom), (right, top), (left, top)), color))
+                fills.append((((left, bottom), (right, bottom),
+                               (right, bottom), (right, top),
+                               (right, top), (left, top),
+                               (left, top), (left, bottom)),
+                              (0.85, 0.92, 1.0, 0.45)))
+                if blob == "GKNodeUiBar":
+                    try:
+                        value = float(getattr(node, "gk_value", 0.0) or 0.0)
+                        biggest = float(getattr(node, "gk_max", 1.0) or 1.0)
+                        ratio = 0.0 if biggest <= 0.0 else max(
+                            0.0, min(1.0, value / biggest))
+                    except Exception:                     # noqa: BLE001
+                        ratio = 0.0
+                    bars.append((left, bottom, left + (right - left) * ratio, top))
+                text = str(getattr(node, "gk_text", "") or "")
+                raw_color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+                try:
+                    text_color = (float(raw_color[0]), float(raw_color[1]),
+                                  float(raw_color[2]), 1.0)
+                except Exception:                         # noqa: BLE001
+                    text_color = (1.0, 1.0, 1.0, 1.0)
+                size = max(9.0, min(44.0,
+                                    float(getattr(node, "gk_size", 22.0) or 22.0)
+                                    * scale))
+                if blob in ("GKNodeUiText", "GKNodeUiButton") and text:
+                    if blob == "GKNodeUiButton":
+                        try:
+                            blf.size(0, size)
+                            text_w, text_h = blf.dimensions(0, text)
+                        except Exception:                 # noqa: BLE001
+                            text_w, text_h = len(text) * size * 0.6, size
+                        texts.append((text, (left + right - text_w) * 0.5,
+                                      (bottom + top - text_h) * 0.5,
+                                      size, text_color))
+                    else:
+                        texts.append((text, left + 3.0, top - size - 2.0,
+                                      size, text_color))
+                else:
+                    texts.append((name, left + 3.0, top - 13.0, 11.0,
+                                  (0.85, 0.9, 1.0, 0.75)))
+            for verts, color in fills:
+                batch = batch_for_shader(
+                    shader, "LINES" if len(verts) == 8 else "TRIANGLES",
+                    {"pos": verts})
+                shader.bind()
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            for left, bottom, right, top in bars:
+                if right - left <= 0.5:
+                    continue
+                verts = ((left, bottom), (right, bottom), (right, top),
+                         (left, bottom), (right, top), (left, top))
                 batch = batch_for_shader(shader, "TRIANGLES", {"pos": verts})
                 shader.bind()
-                shader.uniform_float("color", _UI_PREVIEW_COLORS[index])
+                shader.uniform_float("color", (0.35, 0.85, 0.45, 0.85))
                 batch.draw(shader)
-
-            blf.size(0, 11.0)
-            blf.color(0, 0.95, 0.95, 0.95, 0.9)
-            for name, lx, ly in labels:
-                blf.position(0, lx, ly, 0.0)
-                blf.draw(0, name)
+            for text, tx, ty, size, color in texts:
+                blf.size(0, size)
+                blf.color(0, color[0], color[1], color[2], color[3])
+                blf.position(0, tx, ty, 0.0)
+                blf.draw(0, text)
         finally:
             gpu.state.blend_set("NONE")
     except Exception:                                     # noqa: BLE001

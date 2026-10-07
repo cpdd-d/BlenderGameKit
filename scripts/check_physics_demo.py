@@ -149,6 +149,15 @@ var vdrift := 0.0
 var vmeta := false
 var carbox_start_z := 0.0      # 车头箱子:开工位时的 z(推没推开看它)
 var vpushed := 0.0
+# 车顶开 AI 角色(第四十六轮):车把『追踪者』顶开多少米 / 顶开时峰值速度
+var vai_pushed := 0.0          # 从"摆好位置"到"测完",追踪者被顶开多远(米)
+var vai_max_step := 0.0        # 单物理帧最大位移(查"弹飞尖峰")
+var vai_max_speed := 0.0       # 由最大单帧位移折算的速度(米/秒)
+var vai_start := Vector3.ZERO
+var vai_prev := Vector3.ZERO
+var vcar_ai_start := Vector3.ZERO
+var vcar_ai_drove := 0.0
+var vai_ready := false
 # 时停采样(第三十五轮)
 var vstop_on := false          # 按 T 之后 `tree.paused` 真的变真了吗
 var vstop_off := false         # 再按一下真的解冻了吗
@@ -386,9 +395,57 @@ func _vehicle_step(delta: float) -> void:
 			# 推不动的话车会被它挡在路上(vdrove 也够不到 5)。
 			if carbox != null:
 				vpushed = carbox_start_z - carbox.global_position.z
-			# ── 上帝视角里不该还能开车(用户 2026-10-06 实测)─────────
-			# 按 Tab 切上帝机,再按住 W 半秒:那时 WASD 是**飞相机**的,
-			# 车一步都不该动(驾驶节点现在也有上帝守卫)。测完 Tab 切回来。
+			# ── 第四十六轮:车顶开『追踪者』(先测这个,再进上帝视角)──
+			# (`vgod_car` 要等车被挪到开阔地测完之后再取,所以先跳到 20。)
+			vphase = 20
+			vtime = 0.0
+	elif vphase == 20:
+		# ── 车顶开 AI 角色(第四十六轮)──────────────────────────────
+		# 用户:"上车后与 AI 碰撞会弹开 AI"。车挪到开阔地(z=+8)、车头归零,
+		# 把『车头箱子』暂时挪开,再把『追踪者』摆到车头正前方 6 米。
+		# 「追击开关」保持**关**(追踪者不走动,量的就是"纯顶开":车每帧给它
+		# 一段限速位移 —— 第四十六轮的行为)。测完把追踪者 / 箱子都摆回原位,
+		# 别搅了后面 ⑩ 绕墙追击那一站。
+		if chaser == null or carbox == null:
+			vgod_car = vehicle.global_position
+			_send_key(KEY_TAB, true)
+			vphase = 5
+			vtime = 0.0
+			return
+		vehicle.global_position = Vector3(vehicle.global_position.x, 0.6, 8.0)
+		vehicle.rotation.y = 0.0
+		vehicle.velocity = Vector3.ZERO
+		carbox.global_position = Vector3(56.0, 0.6, 30.0)
+		chaser.global_position = Vector3(vehicle.global_position.x, 0.8,
+			vehicle.global_position.z - 6.0)
+		chaser.velocity = Vector3.ZERO
+		vai_start = chaser.global_position
+		vai_prev = chaser.global_position
+		vcar_ai_start = vehicle.global_position
+		vai_ready = true
+		_send_key(KEY_W, true)
+		vphase = 21
+		vtime = 0.0
+	elif vphase == 21:
+		if chaser != null and vai_ready:
+			var cpos := chaser.global_position
+			var step := vai_prev.distance_to(cpos)
+			vai_max_step = maxf(vai_max_step, step)
+			vai_max_speed = maxf(vai_max_speed, step / maxf(delta, 0.0001))
+			vai_prev = cpos
+		if vtime >= 1.2:
+			_send_key(KEY_W, false)
+			if chaser != null and vai_ready:
+				vai_pushed = vai_start.distance_to(chaser.global_position)
+				# 摆回原位:别把追踪者留在这儿,⑩ 绕墙追击要靠它在 z=-2
+				chaser.global_position = Vector3(63.0, 0.8, -2.0)
+				chaser.velocity = Vector3.ZERO
+			if carbox != null:
+				carbox.global_position = Vector3(56.0, 0.6, carbox_start_z)
+				carbox.linear_velocity = Vector3.ZERO
+				carbox.angular_velocity = Vector3.ZERO
+			vcar_ai_drove = vcar_ai_start.distance_to(vehicle.global_position)
+			# 上帝视角那段的基准点(车刚被挪过,要在这之后取)
 			vgod_car = vehicle.global_position
 			_send_key(KEY_TAB, true)
 			vphase = 5
@@ -538,12 +595,14 @@ func _finish_vehicle() -> void:
 	# + 下车后角色在车外 + 控制权回到角色(walked)+ 车没被"偷开"(drift)
 	# + 上帝视角里按 W **车不能动**(god_drift,用户 2026-10-06 实测的那条)
 	# + 车头箱子**被推开**(pushed,用户实测:"上车后推不动箱子")
+	# + 车把『追踪者』**顶开**(pushed_ai ≥ 1,且顶开速度封顶不弹飞,第四十六轮)
 	# + 时停三件事:按 T 真的冻上 / 再按真的解冻 / 冻着上帝机照飞、
 	#   世界一动不动(第三十五轮)
 	var ok := (vmeta and vdrove >= 5.0 and vgap_max <= 0.8
 		and vback_gap >= 1.5 and vwalked >= 1.0 and vdrift <= 0.3
 		and vyaw >= 0.3 and vyaw <= 1.2 and vgod_drift <= 0.2
 		and vpushed >= 0.5
+		and vai_pushed >= 1.0 and vai_max_speed <= 9.5
 		and vstop_on and vstop_off and vstop_fly >= 1.0
 		and vstop_world <= 0.15)
 	station_time = -1.0
@@ -551,8 +610,10 @@ func _finish_vehicle() -> void:
 		% [ok, vdrove, vgap_max, vback_gap]
 		+ "walked=%.2f drift=%.2f steer=%.2f god_drift=%.2f meta=%s"
 		% [vwalked, vdrift, vyaw, vgod_drift, vmeta]
-		+ " pushed=%.2f stop=%s/%s fly=%.2f frozen=%.2f"
-		% [vpushed, vstop_on, vstop_off, vstop_fly, vstop_world])
+		+ " pushed=%.2f pushed_ai=%.2f ai_max_speed=%.2f"
+		% [vpushed, vai_pushed, vai_max_speed]
+		+ " stop=%s/%s fly=%.2f frozen=%.2f"
+		% [vstop_on, vstop_off, vstop_fly, vstop_world])
 
 
 func _start_station(index: int) -> void:
@@ -624,6 +685,15 @@ func _start_station(index: int) -> void:
 	box_start_z = box.global_position.z if box != null else 0.0
 	carbox_start_z = carbox.global_position.z if carbox != null else 0.0
 	vpushed = 0.0
+	# 车顶开 AI 角色(第四十六轮)
+	vai_pushed = 0.0
+	vai_max_step = 0.0
+	vai_max_speed = 0.0
+	vai_start = Vector3.ZERO
+	vai_prev = Vector3.ZERO
+	vcar_ai_start = Vector3.ZERO
+	vcar_ai_drove = 0.0
+	vai_ready = false
 	vstop_on = false
 	vstop_off = false
 	vstop_fly = 0.0
@@ -843,6 +913,27 @@ def main():
             print(f"✗ {why}:",
                   [line for line in text.splitlines()
                    if f"PHYS_{key} " in line or f"PHYS_START" in line])
+            ok = False
+    # ── 第四十六轮:车顶开 AI 角色(『追踪者』)──────────────────────
+    # 现象:车开过去能把『追踪者』(CharacterBody)顶着走(≥ 1 米),
+    # 但每帧位移有封顶(≈6 米/秒、硬顶 0.15 米/帧)—— **不能弹飞**。
+    match = re.search(
+        r"PHYS_vehicle .*pushed_ai=([0-9.]+) ai_max_speed=([0-9.]+)", text)
+    if match is None:
+        print("✗ 载具站没打印车顶开 AI 的字段(pushed_ai / ai_max_speed):",
+              [line for line in text.splitlines() if "PHYS_vehicle" in line])
+        ok = False
+    else:
+        pushed_ai = float(match.group(1))
+        ai_speed = float(match.group(2))
+        if pushed_ai < 1.0:
+            print(f"✗ 车没把『追踪者』顶开(只顶了 {pushed_ai:.2f} 米,该 ≥ 1):"
+                  "两边都是运动学体,少了『载具_驾驶』第四十六轮那段"
+                  "每帧限速的顶开位移")
+            ok = False
+        if ai_speed > 9.5:
+            print(f"✗ 顶开 AI 时把它弹飞了(峰值 {ai_speed:.1f} 米/秒,"
+                  "该 ≤ 约 9):限速封顶(0.15 米/帧)没生效")
             ok = False
     if "DEMO_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")

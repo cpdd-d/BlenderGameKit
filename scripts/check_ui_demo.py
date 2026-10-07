@@ -96,11 +96,24 @@ func _widget(name: String) -> Control:
 	return found as Control
 
 
+## 第四十六轮:开局"选单态" —— 世界暂停 + 鼠标可见
+## (世界停着,移动 / 鼠标转视角全都不跑;CAPTURED=2 / VISIBLE=0)
+func _check_startup() -> void:
+	print("UI_STARTUP paused=", get_tree().paused, " mouse=", Input.mouse_mode)
+
+
+## 对话点完 = "选择完成":继续世界 + 鼠标锁回去
+func _check_startup_resume() -> void:
+	print("UI_STARTUP_RESUME paused=", get_tree().paused,
+		" mouse=", Input.mouse_mode)
+
+
 func _physics_process(delta: float) -> void:
 	elapsed += delta
 	if phase == 0 and elapsed >= 0.35:
 		phase = 1
 		_check_widgets()
+		_check_startup()
 		_start_dialog_sample()
 	elif phase == 1 and elapsed >= 0.7:
 		phase = 2
@@ -115,6 +128,7 @@ func _physics_process(delta: float) -> void:
 	elif phase == 3 and elapsed >= 1.5:
 		phase = 4
 		_check_dialog_done()
+		_check_startup_resume()
 		# 对话结束后的那两步:输入框淡入 + 焦点交给它(都在 1.4 秒前跑完)
 		_check_focus_and_tween()
 		_send_key(KEY_ESCAPE, true)           # 按住 Esc(热键是每帧轮询的)
@@ -481,6 +495,13 @@ def main():
         # ---- 第四十轮:界面设计图(套用式)----
         (r"UI_DESIGN ok=true", "『界面_套用设计』没把设计图的控件建出来 / 右上角对齐不对"),
         (r"UI_DESIGN_CLICK ok=true", "点设计图里的按钮没走进『界面_按钮点击』接的链"),
+        # ---- 第四十六轮:开局"选单态"(世界停 + 鼠标可见 -> 选完锁回去)----
+        # ⚠ 鼠标模式在**无头模式**下锁不住(CAPTURED 设了还是 0),所以
+        #   "锁回去"这一半用**生成代码**验(见下面 _check_startup_code)。
+        (r"UI_STARTUP paused=true mouse=0",
+         "开局不是『选单态』(应该:世界暂停 + 鼠标可见,免得一上来就能转视角)"),
+        (r"UI_STARTUP_RESUME paused=false",
+         "开场对话点完没有恢复世界(应该继续跑)"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -524,6 +545,15 @@ def main():
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")
                 ok = False
+        # ---- 第四十六轮:选完之后"把鼠标锁回去"必须是**显式**的一句 ──
+        # ⚠ 无头模式验不了 mouse_mode(设 CAPTURED 仍是 0),所以这一半
+        #   用生成代码验;而且**顺序**要对:收起对话 -> 继续世界 -> 锁鼠标。
+        if not re.search(
+                r"_gk_dialog_hide\(\)\s*\n\s*_gk_apply_pause\(false, \"\", true\)"
+                r"\s*\n\s*Input\.mouse_mode = Input\.MOUSE_MODE_CAPTURED", code):
+            print("✗ 生成代码里没有『收起对话 -> 继续世界 -> 锁回鼠标』这一串"
+                  "(开局选单态的收尾少了 / 顺序不对)")
+            ok = False
         art = os.path.join(OUT, "art")
         pngs = [name for name in os.listdir(art)
                 if name.startswith("ui_") and name.endswith(".png")] if os.path.isdir(art) else []

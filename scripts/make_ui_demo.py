@@ -390,6 +390,12 @@ def _build_ui_chain(tree, ready, design):
                   gk_margin=56.0)
     after = _add(tree, "GKNodeUiSet", "改分数文字", 4160.0, 0.0,
                  gk_widget="分数", gk_set_text=True, gk_text="对话结束")
+    # 对话点完 = "选择完成":继续世界 + 把鼠标锁回去(第四十六轮)
+    release = _add(tree, "GKNodeUiPauseGame", "选完恢复", 4160.0, -620.0,
+                   gk_pause=False, gk_show_mouse=True, gk_menu="",
+                   gk_hotkey=False)
+    lock_mouse = _add(tree, "GKNodeMouseMode", "锁回鼠标", 4420.0, -620.0,
+                      gk_mode="CAPTURED")
     # 对话结束后:输入框淡入(缓动) -> 焦点交给它(键盘直接能打字)
     dim = _add(tree, "GKNodeUiSet", "昵称半透明", 4420.0, 0.0,
                gk_widget="昵称", gk_set_alpha=True, gk_alpha=0.15)
@@ -400,6 +406,17 @@ def _build_ui_chain(tree, ready, design):
                        gk_widget="昵称")
 
     _link(tree, ready, "执行", apply_design, "执行")
+    # ── 第四十六轮:开局"选单态"(用户:"一开始应该启用鼠标,禁用鼠标旋转,
+    #    在选择完成后再启用")──────────────────────────────────────────
+    # 做法:开局**暂停世界 + 放出鼠标** —— 世界停着,移动 / 鼠标转视角
+    # 全都不跑(角色脚本是"可暂停"的);玩家把开场对话框点完(= 选择完成)
+    # 之后,『选完恢复』继续世界,『锁回鼠标』显式把鼠标锁回去。
+    # ⚠ 必须挂在『暂停热键』**后面**:那个节点在准备时也会调一次
+    #   "取消暂停"(它是"开/关"型),挂在它前面会被它覆盖掉(实测:
+    #   探针看到 paused=false)。
+    startup = _add(tree, "GKNodeUiPauseGame", "开局选单态", 3120.0, 160.0,
+                   gk_pause=True, gk_show_mouse=True, gk_menu="",
+                   gk_hotkey=False)
     # 一个出口接两条:先接按钮行为,再把整套界面建出来(两条互不依赖)
     _link(tree, apply_design, "完成", design_click, "执行")
     _link(tree, apply_design, "完成", hud, "执行")
@@ -417,10 +434,15 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, quit_button, "完成", logs, "执行")
     _link(tree, logs, "完成", fill, "执行")
     _link(tree, fill, "完成", nickname, "执行")
+    # ⚠ 顺序:『暂停热键』在前(它在准备时会调一次"取消暂停"—— 它是开/关型),
+    #   我的『开局选单态』在后,才不会被它覆盖(实测踩过:paused=false)。
     _link(tree, nickname, "完成", hotkey, "执行")
-    _link(tree, hotkey, "完成", hint, "执行")
+    _link(tree, hotkey, "完成", startup, "执行")
+    _link(tree, startup, "完成", hint, "执行")
     _link(tree, hint, "完成", dialog, "执行")
-    _link(tree, dialog, "完成", after, "执行")
+    _link(tree, dialog, "完成", release, "执行")
+    _link(tree, release, "完成", lock_mouse, "执行")
+    _link(tree, lock_mouse, "完成", after, "执行")
     _link(tree, after, "完成", dim, "执行")
     _link(tree, dim, "完成", fade_in, "执行")
     _link(tree, fade_in, "完成", focus_field, "执行")

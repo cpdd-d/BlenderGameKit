@@ -81,6 +81,24 @@ func _path_probe() -> void:
 	var p := NavigationServer2D.map_get_path(map, from, to, true)
 	print("NAV2D_PATH map=", map, " from=", from, " to=", to,
 		" n=", p.size(), " ", p)
+	# ── 第四十六轮:2D 兜底相机 ────────────────────────────────────
+	# 运行后必须有一台"当前"的 Camera2D,而且**追踪者和玩家都在它的可见
+	# 范围里** —— 不然就是用户报的"运行没内容 / 视角错乱"(Godot 停在
+	# 原点视图,负坐标区的内容全在屏外)。
+	var cam: Camera2D = null
+	for node in get_tree().root.find_children("*", "Camera2D", true, false):
+		if node is Camera2D and (node as Camera2D).is_current():
+			cam = node as Camera2D
+			break
+	var covers := false
+	var rect := Rect2()
+	if cam != null and chaser != null and player != null:
+		var view: Vector2 = get_viewport().get_visible_rect().size / cam.zoom
+		var center: Vector2 = cam.get_screen_center_position()
+		rect = Rect2(center - view * 0.5, view)
+		covers = (rect.has_point(chaser.global_position)
+			and rect.has_point(player.global_position))
+	print("NAV2D_CAM current=", cam != null, " covers=", covers, " rect=", rect)
 
 
 func _physics_process(delta: float) -> void:
@@ -213,6 +231,10 @@ def main():
     if not re.search(r"NAV2D ok=true", text):
         print("✗ 追踪者没绕开中间障碍追到人(2D 烘焙没生效 / 绕不过去 / 穿障了):",
               [line for line in text.splitlines() if "NAV2D " in line])
+        ok = False
+    if not re.search(r"NAV2D_CAM current=true covers=true", text):
+        print("✗ 2D 兜底相机没生效(运行后看不到内容 / 视角错乱):",
+              [line for line in text.splitlines() if "NAV2D_CAM" in line])
         ok = False
     if "NAV2D_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")

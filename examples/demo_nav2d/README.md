@@ -28,7 +28,10 @@ blender -b --gpu-backend vulkan --python scripts\make_nav2d_demo.py   # 重建 .
 
 > 门禁(`scripts\build_and_test.ps1`)里这一层跑的就是上面两条命令,
 > 探针标记 `CHECK_NAV2D_DEMO=OK`。
-> 想看全图:Godot 里加一台 Camera2D(2D 默认视图在原点,不加也能玩)。
+> **镜头不用管**:场景里没有相机时,插件会给 2D 场景自动补一台
+> "框住全部物体"的 Camera2D(第四十六轮;不然 Godot 停在原点视图,
+> 负坐标区的内容全在屏外 = "运行后一片空")。
+> 想自己控镜头:在 Blender 里放一台相机并设为视口当前相机(小键盘 0)。
 >
 > 3D 寻路的现场在 `examples\demo_physics`(『绕墙追击』『群追避障』『门升起重烤』工位);
 > 多层 / 避障 / 区域代价还是待办(见 docs\待办清单.md)。
