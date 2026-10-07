@@ -174,7 +174,7 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:构建 + 重装 + 63 项冒烟 + Godot 端到端(2D 示例 + 平台跳跃;-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:构建 + 重装 + 192 项冒烟 + 示例体检 + Godot 端到端十层(-Deep 再加动画六层)
 ├── verify_anim_system.ps1      ★ 动画系统六层验证(离线/真 Blender/示例/Godot 解析/**真跑 1.5 秒**/反例)
 ├── check_gdscript.ps1          ★ 把生成的 .gd 交给真 Godot 解析(带反例)
 ├── make_anim_example.py        ★ 生成动画状态机示例 .blend
@@ -192,10 +192,19 @@ scripts/
 └── make_render_demo.py         生成 NPR 渲染示例工程(并可出图)
 
 examples/
-├── demo_anim_tree/             ★ 动画状态机示例 .blend(可照抄,见它的 README)
+├── demo_game/                  ★ 小游戏示例(3D:金币 / 守卫AI / 资产库 / 界面设计图 / 显示设置图,5 张图)
+├── demo_curve/                 曲线时间轴示例(运镜轨道 / 触发区 / 上帝机)
+├── demo_physics/               物理测试场(11 个工位:台阶 / 对角 / 推箱 / 平台 / 载具 / 寻路…)
+├── demo_nav2d/                 2D 寻路示例(俯视 2D:真绕障碍追人)
+├── demo_ui/                    界面示例(界面设计图 + 对话框 + 暂停菜单)
+├── demo_ai/                    游戏AI示例(巡逻 -> 看见追 -> 追丢回)
+├── demo_assets/                资产示例(资产库 + 跨场景共用 + 音频管线)
+├── demo_level/                 关卡示例(多场景:关卡1 通关后切关卡2)
+├── demo_anim_tree/             动画状态机示例 .blend(旧示例,仅存档)
+├── demo_2d_blend/              2.5D 示例 .blend(旧示例,仅存档)
 ├── demo_platformer/            ★ 可玩的 2D 平台跳跃示例(相机跟随/金币/HUD/存档)
 ├── demo_2d/                    可直接用 Godot 打开的 2D 横版示例
-├── demo_render/                NPR 渲染示例(含渲染结果 preview.png)
+├── demo_render/                NPR 渲染出图工程(扫光验证面部阴影)
 └── gdextension_cpp/            C++ GDExtension 骨架(GKCharacter)
 ```
 
@@ -557,8 +566,10 @@ pip install pytest && python -m pytest
 # 2. 着色器编译校验 —— 改 .gdshader 后必跑
 python scripts\verify_shaders.py
 
-# 3. 一键门禁:构建 + 装进 Blender + 63 项冒烟 + Godot 端到端 —— 改节点/UI/生成代码后必跑
-#    端到端默认跑两层(2D 示例、平台跳跃),产物写在 _dist(不动 examples);
+# 3. 一键门禁:构建 + 装进 Blender + 192 项冒烟 + 示例完整性体检 + Godot 端到端十层
+#    —— 改节点/UI/生成代码后必跑
+#    端到端十层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
+#                界面 / AI / 资产 / 关卡示例;产物写在 _dist(不动 examples);
 #    加 -Deep 再跑动画系统六层验证(要真 Blender、会重建 examples\demo_anim_tree,较慢)
 #    本机没装 Godot 时自动跳过;加 -SkipGodot 可显式跳过
 powershell -File scripts\build_and_test.ps1

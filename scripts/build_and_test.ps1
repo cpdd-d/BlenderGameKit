@@ -79,6 +79,14 @@ Step "1/6 离线代码生成测试 (不需要 Blender)"
 & python (Join-Path $Root "tests\test_codegen.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "离线测试失败"; exit 1 }
 
+# ---------- 1b. 示例完整性体检 ----------
+# 第四十五轮固化:目录改名打断脚本路径(ANIM_VERIFY 那次)、示例缺 README、
+# 新示例有探针却没接进门禁 —— 这三类问题都在这里判红。
+Step "1b/6 示例完整性体检 (目录 / README / 重建 / 探针 / 门禁)"
+& python (Join-Path $Root "scripts\check_examples.py") 2>&1 |
+    Select-String -Pattern "^(示例|demo_|✗|CHECK_EXAMPLES)" | ForEach-Object { $_.Line }
+if ($LASTEXITCODE -ne 0) { Write-Error "示例完整性体检失败"; exit 1 }
+
 # ---------- 2. 构建扩展 ----------
 Step "2/6 构建 Blender 扩展"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -401,6 +409,37 @@ if ($SkipGodot) {
                 $godotRan += "资产示例"
             } elseif ($assetOut -match "跳过") {
                 Write-Output "（资产示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
+    # 5k. 关卡示例(多场景:关卡1 / 关卡2 各一张 .tscn)—— 第四十五轮接进门禁。
+    #     它是"一关一张逻辑图 + 多场景导出"的能力展示,可它一直只在
+    #     `-Deep` 那一层被跑过(verify_anim_system.ps1);这一层是默认门禁。
+    #     自查脚本自己会导出一份工程并驱动真 Godot 跑(电梯 / 开车 / 切关卡)。
+    Write-Output ""
+    $levelMaker = Join-Path $Root "scripts\make_demo_level.py"
+    $levelChecker = Join-Path $Root "scripts\check_level_example.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过关卡示例:找不到 Blender(示例要先重建才能真跑)"
+    } else {
+        $levelLog = & $Blender -b --gpu-backend vulkan --python $levelMaker 2>&1 | Out-String
+        if ($levelLog -notmatch "已保存") {
+            Write-Host "---- 重建关卡示例失败,尾部 20 行 ----"
+            ($levelLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            # 自查脚本里的运行时探针按 GK_GODOT 找引擎(没装就自动跳过探针)
+            $env:GK_GODOT = $Godot
+            $levelOut = & $Blender -b --gpu-backend vulkan --python $levelChecker 2>&1 | Out-String
+            Remove-Item Env:\GK_GODOT -ErrorAction SilentlyContinue
+            $levelOut -split "`n" | Where-Object { $_ -match "^(LEVEL|结果:|\[INFO\]|✗|\[FAIL\])" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($levelOut -match "LEVEL_CHECK=OK") {
+                $godotRan += "关卡示例"
             } else {
                 $godotOk = $false
             }

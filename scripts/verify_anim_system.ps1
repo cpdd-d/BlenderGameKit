@@ -18,6 +18,12 @@ param(
 $ErrorActionPreference = "Continue"
 $failed = @()
 
+# ── 无头跑 Blender **必须**带这个参数(第四十五轮补上)────────────────
+# 不带的话,打开带 NPR 预览材质的 .blend 会走 GPU 预览渲染并直接
+# `EXCEPTION_ACCESS_VIOLATION`(实测:关卡示例那一层整层没输出、只报
+# "失败项: 关卡示例",查了半天是这里)。全脚本统一用这一个变量,别再各写各的。
+$GpuFlag = @("--gpu-backend", "vulkan")
+
 function Step($text) {
     Write-Output ""
     Write-Output ("=" * 60)
@@ -37,7 +43,7 @@ if (-not (Test-Path $Blender)) {
     Write-Output "跳过:找不到 Blender"
     $failed += "Blender 不存在"
 } else {
-    $log = & $Blender -b --python (Join-Path $Root "tests\blender_anim_tree.py") 2>&1 | Out-String
+    $log = & $Blender -b $GpuFlag --python (Join-Path $Root "tests\blender_anim_tree.py") 2>&1 | Out-String
     $log -split "`n" | Select-String -Pattern "^\[(PASS|FAIL|INFO)\]|^结果:|^ANIM_TREE_RESULT" |
         ForEach-Object { $_.Line }
     if ($log -notmatch "ANIM_TREE_RESULT=OK") { $failed += "Blender 动画树测试" }
@@ -50,13 +56,13 @@ Step "3/6 示例工程(examples\demo_anim_tree)重建并自查"
 if (-not (Test-Path $Blender)) {
     Write-Output "跳过:找不到 Blender"
 } else {
-    $make = & $Blender -b --python (Join-Path $Root "scripts\make_anim_example.py") 2>&1 | Out-String
+    $make = & $Blender -b $GpuFlag --python (Join-Path $Root "scripts\make_anim_example.py") 2>&1 | Out-String
     if ($make -notmatch "ANIM_EXAMPLE_DONE") {
         Write-Output "!! 示例生成失败"
         ($make -split "`n") | Select-Object -Last 15 | ForEach-Object { Write-Output "   $_" }
         $failed += "示例生成"
     }
-    $check = & $Blender -b --python (Join-Path $Root "scripts\check_anim_example.py") 2>&1 | Out-String
+    $check = & $Blender -b $GpuFlag --python (Join-Path $Root "scripts\check_anim_example.py") 2>&1 | Out-String
     $check -split "`n" | Select-String -Pattern "^\[(PASS|FAIL|INFO)\]|^结果:|^ANIM_EXAMPLE_CHECK" |
         ForEach-Object { $_.Line }
     if ($check -notmatch "ANIM_EXAMPLE_CHECK=OK") { $failed += "示例自查" }
@@ -155,7 +161,7 @@ if (-not (Test-Path $godot)) {
 # 打开 -> 导出 -> 补一个探针场景 -> 真 Godot 里模拟按键 -> 断言
 Step "5c/6 2.5D 示例:打开 .blend -> 导出 -> 真跑(模拟按键)"
 $blendScript = Join-Path $Root "scripts\check_2d_blend_example.py"
-$blendOut = & $Blender -b --python $blendScript 2>&1 | Out-String
+$blendOut = & $Blender -b $GpuFlag --python $blendScript 2>&1 | Out-String
 $blendOut -split "`n" | Select-String -Pattern "^\[(PASS|FAIL)\]|^结果:|^2D_BLEND_CHECK" |
     ForEach-Object { Write-Output "   $($_.Line.Trim())" }
 if ($blendOut -notmatch "2D_BLEND_CHECK=OK") { $failed += "2.5D示例导出" }
@@ -177,7 +183,7 @@ foreach ($pair in @(@("PROBE25 moved_x=[1-9]", "按 D 没走动"),
 # 打开 .blend -> 检查场景/节点图/端口 -> 导出 -> 真 Godot 解析。
 Step "5d/6 关卡示例:打开 .blend -> 导出 -> 解析"
 $levelScript = Join-Path $Root "scripts\check_level_example.py"
-$levelOut = & $Blender -b --python $levelScript 2>&1 | Out-String
+$levelOut = & $Blender -b $GpuFlag --python $levelScript 2>&1 | Out-String
 $levelOut -split "`n" | Select-String -Pattern "^\[(PASS|FAIL)\]|^结果:|^LEVEL_CHECK" |
     ForEach-Object { Write-Output "   $($_.Line.Trim())" }
 if ($levelOut -notmatch "LEVEL_CHECK=OK") { $failed += "关卡示例" }

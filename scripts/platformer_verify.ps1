@@ -1,4 +1,4 @@
-# End-to-end check for the 2D platformer demo.
+﻿# End-to-end check for the 2D platformer demo.
 #
 #   powershell -File scripts/platformer_verify.ps1
 #
