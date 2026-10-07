@@ -97,6 +97,13 @@ var pause_resume_ok := false
 var paused_before_resume := false
 var pause_pos := Vector3.ZERO
 var enemy_a_start := Vector3.ZERO
+# 第四十四轮:守卫(『守卫AI』图驱动)—— 记起点,1 秒后看它有没有真的在巡逻
+var guard_node: Node3D = null
+var guard_start := Vector3.ZERO
+# ⚠ 巡逻是**往返**的:只量"净位移"会撞上"刚好走回原处"的一刻(实测抓过:
+#   守卫明明在正常巡逻,净位移只有 0.28 米)。所以量**累计路程**(计步器)。
+var guard_path := 0.0
+var guard_last := Vector3.ZERO
 var chase_start := 0.0
 var hits_before := 0
 var hp_before := 0
@@ -150,6 +157,20 @@ func _ready() -> void:
 		" chaser=", _chaser() != null,
 		" spark=", spark != null,
 		" fx=", fx_names)
+	# ── 第四十四轮新内容:守卫(『游戏AI』图驱动)+ 状态变量在跑 ──────
+	# ⚠ `ai_state` 在**玩家脚本**上(AI_启用 的『作用在谁』= 敌3守卫,
+	#   但代码生成在"挂脚本的那个物体" = 玩家,和 AI 示例同一个做法)。
+	var guards := world.find_children("敌3守卫", "CharacterBody3D", true, false)
+	var guard_state := "<no-host>"
+	if host != null:
+		guard_state = str(host.get("ai_state"))
+	if not guards.is_empty():
+		guard_node = guards[0] as Node3D
+		guard_start = guard_node.global_position
+		guard_last = guard_start
+		guard_path = 0.0
+	print("DEMO_NEW guard=", not guards.is_empty(),
+		" ai_state=", guard_state)
 
 
 func _coins() -> Array:
@@ -311,6 +332,11 @@ func _physics_process(delta: float) -> void:
 		var target := _chaser()
 		if target != null and host != null:
 			(host as Node3D).global_position = target.global_position
+	# 守卫计步器(第四十四轮):往返巡逻只看净位移会误判,这里累加每帧位移
+	if guard_node != null and guard_last != Vector3.ZERO:
+		var guard_now := guard_node.global_position
+		guard_path += guard_now.distance_to(guard_last)
+		guard_last = guard_now
 	_sample_fx()
 	_phases(delta)
 
@@ -487,6 +513,22 @@ func _phases(delta: float) -> void:
 		patrol_moved = now.distance_to(enemy_a_start) > 0.5
 		print("DEMO_PATROL ok=", patrol_moved,
 			" moved=", "%.2f" % now.distance_to(enemy_a_start))
+		# ②b 守卫(第四十四轮):『守卫AI』图驱动的巡逻**真的在走**。
+		# 这条是专门为"守卫顶着树卡住、永远不折返"那种坑加的:
+		# 巡逻点是有碰撞的树 / 石头,到达距离必须留够。
+		var guard_moved := -1.0
+		var guard_vel := -1.0
+		if guard_node != null:
+			guard_moved = guard_node.global_position.distance_to(guard_start)
+			guard_vel = (guard_node as CharacterBody3D).velocity.length()
+		var guard_state := "<no-host>"
+		if host != null:
+			guard_state = str(host.get("ai_state"))
+		# 判据用**累计路程**:往返巡逻的净位移可能正好很小
+		print("DEMO_GUARD ok=", guard_path > 1.0,
+			" path=", "%.2f" % guard_path,
+			" moved=", "%.2f" % guard_moved, " vel=", "%.2f" % guard_vel,
+			" ai_state=", guard_state)
 		# ③ 拾取 + 胜利**先做**:收齐 5 枚之后胜负就定了(变量『结束』),
 		# 后面再挨打也不会变成"失败" —— 三个敌人的测试才能各测各的
 		var target := _chaser()
@@ -819,6 +861,74 @@ def main():
     else:
         print("✗ 没找到世界模型:", glb_path)
         ok = False
+
+    # ── 第四十四轮:新加的四张图真的进了产物 ────────────────────────
+    # 用户要求"扩展后检查是否存在错误" —— 这里把新内容全查一遍:
+    # 守卫 AI 的状态机代码 / 资产库的音频 / 设计图的提示文字 / 树的复用。
+    if not re.search(r"DEMO_NEW guard=true ai_state=巡逻", text):
+        print("✗ 守卫没在场景里 / AI 状态机没跑起来:",
+              [line for line in text.splitlines()
+               if line.startswith("DEMO_NEW")])
+        ok = False
+    if not re.search(r"DEMO_GUARD ok=true", text):
+        print("✗ 守卫没有真的在巡逻(常见原因:巡逻点被树/石头挡住、"
+              "到达距离太小,顶着走不了):",
+              [line for line in text.splitlines()
+               if line.startswith("DEMO_GUARD")])
+        ok = False
+    if "找不到音频文件" in text:
+        print("✗ 游戏里报了『找不到音频文件』—— 资产库的『叮』没带进项目")
+        ok = False
+
+    if os.path.isfile(script_path):
+        with open(script_path, "r", encoding="utf-8") as handle:
+            new_code = handle.read()
+        for needle, why in (
+                ("var ai_state: String", "守卫 AI 的状态变量(『守卫AI』图)"),
+                ('if ai_state == "巡逻":', "巡逻行为(『守卫AI』图)"),
+                ('elif ai_state == "追击":', "追击行为(『守卫AI』图)"),
+                (".length() <= 8.0", "『看见玩家』的距离条件(8 米)"),
+                (".length() > 10.0", "『丢失玩家』的距离条件(10 米)"),
+                ("_gk_ai_patrol", "巡逻到点折返"),
+                ("新内容", "设计图『新内容设计』里的提示文字"),
+        ):
+            if needle not in new_code:
+                print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")
+                ok = False
+        audio_dir = os.path.join(OUT, "audio")
+        wavs = []
+        if os.path.isdir(audio_dir):
+            wavs = [name for name in os.listdir(audio_dir)
+                    if name.lower().endswith((".wav", ".ogg", ".mp3"))]
+        if len(wavs) != 1:
+            print(f"✗ audio/ 里的音频不是 1 个: {wavs}")
+            ok = False
+        elif f'load("res://audio/{wavs[0]}")' not in new_code:
+            print(f"✗ 脚本 load() 的不是 audio/{wavs[0]}(资产库没接上)")
+            ok = False
+    else:
+        print("✗ 没找到生成脚本:", script_path)
+        ok = False
+
+    # 场景层面:树 / 石头是静态资产(三棵树共用一个 glb)、守卫是角色体
+    if os.path.isfile(world_tscn):
+        with open(world_tscn, "r", encoding="utf-8") as handle:
+            scene_new = handle.read()
+        for needle, why in (
+                ('[node name="树_本体" type="StaticBody3D"', "树(静态资产本体)"),
+                ('[node name="树_实例1" type="StaticBody3D"', "树实例 1"),
+                ('[node name="树_实例2" type="StaticBody3D"', "树实例 2"),
+                ('[node name="石头_本体" type="StaticBody3D"', "石头(静态资产)"),
+                ('[node name="敌3守卫" type="CharacterBody3D"', "守卫(角色体)")):
+            if needle not in scene_new:
+                print(f"✗ World.tscn 里没有{why}: {needle}")
+                ok = False
+        ids = re.findall(
+            r'parent="Colliders/树_[^"]*" instance=ExtResource\("([^"]+)"\)',
+            scene_new)
+        if len(ids) != 3 or len(set(ids)) != 1:
+            print(f"✗ 三棵树的模型不是同一个 glb(实例没复用): {ids}")
+            ok = False
 
     print("CHECK_GAME_DEMO=" + ("OK" if ok else "FAIL"))
     return 0 if ok else 1

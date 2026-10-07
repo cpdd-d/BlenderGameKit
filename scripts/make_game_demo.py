@@ -24,6 +24,14 @@
 | 重开 | 按 **R** 重开(『实例_重载场景』)—— 金币、血量、位置全部复位 |
 | 掉出地图 | 掉下去自动送回出生点 |
 | 上帝机 / 调试面板 | **Tab** 自由飞;**F1** 弹调试面板(能看到金币数/血量)、**F2** 复制 |
+| **守卫 AI**(第四十四轮)| 北墙边新加一个守卫:沿树--石头来回巡逻,看见你(8 米)就追,追丢(10 米)自己回去。规则**不在玩法图里** —— 画在独立的『游戏AI』图『守卫AI』(玩法图只有一个『AI_启用』引用它),想改行为直接改那张图 |
+| **资产库**(第四十四轮)| 树×3 + 石头×2 是**静态资产**(一个模型导一次、实例复用),进『资产』集合;拾取金币的"叮"来自『资产_声音卡』(导出时复制进 `audio/`);金币图标来自『资产_图片卡』 |
+| **界面设计图**(第四十四轮)| 左下角那块"新内容提示"画在独立的『游戏界面』设计图『新内容设计』里,玩法图用一个『界面_套用设计』套用它(想改文字/位置就改设计图) |
+| **显示设置图**(第四十四轮)| 一张『游戏显示』设置图:物理线框 / 调试面板 / 卡通材质 / 视口预览 四张设置卡(改这里 = 改导出,不用翻侧栏) |
+
+⚠ 上面标"第四十四轮"的四张**新图**都在节点编辑器里能打开、能改 ——
+玩法图里只有几个"入口节点"(AI_启用 / 界面_套用设计 / 音效_播放),
+规则本身全在各自的图里(用户要求:"必须要用节点图,可以对节点图进行修改")。
 
 跑法:
     blender -b --python scripts\\make_game_demo.py
@@ -74,6 +82,35 @@ HURT_COOLDOWN_AREA = 1.5      # 敌1(触发区)
 HURT_COOLDOWN_CHASER = 2.0    # 敌2(追击)
 COIN_GOAL = 5
 MAX_HP = 3
+
+# ── 第四十四轮:资产库 / 守卫 AI / 设计图 / 显示设置图 ────────────────
+# 用户原话:"进行游戏示例的扩展,要包含上述新添加的内容,然后检查是否存在
+# 错误,要求:必须要用节点图,可以对节点图进行修改";确认的是"只加不减"。
+GUARD = "敌3守卫"                 # 守卫 AI 控制的那个角色体
+GUARD_AI_TREE = "守卫AI"          # AI 图的名字(玩法图『AI_启用』引用它)
+GUARD_SIGHT = 8.0                 # 看见玩家(米)
+GUARD_LOST = 10.0                 # 追丢(米)
+GUARD_PATROL_SPEED = 2.4
+GUARD_CHASE_SPEED = 3.0
+# 巡逻的"到达距离":两个巡逻点是有碰撞的树 / 石头,留够距离才不会顶着它们
+GUARD_PATROL_STOP = 1.7
+GUARD_PATROL_A = "树_本体"         # 巡逻两点(用看得见的树 / 石头当路标)
+GUARD_PATROL_B = "石头_本体"
+TREE_COLOR = (0.22, 0.55, 0.28, 1.0)
+ROCK_COLOR = (0.55, 0.55, 0.60, 1.0)
+# 静态资产:名字 -> (尺寸, 位置, 资产名, 是不是实例)
+# 树:本体 + 两个实例(一个模型导一次、摆三份);石头:本体 + 一个实例
+ASSET_OBJECTS = (
+    ("树_本体", (1.1, 1.1, 3.0), (-8.5, 9.5, 1.5), "树", False),
+    ("树_实例1", (1.1, 1.1, 3.0), (-1.5, 10.6, 1.5), "树", True),
+    ("树_实例2", (1.1, 1.1, 3.0), (8.5, 9.5, 1.5), "树", True),
+    ("石头_本体", (1.6, 1.6, 1.0), (-2.5, 9.5, 0.5), "石头", False),
+    ("石头_实例1", (1.6, 1.6, 1.0), (4.5, 10.6, 0.5), "石头", True),
+)
+ICON_NAME = "金币图标"             # 程序生成的图片资产(设计图里的提示图标)
+AUDIO_PATH = os.path.join(OUT_DIR, "叮.wav")   # 程序生成的音效(拾取金币)
+DESIGN_NAME = "新内容设计"          # 界面设计图
+DISPLAY_TREE = "游戏显示"           # 显示设置图(四张设置卡)
 
 
 def log(message):
@@ -141,6 +178,18 @@ def build_scene():
     enemies = [make_box(name, (1.4, 1.4, 1.4), spot, (0.85, 0.25, 0.25, 1.0))
                for name, spot in (ENEMY_A, ENEMY_B)]
 
+    # ── 第四十四轮:守卫(角色体,行为写在『游戏AI』图里)──────────────
+    # 紫色,和两个红方块一眼分得开。
+    # ⚠ 出生点取两个巡逻点的**正中**(不是巡逻点甲):树 / 石头有碰撞体,
+    #   生在它们身上会被挤住;巡逻的『到达距离』也相应留到 1.7 米(见
+    #   build_guard_ai),这样它走到树跟前就算"到点"、掉头 —— 不会顶着树。
+    make_box(GUARD, (1.4, 1.4, 1.4), (-5.5, 9.5, 0.7), (0.62, 0.35, 0.85, 1.0))
+    # 装饰性静态资产:沿北墙摆(既当风景,也当守卫的巡逻路标)——
+    # 一个模型导一次、实例复用;它们会进『资产』集合(第四十三轮的规则)。
+    for name, size, position, _asset, _instance in ASSET_OBJECTS:
+        color = TREE_COLOR if name.startswith("树") else ROCK_COLOR
+        make_box(name, size, position, color)
+
     # 金币火花:一个**空物体**当发射器(只标位置和朝向)。吃到金币时把它
     # 挪到那枚金币的位置再『特效_爆发』—— 一个发射器服务全部金币。
     spark = bpy.data.objects.new("金币火花", None)
@@ -176,7 +225,8 @@ def write_physics(scene, player, coins, enemies):
             physics.body_type = "CharacterBody3D"
             physics.dimension = "3"
             physics.script_target = True
-        elif obj.name == chaser:
+        elif obj.name == chaser or obj.name == GUARD:
+            # 敌2 追人 / 守卫走 AI 图 —— 两个都要 velocity,所以是角色体
             physics.body_type = "CharacterBody3D"
             physics.dimension = "3"
         elif obj.name in trigger_names:
@@ -187,6 +237,13 @@ def write_physics(scene, player, coins, enemies):
         elif getattr(obj, "type", "") == "MESH":
             physics.body_type = "StaticBody3D"
             physics.dimension = "3"
+    # 静态资产的『资产名 / 作为实例』(第四十三轮的字段,第四十四轮才用上)
+    for name, _size, _position, asset, instance in ASSET_OBJECTS:
+        obj = scene.objects.get(name)
+        physics = getattr(obj, "gk_physics", None) if obj else None
+        if physics is not None:
+            physics.asset_name = asset
+            physics.asset_instance = instance
 
 
 def write_fx(scene):
@@ -246,7 +303,7 @@ def write_animations(scene, enemies):
 # ==========================================================================
 # 节点图
 # ==========================================================================
-def build_graph(scene, player, coins, enemies):
+def build_graph(scene, player, coins, enemies, audio_res=""):
     from BlenderGameKit import presets
 
     logic, _anim, notes = presets.create_character_preset(
@@ -260,7 +317,7 @@ def build_graph(scene, player, coins, enemies):
     for note in notes:
         log(f"预设: {note}")
     _declare_vars(logic)
-    _extend_graph(logic, coins, enemies)
+    _extend_graph(logic, coins, enemies, audio_res)
     return logic
 
 
@@ -309,7 +366,7 @@ def _by_name(tree, name):
     return node
 
 
-def _extend_graph(tree, coins, enemies):
+def _extend_graph(tree, coins, enemies, audio_res=""):
     ready_tail = _by_name(tree, "设定初始视野")
     physics = _by_name(tree, "每当_物理帧")
 
@@ -351,9 +408,10 @@ def _extend_graph(tree, coins, enemies):
     # ---- ③ 追击:敌2 追着玩家跑 + 贴近了扣血(带无敌帧)----
     _chase_chain(tree, physics, enemies[1].name, 340.0, -620.0)
 
-    # ---- ④ 吃金币:每枚一条链(触发区 -> 计数 -> 火花 -> 销毁)----
+    # ---- ④ 吃金币:每枚一条链(触发区 -> 计数 -> 播叮 -> 火花 -> 销毁)----
     for index, coin in enumerate(coins):
-        _coin_chain(tree, coin.name, index, -260.0, -60.0 - index * 300.0)
+        _coin_chain(tree, coin.name, index, -260.0, -60.0 - index * 300.0,
+                    audio_res)
 
     # ---- ⑤ 敌1 巡逻 + 受伤:碰到就扣血(带无敌帧:同一波接触只掉一次)----
     for index, enemy in enumerate(enemies[:1]):
@@ -362,7 +420,22 @@ def _extend_graph(tree, coins, enemies):
     # ---- ⑥ 按 E:拍一下敌1(试『动画_播放』的"先放完再重复")----
     _pose_chain(tree, physics, 340.0, -1500.0)
 
+    # ---- ⑦ 第四十四轮:守卫 AI 入口 + 套用设计图(两条新分支)----
+    # ⚠ 挂法:从「设定初始视野」的『完成』再拉一条线出来 ——
+    # 一个执行出口接两条线是**故意**的(两条互不依赖,生成时按画布上下顺序
+    # 依次出码);想改守卫的行为就打开『游戏AI』图『守卫AI』,
+    # 想改左下角提示就打开『游戏界面』图『新内容设计』。
+    enable = _add(tree, "GKNodeAiEnable", "启动守卫AI", -760.0, 980.0,
+                  gk_tree_name=GUARD_AI_TREE, gk_target=GUARD,
+                  gk_debug_print=True)
+    _link(tree, ready_tail, "完成", enable, "执行")
+    apply_design = _add(tree, "GKNodeUiApplyDesign", "套用设计提示",
+                        -760.0, 800.0, gk_design=DESIGN_NAME)
+    _link(tree, enable, "完成", apply_design, "执行")
+
     log(f"小游戏逻辑:共 {len(tree.nodes)} 个节点 / {len(tree.links)} 条连线")
+    log(f"新入口:『启动守卫AI』(-> {GUARD},引用『{GUARD_AI_TREE}』)+ "
+        f"『套用设计提示』(-> 『{DESIGN_NAME}』)")
 
 
 def _patrol_timeline(tree, x, y, enemies):
@@ -562,20 +635,28 @@ def _pause_menu(tree, x, y):
     return panel, arm
 
 
-def _coin_chain(tree, coin_name, index, x, y):
-    """一枚金币:走进触发区 -> 金币数 +1 -> 飘个 "+1" -> 火花爆一下 -> 金币消失。
+def _coin_chain(tree, coin_name, index, x, y, audio_res=""):
+    """一枚金币:走进触发区 -> 金币数 +1 -> 播"叮" -> 飘个 "+1" -> 火花爆一下 -> 金币消失。
 
     ⚠ 『变量_增减』一个节点就顶掉了原来的
     『变量_读取』->『数学_运算』->『变量_设置』三件套;
     『限制范围』勾上 0~5,金币数不可能被加冒;
     飘字是**一次性的 Label3D**(第二十六轮):贴着金币冒 "+1",飘完自删,
     不占屏幕角落的 HUD。
+    第四十四轮:"叮"来自**资产库**的『资产_声音卡』(audio_res 由调用方
+    用 sound_assets.sound_res_path 算好 —— 和导出复制进 audio/ 的是同一个)。
     """
     touched = _add(tree, "GKNodeOnAreaEntered", f"碰到{coin_name}", x, y,
                    gk_area=coin_name, gk_filter=PLAYER)
     add_one = _add(tree, "GKNodeAddVar", f"金币+1_{index + 1}", x + 240.0, y,
                    gk_var_name="金币数", gk_amount=1.0,
                    gk_clamp=True, gk_min=0.0, gk_max=float(COIN_GOAL))
+    tail = add_one
+    if audio_res:
+        sound = _add(tree, "GKNodePlaySound", f"金币音效{index + 1}",
+                     x + 360.0, y - 260.0, gk_path=audio_res)
+        _link(tree, add_one, "完成", sound, "执行")
+        tail = sound
     floating = _add(tree, "GKNodeFloatText", f"金币飘字{index + 1}",
                     x + 480.0, y + 180.0, gk_target=coin_name,
                     gk_prefix="+", gk_value=1.0)
@@ -591,7 +672,7 @@ def _coin_chain(tree, coin_name, index, x, y):
     _link(tree, where, "Y", move_spark, "Y")
     _link(tree, where, "Z", move_spark, "Z")
     _link(tree, touched, "执行", add_one, "执行")
-    _link(tree, add_one, "完成", floating, "执行")
+    _link(tree, tail, "完成", floating, "执行")
     _link(tree, floating, "完成", move_spark, "执行")
     _link(tree, move_spark, "完成", burst, "执行")
     _link(tree, burst, "完成", kill, "执行")
@@ -721,6 +802,160 @@ def _chase_chain(tree, physics, chaser_name, x, y):
     _link(tree, shake, "完成", say, "执行")
 
 
+# ==========================================================================
+# 第四十四轮:新加的四张图(资产库 / 守卫AI / 设计图 / 显示设置图)
+# ==========================================================================
+def make_pickup_wav(path):
+    """程序生成拾取音效("叮",1320Hz 短音)—— 不依赖任何外部素材。"""
+    import struct
+    import wave
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    seconds, freq, rate = 0.18, 1320.0, 22050
+    count = int(seconds * rate)
+    frames = bytearray()
+    for index in range(count):
+        t = index / rate
+        fade_in = min(1.0, index / (rate * 0.01))
+        fade_out = min(1.0, (count - index) / (rate * 0.06))
+        value = int(20000 * fade_in * fade_out
+                    * math.sin(2.0 * math.pi * freq * t))
+        frames += struct.pack("<h", value)
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(bytes(frames))
+    log(f"音效资产:{os.path.basename(path)}({seconds:g} 秒,程序生成)")
+    return path
+
+
+def make_icon_image():
+    """程序生成金币图标(64×64 金色圆盘)—— 设计图里那块提示的图标。"""
+    image = bpy.data.images.get(ICON_NAME)
+    if image is not None:
+        bpy.data.images.remove(image)
+    size = 64
+    image = bpy.data.images.new(ICON_NAME, size, size, alpha=True)
+    pixels = [0.0] * (size * size * 4)
+    center = (size - 1) / 2.0
+    for y in range(size):
+        for x in range(size):
+            dx = (x - center) / center
+            dy = (y - center) / center
+            distance = (dx * dx + dy * dy) ** 0.5
+            index = (y * size + x) * 4
+            if distance < 0.68:
+                pixels[index] = 0.98
+                pixels[index + 1] = 0.82
+                pixels[index + 2] = 0.25
+                pixels[index + 3] = 1.0
+            elif distance < 0.95:
+                pixels[index] = 0.55
+                pixels[index + 1] = 0.42
+                pixels[index + 2] = 0.10
+                pixels[index + 3] = 1.0
+            else:
+                pixels[index + 3] = 0.0
+    image.pixels = pixels
+    image.pack()          # 跟着 .blend 走(不留外部依赖)
+    log(f"图片资产:{ICON_NAME} 64×64(程序生成 + 打包)")
+    return image
+
+
+def build_guard_ai():
+    """守卫的 AI 图:巡逻 <-看见(8 米)-- 追击 --追丢(10 米)--> 巡逻。
+
+    这张图在节点编辑器里能直接打开改(类型切『游戏AI』)——
+    玩法图里只有『AI_启用』一个入口节点。
+    """
+    tree = bpy.data.node_groups.new(GUARD_AI_TREE, "GKGameAiTree")
+    tree.use_fake_user = True
+    patrol = _add(tree, "GKNodeAiState", "巡逻", -60.0, 0.0,
+                  gk_state_name="巡逻", gk_behavior="PATROL",
+                  gk_patrol_a=GUARD_PATROL_A, gk_patrol_b=GUARD_PATROL_B,
+                  gk_speed=GUARD_PATROL_SPEED,
+                  # ⚠ 到达距离留 1.7 米:两个巡逻点是**有碰撞的树 / 石头**,
+                  #   贴到 0.6 米会先被挡住 -> 永远"到不了" -> 不折返(卡住)。
+                  gk_stop_distance=GUARD_PATROL_STOP,
+                  gk_facing="MOVE")
+    chase = _add(tree, "GKNodeAiState", "追击", 700.0, 0.0,
+                 gk_state_name="追击", gk_behavior="CHASE", gk_goal=PLAYER,
+                 gk_speed=GUARD_CHASE_SPEED, gk_stop_distance=CHASE_STOP,
+                 gk_facing="GOAL")
+    see = _add(tree, "GKNodeAiTransition", "看见玩家", 320.0, 180.0,
+               gk_cond_source="SEE", gk_goal=PLAYER, gk_sight=GUARD_SIGHT)
+    back = _add(tree, "GKNodeAiTransition", "丢失玩家", 320.0, -210.0,
+                gk_cond_source="LOST", gk_goal=PLAYER, gk_sight=GUARD_LOST)
+    _link(tree, patrol, "转到", see, "上游")
+    _link(tree, see, "转到", chase, "进入")
+    _link(tree, chase, "转到", back, "上游")
+    _link(tree, back, "转到", patrol, "进入")
+    log(f"AI 图『{tree.name}』:巡逻 --看见({GUARD_SIGHT:g} 米)--> 追击 "
+        f"--丢失({GUARD_LOST:g} 米)--> 巡逻(起始状态 = 巡逻)")
+    return tree
+
+
+def build_design_tree():
+    """左下角的"新内容提示"—— 画在独立的设计图里(第四十轮的套用式)。"""
+    design = bpy.data.node_groups.new(DESIGN_NAME, "GKUiDesignTree")
+    design.use_fake_user = True
+    _add(design, "GKNodeUiPanel", "提示底板", 0.0, 0.0,
+         gk_width=520.0, gk_height=96.0, gk_radius=12,
+         gk_align="BOTTOM_LEFT", gk_margin=14.0,
+         gk_color=(0.10, 0.12, 0.18, 0.72))
+    _add(design, "GKNodeUiImage", "提示图标", 300.0, 0.0,
+         gk_image=ICON_NAME, gk_width=52.0, gk_height=52.0,
+         gk_x=16.0, gk_y=22.0, gk_parent_widget="提示底板")
+    _add(design, "GKNodeUiText", "提示文字", 600.0, 0.0,
+         gk_text=("新内容:守卫 AI(紫方块,会追你)/ 资产库(树·石头·叮)/ "
+                  "界面设计图 / 显示设置图"),
+         gk_size=18, gk_color=(0.85, 0.92, 1.0, 1.0),
+         gk_x=82.0, gk_y=36.0, gk_parent_widget="提示底板")
+    log(f"设计图『{design.name}』:{len(design.nodes)} 个控件"
+        f"(底板 + 图标 + 文字,后两个挂在底板上)")
+    return design
+
+
+def build_asset_tree(wav_path):
+    """资产库:收录(树/石头 -> 模型卡,金币图标 -> 图片卡,叮 -> 声音卡)。"""
+    from BlenderGameKit import sound_assets
+    from BlenderGameKit import ui as gk_ui
+    tree = gk_ui._asset_tree_or_new()
+    counts = gk_ui._fill_asset_cards(tree)
+    # 声音卡:音效节点里那个路径已经被收录成卡了(同一个函数算的),
+    # 这里把本地文件补上 —— 收录只看得到 res:// 路径
+    card = gk_ui._ensure_asset_card(
+        tree, "GKNodeAssetSound", sound_assets.sound_res_path(wav_path))
+    if card is not None:
+        card.gk_name = "叮"
+        card.gk_file = wav_path
+    total = len([node for node in tree.nodes
+                 if getattr(node, "bl_idname", "").startswith("GKNodeAsset")])
+    log(f"资产图『{tree.name}』:收录 模型 {counts['model']} / 图片 "
+        f"{counts['image']} / 曲线 {counts['curve']} / 声音 {counts['sound']}"
+        f"(共 {total} 张卡)")
+    return tree
+
+
+def build_display_tree():
+    """显示设置图(第四十二轮的做法):四张设置卡,写透到本场景设置。"""
+    from BlenderGameKit import ui as gk_ui
+    tree = gk_ui._new_display_tree()
+    log(f"显示设置图『{tree.name}』:{len(tree.nodes)} 张设置卡"
+        f"(物理线框 / 调试面板 / 画面风格 / 视口预览)")
+    return tree
+
+
+def collect_assets_into_collection(scene):
+    """把静态资产收进『资产』集合(大纲视图里和普通物体分开)。"""
+    from BlenderGameKit import ui as gk_ui
+    objects = gk_ui._scene_asset_objects(scene)
+    moved = gk_ui.move_into_asset_collection(scene, objects)
+    collection = gk_ui.asset_collection(scene, create=False)
+    log(f"『资产』集合:{moved} 个物体"
+        + (f" -> 『{collection.name}』" if collection else ""))
+
+
 def save_blend(path):
     """保存 .blend(无头模式下用 libraries.write,见 make_curve_demo 的说明)。"""
     if not bpy.app.background:
@@ -728,21 +963,35 @@ def save_blend(path):
         return
     blocks = set(bpy.data.objects) | set(bpy.data.meshes) | \
         set(bpy.data.materials) | set(bpy.data.curves) | \
-        set(bpy.data.node_groups) | set(bpy.data.cameras) | set(bpy.data.lights)
+        set(bpy.data.node_groups) | set(bpy.data.cameras) | set(bpy.data.lights) | \
+        set(bpy.data.images) | set(bpy.data.collections)
+    # ⚠ images(金币图标)+ collections(『资产』集合)是第四十四轮新加的:
+    # 少写 collections,集合和归属关系就没了(物体变成孤儿)。
     scenes = list(bpy.data.scenes)
     bpy.data.libraries.write(path, blocks | set(scenes), fake_user=True)
 
 
 def main():
-    from BlenderGameKit import asset_export, project
+    from BlenderGameKit import asset_export, project, sound_assets
 
     os.makedirs(OUT_DIR, exist_ok=True)
     scene, player, coins, enemies = build_scene()
     write_physics(scene, player, coins, enemies)
     write_fx(scene)
     write_animations(scene, enemies)
-    build_graph(scene, player, coins, enemies)
+    # ── 第四十四轮:先备好"资产"(音效文件 / 图标图),再建图 ─────────
+    wav_path = make_pickup_wav(AUDIO_PATH)
+    make_icon_image()
+    build_graph(scene, player, coins, enemies,
+                audio_res=sound_assets.sound_res_path(wav_path))
+    # 四张新图:守卫AI / 设计图 / 资产库 / 显示设置图(节点编辑器里都能改)
+    build_guard_ai()
+    build_design_tree()
+    build_asset_tree(wav_path)
+    build_display_tree()
+    collect_assets_into_collection(scene)
     # 上帝机(Tab)+ 调试面板(F1 / F2)—— 这两样也是"链路"的一部分
+    # (第四十二轮起,这些开关也能在『游戏显示』设置图上改)
     settings = scene.gk_settings
     settings.god_camera = True
     settings.debug_panel = True
