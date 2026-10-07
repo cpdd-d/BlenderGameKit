@@ -1266,6 +1266,156 @@ def main():
         check("第四十二轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 资产库(第四十三轮:『游戏资产』)----
+    # ① 第六种图类型注册成功;`_fill_asset_cards` 把 .blend 里的资产收成卡,
+    #    再收一遍不重复;
+    # ② 玩法节点进不了资产库、资产卡进不了玩法图(Blender 侧 poll 把关);
+    # ③ 『资产』集合:真的从原来的集合摘出来(大纲里和普通物体分开);
+    # ④ 跨场景:本体在 A 关,往 B 关摆 —— 第一份自动当本体、第二份是实例,
+    #    这样 B 关导出的账本上有本体(实例有模型可用);
+    # ⑤ 音频:声音卡进导出清单(名字 / 本地文件 / res:// 路径);
+    # ⑥ 四张资产卡的 draw_buttons 都能画完 + 侧栏面板已注册。
+    try:
+        from importlib import import_module
+        import bmesh
+        r43_ui = import_module(f"{module_name}.ui")
+        r43_sound = import_module(f"{module_name}.sound_assets")
+        r43_export = import_module(f"{module_name}.asset_export")
+
+        r43_scene = bpy.context.scene
+        r43_mesh = bpy.data.meshes.new("冒烟资产43")
+        r43_bm = bmesh.new()
+        bmesh.ops.create_cube(r43_bm, size=1.0)
+        r43_bm.to_mesh(r43_mesh)
+        r43_bm.free()
+        r43_obj = bpy.data.objects.new("冒烟树43", r43_mesh)
+        r43_scene.collection.objects.link(r43_obj)
+        r43_obj.gk_physics.asset_name = "冒烟树43"
+
+        r43_tree = r43_ui._asset_tree_or_new()
+        r43_counts = r43_ui._fill_asset_cards(r43_tree)
+        r43_model_cards = [getattr(node, "gk_asset", "")
+                           for node in r43_tree.nodes
+                           if getattr(node, "bl_idname", "")
+                           == "GKNodeAssetModel"]
+        check("资产:第六种图类型注册成功 + 收录出模型卡",
+              getattr(r43_tree, "bl_idname", "") == "GKAssetTree"
+              and "冒烟树43" in r43_model_cards,
+              f"counts={r43_counts} cards={r43_model_cards}")
+        check("资产:重复收录不重复加卡",
+              sum(r43_ui._fill_asset_cards(r43_tree).values()) == 0)
+
+        # 双向拦节点(poll 把关)
+        r43_before = len(r43_tree.nodes)
+        try:
+            r43_tree.nodes.new("GKNodeMoveDirection")
+            r43_move_blocked = False
+        except RuntimeError:
+            r43_move_blocked = True
+        check("资产:玩法节点进不了资产库(Blender 侧把关)",
+              r43_move_blocked and len(r43_tree.nodes) == r43_before)
+        r43_logic = bpy.data.node_groups.new("资产玩法冒烟43", "GKGameLogicTree")
+        try:
+            r43_logic.nodes.new("GKNodeAssetModel")
+            r43_card_blocked = False
+        except RuntimeError:
+            r43_card_blocked = True
+        check("资产:资产卡进不了玩法图(不会污染代码生成)",
+              r43_card_blocked and len(r43_logic.nodes) == 0)
+
+        # ③ 收进『资产』集合(用户选的"在 Blender 里就隔开")
+        r43_collection = r43_ui.asset_collection(r43_scene)
+        r43_moved = r43_ui.move_into_asset_collection(r43_scene, [r43_obj])
+        check("资产:收进『资产』集合(从原来的集合摘出来)",
+              r43_moved == 1 and r43_collection is not None
+              and r43_obj.name in r43_collection.objects
+              and r43_obj.name not in r43_scene.collection.objects
+              and r43_obj.name in r43_scene.objects,
+              f"collections={[c.name for c in r43_obj.users_collection]}")
+
+        # ④ 跨场景摆一份(本体在这一关,摆到新的一关)
+        r43_scene2 = bpy.data.scenes.new("资产第二关43")
+        r43_ok1, r43_msg1, r43_first = r43_ui.place_asset_into_scene(
+            r43_scene2, "冒烟树43")
+        r43_ok2, r43_msg2, r43_second = r43_ui.place_asset_into_scene(
+            r43_scene2, "冒烟树43")
+        check("资产:跨场景摆一份(第一份当本体、第二份当实例)",
+              r43_ok1 and r43_ok2
+              and r43_first is not None and r43_second is not None
+              and not r43_first.gk_physics.asset_instance
+              and r43_second.gk_physics.asset_instance
+              and r43_first.name in r43_scene2.objects
+              and r43_second.name in r43_scene2.objects,
+              f"{r43_msg1} / {r43_msg2}")
+        r43_entry = r43_export.collect_assets(r43_scene2).get("冒烟树43") or {}
+        check("资产:第二关的导出账本上有本体(实例有模型可用)",
+              r43_entry.get("source") is not None
+              and len(r43_entry.get("members") or []) == 2,
+              f"source={getattr(r43_entry.get('source'), 'name', None)} "
+              f"members={len(r43_entry.get('members') or [])}")
+
+        # ⑤ 音频:声音卡 -> 导出清单(名字 / 文件 / res:// 路径)
+        r43_wav = os.path.join(tempfile.gettempdir(), "gk_smoke43_跳跃.wav")
+        with open(r43_wav, "wb") as r43_handle:
+            r43_handle.write(b"RIFF....WAVEfmt ")
+        r43_sound_card = r43_tree.nodes.new("GKNodeAssetSound")
+        r43_sound_card.gk_name = "冒烟音效43"
+        r43_sound_card.gk_file = r43_wav
+        r43_sound_card.gk_res = r43_sound.sound_res_path(r43_wav)
+        r43_entries = node_lib.sound_card_entries(r43_tree)
+        check("资产:声音卡进了导出清单(名字 / 文件 / res:// 路径)",
+              ("冒烟音效43", r43_wav, r43_sound.sound_res_path(r43_wav))
+              in r43_entries, str(r43_entries))
+        r43_planned = r43_sound.sound_files(
+            "X:/proj", [(name, path) for name, path, _res in r43_entries])
+        check("资产:声音卡的目标文件落在 audio/ 下",
+              any(item[3].startswith("res://audio/") for item in r43_planned))
+
+        # ⑥ 卡片 draw + 面板注册
+        class _R43Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r43_draw_ok = True
+        r43_draw_error = ""
+        for r43_card in r43_tree.nodes:
+            try:
+                r43_card.draw_buttons(bpy.context, _R43Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r43_draw_ok = False
+                r43_draw_error = (f"{getattr(r43_card, 'bl_label', '?')}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("资产:资产卡的 draw_buttons 都能画完", r43_draw_ok,
+              r43_draw_error)
+        r43_panels = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]
+        check("资产:侧栏面板已注册", "GK_PT_AssetTree" in r43_panels,
+              str(r43_panels)[:200])
+
+        # 收尾(第二关的对象 / 集合 / 场景都要清干净)
+        try:
+            os.remove(r43_wav)
+        except OSError:
+            pass
+        for r43_temp in list(r43_scene2.objects):
+            bpy.data.objects.remove(r43_temp, do_unlink=True)
+        r43_col2 = r43_ui.asset_collection(r43_scene2, create=False)
+        bpy.data.scenes.remove(r43_scene2)
+        if r43_col2 is not None:
+            bpy.data.collections.remove(r43_col2)
+        bpy.data.node_groups.remove(r43_logic)
+        bpy.data.node_groups.remove(r43_tree)
+        bpy.data.objects.remove(r43_obj, do_unlink=True)
+        bpy.data.meshes.remove(r43_mesh)
+    except Exception as exc:
+        check("第四十三轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 上台阶(第二十九轮):『移动_按方向』的『上台阶高度』----
     # Godot 的运动学角色**不会**自动上台阶(0.35 米在它眼里就是堵墙)。
     # 填了高度才生成"三关探测"(被竖面挡住 / 抬起来的路通 / 落点有地),

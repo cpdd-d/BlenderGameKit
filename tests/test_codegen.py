@@ -538,6 +538,7 @@ class TestNodeLibrary(unittest.TestCase):
         no_flow = {"GKNodeAnimState", "GKNodeAnimTransition",
                    "GKNodeAnimEntry"}
         no_flow |= set(NN.DISPLAY_CARD_IDS)
+        no_flow |= set(NN.ASSET_CARD_IDS)
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
                 continue
@@ -11343,6 +11344,238 @@ class TestRound42Display(Base):
         self.assertFalse(rows[0][2])
         # 设置对象本身拿不到(None)= 空摘要,面板自己去报错
         self.assertEqual(NN.display_settings_rows(None), [])
+
+
+class TestRound43Assets(Base):
+    """第四十三轮:『游戏资产』资产库(3D 道具 / 图片 / 曲线 / 音频)。
+
+    用户原话:"添加游戏资产管理编辑器,便于重复利用与和常规资产隔开";
+    动工前在三个形态里点了**新节点树类型**,并选了:收四类、
+    **跨场景共用**、资产实例自动收进『资产』集合。
+
+    这一轮的判据(和『游戏显示』那轮一样):
+      * 四张资产卡只属于资产库(一个引脚都没有,不参与代码生成);
+      * "谁在用" / "收录" 是**纯函数**(喂桩树就能验);
+      * 音频管线两端算同一个路径(sound_assets),导出时真的复制。
+    """
+
+    def _trees_with_users(self):
+        logic = gk_stub.StubNodeTree("玩法")
+        logic.bl_idname = "GKGameLogicTree"
+        logic.new_node(NN.GKNodeUiImage, "头像", gk_image="头像图")
+        logic.new_node(NN.GKNodeUiImage, "背景", gk_image="头像图")
+        logic.new_node(NN.GKNodeCameraSetCurrent, "运镜", gk_path_curve="轨道")
+        logic.new_node(NN.GKNodePlaySound, "音效", gk_path="res://audio/x.wav")
+        anim = gk_stub.StubNodeTree("动画")
+        anim.bl_idname = "GKAnimationTree"
+        anim.new_node(NN.GKNodeUiText, "文字")
+        return [logic, anim]
+
+    # ---- 树归属 / 菜单 ----
+    def test_card_list_matches_classes(self):
+        from BlenderGameKit import properties as props
+        self.assertEqual(len(NN.ASSET_CARD_IDS), 4)
+        for blob in NN.ASSET_CARD_IDS:
+            cls = getattr(NN, blob, None)
+            self.assertIsNotNone(cls, f"ASSET_CARD_IDS 里的 {blob} 没定义")
+            self.assertEqual(cls.bl_idname, blob)
+            self.assertEqual(list(cls.gk_inputs), [], blob)
+            self.assertEqual(list(cls.gk_outputs), [], blob)
+            self.assertTrue(props.node_fits_tree(cls, "GKAssetTree"))
+
+    def test_asset_cards_tree_scope(self):
+        from BlenderGameKit import properties as props
+        for blob in NN.ASSET_CARD_IDS:
+            cls = getattr(NN, blob)
+            for other in ("GKGameLogicTree", "GKAnimationTree",
+                          "GKUiDesignTree", "GKGameAiTree", "GKDisplayTree"):
+                self.assertFalse(props.node_fits_tree(cls, other),
+                                 f"{cls.bl_label} 不该出现在 {other} 里")
+        # 玩法节点 / 设置卡进不了资产库
+        self.assertFalse(props.node_fits_tree(NN.GKNodeMoveDirection,
+                                              "GKAssetTree"))
+        self.assertFalse(props.node_fits_tree(NN.GKNodeDisplayCollision,
+                                              "GKAssetTree"))
+
+    def test_menu_lists_only_asset_cards(self):
+        from BlenderGameKit import properties as props
+        labels = [cls.bl_label
+                  for _cat, items in props.node_menu_entries("GKAssetTree")
+                  for cls in items]
+        for wanted in ("资产_模型卡", "资产_图片卡", "资产_曲线卡",
+                       "资产_声音卡"):
+            self.assertIn(wanted, labels)
+        self.assertNotIn("移动_按方向", labels)
+
+    def test_missing_asset_cards(self):
+        tree = gk_stub.StubNodeTree("游戏资产")
+        self.assertEqual(NN.missing_asset_cards(tree),
+                         list(NN.ASSET_CARD_IDS))
+        tree.new_node(NN.GKNodeAssetModel)
+        self.assertEqual(NN.missing_asset_cards(tree),
+                         list(NN.ASSET_CARD_IDS[1:]))
+
+    # ---- "谁在用" / "收录"(纯函数)----
+    def test_asset_users_finds_references(self):
+        trees = self._trees_with_users()
+        image_users = NN.asset_users(trees, "image", "头像图")
+        self.assertEqual(len(image_users), 2)
+        self.assertTrue(all(entry[0] == "玩法" for entry in image_users))
+        curve_users = NN.asset_users(trees, "curve", "轨道")
+        self.assertEqual([entry[1] for entry in curve_users], ["运镜"])
+        sound_users = NN.asset_users(trees, "sound", "res://audio/x.wav")
+        self.assertEqual([entry[1] for entry in sound_users], ["音效"])
+        # 没被引用的资产 = 空清单;空值不误伤
+        self.assertEqual(NN.asset_users(trees, "image", "没人用的图"), [])
+        self.assertEqual(NN.asset_users(trees, "image", ""), [])
+
+    def test_collect_used_assets(self):
+        used = NN.collect_used_assets(self._trees_with_users())
+        self.assertEqual(used["images"], ["头像图"])
+        self.assertEqual(used["curves"], ["轨道"])
+        self.assertEqual(used["sounds"], ["res://audio/x.wav"])
+
+    # ---- 音频管线:名字 / 复制 ----
+    def test_sound_naming_is_stable_and_ascii(self):
+        from BlenderGameKit import sound_assets
+        first = sound_assets.sound_file_name("D:/音频/跳跃.wav")
+        second = sound_assets.sound_file_name("D:/音频/跳跃.wav")
+        self.assertEqual(first, second)                    # 稳定
+        self.assertTrue(first.endswith(".wav"))
+        self.assertTrue(first[:-4].isascii())              # 压成 ASCII
+        # 同名的两个文件(不同目录)不能撞成同一个目标名
+        other = sound_assets.sound_file_name("E:/备份/跳跃.wav")
+        self.assertNotEqual(first, other)
+        self.assertTrue(sound_assets.sound_res_path("D:/音频/跳跃.wav")
+                        .startswith("res://audio/"))
+        self.assertTrue(sound_assets.is_sound_file("a.OGG"))
+        self.assertFalse(sound_assets.is_sound_file("a.txt"))
+
+    def test_sound_files_filter_and_dedupe(self):
+        from BlenderGameKit import sound_assets
+        cards = [("跳跃", "D:/s/jump.wav"),
+                 ("没有文件", ""),
+                 ("不是音频", "D:/s/note.txt"),
+                 ("重复的同一个文件", "D:/s/jump.wav")]
+        planned = sound_assets.sound_files("X:/proj", cards)
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0][0], "跳跃")
+
+    def test_copy_sounds_reports_missing(self):
+        from BlenderGameKit import sound_assets
+        folder = tempfile.mkdtemp(prefix="gk_sound_")
+        try:
+            source = os.path.join(folder, "跳跃.wav")
+            with open(source, "wb") as handle:
+                handle.write(b"RIFF....WAVEfmt ")
+            written, missing = sound_assets.copy_sounds(folder, [
+                ("跳跃", source),
+                ("丢了", os.path.join(folder, "没有这个.wav")),
+            ])
+            self.assertEqual(len(written), 1)
+            self.assertTrue(written[0].startswith("audio/"))
+            self.assertTrue(os.path.isfile(
+                os.path.join(folder, written[0].replace("/", os.sep))))
+            self.assertEqual([name for name, _path in missing], ["丢了"])
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_export_copies_sound_assets(self):
+        """导出时必须真的把声音卡的文件复制进 audio/,并写进清单。"""
+        folder = tempfile.mkdtemp(prefix="gk_sound_export_")
+        try:
+            source = os.path.join(folder, "跳跃.wav")
+            with open(source, "wb") as handle:
+                handle.write(b"RIFF....WAVEfmt ")
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            play = tree.new_node(NN.GKNodePlaySound, "音效",
+                                 gk_path="res://audio/x.wav")
+            gk_stub.connect(tree, event, "执行", play, "执行")
+            out = os.path.join(folder, "proj")
+            os.makedirs(out, exist_ok=True)
+            with mock.patch.object(exporter, "_sound_asset_cards",
+                                   return_value=[("跳跃", source)]):
+                result = exporter.export_tree(
+                    tree, {"output_dir": out, "dimension": "3",
+                           "base_class": "CharacterBody3D"}, write_scene=False)
+            self.assertTrue(result["ok"], result)
+            files = os.listdir(os.path.join(out, "audio"))
+            self.assertEqual(len(files), 1, files)
+            self.assertIn(f"audio/{files[0]}", result["manifest"])
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_export_missing_sound_is_warning_not_failure(self):
+        """声音卡的文件被挪走:导出照常成功,只给一条告警。"""
+        folder = tempfile.mkdtemp(prefix="gk_sound_missing_")
+        try:
+            tree = make_tree()
+            tree.new_node(NN.GKNodeOnReady, "准备")
+            out = os.path.join(folder, "proj")
+            os.makedirs(out, exist_ok=True)
+            with mock.patch.object(
+                    exporter, "_sound_asset_cards",
+                    return_value=[("丢了", os.path.join(folder, "无.wav"))]):
+                result = exporter.export_tree(
+                    tree, {"output_dir": out, "dimension": "3",
+                           "base_class": "CharacterBody3D"}, write_scene=False)
+            self.assertTrue(result["ok"], result)
+            codes = [item.code for item in result["diagnostics"]]
+            self.assertIn("SOUND_FILE_MISSING", codes)
+            self.assertFalse(os.path.isdir(os.path.join(out, "audio"))
+                             and os.listdir(os.path.join(out, "audio")))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_sound_survives_old_file_cleanup(self):
+        """音频刚复制进去,不能被"旧文件清理"当成上一轮的残留删掉。
+
+        实测踩过:整次导出末尾的清理只看"事务写过的文件 + 被引用的文件" ——
+        音频是直接拷的(二进制不走文本事务),两边都不占,于是刚写进去
+        就被清走了(godot 里表现为"找不到音频文件")。
+        修法:复制成功的音频进 `written`(`FileTransaction.mark`),
+        而且 `.wav/.ogg/.mp3` 加进 `referenced_files` 认的扩展名表。
+        这里两头都验:在用 -> 保住;不用了 -> 才清掉。
+        """
+        from BlenderGameKit import generated_files
+        folder = tempfile.mkdtemp(prefix="gk_sound_cleanup_")
+        try:
+            source = os.path.join(folder, "叮.wav")
+            with open(source, "wb") as handle:
+                handle.write(b"RIFF....WAVEfmt ")
+            out = os.path.join(folder, "proj")
+            os.makedirs(out, exist_ok=True)
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            play = tree.new_node(NN.GKNodePlaySound, "音效",
+                                 gk_path="res://audio/x.wav")
+            gk_stub.connect(tree, event, "执行", play, "执行")
+            options = {"output_dir": out, "dimension": "3",
+                       "base_class": "CharacterBody3D"}
+            with mock.patch.object(exporter, "_sound_asset_cards",
+                                   return_value=[("叮", source)]):
+                first = exporter.export_tree(tree, options, write_scene=False)
+            self.assertTrue(first["ok"], first)
+            generated_files.cleanup_after_export(out, first["written"])
+            audio_dir = os.path.join(out, generated_files.project.AUDIO_DIR)
+            self.assertTrue(os.listdir(audio_dir),
+                            "第一次导出后音频被清理删掉了")
+
+            # 第二次:资产库里没有这张声音卡了 -> 它才该被清掉
+            quiet = make_tree()
+            quiet.new_node(NN.GKNodeOnReady, "准备")
+            with mock.patch.object(exporter, "_sound_asset_cards",
+                                   return_value=[]):
+                second = exporter.export_tree(quiet, options,
+                                              write_scene=False)
+            deleted = generated_files.cleanup_after_export(
+                out, second["written"])
+            self.assertTrue(any(item.startswith("audio/") for item in deleted),
+                            f"不再引用的音频没被清掉: {deleted}")
+            self.assertFalse(os.listdir(audio_dir))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 if __name__ == "__main__":

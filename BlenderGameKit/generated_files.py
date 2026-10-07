@@ -45,7 +45,7 @@ MANIFEST_VERSION = 1
 # 只允许在这几个目录里删东西(全部是插件生成的目录)
 GENERATED_DIRS = (project.SCRIPTS_DIR, project.SCENES_DIR, project.ART_DIR,
                   project.MATERIALS_DIR, project.SHADERS_DIR,
-                  project.CURVES_DIR)
+                  project.CURVES_DIR, project.AUDIO_DIR)
 
 # 曲线资源文件名的后缀(`名字_8位十六进制.tres`,见 curve_assets.curve_file_name)
 _CURVE_NAME_RE = re.compile(r"_[0-9a-f]{8}\.tres$", re.IGNORECASE)
@@ -107,6 +107,12 @@ def is_generated_file(path):
         return "gk_toon" in _head(path, 4096)
     if folder == project.CURVES_DIR and ext == ".tres":
         return bool(_CURVE_NAME_RE.search(name))
+    if folder == project.AUDIO_DIR and ext in (".wav", ".ogg", ".mp3"):
+        # 音频没法靠"内容标记"认领(二进制、没有可读的头)。
+        # 靠**目录 + 扩展名**:audio/ 只有资产管线(『资产_声音卡』)会写,
+        # 而且删不删还要再看"它在不在上一轮的清单里"(见 stale_files)——
+        # 用户自己放进 audio/ 的文件从没进过清单,永远不会被删。
+        return True
     if folder == project.SHADERS_DIR and ext in (".gdshader", ".gdshaderinc"):
         return name in _plugin_shader_names()
     if folder == project.SCENES_DIR and ext == ".tscn":
@@ -141,7 +147,11 @@ def scan_generated_files(directory):
 # 而且**只认已知的扩展名** —— 宁少不多。
 _RES_REF_RE = re.compile(r"res://([^\"'\s|()=<>]+)")
 _RES_EXTS = (".gd", ".tscn", ".tres", ".glb", ".png", ".gdshader",
-             ".gdshaderinc", ".json", ".import")
+             ".gdshaderinc", ".json", ".import",
+             # 音频资产(第四十三轮):脚本里写死 `res://audio/x.wav`,
+             # 清单判定"被引用到"时必须认得它,否则刚复制的音频会被
+             # 当成旧文件清掉(实测踩过)
+             ".wav", ".ogg", ".mp3")
 # 每个文件最多读这么多字符找引用(生成的脚本/场景都不大,这是防呆)
 _REF_READ_LIMIT = 400000
 

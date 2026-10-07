@@ -23,6 +23,10 @@ SCENES_DIR = "scenes"
 ART_DIR = "art"
 MATERIALS_DIR = "materials"
 SHADERS_DIR = "shaders"
+# 音频资产目录(第四十三轮:『游戏资产』图的『资产_声音卡』挑进来的本地文件)。
+# 和 curves/ 同理:**按需创建**,不进 SUBDIRS —— 老项目没有这个目录,
+# 列进去的话项目面板会一直显示"缺少子目录: audio"。
+AUDIO_DIR = "audio"
 
 # ⚠ `curves/` 故意**不在** SUBDIRS 里:老项目没有这个目录,列进去的话
 # 项目面板会一直显示"缺少子目录: curves"(用户什么都没做错却看到红色)。
@@ -62,6 +66,7 @@ _README = """# {title}
 | `materials/` | 卡通材质 `.tres` | Blender NPR 预览面板 |
 | `shaders/` | NPR 着色器 | 插件自带 |
 | `curves/` | 你画的曲线(运镜轨道 / 时间轴) `.tres` | Blender 曲线物体(按需创建) |
+| `audio/` | 音频资产(音效 / BGM) `.wav` / `.ogg` / `.mp3` | 『游戏资产』图的『资产_声音卡』(按需创建) |
 
 `art/` 和 `materials/` 里**由你自己做的**东西不会被覆盖;
 只有同名文件会被重写。

@@ -152,6 +152,8 @@ def main():
         # 『游戏显示』设置图的侧栏面板(第四十二轮)—— 没有节点编辑器上下文时
         # 它应该走"没有显示设置图"的早退分支,同样不许抛异常。
         ("GK_PT_DisplayTree", cube),
+        # 『游戏资产』资产库的侧栏面板(第四十三轮)同理。
+        ("GK_PT_AssetTree", cube),
     ]
     for class_name, target in cases:
         panel = getattr(ui, class_name, None)
@@ -290,6 +292,46 @@ def main():
         bpy.data.node_groups.remove(tree)
     except Exception as exc:
         check("『游戏显示』面板", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 5. 『游戏资产』资产库的面板 + 四张资产卡(第四十三轮)----
+    print("=" * 72)
+    print("5. 『游戏资产』面板 + 四张资产卡")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟资产43", "GKAssetTree")
+        model = tree.nodes.new("GKNodeAssetModel")
+        model.gk_asset = cube.name          # 拿上面的立方体当资产
+        cube.gk_physics.asset_name = cube.name
+        panel = getattr(ui, "GK_PT_AssetTree", None)
+        if panel is None:
+            check("GK_PT_AssetTree 存在", False, "类找不到")
+        else:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, tree))
+            names = list(layout.operator_names)
+            for wanted in ("gk.asset_fill_cards", "gk.asset_register",
+                           "gk.switch_tree"):
+                check(f"『游戏资产』面板画出 {wanted}", wanted in names,
+                      str(sorted(set(names))))
+
+        # 四张资产卡的 draw_buttons 都要能画完
+        for blob in ("GKNodeAssetImage", "GKNodeAssetCurve",
+                     "GKNodeAssetSound"):
+            tree.nodes.new(blob)
+        card_error = ""
+        for card in tree.nodes:
+            try:
+                card.draw_buttons(bpy.context, RecordingLayout())
+            except Exception as exc:                      # noqa: BLE001
+                card_error = (f"{getattr(card, 'bl_label', '?')}: "
+                              f"{type(exc).__name__}: {exc}")
+                break
+        check("四张资产卡的 draw_buttons 都能画完", not card_error, card_error)
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『游戏资产』面板", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     addon_utils.disable(module_name, default_set=True)

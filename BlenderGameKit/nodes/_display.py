@@ -777,7 +777,12 @@ class GKNodePlaySound(B.GKStatementNode):
     )
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "gk_path", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_path", text="")
+        # 从资产库挑(第四十三轮):挑中的是『资产_声音卡』,导出时
+        # 那个文件会被复制进 audio/ —— 不用自己拷、也不会手敲错路径
+        pick = row.operator("gk.pick_sound", text="", icon="SOUND")
+        pick.node_name = self.name
         row = layout.row(align=True)
         row.prop(self, "gk_volume", text="")
         row.prop(self, "gk_pitch", text="")
@@ -806,7 +811,11 @@ class GKNodePlayMusic(B.GKStatementNode):
     )
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "gk_path", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_path", text="")
+        # 从资产库挑(第四十三轮,同『音效_播放』)
+        pick = row.operator("gk.pick_sound", text="", icon="SOUND")
+        pick.node_name = self.name
         row = layout.row(align=True)
         row.prop(self, "gk_volume", text="")
         row.prop(self, "gk_fade", text="")

@@ -79,6 +79,8 @@ _SUBMODULES = (
     # 显示设置卡(第四十二轮:『游戏显示』树)—— 也必须在这张表里,
     # 否则重载后这 4 张卡会从 ALL_CLASSES 里整批消失(和 _fx 那次同一个坑)
     "nodes._displayset",
+    # 资产卡(第四十三轮:『游戏资产』树)—— 同样必须在重载表里(见上面那条)
+    "nodes._assets",
     "nodes.nodes",
     "nodes",
     # codegen 主体按领域拆成 10 个模块(纯搬运)。顺序 = 依赖顺序:
@@ -86,6 +88,9 @@ _SUBMODULES = (
     # generator 依赖所有。必须"被依赖者在前",否则重载后装饰器会把
     # 处理器登记进**上一版**的注册表(注册表在 registry.py 里重新定义)。
     "curve_assets",
+    # 音频资产(第四十三轮:『资产_声音卡』-> 项目的 audio/)。放在
+    # exporter 之前 —— exporter 会 import 它,重载时它得先刷新。
+    "sound_assets",
     "codegen.literals",
     "codegen.registry",
     "codegen.easing",

@@ -6,7 +6,7 @@ import tempfile
 import time
 
 from . import (blender_adapter, codegen, curve_assets, gk_log, models, paths,
-               project)
+               project, sound_assets)
 from .nodes.node_base import snake_case
 
 GDScriptVersion = 4
@@ -396,6 +396,31 @@ def atomic_write_text(path, text):
     return path
 
 
+def atomic_write_bytes(path, data):
+    """原子写(二进制)—— 和 `atomic_write_text` 同一套做法。
+
+    第四十三轮加的:回滚音频资产要用它。音频是二进制,照文本写会被
+    UTF-8 编码器拒绝(这是实测踩出来的:先炸在"读旧底稿"上)。
+    """
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "wb", dir=folder or ".", prefix=".gk_tmp_", suffix=".part",
+        delete=False)
+    try:
+        with handle:
+            handle.write(data)
+        os.replace(handle.name, path)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def write_text(path, text):
     """UTF-8 写文件(Godot 与 Blender 都能正确读取)。走原子写。"""
     return atomic_write_text(path, text)
@@ -419,15 +444,20 @@ class FileTransaction:
         self._snapshots = {}
         self.written = []
 
-    def _snapshot(self, path):
+    def _snapshot(self, path, binary=False):
         if path in self._snapshots:
             return
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                self._snapshots[path] = handle.read()
+            if binary:
+                # 二进制底稿(音频):按字节读 —— 照文本读会炸在解码上
+                with open(path, "rb") as handle:
+                    self._snapshots[path] = handle.read()
+            else:
+                with open(path, "r", encoding="utf-8") as handle:
+                    self._snapshots[path] = handle.read()
         except FileNotFoundError:
             self._snapshots[path] = None
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             # 读不出来(权限/编码)也要登记成"不存在",回滚时删掉它,
             # 总比留下一个被改了一半的文件强
             gk_log.warn(f"快照失败,回滚将删除该文件: {path}({exc})")
@@ -449,6 +479,22 @@ class FileTransaction:
             self.written.append(path)
         return path
 
+    def mark(self, path):
+        """登记一个**由外部写出来**的文件:快照 + 计入本轮产物。
+
+        和 `note()` 只差"记不记帐":`note()` 给 project.godot 那类
+        自己有一套管理方式的文件用;`mark()` 给"确实是这次导出写出来的"
+        文件用(第四十三轮:复制进 audio/ 的音频)—— 它必须进 `written`,
+        否则旧文件清理会把它当上一轮的残留删掉(实测踩过:音频刚复制
+        进去就被清走了)。
+        """
+        if not path:
+            return path
+        self._snapshot(path, binary=True)
+        if path not in self.written:
+            self.written.append(path)
+        return path
+
     def rollback(self):
         """把登记过的文件还原到导出前。返回还原失败的路径列表。"""
         failed = []
@@ -457,6 +503,8 @@ class FileTransaction:
                 if original is None:
                     if os.path.exists(path):
                         os.unlink(path)
+                elif isinstance(original, bytes):
+                    atomic_write_bytes(path, original)
                 else:
                     atomic_write_text(path, original)
             except OSError as exc:
@@ -569,6 +617,22 @@ def validate_output_dir(directory):
     return paths.validate_project_dir(directory)
 
 
+def _sound_asset_cards():
+    """『游戏资产』图里所有声音卡:**[(显示名, 本地文件)]**(第四十三轮)。
+
+    单独包一层是为了两件事:
+      * exporter 不在模块级 import nodes(绕成循环导入),所以延后到调用时;
+      * 离线测试里没有 bpy / 没有资产图 —— 拿不到就当"没有音频资产",
+        导出照常走完(少带一个音频不该让整次导出失败)。
+    """
+    try:
+        from .nodes import nodes as node_lib
+        return [(name, path)
+                for name, path, _res in node_lib.sound_card_entries()]
+    except Exception:                                     # noqa: BLE001
+        return []
+
+
 def export_tree(tree, settings=None, write_scene=None):
     """导出节点树，返回一个结果字典(给 UI 用)。
 
@@ -675,6 +739,16 @@ def export_tree(tree, settings=None, write_scene=None):
     # (运行时只是警句 + 退回直线过渡,但用户会以为曲线没生效)。
     curve_files = curve_assets.curve_files(directory, curve_assets_data)
     manifest.extend(path for _name, path, _text in curve_files)
+    # ── 音频资产(第四十三轮)──────────────────────────────────────────
+    # 『游戏资产』图的『资产_声音卡』挑好的本地文件,导出时复制进项目的
+    # audio/ —— 音效节点里写死的 `res://audio/...` 才找得到东西。
+    # 和曲线同一条思路:脚本引用什么,这一步就得把什么带上。
+    sound_cards = _sound_asset_cards()
+    planned_sounds = [
+        f"{sound_assets.AUDIO_DIR}/{os.path.basename(target)}"
+        for _name, _path, target, _res
+        in sound_assets.sound_files(directory, sound_cards)]
+    manifest.extend(planned_sounds)
     if scene_path:
         manifest.append(scene_path)
     if actions or should_write_scene:
@@ -727,6 +801,34 @@ def export_tree(tree, settings=None, write_scene=None):
             scene_name = os.path.basename(scene_path)
             if project.set_main_scene(directory, f"{project.SCENES_DIR}/{scene_name}"):
                 gk_log.info(f"已把主场景设为 {project.SCENES_DIR}/{scene_name}")
+
+        # 音频资产(第四十三轮):复制进 audio/。不走文本事务(二进制),
+        # 所以放在事务写入之后 —— 最坏情况是多留一个音频文件,
+        # 下一次导出的清理会按清单把它收走(见 generated_files)。
+        if planned_sounds:
+            stage = "复制音频资产"
+            written_sounds, missing_sounds = sound_assets.copy_sounds(
+                directory, sound_cards)
+            if written_sounds:
+                gk_log.info(f"音频资产 {len(written_sounds)} 个 -> "
+                            f"{sound_assets.AUDIO_DIR}/")
+            # 复制成功的**记进本轮产物**:不记的话旧文件清理会把它删掉
+            # (它不在事务的 written 里 —— 二进制是直接拷的)
+            for name, path, target, _res in sound_assets.sound_files(
+                    directory, sound_cards):
+                if os.path.isfile(target):
+                    transaction.mark(target)
+            for missing_name, missing_path in missing_sounds:
+                _note(models.Diagnostic(
+                    level="warning", code="SOUND_FILE_MISSING",
+                    message=f"音频资产『{missing_name}』的本地文件找不到了:"
+                            f"{missing_path}",
+                    hint="在『游戏资产』图的『资产_声音卡』上重新挑一次文件"))
+            # 没复制成功的从清单里去掉(它们没进项目,别让清理以为写过)
+            kept = [rel for rel in planned_sounds
+                    if os.path.isfile(os.path.join(directory, rel))]
+            manifest = [item for item in manifest
+                        if item not in planned_sounds] + kept
     except Exception as exc:
         failed = transaction.rollback()
         gk_log.exception(f"导出失败({stage}),已回滚本次写入")

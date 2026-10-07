@@ -127,6 +127,8 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 │   ├── validation.py           导出前静态校验与告警
 │   └── api.py                  对外入口(generate / generate_result / required_base_class)
 ├── asset_export.py             ★ 资产导出:glTF + 卡通材质 + 场景装配
+├── curve_assets.py             曲线资产 -> curves/*.tres(运镜 / 时间轴)
+├── sound_assets.py             音频资产 -> audio/(『资产_声音卡』挑的文件)
 ├── npr_preview.py              ★ Blender 端 NPR 预览材质(EEVEE 里调卡通参数)
 ├── project/                    ★ 一个 .blend 一个 Godot 项目
 │   ├── layout.py               路径解析 / 建骨架(art、scripts、scenes…)
@@ -147,7 +149,7 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
     └── _events.py / _flow.py / _movement.py / _animation.py /
         _instances.py / _fx.py / _variables.py / _input.py /
         _expressions.py / _display.py / _containers.py /
-        _functions.py / _ai.py / _displayset.py   ★ 节点按领域拆分
+        _functions.py / _ai.py / _displayset.py / _assets.py   ★ 节点按领域拆分
 
 docs/
 ├── Blender与Godot互通.md       资产管线 + 脚本搭载 + C++ GDExtension
@@ -280,7 +282,7 @@ func _physics_process(delta: float) -> void:
 
 ---
 
-## 节点一览(178 个)
+## 节点一览(182 个)
 
 | 分类 | 节点 |
 |---|---|
@@ -291,6 +293,7 @@ func _physics_process(delta: float) -> void:
 | **动画系统**<br>(在「游戏动画」图里) | 动画_开始、动画_结束、动画_状态、动画_转场、动画判断_移动状态、动画_取变量、动画_设变量 |
 | **AI**<br>(在「游戏AI」图里) | AI_状态、AI_转场、AI_看得见、AI_启用 |
 | **显示设置**<br>(在「游戏显示」图里) | 显示_碰撞线框、显示_调试面板、显示_画面风格、显示_视口预览 —— 四张**设置卡**,卡上改的就是当前场景的显示设置(物理线框 / 调试面板 / 卡通材质 / 视口预览开关) |
+| **资产**<br>(在「游戏资产」图里) | 资产_模型卡、资产_图片卡、资产_曲线卡、资产_声音卡 —— 四张**资产卡**,资产库跨场景共用;音频卡挑的本地文件导出时复制进工程的 `audio/` |
 | **实例** | 实例_生成、实例_销毁、实例_重载场景、取值_获取节点、取值_是否在地面 |
 | **变量** | 变量_设置、变量_读取 |
 | **信号** | 信号_发出、信号_连接 |

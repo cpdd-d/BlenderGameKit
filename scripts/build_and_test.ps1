@@ -374,6 +374,39 @@ if ($SkipGodot) {
         }
     }
 
+    # 5j. 资产示例(第四十三轮:游戏资产)—— 资产库 + 跨场景 + 音频管线。
+    #     这一层验的是:三棵树共用同一个 glb(一个模型导一次)、
+    #     音频从资产库复制进 audio/ 并能在真 Godot 里 load 出来、
+    #     图片 / 曲线资产都在产物里、第二关的树是跨场景摆过来的。
+    Write-Output ""
+    $assetDir = Join-Path $Root "examples\demo_assets"
+    $assetMaker = Join-Path $Root "scripts\make_assets_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过资产示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $assetDir)) {
+        Write-Output "跳过资产示例:还没有 examples\demo_assets"
+    } else {
+        $assetLog = & $Blender -b --gpu-backend vulkan --python $assetMaker 2>&1 | Out-String
+        if ($assetLog -notmatch "已保存") {
+            Write-Host "---- 重建资产示例失败,尾部 20 行 ----"
+            ($assetLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $assetChecker = Join-Path $Root "scripts\check_assets_demo.py"
+            $assetOut = & python $assetChecker --godot $Godot 2>&1 | Out-String
+            $assetOut -split "`n" | Where-Object { $_ -match "^(ASSET_|CHECK_ASSETS_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($assetOut -match "CHECK_ASSETS_DEMO=OK") {
+                $godotRan += "资产示例"
+            } elseif ($assetOut -match "跳过") {
+                Write-Output "（资产示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

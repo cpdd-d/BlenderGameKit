@@ -257,6 +257,7 @@ def node_tree_error(cls, tree):
         "GKUiDesignTree": "界面设计图(『游戏界面』)",
         "GKGameAiTree": "AI 图(『游戏AI』)",
         "GKDisplayTree": "显示设置图(『游戏显示』)",
+        "GKAssetTree": "资产库(『游戏资产』)",
     }
     names = [label_of[kind] for kind in kinds if kind in label_of]
     where = " / ".join(names) if names else "游戏逻辑树"
@@ -271,6 +272,9 @@ def node_tree_error(cls, tree):
     elif "GKDisplayTree" in kinds:
         hint = ("侧栏『游戏逻辑』面板 -> 『游戏显示设置』-> "
                 "点『打开/新建显示设置图』")
+    elif "GKAssetTree" in kinds:
+        hint = ("侧栏『游戏逻辑』面板 -> 『游戏资产』-> "
+                "点『打开/新建资产库』")
     else:
         hint = "请切到游戏逻辑图"
     return (f"『{getattr(cls, 'bl_label', cls)}』是{where}里的节点,"
@@ -1749,6 +1753,104 @@ class GK_OT_PickImage(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ── 音频资产(第四十三轮:『游戏资产』图的『资产_声音卡』)──────────────
+def sound_asset_items(_self=None, _context=None):
+    """资产库里所有声音卡,给音效节点卡上的『从资产库挑』用。
+
+    条目值是 **res:// 路径** —— 直接写进节点的 `gk_path`,和导出时
+    复制进 audio/ 用的那个路径**是同一个函数**算出来的,不会对不上。
+    """
+    try:
+        from .nodes import nodes as node_lib
+        entries = node_lib.sound_card_entries()
+    except Exception:                                     # noqa: BLE001
+        entries = []
+    items = []
+    for name, path, res in entries:
+        if not res:
+            continue
+        label = name or os.path.basename(path) or res
+        hint = ("导出时复制进 audio/" if path
+                else "只登记路径(自己放进项目)")
+        items.append((res, label, hint, "SOUND", 0))
+    if not items:
+        items.append(("", "(资产库里还没有声音卡)",
+                      "侧栏『游戏逻辑』->『游戏资产』->『打开/新建资产库』"
+                      "-> 加一张『资产_声音卡』", "ERROR", 0))
+    return items
+
+
+class GK_OT_PickSound(bpy.types.Operator):
+    """从资产库挑一个音频,写进音效节点的『音频路径』。"""
+
+    bl_idname = "gk.pick_sound"
+    bl_label = "从资产库挑声音"
+    bl_description = "把这份资产的声音路径写进节点的『音频路径』"
+    bl_property = "sound_path"
+
+    node_name: StringProperty(name="节点", default="")
+    sound_prop: StringProperty(name="属性名", default="gk_path")
+    sound_path: EnumProperty(name="声音", items=sound_asset_items)
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        prop_name = self.sound_prop or "gk_path"
+        if node is None or not hasattr(node, prop_name):
+            _report(self, "WARNING", "没找到目标节点(或这个节点没有音频栏位)")
+            return {"CANCELLED"}
+        if not self.sound_path:
+            _report(self, "WARNING", "资产库里还没有声音卡")
+            return {"CANCELLED"}
+        setattr(node, prop_name, self.sound_path)
+        _report(self, "INFO", f"音频 -> {self.sound_path}")
+        return {"FINISHED"}
+
+
+class GK_OT_AssetPickSound(bpy.types.Operator):
+    """『资产_声音卡』上挑一个本地音频文件(带进 Godot 的源头)。"""
+
+    bl_idname = "gk.asset_pick_sound"
+    bl_label = "挑音频文件"
+    bl_description = ("挑一个本地音频(wav / ogg / mp3);"
+                      "导出时复制进项目的 audio/ 目录")
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    filepath: StringProperty(name="文件", subtype="FILE_PATH", default="")
+    filter_glob: StringProperty(default="*.wav;*.ogg;*.mp3",
+                                options={"HIDDEN"})
+
+    def invoke(self, context, _event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        from . import sound_assets
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        path = str(self.filepath or "").strip()
+        if node is None or not hasattr(node, "gk_file"):
+            _report(self, "WARNING", "没找到那张声音卡")
+            return {"CANCELLED"}
+        if not path:
+            return {"CANCELLED"}
+        if not sound_assets.is_sound_file(path):
+            _report(self, "ERROR", f"只支持 wav / ogg / mp3: {path}")
+            return {"CANCELLED"}
+        node.gk_file = path
+        node.gk_res = sound_assets.sound_res_path(path)
+        if not str(getattr(node, "gk_name", "") or "").strip():
+            node.gk_name = os.path.splitext(os.path.basename(path))[0]
+        _report(self, "INFO",
+                f"音频资产 -> {node.gk_res}(导出会复制进 audio/)")
+        return {"FINISHED"}
+
+
 class GK_OT_PreviewCameraPath(bpy.types.Operator):
     """**真预览**:在视口里把相机沿曲线(或过渡)跑一遍。
 
@@ -2739,6 +2841,9 @@ GK_CLASSES = (
     # AI 图选择器(『AI_启用』用)+ AI 转场的『从』/『到』状态选择器(第四十一轮)
     GK_OT_PickAiTree,
     GK_OT_PickAiState,
+    # 音频资产:音效节点『从资产库挑』+ 声音卡上『挑本地文件』(第四十三轮)
+    GK_OT_PickSound,
+    GK_OT_AssetPickSound,
     # 转场的『从』/『到』状态选择器(忘了连线时的兜底)
     GK_OT_PickAnimState,
     # 按一下键盘就绑定按键(照 UPBGE 的 Press & Choose)

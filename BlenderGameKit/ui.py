@@ -140,7 +140,8 @@ class GK_OT_SwitchTree(bpy.types.Operator):
                                                     "GKAnimationTree",
                                                     "GKUiDesignTree",
                                                     "GKGameAiTree",
-                                                    "GKDisplayTree"):
+                                                    "GKDisplayTree",
+                                                    "GKAssetTree"):
             _LAST_TREE[current_kind] = current
 
         wanted = self.target
@@ -163,6 +164,10 @@ class GK_OT_SwitchTree(bpy.types.Operator):
             elif wanted == "GKDisplayTree":
                 # 顺手把四张设置卡摆好(见 _new_display_tree)
                 tree = _new_display_tree()
+            elif wanted == "GKAssetTree":
+                # 顺便把 .blend 里已有的资产收录成卡(见 _fill_asset_cards)
+                tree = _asset_tree_or_new()
+                _fill_asset_cards(tree)
             elif wanted == "GKAnimationTree":
                 # 顺手放个起始状态,免得面对空图不知道从哪下手
                 tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
@@ -1088,6 +1093,536 @@ class GK_PT_DisplayTree(bpy.types.Panel):
             box.operator("gk.display_fill_cards",
                          text=f"补齐 {len(missing)} 张", icon="ADD")
         box.label(text="卡上改 = 导出立刻按新值走,不用点应用", icon="INFO")
+        back = box.operator("gk.switch_tree", text="← 回到游戏逻辑",
+                            icon="LOOP_BACK")
+        back.target = "GKGameLogicTree"
+
+
+# ==========================================================================
+# 第六种节点树:『游戏资产』资产库(第四十三轮)
+# ==========================================================================
+# 用户原话:"添加游戏资产管理编辑器,便于重复利用与和常规资产隔开";
+# 三个形态里点了**新节点树类型**,并选了:收四类(3D 道具 / 图片 /
+# 曲线 / 音频)、**跨场景共用**、资产实例自动收进『资产』集合。
+#
+# 这张图是**资产库**:每份资产一张卡,卡上只存**名字**
+# (资产名 / 图片名 / 曲线名 / 音频文件路径)—— 真正的数据还在原地
+# (物体属性 / bpy.data.images / 曲线物体 / 本地文件),不搬数据只做索引,
+# 所以老工程一个字都不用改。
+#
+# ── 跨场景共用怎么做的(不改导出流程)──────────────────────────────
+# 关卡 2 点『再摆一份』时,把关卡 1 的**本体复制**进关卡 2;目标场景
+# 还没有本体时,这份复制品自动当本体(否则导出的场景里实例没有模型)。
+# 于是每个场景都有自己的一份"本体 + 实例",导出语义和现在**完全一样**。
+class GKAssetTree(bpy.types.NodeTree):
+    """游戏资产图:可复用资产(道具 / 图片 / 曲线 / 音频)的资产库。"""
+
+    bl_idname = "GKAssetTree"
+    bl_label = "游戏资产"
+    bl_icon = "ASSET_MANAGER"
+    bl_description = ("BlenderGameKit 的资产库 —— 3D 道具 / 图片 / 曲线 / "
+                      "音频 各一张资产卡,卡上写清楚几份、谁在用;"
+                      "资产库是整个 .blend 共用的(关卡 1 的树能摆到关卡 2)")
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        layout.label(text="资产库跨场景共用:关卡 1 的资产也能摆到关卡 2",
+                     icon="INFO")
+
+
+# 卡片类型 -> 卡上存"名字"的那个属性
+_ASSET_CARD_VALUE_PROP = {
+    "GKNodeAssetModel": "gk_asset",
+    "GKNodeAssetImage": "gk_image",
+    "GKNodeAssetCurve": "gk_curve",
+    "GKNodeAssetSound": "gk_res",
+}
+
+
+def _asset_card_icon(blob):
+    return {"GKNodeAssetModel": "MESH_DATA", "GKNodeAssetImage": "IMAGE_DATA",
+            "GKNodeAssetCurve": "CURVE_DATA",
+            "GKNodeAssetSound": "SOUND"}.get(blob, "ASSET_MANAGER")
+
+
+def _ensure_asset_card(tree, blob, value, extras=None):
+    """保证图上有这么一张卡(同类型 + 同名的不重复加)。加过就返回它。
+
+    extras 是"顺带写上的其它栏位"(比如声音卡的名字)—— 只在新建时写。
+    """
+    prop = _ASSET_CARD_VALUE_PROP.get(blob)
+    if prop is None:
+        return None
+    value = str(value or "").strip()
+    for node in getattr(tree, "nodes", ()) or ():
+        if getattr(node, "bl_idname", "") != blob:
+            continue
+        if str(getattr(node, prop, "") or "").strip() == value:
+            return node
+    node = tree.nodes.new(blob)
+    try:
+        setattr(node, prop, value)
+        for key, item in (extras or {}).items():
+            setattr(node, key, item)
+    except Exception:                                     # noqa: BLE001
+        pass
+    node.location = (0.0, -node_lib.ASSET_CARD_GAP
+                     * max(0, len(tree.nodes) - 1))
+    return node
+
+
+def _asset_trees():
+    return [group for group in bpy.data.node_groups
+            if getattr(group, "bl_idname", "") == "GKAssetTree"]
+
+
+def _asset_tree_or_new():
+    trees = _asset_trees()
+    if trees:
+        return trees[0]
+    tree = bpy.data.node_groups.new("游戏资产", "GKAssetTree")
+    # 没有人"引用"它的数据块存盘时会丢(和 AI 图 / 显示设置图同一个坑)
+    tree.use_fake_user = True
+    return tree
+
+
+def _fill_asset_cards(tree):
+    """**收录**:把 .blend 里已有的东西登记成资产卡(不重复加)。
+
+    扫三类来源:
+      * 所有场景里填了『资产名』的物体 -> 模型卡(跨场景);
+      * 所有节点图里在用的图片 -> 图片卡;
+      * 在用的曲线 / 音频路径 -> 曲线卡 / 声音卡(声音只登记路径)。
+    返回 {"model": n, "image": n, "curve": n, "sound": n}(补了几张)。
+    """
+    counts = {"model": 0, "image": 0, "curve": 0, "sound": 0}
+    for name in node_lib.all_asset_names():
+        before = len(tree.nodes)
+        _ensure_asset_card(tree, "GKNodeAssetModel", name)
+        counts["model"] += len(tree.nodes) - before
+    used = node_lib.collect_used_assets(bpy.data.node_groups)
+    for image_name in used["images"]:
+        before = len(tree.nodes)
+        _ensure_asset_card(tree, "GKNodeAssetImage", image_name)
+        counts["image"] += len(tree.nodes) - before
+    for blob, key, values in (("GKNodeAssetCurve", "curve", used["curves"]),
+                              ("GKNodeAssetSound", "sound",
+                               used["sounds"])):
+        for value in values:
+            before = len(tree.nodes)
+            extras = {"gk_name": os.path.basename(value)} \
+                if blob == "GKNodeAssetSound" else None
+            _ensure_asset_card(tree, blob, value, extras)
+            counts[key] += len(tree.nodes) - before
+    return counts
+
+
+# ── 『资产』集合(用户选的"场景里收进『资产』集合")────────────────────
+# 每个场景**各有一个**同名集合(名字后面带 .001 的是第二个场景的)——
+# 不能所有场景共用一个集合:同一个集合链进两个场景时,里面的物体会
+# 在两个场景里**都出现**(Blender 的集合是场景之上的结构)。
+# 用场景自定义属性记住"这个场景的资产集合叫什么"。
+_ASSET_COLLECTION_KEY = "gk_asset_collection"
+
+
+def asset_collection(scene, create=True):
+    """这个场景的『资产』集合(没有就建)。"""
+    if scene is None:
+        return None
+    stored = str(scene.get(_ASSET_COLLECTION_KEY) or "")
+    if stored:
+        collection = bpy.data.collections.get(stored)
+        if collection is not None and stored in scene.collection.children:
+            return collection
+    # 退路:这个场景下已经有叫『资产』的集合(老文件 / 用户自己建的)
+    for child in scene.collection.children:
+        if child.name == "资产" or child.name.startswith("资产."):
+            scene[_ASSET_COLLECTION_KEY] = child.name
+            return child
+    if not create:
+        return None
+    collection = bpy.data.collections.new("资产")
+    scene.collection.children.link(collection)
+    scene[_ASSET_COLLECTION_KEY] = collection.name
+    return collection
+
+
+def move_into_asset_collection(scene, objects):
+    """把资产物体收进『资产』集合,并从**同场景**的其它集合里摘出来。
+
+    只摘"属于这个场景"的集合(别的场景的集合不动)—— 用户要的是
+    "大纲视图里和普通物体分开",不是"把它从所有地方摘出去"。
+    返回真正挪动的个数。
+    """
+    collection = asset_collection(scene)
+    if collection is None:
+        return 0
+    moved = 0
+    for obj in objects or ():
+        try:
+            if obj.name not in collection.objects:
+                collection.objects.link(obj)
+        except Exception:                                 # noqa: BLE001
+            continue
+        for other in list(getattr(obj, "users_collection", ()) or ()):
+            if other is collection:
+                continue
+            try:
+                scenes = getattr(other, "users_scene", None)
+                if scenes is not None and scene not in scenes:
+                    continue
+                other.objects.unlink(obj)
+            except Exception:                             # noqa: BLE001
+                pass
+        moved += 1
+    return moved
+
+
+def _scene_asset_objects(scene):
+    """这个场景里填了『资产名』的网格物体(『收进集合』用)。"""
+    out = []
+    for obj in getattr(scene, "objects", ()) or ():
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        physics = getattr(obj, "gk_physics", None)
+        if physics is None or not getattr(physics, "enabled", True):
+            continue
+        if str(getattr(physics, "asset_name", "") or "").strip():
+            out.append(obj)
+    return out
+
+
+def _asset_source(asset_name):
+    """跨场景找本体:返回 (本体物体, 场景) —— 优先当前场景。"""
+    from . import asset_export
+    wanted = str(asset_name or "").strip()
+    if not wanted:
+        return None, None
+    scenes = list(getattr(bpy.data, "scenes", ()) or ())
+    current = getattr(bpy.context, "scene", None)
+    if current is not None and current in scenes:
+        scenes.remove(current)
+        scenes.insert(0, current)
+    for scene in scenes:
+        try:
+            entry = asset_export.collect_assets(scene).get(wanted)
+        except Exception:                                 # noqa: BLE001
+            continue
+        if entry and entry.get("source") is not None:
+            return entry["source"], scene
+    return None, None
+
+
+class GK_OT_OpenAssetTree(bpy.types.Operator):
+    """打开资产图;没有就新建一张(顺手收录现有资产)。"""
+
+    bl_idname = "gk.open_asset_tree"
+    bl_label = "打开/新建资产库"
+    bl_description = ("切到『游戏资产』图(没有就新建一张,"
+                      "顺手把 .blend 里已有的资产收录成卡)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        trees = _asset_trees()
+        tree = trees[0] if trees else None
+        if tree is None:
+            tree = _asset_tree_or_new()
+            counts = _fill_asset_cards(tree)
+            total = sum(counts.values())
+            self.report({"INFO"}, f"已新建资产库『{tree.name}』"
+                                  f"(收录了 {total} 份资产)")
+
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"},
+                        "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+        space.tree_type = "GKAssetTree"
+        space.node_tree = tree
+        return {"FINISHED"}
+
+
+class GK_OT_AssetFillCards(bpy.types.Operator):
+    """收录:把 .blend 里已有的资产登记成卡(不重复加)。"""
+
+    bl_idname = "gk.asset_fill_cards"
+    bl_label = "收录已有资产"
+    bl_description = ("扫所有场景的静态资产 + 所有节点图在用的图片 / 曲线 / "
+                      "音频,缺的卡补上(已有的不动)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _asset_tree_or_new()
+        counts = _fill_asset_cards(tree)
+        total = sum(counts.values())
+        if not total:
+            self.report({"INFO"}, "能收的都收过了(或还没有资产)")
+        else:
+            self.report({"INFO"},
+                        f"收录 {total} 张卡:模型 {counts['model']} / "
+                        f"图片 {counts['image']} / 曲线 {counts['curve']} / "
+                        f"声音 {counts['sound']}")
+        return {"FINISHED"}
+
+
+class GK_OT_AssetRegister(bpy.types.Operator):
+    """把当前选中的物体登记为资产(填名 + 收录卡 + 收进『资产』集合)。"""
+
+    bl_idname = "gk.asset_register"
+    bl_label = "把选中物体登记为资产"
+    bl_description = ("给选中物体填上『资产名』(没填的话用物体名),"
+                      "在资产库建一张卡,并收进『资产』集合")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = getattr(context, "active_object", None) \
+            or getattr(context, "object", None)
+        if obj is None or getattr(obj, "type", "") != "MESH":
+            self.report({"WARNING"}, "先在视口里选中一个网格物体")
+            return {"CANCELLED"}
+        physics = getattr(obj, "gk_physics", None)
+        if physics is None:
+            self.report({"WARNING"}, "这个物体没有『游戏物理』设置")
+            return {"CANCELLED"}
+        name = str(getattr(physics, "asset_name", "") or "").strip() or obj.name
+        physics.asset_name = name
+        tree = _asset_tree_or_new()
+        _ensure_asset_card(tree, "GKNodeAssetModel", name)
+        moved = move_into_asset_collection(context.scene, [obj])
+        self.report({"INFO"},
+                    f"已登记资产『{name}』(卡片已建"
+                    + (f",已收进『资产』集合" if moved else "") + ")")
+        return {"FINISHED"}
+
+
+class GK_OT_AssetCollect(bpy.types.Operator):
+    """把本场景的资产全部收进『资产』集合(批量,给老工程用)。"""
+
+    bl_idname = "gk.asset_collect"
+    bl_label = "把本场景资产收进『资产』集合"
+    bl_description = ("把本场景所有填了『资产名』的物体挪进『资产』集合,"
+                      "和普通物体分开(只动这个场景的集合)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        objects = _scene_asset_objects(context.scene)
+        if not objects:
+            self.report({"INFO"}, "本场景还没有资产(先在物体上填『资产名』)")
+            return {"CANCELLED"}
+        moved = move_into_asset_collection(context.scene, objects)
+        self.report({"INFO"}, f"已把 {moved} 个资产物体收进『资产』集合")
+        return {"FINISHED"}
+
+
+def place_asset_into_scene(scene, asset_name):
+    """把一份资产摆进 scene(跨场景可用)。
+
+    返回 (成功?, 说明, 新物体或 None) —— 抽成普通函数是为了能**直接测**
+    (后台模式里造不出完整的 operator 上下文,而这段逻辑值得一条真测试):
+    本体在别的场景时,这份复制品在目标场景里自动当**本体**。
+    """
+    from . import asset_export
+    name = str(asset_name or "").strip()
+    if not name:
+        return False, "没指定资产", None
+    source, source_scene = _asset_source(name)
+    if source is None:
+        return (False,
+                f"资产『{name}』还没有本体 —— 先在某个场景里把一份的"
+                f"『作为实例』取消勾选,让它当本体", None)
+    try:
+        entry = asset_export.collect_assets(scene).get(name)
+    except Exception:                                     # noqa: BLE001
+        entry = None
+    members = list((entry or {}).get("members") or [])
+    has_source = bool((entry or {}).get("source"))
+
+    copy = source.copy()                       # 共享网格数据 = 实例
+    copy.data = source.data
+    copy.name = f"{name}_实例"
+    scene.collection.objects.link(copy)
+    physics = getattr(copy, "gk_physics", None)
+    if physics is not None:
+        physics.asset_name = name
+        # 这一关没有本体 -> 这份当本体;有本体 -> 它是实例
+        physics.asset_instance = has_source
+        physics.script_target = False          # 实例不挂脚本
+    # 摆在哪:这一关已经摆过 -> 挨着第一份;完全没摆过 -> 站本体原位
+    if members:
+        anchor = members[0]
+        width = max(float(getattr(anchor.dimensions, "x", 1.0) or 1.0), 0.5)
+        copy.location = (anchor.location.x + width * 1.2,
+                         anchor.location.y, anchor.location.z)
+    else:
+        copy.location = source.location
+    move_into_asset_collection(scene, [copy])
+    role = "实例" if physics is not None and physics.asset_instance else "本体"
+    origin = "" if source_scene is scene \
+        else f"(本体来自『{getattr(source_scene, 'name', '?')}』)"
+    return (True,
+            f"已摆一份{role}: {copy.name}{origin}(资产『{name}』,"
+            f"本场景现在共 {len(members) + 1} 份)", copy)
+
+
+class GK_OT_AssetPlace(bpy.types.Operator):
+    """再摆一份(跨场景):把本体复制进当前场景。
+
+    目标场景还没有本体时,这份复制品自动当**本体**(否则导出时
+    这一关的实例没有模型可用)。
+    """
+
+    bl_idname = "gk.asset_place"
+    bl_label = "再摆一份资产"
+    bl_description = ("把这份资产摆到当前场景(本体在别的关卡也能用);"
+                      "这一关还没有本体时,摆的第一份自动当本体")
+    bl_options = {"REGISTER", "UNDO"}
+
+    asset_name: StringProperty(name="资产", default="")
+
+    def execute(self, context):
+        ok, message, copy = place_asset_into_scene(context.scene,
+                                                   self.asset_name)
+        if not ok:
+            self.report({"WARNING"}, message)
+            return {"CANCELLED"}
+        scene = context.scene
+        for other in scene.objects:
+            other.select_set(False)
+        if copy is not None:
+            copy.select_set(True)
+            context.view_layer.objects.active = copy
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class GK_OT_AssetFocus(bpy.types.Operator):
+    """定位资产的本体(本体在别的场景时会切过去)。"""
+
+    bl_idname = "gk.asset_focus"
+    bl_label = "定位资产本体"
+    bl_description = "切到本体所在的场景并选中它"
+    bl_options = {"REGISTER", "UNDO"}
+
+    asset_name: StringProperty(name="资产", default="")
+
+    def execute(self, context):
+        source, scene = _asset_source(self.asset_name)
+        if source is None:
+            self.report({"WARNING"}, f"找不到资产『{self.asset_name}』的本体")
+            return {"CANCELLED"}
+        window = getattr(context, "window", None)
+        if scene is not None and context.scene is not scene:
+            if window is None:
+                self.report({"WARNING"}, "没有窗口可切场景(用命令行跑的?)")
+                return {"CANCELLED"}
+            window.scene = scene
+        try:
+            for other in scene.objects:
+                other.select_set(False)
+            source.select_set(True)
+            scene.view_layers[0].objects.active = source
+        except Exception:                                 # noqa: BLE001
+            pass
+        self.report({"INFO"}, f"已定位到本体: {source.name}(场景『{scene.name}』)")
+        return {"FINISHED"}
+
+
+class GK_OT_AssetFocusNode(bpy.types.Operator):
+    """跳到"用着这份资产"的那个节点(卡上『谁在用』旁边的小放大镜)。"""
+
+    bl_idname = "gk.asset_focus_node"
+    bl_label = "跳到那个节点"
+    bl_description = "切到那张图并选中那个节点"
+    bl_options = {"REGISTER", "UNDO"}
+
+    tree_name: StringProperty(name="节点图", default="")
+    node_name: StringProperty(name="节点", default="")
+
+    def execute(self, context):
+        group = bpy.data.node_groups.get(self.tree_name)
+        node = group.nodes.get(self.node_name) if group is not None else None
+        space = _node_space(context)
+        if group is None or node is None or space is None:
+            self.report({"WARNING"}, "找不到那个节点(图或节点被删了?)")
+            return {"CANCELLED"}
+        try:
+            space.tree_type = str(getattr(group, "bl_idname", ""))
+            space.pin = True
+            space.node_tree = group
+            for other in group.nodes:
+                other.select = other is node
+            group.nodes.active = node
+            space.cursor_location = node.location
+        except Exception:                                 # noqa: BLE001
+            self.report({"WARNING"}, "这个编辑器打不开那张图")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class GK_PT_AssetTree(bpy.types.Panel):
+    """『游戏资产』图的侧栏面板:资产统计 + 收录 / 登记 / 收集合。"""
+
+    bl_idname = "GK_PT_AssetTree"
+    bl_label = "游戏资产 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏资产"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return (space is not None
+                and getattr(space, "tree_type", "") == "GKAssetTree")
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        scene_name = getattr(getattr(context, "scene", None), "name", "?")
+        box = layout.box()
+        box.label(text=f"当前场景:{scene_name}", icon="SCENE_DATA")
+        if tree is None:
+            box.label(text="没有资产库", icon="INFO")
+            return
+
+        # ---- 资产统计(按卡的类型数)----
+        counts = {}
+        for node in tree.nodes:
+            blob = getattr(node, "bl_idname", "")
+            if blob in _ASSET_CARD_VALUE_PROP:
+                counts[blob] = counts.get(blob, 0) + 1
+        box = layout.box()
+        box.label(text=f"资产库共 {sum(counts.values())} 份资产",
+                  icon="ASSET_MANAGER")
+        for blob in node_lib.ASSET_CARD_IDS:
+            label = {"GKNodeAssetModel": "3D 道具", "GKNodeAssetImage": "图片",
+                     "GKNodeAssetCurve": "曲线",
+                     "GKNodeAssetSound": "音频"}.get(blob, blob)
+            box.label(text=f"{label}: {counts.get(blob, 0)}", icon=_asset_card_icon(blob))
+
+        # ---- 本场景的资产 / 集合 ----
+        local = _scene_asset_objects(context.scene)
+        collection = asset_collection(context.scene, create=False)
+        in_collection = len(getattr(collection, "objects", ()) or ()) \
+            if collection is not None else 0
+        box = layout.box()
+        box.label(text=f"本场景 {len(local)} 个资产物体"
+                       f"(集合里 {in_collection} 个)", icon="MESH_DATA")
+        if local and in_collection < len(local):
+            box.operator("gk.asset_collect",
+                         text="把本场景资产收进『资产』集合", icon="GROUP")
+        box.label(text="收进集合 = 大纲视图里和普通物体分开", icon="INFO")
+
+        # ---- 收录 / 登记 ----
+        box = layout.box()
+        box.operator("gk.asset_fill_cards", text="收录已有资产", icon="ADD")
+        box.operator("gk.asset_register", text="把选中物体登记为资产",
+                     icon="ASSET_MANAGER")
+        box.label(text="收录会扫所有场景(资产库跨场景共用)", icon="INFO")
+
         back = box.operator("gk.switch_tree", text="← 回到游戏逻辑",
                             icon="LOOP_BACK")
         back.target = "GKGameLogicTree"
@@ -3415,7 +3950,8 @@ def _draw_tree_list_box(layout, context):
                                                  "GKAnimationTree",
                                                  "GKUiDesignTree",
                                                  "GKGameAiTree",
-                                                 "GKDisplayTree")]
+                                                 "GKDisplayTree",
+                                                 "GKAssetTree")]
     if not groups:
         box.label(text="还没有节点图", icon="INFO")
         return
@@ -3430,15 +3966,16 @@ def _draw_tree_list_box(layout, context):
                 else "ARMATURE_DATA" if blob == "GKAnimationTree"
                 else "TRACKER" if blob == "GKGameAiTree"
                 else "HIDE_OFF" if blob == "GKDisplayTree"
+                else "ASSET_MANAGER" if blob == "GKAssetTree"
                 else "WINDOW")
         # 勾选框:关掉 = 这张图不参与导出
-        if blob in ("GKUiDesignTree", "GKGameAiTree", "GKDisplayTree"):
-            # ── 设计图 / AI 图 / 显示设置图没有"参与导出"这一说
-            # (第四十 / 四十一 / 四十二轮)────────────────────────────────
+        if blob in ("GKUiDesignTree", "GKGameAiTree", "GKDisplayTree",
+                    "GKAssetTree"):
+            # ── 设计图 / AI 图 / 显示设置图 / 资产库没有"参与导出"这一说
+            # (第四十 / 四十一 / 四十二 / 四十三轮)──────────────────────
             # 前两张由玩法图按需引用(『界面_套用设计』『AI_启用』),
-            # 显示设置图更是"写透到场景设置"的控制台 ——
-            # 摆一个勾选框不仅含义含糊,`prop()` 还会去读它们**没有**的
-            # 属性(画面板时炸)。
+            # 后两张更是"索引 / 控制台" —— 摆一个勾选框不仅含义含糊,
+            # `prop()` 还会去读它们**没有**的属性(画面板时炸)。
             row.label(text=" ")
         else:
             row.prop(group, "gk_enabled", text="")
@@ -3446,7 +3983,7 @@ def _draw_tree_list_box(layout, context):
         op.tree_name = group.name
         kind = {"GKGameLogicTree": "逻辑", "GKAnimationTree": "动画",
                 "GKUiDesignTree": "界面", "GKGameAiTree": "AI",
-                "GKDisplayTree": "显示"}.get(blob, "图")
+                "GKDisplayTree": "显示", "GKAssetTree": "资产"}.get(blob, "图")
         row.label(text=f"{kind} · {len(group.nodes)} 节点")
     if disabled:
         box.label(text=f"有 {disabled} 张图已停用(不会导出)", icon="INFO")
@@ -3607,7 +4144,7 @@ class GK_OT_FocusTree(bpy.types.Operator):
             # 时直接塞一张界面设计图进去会被拒(打不开 / 悄悄弹回)。
             kind = str(getattr(group, "bl_idname", ""))
             if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
-                        "GKGameAiTree", "GKDisplayTree"):
+                        "GKGameAiTree", "GKDisplayTree", "GKAssetTree"):
                 space.tree_type = kind
             space.pin = True
             space.node_tree = group
@@ -4189,6 +4726,25 @@ class GK_PT_Main(bpy.types.Panel):
             box.label(text="物理线框 / 调试面板 / 画面风格 / 视口预览"
                            " 都在这张图里", icon="INFO")
 
+        # ---- 游戏资产(独立那张图,第四十三轮)----
+        box, opened = collapsible_box(layout, "asset_library",
+                                      "游戏资产(单独一张图)", "ASSET_MANAGER")
+        if opened:
+            asset_trees = _asset_trees()
+            if asset_trees:
+                for asset_tree in asset_trees:
+                    count = len([n for n in asset_tree.nodes
+                                 if getattr(n, "bl_idname", "")
+                                 in _ASSET_CARD_VALUE_PROP])
+                    box.label(text=f"{asset_tree.name}  ({count} 份资产)",
+                              icon="ASSET_MANAGER")
+            else:
+                box.label(text="还没有资产库", icon="INFO")
+            box.operator("gk.open_asset_tree", text="打开/新建资产库",
+                         icon="FILE_NEW")
+            box.label(text="3D 道具 / 图片 / 曲线 / 音频;跨场景共用",
+                      icon="INFO")
+
         # 「动作分类」删掉(用户第 24、25 轮两次点名):
         # 它只是给动作打个标签,而标签现在没有任何地方用到 ——
         # 占了侧栏一大块,却只显示"未分类 · 待机"这种没用的一行。
@@ -4619,6 +5175,7 @@ GK_CLASSES = (
     GKUiDesignTree,
     GKGameAiTree,
     GKDisplayTree,
+    GKAssetTree,
     # 侧栏里"点一下就跳过去"的两个小算子(节点图总览 / 脚本载体)
     GK_OT_FocusTree,
     GK_OT_FocusObject,
@@ -4651,6 +5208,14 @@ GK_CLASSES = (
     GK_OT_OpenAiTree,
     GK_OT_OpenDisplayTree,
     GK_OT_DisplayFillCards,
+    # 资产库(第四十三轮):打开 / 收录 / 登记 / 收集合 / 摆一份 / 定位
+    GK_OT_OpenAssetTree,
+    GK_OT_AssetFillCards,
+    GK_OT_AssetRegister,
+    GK_OT_AssetCollect,
+    GK_OT_AssetPlace,
+    GK_OT_AssetFocus,
+    GK_OT_AssetFocusNode,
     GK_OT_SwitchTree,
     GK_OT_AnimVarAdd,
     GK_OT_AnimVarRemove,
@@ -4676,6 +5241,7 @@ GK_CLASSES = (
     GK_PT_UiDesign,
     GK_PT_AiDesign,
     GK_PT_DisplayTree,
+    GK_PT_AssetTree,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,
 ) + tuple(CATEGORY_MENUS)
