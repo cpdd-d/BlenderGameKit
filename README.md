@@ -210,8 +210,9 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 240 项冒烟 + 示例体检 + Godot 端到端十四层(-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 268 项冒烟 + 面板 draw() + 示例体检 + Godot 端到端十四层(-Deep 再加动画六层)
 ├── check_release.py            ★ 打包发布自检:真 Godot 跑 `--export-release` 出可执行文件(没装导出模板则跳过)
+├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── verify_anim_system.ps1      ★ 动画系统六层验证(离线/真 Blender/示例/Godot 解析/**真跑 1.5 秒**/反例)
 ├── check_gdscript.ps1          ★ 把生成的 .gd 交给真 Godot 解析(带反例)
 ├── make_anim_example.py        ★ 生成动画状态机示例 .blend
