@@ -6,7 +6,8 @@ import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        IntProperty, StringProperty)
 
-from . import codegen, diagnostics, export_report, exporter, gk_log, project
+from . import (advisor, codegen, diagnostics, export_report, exporter, gk_log,
+               project)
 from . import asset_export
 from . import operator_io as ops
 from . import properties as props
@@ -4920,6 +4921,11 @@ class GK_PT_Main(bpy.types.Panel):
             diag.operator("gk.dump_diagnostics", text="导出诊断信息",
                           icon="TEXT")
 
+        # ---- 项目顾问(AI)(第五十三轮)----
+        # 和上面『出问题了?』是一对:那个把诊断**导出成文件**,这个把诊断
+        # **交给 AI 分析并给下一步**。做成可折叠是因为回答可能很长。
+        _draw_advisor_box(layout, context, settings)
+
         # ---- 日志 ----
         if settings is not None and settings.show_log:
             box, opened = collapsible_box(
@@ -4934,6 +4940,62 @@ class GK_PT_Main(bpy.types.Panel):
                     icon = {"ERROR": "ERROR", "WARN": "ERROR"}.get(level, "INFO")
                     box.label(text=line[11:] if len(line) > 11 else line,
                               icon=icon)
+
+
+def _draw_advisor_box(layout, context, settings):
+    """画『项目顾问』:把项目诊断交给 AI,要"下一步怎么做"。
+
+    ── 为什么要有『复制诊断』这个不联网的按钮 ──────────────────────
+    整理上下文才是这个功能里最值钱的部分 —— 一份把插件版本、碰撞体尺寸、
+    节点图连线、生成的代码、导出告警全摊开的快照,**粘到任何 AI 里都能用**。
+    所以没配 API 的人也不该被挡在门外。而且它还能当"发出去之前先看一眼
+    要发什么"的检查手段。
+    """
+    box, opened = collapsible_box(layout, "advisor", "项目顾问(AI)", "HELP")
+    if not opened:
+        return
+
+    prefs = project.preferences(context)
+    base_url = (getattr(prefs, "advisor_base_url", "") or "").strip() if prefs else ""
+    configured = bool(base_url)
+
+    if settings is not None:
+        box.prop(settings, "advisor_question", text="", icon="QUESTION")
+    else:
+        box.label(text="(场景设置还没挂上,先重载插件)", icon="ERROR")
+
+    row = box.row(align=True)
+    row.scale_y = 1.35
+    ask = row.row(align=True)
+    # 没配 AI 就把『问 AI』置灰 —— 点了也只会报错,不如直接灰掉,
+    # 旁边留『复制诊断』这条能走通的路。
+    ask.enabled = configured and settings is not None
+    ask.operator("gk.ask_advisor", text="问 AI", icon="QUESTION")
+    row.operator("gk.copy_advisor_context", text="复制诊断", icon="COPYDOWN")
+
+    if not configured:
+        box.label(text="还没配 AI(偏好设置 -> 项目顾问)", icon="INFO")
+        box.label(text="也可以点『复制诊断』,粘给别处的 AI 问", icon="INFO")
+
+    # ── 结果区 ────────────────────────────────────────────────────
+    error = ops.LAST_ADVISOR.get("error", "")
+    answer = ops.LAST_ADVISOR.get("answer", "")
+    if error:
+        inner = box.box()
+        inner.label(text="AI 调用失败", icon="ERROR")
+        for line in advisor.wrap(error, 46)[:12]:
+            inner.label(text=line or " ")
+    elif answer:
+        inner = box.box()
+        head = inner.row(align=True)
+        head.label(text=f"AI 的回答({len(answer)} 字)", icon="CHECKMARK")
+        head.operator("gk.copy_advisor_answer", text="复制", icon="COPYDOWN")
+        head.operator("gk.clear_advisor", text="", icon="TRASH")
+        lines = advisor.wrap(answer, 46)
+        for line in lines[:60]:
+            inner.label(text=line or " ")
+        if len(lines) > 60:
+            inner.label(text="…(太长,点『复制』看全文)")
 
 
 def _draw_project_box(layout, context):

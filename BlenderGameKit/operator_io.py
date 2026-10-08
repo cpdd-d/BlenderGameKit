@@ -10,8 +10,8 @@ import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
 
-from . import (asset_export, codegen, curve_assets, export_report, exporter,
-               gk_log, npr_preview, packaging, project)
+from . import (advisor, asset_export, codegen, curve_assets, export_report,
+               exporter, gk_log, npr_preview, packaging, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -2821,6 +2821,142 @@ def _auto_prepare(operator, context, directory):
         _report(operator, "WARNING", f"自动导出模型失败(继续): {exc}")
 
 
+# 项目顾问最近一次问答,供侧栏显示 / 复制。只在内存里:它是"刚才那一下"
+# 的对话,重开 Blender 后没必要留着(问题本身存在场景里,不会丢)。
+LAST_ADVISOR = {}
+
+
+def _copy_to_clipboard(context, operator, text, what):
+    """把一段文本塞进系统剪贴板。返回操作结果字典。"""
+    if not text:
+        _report(operator, "ERROR", f"还没有可复制的{what}")
+        return {"CANCELLED"}
+    try:
+        context.window_manager.clipboard = text
+    except Exception as exc:                              # noqa: BLE001
+        _report(operator, "ERROR", f"写剪贴板失败: {exc}")
+        return {"CANCELLED"}
+    _report(operator, "INFO", f"已复制{what}({len(text)} 字)到剪贴板")
+    return {"FINISHED"}
+
+
+class GK_OT_AskAdvisor(bpy.types.Operator):
+    """把"项目诊断 + 你的问题"发给 AI 顾问,让它分析并给下一步。
+
+    ── 为什么是阻塞调用(界面会没响应)──────────────────────────────
+    和『直接运行游戏』『打包成可执行文件』保持一致:先说一声要等,然后等。
+    好处是不用引线程 + 定时器轮询,少一整类难查的 bug。所以这里**必须**
+    在调用前把"要等多久、界面会没响应"讲清楚,否则会被当成卡死。
+    """
+
+    bl_idname = "gk.ask_advisor"
+    bl_label = "问 AI"
+    bl_description = ("把项目诊断快照和你的问题发给 AI(需先填 AI 地址 / "
+                      "模型名 / API Key)")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        question = (getattr(settings, "advisor_question", "") or "").strip()
+        if not question:
+            _report(self, "ERROR", "先在『项目顾问』里写一句你卡在哪,再点『问 AI』")
+            return {"CANCELLED"}
+
+        prefs = project.preferences(context)
+        base_url = (getattr(prefs, "advisor_base_url", "") or "") if prefs else ""
+        if not base_url.strip():
+            _report(self, "ERROR",
+                    "还没填 AI 地址(插件偏好设置 -> 『项目顾问』)。\n"
+                    "不打算配的话,点『复制诊断』把它粘到别处的 AI 里问也一样")
+            return {"CANCELLED"}
+        api_key = (getattr(prefs, "advisor_api_key", "") or "") if prefs else ""
+        model = (getattr(prefs, "advisor_model", "") or "").strip() if prefs else ""
+        include_code = bool(getattr(prefs, "advisor_include_code", True)) \
+            if prefs else True
+
+        _report(self, "INFO", "正在收集项目诊断...")
+        try:
+            context_text, _sizes = advisor.collect_context(
+                context, include_code=include_code)
+        except Exception as exc:                          # noqa: BLE001
+            _report(self, "ERROR", f"收集项目诊断失败: {type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
+
+        LAST_ADVISOR.clear()
+        LAST_ADVISOR.update({"question": question, "context": context_text,
+                             "answer": "", "error": ""})
+        # ── 一定要说"界面会没响应"──────────────────────────────────
+        # 不说的话,用户会以为插件挂了然后强杀 Blender。
+        _report(self, "INFO",
+                f"已收集 {len(context_text)} 字诊断,正在问 AI"
+                f"(最多等 60 秒,这期间 Blender 界面会没响应)")
+        messages = advisor.build_messages(question, context_text)
+        ok, text = advisor.call_chat(base_url, api_key, model, messages)
+        if not ok:
+            LAST_ADVISOR["error"] = text
+            _report(self, "ERROR", text)
+            return {"CANCELLED"}
+        LAST_ADVISOR["answer"] = text
+        _report(self, "INFO", f"AI 回答了 {len(text)} 字,见侧栏『项目顾问』")
+        return {"FINISHED"}
+
+
+class GK_OT_CopyAdvisorContext(bpy.types.Operator):
+    """把"问题 + 项目诊断"整理成一段文本复制走(**不联网**)。
+
+    这是没配 AI 时的兜底,而且往往比配 API 更省事:直接粘到 Trae / 网页版
+    AI 里问。整理上下文才是这个功能里最值钱的部分,发不发出去是次要的。
+    """
+
+    bl_idname = "gk.copy_advisor_context"
+    bl_label = "复制诊断"
+    bl_description = "把问题 + 项目诊断快照整理成一段文本复制到剪贴板(不联网)"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        question = (getattr(settings, "advisor_question", "") or "").strip()
+        prefs = project.preferences(context)
+        include_code = bool(getattr(prefs, "advisor_include_code", True)) \
+            if prefs else True
+        try:
+            context_text, _sizes = advisor.collect_context(
+                context, include_code=include_code)
+        except Exception as exc:                          # noqa: BLE001
+            _report(self, "ERROR", f"收集项目诊断失败: {type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
+        LAST_ADVISOR["context"] = context_text
+        return _copy_to_clipboard(context, self,
+                                  advisor.compose_text(question, context_text),
+                                  "诊断")
+
+
+class GK_OT_CopyAdvisorAnswer(bpy.types.Operator):
+    """把 AI 的回答复制到剪贴板。"""
+
+    bl_idname = "gk.copy_advisor_answer"
+    bl_label = "复制回答"
+    bl_description = "把 AI 顾问的回答整段复制到剪贴板"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        return _copy_to_clipboard(context, self, LAST_ADVISOR.get("answer", ""),
+                                  "AI 回答")
+
+
+class GK_OT_ClearAdvisor(bpy.types.Operator):
+    """清掉侧栏里的问答结果。"""
+
+    bl_idname = "gk.clear_advisor"
+    bl_label = "清空"
+    bl_description = "清掉侧栏『项目顾问』里显示的回答"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        LAST_ADVISOR.clear()
+        return {"FINISHED"}
+
+
 class GK_OT_RelinkProject(bpy.types.Operator):
     """把当前 .blend 重新绑到别的项目目录(或恢复成"跟着 .blend 走")。"""
 
@@ -3013,6 +3149,11 @@ GK_CLASSES = (
     # 打包发布:一键把工程打成可执行文件(补全流程最后断掉的一环)
     GK_OT_ExportRelease,
     GK_OT_OpenReleaseFolder,
+    # 项目顾问(AI):把项目诊断 + 你的问题交给模型分析
+    GK_OT_AskAdvisor,
+    GK_OT_CopyAdvisorContext,
+    GK_OT_CopyAdvisorAnswer,
+    GK_OT_ClearAdvisor,
     GK_OT_RelinkProject,
     GK_OT_DetectGodot,
     GK_OT_Export,
@@ -3040,5 +3181,7 @@ def on_register():
 def on_unregister():
     _unregister_handlers()
     LAST_EXPORT.clear()
+    LAST_RELEASE.clear()
+    LAST_ADVISOR.clear()
     export_report.clear()
     RECENT_NODES.clear()

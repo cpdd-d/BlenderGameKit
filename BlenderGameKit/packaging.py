@@ -269,6 +269,18 @@ def run_release(executable, directory, preset_name, output_path, timeout=600):
     只用退出码判成败 —— Godot 导出期会打一些 `ERROR:` 字样但并非致命
     (比如渲染特性回退),拿日志关键词判成败会误报。真出问题时退出码是 1。
     """
+    # ── 产物目录必须先存在(真机踩到的坑)────────────────────────────
+    # Godot **不会**替你建导出目录:目录不在就报
+    #     ERROR: 准备模板: 给定的导出路径不存在。
+    # 这条错误文案完全没提"目录",很容易被当成预设写坏了。放在这里做,
+    # 是为了让**任何**调用方(算子 / 门禁脚本 / 以后的新入口)都不会漏。
+    parent = os.path.dirname(output_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            return False, f"创建导出目录失败: {exc}"
+
     args = release_command(executable, directory, preset_name, output_path)
     try:
         if sys.platform.startswith("win"):

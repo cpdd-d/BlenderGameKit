@@ -110,6 +110,9 @@ _SUBMODULES = (
     # 打包发布(生成导出预设 + 调 Godot --export-release,纯标准库、离线可测)
     # 必须排在 operator_io 之前 —— 它 import 这个模块
     "packaging",
+    # 项目顾问(收集项目快照 + 调 OpenAI 兼容接口)。排在 operator_io 之前,
+    # 因为它 import diagnostics / export_report / packaging
+    "advisor",
     "exporter",
     "npr_preview",
     "asset_export",

@@ -12253,6 +12253,210 @@ class TestRound52Packaging(Base):
         self.assertFalse(ok2)
         self.assertIn("template", log2)
 
+    def test_run_release_creates_output_dir(self):
+        """Godot **不会**替你建导出目录:目录不在就报"给定的导出路径不存在"。
+
+        真机踩到:装了导出模板后第一次真打包就撞上这条报错,而报错文案里
+        根本没提"目录",很像预设写坏了。修法是把"建目录"放进 run_release ——
+        这样算子 / 门禁脚本 / 以后的新入口都不会漏。
+        """
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_release_dir_")
+        try:
+            out = os.path.join(folder, "dist", "sub", "g.exe")
+            seen = {}
+
+            def spy(_args, **_kwargs):
+                # 断言"调用 Godot 之前目录已经建好"
+                seen["dir_exists"] = os.path.isdir(os.path.dirname(out))
+                with open(out, "wb") as handle:
+                    handle.write(b"MZ" + b"\0" * 2048)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("subprocess.run", side_effect=spy):
+                ok, _log = packaging.run_release("godot", "proj", "P", out)
+            self.assertTrue(ok)
+            self.assertTrue(seen.get("dir_exists"),
+                            "run_release 必须在调 Godot 之前把产物目录建出来")
+            self.assertTrue(os.path.isfile(out))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+class TestRound53Advisor(Base):
+    """项目顾问(AI)(第五十三轮):把项目诊断交给 OpenAI 兼容接口分析。
+
+    这一层只测**纯函数**(拼地址 / 拼请求 / 解析响应 / 脱敏 / 换行)——
+    `advisor` 不 import bpy,所以这些都能离线喂数据验。真联网那一小段用
+    mock 把 `urlopen` 换掉,不需要网络也不需要 Key。
+    """
+
+    def test_chat_url_variants(self):
+        """用户填的地址形态五花八门,都得能补成完整地址。"""
+        from BlenderGameKit import advisor
+        self.assertEqual(advisor.chat_url(""),
+                         "")
+        self.assertEqual(advisor.chat_url("https://api.deepseek.com"),
+                         "https://api.deepseek.com/v1/chat/completions")
+        # 结尾带 / 或多写了 /v1 都不能补重
+        self.assertEqual(advisor.chat_url("https://api.deepseek.com/"),
+                         "https://api.deepseek.com/v1/chat/completions")
+        self.assertEqual(advisor.chat_url("http://localhost:11434/v1"),
+                         "http://localhost:11434/v1/chat/completions")
+        # 已经写全的路径原样用(有的自建服务不是 /v1)
+        self.assertEqual(
+            advisor.chat_url("http://my.host/openai/chat/completions"),
+            "http://my.host/openai/chat/completions")
+
+    def test_compose_and_messages(self):
+        from BlenderGameKit import advisor
+        text = advisor.compose_text("角色不动", "【5】节点图\n...")
+        self.assertIn("角色不动", text)
+        self.assertIn("【5】节点图", text)
+        messages = advisor.build_messages("角色不动", "快照内容")
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "user")
+        # user 消息就是 compose_text 的结果(两处必须一致,见它的 docstring)
+        self.assertEqual(messages[1]["content"],
+                         advisor.compose_text("角色不动", "快照内容"))
+        # 系统提示里必须讲清这个插件是什么,否则模型会给 VisualScript 的建议
+        self.assertIn("脚本挂载目标", messages[0]["content"])
+
+    def test_request_payload(self):
+        from BlenderGameKit import advisor
+        body = advisor.request_payload("deepseek-chat", [{"role": "user"}])
+        self.assertEqual(body["model"], "deepseek-chat")
+        self.assertFalse(body["stream"])          # 不流式:一次拿完
+        self.assertIn("messages", body)
+
+    def test_parse_response(self):
+        from BlenderGameKit import advisor
+        ok, text = advisor.parse_response(
+            {"choices": [{"message": {"content": "  先看这个  "}}]})
+        self.assertTrue(ok)
+        self.assertEqual(text, "先看这个")          # 去掉首尾空白
+        # 少数实现给 text 字段
+        self.assertEqual(advisor.parse_response({"choices": [{"text": "hi"}]}),
+                         (True, "hi"))
+        # 各种坏形状都要给一句看得懂的话,而不是抛异常
+        for bad in (None, [], "字符串", {}, {"choices": []},
+                    {"choices": [{}]}, {"choices": [{"message": {}}]}):
+            ok2, note = advisor.parse_response(bad)
+            self.assertFalse(ok2, bad)
+            self.assertTrue(note)
+        ok3, note3 = advisor.parse_response({"error": {"message": "额度用完了"}})
+        self.assertFalse(ok3)
+        self.assertIn("额度用完了", note3)
+
+    def test_call_chat_requires_config(self):
+        """没填地址 / 模型名 -> 直接返回,一个字节都不发(不联网)。"""
+        from BlenderGameKit import advisor
+        with mock.patch("urllib.request.urlopen") as fake:
+            ok, text = advisor.call_chat("", "k", "m", [])
+            self.assertFalse(ok)
+            self.assertIn("AI 地址", text)
+            ok2, text2 = advisor.call_chat("http://x", "k", "  ", [])
+            self.assertFalse(ok2)
+            self.assertIn("模型名", text2)
+            fake.assert_not_called()               # 关键:没发出任何请求
+
+    def test_call_chat_success(self):
+        import json
+
+        from BlenderGameKit import advisor
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": "把脚本挂载目标勾上"}}]}
+        ).encode("utf-8")
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response) as fake:
+            ok, text = advisor.call_chat("https://api.x.com", "sk-abc", "m", [])
+        self.assertTrue(ok)
+        self.assertIn("脚本挂载目标", text)
+        request = fake.call_args[0][0]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer sk-abc")
+        self.assertEqual(request.full_url,
+                         "https://api.x.com/v1/chat/completions")
+
+    def test_call_chat_error_branches(self):
+        """三种最常见的失败:Key 不对 / 连不上 / 返回的不是 JSON。"""
+        import urllib.error
+
+        from BlenderGameKit import advisor
+        auth = urllib.error.HTTPError("http://x/v1/chat/completions", 401,
+                                      "Unauthorized", {}, None)
+        with mock.patch("urllib.request.urlopen", side_effect=auth):
+            ok, text = advisor.call_chat("http://x", "bad", "m", [])
+        self.assertFalse(ok)
+        self.assertIn("API Key", text)              # 要能让用户知道去改 Key
+
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("拒绝连接")):
+            ok2, text2 = advisor.call_chat("http://x", "k", "m", [])
+        self.assertFalse(ok2)
+        self.assertIn("连不上", text2)
+        self.assertIn("http://x/v1/chat/completions", text2)   # 把地址回显出来
+
+        response = mock.MagicMock()
+        response.read.return_value = b"<html>502 Bad Gateway</html>"
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            ok3, text3 = advisor.call_chat("http://x", "k", "m", [])
+        self.assertFalse(ok3)
+        self.assertIn("不是 JSON", text3)
+
+    def test_redact(self):
+        """发送前必须抹掉 Key、把绝对路径换成占位符。"""
+        from BlenderGameKit import advisor
+        out = advisor.redact(
+            "key=sk-1234567890abcdef 在 D:\\我的游戏\\角色_godot\\scripts\\a.gd",
+            secrets=["sk-1234567890abcdef"],
+            replacements=[("D:\\我的游戏\\角色_godot", "<Godot项目>")])
+        self.assertNotIn("sk-1234567890abcdef", out)
+        self.assertIn("***", out)
+        self.assertIn("<Godot项目>", out)
+        # 太短的"密钥"不抹 —— 否则会把正文里的普通字全换成 ***
+        self.assertEqual(advisor.redact("abc", secrets=["a"]), "abc")
+        self.assertEqual(advisor.redact("", secrets=["x"]), "")
+
+    def test_truncate(self):
+        from BlenderGameKit import advisor
+        self.assertEqual(advisor.truncate("abc", 10), "abc")
+        cut = advisor.truncate("abcdefghij", 4)
+        self.assertTrue(cut.startswith("abcd"))
+        self.assertIn("已截断", cut)
+        self.assertEqual(advisor.truncate("abcdefghij", 0), "abcdefghij")
+
+    def test_wrap_by_display_width(self):
+        """Blender 的 label 不会自动换行,所以必须自己按**显示宽度**切。
+
+        CJK 占两列,按字符个数切会让中英混排的行忽长忽短(中文行看起来
+        是英文行的两倍长)。
+        """
+        from BlenderGameKit import advisor
+        # 全角字符算两列
+        self.assertEqual(advisor.display_width("中文"), 4)
+        self.assertEqual(advisor.display_width("ab"), 2)
+        self.assertEqual(advisor.display_width("中a"), 3)
+
+        lines = advisor.wrap("这是一段中文" * 12, 20)
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            self.assertLessEqual(advisor.display_width(line), 20, line)
+        # 拼回去不能丢字(被切开的位置不能吞掉内容)
+        self.assertEqual("".join(lines), "这是一段中文" * 12)
+
+        # 英文/代码优先在空格处断,别把 some_function_name 拦腰截断
+        english = advisor.wrap("hello world foo", 10)
+        self.assertEqual(english[0], "hello")
+        for line in english:
+            self.assertLessEqual(advisor.display_width(line), 10, line)
+
+        # 空行要保留(不然代码 / 分段会挤成一坨)
+        self.assertIn("", advisor.wrap("第一段\n\n第二段", 20))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

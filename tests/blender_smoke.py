@@ -2304,7 +2304,10 @@ def main():
                     "gk.pick_anim_tree", "gk.anim_var_add", "gk.anim_var_remove",
                     "gk.anim_var_make_node", "gk.anim_var_pick",
                     # 打包发布(第五十二轮):一键出可执行文件 + 打开打包目录
-                    "gk.export_release", "gk.open_release_folder"):
+                    "gk.export_release", "gk.open_release_folder",
+                    # 项目顾问(第五十三轮):把项目诊断交给 AI
+                    "gk.ask_advisor", "gk.copy_advisor_context",
+                    "gk.copy_advisor_answer", "gk.clear_advisor"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -2365,6 +2368,82 @@ def main():
             settings.project_dir = saved_dir
     except Exception as exc:
         check("打包发布算子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 项目顾问(AI)(第五十三轮):接线 + 不联网 + 上下文收集 ----
+    # ⚠ 这一层**绝不真的联网**:把 advisor.call_chat 换成假的,再验
+    # "没配地址就不发"、"没写问题就不发"。真调用由用户手动点。
+    try:
+        adv_mod = __import__(f"{module_name}.advisor", fromlist=["collect_context"])
+        proj_mod2 = __import__(f"{module_name}.project", fromlist=["preferences"])
+        settings = bpy.context.scene.gk_settings
+        check("场景设置里有『项目顾问提问』字段",
+              hasattr(settings, "advisor_question"))
+        prefs2 = proj_mod2.preferences(bpy.context)
+        check("偏好设置里有项目顾问的四项",
+              prefs2 is not None
+              and all(hasattr(prefs2, name) for name in (
+                  "advisor_base_url", "advisor_model", "advisor_api_key",
+                  "advisor_include_code")),
+              str(prefs2))
+
+        saved_q = settings.advisor_question
+        saved_prefs = {name: getattr(prefs2, name, "") for name in (
+            "advisor_base_url", "advisor_model", "advisor_api_key")}
+        saved_call = adv_mod.call_chat
+        try:
+            # 先把 Key 填上 —— 这样下面"快照里不能有明文 Key"才是真的在验
+            # 脱敏,而不是因为压根没配
+            prefs2.advisor_api_key = "sk-smoke-should-never-appear"
+            # ⚠ 这里**不能**直接断言返回值:算子里 `report({"ERROR"})` 在
+            # bpy.ops 这一层会变成 RuntimeError(实测踩到)。被挡下时既要
+            # "没做事",也要"把原因说清楚" —— 所以抓异常、看消息。
+            def blocked_reason(call):
+                try:
+                    outcome = call()
+                except RuntimeError as exc:
+                    return str(exc)
+                return "" if outcome == {"CANCELLED"} else f"竟然返回了 {outcome}"
+
+            # 1) 没写问题 -> 明确拒绝
+            settings.advisor_question = ""
+            why1 = blocked_reason(bpy.ops.gk.ask_advisor)
+            check("没写问题时『问 AI』被挡下并说明原因",
+                  "写一句你卡在哪" in why1, why1)
+            # 2) 写了问题但没配地址 -> 也拒绝(绝不偷偷联网)
+            settings.advisor_question = "角色不动"
+            prefs2.advisor_base_url = ""
+            why2 = blocked_reason(bpy.ops.gk.ask_advisor)
+            check("没配 AI 地址时不发请求,并指出去哪配",
+                  "还没填 AI 地址" in why2, why2)
+            # 3) 『复制诊断』不联网也能跑通,而且快照要真的含"节点图 + 代码"
+            result = bpy.ops.gk.copy_advisor_context()
+            check("『复制诊断』跑通(不联网)", result == {"FINISHED"}, str(result))
+            snapshot = ops_mod.LAST_ADVISOR.get("context", "")
+            check("诊断快照含节点图与生成的代码",
+                  "节点图" in snapshot and "生成的 GDScript" in snapshot,
+                  f"{len(snapshot)} 字")
+            check("快照里没有明文 API Key(脱敏生效)",
+                  "sk-smoke-should-never-appear" not in snapshot)
+            # 4) 配好地址 + 假模型 -> 走完整条路(不联网)
+            prefs2.advisor_base_url = "http://example.invalid"
+            prefs2.advisor_model = "smoke-model"
+            adv_mod.call_chat = lambda *a, **k: (True, "先把『脚本挂载目标』勾上。")
+            result = bpy.ops.gk.ask_advisor()
+            check("『问 AI』接线通(假模型)", result == {"FINISHED"}, str(result))
+            answer = ops_mod.LAST_ADVISOR.get("answer", "")
+            check("回答存进了 LAST_ADVISOR 供侧栏显示",
+                  "脚本挂载目标" in answer, answer[:40])
+            check("清空能清掉结果",
+                  bpy.ops.gk.clear_advisor() == {"FINISHED"}
+                  and not ops_mod.LAST_ADVISOR)
+        finally:
+            adv_mod.call_chat = saved_call
+            for name, value in saved_prefs.items():
+                setattr(prefs2, name, value)
+            settings.advisor_question = saved_q
+    except Exception as exc:
+        check("项目顾问算子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- UI 注册:用"面板能不能被 Blender 找到"来验证 ----

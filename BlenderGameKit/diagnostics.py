@@ -39,13 +39,16 @@ def build_report(context=None):
     add("")
     add("【1】插件")
     add(f"  Blender: {bpy.app.version_string}")
+    # ⚠ 这里以前写死 `bl_ext.user_default.blender_game_kit` —— 只在默认仓库
+    # 装的时候对得上;装到别的仓库(门禁用的 gk_test)或作为普通 addon 装时
+    # 全部 import 失败,诊断报告里这几段会静默退化成"取不到"。
+    # 改用相对导入,跟装在哪无关。
     try:
-        import bl_ext.user_default.blender_game_kit as pkg
-        add(f"  插件路径: {os.path.dirname(getattr(pkg, '__file__', '?'))}")
+        add(f"  插件路径: {os.path.dirname(os.path.abspath(__file__))}")
     except Exception as exc:
         add(f"  插件路径: 取不到({exc})")
     try:
-        from bl_ext.user_default.blender_game_kit import nodes as _nodes
+        from . import nodes as _nodes
         add(f"  节点数: {len(_nodes.ALL_CLASSES)}")
         # 关键:确认"该删的节点"在这个版本里是不是真的删了
         for name in ("GKNodeSetPosition", "GKNodeDistance", "GKNodeTextJoin",
@@ -85,7 +88,7 @@ def build_report(context=None):
                 f"手填尺寸={manual} 脚本体={getattr(physics, 'script_target', '?')}")
             # 碰撞体实际会生成多大(和网格比一比,一眼看出"陷进去/悬空")
             try:
-                from bl_ext.user_default.blender_game_kit import asset_export
+                from . import asset_export
                 data = asset_export.build_collision(obj, is_3d=True, physics=physics)
                 if data:
                     sub = str(data.get("sub_resource", "")).replace("\n", " ")
@@ -100,7 +103,7 @@ def build_report(context=None):
     add("")
     add("【4】主相机")
     try:
-        from bl_ext.user_default.blender_game_kit import exporter
+        from . import exporter
         name, why = exporter.resolve_main_camera(scene)
         add(f"  解析结果: {name or '(没有相机)'}  <- {why}")
         view_cam = getattr(scene, "camera", None)
@@ -144,7 +147,7 @@ def build_report(context=None):
         add("  没有可导出的游戏逻辑图")
     else:
         try:
-            from bl_ext.user_default.blender_game_kit import codegen, project
+            from . import codegen, project
             options = {"dimension": str(getattr(settings, "dimension", "3")),
                        "base_class": str(getattr(settings, "base_class", "auto"))}
             # 用返回值拿结果,不再读 codegen 的模块级全局变量(GPT 审查)

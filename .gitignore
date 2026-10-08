@@ -8,6 +8,8 @@ __pycache__/
 _dist/
 # 散落在仓库各处的打包 zip(如根目录的 bgk.zip)——产物,不该进版本库
 *.zip
+# Godot 导出模板安装包(装模板时下载的 .tpz,~1GB)——装完就没用了,别提交
+*.tpz
 # 临时测试仓库:build_and_test.ps1 每次跑完都会删掉它,
 # 跟踪它只会让 `git status` 每次冒出一片删除。它本来就是产物。
 _testrepo/
