@@ -590,6 +590,39 @@ if ($SkipGodot) {
         }
     }
 
+    # 5o. 恐怖示例(第五十九轮:阶段④收尾)—— 氛围套件 + 听觉 + 结局一条龙。
+    #     这一层验的是:AI 巡逻、『氛围_紧张度』随距离升降 + 心跳联动、
+    #     3 张纸条触发计数、走过惊吓区**相机真在震 + Master 真被压低**、
+    #     门口弹结局选择、按 2 之后『结局』= 2 且真的落盘。
+    Write-Output ""
+    $horrorDir = Join-Path $Root "examples\demo_horror"
+    $horrorMaker = Join-Path $Root "scripts\make_horror_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过恐怖示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $horrorDir)) {
+        Write-Output "跳过恐怖示例:还没有 examples\demo_horror"
+    } else {
+        $horrorLog = & $Blender -b --python $horrorMaker 2>&1 | Out-String
+        if ($horrorLog -notmatch "已保存") {
+            Write-Host "---- 重建恐怖示例失败,尾部 20 行 ----"
+            ($horrorLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $horrorChecker = Join-Path $Root "scripts\check_horror_demo.py"
+            $horrorOut = & python $horrorChecker --godot $Godot 2>&1 | Out-String
+            $horrorOut -split "`n" | Where-Object { $_ -match "^(HORROR_|CHECK_HORROR_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($horrorOut -match "CHECK_HORROR_DEMO=OK") {
+                $godotRan += "恐怖示例"
+            } elseif ($horrorOut -match "跳过") {
+                Write-Output "（恐怖示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

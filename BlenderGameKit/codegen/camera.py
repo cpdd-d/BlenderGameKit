@@ -966,6 +966,17 @@ def _stmt_camera_shake(ctx, node, indent):
     做法:这里只负责"装上"(记下相机 + 重置计时器)，
     衰减逻辑登记进 ctx.process_hooks，由 generate() 保证 _process 存在。
     """
+    _install_camera_shake(ctx, node, indent)
+
+
+def _install_camera_shake(ctx, node, indent):
+    """把"震动装上去"的代码吐在 indent 处。
+
+    ── 为什么抽成独立函数(第五十九轮)────────────────────────────
+    『惊吓_事件』(相机震动 + 闪白 + 音效三连)也要装同一次震动 ——
+    它读的属性名和『相机_震动』完全一样(gk_strength / gk_duration /
+    gk_target)，所以两个节点共用这一份实现，不必抄一遍。
+    """
     camera, is_specific = _camera_expr(ctx, node)
     strength = gd_number(getattr(node, "gk_strength", 8.0))
     duration = gd_number(getattr(node, "gk_duration", 0.25))

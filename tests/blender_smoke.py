@@ -2643,6 +2643,81 @@ def main():
         check("AI 听觉节点", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 恐怖氛围套件(第五十九轮):惊吓三连 / 紧张度 / 心跳 / 总线音量 ----
+    try:
+        r59_nodes = __import__(f"{module_name}.nodes.nodes",
+                               fromlist=["ALL_CLASSES"])
+        r59_all = {cls.bl_idname for cls in r59_nodes.ALL_CLASSES}
+        check("『惊吓_事件』已注册", "GKNodeScare" in r59_all)
+        check("『氛围_紧张度』已注册", "GKNodeTension" in r59_all)
+        check("『氛围_心跳』已注册", "GKNodeHeartbeat" in r59_all)
+        check("『音效_总线音量』已注册", "GKNodeBusVolume" in r59_all)
+        check("『氛围』进了分类顺序表", "氛围" in r59_nodes.CATEGORY_ORDER,
+              str(r59_nodes.CATEGORY_ORDER))
+
+        r59_tree = bpy.data.node_groups.new("氛围冒烟59", "GKGameLogicTree")
+        r59_ready = r59_tree.nodes.new("GKNodeOnReady")
+        r59_phys = r59_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r59_scare = r59_tree.nodes.new("GKNodeScare")
+        r59_scare.gk_path = "res://art/slam.wav"
+        r59_scare.gk_strength = 14.0
+        r59_bus = r59_tree.nodes.new("GKNodeBusVolume")
+        r59_bus.gk_bus = "Master"
+        r59_bus.gk_db = -80.0
+        r59_heart = r59_tree.nodes.new("GKNodeHeartbeat")
+        r59_tense = r59_tree.nodes.new("GKNodeTension")
+        r59_tense.gk_threat = "冒烟怪"
+        r59_tree.links.new(r59_ready.outputs["执行"], r59_scare.inputs["执行"])
+        r59_tree.links.new(r59_scare.outputs["完成"], r59_bus.inputs["执行"])
+        r59_tree.links.new(r59_phys.outputs["执行"], r59_heart.inputs["执行"])
+        r59_tree.links.new(r59_tense.outputs["紧张度"], r59_heart.inputs["紧张度"])
+
+        r59_code, r59_warn = codegen.generate(r59_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("氛围:惊吓_事件 三连都出码(震/闪/响)",
+              "_gk_shake_cam" in r59_code
+              and "ColorRect.new()" in r59_code
+              and "AudioStreamPlayer.new()" in r59_code
+              and 'load("res://art/slam.wav")' in r59_code,
+              r59_code[-500:])
+        check("氛围:紧张度 -> 心跳(内联 clampf + 越快越响)",
+              "clampf(" in r59_code
+              and "_gk_heart_tension += (clampf(" in r59_code
+              and "lerpf(" in r59_code,
+              r59_code[-500:])
+        check("氛围:总线音量走 AudioServer",
+              'AudioServer.get_bus_index("Master")' in r59_code
+              and "AudioServer.set_bus_volume_db(" in r59_code,
+              r59_code[-500:])
+        check("氛围:生成无告警", not r59_warn, str(r59_warn)[:300])
+
+        class _R59Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r59_draw_ok = True
+        r59_draw_error = ""
+        for r59_card in (r59_scare, r59_bus, r59_heart, r59_tense):
+            try:
+                r59_card.draw_buttons(bpy.context, _R59Layout())
+            except Exception as exc:                       # noqa: BLE001
+                r59_draw_ok = False
+                r59_draw_error = (f"{r59_card.bl_label}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("氛围:四张节点卡片都能画完", r59_draw_ok, r59_draw_error)
+
+        bpy.data.node_groups.remove(r59_tree)
+    except Exception as exc:
+        check("恐怖氛围套件", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- UI 注册:用"面板能不能被 Blender 找到"来验证 ----
     try:
         panel_names = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]

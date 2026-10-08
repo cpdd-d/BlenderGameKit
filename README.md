@@ -48,6 +48,7 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 | 碰撞体要跑到 Godot 里配 | **在物体属性面板里设**(像 UPBGE),导出时自动生成 |
 | **按键在 Godot 里要手工加输入映射** | **自动写进 `project.godot`** —— 节点图用了哪些动作就登记哪些,并绑好默认键(A/D/W/S、空格、J、E) |
 | 二次元游戏 | **3 个 NPR 卡通着色器**(描边/边缘光/三阶明暗/面部 SDF) + 手绘线条抖动 |
+| 做恐怖游戏 | **氛围套件**:心跳随危险变快变响(『氛围_紧张度』『氛围_心跳』)、一键**惊吓三连**(震屏 + 闪白 + 音效)、总线音量压低;配上**听觉 AI** 就是"扔石头把怪物引开"那套 |
 | 卡住了不知道问谁 | 侧栏**『项目顾问』** —— 把项目诊断(节点图与连线 / 碰撞体尺寸 / 生成的代码 / 导出告警 / 最近报错)整理成快照交给 AI,要"下一步怎么做"。也支持**不联网**只复制快照 |
 | 只能导出工程、出不了可执行文件 | 点一下**打包成可执行文件**,在 Blender 里直接出 `.exe`(自动生成导出预设,不覆盖你已有的) |
 
@@ -130,7 +131,7 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 | 你想知道 | 看这个 |
 |---|---|
 | ★ **"我想做 X,该连哪几个节点?"**(让角色跑 / 小怪追人 / 听声辨位 / 对话分支 / 恐怖氛围 / 存档 / 切关卡 / 出 exe) | [docs/入门路线.md](docs/入门路线.md) |
-| **每个节点的引脚 / 参数 / 说明**(184 个,从代码自动生成) | [docs/节点手册.md](docs/节点手册.md) |
+| **每个节点的引脚 / 参数 / 说明**(188 个,从代码自动生成) | [docs/节点手册.md](docs/节点手册.md) |
 | **节点怎么连、三条必经规则、三条线的含义** | [docs/节点怎么连.md](docs/节点怎么连.md) |
 | **项目怎么组织、模型贴图怎么进 Godot、脚本怎么挂、C++ 怎么写** | [docs/Blender与Godot互通.md](docs/Blender与Godot互通.md) |
 | **卡通着色怎么调、参数什么意思** | [docs/渲染-NPR卡通着色.md](docs/渲染-NPR卡通着色.md) |
@@ -194,7 +195,7 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 
 docs/
 ├── 入门路线.md                 ★ "我想做 X,该连哪几个节点?"(13 条路线 + 三条必经规则)
-├── 节点手册.md                 ★ 184 个节点的引脚/参数/说明(**自动生成**,门禁校验)
+├── 节点手册.md                 ★ 188 个节点的引脚/参数/说明(**自动生成**,门禁校验)
 ├── 节点怎么连.md               三条线的含义、从零到能跑角色的顺序
 ├── Blender与Godot互通.md       资产管线 + 脚本搭载 + C++ GDExtension
 ├── 渲染-NPR卡通着色.md          着色器用法、参数含义、光照强度甜点区
@@ -221,10 +222,12 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 268 项冒烟 + 面板 draw() + 示例体检 + Godot 端到端十四层(-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 284 项冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端十五层(-Deep 再加动画六层)
 ├── check_release.py            ★ 打包发布自检:真 Godot 跑 `--export-release` 出可执行文件(没装导出模板则跳过)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
+├── make_horror_demo.py         ★ 生成恐怖示例(氛围套件 + 听觉怪物 + 结局分支;现生成音频)
+├── check_horror_demo.py        ★ 恐怖示例探针(真 Godot:紧张度/心跳/惊吓/纸条计数/结局落盘)
 ├── verify_anim_system.ps1      ★ 动画系统六层验证(离线/真 Blender/示例/Godot 解析/**真跑 1.5 秒**/反例)
 ├── check_gdscript.ps1          ★ 把生成的 .gd 交给真 Godot 解析(带反例)
 ├── make_anim_example.py        ★ 生成动画状态机示例 .blend
@@ -252,6 +255,7 @@ examples/
 ├── demo_level/                 关卡示例(多场景:关卡1 通关后切关卡2)
 ├── demo_lights/                灯光示例(三种灯 + 手电筒跟相机 + 数字键开关灯)
 ├── demo_env/                   环境示例(白天 / 幽暗两关:天空·纯色 / 雾 / 泛光 / 色调)
+├── demo_horror/                ★ 恐怖示例(幽暗教学楼:手电筒 + 听觉怪物 + 心跳紧张度 + 惊吓三连 + 结局分支 + 存档)
 ├── demo_anim_tree/             动画状态机示例 .blend(旧示例,仅存档)
 ├── demo_2d_blend/              2.5D 示例 .blend(旧示例,仅存档)
 ├── demo_platformer/            ★ 可玩的 2D 平台跳跃示例(相机跟随/金币/HUD/存档)
@@ -343,7 +347,7 @@ func _physics_process(delta: float) -> void:
 
 ---
 
-## 节点一览(**184** 个可用 + 4 个隐藏的老节点)
+## 节点一览(**188** 个可用 + 4 个隐藏的老节点)
 
 > **完整手册(引脚 / 参数 / 说明)在 [docs/节点手册.md](docs/节点手册.md)** ——
 > 那份**从代码自动生成**,不会像手写清单那样过期
@@ -617,10 +621,10 @@ pip install pytest && python -m pytest
 #    (后者是最容易漏的:无头探针用 dummy 渲染器,着色器编译错误不进断言)
 python scripts\verify_shaders.py
 
-# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 220 项冒烟 + 示例完整性体检 + Godot 端到端十三层
+# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 284 项冒烟 + 示例完整性体检 + 节点手册新鲜度 + Godot 端到端十五层
 #    —— 改节点/UI/生成代码后必跑
-#    端到端十三层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
-#                界面 / AI / 资产 / 关卡 / 灯光 / 环境示例;产物写在 _dist(不动 examples);
+#    端到端十五层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
+#                界面 / AI / 资产 / 关卡 / 灯光 / 环境 / 恐怖示例 / 打包发布;产物写在 _dist(不动 examples);
 #    加 -Deep 再跑动画系统六层验证(要真 Blender、会重建 examples\demo_anim_tree,较慢)
 #    本机没装 Godot 时自动跳过;加 -SkipGodot 可显式跳过
 powershell -File scripts\build_and_test.ps1
@@ -925,6 +929,18 @@ godot --headless --path _dist\anim_probe --quit-after 900
     修法：同一个函数里只声明一次（[generator.py](BlenderGameKit/codegen/generator.py)
     里的 `declared_unused`）。教训是"这句无关紧要的消警告语句"也会
     让整个游戏停摆。
+
+40. **"往已经吐好的代码里插行"必须跟着当前缩进。** 存档的惰性读盘守卫
+    原来是把几行**硬插进当前段落**、缩进写死 4 个空格 —— 只在"语句正好
+    在函数体第一层"时才对。恐怖示例把『存档_写入』放进了
+    `match _gk_choice_picked:` 的某个 `case` 里（"选了结局再存档"），
+    生成出来就是:守卫缩进比周围**浅**、下一行又深回去,Godot 报
+    `Parse Error: Expected statement, found "Indent" instead.`，
+    **整个脚本编不过**（而且只报这一句,很难联想到存档节点）。
+    修法：`_ensure_save_block` 改成按**当前 indent** 就地吐
+    （[services.py](BlenderGameKit/codegen/services.py)），并加了两条单测锁住
+    "分支里的守卫缩进"和"守卫必须在写入之前"。
+    教训：凡是"往已成形的代码里插东西"的代码,都要问一句**当前在第几层**。
 
 ---
 

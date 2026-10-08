@@ -13372,5 +13372,200 @@ class TestRound57AiHearing(Base):
         return tree, enable
 
 
+class TestRound59Horror(Base):
+    """第五十九轮:恐怖氛围套件(阶段④收尾)。
+
+    四个新节点:
+      * 『惊吓_事件』 —— 相机震动 + 闪白 + 音效三连(一个节点全做);
+      * 『氛围_紧张度』 —— 离威胁越近越高,输出 0~1(**纯表达式**,不平滑);
+      * 『氛围_心跳』 —— 紧张度驱动的心跳(越快越响,低于阈值停);
+      * 『音效_总线音量』 —— 设总线音量(可渐变)。
+    判据:各生成对的 Godot API;没用到时一个字符都不多。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_scare_does_all_three(self):
+        """三连:相机震动 + 全屏 ColorRect 闪白 + 一次性音效。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScare, "开门吓一跳",
+                             gk_strength=14.0, gk_duration=0.4,
+                             gk_color=(1.0, 0.0, 0.0, 1.0), gk_alpha=0.7,
+                             gk_flash_time=0.25,
+                             gk_path="res://art/slam.wav", gk_volume=-2.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # ① 震动(和『相机_震动』同一套成员变量 + 每帧衰减钩子)
+        self.assertIn("_gk_shake_cam", code)
+        self.assertIn("_gk_shake_power = 14.0", code)
+        self.assertIn("randf_range(-_gk_shake_power, _gk_shake_power)", code)
+        # ② 闪白(全屏 ColorRect + Tween 淡出)
+        self.assertIn("ColorRect.new()", code)
+        self.assertIn("Color(1.0, 0.0, 0.0, 0.7)", code)
+        self.assertIn('tween_property(', code)
+        self.assertIn('"color:a", 0.0, 0.25)', code)
+        # ③ 音效(运行时建、播完自删)
+        self.assertIn('load("res://art/slam.wav") as AudioStream', code)
+        self.assertIn("AudioStreamPlayer.new()", code)
+        self.assertIn(".finished.connect(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_scare_without_sound_still_shakes_and_flashes(self):
+        """『音效』留空 = 只震 + 闪,不生成任何音频代码(没素材也能先用)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeScare, "震一下", gk_path="")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_shake_cam", code)
+        self.assertIn("ColorRect.new()", code)
+        self.assertNotIn("AudioStreamPlayer", code)
+        self.assert_indent_sane(code)
+
+    def test_tension_is_pure_expression_between_near_and_far(self):
+        """紧张度是**内联表达式**(不落中间变量),用位置 reader 算距离。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        heart = tree.new_node(NN.GKNodeHeartbeat, "心跳")
+        tension = tree.new_node(NN.GKNodeTension, "紧张",
+                                gk_threat="怪物", gk_near=3.0, gk_far=15.0)
+        gk_stub.connect(tree, event, "执行", heart, "执行")
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 位置 reader(和『取值_位置』共用的那个)
+        self.assertIn("func _gk_global_position_3d(host: Node)", code)
+        self.assertIn("_gk_global_position_3d(", code)
+        # 0~1 夹取 + near/far 线性
+        self.assertIn("clampf(", code)
+        self.assertIn("maxf(", code)
+        self.assertIn("0.0001", code)
+        # 是内联的:心跳那行直接读到 clampf,而不是先赋值给某个 _gk_tension_*
+        self.assertIn("_gk_heart_tension += (clampf(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_tension_without_threat_warns_and_returns_zero(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        heart = tree.new_node(NN.GKNodeHeartbeat, "心跳")
+        tension = tree.new_node(NN.GKNodeTension, "紧张")   # 没选威胁
+        gk_stub.connect(tree, event, "执行", heart, "执行")
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("没有指定" in w for w in warnings), warnings)
+        self.assertIn("_gk_heart_tension += (0.0", code)
+
+    def test_heartbeat_speeds_up_and_stops_when_calm(self):
+        """心跳:间隔/音量随紧张度 lerp,低于安静阈值就停。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeHeartbeat, "心跳",
+                             gk_path="res://art/heartbeat.wav",
+                             gk_slow_interval=1.0, gk_fast_interval=0.3,
+                             gk_quiet_db=-20.0, gk_loud_db=-4.0,
+                             gk_quiet=0.2, gk_smooth=1.5)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 固定步长(不依赖 delta 参数),平滑朝目标靠拢
+        self.assertIn("get_physics_process_delta_time()", code)
+        self.assertIn("/ maxf(1.5, 0.0001)", code)
+        # 越快越响 + 安静阈值
+        self.assertIn("lerpf(1.0, 0.3, _gk_heart_tension)", code)
+        self.assertIn("lerpf(-20.0, -4.0, _gk_heart_tension)", code)
+        self.assertIn("_gk_heart_tension <= 0.2", code)
+        self.assertIn("_gk_heart_player.play()", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_heartbeat_without_sound_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeHeartbeat, "心跳", gk_path="")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("没填『心跳音效』" in w for w in warnings), warnings)
+
+    def test_bus_volume_sets_audioserver_with_fade(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBusVolume, "压低BGM",
+                             gk_bus="Music", gk_db=-80.0, gk_fade=1.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('AudioServer.get_bus_index("Music")', code)
+        self.assertIn("AudioServer.set_bus_volume_db(", code)
+        self.assertIn("AudioServer.get_bus_volume_db(", code)
+        self.assertIn("tween_method(func(_v: float):", code)
+        self.assertIn(", 1.0)", code)          # tween 时长
+        self.assertIn("找不到音频总线", code)     # 总线名写错时有可读告警
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_save_guard_keeps_indent_inside_branch(self):
+        """真机 bug(第五十九轮):存档节点在 `if` / `match` 里时,惰性读盘守卫
+        的缩进必须跟着**当前层**走。
+
+        老实现把守卫行硬插进行列表、缩进写死 4 个空格 —— 只在语句位于
+        函数体第一层时才对。放进分支里(恐怖示例的"选了结局再存档")就生成::
+
+            if x:
+                _gk_save_data["hp"] = 0
+            _gk_save_path = _gk_save_file("save1")     <- 缩进变浅
+                _gk_save_data = _gk_read_save(...)      <- 再深回去
+        Godot 报 `Parse Error: Expected statement, found "Indent" instead.`,
+        **整个脚本编不过**。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        cond = tree.new_node(NN.GKNodeConstBool, "开关", gk_value=True)
+        branch = tree.new_node(NN.GKNodeBranch, "要不要存")
+        setter = tree.new_node(NN.GKNodeSaveSet, "写", gk_key="hp", gk_slot="save1")
+        gk_stub.connect(tree, cond, "值", branch, "条件")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, branch, "是", setter, "执行")
+        code, _ = gen(tree, V2)
+        # 守卫在分支体里 = 8 空格缩进(不是写死的 4 空格)
+        self.assertIn(
+            '\n        _gk_save_path = _gk_save_file("save1")\n'
+            '        if _gk_save_path == "":\n'
+            '            _gk_save_path = _gk_save_file("save1")\n'
+            '            _gk_save_data = _gk_read_save(_gk_save_path)\n',
+            code, code)
+        self.assertIn('\n        _gk_save_data["hp"] = 3', code, code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_save_guard_emitted_before_the_write(self):
+        """守卫要在写入**之前** —— 『存档_写入』往字典里塞值时,那份字典
+        必须先被载入(Godot 里对 null Dictionary 赋值会报错)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        setter = tree.new_node(NN.GKNodeSaveSet, "写", gk_key="hp", gk_slot="save1")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, _ = gen(tree, V2)
+        self.assertLess(code.index("_gk_read_save(_gk_save_path)"),
+                        code.index('_gk_save_data["hp"]'))
+
+    def test_no_horror_code_without_the_nodes(self):
+        """没用到氛围套件的图里一个相关字符都不多(老产物逐字不变)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_gk_shake_", code)
+        self.assertNotIn("_gk_heart_", code)
+        self.assertNotIn("AudioServer", code)
+        self.assertNotIn("_gk_global_position_", code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

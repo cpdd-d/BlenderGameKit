@@ -836,6 +836,38 @@ class GKNodeStopSound(B.GKStatementNode):
         layout.prop(self, "gk_fade", text="")
 
 
+@N
+class GKNodeBusVolume(B.GKStatementNode):
+    bl_idname = "GKNodeBusVolume"
+    bl_label = "音效_总线音量"
+    bl_icon = "SOUND"
+    gk_category = "音效"
+    gk_doc = ("设置一条**音频总线**的音量,支持渐变(第五十九轮)。\n"
+              "做『整体音量淡出』/『进恐怖段落时把 BGM 压低』用它 —— "
+              "『音效_音乐』只管单曲的启停,压不住别的声音。\n"
+              "『总线』要填 Godot 音频面板里已有的名字(默认 Master;"
+              "自己加过 Music / SFX 总线就填那一层的名字)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "目标音量", 0.0),
+        S.pin(FLOAT, "时长", 0.5),
+    )
+    gk_input_props = {"目标音量": "gk_db", "时长": "gk_fade"}
+    gk_prop_defs = (
+        ("gk_bus", "string", "Master", "总线",
+         "Godot 音频面板里的总线名,默认 Master"),
+        ("gk_db", "float", 0.0, "目标音量", "分贝;0 = 原始音量,-80 约等于静音"),
+        ("gk_fade", "float", 0.5, "时长", "渐变秒数;0 = 立刻生效"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_bus", text="")
+        row.prop(self, "gk_db", text="")
+        layout.prop(self, "gk_fade", text="渐变秒数")
+
+
 # ==========================================================================
 # 存档
 # ==========================================================================
@@ -1014,6 +1046,153 @@ class GKNodeScreenFade(B.GKStatementNode):
         row.prop(self, "gk_time", text="")
         row.prop(self, "gk_hold", text="")
         layout.prop(self, "gk_to_opaque", text="渐变到不透明", toggle=True)
+
+
+# ==========================================================================
+# 恐怖氛围套件(第五十九轮)
+# ==========================================================================
+# 阶段④ 剩下的三块:惊吓三连 / 心跳紧张度 / BGM 总线音量(见
+# docs/二次元剧情与恐怖游戏设计.md 第三节 P1)。零件其实早就有
+# (『相机_震动』『屏幕_闪白』『音效_播放』),缺的是"把它们凑成一次惊吓"、
+# "让氛围随危险连续变化"这两件事 —— 手工连出来线太多、还容易漏。
+@N
+class GKNodeScare(B.GKStatementNode):
+    bl_idname = "GKNodeScare"
+    bl_label = "惊吓_事件"
+    bl_icon = "ERROR"
+    gk_category = "氛围"
+    gk_doc = ("一次**惊吓三连** —— 相机震动 + 屏幕闪白 + 音效,一个节点全做掉。\n"
+              "── 为什么要合成一个 ──\n"
+              "零件『相机_震动』『屏幕_闪白』『音效_播放』都有,但『惊吓』要三样"
+              "**同时**发生才算数;分三个节点连,线多、还得三条并行,漏掉一样"
+              "就不够吓人。\n"
+              "── 单独调 ──\n"
+              "『强度』管震得多厉害,『闪光颜色/透明度/时长』管闪什么颜色、"
+              "『音效』留空 = 只震 + 闪不播音(没素材也能先用)。\n"
+              "接法:开门 / 敌人扑上来 / 触发区里放一个,从『执行』接下去。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "强度", 8.0),
+        S.pin(COLOR, "闪光颜色", (1.0, 1.0, 1.0, 1.0)),
+        S.pin(TEXT, "音效", ""),
+        S.pin(FLOAT, "音量", 0.0),
+    )
+    gk_input_props = {"强度": "gk_strength", "音量": "gk_volume"}
+    gk_prop_defs = (
+        ("gk_strength", "float", 8.0, "震动强度", "相机最大偏移像素"),
+        ("gk_duration", "float", 0.25, "震动持续", "震动时长(秒)"),
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "闪光颜色", "闪白/闪红颜色"),
+        ("gk_alpha", "float", 0.5, "闪光透明度", "1 = 全不透明"),
+        ("gk_flash_time", "float", 0.3, "闪光时长", "闪白淡出所需秒数"),
+        ("gk_path", "string", "", "音效", "res:// 音频文件;留空 = 不播音"),
+        ("gk_volume", "float", 0.0, "音量", "分贝;0 = 原始,-6 约减半"),
+        ("gk_target", "node", "", "相机", "留空则运行时自动找场景里的相机"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_strength", text="")
+        row.prop(self, "gk_duration", text="秒")
+        row = layout.row(align=True)
+        row.prop(self, "gk_color", text="")
+        row.prop(self, "gk_alpha", text="透明")
+        layout.prop(self, "gk_flash_time", text="闪光秒数")
+        row = layout.row(align=True)
+        row.prop(self, "gk_path", text="")
+        pick = row.operator("gk.pick_sound", text="", icon="SOUND")
+        pick.node_name = self.name
+        layout.prop(self, "gk_volume", text="音量")
+        B.draw_target_picker(self, layout)
+
+
+@N
+class GKNodeTension(B.GKExpressionNode):
+    bl_idname = "GKNodeTension"
+    bl_label = "氛围_紧张度"
+    bl_icon = "RNDCURVE"
+    gk_category = "氛围"
+    gk_doc = ("紧张度 0~1 —— 离『威胁』越近越高(距离 ≤ 『近距』= 1,"
+              "≥ 『远距』= 0,中间线性)。\n"
+              "── 拿来干嘛 ──\n"
+              "喂给『氛围_心跳』让心跳**越近越快越响**;也可以接到"
+              "『屏幕_暗角』的强度 / 『屏幕_滤镜』,让画面随危险压暗。\n"
+              "── 它是纯计算 ──\n"
+              "每帧读它 = 当前瞬间的紧张度(**不平滑**);平滑在"
+              "『氛围_心跳』内部做,这样一张图里只在需要的地方平滑一次。")
+    gk_inputs = (
+        S.pin(OBJECT, "威胁", None),
+        S.pin(FLOAT, "近距", 3.0),
+        S.pin(FLOAT, "远距", 15.0),
+    )
+    gk_input_props = {"近距": "gk_near", "远距": "gk_far"}
+    gk_outputs = (S.pin(FLOAT, "紧张度", 0.0),)
+    gk_prop_defs = (
+        ("gk_threat", "node", "", "威胁",
+         "离谁越近越紧张(一般选那只怪;『威胁』引脚没接线时用它)"),
+        ("gk_near", "float", 3.0, "近距", "这个距离以内 = 紧张度 1"),
+        ("gk_far", "float", 15.0, "远距", "这个距离以外 = 紧张度 0"),
+    )
+
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_near", text="")
+        row.prop(self, "gk_far", text="")
+        B.draw_target_picker(self, layout, "gk_threat")
+
+
+@N
+class GKNodeHeartbeat(B.GKStatementNode):
+    bl_idname = "GKNodeHeartbeat"
+    bl_label = "氛围_心跳"
+    bl_icon = "TIME"
+    gk_category = "氛围"
+    gk_doc = ("随『紧张度』变化的心跳声:越紧张**跳得越快、越响**,"
+              "低于『安静阈值』就停 —— 恐怖游戏的『心里发毛』就靠它。\n"
+              "── 接法(必须每帧跑)──\n"
+              "『每当_物理帧』→ 本节点;把『氛围_紧张度』的输出接到它的"
+              "『紧张度』引脚。\n"
+              "── 两个间隔 / 两个音量 ──\n"
+              "『最慢间隔』= 平静时多久跳一下,『最快间隔』= 最紧张时(秒);"
+              "『最轻/最响音量』同理想(分贝)。『平滑秒数』让紧张度变化"
+              "不要瞬间跳变(0 = 不平滑)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "紧张度", 0.0),
+    )
+    gk_input_props = {"紧张度": "gk_tension"}
+    gk_prop_defs = (
+        ("gk_path", "string", "res://art/heartbeat.wav", "心跳音效",
+         "res:// 音频文件(短促的一声'咚')"),
+        ("gk_tension", "float", 0.0, "紧张度",
+         "0~1;接『氛围_紧张度』的输出,或未连线时用这个固定值"),
+        ("gk_slow_interval", "float", 1.1, "最慢间隔",
+         "紧张度 0 时多久跳一下(秒)"),
+        ("gk_fast_interval", "float", 0.35, "最快间隔",
+         "紧张度 1 时多久跳一下(秒)"),
+        ("gk_quiet_db", "float", -18.0, "最轻音量", "紧张度 0 时的分贝"),
+        ("gk_loud_db", "float", -4.0, "最响音量", "紧张度 1 时的分贝"),
+        ("gk_quiet", "float", 0.15, "安静阈值",
+         "紧张度低于它就**不播**(免得平常也在咚咚咚)"),
+        ("gk_smooth", "float", 1.5, "平滑秒数", "紧张度变化的平滑时间;0 = 不平滑"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_path", text="")
+        pick = row.operator("gk.pick_sound", text="", icon="SOUND")
+        pick.node_name = self.name
+        row = layout.row(align=True)
+        row.prop(self, "gk_slow_interval", text="慢")
+        row.prop(self, "gk_fast_interval", text="快")
+        row = layout.row(align=True)
+        row.prop(self, "gk_quiet_db", text="轻")
+        row.prop(self, "gk_loud_db", text="响")
+        row = layout.row(align=True)
+        row.prop(self, "gk_quiet", text="静阈")
+        row.prop(self, "gk_smooth", text="平滑")
 
 
 # ==========================================================================

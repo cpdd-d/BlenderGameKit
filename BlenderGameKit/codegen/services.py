@@ -108,6 +108,182 @@ def _stmt_stop_sound(ctx, node, indent):
         ctx.add_line(indent + 1, f"{music_var}.stop()")
 
 
+@stmt_node("GKNodeBusVolume")
+def _stmt_bus_volume(ctx, node, indent):
+    """设置音频**总线**音量(可渐变,第五十九轮)。
+
+    ── 为什么是"总线"而不是"音乐播放器" ────────────────────────────
+    『音效_音乐』只管它自己那一条流;BGM 淡出要"整层降下去"时,
+    它压不住音效 / 环境音。总线音量(AudioServer)是唯一能一次压住
+    一整类声音的口子 —— 恐怖段落里把 Master 压暗、或者给 BGM 单独
+    建一条 Music 总线再压它,都走这里。
+    """
+    bus = str(getattr(node, "gk_bus", "Master") or "Master").strip() or "Master"
+    target = ctx.input_number(node, "目标音量", gd_number(getattr(node, "gk_db", 0.0)))
+    fade = ctx.input_number(node, "时长", gd_number(getattr(node, "gk_fade", 0.5)))
+
+    bus_var = ctx.new_temp("bus")
+    ctx.add_line(indent, f"var {bus_var} := AudioServer.get_bus_index({gd_string(bus)})")
+    ctx.add_line(indent, f"if {bus_var} >= 0:")
+    ctx.add_line(indent + 1, f"if {fade} <= 0.0:")
+    ctx.add_line(indent + 2, f"AudioServer.set_bus_volume_db({bus_var}, {target})")
+    ctx.add_line(indent + 1, "else:")
+    from_var = ctx.new_temp("bus_from")
+    tween_var = ctx.new_temp("bus_tween")
+    ctx.add_line(indent + 2, f"var {from_var} := AudioServer.get_bus_volume_db({bus_var})")
+    ctx.add_line(indent + 2, f"var {tween_var} := create_tween()")
+    # 总线音量是个 float,没有属性路径可 tween —— 用 tween_method 每次回调 set
+    ctx.add_line(indent + 2,
+                 f"{tween_var}.tween_method(func(_v: float): "
+                 f"AudioServer.set_bus_volume_db({bus_var}, _v), "
+                 f"{from_var}, {target}, {fade})")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("[GK] 找不到音频总线: " + {gd_string(bus)})')
+
+
+# ── 恐怖氛围套件(第五十九轮)────────────────────────────────────────
+@expr_node("GKNodeTension")
+def _expr_tension(ctx, node):
+    """『氛围_紧张度』:离『威胁』越近越高,输出 0~1。
+
+    ── 为什么是纯表达式、不做平滑 ──────────────────────────────────
+    表达式节点可能在**别的函数作用域**里被求值(见 animation.py 里
+    移动状态那次踩坑),所以不能生成中间变量。这里只算"当前瞬间"的
+    紧张度;需要平滑的『氛围_心跳』自己内部做。
+    """
+    from .expressions import ensure_position_helper
+    socket = ctx._socket(node, "威胁")
+    if socket is not None and getattr(socket, "is_linked", False):
+        threat = ctx.expr_of(socket)
+    else:
+        raw = str(getattr(node, "gk_threat", "") or "").strip()
+        if not raw or raw == TARGET_SELF:
+            ctx.warn("『氛围_紧张度』没有指定『威胁』—— 它永远返回 0"
+                     "(请在卡片里选一个『威胁』物体,或把引脚接上)")
+            return "0.0"
+        threat = ctx.target_expr(node, "gk_threat", hint="威胁")
+    reader = ensure_position_helper(ctx)
+    near = ctx.input_number(node, "近距", gd_number(getattr(node, "gk_near", 3.0)))
+    far = ctx.input_number(node, "远距", gd_number(getattr(node, "gk_far", 15.0)))
+    dist = f"({reader}({threat}) - {reader}(self)).length()"
+    return (f"clampf((({far}) - {dist}) / "
+            f"maxf(({far}) - ({near}), 0.0001), 0.0, 1.0)")
+
+
+@stmt_node("GKNodeHeartbeat")
+def _stmt_heartbeat(ctx, node, indent):
+    """『氛围_心跳』:紧张度驱动的心跳(越快越响,低于阈值停)。
+
+    ── 计时不用 delta 参数,用 get_physics_process_delta_time() ──────
+    本节点被接在『每当_物理帧』后面时确实有 delta,但用户也可能从
+    『每当_准备』/触发器里接一条 —— 那时没有 delta 参数。直接向引擎要
+    固定步长最省心,而且心跳本来就该按物理帧走。
+    """
+    path_raw = str(getattr(node, "gk_path", "") or "").strip()
+    if not path_raw:
+        ctx.warn("『氛围_心跳』没填『心跳音效』—— 它不会发出声音"
+                 "(可以先不填,等有素材了再补)")
+        return
+
+    player = ctx.declare_var("_gk_heart_player", "AudioStreamPlayer")
+    timer = ctx.declare_var("_gk_heart_timer", "float")
+    tense = ctx.declare_var("_gk_heart_tension", "float")
+
+    tension = ctx.input_number(node, "紧张度", gd_number(getattr(node, "gk_tension", 0.0)))
+    slow = ctx.input_number(node, "最慢间隔", gd_number(getattr(node, "gk_slow_interval", 1.1)))
+    fast = ctx.input_number(node, "最快间隔", gd_number(getattr(node, "gk_fast_interval", 0.35)))
+    quiet_db = ctx.input_number(node, "最轻音量", gd_number(getattr(node, "gk_quiet_db", -18.0)))
+    loud_db = ctx.input_number(node, "最响音量", gd_number(getattr(node, "gk_loud_db", -4.0)))
+    quiet = ctx.input_number(node, "安静阈值", gd_number(getattr(node, "gk_quiet", 0.15)))
+    smooth = ctx.input_number(node, "平滑秒数", gd_number(getattr(node, "gk_smooth", 1.5)))
+
+    dt = ctx.new_temp("hb_dt")
+    ctx.add_line(indent, f"var {dt} := get_physics_process_delta_time()")
+    # 平滑:朝目标紧张度靠拢(除以平滑时间;0 会被 maxf 兜住 = 不平滑)
+    ctx.add_line(indent, f"{tense} += ({tension} - {tense}) * "
+                         f"clampf({dt} / maxf({smooth}, 0.0001), 0.0, 1.0)")
+
+    # 播放器懒建一次(和『音效_播放』一个路数:运行时建,不要求先摆节点)
+    stream = ctx.new_temp("hb_stream")
+    ctx.add_line(indent, f"if {player} == null:")
+    ctx.add_line(indent + 1, f"var {stream}: AudioStream = load({gd_string(path_raw)}) as AudioStream")
+    ctx.add_line(indent + 1, f"if {stream} != null:")
+    ctx.add_line(indent + 2, f"{player} = AudioStreamPlayer.new()")
+    ctx.add_line(indent + 2, f"{player}.stream = {stream}")
+    ctx.add_line(indent + 2, f'{player}.bus = "Master"')
+    ctx.add_line(indent + 2, f"self.add_child({player})")
+
+    interval = ctx.new_temp("hb_iv")
+    ctx.add_line(indent, f"if {player} != null:")
+    ctx.add_line(indent + 1, f"if {tense} <= {quiet}:")
+    ctx.add_line(indent + 2, f"{player}.volume_db = -80.0")
+    ctx.add_line(indent + 2, f"{timer} = 0.0")
+    ctx.add_line(indent + 1, "else:")
+    ctx.add_line(indent + 2, f"{timer} += {dt}")
+    ctx.add_line(indent + 2, f"var {interval} := lerpf({slow}, {fast}, {tense})")
+    ctx.add_line(indent + 2, f"if {timer} >= {interval}:")
+    ctx.add_line(indent + 3, f"{timer} = 0.0")
+    ctx.add_line(indent + 3, f"{player}.volume_db = lerpf({quiet_db}, {loud_db}, {tense})")
+    ctx.add_line(indent + 3, f"{player}.play()")
+
+
+@stmt_node("GKNodeScare")
+def _stmt_scare(ctx, node, indent):
+    """『惊吓_事件』:相机震动 + 屏幕闪白 + 音效,三连一起上。
+
+    ── 为什么在 services.py 而不是 camera.py ──────────────────────
+    它同时用到"相机"(camera.py)、"屏幕"(本文件)、"音效"(本文件)——
+    放中间这个文件,只对相机那边做一次**函数级导入**,不会造成
+    两个模块互相 import。
+    """
+    from .camera import _install_camera_shake
+    # ① 相机震动(和『相机_震动』完全同一份实现,属性名一致)
+    _install_camera_shake(ctx, node, indent)
+
+    # ② 屏幕闪白
+    color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+    alpha = float(getattr(node, "gk_alpha", 0.5) or 0.5)
+    duration = gd_number(getattr(node, "gk_flash_time", 0.3))
+    rect_var = ctx.new_temp("scare_flash")
+    tween_var = ctx.new_temp("scare_tween")
+    ctx.add_line(indent, f"var {rect_var} := ColorRect.new()")
+    ctx.add_line(indent, f"{rect_var}.color = Color({gd_number(color[0])}, "
+                         f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                         f"{gd_number(alpha)})")
+    ctx.add_line(indent, f"{rect_var}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent, f"{rect_var}.set_anchors_preset(Control.PRESET_FULL_RECT)")
+    ctx.add_line(indent, f"{rect_var}.z_index = 100")
+    ctx.add_line(indent, f"add_child({rect_var})")
+    ctx.add_line(indent, f"var {tween_var} := create_tween()")
+    ctx.add_line(indent, f"{tween_var}.tween_property({rect_var}, \"color:a\", 0.0, {duration})")
+    ctx.add_line(indent, f"{tween_var}.tween_callback({rect_var}.queue_free)")
+
+    # ③ 音效(可留空 —— 只震 + 闪也成立)
+    socket = ctx._socket(node, "音效")
+    linked = socket is not None and getattr(socket, "is_linked", False)
+    path_raw = str(getattr(node, "gk_path", "") or "").strip()
+    if not linked and not path_raw:
+        return
+    path = ctx.expr_of(socket) if linked else gd_string(path_raw)
+    volume = _tunable_number(ctx, node, "音量",
+                             gd_number(getattr(node, "gk_volume", 0.0)), "scare_volume")
+    stream = ctx.new_temp("scare_stream")
+    player = ctx.new_temp("scare_sfx")
+    # 挂在**脚本所在节点**上(self)—— 惊吓音是"给你听的",不做 3D 定位,
+    # 用普通 AudioStreamPlayer 就够,也不受『相机』那个引用干扰。
+    ctx.add_line(indent, f"var {stream}: AudioStream = load({path}) as AudioStream")
+    ctx.add_line(indent, f"if {stream} != null:")
+    ctx.add_line(indent + 1, f"var {player} := AudioStreamPlayer.new()")
+    ctx.add_line(indent + 1, f"{player}.stream = {stream}")
+    ctx.add_line(indent + 1, f"{player}.volume_db = {volume}")
+    ctx.add_line(indent + 1, f"{player}.max_polyphony = 4")
+    ctx.add_line(indent + 1, f"self.add_child({player})")
+    ctx.add_line(indent + 1, f"{player}.play()")
+    ctx.add_line(indent + 1, f"{player}.finished.connect({player}.queue_free)")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'push_warning("找不到音频文件: " + str({path}))')
+
+
 # ==========================================================================
 # 存档
 # ==========================================================================
@@ -122,8 +298,8 @@ def _save_dict(ctx):
     return ctx.declare_var(_SAVE_DATA_VAR, "Dictionary")
 
 
-def _ensure_save_block(ctx, data, path, slot):
-    """保证存档字典在本代码块内已从磁盘载入一次。
+def _ensure_save_block(ctx, data, path, slot, indent=0):
+    """保证存档字典在本代码块内已从磁盘载入一次(**在本条语句之前**调)。
 
     ── 为什么不靠"谁先谁后"标记 ────────────────────────────────────
     最初用"显式载入时打个标记，后面的节点就别插守卫"的办法。
@@ -133,28 +309,26 @@ def _ensure_save_block(ctx, data, path, slot):
     改成直接扫描本函数已经生成的代码:只要里面已经有 `_gk_read_save(`，
     就说明这个函数已经读过盘了，不需要再插守卫。
     这跟顺序无关，也不会漏。
+
+    ── 第五十九轮修:缩进跟着**当前层**走 ──────────────────────────
+    老实现把守卫行**硬插进当前 section 的行列表**、缩进写死 4 个空格 ——
+    只在"语句正好在函数体第一层"时才对。一旦『存档_写入』出现在
+    `match` / `if` 里面(恐怖示例:"选了结局再存档"),插进去的那几行
+    比周围**浅**,Godot 直接
+        Parse Error: Expected statement, found "Indent" instead.
+    整个脚本编不过(而且只报这一句,很难联想到存档节点)。
+    现在改成"就地按 indent 吐",深到哪一层都对。
     """
     ctx.need_save_helpers = True
-    sink = getattr(ctx, "sink", None)
-    lines = getattr(sink, "lines", None)
-    if not isinstance(lines, list):
-        # 拿不到收集器时退化成"就地守卫一次"。仍然正确，只是啰嗦一点。
-        slot_expr = gd_string(slot)
-        ctx.add_line(0, f"{path} = _gk_save_file({slot_expr})")
-        ctx.add_line(0, f'if {path} == "":')
-        ctx.add_line(1, f"{path} = _gk_save_file({slot_expr})")
-        ctx.add_line(1, f"{data} = _gk_read_save({path})")
-        return
-
-    if any("_gk_read_save(" in text for text in lines):
+    lines = getattr(getattr(ctx, "sink", None), "lines", None)
+    if isinstance(lines, list) and any("_gk_read_save(" in text for text in lines):
         return
 
     slot_expr = gd_string(slot)
-    index = len(lines)
-    lines.insert(index, f"    {path} = _gk_save_file({slot_expr})")
-    lines.insert(index + 1, f'    if {path} == "":')
-    lines.insert(index + 2, f"        {path} = _gk_save_file({slot_expr})")
-    lines.insert(index + 3, f"        {data} = _gk_read_save({path})")
+    ctx.add_line(indent, f"{path} = _gk_save_file({slot_expr})")
+    ctx.add_line(indent, f'if {path} == "":')
+    ctx.add_line(indent + 1, f"{path} = _gk_save_file({slot_expr})")
+    ctx.add_line(indent + 1, f"{data} = _gk_read_save({path})")
 
 
 @stmt_node("GKNodeSaveSet")
@@ -168,8 +342,8 @@ def _stmt_save_set(ctx, node, indent):
         value = ctx.expr_of(socket)
     else:
         value = gd_literal(node.input_value(ctx, "值", 0))
+    _ensure_save_block(ctx, data, path, slot, indent)
     ctx.add_line(indent, f"{data}[{key}] = {value}")
-    _ensure_save_block(ctx, data, path, slot)
 
 
 @stmt_node("GKNodeSaveGet")
@@ -188,9 +362,9 @@ def _stmt_save_get(ctx, node, indent):
     # 有声明就用声明的,没声明仍然是 Variant。
     var_name = ctx.declare_var(getattr(node, "gk_var", "value"), None)
     default = gd_literal(node.input_value(ctx, "默认值", 0.0))
+    _ensure_save_block(ctx, data, path, slot, indent)
     ctx.add_line(indent, f"{var_name} = {data}.get({key}, {default})")
     ctx.read_vars.add(var_name)
-    _ensure_save_block(ctx, data, path, slot)
 
 
 @stmt_node("GKNodeSaveWrite")
@@ -198,9 +372,9 @@ def _stmt_save_write(ctx, node, indent):
     data = _save_dict(ctx)
     path = ctx.declare_var("_gk_save_path", "String")
     slot = getattr(node, "gk_slot", "save1")
+    _ensure_save_block(ctx, data, path, slot, indent)
     ctx.add_line(indent, f"{path} = _gk_save_file({gd_string(slot)})")
     ctx.add_line(indent, f"_gk_write_save({path}, {data})")
-    _ensure_save_block(ctx, data, path, slot)
 
 
 @stmt_node("GKNodeSaveLoad")
