@@ -87,6 +87,21 @@ Step "1b/6 示例完整性体检 (目录 / README / 重建 / 探针 / 门禁)"
     Select-String -Pattern "^(示例|demo_|✗|CHECK_EXAMPLES)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "示例完整性体检失败"; exit 1 }
 
+# ---------- 1b2. 节点手册是不是最新的 ----------
+# ── 为什么这条要进守则 ──────────────────────────────────────────────
+# README 里那张节点表原来是**手写**的,于是它一直是过期的:表头写"182 个"
+# 而实际已经 188,新加的节点一个都没进去。手写的清单**注定会漂**。
+# 现在节点手册从代码生成(`make_node_docs.py`),这条检查就是"改了节点但
+# 忘了重新生成手册"的看门狗 —— 报红时跑一次那个脚本即可。
+Step "1b2/6 节点手册新鲜度(docs\节点手册.md 是否与代码一致)"
+$docOut = & python (Join-Path $Root "scripts\make_node_docs.py") --check 2>&1 | Out-String
+$docOut -split "`n" | Where-Object { $_.Trim() -ne "" } |
+    ForEach-Object { Write-Host $_.TrimEnd() }
+if ($docOut -notmatch "CHECK_NODE_DOCS=OK") {
+    Write-Error "节点手册过期(跑一次 python scripts\make_node_docs.py)"
+    exit 1
+}
+
 # ---------- 1c. 着色器编译校验 ----------
 # ── 为什么接进门禁(第五十一轮真机抓到)──────────────────────────────
 # 『屏幕_滤镜』的着色器源码是**写在 Python 里的字符串**,不是 .gdshader
