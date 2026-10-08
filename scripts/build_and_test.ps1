@@ -531,6 +531,28 @@ if ($SkipGodot) {
         }
     }
 
+    # 5n. 打包发布(第五十二轮:补全流程最后一环)—— 真 Godot 跑一次
+    #     `--export-release`,断言磁盘上真的多出一个可执行文件。
+    #     ── 没装导出模板时**跳过、不判红** ──────────────────────────────
+    #     模板装没装是本机环境的事,和插件代码无关;装了模板的机器才会走到
+    #     真打包那一步,那一步才是这一层的判据。脚本自己会打印"跳过"。
+    Write-Output ""
+    $releaseChecker = Join-Path $Root "scripts\check_release.py"
+    if (-not (Test-Path $releaseChecker)) {
+        Write-Output "跳过打包发布:还没有 scripts\check_release.py"
+    } else {
+        $releaseOut = & python $releaseChecker --godot $Godot 2>&1 | Out-String
+        $releaseOut -split "`n" | Where-Object { $_ -match "^(RELEASE_|CHECK_RELEASE|跳过|✗)" } |
+            ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($releaseOut -match "CHECK_RELEASE=OK") {
+            $godotRan += "打包发布"
+        } elseif ($releaseOut -match "跳过") {
+            Write-Output "（打包发布跳过:本机没装 Godot 导出模板）"
+        } else {
+            $godotOk = $false
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

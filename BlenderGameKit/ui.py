@@ -5005,6 +5005,23 @@ def _draw_project_box(layout, context):
             box.label(text="运行前会自动保存并导出", icon="INFO")
         else:
             box.label(text="运行前不会自动导出(改完记得手动导)", icon="ERROR")
+
+        # ── 打包发布(补全流程最后一环:出可执行文件)──────────────────
+        # 以前这里到"运行游戏"为止 —— 要 exe 还得自己开 Godot 配导出预设、
+        # 装导出模板、再点一次导出。现在一个按钮走完:
+        # 导出工程 -> 生成预设(不覆盖已有的)-> godot --export-release。
+        row = box.row(align=True)
+        row.scale_y = 1.4
+        row.operator("gk.export_release", text="打包成可执行文件",
+                     icon="EXPORT")
+        released = ops.LAST_RELEASE.get("output", "")
+        if released:
+            row = box.row(align=True)
+            row.label(text=f"上次打包: {os.path.basename(released)}", icon="CHECKMARK")
+            row.operator("gk.open_release_folder", text="", icon="FILE_FOLDER")
+        else:
+            box.label(text="打出可直接运行的 exe(需装导出模板)", icon="INFO")
+
         row = box.row(align=True)
         row.operator("gk.relink_project", text="改位置", icon="FILE_FOLDER")
         row.operator("gk.reset_settings", text="重置", icon="LOOP_BACK")

@@ -63,6 +63,8 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 5. 开始画逻辑:按 **Shift+A** 添加节点(和 Blender 其他地方一样)
 6. 侧栏 **导出为 Godot 脚本** / **导出模型到 Godot**
 7. 想测试时点 **打开 Godot 编辑器**(或 **直接运行游戏**)
+8. 要发出去/给别人玩:点 **打包成可执行文件** —— 在 Blender 里一步出 `.exe`
+   (需要先在 Godot 里装一次**导出模板**:编辑器菜单『编辑器 → 管理导出模板 → 下载并安装』)
 
 > **节点怎么用?** 一句话:**金色线是骨架**。必须先放一个『事件』节点当入口
 > (比如「每当_准备」),再用金色『执行』线把后面要做的事串起来。灰色线只是传值。
@@ -130,6 +132,7 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 ├── curve_assets.py             曲线资产 -> curves/*.tres(运镜 / 时间轴)
 ├── sound_assets.py             音频资产 -> audio/(『资产_声音卡』挑的文件)
 ├── npr_preview.py              ★ Blender 端 NPR 预览材质(EEVEE 里调卡通参数)
+├── packaging.py                ★ 打包发布:生成导出预设 + 调 Godot `--export-release` 出可执行文件(纯标准库,离线可测)
 ├── project/                    ★ 一个 .blend 一个 Godot 项目
 │   ├── layout.py               路径解析 / 建骨架(art、scripts、scenes…)
 │   ├── godot.py                引擎定位与进程管理
@@ -174,7 +177,8 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 220 项冒烟 + 示例体检 + Godot 端到端十三层(-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 220 项冒烟 + 示例体检 + Godot 端到端十四层(-Deep 再加动画六层)
+├── check_release.py            ★ 打包发布自检:真 Godot 跑 `--export-release` 出可执行文件(没装导出模板则跳过)
 ├── verify_anim_system.ps1      ★ 动画系统六层验证(离线/真 Blender/示例/Godot 解析/**真跑 1.5 秒**/反例)
 ├── check_gdscript.ps1          ★ 把生成的 .gd 交给真 Godot 解析(带反例)
 ├── make_anim_example.py        ★ 生成动画状态机示例 .blend

@@ -12086,5 +12086,173 @@ class TestRound43Assets(Base):
             shutil.rmtree(folder, ignore_errors=True)
 
 
+class TestRound52Packaging(Base):
+    """打包发布(第五十二轮):一键把 Godot 工程打成可执行文件。
+
+    这是"3D 全流程"里**唯一断掉的一环**:以前导出到工程为止,出 exe 还得
+    自己开 Godot 配导出预设、装模板、点导出。这一轮把它接成一条龙。
+
+    这一层能离线测,是因为 `packaging` 刻意做成**纯标准库**(不 import bpy、
+    不动本插件其它模块)—— 所以"生成预设 / 拼命令 / 探模板"这些纯函数
+    直接喂真实文件就能验,不用起 Blender。
+    """
+
+    def test_preset_text_has_required_fields(self):
+        from BlenderGameKit import packaging
+        text = packaging.export_presets_text(
+            title="我的游戏", preset_name="Windows Desktop",
+            export_path="dist/我的游戏.exe")
+        # Godot 靠这几个键认"这个预设导出什么、怎么导"
+        self.assertIn("[preset.0]", text)
+        self.assertIn("[preset.0.options]", text)
+        self.assertIn('name="Windows Desktop"', text)
+        self.assertIn('platform="Windows Desktop"', text)
+        self.assertIn('export_path="dist/我的游戏.exe"', text)
+        # 单文件分发:资源打进 exe,免得用户漏拷同名的 .pck
+        self.assertIn("binary_format/embed_pck=true", text)
+        self.assertIn('application/product_name="我的游戏"', text)
+
+    def test_ensure_presets_never_overwrites(self):
+        """已有 export_presets.cfg 一律原样保留(最重要的那条约束)。"""
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_presets_")
+        try:
+            path, created = packaging.ensure_export_presets(
+                folder, title="g", export_path="dist/g.exe")
+            self.assertTrue(created)
+            self.assertTrue(os.path.isfile(path))
+            # 用户手工改一下(模拟他在 Godot 编辑器里配过)
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write('[preset.0]\nname="我改过的"\n')
+            again, created2 = packaging.ensure_export_presets(
+                folder, title="g", export_path="dist/g.exe")
+            self.assertFalse(created2)
+            self.assertEqual(again, path)
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertIn("我改过的", handle.read())   # 没被覆盖
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_read_preset_name_and_export_path(self):
+        """沿用用户已有预设的**名字和输出路径**,别硬塞默认值。"""
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_presets_read_")
+        try:
+            self.assertIsNone(packaging.read_preset_name(folder))
+            self.assertIsNone(packaging.read_export_path(folder))
+            with open(os.path.join(folder, packaging.EXPORT_PRESETS_NAME),
+                      "w", encoding="utf-8", newline="\n") as handle:
+                handle.write('[preset.0]\nname="我的预设"\n'
+                             'export_path="build/Game.exe"\n')
+            self.assertEqual(packaging.read_preset_name(folder), "我的预设")
+            self.assertEqual(packaging.read_export_path(folder),
+                             "build/Game.exe")
+            # 只有名字、没写路径(空串)也算"没配路径"
+            with open(os.path.join(folder, packaging.EXPORT_PRESETS_NAME),
+                      "w", encoding="utf-8", newline="\n") as handle:
+                handle.write('[preset.0]\nname="x"\nexport_path=""\n')
+            self.assertIsNone(packaging.read_export_path(folder))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_release_command_shape(self):
+        from BlenderGameKit import packaging
+        args = packaging.release_command(
+            r"D:\godot\godot.exe", r"D:\proj", "Windows Desktop",
+            r"D:\proj\dist\g.exe")
+        self.assertEqual(args[0], r"D:\godot\godot.exe")
+        self.assertIn("--headless", args)
+        self.assertEqual(args[args.index("--path") + 1], r"D:\proj")
+        self.assertEqual(args[args.index("--export-release") + 1],
+                         "Windows Desktop")
+        self.assertEqual(args[-1], r"D:\proj\dist\g.exe")
+
+    def test_output_path_and_rel(self):
+        from BlenderGameKit import packaging
+        out = packaging.default_output_path(r"D:\proj", "我的游戏")
+        self.assertTrue(out.endswith(os.path.join("dist", "我的游戏.exe")))
+        self.assertEqual(packaging.rel_output_path(r"D:\proj", out),
+                         "dist/我的游戏.exe")
+
+    def test_template_detection(self):
+        """模板探测:按版本号找目录、按"含 windows 且含 release"认文件。"""
+        from BlenderGameKit import packaging
+        root = tempfile.mkdtemp(prefix="gk_templates_")
+        try:
+            version_dir = os.path.join(root, "4.7.2.stable")
+            os.makedirs(version_dir, exist_ok=True)
+            with open(os.path.join(version_dir, "windows_release_x86_64.exe"),
+                      "wb") as handle:
+                handle.write(b"MZ")
+            with open(os.path.join(version_dir, "README.txt"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("模板说明")
+            # 前缀匹配:4.7 也要能找到 4.7.2.stable
+            self.assertEqual(
+                packaging.find_template_dir("4.7.2", root), version_dir)
+            self.assertEqual(
+                packaging.find_template_dir("4.7", root), version_dir)
+            self.assertIsNone(packaging.find_template_dir("4.9", root))
+            self.assertEqual(
+                packaging.windows_release_template(version_dir),
+                "windows_release_x86_64.exe")
+            with mock.patch.object(packaging, "export_templates_root",
+                                   return_value=root):
+                ready, found_dir, note = packaging.templates_status("4.7.2")
+                self.assertTrue(ready, note)
+                self.assertEqual(found_dir, version_dir)
+                # 版本对不上 -> 不认,并且说明里要写清"去哪儿装"
+                missing, _d, miss_note = packaging.templates_status("4.9")
+                self.assertFalse(missing)
+                self.assertIn("导出模板", miss_note)
+                self.assertIn("管理导出模板", miss_note)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_failure_hint_translates_template_error(self):
+        """Godot 那句英文 No export template 要翻成"去哪儿装"。"""
+        from BlenderGameKit import packaging
+        hint = packaging.failure_hint(
+            "ERROR: No export template found at: ...", "4.7.2")
+        self.assertIn("导出模板", hint)
+        self.assertIn("管理导出模板", hint)
+        # ── 中文界面的 Godot 打的是中文(真机实测)────────────────────
+        # 「在预期路径处未找到导出模板： ...\windows_release_x86_64.exe」
+        # 只认英文的话,中文用户看到的永远是一句没翻译的 Godot 原文。
+        zh_log = ("ERROR: Cannot export project with preset \"Windows Desktop\""
+                  " due to configuration errors:\n"
+                  "在预期路径处未找到导出模板：\n"
+                  "  C:/Users/x/AppData/Roaming/Godot/export_templates/"
+                  "4.7.2.stable/windows_release_x86_64.exe\n")
+        self.assertTrue(packaging.template_missing_in_log(zh_log))
+        self.assertTrue(packaging.template_missing_in_log(
+            "No export template found"))
+        self.assertFalse(packaging.template_missing_in_log("all good"))
+        zh_hint = packaging.failure_hint(zh_log, "4.7.2")
+        self.assertIn("管理导出模板", zh_hint)
+        # 找不到预设 -> 给"删掉重生成"的兜底
+        preset_hint = packaging.failure_hint(
+            'ERROR: Couldn\'t find preset "Windows Desktop"', "4.7.2")
+        self.assertIn("export_presets.cfg", preset_hint)
+        # 其它错误 -> 至少把 Godot 的原话带回去,别吞掉
+        other = packaging.failure_hint("ERROR: something else went wrong")
+        self.assertIn("something else", other)
+
+    def test_run_release_uses_returncode(self):
+        """退出码判成败:Godot 会打一些非致命的 ERROR 字样,不能拿它当判据。"""
+        from BlenderGameKit import packaging
+        ok_result = types.SimpleNamespace(returncode=0, stdout="ERROR: harmless",
+                                          stderr="")
+        with mock.patch("subprocess.run", return_value=ok_result):
+            ok, log = packaging.run_release("godot", "proj", "P", "out.exe")
+        self.assertTrue(ok, log)
+        bad_result = types.SimpleNamespace(returncode=1, stdout="",
+                                           stderr="No export template found")
+        with mock.patch("subprocess.run", return_value=bad_result):
+            ok2, log2 = packaging.run_release("godot", "proj", "P", "out.exe")
+        self.assertFalse(ok2)
+        self.assertIn("template", log2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

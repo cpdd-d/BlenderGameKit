@@ -17,20 +17,34 @@ from .windows import focus_godot_window, project_title, running_editors
 
 
 
-def _godot_version_string():
-    """给 project.godot 用的引擎版本串。取不到就用一个保守值。"""
-    executable = find_godot_executable()
+def godot_version(executable=None, context=None):
+    """读 Godot 的**完整**版本号(如 "4.7.2");读不到返回空串。
+
+    ── 为什么要完整版本 ──────────────────────────────────────────────
+    打包要用**导出模板**,而模板是按完整版本号分目录的
+    (`%APPDATA%\\Godot\\export_templates\\4.7.2.stable\\`)。只要到
+    "4.7" 的话就对不上目录名,会误报"没装模板"。
+    """
+    executable = executable or find_godot_executable(context)
     if not executable:
-        return "4.4"
+        return ""
     try:
         result = subprocess.run([executable, "--version"], capture_output=True,
                                 text=True, timeout=8)
         text = (result.stdout or "") + (result.stderr or "")
-        match = re.search(r"(\d+\.\d+)", text)
+        match = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
         if match:
             return match.group(1)
     except Exception:
         pass
+    return ""
+
+
+def _godot_version_string():
+    """给 project.godot 用的引擎版本串(主.次)。取不到就用一个保守值。"""
+    full = godot_version()
+    if full:
+        return ".".join(full.split(".")[:2])
     return "4.4"
 
 

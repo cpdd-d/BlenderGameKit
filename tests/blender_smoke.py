@@ -2302,9 +2302,70 @@ def main():
                     "gk.auto_link", "gk.pick_target", "gk.set_target",
                     "gk.tag_anim_category", "gk.pick_anim_name",
                     "gk.pick_anim_tree", "gk.anim_var_add", "gk.anim_var_remove",
-                    "gk.anim_var_make_node", "gk.anim_var_pick"):
+                    "gk.anim_var_make_node", "gk.anim_var_pick",
+                    # 打包发布(第五十二轮):一键出可执行文件 + 打开打包目录
+                    "gk.export_release", "gk.open_release_folder"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
+
+    # ---- 打包发布(第五十二轮):算子接线 + 绝不覆盖已有预设 ----
+    # 这一层只验"接线"(用假 Godot / 假模板 / 假打包),真打包由门禁 5n
+    # 那层用真 Godot 跑 —— 免得冒烟测试还要依赖本机装没装导出模板。
+    try:
+        packaging_mod = __import__(f"{module_name}.packaging",
+                                   fromlist=["EXPORT_PRESETS_NAME"])
+        ops_mod = __import__(f"{module_name}.operator_io",
+                             fromlist=["LAST_RELEASE"])
+        proj_mod = __import__(f"{module_name}.project",
+                              fromlist=["find_godot_executable"])
+        work = tempfile.mkdtemp(prefix="gk_smoke_package_")
+        proj_mod.create_project(work, title="打包冒烟")
+
+        saved = (proj_mod.find_godot_executable, proj_mod.godot_version,
+                 packaging_mod.templates_status, packaging_mod.run_release)
+        made = []
+
+        def fake_run(exe, directory, preset, output, timeout=600):
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            with open(output, "wb") as handle:
+                handle.write(b"MZ")
+            made.append(preset)
+            return True, ""
+
+        settings = bpy.context.scene.gk_settings
+        saved_dir = settings.project_dir
+        try:
+            proj_mod.find_godot_executable = lambda *a, **k: "godot-fake"
+            proj_mod.godot_version = lambda *a, **k: "4.7.2"
+            packaging_mod.templates_status = lambda v: (True, work, "ok")
+            packaging_mod.run_release = fake_run
+            settings.project_dir = work
+
+            # 先放一份"用户自己的"预设 -> 打包**绝不能**覆盖它
+            preset_file = os.path.join(work,
+                                       packaging_mod.EXPORT_PRESETS_NAME)
+            with open(preset_file, "w", encoding="utf-8", newline="\n") as h:
+                h.write('[preset.0]\nname="我的预设"\n'
+                        'export_path="build/x.exe"\n')
+
+            result = bpy.ops.gk.export_release(auto_export=False)
+            check("打包算子跑通", result == {"FINISHED"}, str(result))
+            with open(preset_file, "r", encoding="utf-8") as h:
+                preset_text = h.read()
+            check("打包不覆盖用户已有的预设", "我的预设" in preset_text,
+                  preset_text[:80])
+            check("打包沿用了用户的预设名", made == ["我的预设"], str(made))
+            out = ops_mod.LAST_RELEASE.get("output", "")
+            check("打包产物落在用户预设指定的位置",
+                  out.replace("\\", "/").endswith("build/x.exe"), out)
+        finally:
+            (proj_mod.find_godot_executable, proj_mod.godot_version,
+             packaging_mod.templates_status,
+             packaging_mod.run_release) = saved
+            settings.project_dir = saved_dir
+    except Exception as exc:
+        check("打包发布算子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
 
     # ---- UI 注册:用"面板能不能被 Blender 找到"来验证 ----
     try:

@@ -107,6 +107,9 @@ _SUBMODULES = (
     "codegen",
     # 导出物清单 / 旧文件清理(纯标准库,离线可测)
     "generated_files",
+    # 打包发布(生成导出预设 + 调 Godot --export-release,纯标准库、离线可测)
+    # 必须排在 operator_io 之前 —— 它 import 这个模块
+    "packaging",
     "exporter",
     "npr_preview",
     "asset_export",

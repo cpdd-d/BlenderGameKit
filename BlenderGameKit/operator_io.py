@@ -11,12 +11,15 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
 
 from . import (asset_export, codegen, curve_assets, export_report, exporter,
-               gk_log, npr_preview, project)
+               gk_log, npr_preview, packaging, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
 # 记录上一次导出结果，供面板与"打开结果"使用
 LAST_EXPORT = {}
+# 记录上一次**打包**出来的可执行文件路径,供面板显示 + 『打开打包目录』。
+# 只在内存里:打包是"刚才那一下"的动作,重开 Blender 后路径多半已经没意义了。
+LAST_RELEASE = {}
 # 最近用过的节点类型(bl_idname),最近的在最前面。
 # 蓝图里加节点是高频操作,菜单里给个"最近使用"能省不少翻分类的时间。
 RECENT_NODES = []
@@ -2258,7 +2261,7 @@ class GK_OT_TagAnimCategory(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     action_name: StringProperty(name="动作", default="")
-    # 用 EnumProperty 而不是字符串:面板上用 `operator_menu_enum` 把
+    # 用 EnumProperty 而不是字符串:面板上用 `operatormenu_enum` 把
     # 六个分类直接列成菜单,点一下就打上,不用弹对话框。
     category: EnumProperty(
         name="分类",
@@ -2610,7 +2613,7 @@ class GK_OT_OpenGodot(bpy.types.Operator):
         prefs = project.preferences(context)
         pref_on = bool(getattr(prefs, "auto_export_on_run", True)) if prefs else True
         if not self.editor and self.auto_export and pref_on:
-            self._auto_prepare(context, directory)
+            _auto_prepare(self, context, directory)
 
         # ── 启动前先说一句"要等几秒"(用户 2026-10-03:"打开的有点慢")────
         # 导出本身只要几毫秒(日志里有),慢的是 **Godot 引擎自己启动**
@@ -2630,57 +2633,192 @@ class GK_OT_OpenGodot(bpy.types.Operator):
         _report(self, "INFO", message)
         return {"FINISHED"}
 
-    def _auto_prepare(self, context, directory):
-        """保存 .blend 并导出脚本 + 模型。失败只警告,不阻止运行。
 
-        注意:这一步刻意**不抛异常打断流程** —— 用户点的是"运行",
-        因为导出出了点问题就不让跑会很恼人。警告写进日志就够了。
-        """
-        # 1) 保存 .blend —— 素材和节点图都在文件里,不保存的话导出的是旧内容
-        if bpy.data.filepath and bpy.data.is_dirty:
-            try:
-                bpy.ops.wm.save_mainfile()
-                _report(self, "INFO", "已自动保存 .blend")
-            except Exception as exc:
-                _report(self, "WARNING", f"自动保存失败(继续运行): {exc}")
+class GK_OT_ExportRelease(bpy.types.Operator):
+    """一键打包:导出工程 + 调 Godot 打出可执行文件(Windows .exe)。
 
-        # 2) 导出脚本(节点图)
-        tree = None
-        for group in bpy.data.node_groups:
-            if getattr(group, "bl_idname", "") == "GKGameLogicTree" and len(group.nodes):
-                tree = group
-                break
-        script_name = None
-        if tree is not None:
-            try:
-                settings = exporter.build_settings(context.scene)
-                settings["output_dir"] = directory
-                result = exporter.export_tree(tree, settings, write_scene=False)
-                remember_export(context.scene, result)
-                script_name = result["script_name"]
-                for warning in result["warnings"]:
-                    self.report({"WARNING"}, warning)
-            except Exception as exc:
-                _report(self, "WARNING", f"自动导出脚本失败(继续运行): {exc}")
+    ── 为什么要有这个按钮 ──────────────────────────────────────────────
+    插件以前导出到 Godot **工程**为止。要拿到"能双击运行的游戏",用户还得
+    开 Godot 编辑器、配导出预设、去装导出模板、再点一次导出 —— 四步。
+    这就是整个 3D 全流程里**唯一断掉的一环**。这个算子把它接成一条龙。
 
-        # 3) 导出场景 / 模型 / 材质(多场景时每个 Blender 场景各导一张 .tscn)
-        try:
-            outcome = asset_export.export_all_scenes(
-                directory,
-                dimension=exporter.build_settings(context.scene).get("dimension", "3"),
-                script_name=script_name,
-            )
-            if outcome.get("error"):
-                _report(self, "WARNING", f"自动导出模型失败: {outcome['error']}")
-            else:
-                for warning in outcome.get("warnings", []):
-                    _report(self, "WARNING", warning)
+    流程(和『直接运行游戏』尽量共用同一条路,减少"两处不一致"):
+      1. 保存 .blend 并把脚本 / 模型重新导出到 Godot 工程;
+      2. 检查导出模板(没装就直接给"去哪儿装"的人话,不再往下走);
+      3. 缺 export_presets.cfg 就生成一份(已有的一律不覆盖);
+      4. `godot --headless --path <项目> --export-release "<预设>" <产物>`。
+    """
+
+    bl_idname = "gk.export_release"
+    bl_label = "打包成可执行文件"
+    bl_description = ("导出工程并调用 Godot --export-release 打出可执行文件"
+                      "(需要先装好 Godot 导出模板)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    auto_export: BoolProperty(
+        name="打包前自动导出",
+        description=("打包之前自动保存 .blend 并导出脚本与模型,"
+                     "这样就不用手动先点一次导出"),
+        default=True,
+    )
+
+    def execute(self, context):
+        directory, ok = _resolve_project(self, context, create=False)
+        if not ok:
+            return {"CANCELLED"}
+
+        # 1) 先把最新内容导出到 Godot 工程(和"运行游戏"同一套)。
+        prefs = project.preferences(context)
+        pref_on = bool(getattr(prefs, "auto_export_on_run", True)) if prefs else True
+        if self.auto_export and pref_on:
+            _auto_prepare(self, context, directory)
+
+        # 2) 找 Godot
+        executable = project.find_godot_executable(context)
+        if not executable:
+            _report(self, "ERROR",
+                    "找不到 Godot。请在插件偏好设置里指定 godot.exe 的路径"
+                    "(侧栏『项目』->『自动查找 Godot』)")
+            return {"CANCELLED"}
+
+        # 3) 导出模板检查 —— 头号失败模式,提前拦下并给出装法
+        version = project.godot_version(executable, context)
+        if version:
+            ready, _template_dir, note = packaging.templates_status(version)
+            if not ready:
+                _report(self, "ERROR", note)
+                return {"CANCELLED"}
+        else:
+            _report(self, "WARNING",
+                    "读不到 Godot 版本号,跳过导出模板预检;"
+                    "如果下面打包失败,多半是模板没装")
+
+        # 4) 预设:优先沿用用户已有的(绝不覆盖),没有才生成一份
+        project_name = project.safe_project_name(
+            os.path.basename(directory.rstrip("\\/")))
+        preset_name = packaging.read_preset_name(directory)
+        output_path = None
+        if not preset_name:
+            preset_name = packaging.WINDOWS_PRESET_NAME
+            output_path = packaging.default_output_path(directory, project_name)
+            preset_path, created = packaging.ensure_export_presets(
+                directory, title=project_name, preset_name=preset_name,
+                export_path=packaging.rel_output_path(directory, output_path))
+            if created:
                 _report(self, "INFO",
-                        f"已自动导出:{outcome['materials']} 个材质、"
-                        f"{outcome['bodies']} 个碰撞体、"
-                        f"{outcome['cameras']} 个相机、{outcome['lights']} 盏灯")
+                        f"已生成导出预设(Windows Desktop): {preset_path}")
+        else:
+            # 用户预设里可能自带输出路径;有就用它,别把产物丢到他没预期的地方
+            configured = packaging.read_export_path(directory)
+            if configured:
+                output_path = configured if os.path.isabs(configured) \
+                    else os.path.join(directory, configured)
+        if not output_path:
+            output_path = packaging.default_output_path(directory, project_name)
+
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        except OSError as exc:
+            _report(self, "ERROR", f"创建打包输出目录失败: {exc}")
+            return {"CANCELLED"}
+
+        # 5) 真打包。这一步要等 Godot 起来(几秒到十几秒),先说一声。
+        _report(self, "INFO",
+                f"正在打包(预设『{preset_name}』,Godot 启动约 3~6 秒)...")
+        ok_run, log = packaging.run_release(executable, directory, preset_name,
+                                            output_path)
+        if not ok_run or not os.path.isfile(output_path):
+            hint = packaging.failure_hint(log, version)
+            _report(self, "ERROR", f"打包失败。\n{hint}")
+            return {"CANCELLED"}
+
+        LAST_RELEASE.clear()
+        LAST_RELEASE.update({"output": output_path, "directory": directory,
+                             "preset": preset_name})
+        _report(self, "INFO", f"打包完成: {output_path}")
+        return {"FINISHED"}
+
+
+class GK_OT_OpenReleaseFolder(bpy.types.Operator):
+    """在文件管理器里打开上一次打包产物的所在目录。"""
+
+    bl_idname = "gk.open_release_folder"
+    bl_label = "打开打包目录"
+    bl_description = "用系统文件管理器打开上次打出来的可执行文件所在的目录"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        output = LAST_RELEASE.get("output")
+        directory = os.path.dirname(output) if output else None
+        if not directory or not os.path.isdir(directory):
+            _report(self, "ERROR",
+                    "还没有打包产物。先在侧栏『项目』里点『打包成可执行文件』")
+            return {"CANCELLED"}
+        ok, message = project.open_folder(directory)
+        if not ok:
+            _report(self, "ERROR", message)
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+def _auto_prepare(operator, context, directory):
+    """保存 .blend 并导出脚本 + 模型。失败只警告,不阻止后续动作。
+    (参数名就叫 operator,避开了与 bpy.types.Operator 的混淆——这里收的
+     是**算子实例**,用它上报消息。)
+
+    注意:这一步刻意**不抛异常打断流程** —— 用户点的是"运行"/"打包",
+    因为导出出了点问题就不让跑(不让打包)会很恼人。警告写进日志就够了。
+
+    ── 为什么抽成模块级函数 ────────────────────────────────────────
+    『直接运行游戏』和『打包成可执行文件』都要这一步,逻辑必须**完全一致**
+    (以前只有前者用,后者接进来时把它提出来共用,免得两处各写一份、改一处
+    漏一处)。
+    """
+    # 1) 保存 .blend —— 素材和节点图都在文件里,不保存的话导出的是旧内容
+    if bpy.data.filepath and bpy.data.is_dirty:
+        try:
+            bpy.ops.wm.save_mainfile()
+            _report(operator, "INFO", "已自动保存 .blend")
         except Exception as exc:
-            _report(self, "WARNING", f"自动导出模型失败(继续运行): {exc}")
+            _report(operator, "WARNING", f"自动保存失败(继续): {exc}")
+
+    # 2) 导出脚本(节点图)
+    tree = None
+    for group in bpy.data.node_groups:
+        if getattr(group, "bl_idname", "") == "GKGameLogicTree" and len(group.nodes):
+            tree = group
+            break
+    script_name = None
+    if tree is not None:
+        try:
+            settings = exporter.build_settings(context.scene)
+            settings["output_dir"] = directory
+            result = exporter.export_tree(tree, settings, write_scene=False)
+            remember_export(context.scene, result)
+            script_name = result["script_name"]
+            for warning in result["warnings"]:
+                operator.report({"WARNING"}, warning)
+        except Exception as exc:
+            _report(operator, "WARNING", f"自动导出脚本失败(继续): {exc}")
+
+    # 3) 导出场景 / 模型 / 材质(多场景时每个 Blender 场景各导一张 .tscn)
+    try:
+        outcome = asset_export.export_all_scenes(
+            directory,
+            dimension=exporter.build_settings(context.scene).get("dimension", "3"),
+            script_name=script_name,
+        )
+        if outcome.get("error"):
+            _report(operator, "WARNING", f"自动导出模型失败: {outcome['error']}")
+        else:
+            for warning in outcome.get("warnings", []):
+                _report(operator, "WARNING", warning)
+            _report(operator, "INFO",
+                    f"已自动导出:{outcome['materials']} 个材质、"
+                    f"{outcome['bodies']} 个碰撞体、"
+                    f"{outcome['cameras']} 个相机、{outcome['lights']} 盏灯")
+    except Exception as exc:
+        _report(operator, "WARNING", f"自动导出模型失败(继续): {exc}")
 
 
 class GK_OT_RelinkProject(bpy.types.Operator):
@@ -2872,6 +3010,9 @@ GK_CLASSES = (
     # 项目管理(一个 .blend 对应一个 Godot 项目)
     GK_OT_CreateProject,
     GK_OT_OpenGodot,
+    # 打包发布:一键把工程打成可执行文件(补全流程最后断掉的一环)
+    GK_OT_ExportRelease,
+    GK_OT_OpenReleaseFolder,
     GK_OT_RelinkProject,
     GK_OT_DetectGodot,
     GK_OT_Export,
