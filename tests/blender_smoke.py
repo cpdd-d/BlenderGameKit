@@ -2332,6 +2332,97 @@ def main():
         check("动画树变量链路", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 音频与叙事(第六十四轮):字幕 / 打字机音效 / 对话历史 ----
+    # 这一批是界面 + 音频的东西,冒烟查"接线对不对"(节点注册 / 生成物里
+    # 那几条关键链在不在 / 卡片画不画得完);**行为**由界面示例的探针在真
+    # Godot 里查(字幕不阻塞、历史面板能开、打字音播放器真的被建出来)。
+    try:
+        r64_tree = bpy.data.node_groups.new("叙事冒烟64", "GKGameLogicTree")
+        r64_ready = r64_tree.nodes.new("GKNodeOnReady")
+        r64_dialog = r64_tree.nodes.new("GKNodeUiDialog")
+        r64_dialog.gk_speaker = "向导"
+        r64_dialog.gk_text = "你好"
+        r64_dialog.gk_type_sound = "res://audio/type.wav"
+        r64_dialog.gk_type_every = 2
+        r64_sub = r64_tree.nodes.new("GKNodeUiSubtitle")
+        r64_sub.gk_text = "脚步声……"
+        r64_sub.gk_type_sound = "res://audio/type.wav"
+        r64_hist = r64_tree.nodes.new("GKNodeDialogHistory")
+        r64_tree.links.new(r64_ready.outputs["执行"], r64_dialog.inputs["执行"])
+        r64_tree.links.new(r64_dialog.outputs["完成"], r64_sub.inputs["执行"])
+        r64_tree.links.new(r64_sub.outputs["完成"], r64_hist.inputs["执行"])
+        r64_code, r64_warn = codegen.generate(
+            r64_tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("叙事:字幕 / 历史节点都建出来了(已注册)",
+              r64_sub.bl_idname == "GKNodeUiSubtitle"
+              and r64_hist.bl_idname == "GKNodeDialogHistory")
+        check("叙事:字幕 / 打字音 / 历史三条链都出了码",
+              "_gk_subtitle_show(self, " in r64_code
+              and '_gk_dialog_blip = "res://audio/type.wav"' in r64_code
+              and "func _gk_play_blip(" in r64_code
+              and "func _gk_history_show(" in r64_code
+              and "_gk_dialog_history.append(" in r64_code,
+              r64_code[-400:])
+        check("叙事:UI 根容器变量声明了(只用到对话框的图也能编译)",
+              "var _gk_ui_layer: CanvasLayer" in r64_code
+              and "var _gk_ui_root: Control" in r64_code)
+        check("叙事:生成无告警", not r64_warn, str(r64_warn)[:300])
+
+        class _R64Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r64_draw_ok = True
+        r64_draw_error = ""
+        for card in (r64_dialog, r64_sub, r64_hist):
+            try:
+                card.draw_buttons(bpy.context, _R64Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r64_draw_ok = False
+                r64_draw_error = (f"{card.bl_label}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("叙事:三张节点卡片能画完", r64_draw_ok, r64_draw_error)
+
+        bpy.data.node_groups.remove(r64_tree)
+
+        # ---- 音频:BGM 循环 / 总线(第六十四轮)----
+        r64b_tree = bpy.data.node_groups.new("音频冒烟64", "GKGameLogicTree")
+        r64b_ready = r64b_tree.nodes.new("GKNodeOnReady")
+        r64b_music = r64b_tree.nodes.new("GKNodePlayMusic")
+        r64b_music.gk_path = "res://audio/bgm.ogg"
+        r64b_music.gk_loop = True
+        r64b_music.gk_bus = "Music"
+        r64b_tree.links.new(r64b_ready.outputs["执行"], r64b_music.inputs["执行"])
+        r64b_code, r64b_warn = codegen.generate(
+            r64b_tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        # 循环要按流类型分别设(Ogg/MP3 是 .loop,wav 是 loop_mode)——
+        # 只设一种的话换个格式就"播一遍就没了",而且不报错
+        check("音频:BGM 按流类型设循环 + 总线可配",
+              "AudioStreamWAV.LOOP_FORWARD" in r64b_code
+              and "AudioStreamOggVorbis" in r64b_code
+              and '.bus = "Music"' in r64b_code,
+              r64b_code[-300:])
+        check("音频:BGM 生成无告警", not r64b_warn, str(r64b_warn)[:200])
+        r64b_draw_ok = True
+        r64b_draw_error = ""
+        try:
+            r64b_music.draw_buttons(bpy.context, _R64Layout())
+        except Exception as exc:                          # noqa: BLE001
+            r64b_draw_ok = False
+            r64b_draw_error = f"{type(exc).__name__}: {exc}"
+        check("音频:音乐卡片能画完(循环 / 总线两栏)", r64b_draw_ok,
+              r64b_draw_error)
+        bpy.data.node_groups.remove(r64b_tree)
+    except Exception as exc:
+        check("音频与叙事", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 算子注册 ----
     for op_name in ("gk.export_script", "gk.preview_script", "gk.add_node",
                     "gk.auto_link", "gk.pick_target", "gk.set_target",
@@ -2946,7 +3037,12 @@ def main():
         for obj in list(bpy.context.scene.objects):
             obj.select_set(obj is hero)
         bpy.context.view_layer.objects.active = hero
-        result = bpy.ops.gk.character_preset(with_god_camera=False)
+        # 先把场景的『上帝摄像机』关掉 —— 预设**不许**去动它(第六十五轮:
+        # 用户说"预设里不需要加入调试用的上帝机")
+        settings = getattr(bpy.context.scene, "gk_settings", None)
+        if settings is not None and hasattr(settings, "god_camera"):
+            settings.god_camera = False
+        result = bpy.ops.gk.character_preset()
         logic = bpy.data.node_groups.get("角色逻辑(预设)")
         anim = bpy.data.node_groups.get("角色动作(预设)")
         check("预设:算子跑通并建出两张图",
@@ -2965,6 +3061,27 @@ def main():
         check("预设:角色被配成『脚本挂载目标』",
               bool(getattr(getattr(hero, "gk_physics", None),
                            "script_target", False)))
+        # ---- 第六十五轮:对话框里不该有"调试用的上帝机 / 测试用的机位"----
+        # 用户原话:"预设里不需要加入调试用的上帝机的,还有摄像机的视角只是
+        # 测试这个功能的,不需要添加预设,预设有的是输入,视角选择,视角缩放"。
+        # ⚠ 走 **RNA**(`get_rna_type()`)而不是翻 `Operator.__subclasses__()`:
+        #   后者可能翻到同一进程里留下的**旧类副本**(实测:插件在本次运行里
+        #   被加载过两次时,按名字找会拿到旧那一份,断言就红了 —— 而按钮实际
+        #   调的是 RNA 上这份)。RNA 才是用户点下去真正生效的那个。
+        try:
+            preset_props = set(
+                bpy.ops.gk.character_preset.get_rna_type().properties.keys())
+        except Exception as exc:                          # noqa: BLE001
+            preset_props = set()
+            check("预设:算子 RNA 读得到", False, f"{type(exc).__name__}: {exc}")
+        check("预设:对话框里没有机位名 / 上帝机这几栏",
+              "camera_side" not in preset_props
+              and "camera_top" not in preset_props
+              and "with_god_camera" not in preset_props
+              and "move_speed" in preset_props,
+              str(sorted(preset_props)))
+        check("预设:没有顺手打开场景的『上帝摄像机』",
+              settings is None or not bool(getattr(settings, "god_camera", False)))
     except Exception as exc:
         check("预设", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()

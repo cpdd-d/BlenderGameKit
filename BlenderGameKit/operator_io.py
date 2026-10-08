@@ -682,10 +682,13 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
     character: StringProperty(
         name="角色物体", default="",
         description="留空 = 用当前选中的网格 / 已经挂了脚本的物体")
-    camera_side: StringProperty(name="跟随机位名", default="侧视机位",
-                                description="第三人称跟随机位(弹簧臂的主人)")
-    camera_top: StringProperty(name="俯瞰机位名", default="俯瞰机位",
-                               description="按 C 切过去的俯瞰机位")
+    # ── 机位名 / 上帝机**不在对话框里**(用户 2026-10-08 第六十五轮)──────
+    # 用户原话:"预设里不需要加入调试用的上帝机的,还有摄像机的视角只是
+    # 测试这个功能的,不需要添加预设,预设有的是输入,视角选择,视角缩放,
+    # 就这些。"
+    # 所以机位名用**约定值**(侧视机位 / 俯瞰机位)—— 生成出来的两张弹簧臂
+    # 和『相机_切换』按这两个名字找相机,场景里摆好同名的就行(文档里一直
+    # 是这么写的);而"顺手打开上帝机"是**调试开关**,预设不再去动它。
     move_speed: FloatProperty(name="移动速度(米/秒)", default=6.0,
                               min=0.1, max=50.0)
     jump_force: FloatProperty(name="跳跃强度", default=7.0, min=0.1, max=50.0)
@@ -699,8 +702,6 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
                                  default=True)
     with_ports: BoolProperty(name="对外端口(位置 X/Y/Z + 在地面)",
                              default=True)
-    with_god_camera: BoolProperty(name="打开场景的『上帝摄像机』开关",
-                                  default=True)
 
     def invoke(self, context, event):
         # 参数都摆在一个小对话框里 —— 一次性动作,不占侧栏
@@ -709,10 +710,6 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "character")
-        box = layout.box()
-        box.label(text="机位(自己摆好,名字对上就行)", icon="CAMERA_DATA")
-        box.prop(self, "camera_side")
-        box.prop(self, "camera_top")
         box = layout.box()
         box.label(text="手感", icon="DRIVER")
         box.prop(self, "move_speed")
@@ -725,7 +722,8 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
         box.label(text="带什么", icon="CHECKBOX_HLT")
         box.prop(self, "with_animation")
         box.prop(self, "with_ports")
-        box.prop(self, "with_god_camera")
+        layout.label(text="相机自己摆:名字叫『侧视机位』/『俯瞰机位』",
+                     icon="CAMERA_DATA")
 
     def execute(self, context):
         from . import presets
@@ -745,21 +743,23 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
             logic_tree, _anim_tree, notes = presets.create_character_preset(
                 scene,
                 character=self.character or None,
-                camera_side=self.camera_side, camera_top=self.camera_top,
+                # 机位名 / 上帝机不在对话框里(见上面那段说明):机位用约定值,
+                # 上帝机是调试开关 —— **预设不去动它**(用户明确要求)。
+                camera_side="侧视机位", camera_top="俯瞰机位",
                 move_speed=self.move_speed, jump_force=self.jump_force,
                 sensitivity=self.sensitivity, arm_length=self.arm_length,
                 arm_height=self.arm_height, aim_pitch=self.aim_pitch,
                 with_animation=self.with_animation,
                 with_ports=self.with_ports,
-                with_god_camera=self.with_god_camera)
+                with_god_camera=False)
         except Exception as exc:                          # noqa: BLE001
             _report(self, "ERROR", f"生成失败:{type(exc).__name__}: {exc}")
             return {"CANCELLED"}
         for note in notes:
             print(f"[BlenderGameKit] {note}")
         _report(self, "INFO",
-                f"预设已生成『{logic_tree.name}』—— 相机名对不上时在 "
-                f"『弹簧臂 / 相机_切换』节点里改一下即可")
+                f"预设已生成『{logic_tree.name}』—— 相机自己摆,"
+                f"名字叫『侧视机位』/『俯瞰机位』就行")
         # 顺手切到新那张图,让用户立刻看到成果(没有节点编辑器就算了)
         try:
             bpy.ops.gk.focus_tree(tree_name=logic_tree.name)

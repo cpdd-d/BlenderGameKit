@@ -200,6 +200,11 @@ class GenContext:
         self.need_pause_helpers = False
         # 对话框:生成 _gk_dialog_* 那组辅助函数 + 往 _input 里挂点按采集
         self.need_dialog_helpers = False
+        # 字幕(第六十四轮):生成 `_gk_subtitle_show()`(复用对话框面板,
+        # 但**不阻塞** —— 飘一行字,过几秒自己消失)
+        self.need_subtitle_helpers = False
+        # 对话历史回顾(第六十四轮):生成 `_gk_history_show/_hide()`
+        self.need_history_helpers = False
         # 对话选择(第四十九轮:阶段③『对话_选择』分支):
         # 生成 _gk_choice_* 那组辅助函数(和对话框共用 UI 容器,不冲突)
         self.need_choice_helpers = False

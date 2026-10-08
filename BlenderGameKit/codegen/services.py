@@ -65,11 +65,27 @@ def _stmt_play_music(ctx, node, indent):
     path = ctx.input_string(node, "音频路径", "")
     volume = gd_number(getattr(node, "gk_volume", -6.0))
     fade = gd_number(getattr(node, "gk_fade", 0.5))
+    loop = bool(getattr(node, "gk_loop", True))
+    bus = str(getattr(node, "gk_bus", "Master") or "Master").strip() or "Master"
 
     music_var = ctx.declare_var("_gk_music", "AudioStreamPlayer")
     stream_var = ctx.new_temp("bgm_stream")
 
     ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
+    if loop:
+        # ── 循环要**按流类型**分别设(第六十四轮)────────────────────
+        # Godot 没有一个统一点:Ogg / MP3 是 `.loop`,`wav` 是 `loop_mode`。
+        # 只设一种的话换个格式就"播一遍就没了",而且不报错 —— 很难查。
+        # (素材导入时的 loop 勾选也会被这里覆盖:节点上的『循环』才是准的)
+        ctx.add_line(indent, f"if {stream_var} is AudioStreamOggVorbis:")
+        ctx.add_line(indent + 1,
+                     f"({stream_var} as AudioStreamOggVorbis).loop = true")
+        ctx.add_line(indent, f"elif {stream_var} is AudioStreamMP3:")
+        ctx.add_line(indent + 1, f"({stream_var} as AudioStreamMP3).loop = true")
+        ctx.add_line(indent, f"elif {stream_var} is AudioStreamWAV:")
+        ctx.add_line(indent + 1,
+                     f"({stream_var} as AudioStreamWAV).loop_mode = "
+                     f"AudioStreamWAV.LOOP_FORWARD")
     ctx.add_line(indent, f"if {stream_var} != null:")
     # 重复播放同一首时不要打断(主菜单返回游戏很常见)
     ctx.add_line(indent + 1, f"if {music_var} != null and {music_var}.stream == {stream_var} and {music_var}.playing:")
@@ -79,7 +95,7 @@ def _stmt_play_music(ctx, node, indent):
     ctx.add_line(indent + 3, f"{music_var}.queue_free()")
     ctx.add_line(indent + 2, f"{music_var} = AudioStreamPlayer.new()")
     ctx.add_line(indent + 2, f"{music_var}.stream = {stream_var}")
-    ctx.add_line(indent + 2, f"{music_var}.bus = \"Master\"")
+    ctx.add_line(indent + 2, f"{music_var}.bus = {gd_string(bus)}")
     ctx.add_line(indent + 2, f"self.add_child({music_var})")
     ctx.add_line(indent + 2, f"{music_var}.play()")
     if float(getattr(node, "gk_fade", 0.5) or 0.0) > 0.0:
@@ -995,6 +1011,82 @@ def _stmt_ui_pause(ctx, node, indent):
     ctx.add_line(indent, f"_gk_apply_pause({action}, {gd_string(menu)}, {mouse_literal})")
 
 
+# ── 对话框 / 字幕 / 历史 三者共用的运行时变量(第六十四轮)────────────
+# 打字音(逐字显示时每隔几个字响一下)和对话历史都挂在这一组变量上。
+# 只在**用到对话框那一族**的图里声明 —— 别的图一个字都不多。
+_DIALOG_RUNTIME_VARS = (
+    # ── UI 根容器(第六十四轮补)───────────────────────────────────
+    # `_gk_ensure_ui()` 用的是这两个,但它们原来**只有**界面控件节点
+    # (`_ui_root()`)才声明 —— 于是"一张图里只有对话框 / 字幕"的脚本会
+    # 生成 `_gk_ui_layer` 却没声明,Godot 直接
+    #     Parse Error: Identifier "_gk_ui_layer" not declared
+    # **整个脚本加载不了**(真 Godot --check-only 跑出来的;离线测试当时
+    # 全绿,因为它们不看"变量声明和引用配没配上")。
+    ("_gk_ui_layer", "CanvasLayer", None),
+    ("_gk_ui_root", "Control", None),
+    # 面板 / 说话人 / 正文 / 立绘 / 逐字 tween / "点过了吗"
+    ("_gk_dialog_panel", "Panel", None),
+    ("_gk_dialog_name", "Label", None),
+    ("_gk_dialog_text", "Label", None),
+    ("_gk_dialog_portrait", "TextureRect", None),
+    ("_gk_dialog_tween", "Tween", None),
+    ("_gk_dialog_clicked", "bool", "false"),
+    # 打字音:当前这一句用什么音、每几个字响一次、多大声、已经响到第几次
+    ("_gk_dialog_blip", "String", None),
+    ("_gk_dialog_blip_every", "int", "2"),
+    ("_gk_dialog_blip_db", "float", "-6.0"),
+    ("_gk_dialog_blip_step", "int", "0"),
+    # 打字音播放器(**复用同一个**):每个字都新建一个 AudioStreamPlayer
+    # 会瞬间堆出几十个节点(实测会卡)。缓存的 path 用来判断要不要重新 load。
+    ("_gk_blip_player", "AudioStreamPlayer", None),
+    ("_gk_blip_cache", "String", None),
+    # 对话历史:[[说话人, 正文], …],上限 200 句(见 _gk_dialog_show)
+    ("_gk_dialog_history", "Array", "[]"),
+    # 字幕的"第几代":新字幕/新对话框一出现就 +1,老字幕的定时器看到
+    # 代数变了就不再关面板(否则老定时器会把新对话框关掉)
+    ("_gk_sub_token", "int", "0"),
+    # 回顾面板
+    ("_gk_history_panel", "Panel", None),
+    ("_gk_history_title", "Label", None),
+    ("_gk_history_scroll", "ScrollContainer", None),
+    ("_gk_history_list", "VBoxContainer", None),
+    ("_gk_history_clicked", "bool", "false"),
+)
+
+
+def _declare_dialog_runtime(ctx):
+    """登记对话框那一族的运行时变量(幂等,谁先走到谁登记)。
+
+    ⚠ 必须在**节点遍历阶段**登记:成员变量块是在遍历**之后**才写出去的,
+    辅助函数阶段再 declare 就晚了(和 `_gk_dialog_panel` 同一个坑)。
+    """
+    for name, gd_type, initial in _DIALOG_RUNTIME_VARS:
+        if initial is None:
+            ctx.declare_var(name, gd_type)
+        else:
+            ctx.declare_var(name, gd_type, initial=initial)
+
+
+def _emit_blip_setup(ctx, node, indent):
+    """把这张卡上的『打字音』写进运行时变量。
+
+    ── 为什么走成员变量,而不是给 `_gk_dialog_show()` 加参数 ──────────
+    加参数就得改那个 helper 的签名(用得越多改得越多)。成员变量这条路
+    只在**语句**里多三行,helper 一行不动。
+
+    ── 为什么"没填"也要写三行 ──────────────────────────────────────
+    上一张卡设过打字音之后,这张卡不写就等于**继承了别人的音效** ——
+    "这张卡上没有打字音,结果它响了"是很难查的。所以每次显式写一遍
+    (没填就是空字符串 = 不响)。
+    """
+    sound = str(getattr(node, "gk_type_sound", "") or "").strip()
+    every = int(getattr(node, "gk_type_every", 2) or 2)
+    volume = float(getattr(node, "gk_type_volume", -6.0) or 0.0)
+    ctx.add_line(indent, f"_gk_dialog_blip = {gd_string(sound)}")
+    ctx.add_line(indent, f"_gk_dialog_blip_every = {max(1, min(20, every))}")
+    ctx.add_line(indent, f"_gk_dialog_blip_db = {gd_number(volume)}")
+
+
 @stmt_node("GKNodeUiDialog")
 def _stmt_ui_dialog(ctx, node, indent):
     """对话框:显示 + 逐字 + 等"点一下 / 按一下"。
@@ -1017,12 +1109,10 @@ def _stmt_ui_dialog(ctx, node, indent):
     # ── 成员变量 + 点按采集(在**节点遍历阶段**登记)──────────────────
     # `_input(event)` 的派发表在 generator 里是**早于辅助函数**拼的,
     # 辅助函数阶段再登记就晚了(派发行里不会出现这个函数名)。
-    ctx.declare_var("_gk_dialog_panel", "Panel")
-    ctx.declare_var("_gk_dialog_name", "Label")
-    ctx.declare_var("_gk_dialog_text", "Label")
-    ctx.declare_var("_gk_dialog_portrait", "TextureRect")
-    ctx.declare_var("_gk_dialog_tween", "Tween")
-    ctx.declare_var("_gk_dialog_clicked", "bool", initial="false")
+    # 面板 / 说话人 / 正文 / 打字音 / 对话历史这一整组都在这里面
+    # (第六十四轮统一到 _declare_dialog_runtime —— 字幕、历史也要用其中几个,
+    #  分开声明会漏,漏了就是"变量没声明"的 Parse Error)。
+    _declare_dialog_runtime(ctx)
     ctx.register_input_handler(
         "gk_dialog_input_event", reset=False, body=[
             "    if _gk_dialog_panel == null or not _gk_dialog_panel.visible:",
@@ -1042,6 +1132,7 @@ def _stmt_ui_dialog(ctx, node, indent):
     height = gd_number(getattr(node, "gk_height", 150.0))
     margin = gd_number(getattr(node, "gk_margin", 48.0))
 
+    _emit_blip_setup(ctx, node, indent)
     ctx.add_line(indent, f"_gk_dialog_show(self, {speaker}, str({text}), "
                          f"{speed}, {portrait}, {width}, {height}, {margin})")
     ctx.add_line(indent, "while not _gk_dialog_clicked:")
@@ -1053,6 +1144,73 @@ def _stmt_ui_dialog(ctx, node, indent):
     ctx.add_line(indent + 1, "while not _gk_dialog_clicked:")
     ctx.add_line(indent + 2, "await get_tree().process_frame")
     ctx.add_line(indent, "_gk_dialog_hide()")
+
+
+@stmt_node("GKNodeUiSubtitle")
+def _stmt_ui_subtitle(ctx, node, indent):
+    """『界面_字幕』:飘一行字,**不阻塞**,过几秒自己消失(第六十四轮)。
+
+    ── 和对话框唯一的分工 ──────────────────────────────────────────
+    对话框 `await` 到玩家点一下;字幕**不等** —— 生成完就往下走,
+    所以"一边播运镜一边出旁白"才写得出来(运镜节点和字幕在同一个
+    执行链上,字幕不挡住它)。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_dialog_helpers = True      # 复用对话框那套面板 / 逐字 helper
+    ctx.need_subtitle_helpers = True
+    _declare_dialog_runtime(ctx)
+    _emit_blip_setup(ctx, node, indent)
+
+    speaker = gd_string(str(getattr(node, "gk_speaker", "") or ""))
+    fallback = str(getattr(node, "gk_text", "") or "")
+    text = ctx.input_string(node, "文字", fallback)
+    speed = gd_number(float(getattr(node, "gk_speed", 30.0) or 0.0))
+    seconds = gd_number(float(getattr(node, "gk_seconds", 3.0) or 0.0))
+    fade = gd_number(float(getattr(node, "gk_fade", 0.3) or 0.0))
+    width = gd_number(getattr(node, "gk_width", 720.0))
+    height = gd_number(getattr(node, "gk_height", 110.0))
+    margin = gd_number(getattr(node, "gk_margin", 48.0))
+
+    ctx.add_line(indent, f"_gk_subtitle_show(self, {speaker}, str({text}), "
+                         f"{speed}, {seconds}, {fade}, {width}, {height}, "
+                         f"{margin})")
+
+
+@stmt_node("GKNodeDialogHistory")
+def _stmt_dialog_history(ctx, node, indent):
+    """『对话_历史』:翻出一块可滚动的回顾面板,等玩家看完再继续。
+
+    历史本身是**自动**攒的(『界面_对话框』『界面_字幕』每显示一句就记
+    一条,见 `_gk_dialog_show`),这个节点只负责"打开面板给人看"。
+    """
+    ctx.need_ui_helpers = True
+    # 只生成历史面板那一套 —— 对话框的 helper 这个图可能根本不用
+    # (历史的运行时变量另外由 _declare_dialog_runtime 补上)
+    ctx.need_history_helpers = True
+    _declare_dialog_runtime(ctx)
+    # 点按采集要在**节点遍历阶段**登记(见 _stmt_ui_dialog 的说明:
+    # `_input` 的派发行比辅助函数先拼好)
+    ctx.register_input_handler("gk_history_input_event", reset=False, body=[
+        "    if _gk_history_panel == null or not _gk_history_panel.visible:",
+        "        return",
+        "    if event is InputEventMouseButton and event.pressed "
+        "and event.button_index == MOUSE_BUTTON_LEFT:",
+        "        _gk_history_clicked = true",
+        "    elif event is InputEventKey and event.pressed and not event.echo:",
+        "        _gk_history_clicked = true",
+    ])
+
+    title = gd_string(str(getattr(node, "gk_title", "对话回顾") or ""))
+    empty = gd_string(str(getattr(node, "gk_empty", "还没有说过话") or ""))
+    font = int(getattr(node, "gk_font", 18) or 18)
+    width = gd_number(getattr(node, "gk_width", 720.0))
+    height = gd_number(getattr(node, "gk_height", 380.0))
+
+    ctx.add_line(indent, f"_gk_history_show(self, {title}, {width}, {height}, "
+                         f"{max(8, min(48, font))}, {empty})")
+    ctx.add_line(indent, "while not _gk_history_clicked:")
+    ctx.add_line(indent + 1, "await get_tree().process_frame")
+    ctx.add_line(indent, "_gk_history_hide()")
 
 
 def _choice_option_texts(node):

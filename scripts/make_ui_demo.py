@@ -48,8 +48,11 @@
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ui_demo.py`
 """
 
+import math
 import os
+import struct
 import sys
+import wave
 
 import bpy
 
@@ -72,6 +75,9 @@ BAR_SIZE = 64
 BAR_BORDER = 14
 DIALOG_TEXT = ("欢迎!这是界面示例:图片、血条、对话框和暂停菜单都在这一屏。"
                "点一下继续。")
+# 第六十四轮:打字机音效 —— 程序生成一个小 wav 放进导出目录的 audio/
+TYPE_SOUND_FILE = "gk_type.wav"
+TYPE_SOUND_RES = f"res://audio/{TYPE_SOUND_FILE}"
 # 第四十轮:界面设计图(『游戏界面』)—— 右上角那块小 HUD 摆在这张**独立图**里
 DESIGN_NAME = "设计_HUD"
 
@@ -388,7 +394,10 @@ def _build_ui_chain(tree, ready, design):
     dialog = _add(tree, "GKNodeUiDialog", "开场白", 3900.0, 0.0,
                   gk_speaker="向导", gk_text=DIALOG_TEXT,
                   gk_speed=28.0, gk_width=640.0, gk_height=150.0,
-                  gk_margin=56.0)
+                  gk_margin=56.0,
+                  # 第六十四轮:逐字显示时每 2 个字响一下"嗒"(打字机音效)
+                  gk_type_sound=TYPE_SOUND_RES, gk_type_every=2,
+                  gk_type_volume=-10.0)
     after = _add(tree, "GKNodeUiSet", "改分数文字", 4160.0, 0.0,
                  gk_widget="分数", gk_set_text=True, gk_text="对话结束")
     # 对话点完 = "选择完成":继续世界 + 把鼠标锁回去(第四十六轮)
@@ -466,6 +475,15 @@ def _build_ui_chain(tree, ready, design):
                     gk_widget="分数", gk_set_text=True, gk_text="结局:独自逃出")
     three_text = _add(tree, "GKNodeUiSet", "显示再想想", 5460.0, -700.0,
                       gk_widget="分数", gk_set_text=True, gk_text="结局:再想想")
+    # ── 第六十四轮:字幕(不阻塞)+ 对话历史回顾 ───────────────────────
+    # 字幕插在『记结局2』和『显示独自逃出』**中间**:字幕不等玩家点,
+    # 所以后面那句改分数会**立刻**执行 —— 探针查"分数变成了『结局:独自
+    # 逃出』"其实就顺带证明了**字幕没把执行流卡住**(卡住的话分数永远不变)。
+    subtitle = _add(tree, "GKNodeUiSubtitle", "旁白字幕", 5460.0, -560.0,
+                    gk_text="你独自跑出了教学楼……", gk_seconds=2.5,
+                    gk_type_sound=TYPE_SOUND_RES)
+    history = _add(tree, "GKNodeDialogHistory", "回顾", 5980.0, -300.0,
+                   gk_title="对话回顾")
 
     _link(tree, focus_field, "完成", choice, "执行")
     _link(tree, choice, "选项1", pick_one, "执行")
@@ -473,7 +491,9 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, pick_one, "完成", one_text, "执行")
     _link(tree, choice, "选项2", pick_two, "执行")
     _link(tree, choice, "选了第几个", pick_two, "值")
-    _link(tree, pick_two, "完成", two_text, "执行")
+    _link(tree, pick_two, "完成", subtitle, "执行")
+    _link(tree, subtitle, "完成", two_text, "执行")
+    _link(tree, two_text, "完成", history, "执行")
     _link(tree, choice, "选项3", three_text, "执行")
 
     # 输入框『提交』(回车):读框里的字 -> 写进"得分"
@@ -540,6 +560,33 @@ def save_blend(path):
     bpy.data.libraries.write(path, blocks | set(scenes), fake_user=True)
 
 
+def _write_type_wav(path, seconds=0.05, freq=1200.0, rate=22050):
+    """程序生成一个"嘀"的打字音(第六十四轮)。
+
+    示例不该依赖"你机器上恰好有某个音频"(和 demo_assets 的立场一样)。
+    0.05 秒 + 两头极短淡入淡出 —— 就是视觉小说里那种打字机"嗒"的一下。
+
+    ⚠ 直接写进导出目录的 `audio/`,不走『资产_声音卡』:这一版只是给
+      示例配一个打字音,没必要为它建一整棵资产图。插件清理只删**它自己
+      写过**的文件(清单里那些),手工放进去的这个不会被动。
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    count = max(1, int(seconds * rate))
+    frames = bytearray()
+    for index in range(count):
+        t = index / rate
+        fade_in = min(1.0, index / (rate * 0.005))
+        fade_out = min(1.0, (count - index) / (rate * 0.02))
+        value = int(16000 * fade_in * fade_out * math.sin(2.0 * math.pi * freq * t))
+        frames += struct.pack("<h", value)
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(bytes(frames))
+    return path
+
+
 def main():
     from BlenderGameKit import asset_export, project
 
@@ -570,6 +617,12 @@ def main():
     logo_file = os.path.join(directory, "art",
                              curve_assets.image_file_name(LOGO_NAME))
     log(f"徽标 PNG: {logo_file} 存在={'是' if os.path.isfile(logo_file) else '否'}")
+
+    # 打字机音效(第六十四轮):程序生成后直接放进导出目录的 audio/
+    type_wav = _write_type_wav(os.path.join(directory, "audio",
+                                            TYPE_SOUND_FILE))
+    log(f"打字音: {os.path.relpath(type_wav, directory)} "
+        f"存在={'是' if os.path.isfile(type_wav) else '否'}")
 
     save_blend(BLEND_PATH)
     log(f"已保存 {BLEND_PATH}")

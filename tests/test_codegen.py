@@ -14047,5 +14047,214 @@ class TestRound63AiPathfinding(Base):
         self.assertEqual(code.count("func _gk_ref("), 1)
 
 
+class TestRound64Narrative(Base):
+    """第六十四轮:音频与叙事 —— 字幕行 / 打字机音效 / 对话历史回顾。
+
+    ── 这一轮验什么 ────────────────────────────────────────────────
+      * 『界面_字幕』**不阻塞**(生成里没有 await 循环)—— 后面跟着的节点
+        立刻接着跑,所以"一边运镜一边出旁白"才写得出来;
+      * 打字音:逐字显示改成 `tween_method` + 每 N 个字响一声;
+      * 每显示一句就自动进对话历史,还有上限(免得长流程吃内存);
+      * **只用到对话框 / 字幕的图也要能编译**:`_gk_ui_layer` / `_gk_ui_root`
+        这两个 UI 根容器变量原来只有界面控件节点才声明 —— 真 Godot
+        `--check-only` 跑出 `Identifier "_gk_ui_layer" not declared`,
+        整个脚本加载不了。这条锁死它。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    # ---- 字幕:不阻塞 ----
+
+    def test_subtitle_does_not_block(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="脚步声……",
+                            gk_seconds=2.5)
+        later = tree.new_node(NN.GKNodePrint, "后面的节点", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", sub, "执行")
+        gk_stub.connect(tree, sub, "完成", later, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 飘一句就走(参数齐全)
+        self.assertIn("_gk_subtitle_show(self, \"\", str(\"脚步声……\"), 30.0, "
+                      "2.5, 0.3, 720.0, 110.0, 48.0)", code)
+        # 字幕**不能**有自己的 await 等待环(那就不叫字幕了)
+        self.assertNotIn("while not _gk_dialog_clicked:", code)
+        # 后面的节点照跑
+        self.assertIn('print("hi")', code)
+        self.assert_indent_sane(code)
+
+    def test_subtitle_uses_the_dialog_panel_and_cancels_old_timer(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="甲")
+        gk_stub.connect(tree, event, "执行", sub, "执行")
+        code, _ = gen(tree, V3)
+        # 复用对话框那块面板(同一套观感)
+        self.assertIn("func _gk_subtitle_show(", code)
+        self.assertIn("_gk_dialog_show(host, speaker, body, speed, \"\", width, "
+                      "height, margin)", code)
+        # 代数守卫:老定时器不许把新的一句关掉
+        self.assertIn("_gk_sub_token += 1", code)
+        self.assertIn("if token != _gk_sub_token:", code)
+
+    # ---- 打字机音效 ----
+
+    def test_typing_sound_sets_runtime_vars_and_uses_tween_method(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "第一句", gk_text="你好",
+                               gk_type_sound="res://art/type.wav",
+                               gk_type_every=3, gk_type_volume=-8.0)
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_dialog_blip = "res://art/type.wav"', code)
+        self.assertIn("_gk_dialog_blip_every = 3", code)
+        self.assertIn("_gk_dialog_blip_db = -8.0", code)
+        # 有打字音时逐字走 tween_method(属性 tween 插不进回调)
+        self.assertIn("_gk_dialog_tween.tween_method(", code)
+        self.assertIn("func _gk_dialog_advance(host: Node, shown: int) -> void:",
+                      code)
+        self.assertIn("func _gk_play_blip(host: Node, path: String, db: float) -> void:",
+                      code)
+        self.assert_indent_sane(code)
+
+    def test_no_typing_sound_still_clears_the_setting(self):
+        """这张卡没填打字音 -> 显式清空(不然会**继承上一张卡**的音效)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "第一句", gk_text="你好")
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_dialog_blip = ""', code)
+        # 调用点没有配任何音效(helper 里那条分支是给"配了音效"用的)
+        self.assertNotIn('_gk_dialog_blip = "res://', code)
+        self.assertIn('if _gk_dialog_blip != "":', code)
+
+    # ---- 对话历史 ----
+
+    def test_dialog_line_goes_into_history_with_a_cap(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "第一句", gk_text="你好")
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_dialog_history.append({"who": speaker, "text": body})',
+                      code)
+        self.assertIn("if _gk_dialog_history.size() > 200:", code)
+        self.assertIn("_gk_dialog_history.pop_front()", code)
+
+    def test_history_node_blocks_until_click(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        hist = tree.new_node(NN.GKNodeDialogHistory, "回顾")
+        gk_stub.connect(tree, event, "执行", hist, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_history_show(self, "对话回顾", 720.0, 380.0, 18, '
+                      '"还没有说过话")', code)
+        self.assertIn("while not _gk_history_clicked:", code)
+        self.assertIn("_gk_history_hide()", code)
+        # 自动滚动的列表 + 每句一行
+        self.assertIn("func _gk_history_show(", code)
+        self.assertIn("_gk_history_scroll = ScrollContainer.new()", code)
+        self.assertIn("for entry in _gk_dialog_history:", code)
+        self.assert_indent_sane(code)
+
+    # ---- 真 Godot 抓到的:UI 根容器变量没声明 ----
+
+    def test_ui_root_vars_declared_for_dialog_only_graph(self):
+        """只放一个对话框的图,`_gk_ui_layer` / `_gk_ui_root` 也必须声明。
+
+        ── 这条是怎么来的 ────────────────────────────────────────────
+        这两个变量原来**只有**界面控件节点(`_ui_root()`)才声明。于是
+        "一张图里只有对话框 / 字幕"的脚本生成出 `_gk_ui_layer` 的使用,
+        却没有声明 —— 真 Godot:
+            Parse Error: Identifier "_gk_ui_layer" not declared
+        **整个脚本加载不了**。离线单测当时全绿(它们不检查"声明和引用
+        配没配上"),是拿生成物去 `godot --check-only` 才现形的。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        dialog = tree.new_node(NN.GKNodeUiDialog, "只有对话框", gk_text="你好")
+        gk_stub.connect(tree, event, "执行", dialog, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("var _gk_ui_layer: CanvasLayer", code)
+        self.assertIn("var _gk_ui_root: Control", code)
+        # 只声明一次(和界面控件节点共存时也不许重复)
+        self.assertEqual(code.count("var _gk_ui_layer: CanvasLayer"), 1)
+
+    def test_ui_root_vars_not_duplicated_with_widget_nodes(self):
+        """对话框 + 界面控件一起用时,那两个变量还是只声明一次。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        text = tree.new_node(NN.GKNodeUiText, "提示", gk_text="hi")
+        dialog = tree.new_node(NN.GKNodeUiDialog, "第一句", gk_text="你好")
+        gk_stub.connect(tree, event, "执行", text, "执行")
+        gk_stub.connect(tree, text, "完成", dialog, "执行")
+        code, _ = gen(tree, V3)
+        self.assertEqual(code.count("var _gk_ui_layer: CanvasLayer"), 1)
+        self.assertEqual(code.count("var _gk_ui_root: Control"), 1)
+
+    def test_subtitle_only_graph_declares_ui_root(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="甲")
+        gk_stub.connect(tree, event, "执行", sub, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("var _gk_ui_layer: CanvasLayer", code)
+        self.assertIn("var _gk_ui_root: Control", code)
+
+    # ---- 音频:循环 + 总线(第六十四轮)----
+
+    def test_music_loops_by_stream_type(self):
+        """『音效_音乐』默认循环 —— 而且要**按流类型**分别设。
+
+        Godot 没有一个统一点:Ogg / MP3 是 `.loop`,wav 是 `loop_mode`。
+        只设一种的话换个格式就"播一遍就没了",而且**不报错**(很难查)。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        music = tree.new_node(NN.GKNodePlayMusic, "BGM",
+                              gk_path="res://art/bgm.ogg")
+        gk_stub.connect(tree, event, "执行", music, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("AudioStreamOggVorbis", code)
+        self.assertIn("AudioStreamMP3", code)
+        self.assertIn("AudioStreamWAV.LOOP_FORWARD", code)
+        self.assertIn(".loop = true", code)
+        self.assert_indent_sane(code)
+
+    def test_music_loop_can_be_turned_off(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        music = tree.new_node(NN.GKNodePlayMusic, "BGM",
+                              gk_path="res://art/once.ogg", gk_loop=False)
+        gk_stub.connect(tree, event, "执行", music, "执行")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("LOOP_FORWARD", code)
+        self.assertNotIn(".loop = true", code)
+
+    def test_music_bus_is_configurable(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        music = tree.new_node(NN.GKNodePlayMusic, "BGM",
+                              gk_path="res://art/bgm.ogg", gk_bus="Music")
+        gk_stub.connect(tree, event, "执行", music, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('.bus = "Music"', code)
+        # 没填就是 Master(和以前一样,不写死成别的)
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        music2 = tree2.new_node(NN.GKNodePlayMusic, "BGM2",
+                                gk_path="res://art/bgm.ogg", gk_bus="")
+        gk_stub.connect(tree2, event2, "执行", music2, "执行")
+        code2, _ = gen(tree2, V3)
+        self.assertIn('.bus = "Master"', code2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

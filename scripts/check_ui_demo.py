@@ -176,12 +176,56 @@ func _physics_process(delta: float) -> void:
 	elif phase == 10 and elapsed >= 4.2:
 		phase = 11
 		_check_choice_picked()
+		# 第六十四轮:字幕(不阻塞)+ 对话历史回顾
+		_check_narrative()
+		# 历史面板是"阻塞"的(等玩家点)—— 点一下关掉,下一阶段查它真关了。
+		# 面板本身不吃鼠标(`_input` 采点按),点哪儿都算。
+		_click_at(Vector2(400.0, 300.0))
+	elif phase == 11 and elapsed >= 4.6:
+		phase = 12
+		_check_history_closed()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
 		# 靠 `--quit-after` 卡帧数容易"还没跑到最后一条就被掐了"(实测)。
 		# --quit-after 留着当安全网(卡死时兜底)。
 		get_tree().quit()
+
+
+## 第六十四轮:字幕 **不阻塞** + 对话历史自动记录 + 打字机音效。
+##
+## 证据链(三条都是"行为"而不是"代码长什么样"):
+##   ① `分数` 已经是『结局:独自逃出』—— 那个节点**排在字幕后面**。
+##      字幕要是像对话框那样等玩家点,这句话永远执行不到 —— 这就是
+##      "字幕不阻塞执行流"的活证据;
+##   ② 『对话_历史』面板弹出来了,里面正好 **2 行**(开场白 + 旁白字幕);
+##   ③ 宿主身上多了一个叫 `GKBlip` 的播放器 —— 打字音真的响了
+##      (它只在"配了打字音 + 音效文件真的存在"时才被创建)。
+func _check_narrative() -> void:
+	var score := _widget("分数") as Label
+	var score_text := score.text if score != null else "<none>"
+	var panel := _widget("对话历史")
+	var shown: bool = panel != null and panel.visible
+	var rows := 0
+	var first := ""
+	if panel != null:
+		var list := panel.find_child("列表", true, false)
+		if list != null:
+			rows = list.get_child_count()
+			if rows > 0 and list.get_child(0) is Label:
+				first = (list.get_child(0) as Label).text
+	var blip := world.find_child("GKBlip", true, false)
+	var ok: bool = shown and rows == 2 and blip != null \
+		and score_text == "结局:独自逃出"
+	print("UI_NARRATIVE ok=", ok, " panel=", shown, " rows=", rows,
+		" first=", first, " blip=", blip != null, " score=", score_text)
+
+
+## 点一下之后历史面板要关掉(和对话框同一套:等一次点按)。
+func _check_history_closed() -> void:
+	var panel := _widget("对话历史")
+	var hidden: bool = panel == null or not panel.visible
+	print("UI_HISTORY_CLOSED ok=", hidden, " hidden=", hidden)
 
 
 func _check_widgets() -> void:
@@ -565,6 +609,11 @@ def main():
          "『对话_选择』没弹出来 / 问题文字或三个选项不对"),
         (r"UI_CHOICE ok=true",
          "点第 2 个选项没走第 2 条链(得分没变,或『选了第几个』没写进结局变量)"),
+        # ---- 第六十四轮:字幕 / 打字音 / 对话历史 ----
+        (r"UI_NARRATIVE ok=true",
+         "字幕或对话历史不对(字幕**卡住了执行流** / 历史里不是 2 行 / "
+         "打字音播放器没建出来)"),
+        (r"UI_HISTORY_CLOSED ok=true", "点一下没把『对话回顾』面板关掉"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -587,6 +636,11 @@ def main():
                 ("_gk_find_widget(\"血条\")", "『界面_设置』找控件"),
                 ("Control.PRESET_CENTER_BOTTOM", "底部居中的锚点"),
                 ("_gk_dialog_show(", "对话框辅助函数"),
+                # ---- 第六十四轮:字幕 / 打字音 / 对话历史 ----
+                ("func _gk_subtitle_show(", "字幕辅助函数"),
+                ("func _gk_history_show(", "对话历史面板"),
+                ('_gk_dialog_blip = "res://audio/gk_type.wav"', "打字音路径"),
+                ("_gk_play_blip(", "打字音播放"),
                 ("_gk_apply_pause(", "暂停 / 继续世界"),
                 ("process_frame.connect(_gk_pause_watch)", "Esc 热键(暂停也读得到按键)"),
                 # ---- 第二版(第三十八轮)----

@@ -1155,13 +1155,28 @@ class Generator:
                     "    if _gk_dialog_tween != null and _gk_dialog_tween.is_valid():",
                     "        _gk_dialog_tween.kill()",
                     "    var count := body.length()",
+                    "    _gk_dialog_blip_step = 0",
                     "    if speed > 0.0 and count > 0:",
                     "        _gk_dialog_tween = _gk_dialog_panel.create_tween()",
-                    "        _gk_dialog_tween.tween_property(_gk_dialog_text, \"visible_characters\", count, float(count) / speed)",
+                    "        if _gk_dialog_blip != \"\":",
+                    "            # 有打字音:走 tween_method,每帧自己推进『已显示几个字』",
+                    "            # 并『每 N 个字』响一声(属性 tween 插不进回调)",
+                    "            _gk_dialog_tween.tween_method(",
+                    "                func(shown: float) -> void: _gk_dialog_advance(host, int(shown)),",
+                    "                0.0, float(count), float(count) / speed)",
+                    "        else:",
+                    "            _gk_dialog_tween.tween_property(_gk_dialog_text, \"visible_characters\", count, float(count) / speed)",
                     "    else:",
                     "        _gk_dialog_text.visible_characters = -1",
                     "    _gk_dialog_panel.visible = true",
+                    "    _gk_dialog_panel.modulate.a = 1.0    # 字幕淡出过之后要能亮回来",
                     "    _gk_dialog_clicked = false",
+                    "    # 新的一句顶掉上一句:老字幕的定时器看到『代数』变了就不再关面板",
+                    "    _gk_sub_token += 1",
+                    "    # 自动记进对话历史(『对话_历史』读它);上限 200 句,免得长流程吃内存",
+                    "    _gk_dialog_history.append({\"who\": speaker, \"text\": body})",
+                    "    if _gk_dialog_history.size() > 200:",
+                    "        _gk_dialog_history.pop_front()",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
@@ -1188,6 +1203,160 @@ class Generator:
                 "lines": [
                     "    if _gk_dialog_panel != null:",
                     "        _gk_dialog_panel.visible = false",
+                ],
+                "empty_body": "    pass",
+            })
+            # ── 打字机音效(第六十四轮)────────────────────────────────
+            # 逐字推进 + "每 N 个字"响一声。只在**开了打字音**时才走这条路
+            # (见 _gk_dialog_show 里那个 if),所以这两个函数对没配打字音
+            # 的图是死代码 —— 但也没别的地方放它们,就一起生成。
+            sections.append({
+                "signature": "func _gk_dialog_advance(host: Node, shown: int) -> void:",
+                "lines": [
+                    "    _gk_dialog_text.visible_characters = shown",
+                    "    if _gk_dialog_blip == \"\" or _gk_dialog_blip_every <= 0:",
+                    "        return",
+                    "    # 『每 N 个字响一声』:用『已经响到第几次』记账,不按帧算",
+                    "    var step := shown / _gk_dialog_blip_every",
+                    "    if step <= _gk_dialog_blip_step:",
+                    "        return",
+                    "    _gk_dialog_blip_step = step",
+                    "    _gk_play_blip(host, _gk_dialog_blip, _gk_dialog_blip_db)",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_play_blip(host: Node, path: String, db: float) -> void:",
+                "lines": [
+                    "    if path == \"\" or not ResourceLoader.exists(path):",
+                    "        return",
+                    "    # 播放器**复用同一个**:每个字新建一个会瞬间堆出几十个节点",
+                    "    if _gk_blip_player == null:",
+                    "        _gk_blip_player = AudioStreamPlayer.new()",
+                    "        _gk_blip_player.name = \"GKBlip\"",
+                    "        host.add_child(_gk_blip_player)",
+                    "    if _gk_blip_cache != path:",
+                    "        _gk_blip_player.stream = load(path) as AudioStream",
+                    "        _gk_blip_cache = path",
+                    "    _gk_blip_player.volume_db = db",
+                    "    _gk_blip_player.play()",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 字幕行(第六十四轮:"字幕行 / 打字机音效")------------------
+        # 复用对话框那块面板,但**不等玩家点**:飘出来之后立刻返回,
+        # 后面的节点照跑(运镜 + 台词同时进行才写得出来)。到点由一个
+        # SceneTreeTimer 把面板淡出关掉;`_gk_sub_token` 是"第几代" ——
+        # 新字幕/新对话框一来就 +1,老定时器看到代数变了就**不再关面板**
+        # (不然老字幕的定时器会把后面新弹的对话框关掉)。
+        if self.ctx.need_subtitle_helpers:
+            sections.append({
+                "signature": ("func _gk_subtitle_show(host: Node, speaker: String, "
+                              "body: String, speed: float, seconds: float, "
+                              "fade: float, width: float, height: float, "
+                              "margin: float) -> void:"),
+                "lines": [
+                    "    _gk_dialog_show(host, speaker, body, speed, \"\", width, height, margin)",
+                    "    _gk_sub_token += 1",
+                    "    var token := _gk_sub_token",
+                    "    var timer := host.get_tree().create_timer(maxf(seconds, 0.05))",
+                    "    timer.timeout.connect(func() -> void:",
+                    "        if token != _gk_sub_token:",
+                    "            return      # 已经有新的一句顶掉了,别关",
+                    "        if fade > 0.0:",
+                    "            var tween := _gk_dialog_panel.create_tween()",
+                    "            tween.tween_property(_gk_dialog_panel, \"modulate:a\", 0.0, fade)",
+                    "            tween.tween_callback(_gk_dialog_hide)",
+                    "        else:",
+                    "            _gk_dialog_hide())",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 对话历史回顾(第六十四轮)----------------------------------
+        # 历史本身是 `_gk_dialog_show` 每显示一句就 append 的(在对话框那段),
+        # 这里只负责"把记下来的列出来给人看"。滚动容器设成 STOP:
+        # 鼠标滚轮滚得动(点一下仍然关 —— 那是 `_input` 管的,不受它影响)。
+        if self.ctx.need_history_helpers:
+            sections.append({
+                "signature": ("func _gk_history_show(host: Node, title: String, "
+                              "width: float, height: float, font_size: int, "
+                              "empty_hint: String) -> void:"),
+                "lines": [
+                    "    _gk_ensure_ui(host)",
+                    "    if _gk_history_panel == null:",
+                    "        _gk_history_panel = Panel.new()",
+                    "        _gk_history_panel.name = \"对话历史\"",
+                    "        var box := StyleBoxFlat.new()",
+                    "        box.bg_color = Color(0.05, 0.06, 0.09, 0.92)",
+                    "        box.corner_radius_top_left = 14",
+                    "        box.corner_radius_top_right = 14",
+                    "        box.corner_radius_bottom_left = 14",
+                    "        box.corner_radius_bottom_right = 14",
+                    "        box.border_width_top = 2",
+                    "        box.border_width_bottom = 2",
+                    "        box.border_width_left = 2",
+                    "        box.border_width_right = 2",
+                    "        box.border_color = Color(1.0, 1.0, 1.0, 0.25)",
+                    "        _gk_history_panel.add_theme_stylebox_override(\"panel\", box)",
+                    "        # 面板本身不吃鼠标:点哪儿都算『关掉』(见 gk_history_input_event)",
+                    "        _gk_history_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_ui_root.add_child(_gk_history_panel)",
+                    "        _gk_history_title = Label.new()",
+                    "        _gk_history_title.name = \"标题\"",
+                    "        _gk_history_title.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_history_panel.add_child(_gk_history_title)",
+                    "        _gk_history_scroll = ScrollContainer.new()",
+                    "        _gk_history_scroll.name = \"滚动\"",
+                    "        # STOP = 滚轮能滚它(关面板走 `_input`,不受这里影响)",
+                    "        _gk_history_scroll.mouse_filter = Control.MOUSE_FILTER_STOP",
+                    "        _gk_history_panel.add_child(_gk_history_scroll)",
+                    "        _gk_history_list = VBoxContainer.new()",
+                    "        _gk_history_list.name = \"列表\"",
+                    "        _gk_history_list.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_history_scroll.add_child(_gk_history_list)",
+                    "    _gk_history_panel.size = Vector2(width, height)",
+                    "    _gk_history_panel.set_anchors_and_offsets_preset(",
+                    "        Control.PRESET_CENTER, Control.PRESET_MODE_KEEP_SIZE)",
+                    "    _gk_history_title.text = title",
+                    "    _gk_history_title.add_theme_font_size_override(\"font_size\", font_size + 4)",
+                    "    _gk_history_title.position = Vector2(18.0, 12.0)",
+                    "    var top := 12.0 + float(font_size) + 22.0",
+                    "    _gk_history_scroll.position = Vector2(18.0, top)",
+                    "    _gk_history_scroll.size = Vector2(width - 36.0, height - top - 16.0)",
+                    "    # 先摘再有声地删:只用 queue_free 的话这一帧它还挂在树上,",
+                    "    # 下面的新行会跟旧行**同时**显示一帧(看起来像重影)",
+                    "    for child in _gk_history_list.get_children():",
+                    "        _gk_history_list.remove_child(child)",
+                    "        child.queue_free()",
+                    "    if _gk_dialog_history.is_empty():",
+                    "        var hint := Label.new()",
+                    "        hint.text = empty_hint",
+                    "        hint.add_theme_font_size_override(\"font_size\", font_size)",
+                    "        hint.add_theme_color_override(\"font_color\", Color(1.0, 1.0, 1.0, 0.6))",
+                    "        _gk_history_list.add_child(hint)",
+                    "    else:",
+                    "        for entry in _gk_dialog_history:",
+                    "            var who := str(entry.get(\"who\", \"\"))",
+                    "            var line := Label.new()",
+                    "            line.text = str(entry.get(\"text\", \"\")) if who == \"\" else who + \"：\" + str(entry.get(\"text\", \"\"))",
+                    "            line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART",
+                    "            line.custom_minimum_size = Vector2(width - 56.0, 0.0)",
+                    "            line.add_theme_font_size_override(\"font_size\", font_size)",
+                    "            _gk_history_list.add_child(line)",
+                    "    _gk_history_panel.visible = true",
+                    "    _gk_history_clicked = false",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_history_hide() -> void:",
+                "lines": [
+                    "    if _gk_history_panel != null:",
+                    "        _gk_history_panel.visible = false",
                 ],
                 "empty_body": "    pass",
                 "separator": True,

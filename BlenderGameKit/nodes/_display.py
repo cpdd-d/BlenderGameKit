@@ -797,7 +797,16 @@ class GKNodePlayMusic(B.GKStatementNode):
     bl_label = "音效_音乐"
     bl_icon = "PLAY_SOUND"
     gk_category = "音效"
-    gk_doc = "播放背景音乐(BGM)。重复调用会切换曲目并做淡入淡出，不会叠着播"
+    gk_doc = ("播放背景音乐(BGM)。重复调用会切换曲目并做淡入淡出,不会叠着播。\n"
+              "── 循环(第六十四轮)──\n"
+              "『循环』默认**开** —— 背景音乐播完就停是很少见的意外"
+              "(主菜单 / 战斗曲都该一直放)。只有『这首就放一遍』的曲子才取消勾选。\n"
+              "跑的是 `AudioStreamOggVorbis / MP3` 的 `loop`,wav 用 "
+              "`loop_mode = LOOP_FORWARD` —— 三种都认,不用你自己去加点。\n"
+              "── 总线(第六十四轮)──\n"
+              "『总线』填 Godot 音频面板里的总线名(默认 Master)。"
+              "想单独压 BGM 就自己建一条 Music 总线,填它的名字 —— "
+              "之后用『音效_总线音量』就能只压这一路,不动音效。")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "音频路径", "res://art/bgm.ogg"),
@@ -808,6 +817,9 @@ class GKNodePlayMusic(B.GKStatementNode):
         ("gk_path", "string", "res://art/bgm.ogg", "音频路径", "res:// 开头的音频文件"),
         ("gk_volume", "float", -6.0, "音量", "分贝，0 为原始音量"),
         ("gk_fade", "float", 0.5, "淡入秒数", "0 表示直接开始"),
+        ("gk_loop", "bool", True, "循环", "播完接着放(背景音乐一般都要)"),
+        ("gk_bus", "string", "Master", "总线",
+         "走哪条音频总线(Godot 音频面板里的名字);默认 Master"),
     )
 
     def draw_buttons(self, context, layout):
@@ -819,6 +831,8 @@ class GKNodePlayMusic(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_volume", text="")
         row.prop(self, "gk_fade", text="")
+        row.prop(self, "gk_loop", text="循环", toggle=True)
+        layout.prop(self, "gk_bus", text="总线")
 
 
 @N
@@ -1623,7 +1637,13 @@ class GKNodeUiDialog(B.GKStatementNode):
               "(所以执行流会在对话框这里**停住**,等玩家看完)。\n"
               "── 立绘 ──\n"
               "『立绘』可选(点『选图片』挑一张 Blender 图片,"
-              "导出时跟着带进 Godot);留空就是纯文字对话框。")
+              "导出时跟着带进 Godot);留空就是纯文字对话框。\n"
+              "── 打字音(第六十四轮)──\n"
+              "『打字音』挑一个『嘀』的音效:逐字显示时**每几个字响一下**"
+              "(经典视觉小说的打字机声)。留空就不响。\n"
+              "── 回顾 ──\n"
+              "说过的每一句都会**自动记进对话历史**,想给玩家一个"
+              "『对话回顾』入口就放一个『对话_历史』。")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "文字", "你好，冒险者！"),
@@ -1635,6 +1655,14 @@ class GKNodeUiDialog(B.GKStatementNode):
         ("gk_image", "string", "", "立绘",
          "可选的半身像 / 头像(Blender 图片名或 res:// 路径)"),
         ("gk_speed", "float", 30.0, "打字速度", "每秒显示几个字;0 = 直接全显示"),
+        # ── 打字音(第六十四轮:用户选的"字幕行 / 打字机音效")──────────
+        ("gk_type_sound", "string", "", "打字音",
+         "逐字显示时每隔几个字响一下的音效(res:// 路径或从资产库挑);留空 = 不响"),
+        ("gk_type_every", "int", 2, "每几个字",
+         "每显示几个字响一下;1 = 每个字都响",
+         None, {"min": 1, "max": 20}),
+        ("gk_type_volume", "float", -6.0, "打字音音量",
+         "分贝;0 = 原始音量,-6 约减半"),
         ("gk_width", "float", 720.0, "宽", "面板宽(像素)"),
         ("gk_height", "float", 150.0, "高", "面板高(像素)"),
         ("gk_margin", "float", 48.0, "距底边", "面板离屏幕下边多少像素"),
@@ -1650,6 +1678,14 @@ class GKNodeUiDialog(B.GKStatementNode):
         pick = row.operator("gk.pick_image", text="", icon="VIEWZOOM")
         pick.node_name = self.name
         pick.image_prop = "gk_image"
+        # 打字音:一行"音效路径 + 挑 + 每几个字 + 音量"
+        row = layout.row(align=True)
+        row.prop(self, "gk_type_sound", text="", icon="SOUND")
+        pick_sound = row.operator("gk.pick_sound", text="", icon="VIEWZOOM")
+        pick_sound.node_name = self.name
+        pick_sound.sound_prop = "gk_type_sound"
+        row.prop(self, "gk_type_every", text="字/次")
+        row.prop(self, "gk_type_volume", text="dB")
         row = layout.row(align=True)
         row.prop(self, "gk_width", text="宽")
         row.prop(self, "gk_height", text="高")
@@ -1753,6 +1789,104 @@ class GKNodeUiChoice(B.GKStatementNode):
         row.prop(self, "gk_height", text="高")
         row.prop(self, "gk_margin", text="距底边")
         layout.label(text="每个出口接一条链;数字键 1~6 也能选", icon="INFO")
+
+
+@N
+class GKNodeUiSubtitle(B.GKStatementNode):
+    bl_idname = "GKNodeUiSubtitle"
+    bl_label = "界面_字幕"
+    bl_icon = "FONT_DATA"
+    gk_category = "界面"
+    gk_doc = ("屏幕下方飘一行**字幕**,过几秒自己消失 —— 给演出 / 运镜 / "
+              "旁白配台词用。\n"
+              "── 和『界面_对话框』的区别(关键)──────────────────────────\n"
+              "对话框是**阻塞**的:执行流停在那里,等玩家点一下才继续。\n"
+              "字幕**不等**:它飘出来之后,后面的节点**立刻照跑** —— "
+              "所以你能一边放运镜 / 一边走剧情,台词自己浮在下面。\n"
+              "── 什么时候用哪个 ──\n"
+              "要玩家读一句点一下(对话 / 选项前)→ 『界面_对话框』;\n"
+              "镜头在飞 / 角色在走,只想让台词跟着出现 → 这个。\n"
+              "── 打字音 ──\n"
+              "和对话框一样可以配『打字音』(逐字显示时每几个字响一下)。\n"
+              "⚠ 字幕和对话框**共用同一块面板**:紧接着再弹对话框会把它顶掉"
+              "(这是有意的 —— 字幕本来就该让位给正式对话)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "文字", "……"),
+    )
+    gk_input_props = {"文字": "gk_text"}
+    gk_prop_defs = (
+        ("gk_speaker", "string", "", "说话人", "留空 = 不显示名字"),
+        ("gk_text", "string", "……", "文字", "没接『文字』引脚时显示这句"),
+        ("gk_seconds", "float", 3.0, "停留秒数", "飘多久后自动消失"),
+        ("gk_fade", "float", 0.3, "淡出秒数", "消失时的淡出;0 = 直接消失"),
+        ("gk_speed", "float", 30.0, "打字速度", "每秒显示几个字;0 = 直接全显示"),
+        ("gk_type_sound", "string", "", "打字音",
+         "逐字显示时每隔几个字响一下的音效;留空 = 不响"),
+        ("gk_type_every", "int", 2, "每几个字",
+         "每显示几个字响一下;1 = 每个字都响",
+         None, {"min": 1, "max": 20}),
+        ("gk_type_volume", "float", -6.0, "打字音音量", "分贝"),
+        ("gk_width", "float", 720.0, "宽", "面板宽(像素)"),
+        ("gk_height", "float", 110.0, "高", "面板高(像素)"),
+        ("gk_margin", "float", 48.0, "距底边", "面板离屏幕下边多少像素"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_speaker", text="", icon="USER")
+        row.prop(self, "gk_seconds", text="秒")
+        row.prop(self, "gk_fade", text="淡出")
+        layout.prop(self, "gk_text", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_speed", text="字/秒")
+        row.prop(self, "gk_type_sound", text="", icon="SOUND")
+        pick = row.operator("gk.pick_sound", text="", icon="VIEWZOOM")
+        pick.node_name = self.name
+        pick.sound_prop = "gk_type_sound"
+        row.prop(self, "gk_type_every", text="字/次")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_margin", text="距底边")
+
+
+@N
+class GKNodeDialogHistory(B.GKStatementNode):
+    bl_idname = "GKNodeDialogHistory"
+    bl_label = "对话_历史"
+    bl_icon = "TEXT"
+    gk_category = "界面"
+    gk_doc = ("翻出一块**对话回顾**面板:把说过的话按顺序列出来,能滚动着看。\n"
+              "── 历史哪来的 ──\n"
+              "不用你记:每走过一个『界面_对话框』或『界面_字幕』,"
+              "那一句(说话人 + 正文)会**自动**进历史(最多留 200 句,"
+              "超了丢最老的 —— 免得长流程把内存吃光)。\n"
+              "── 怎么关 ──\n"
+              "点一下鼠标 / 按任意键关掉,沿『完成』继续后面的逻辑"
+              "(和对话框一样,执行流会停在这儿等玩家看完)。\n"
+              "── 典型接法 ──\n"
+              "按某个键打开(比如 I / Tab),或者放在暂停菜单里。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_title", "string", "对话回顾", "标题", "面板顶上那行字"),
+        ("gk_empty", "string", "还没有说过话", "没说过话时",
+         "一句都没记下时显示的提示"),
+        ("gk_font", "int", 18, "字号", "正文像素大小",
+         None, {"min": 8, "max": 48}),
+        ("gk_width", "float", 720.0, "宽", "面板宽(像素)"),
+        ("gk_height", "float", 380.0, "高", "面板高(像素)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_title", text="")
+        layout.prop(self, "gk_empty", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_font", text="号")
 
 
 # ==========================================================================
