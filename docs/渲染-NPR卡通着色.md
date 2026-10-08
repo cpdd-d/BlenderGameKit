@@ -462,6 +462,32 @@ powershell -ExecutionPolicy Bypass -File scripts\verify_jitter.ps1
 
 调法:先把环境光压到 0.12,再把主光从 0.3 往上加,直到亮部颜色刚好饱满。
 
+### 场景灯怎么进 Godot(第四十八轮:阶段①灯光扩展)
+
+三种灯都导:太阳 SUN → `DirectionalLight3D`、点光 POINT → `OmniLight3D`、
+聚光 SPOT → `SpotLight3D`(锥角:Blender 的 `spot_size` 是**整锥角**(弧度),
+Godot 的 `spot_angle` 是**半角**(度)—— 40° 写 20.0);颜色 / 阴影开关 /
+范围(Blender 的『自定义距离』→ `omni_range` / `spot_range`)一并带走。
+
+能量换算(写在 `BlenderGameKit/asset_export.py` 的 `_light_energy_for`,别去猜):
+
+| Blender | Godot |
+|---|---|
+| 太阳 energy 1.0 | `light_energy = 1.2`(×1.2,夹 [0.2, 4.0]) |
+| 点光 / 聚光 1000W | `light_energy = 1.0`(约定 **1000W ≈ 1.0**,夹 [0.05, 8.0]) |
+
+**卡通材质跟哪盏灯**(场景勾『卡通跟随场景光照』后):每帧对**每个材质**算
+"影响最大的那盏亮灯" —— 平行光按 `light_energy × 0.8`(打 0.8 折,让
+照到脸上的手电筒能盖过月光);点光 / 聚光按距离衰减(聚光还要"照在锥里"),
+方向取"灯 → 材质"。挑中的那盏喂给 shader 的 `light_dir` / `light_color` /
+`light_energy`;一盏亮的都没有时 `light_dir` 置零(退化成平涂)。
+⚠ 这是**近似**:shader 的色阶只有一盏灯的通道,多盏同时照只取影响最大的
+那盏(要逐像素混合得改 shader,不值当)。
+
+**手电筒**:选中灯 →『游戏物理』→ 灯光 → 勾『跟随相机(手电筒)』,
+运行时代码每物理帧把这盏灯贴到当前相机上(颜色 / 亮度 / 阴影照旧)。
+完整示例:`examples/demo_lights`(数字键 1/2/3/4 开关三盏灯)。
+
 ---
 
 

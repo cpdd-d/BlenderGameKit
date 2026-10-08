@@ -474,6 +474,80 @@ def main():
         check("粒子特效", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 灯光:三种类型 / 颜色 / 阴影 / 手电筒(第四十八轮:阶段①)----
+    # 以前只导"场景里第一盏 SUN",点光聚光全丢(恐怖游戏做不了手电筒)。
+    # 真 Blender 里摆三盏灯(太阳 + 台灯 + 手电筒),验导出的 .tscn:
+    #   * 三种类型各一个节点;
+    #   * 颜色 / 阴影 / 范围 / 锥角都写进去了;
+    #   * 勾了『跟随相机』的那盏名字进了环境脚本的 follow_lights。
+    try:
+        import math
+        import shutil
+
+        work = os.path.join(tempfile.gettempdir(), "gk_lights")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+
+        moon = bpy.data.lights.new("月光", type="SUN")
+        moon.energy = 0.4
+        moon.color = (0.6, 0.7, 1.0)
+        moon_obj = bpy.data.objects.new("月光", moon)
+        bpy.context.scene.collection.objects.link(moon_obj)
+
+        lamp = bpy.data.lights.new("台灯", type="POINT")
+        lamp.energy = 800.0
+        lamp.color = (1.0, 0.7, 0.4)
+        lamp.cutoff_distance = 8.0
+        lamp_obj = bpy.data.objects.new("台灯", lamp)
+        lamp_obj.location = (2.0, 2.0, 0.0)
+        bpy.context.scene.collection.objects.link(lamp_obj)
+
+        torch = bpy.data.lights.new("手电筒", type="SPOT")
+        torch.energy = 1500.0
+        torch.spot_size = math.radians(40.0)
+        torch.use_shadow = False
+        torch_obj = bpy.data.objects.new("手电筒", torch)
+        bpy.context.scene.collection.objects.link(torch_obj)
+        torch_obj.gk_physics.light_follow_camera = True
+        bpy.context.view_layer.update()
+
+        asset_export.export_scene_glb(work, "World")
+        path, _count = asset_export.write_world_scene(
+            work, "World", scene=bpy.context.scene, dimension="3")
+        with open(path, encoding="utf-8") as handle:
+            scene_text = handle.read()
+        env_file = os.path.join(work, "scripts", "gk_environment.gd")
+        env_code = ""
+        if os.path.isfile(env_file):
+            with open(env_file, encoding="utf-8") as handle:
+                env_code = handle.read()
+        check("灯光:三种类型都导出来了",
+              'type="DirectionalLight3D"' in scene_text
+              and 'type="OmniLight3D"' in scene_text
+              and 'type="SpotLight3D"' in scene_text,
+              [ln for ln in scene_text.splitlines() if "Light3D" in ln][:4])
+        check("灯光:颜色 / 阴影 / 范围 / 锥角都写进去了",
+              "light_color = Color(0.600000, 0.700000, 1.000000, 1)" in scene_text
+              and "shadow_enabled = false" in scene_text
+              and "omni_range = 8.000" in scene_text
+              and "spot_angle = 20.000" in scene_text,
+              [ln for ln in scene_text.splitlines()
+               if "light_color" in ln or "range" in ln or "angle" in ln][:6])
+        check("手电筒:『跟随相机』的灯名进了环境脚本",
+              'follow_lights: String = "手电筒"' in env_code)
+        check("手电筒:环境脚本每帧贴相机",
+              "func _gk_follow_lights_tick() -> void:" in env_code
+              and "global_transform = cam.global_transform" in env_code)
+        # 收尾:清掉这一节的灯(网格留给下一节自己清)
+        for leftover in (moon_obj, lamp_obj, torch_obj):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+    except Exception as exc:
+        check("灯光导出", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 游戏内调试面板(用户 2026-10-05 第二十二轮:调试体验)----
     # 真 Blender 里验两件事:
     #   ① 场景开关打开 -> 写出的**环境脚本**里带着面板(按键 / 复制 / 变量过滤),
@@ -1210,9 +1284,9 @@ def main():
         # 写透:卡上读写的就是场景设置本身(改场景 -> 摘要跟着变,没有第二份值)
         r42_settings = bpy.context.scene.gk_settings
         r42_rows = node_lib.display_settings_rows(r42_settings)
-        check("显示:侧栏摘要读的是场景设置(三项都在)",
+        check("显示:侧栏摘要读的是场景设置(四项都在)",
               [row[0] for row in r42_rows]
-              == ["调试面板", "运行日志", "画面风格"])
+              == ["调试面板", "运行日志", "画面风格", "环境氛围"])
         r42_old_toon = bool(getattr(r42_settings, "toon_materials", True))
         r42_old_follow = bool(getattr(r42_settings, "toon_follow_light", False))
         r42_settings.toon_materials = True
@@ -1264,6 +1338,279 @@ def main():
         bpy.data.node_groups.remove(r42_tree)
     except Exception as exc:
         check("第四十二轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 环境与后处理(第四十九轮:阶段②环境与后处理)----
+    # ① 场景设置里开着『环境与后处理』-> 主场景 .tscn 里多出 WorldEnvironment
+    #    节点 + Environment 子资源(背景 / 环境光 / 雾 / 泛光 / 色调都在);
+    # ② **关着时一个字符都不多**(老工程产物一字不变);
+    # ③ 天空背景多两个子资源(ProceduralSkyMaterial + Sky);
+    # ④ 『显示_环境氛围』卡的 draw_buttons 画得完(第五张卡)。
+    try:
+        import shutil as _r49_shutil
+
+        asset_export = import_module(f"{module_name}.asset_export")
+        r49_settings = bpy.context.scene.gk_settings
+        r49_saved = {name: getattr(r49_settings, name) for name in (
+            "env_enabled", "env_background", "env_fog", "env_glow",
+            "env_adjust", "env_tonemap", "env_ambient_energy")}
+
+        r49_work = os.path.join(tempfile.gettempdir(), "gk_env_smoke")
+        _r49_shutil.rmtree(r49_work, ignore_errors=True)
+        os.makedirs(r49_work, exist_ok=True)
+        for r49_leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(r49_leftover, do_unlink=True)
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 0.0))
+        r49_ground = bpy.context.active_object
+        r49_ground.name = "环境地面"
+        bpy.context.view_layer.update()
+        check("环境:世界 glb 导出成功",
+              asset_export.export_scene_glb(r49_work, "World")[1])
+
+        # 关着 -> 产物里连节点都没有
+        r49_settings.env_enabled = False
+        r49_path, _r49_count = asset_export.write_world_scene(
+            r49_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r49_path, encoding="utf-8") as handle:
+            r49_off = handle.read()
+        check("环境:关着时产物里没有 WorldEnvironment",
+              "WorldEnvironment" not in r49_off, r49_off[-400:])
+
+        # 开着:纯色背景 + 环境光 + 雾 + 泛光 + 调色
+        r49_settings.env_enabled = True
+        r49_settings.env_background = "COLOR"
+        r49_settings.env_ambient_energy = 0.42
+        r49_settings.env_fog = True
+        r49_settings.env_fog_density = 0.07
+        r49_settings.env_glow = True
+        r49_settings.env_adjust = True
+        r49_settings.env_tonemap = "ACES"
+        r49_path, _r49_count = asset_export.write_world_scene(
+            r49_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r49_path, encoding="utf-8") as handle:
+            r49_on = handle.read()
+        check("环境:.tscn 里有 WorldEnvironment 节点 + Environment 子资源",
+              '[node name="WorldEnvironment" type="WorldEnvironment"'
+              in r49_on
+              and '[sub_resource type="Environment" id="gk_environment"]'
+              in r49_on
+              and 'environment = SubResource("gk_environment")' in r49_on,
+              r49_on[-700:])
+        check("环境:背景 / 环境光 / 雾 / 泛光 / 色调字段都写进去了",
+              "background_mode = 1" in r49_on
+              and "ambient_light_energy = 0.420000" in r49_on
+              and "fog_enabled = true" in r49_on
+              and "fog_density = 0.070000" in r49_on
+              and "glow_enabled = true" in r49_on
+              and "adjustment_enabled = true" in r49_on
+              and "tonemap_mode = 3" in r49_on)
+
+        # 天空:多两个子资源 + background_mode = 2
+        r49_settings.env_background = "SKY"
+        r49_path, _r49_count = asset_export.write_world_scene(
+            r49_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r49_path, encoding="utf-8") as handle:
+            r49_sky = handle.read()
+        check("环境:天空背景导出 Sky + 程序化天空材质",
+              '[sub_resource type="Sky" id="gk_sky"]' in r49_sky
+              and '[sub_resource type="ProceduralSkyMaterial"' in r49_sky
+              and "background_mode = 2" in r49_sky
+              and 'sky = SubResource("gk_sky")' in r49_sky)
+
+        # 第五张卡的 draw_buttons 也要能画完
+        class _R49Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        try:
+            node_lib.GKNodeDisplayEnvironment.draw_buttons(
+                None, bpy.context, _R49Layout())
+            r49_draw_ok = True
+            r49_draw_error = ""
+        except Exception as exc:                          # noqa: BLE001
+            r49_draw_ok = False
+            r49_draw_error = f"{type(exc).__name__}: {exc}"
+        check("环境:『显示_环境氛围』卡 draw_buttons 画得完", r49_draw_ok,
+              r49_draw_error)
+
+        # 收尾:设置还原 + 清掉临时物体
+        for r49_name, r49_value in r49_saved.items():
+            setattr(r49_settings, r49_name, r49_value)
+        bpy.data.objects.remove(r49_ground, do_unlink=True)
+        _r49_shutil.rmtree(r49_work, ignore_errors=True)
+    except Exception as exc:
+        check("第四十九轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 对话选择(第五十轮:阶段③『对话_选择』分支)----
+    # ① 节点注册上了,出口跟着『选项数』走(选项1..N + 『选了第几个』);
+    # ② **没有『完成』出口**(有的话选都没选后面的逻辑就跑了);
+    # ③ 玩法图能放它、『游戏界面』设计图放不进去;
+    # ④ 生成物里是 `match _gk_choice_picked:` + 每个出口一个 case。
+    try:
+        from importlib import import_module as _r50_import
+
+        r50_codegen = _r50_import(f"{module_name}.codegen")
+        r50_choice_cls = getattr(node_lib, "GKNodeUiChoice", None)
+        check("对话选择:节点注册成功", r50_choice_cls is not None)
+
+        r50_tree = bpy.data.node_groups.new("对话选择冒烟50", "GKGameLogicTree")
+        r50_ready = r50_tree.nodes.new("GKNodeOnReady")
+        r50_choice = r50_tree.nodes.new("GKNodeUiChoice")
+        r50_choice.gk_question = "你怎么做？"
+        r50_choice.gk_option_count = 3
+        r50_choice.gk_options = "救她|自己跑|再想想"
+        r50_choice.build_sockets()
+        r50_names = [socket.name for socket in r50_choice.outputs]
+        check("对话选择:出口 = 选项1..N + 『选了第几个』",
+              r50_names == ["选项1", "选项2", "选项3", "选了第几个"],
+              str(r50_names))
+        check("对话选择:没有『完成』出口(免得没选就往下跑)",
+              r50_choice.outputs.get("完成") is None)
+        check("对话选择:选项文字按 | 分隔",
+              r50_choice.option_texts() == ["救她", "自己跑", "再想想"],
+              str(r50_choice.option_texts()))
+
+        # 改『选项数』-> 出口立刻变(蓝图手感)
+        r50_choice.gk_option_count = 2
+        r50_choice.build_sockets()
+        check("对话选择:改『选项数』出口跟着变",
+              len([s for s in r50_choice.outputs
+                   if s.name.startswith("选项")]) == 2,
+              str([s.name for s in r50_choice.outputs]))
+
+        # 出口接两条链 -> 生成 match + 各自的分支
+        r50_choice.gk_option_count = 3
+        r50_choice.build_sockets()
+        r50_one = r50_tree.nodes.new("GKNodePrint")
+        r50_one.gk_text = "选了一"
+        r50_two = r50_tree.nodes.new("GKNodePrint")
+        r50_two.gk_text = "选了二"
+        r50_tree.links.new(r50_ready.outputs["执行"], r50_choice.inputs["执行"])
+        r50_tree.links.new(r50_choice.outputs["选项1"], r50_one.inputs["执行"])
+        r50_tree.links.new(r50_choice.outputs["选项2"], r50_two.inputs["执行"])
+        r50_code, r50_warnings = r50_codegen.generate(r50_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D"})
+        check("对话选择:生成无告警", not r50_warnings, str(r50_warnings)[:300])
+        check("对话选择:生成 match + 各出口的 case",
+              "_gk_choice_show(self," in r50_code
+              and "while _gk_choice_picked < 0:" in r50_code
+              and "match _gk_choice_picked:" in r50_code
+              and 'print("选了一")' in r50_code
+              and 'print("选了二")' in r50_code,
+              r50_code[:400])
+        check("对话选择:没连线的出口补 pass",
+              "        3:\n            pass" in r50_code)
+        check("对话选择:数字键 / 按钮两条路都在",
+              "func gk_choice_input_event" in r50_code
+              and "button.pressed.connect(_gk_choice_pick.bind(index + 1))"
+              in r50_code)
+
+        # 设计图里放不进去(它不是"控件构建"节点)
+        r50_design = bpy.data.node_groups.new("对话选择设计冒烟50", "GKUiDesignTree")
+        try:
+            r50_design.nodes.new("GKNodeUiChoice")
+            r50_blocked = False
+        except RuntimeError:
+            r50_blocked = True
+        check("对话选择:『游戏界面』设计图里放不进去",
+              r50_blocked and len(r50_design.nodes) == 0)
+
+        # 第五张卡之后又多了一张卡之外的东西 —— draw_buttons 也要画得完
+        class _R50Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        try:
+            r50_choice.draw_buttons(bpy.context, _R50Layout())
+            check("对话选择:节点卡片能画完(选项逐条列出来)", True)
+        except Exception as exc:                          # noqa: BLE001
+            check("对话选择:节点卡片能画完(选项逐条列出来)", False,
+                  f"{type(exc).__name__}: {exc}")
+
+        bpy.data.node_groups.remove(r50_design)
+        bpy.data.node_groups.remove(r50_tree)
+    except Exception as exc:
+        check("第五十轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 屏幕暗角(第五十一轮:阶段④屏幕氛围)----
+    # ① 节点注册上了,属性齐(强度 / 内圈 / 柔和 / 颜色 / 过渡);
+    # ② 生成物:自己的着色器常量 + 全屏 ColorRect + 层号 92(滤镜 90 之上);
+    # ③ 两个屏幕效果能叠着用(滤镜 + 暗角各有各的常量 / 层);
+    # ④ 节点卡片画得完。
+    try:
+        r51_codegen = _r50_import(f"{module_name}.codegen")
+        r51_cls = getattr(node_lib, "GKNodeScreenVignette", None)
+        check("屏幕暗角:节点注册成功", r51_cls is not None)
+
+        r51_tree = bpy.data.node_groups.new("屏幕暗角冒烟51", "GKGameLogicTree")
+        r51_ready = r51_tree.nodes.new("GKNodeOnReady")
+        r51_vig = r51_tree.nodes.new("GKNodeScreenVignette")
+        r51_vig.gk_amount = 0.7
+        r51_vig.gk_radius = 0.55
+        r51_vig.gk_edge = 0.35
+        r51_vig.gk_fade = 0.0
+        r51_tree.links.new(r51_ready.outputs["执行"], r51_vig.inputs["执行"])
+        r51_code, r51_warnings = r51_codegen.generate(r51_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D"})
+        check("屏幕暗角:生成无告警", not r51_warnings, str(r51_warnings)[:300])
+        check("屏幕暗角:自带着色器常量 + 全屏遮罩 + 层号 92",
+              "const _GK_VIGNETTE_SHADER :=" in r51_code
+              and "func _gk_ensure_vignette(" in r51_code
+              and "ColorRect.new()" in r51_code
+              and "layer = 92" in r51_code,
+              r51_code[-500:])
+        check("屏幕暗角:读屏走 hint_screen_texture(Godot 4.7 没有 SCREEN_TEXTURE)",
+              "hint_screen_texture" in r51_code
+              and "SCREEN_TEXTURE" not in r51_code)
+        check("屏幕暗角:四个参数都写进去了",
+              'set_shader_parameter("vignette_radius", 0.55)' in r51_code
+              and 'set_shader_parameter("vignette_edge", 0.35)' in r51_code
+              and 'set_shader_parameter("vignette_color"' in r51_code
+              and 'set_shader_parameter("vignette_amount"' in r51_code)
+
+        # 和『屏幕_滤镜』叠着用:两个常量、两层都在
+        r51_tint = r51_tree.nodes.new("GKNodeScreenFilter")
+        r51_tint.gk_amount = 0.6
+        r51_tree.links.new(r51_vig.outputs["完成"], r51_tint.inputs["执行"])
+        r51_code2, _r51_warn2 = r51_codegen.generate(r51_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D"})
+        check("屏幕暗角:和『屏幕_滤镜』叠着用(两层各一个着色器)",
+              "const _GK_FILTER_SHADER :=" in r51_code2
+              and "const _GK_VIGNETTE_SHADER :=" in r51_code2
+              and "layer = 90" in r51_code2 and "layer = 92" in r51_code2,
+              "缺常量或层号")
+
+        class _R51Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        try:
+            r51_vig.draw_buttons(bpy.context, _R51Layout())
+            check("屏幕暗角:节点卡片能画完", True)
+        except Exception as exc:                          # noqa: BLE001
+            check("屏幕暗角:节点卡片能画完", False,
+                  f"{type(exc).__name__}: {exc}")
+
+        bpy.data.node_groups.remove(r51_tree)
+    except Exception as exc:
+        check("第五十一轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 资产库(第四十三轮:『游戏资产』)----

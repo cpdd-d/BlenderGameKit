@@ -2577,3 +2577,30 @@ def _stmt_wait(ctx, node, indent):
         ctx.add_line(indent, f"await get_tree().create_timer({seconds}, true, false, true).timeout")
     else:
         ctx.add_line(indent, f"await get_tree().create_timer({seconds}).timeout")
+
+
+# ==========================================================================
+# 灯光(第四十八轮:阶段①灯光扩展)
+# ==========================================================================
+@stmt_node("GKNodeSetLight")
+def _stmt_set_light(ctx, node, indent):
+    """『灯光_设置』:开关 / 亮度 / 颜色一盏场景灯。
+
+    ── 为什么运行时按**名字**找灯,而不是导出时写死节点路径 ─────────
+    灯是场景根下的节点(名字 = Blender 里灯光物体的名字),而挂脚本的
+    物体可能在任意深度;场景还会换关卡(整棵树换掉)。按名字从
+    current_scene 往下找,换场景后照样对得上;找不到就**静默跳过** ——
+    灯没导出来 / 名字打错,不该让游戏崩掉(探针那边另有断言兜着)。
+    """
+    light = ctx.input_string(node, "灯名", "")
+    on = ctx.input_bool_expr(node, "开启", "true")
+    energy = ctx.input_number(node, "亮度", "0.0")
+    if bool(getattr(node, "gk_set_color", False)):
+        color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+        color_text = (f"Color({gd_number(color[0])}, {gd_number(color[1])}, "
+                      f"{gd_number(color[2])}, {gd_number(color[3])})")
+    else:
+        color_text = "null"
+    ctx.need_light_helper = True
+    ctx.add_line(indent, f"_gk_set_light(self, {light}, {on}, {energy}, "
+                         f"{color_text})")

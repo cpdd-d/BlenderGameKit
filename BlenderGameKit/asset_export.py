@@ -105,11 +105,25 @@ fov = {fov:.2f}
 current = true
 """
 
-ENVIRONMENT_LIGHT = """
-[node name="{name}" type="DirectionalLight3D" parent="."]
+# ── 灯光节点(第四十八轮:阶段①灯光扩展)────────────────────────────
+# 以前这里只有太阳一条模板、而且**只取场景里第一盏 SUN**(见 git 历史):
+# 颜色 / 阴影 / 点光 / 聚光全都没有 —— 恐怖游戏要的"手电筒照出一小片"
+# 根本做不出来。现在三种灯都导:
+#   * SUN   -> DirectionalLight3D(平行光 / 太阳)
+#   * POINT -> OmniLight3D(灯泡,随距离变暗)
+#   * SPOT  -> SpotLight3D(手电筒 / 聚光)
+# 颜色 / 亮度 / 阴影开关 / 柔和尺寸都带上;点光与聚光再带范围与锥角。
+#
+# ── 颜色为什么不转换(说明白,免得下次又有人来"修")──────────────
+# Blender 的灯光颜色是**线性**空间的值(和材质 base_color 一个习惯),
+# Godot 的 light_color 也按线性参与渲染 —— 1:1 直接写,不做 sRGB 转换。
+LIGHT_NODE = """
+[node name="{name}" type="{type}" parent="."]
 transform = Transform3D({basis}, {lx}, {ly}, {lz})
+light_color = Color({r}, {g}, {b}, 1)
 light_energy = {energy:.3f}
-"""
+shadow_enabled = {shadow}
+{extra}"""
 
 # 让 glb 里带进来的相机成为主相机。
 #
@@ -175,8 +189,16 @@ extends Node
 ## 但方向跟着场景灯走 —— 转太阳,角色身上的阴影跟着转。
 @export var follow_scene_light: bool = {follow_scene_light}
 
-## 想指定用哪盏灯就填它的名字;留空 = 用场景里找到的第一盏平行光。
+## 想指定用哪盏灯就填它的名字;留空 = 自动挑(见 _gk_lights_on)。
 @export var light_name: String = ""
+
+## ── 手电筒:跟着相机走的灯(第四十八轮:阶段①灯光扩展)──────────────
+## 在 Blender 里给灯勾上『跟随相机(手电筒)』(『游戏物理』面板 -> 灯光),
+## 导出会把这盏灯的名字写进来(多盏用竖线分隔)。运行时**每物理帧**把
+## 它的位置和朝向对齐**当前相机** —— 手电筒 / 头灯的效果。
+## 灯的颜色 / 亮度 / 影子照旧用它自己的设置,这里只搬 transform;
+## 编辑器里不搬(免得在编辑器里乱动场景)。
+@export var follow_lights: String = "{follow_lights}"
 
 ## ── 上帝摄像机(关卡测试)──────────────────────────────────────────
 ## 场景设置里开了『上帝摄像机』时,这里常驻一台自由飞行相机:
@@ -205,8 +227,9 @@ extends Node
 ## 两个功能互相打架)。所以这里不是"永远抢 Esc",而是"没人用才兜底"。
 @export var esc_quit: bool = {esc_quit}
 
-## 收集到的卡通材质(供 _update_light 用)。
-var _gk_materials: Array = []
+## 收集到的卡通材质(第四十八轮起**连宿主节点一起收** —— 多光近似要按
+## 每个材质自己的位置算"离哪盏灯近"):[[MeshInstance3D, ShaderMaterial], …]。
+var _gk_mats: Array = []
 
 ## 上帝摄像机的运行状态(Tab 切换 / **自己**那份鼠标位移)。
 var _gk_god_cam: Camera3D = null
@@ -458,8 +481,8 @@ func _apply_material_table(root: Node, quiet: bool = false) -> int:
 ## light_dir 置零(shader 走"没有光"那条路)+ 环境色拉满 + 阴影色改白,
 ## 结果就是 ALBEDO = 贴图本色。
 func _apply_flat() -> void:
-	for mat in _gk_materials:
-		var sm := mat as ShaderMaterial
+	for pair in _gk_mats:
+		var sm := pair[1] as ShaderMaterial
 		if sm == null:
 			continue
 		sm.set_shader_parameter("light_dir", Vector3.ZERO)
@@ -468,7 +491,7 @@ func _apply_flat() -> void:
 
 
 func _collect_materials() -> void:
-	_gk_materials.clear()
+	_gk_mats.clear()
 	var root := _scene_root()
 	if root == null:
 		return
@@ -476,56 +499,144 @@ func _collect_materials() -> void:
 		var mesh_node := node as MeshInstance3D
 		if mesh_node == null:
 			continue
+		# ⚠ 同一个材质资源可能被多个网格共用(复制出来的道具)。这里**按
+		# 宿主逐条**收,不去重 —— 多光近似要按"这个网格在哪"算方向,
+		# 共用一份材质时两边的取值会互相覆盖(每帧重设,最后一个赢)。
+		# 想各自正确就得各用各的材质,这一点写在 README 里了。
+		var found: Array = []
 		if mesh_node.material_override is ShaderMaterial:
-			_gk_materials.append(mesh_node.material_override)
+			found.append(mesh_node.material_override)
 		for i in range(mesh_node.get_surface_override_material_count()):
 			var sm := mesh_node.get_surface_override_material(i) as ShaderMaterial
-			if sm != null and not _gk_materials.has(sm):
-				_gk_materials.append(sm)
+			if sm != null and not found.has(sm):
+				found.append(sm)
+		for mat in found:
+			_gk_mats.append([mesh_node, mat])
 
 
-## 场景灯光 -> 卡通材质。见 follow_scene_light 的说明。
+## ── 手电筒:把标了『跟随相机』的灯每帧贴到当前相机上(第四十八轮)──────
+## 为什么在**物理帧**里搬:角色移动在 _physics_process,手电筒晚一帧会
+## 看到"人动了、光柱慢半拍"。编辑器里不搬(免得在编辑器里乱动场景)。
+func _gk_follow_lights_tick() -> void:
+	if follow_lights.strip_edges().is_empty() or Engine.is_editor_hint():
+		return
+	var cam := get_viewport().get_camera_3d()
+	if cam == null:
+		return
+	var root := _scene_root()
+	if root == null:
+		return
+	for entry in follow_lights.split("|", false):
+		var wanted := entry.strip_edges()
+		if wanted.is_empty():
+			continue
+		var found := root.find_child(wanted, true, false)
+		if found is Light3D:
+			(found as Light3D).global_transform = cam.global_transform
+
+
+## 场景灯光 -> 卡通材质(第四十八轮:从"只跟一盏平行光"升级成多光近似)。
 ## 参数名带下划线前缀 = "故意不用":取值走 get_physics_process_delta_time(),
 ## 而 Godot 会把没用上的参数报成 UNUSED_PARAMETER(调试器里一条错误)。
+##
+## 主光怎么选:每帧对**每个材质**算一遍"哪盏亮着的灯对它影响最大" ——
+##   * 平行光:按 light_energy(打了 0.8 折,见 _gk_pick_light 的说明);
+##   * 点光 / 聚光:按距离衰减(聚光还要"照在锥里"),方向 = 灯照向材质。
+## 挑中的那盏按"主光"喂给 shader(色阶 / 阴影方向 / 亮度都跟着它)。
+##
+## ⚠ 这是**近似**,不是真实多光源:shader 的色阶是硬边的,多盏叠加会糊成
+## 一片灰,所以"多盏同时照"只取影响最大的那盏。要逐像素一致得改 shader,
+## 不值当 —— 这里保证的是"手电筒照到谁,谁就跟着手电筒变化"这个体感。
 func _update_light(_delta: float) -> void:
-	if not follow_scene_light or _gk_materials.is_empty():
+	if not follow_scene_light or _gk_mats.is_empty():
 		return
-	var light := _find_directional_light()
-	if light == null:
-		# 场景里没有**亮着**的平行光 -> 告诉 shader "没光",
-		# 它会退化成只画环境色(见 gk_toon.gdshader 里的零向量特判)。
-		# 不这么做的话,灯关了角色还是亮的(实测踩过)。
-		for mat in _gk_materials:
-			var sm_off := mat as ShaderMaterial
+	var lights := _gk_lights_on()
+	if lights.is_empty():
+		# 一盏亮的灯都没有 -> 告诉 shader "没光",它会退化成只画环境色
+		# (见 gk_toon.gdshader 里的零向量特判)。不这么做的话,灯关了
+		# 角色还是亮的(实测踩过)。
+		for pair in _gk_mats:
+			var sm_off := pair[1] as ShaderMaterial
 			if sm_off != null:
 				sm_off.set_shader_parameter("light_dir", Vector3.ZERO)
 		return
-	# 平行光的 -Z 轴就是它照射的方向;取反得到"光从哪来"。
-	var dir: Vector3 = -light.global_transform.basis.z.normalized()
-	var energy: float = light.light_energy
-	var col: Color = light.light_color
-	for mat in _gk_materials:
-		var sm := mat as ShaderMaterial
+	for pair in _gk_mats:
+		var sm := pair[1] as ShaderMaterial
 		if sm == null:
 			continue
-		sm.set_shader_parameter("light_dir", dir)
-		sm.set_shader_parameter("light_color", col)
-		# 场景灯的 energy 直接当亮度。1.0 是基准,免得默认灯太暗。
-		sm.set_shader_parameter("light_energy", clampf(energy, 0.0, 4.0))
+		var pick := _gk_pick_light(lights, pair[0] as Node3D)
+		if pick.is_empty():
+			continue
+		sm.set_shader_parameter("light_dir", pick[0])
+		sm.set_shader_parameter("light_color", pick[1])
+		# 亮度夹到 shader 的 0~4,免得点光一近就过曝成一片白。
+		sm.set_shader_parameter("light_energy", pick[2])
 
 
-func _find_directional_light() -> DirectionalLight3D:
+## 场景里**亮着**的灯(第四十八轮:三种类型都能当主光)。
+## 指定了 light_name 就只认那一盏(老行为);否则全部类型都算候选。
+func _gk_lights_on() -> Array:
 	var root := _scene_root()
 	if root == null:
-		return null
+		return []
+	var out: Array = []
 	if not light_name.is_empty():
 		var named := root.find_child(light_name, true, false)
-		if named is DirectionalLight3D and _light_is_on(named):
-			return named as DirectionalLight3D
-	for node in root.find_children("*", "DirectionalLight3D", true, false):
+		if named is Light3D and _light_is_on(named):
+			out.append(named)
+		return out
+	for node in root.find_children("*", "Light3D", true, false):
 		if _light_is_on(node):
-			return node as DirectionalLight3D
-	return null
+			out.append(node)
+	return out
+
+
+## 这个材质该用哪盏灯:算"影响"挑最大的那盏(近似,见 _update_light)。
+## 返回 [照射方向, 颜色, 亮度];空数组 = 没有可用的灯。
+func _gk_pick_light(lights: Array, node: Node3D) -> Array:
+	var best: Array = []
+	var best_score := -1.0
+	var here := Vector3.ZERO
+	if node != null:
+		here = node.global_position
+	for light in lights:
+		var l := light as Light3D
+		if l == null:
+			continue
+		var score := 0.0
+		var reach := 1.0
+		var dir := Vector3.ZERO
+		if l is DirectionalLight3D:
+			# 平行光照的是全场景 —— 给 0.8 的折扣,让"照到脸上的手电筒"能
+			# 盖过月光(不打折的话,恐怖游戏里手电筒永远赢不了太阳)。
+			score = l.light_energy * 0.8
+			dir = -l.global_transform.basis.z.normalized()
+		else:
+			var span := 5.0
+			if l is OmniLight3D:
+				span = (l as OmniLight3D).omni_range
+			elif l is SpotLight3D:
+				span = (l as SpotLight3D).spot_range
+			if span <= 0.0:
+				span = 5.0
+			var away := here - l.global_position
+			var dist := away.length()
+			reach = clampf(1.0 - dist / span, 0.0, 1.0)
+			score = l.light_energy * reach
+			if dist > 0.001:
+				dir = away.normalized()
+				if l is SpotLight3D:
+					# 聚光只在锥内有影响:拿"灯的照射方向"和"灯到材质的方向"
+					# 点乘当权重 —— 照不到的方向不该被它染色。
+					var aim := -l.global_transform.basis.z.normalized()
+					score *= clampf(aim.dot(dir), 0.0, 1.0)
+			else:
+				dir = -l.global_transform.basis.z.normalized()
+		if score > best_score:
+			best_score = score
+			best = [dir, l.light_color,
+					clampf(l.light_energy * reach, 0.0, 4.0)]
+	return best
 
 
 ## 这盏灯**现在是否在发光**。
@@ -551,6 +662,9 @@ func _light_is_on(node: Node) -> bool:
 ## 光照跟着一起更新才不会出现"身体动了阴影还停在上一帧"的晃动。
 func _physics_process(delta: float) -> void:
 	_update_light(delta)
+	# 手电筒(第四十八轮):贴到当前相机上 —— 排在 _update_light 之后,
+	# 这一帧喂给 shader 的方向就是手电筒搬完后的位置(不差一帧)。
+	_gk_follow_lights_tick()
 	_gk_sync_colliders()
 	# 内置 ESC 退出(第三十九轮):和上帝机无关,每一帧都要看
 	if esc_quit and not Engine.is_editor_hint():
@@ -1349,6 +1463,7 @@ ENV_SCRIPT_DEFAULTS = dict(
     possess_key="KEY_F",
     esc_quit="true",
     nav_bake="false",
+    follow_lights="",
 )
 
 
@@ -1559,6 +1674,199 @@ def _esc_claimed_by_graph(scene):
 
 
 # ==========================================================================
+# 环境与后处理(第四十九轮:阶段②—— WorldEnvironment + Environment)
+# ==========================================================================
+# 用户在设计文档里选的第二阶段:"导出 WorldEnvironment + Environment 资源:
+# 背景(纯色 / 天空)、环境光、雾(开关 / 浓度 / 颜色)、泛光(glow)、
+# 暗角 / 色调"。入口在『游戏显示』设置图新增的『显示_环境氛围』卡。
+#
+# ── 为什么是**子资源**(而不是单独一个 env/*.tres)──────────────────
+# 场景本来就一个 .tscn,Environment 只属于这一关 —— 写成 .tscn 里的
+# `[sub_resource type="Environment"]`,Godot 打开就自带,少一个文件、
+# 少一处"忘了清理"的风险(多场景导出时每关各一份,天然隔离)。
+#
+# ── 颜色为什么不转换(和灯光同一条约定)──────────────────────────
+# Blender 的 FloatVectorProperty(COLOR)是**线性**空间的值,Godot 的
+# 环境颜色也按线性参与渲染 —— 1:1 直接写,不做 sRGB 转换。
+#
+# ── 暗角呢?──────────────────────────────────────────────────────
+# Godot 的 Environment **没有**内置暗角(vignette)—— 暗角要靠后处理
+# 着色器做。这一版先给 Environment 真有的这几样(背景 / 环境光 / 雾 /
+# 泛光 / 色调映射 + 调色),暗角留到氛围套件那一轮(配合全屏 shader)。
+
+# 背景模式 / 色调映射的取值 = Godot 的枚举数值。离线测试会断言这里的
+# 顺序和 properties 里枚举项的**顺序一致**(防两处各写一套飘掉)。
+ENV_BACKGROUND_MODES = {"COLOR": 1, "SKY": 2}
+ENV_TONEMAP_MODES = {"LINEAR": 0, "REINHARD": 1, "FILMIC": 2, "ACES": 3}
+
+ENV_RESOURCE_ID = "gk_environment"
+ENV_SKY_MATERIAL_ID = "gk_sky_material"
+ENV_SKY_ID = "gk_sky"
+
+ENVIRONMENT_SUBRESOURCE = """[sub_resource type="Environment" id="{res_id}"]
+background_mode = {background_mode}
+background_color = {bg_color}
+ambient_light_source = 3
+ambient_light_color = {ambient_color}
+ambient_light_energy = {ambient_energy}
+fog_enabled = {fog}
+fog_light_color = {fog_color}
+fog_density = {fog_density}
+glow_enabled = {glow}
+glow_intensity = {glow_intensity}
+glow_bloom = {glow_bloom}
+tonemap_mode = {tonemap}
+adjustment_enabled = {adjust}
+adjustment_brightness = {brightness}
+adjustment_contrast = {contrast}
+adjustment_saturation = {saturation}
+{sky_line}"""
+
+# 程序化天空:一个 ProceduralSkyMaterial + 一个 Sky 资源。
+# 天空的顶色 = 用户填的背景色,地平线往白里提一点点(纯色天空不好看);
+# 地面那半边压暗,免得"地面颜色"漏进天空里。
+SKY_MATERIAL_SUBRESOURCE = """[sub_resource type="ProceduralSkyMaterial" id="{mat_id}"]
+sky_top_color = {top}
+sky_horizon_color = {horizon}
+ground_bottom_color = {ground_bottom}
+ground_horizon_color = {horizon}"""
+
+SKY_SUBRESOURCE = """[sub_resource type="Sky" id="{sky_id}"]
+sky_material = SubResource("{mat_id}")"""
+
+ENVIRONMENT_NODE_TEXT = """[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("{res_id}")"""
+
+
+def _env_number(settings, attr, fallback):
+    """读一个数字型场景设置(读不到 / 非法值就回退),并夹到合理范围。"""
+    try:
+        value = float(getattr(settings, attr, fallback))
+    except (TypeError, ValueError):
+        return float(fallback)
+    if value != value:                                  # NaN
+        return float(fallback)
+    return value
+
+
+def _env_color_text(value, fallback=(0.0, 0.0, 0.0, 1.0)):
+    """把场景设置里的 RGBA 读成 Godot 的 Color(...) 文本(线性,1:1)。"""
+    try:
+        parts = [float(component) for component in value]
+    except (TypeError, ValueError):
+        parts = list(fallback)
+    while len(parts) < 4:
+        parts.append(1.0)
+    return "Color({:.6f}, {:.6f}, {:.6f}, {:.6f})".format(*parts[:4])
+
+
+def _env_mix(color, other, amount):
+    """两个 RGBA 之间线性插值(天空地平线用:顶色往白里提)。"""
+    out = []
+    for index in range(4):
+        a = float(color[index]) if index < len(color) else 1.0
+        b = float(other[index]) if index < len(other) else 1.0
+        out.append(a + (b - a) * float(amount))
+    return tuple(out)
+
+
+def env_settings(scene):
+    """读出这一关的环境设置;**没开**(或读不到)返回 None。
+
+    纯读 `scene.gk_settings` 的属性 —— 离线测试喂一个假对象就能验。
+
+    ⚠ 2D 项目直接返回 None:WorldEnvironment 是 3D 的东西,挂在 2D 场景里
+    什么都不会发生(用户会觉得"开关开了没反应")。所以卡上开着也**不导**,
+    卡自己会红字提醒"只支持 3D"(和调试面板同一条约定)。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    if settings is None or not bool(getattr(settings, "env_enabled", False)):
+        return None
+    if str(getattr(settings, "dimension", "3")) == "2":
+        return None
+    background = str(getattr(settings, "env_background", "COLOR") or "COLOR")
+    tonemap = str(getattr(settings, "env_tonemap", "LINEAR") or "LINEAR")
+    return {
+        "background": background if background in ENV_BACKGROUND_MODES else "COLOR",
+        "tonemap": tonemap if tonemap in ENV_TONEMAP_MODES else "LINEAR",
+        "bg_color": _env_color_text(getattr(settings, "env_bg_color", None),
+                                    (0.05, 0.06, 0.10, 1.0)),
+        "ambient_color": _env_color_text(
+            getattr(settings, "env_ambient_color", None), (0.55, 0.62, 0.80, 1.0)),
+        "ambient_energy": _env_number(settings, "env_ambient_energy", 0.3),
+        "fog": bool(getattr(settings, "env_fog", False)),
+        "fog_color": _env_color_text(getattr(settings, "env_fog_color", None),
+                                     (0.30, 0.34, 0.42, 1.0)),
+        "fog_density": _env_number(settings, "env_fog_density", 0.02),
+        "glow": bool(getattr(settings, "env_glow", False)),
+        "glow_intensity": _env_number(settings, "env_glow_intensity", 0.8),
+        "glow_bloom": _env_number(settings, "env_glow_bloom", 0.1),
+        "adjust": bool(getattr(settings, "env_adjust", False)),
+        "brightness": _env_number(settings, "env_brightness", 1.0),
+        "contrast": _env_number(settings, "env_contrast", 1.0),
+        "saturation": _env_number(settings, "env_saturation", 1.0),
+    }
+
+
+def environment_scene_blocks(scene):
+    """环境与后处理的 (子资源文本列表, 节点文本)。没开 -> ([], "")。
+
+    子资源要**加进 .tscn 的 sub_resources**(load_steps 之前),
+    节点文本拼到场景末尾 —— 调用方负责这两件事(见 write_world_scene)。
+    """
+    values = env_settings(scene)
+    if values is None:
+        return [], ""
+
+    sub_resources = []
+    sky_line = ""
+    if values["background"] == "SKY":
+        settings = getattr(scene, "gk_settings", None)
+        top = _godot_color_tuple(getattr(settings, "env_bg_color", None),
+                                 (0.05, 0.06, 0.10, 1.0))
+        horizon = _env_mix(top, (1.0, 1.0, 1.0, 1.0), 0.35)
+        ground = tuple(component * 0.5 for component in top[:3]) + (1.0,)
+        sub_resources.append(SKY_MATERIAL_SUBRESOURCE.format(
+            mat_id=ENV_SKY_MATERIAL_ID,
+            top=_env_color_text(top), horizon=_env_color_text(horizon),
+            ground_bottom=_env_color_text(ground)))
+        sub_resources.append(SKY_SUBRESOURCE.format(
+            sky_id=ENV_SKY_ID, mat_id=ENV_SKY_MATERIAL_ID))
+        sky_line = f'sky = SubResource("{ENV_SKY_ID}")'
+
+    sub_resources.append(ENVIRONMENT_SUBRESOURCE.format(
+        res_id=ENV_RESOURCE_ID,
+        background_mode=ENV_BACKGROUND_MODES[values["background"]],
+        bg_color=values["bg_color"],
+        ambient_color=values["ambient_color"],
+        ambient_energy="%.6f" % values["ambient_energy"],
+        fog="true" if values["fog"] else "false",
+        fog_color=values["fog_color"],
+        fog_density="%.6f" % values["fog_density"],
+        glow="true" if values["glow"] else "false",
+        glow_intensity="%.6f" % values["glow_intensity"],
+        glow_bloom="%.6f" % values["glow_bloom"],
+        tonemap=ENV_TONEMAP_MODES[values["tonemap"]],
+        adjust="true" if values["adjust"] else "false",
+        brightness="%.6f" % values["brightness"],
+        contrast="%.6f" % values["contrast"],
+        saturation="%.6f" % values["saturation"],
+        sky_line=sky_line))
+    return sub_resources, ENVIRONMENT_NODE_TEXT.format(res_id=ENV_RESOURCE_ID)
+
+
+def _godot_color_tuple(value, fallback=(0.0, 0.0, 0.0, 1.0)):
+    """场景设置里的 RGBA -> 四元组(给天空材料算颜色用)。"""
+    try:
+        parts = [float(component) for component in value]
+    except (TypeError, ValueError):
+        return tuple(fallback)
+    while len(parts) < 4:
+        parts.append(1.0)
+    return tuple(parts[:4])
+
+
+# ==========================================================================
 # 寻路 / 导航网格(第三十四轮:用户选的"敌人会绕墙追你")
 # ==========================================================================
 # 导出的是一块 **运行时烤的** 导航网格:场景里放一个 NavigationRegion3D
@@ -1749,6 +2057,9 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
         # 暂停菜单 / 用户自己接的 Esc 都算"有人管了"(见 _esc_claimed_by_graph)。
         esc_quit="false" if _esc_claimed_by_graph(scene) else "true",
         nav_bake="true" if _nav_on(scene) else "false",
+        # 手电筒(第四十八轮):勾了『跟随相机』的灯名,运行时贴着相机走
+        # (见环境脚本里的 _gk_follow_lights_tick)。
+        follow_lights=_follow_light_names(_collect_lights(scene)),
     )
 
 
@@ -2266,6 +2577,14 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             sub_resources.append(
                 NAVPOLY_SUBRESOURCE.format(radius=nav["radius"]))
 
+    # ---- 环境与后处理(第四十九轮:阶段②)----
+    # WorldEnvironment 只挂在**这张要走的主场景**上:角色子场景是被
+    # World 实例化的,它再挂一个 WorldEnvironment 会和主场景的打架
+    # (同一个视口只有一个环境生效)。子资源必须**在 load_steps 之前**
+    # 加进来,节点文本拼到场景末尾。
+    env_blocks, env_node = environment_scene_blocks(scene)
+    sub_resources.extend(env_blocks)
+
     load_steps = 1 + len(ext_lines) + len(sub_resources)
 
     lines = ["; 由 BlenderGameKit 自动生成,请勿手动修改",
@@ -2544,6 +2863,11 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         lines.append(environment.strip("\n"))
         lines.append("")
 
+    # 环境与后处理(第四十九轮):WorldEnvironment + Environment 子资源
+    if env_node:
+        lines.append(env_node.strip("\n"))
+        lines.append("")
+
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(lines))
 
@@ -2704,6 +3028,10 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     # 让整场景导出失败。所以 glb 里**不可能**有灯,
     # `skip["lights"]` 不该再影响判断 —— 否则场景里会一盏灯都没有(全黑)。
     glb_has_light = False
+    # 第四十八轮:要导的灯**先收集一遍**(三种类型 + 全盏,隐藏/关着的不算),
+    # 两条分支共用同一份名单 —— 以前是各写一个"找第一盏 SUN"的循环,
+    # 加类型时只改一边就漏(和 _env_fields 踩过的坑同款)。
+    lights = _collect_lights(scene)
 
     parts = []
     files = {}
@@ -2738,20 +3066,10 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
 
         # ── 灯光:这条分支以前**不生成灯**,靠 glb 带进来 ─────────────
         # 现在 glb 里已经没有灯了(见 export_lights=False 的说明),
-        # 所以这里必须自己补一盏,否则场景全黑 ——
-        # 实测踩过:包装场景里一个 Light3D 都没有。
-        for obj in scene.objects:
-            if obj.type != "LIGHT" or obj.hide_get() or obj.data.type != "SUN":
-                continue
-            light_position = _godot_position(obj, True)
-            light_energy = float(getattr(obj.data, "energy", 1.0))
-            parts.append(ENVIRONMENT_LIGHT.format(
-                name=_sanitize_node_name(obj.name),
-                basis=_light_basis_text(obj),
-                lx=_fmt(light_position[0]), ly=_fmt(light_position[1]),
-                lz=_fmt(light_position[2]),
-                energy=max(0.2, min(light_energy * 1.2, 4.0))))
-            break
+        # 所以这里必须自己补 —— 否则场景全黑(实测踩过:包装场景里
+        # 一个 Light3D 都没有)。第四十八轮起**全部类型、全部盏**都导。
+        for obj in lights:
+            parts.append(_light_node_text(obj))
 
         fields = _env_fields(scene, camera_name=name, fov=fov,
                              material_files=material_files)
@@ -2781,18 +3099,10 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         break       # 只补一个
 
     if not glb_has_light:
-        for obj in scene.objects:
-            if obj.type != "LIGHT" or obj.hide_get() or obj.data.type != "SUN":
-                continue
-            position = _godot_position(obj, True)
-            energy = float(getattr(obj.data, "energy", 1.0))
-            # Blender 的太阳能量 1.0 在 Godot 里偏暗,乘个系数让默认看起来正常
-            parts.append(ENVIRONMENT_LIGHT.format(
-                name=_sanitize_node_name(obj.name),
-                basis=_light_basis_text(obj),
-                lx=_fmt(position[0]), ly=_fmt(position[1]), lz=_fmt(position[2]),
-                energy=max(0.2, min(energy * 1.2, 4.0))))
-            break
+        # 第四十八轮:全部类型、全部盏(见上面 _collect_lights 的说明);
+        # 能量换算在 _light_energy_for 里(太阳 ×1.2 / 点光聚光 1000W≈1.0)。
+        for obj in lights:
+            parts.append(_light_node_text(obj))
 
     # ── Environment 节点(踩过的坑)───────────────────────────────────
     # 以前这条分支**没有**加 Environment 节点 —— 只补了相机和灯就返回了。
@@ -2970,6 +3280,112 @@ def _light_basis_text(obj):
     明暗完全对不上。所以朝向必须一起导出。
     """
     return _camera_basis_text(obj)
+
+
+def _light_energy_for(obj):
+    """Blender 灯光能量 -> Godot light_energy(第四十八轮)。
+
+    ── 两套单位,两条规则(都写在这,别去猜)──────────────────────
+    太阳:Blender 的 energy 是辐照度(新建默认 1.0),Godot 平行光默认也是
+          1.0,但实测 1.0 在 Godot 里偏暗 —— 沿用老的 ×1.2、夹 [0.2, 4.0]。
+    点光 / 聚光:Blender 是**瓦特**(新建一盏默认 1000W),Godot 是倍数
+          (默认 1.0)—— 约定 **1000W ≈ 1.0**,夹 [0.05, 8.0]。
+          想微调就直接改 Blender 里的瓦数,或者导出后在 Godot 里改。
+    """
+    energy = float(getattr(obj.data, "energy", 1.0) or 0.0)
+    if str(getattr(obj.data, "type", "")) == "SUN":
+        return max(0.2, min(energy * 1.2, 4.0))
+    return max(0.05, min(energy / 1000.0, 8.0))
+
+
+def _light_node_text(obj):
+    """一盏 Blender 灯 -> Godot 灯光节点文本(第四十八轮)。
+
+    返回 None = 这盏灯不导(隐藏 / 能量 0 / 类型不支持),调用方跳过它。
+    """
+    data = getattr(obj, "data", None)
+    kind = str(getattr(data, "type", ""))
+    if kind not in ("SUN", "POINT", "SPOT"):
+        return None
+    if float(getattr(data, "energy", 1.0) or 0.0) <= 0.0:
+        return None                       # 能量 0 = 关着的灯,不当灯导
+    godot_type = {"SUN": "DirectionalLight3D", "POINT": "OmniLight3D",
+                  "SPOT": "SpotLight3D"}[kind]
+    colour = getattr(data, "color", (1.0, 1.0, 1.0))
+    try:
+        r, g, b = float(colour[0]), float(colour[1]), float(colour[2])
+    except Exception:                                     # noqa: BLE001
+        r, g, b = 1.0, 1.0, 1.0
+
+    extras = []
+    # 范围:用 Blender 的『自定义距离』(= 灯照到多远);没填就交给 Godot 默认。
+    cutoff = float(getattr(data, "cutoff_distance", 0.0) or 0.0)
+    if kind in ("POINT", "SPOT") and cutoff > 0.0:
+        extras.append(("omni_range" if kind == "POINT" else "spot_range",
+                       f"{cutoff:.3f}"))
+    if kind == "SPOT":
+        # Blender 的 spot_size 是**整锥角**(弧度),Godot 的 spot_angle 是
+        # **半角**(度)—— Blender 里 45° 的锥,Godot 里写 22.5 才一样大。
+        angle = float(getattr(data, "spot_size", 0.0) or 0.0)
+        half = max(1.0, min(angle * _DEG / 2.0, 89.0))
+        extras.append(("spot_angle", f"{half:.3f}"))
+    # 阴影柔和度:Blender 的"半径"和 Godot 的 light_size 是同一个意思(米)。
+    soft = float(getattr(data, "shadow_soft_size", 0.0) or 0.0)
+    if kind in ("POINT", "SPOT") and soft > 0.0:
+        extras.append(("light_size", f"{soft:.3f}"))
+    if kind == "SUN":
+        # 太阳的角直径(度)<=> Godot 的 light_angular_distance(同一个东西)。
+        sun_angle = float(getattr(data, "angle", 0.0) or 0.0)
+        extras.append(("light_angular_distance", f"{sun_angle * _DEG:.4f}"))
+
+    extra_text = "".join(f"{key} = {value}\n" for key, value in extras)
+    position = _godot_position(obj, True)
+    return LIGHT_NODE.format(
+        name=_sanitize_node_name(obj.name),
+        type=godot_type,
+        basis=_light_basis_text(obj),
+        lx=_fmt(position[0]), ly=_fmt(position[1]), lz=_fmt(position[2]),
+        r=_fmt(r), g=_fmt(g), b=_fmt(b),
+        energy=_light_energy_for(obj),
+        shadow="true" if bool(getattr(data, "use_shadow", True)) else "false",
+        extra=extra_text)
+
+
+def _light_follow_camera(obj):
+    """这盏灯要不要"跟着相机走"(手电筒;第四十八轮)。
+
+    读物体上的 `gk_physics.light_follow_camera`(『游戏物理』面板 -> 灯光)。
+    后台 / 老 .blend 里属性可能没挂上 —— 一律兜底 False,绝不因此报错。
+    """
+    physics = getattr(obj, "gk_physics", None)
+    if physics is None:
+        return False
+    try:
+        return bool(getattr(physics, "light_follow_camera", False))
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
+def _collect_lights(scene):
+    """场景里所有**要导出的灯**(第四十八轮)。
+
+    过滤规则:隐藏的灯(hide_get)和能量 0 的灯视为"关着",不导;不支持
+    的类型(面积光等)也不导 —— 面板上会红字提示换太阳 / 点光 / 聚光。
+    """
+    lights = []
+    for obj in getattr(scene, "objects", ()) or ():
+        if getattr(obj, "type", "") != "LIGHT" or obj.hide_get():
+            continue
+        if _light_node_text(obj) is None:
+            continue
+        lights.append(obj)
+    return lights
+
+
+def _follow_light_names(lights):
+    """勾了『跟随相机(手电筒)』的灯名(竖线分隔,给环境脚本用)。"""
+    return "|".join(_sanitize_node_name(obj.name) for obj in lights
+                    if _light_follow_camera(obj))
 
 
 # .tscn 里 Transform3D 的**单位基**(9 个数,列优先其实无所谓 —— 单位矩阵对称)

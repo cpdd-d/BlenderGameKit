@@ -4,7 +4,8 @@ from ..nodes.node_base import TARGET_SELF, gd_node_path, gd_string, snake_case
 from ..nodes import nodes as node_lib
 
 from .literals import gd_literal, gd_number
-from .registry import STMT_HANDLERS, _chain, _next_nodes, stmt_node
+from .registry import (STMT_HANDLERS, _chain, _next_nodes, expr_node,
+                       stmt_node)
 from .statements import _tunable_number
 
 
@@ -880,6 +881,128 @@ def _stmt_ui_dialog(ctx, node, indent):
     ctx.add_line(indent, "_gk_dialog_hide()")
 
 
+def _choice_option_texts(node):
+    """『对话_选择』的选项文字(从节点上取,**同一处真相**)。
+
+    节点类自己有 `option_texts()`(卡片上也用它显示"第几个出口是哪句话"),
+    这里优先调它;老节点 / 桩对象上没有这个方法时按『选项数』补默认文字。
+    """
+    getter = getattr(node, "option_texts", None)
+    if callable(getter):
+        try:
+            return [str(item) for item in getter()]
+        except Exception:                                 # noqa: BLE001
+            pass
+    try:
+        count = int(getattr(node, "gk_option_count", 2) or 2)
+    except (TypeError, ValueError):
+        count = 2
+    count = max(1, min(6, count))
+    return [f"选项 {index + 1}" for index in range(count)]
+
+
+@stmt_node("GKNodeUiChoice")
+def _stmt_ui_choice(ctx, node, indent):
+    """『对话_选择』:弹问题 + 选项 -> 等玩家选 -> 按选中的出口往下走。
+
+    ── 生成的语句(和对话框一样是**阻塞**的)──────────────────────
+        _gk_choice_show(self, "问题", ["救她", "自己跑"], 速度, 宽, 高, 距底边)
+        while _gk_choice_picked < 0:      # 等玩家点按钮 / 按数字键
+            await get_tree().process_frame
+        _gk_choice_hide()
+        match _gk_choice_picked:
+            1:
+                <『选项1』那条链>
+            2:
+                <『选项2』那条链>
+
+    ── 为什么是 `match` 而不是一堆 if ──────────────────────────────
+    出口名就是序号(1 起),`match` 的 case 直接写那个数字 —— 生成物一眼
+    能对回图上的出口,也不用为了"接在『选项 N』上"再维护一张映射表。
+
+    ── 为什么没有『完成』出口 ────────────────────────────────────
+    `emit_statement()` 会自动沿『完成』续接,有这个出口就成了
+    "选择还没做,后面的逻辑先跑了"(和『界面_按钮』当年那个坑一模一样)。
+    所以只有『选项 N』这几个出口,玩家选了哪条就走哪条。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_choice_helpers = True
+    # 成员变量 + 数字键采集要在**节点遍历阶段**登记(见 _stmt_ui_dialog 的说明)
+    ctx.declare_var("_gk_choice_panel", "Panel")
+    ctx.declare_var("_gk_choice_question", "Label")
+    ctx.declare_var("_gk_choice_box", "VBoxContainer")
+    ctx.declare_var("_gk_choice_picked", "int", initial="-1")
+    ctx.register_input_handler("gk_choice_input_event", reset=False, body=[
+        "    if _gk_choice_panel == null or not _gk_choice_panel.visible:",
+        "        return",
+        "    if not (event is InputEventKey) or not event.pressed or event.echo:",
+        "        return",
+        "    var index := 0",
+        "    match event.keycode:",
+        "        KEY_1:",
+        "            index = 1",
+        "        KEY_2:",
+        "            index = 2",
+        "        KEY_3:",
+        "            index = 3",
+        "        KEY_4:",
+        "            index = 4",
+        "        KEY_5:",
+        "            index = 5",
+        "        KEY_6:",
+        "            index = 6",
+        "    if index > 0 and index <= _gk_choice_box.get_child_count():",
+        "        _gk_choice_pick(index)",
+    ])
+
+    fallback = str(getattr(node, "gk_question", "") or "")
+    question = ctx.input_string(node, "问题", fallback)
+    texts = _choice_option_texts(node)
+    options = "[" + ", ".join(gd_string(text) for text in texts) + "]"
+    speed = gd_number(float(getattr(node, "gk_speed", 30.0) or 0.0))
+    width = gd_number(getattr(node, "gk_width", 640.0))
+    height = gd_number(getattr(node, "gk_height", 200.0))
+    margin = gd_number(getattr(node, "gk_margin", 48.0))
+
+    ctx.add_line(indent, f"_gk_choice_show(self, str({question}), {options}, "
+                         f"{speed}, {width}, {height}, {margin})")
+    ctx.add_line(indent, "while _gk_choice_picked < 0:")
+    ctx.add_line(indent + 1, "await get_tree().process_frame")
+    ctx.add_line(indent, "_gk_choice_hide()")
+    ctx.add_line(indent, "match _gk_choice_picked:")
+
+    branches = [socket for socket in node.outputs
+                if str(getattr(socket, "name", "")).startswith("选项")]
+    if not branches:
+        # 防御:出口被改没了也得出一段合法代码
+        ctx.add_line(indent + 1, "_:")
+        ctx.add_line(indent + 2, "pass")
+        return
+    for socket in branches:
+        try:
+            index = int(str(socket.name)[2:])
+        except (TypeError, ValueError):
+            continue
+        ctx.add_line(indent + 1, f"{index}:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 2, socket.name)
+        if len(ctx.sink) == before:
+            # match 的分支体不能为空,没连线时补 pass(和『多路分支』同一条约定)
+            ctx.add_line(indent + 2, "pass")
+
+
+@expr_node("GKNodeUiChoice")
+def _expr_ui_choice(ctx, node):
+    """『选了第几个』:玩家选的是第几个选项(1 起数)。
+
+    ⚠ 只有当选择**已经发生过**时才有意义 —— 而每个出口后面的链本来就在
+    "选完之后"才跑,所以接在出口下游用是安全的(值 = 对应出口的序号)。
+    """
+    var = ctx.declare_var("_gk_choice_picked", "int", initial="-1")
+    ctx.read_vars.add(var)
+    return var
+
+
 # ==========================================================================
 # 界面第二版(第三十八轮):列表 / 缓动 / 九宫格 / 输入框 / 焦点
 # ==========================================================================
@@ -1319,13 +1442,25 @@ def _stmt_float_text(ctx, node, indent):
 # ==========================================================================
 # 屏幕效果
 # ==========================================================================
-# 全屏滤镜着色器。用 SCREEN_TEXTURE / SCREEN_UV 读当前画面再染色 ——
-# 这是 Godot 4 画布着色器里读屏的标准做法(实测编译通过)。
+# 全屏滤镜着色器:读当前画面再染色(受击变红 / 中毒变绿)。
+#
+# ── ⚠ 读屏必须用 `hint_screen_texture` 的 uniform(第五十一轮真机抓到)──
+# 这里原来写的是 Godot 3 时代的内置变量 `SCREEN_TEXTURE`,而 **Godot 4.7
+# 已经把它删掉了**。实测(scripts/verify_shaders.py 真编译):
+#     SHADER ERROR: SCREEN_TEXTURE 已被移除，请改用 hint_screen_texture 和 uniform.
+#     ERROR: Shader compilation failed.
+# 也就是说**以前导出的『屏幕_滤镜』根本编不过** —— 只是没人发现:无头
+# 探针用的是 dummy 渲染器,着色器编译错误不进探针的断言。
+# 现在按官方写法声明一个 uniform:
+#     uniform sampler2D screen_tex : hint_screen_texture;
+#     texture(screen_tex, SCREEN_UV)
+# 并把"内嵌着色器必须真的编得过"接进了门禁(见 scripts/verify_shaders.py)。
 _GD_FILTER_SHADER = """shader_type canvas_item;
+uniform sampler2D screen_tex : hint_screen_texture, repeat_disable, filter_nearest;
 uniform float amount : hint_range(0.0, 1.0) = 0.0;
 uniform vec4 tint : source_color = vec4(1.0, 1.0, 1.0, 1.0);
 void fragment() {
-    vec4 screen = texture(SCREEN_TEXTURE, SCREEN_UV);
+    vec4 screen = texture(screen_tex, SCREEN_UV);
     COLOR = vec4(mix(screen.rgb, tint.rgb, amount), screen.a);
 }
 """
@@ -1362,3 +1497,83 @@ def _stmt_screen_filter(ctx, node, indent):
                              f"{amount}, {gd_number(softness)})")
     else:
         ctx.add_line(indent, f"{mat}.set_shader_parameter(\"amount\", {amount})")
+
+
+# ── 屏幕暗角(第五十一轮:阶段④屏幕氛围)──────────────────────────────
+# Godot 的 `Environment` **没有内置 vignette**,所以暗角只能自己写全屏着色器。
+#
+# ── 为什么和『屏幕_滤镜』分成两层,而不是塞进同一个着色器 ──────────────
+# 塞进去要改 `_GK_FILTER_SHADER` 的内容 —— 那会让**已经导出过**的老工程
+# 在下次导出时着色器源码整体变一个字(产物不再逐字一致),而且两者本来
+# 就是"可以叠加"的两件事(受击整屏变红 + 四角一直压暗)。各占一层最省事:
+# 滤镜在 CanvasLayer 90、暗角在 92,谁也不需要知道对方存在。
+# ⚠ 着色器里的注释**只能用 ASCII**(见 scripts/verify_shaders.py 的说明):
+#   Godot 的着色器词法分析器碰到非 ASCII 字符直接报
+#   `Tokenizer: Unknown character #22522`,整个着色器编不出来。
+#   所以下面这行注释是英文的,中文说明留在 Python 这一层。
+_GD_VIGNETTE_SHADER = """shader_type canvas_item;
+uniform sampler2D screen_tex : hint_screen_texture, repeat_disable, filter_nearest;
+uniform float vignette_amount : hint_range(0.0, 1.0) = 0.0;
+uniform float vignette_radius : hint_range(0.0, 1.0) = 0.55;
+uniform float vignette_edge : hint_range(0.01, 1.5) = 0.35;
+uniform vec4 vignette_color : source_color = vec4(0.0, 0.0, 0.0, 1.0);
+void fragment() {
+    vec4 screen = texture(screen_tex, SCREEN_UV);
+    // distance to screen center: 0 = center, 1 = corner (normalized by 0.5*sqrt(2))
+    vec2 offset = SCREEN_UV - vec2(0.5, 0.5);
+    float dist = length(offset) / 0.70710678;
+    float v = smoothstep(vignette_radius, vignette_radius + vignette_edge, dist);
+    COLOR = vec4(mix(screen.rgb, vignette_color.rgb, v * vignette_amount), screen.a);
+}
+"""
+_VIGNETTE_SHADER_CONST = "_GK_VIGNETTE_SHADER"
+
+
+def _screen_vignette_mat(ctx):
+    """取(必要时创建)全屏暗角的材质。返回 (材质变量, 根变量, 矩形变量)。"""
+    layer = ctx.declare_var("_gk_vignette_layer", "CanvasLayer")
+    rect = ctx.declare_var("_gk_vignette_rect", "ColorRect")
+    mat = ctx.declare_var("_gk_vignette_mat", "ShaderMaterial")
+    ctx.need_screen_vignette = True
+    return mat, layer, rect
+
+
+@stmt_node("GKNodeScreenVignette")
+def _stmt_screen_vignette(ctx, node, indent):
+    """屏幕暗角:全屏一层着色器,只在四角按颜色压暗。
+
+    生成的三句(和『屏幕_滤镜』同一套写法):
+        _gk_ensure_vignette(self)                       # 第一次用到时建全屏遮罩
+        _gk_vignette_mat.set_shader_parameter("vignette_radius", 0.55)
+        _gk_vignette_mat.set_shader_parameter("vignette_edge", 0.35)
+        _gk_vignette_mat.set_shader_parameter("vignette_color", Color(0, 0, 0, 1))
+        _gk_vignette_mat.set_shader_parameter("vignette_amount", 0.7)   # 或渐变过去
+
+    ⚠ **内圈 / 柔和 / 颜色每次都写**(它们不是"状态"而是"这一层的形状"),
+    只有『强度』可能被渐变 —— 和滤镜只写 tint + amount 是同一个取舍。
+    """
+    mat, _layer, _rect = _screen_vignette_mat(ctx)
+    amount = _tunable_number(ctx, node, "强度", "0.0", "vignette_amount")
+    radius = float(getattr(node, "gk_radius", 0.55) or 0.0)
+    edge = float(getattr(node, "gk_edge", 0.35) or 0.0)
+    color = getattr(node, "gk_color", (0.0, 0.0, 0.0, 1.0))
+    fade = float(getattr(node, "gk_fade", 0.0) or 0.0)
+
+    ctx.add_line(indent, "_gk_ensure_vignette(self)")
+    ctx.add_line(indent, f"{mat}.set_shader_parameter(\"vignette_radius\", "
+                         f"{gd_number(radius)})")
+    ctx.add_line(indent, f"{mat}.set_shader_parameter(\"vignette_edge\", "
+                         f"{gd_number(edge)})")
+    ctx.add_line(indent, f"{mat}.set_shader_parameter(\"vignette_color\", "
+                         f"Color({gd_number(color[0])}, {gd_number(color[1])}, "
+                         f"{gd_number(color[2])}, {gd_number(color[3])}))")
+    if fade > 0.0:
+        tween_var = ctx.new_temp("vignette")
+        ctx.add_line(indent, f"var {tween_var} := create_tween()")
+        ctx.add_line(indent, f"{tween_var}.tween_method(func(v): "
+                             f"{mat}.set_shader_parameter(\"vignette_amount\", v), "
+                             f"float({mat}.get_shader_parameter(\"vignette_amount\")), "
+                             f"{amount}, {gd_number(fade)})")
+    else:
+        ctx.add_line(indent, f"{mat}.set_shader_parameter(\"vignette_amount\", "
+                             f"{amount})")

@@ -87,6 +87,26 @@ Step "1b/6 示例完整性体检 (目录 / README / 重建 / 探针 / 门禁)"
     Select-String -Pattern "^(示例|demo_|✗|CHECK_EXAMPLES)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "示例完整性体检失败"; exit 1 }
 
+# ---------- 1c. 着色器编译校验 ----------
+# ── 为什么接进门禁(第五十一轮真机抓到)──────────────────────────────
+# 『屏幕_滤镜』的着色器源码是**写在 Python 里的字符串**,不是 .gdshader
+# 文件 —— 只扫 shaders/ 目录那条链路看不到它。结果它一直在用 Godot 3 时代
+# 的 `SCREEN_TEXTURE`(Godot 4.7 已删),导出的材质**根本编译不过**,
+# 而无人发现:无头探针是 dummy 渲染器,着色器编译错误不进断言。
+# 现在把"磁盘上的 + 代码里内嵌的"着色器都交给真 Godot 编译一遍。
+# ⚠ 这一步**发现着色器编译错误会真报错**(不是提醒),因为那类错的症状是
+#   "游戏里什么都没发生",靠肉眼极难查。
+Step "1c/6 着色器编译校验(真 Godot 编译)"
+$shaderOut = & python (Join-Path $Root "scripts\verify_shaders.py") 2>&1 | Out-String
+$shaderOut -split "`n" | Where-Object { $_.Trim() -ne "" } |
+    ForEach-Object { Write-Host $_.TrimEnd() }
+if ($shaderOut -match "跳过:找不到 Godot") {
+    Write-Output "（本机没装 Godot,着色器编译校验跳过）"
+} elseif ($LASTEXITCODE -ne 0) {
+    Write-Error "着色器编译校验失败"
+    exit 1
+}
+
 # ---------- 2. 构建扩展 ----------
 Step "2/6 构建 Blender 扩展"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -440,6 +460,71 @@ if ($SkipGodot) {
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($levelOut -match "LEVEL_CHECK=OK") {
                 $godotRan += "关卡示例"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
+    # 5l. 灯光示例(第四十八轮:阶段①灯光扩展)—— 三盏灯(平行光 / 点光 /
+    #     聚光)的类型与参数、手电筒每帧贴相机、数字键开关灯、
+    #     卡通材质按"影响最大的亮灯"重画明暗(全关 = 平涂)。
+    Write-Output ""
+    $lightDir = Join-Path $Root "examples\demo_lights"
+    $lightMaker = Join-Path $Root "scripts\make_lights_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过灯光示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $lightDir)) {
+        Write-Output "跳过灯光示例:还没有 examples\demo_lights"
+    } else {
+        $lightLog = & $Blender -b --python $lightMaker 2>&1 | Out-String
+        if ($lightLog -notmatch "已保存") {
+            Write-Host "---- 重建灯光示例失败,尾部 20 行 ----"
+            ($lightLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $lightChecker = Join-Path $Root "scripts\check_lights_demo.py"
+            $lightOut = & python $lightChecker --godot $Godot 2>&1 | Out-String
+            $lightOut -split "`n" | Where-Object { $_ -match "^(LIGHTS|CHECK_LIGHTS_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($lightOut -match "CHECK_LIGHTS_DEMO=OK") {
+                $godotRan += "灯光示例"
+            } elseif ($lightOut -match "跳过") {
+                Write-Output "（灯光示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
+    # 5m. 环境示例(第四十九轮:阶段②环境与后处理)—— 白天 / 幽暗两关对比。
+    #     这一层验的是 WorldEnvironment 这套的整条链路:场景设置 -> .tscn 里的
+    #     Environment 子资源 -> 真 Godot 里读回来的 背景 / 环境光 / 雾 /
+    #     泛光 / 色调 五项,而且两关要**真的拉开差距**。
+    Write-Output ""
+    $envDir = Join-Path $Root "examples\demo_env"
+    $envMaker = Join-Path $Root "scripts\make_env_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过环境示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $envDir)) {
+        Write-Output "跳过环境示例:还没有 examples\demo_env"
+    } else {
+        $envLog = & $Blender -b --python $envMaker 2>&1 | Out-String
+        if ($envLog -notmatch "已保存") {
+            Write-Host "---- 重建环境示例失败,尾部 20 行 ----"
+            ($envLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $envChecker = Join-Path $Root "scripts\check_env_demo.py"
+            $envOut = & python $envChecker --godot $Godot 2>&1 | Out-String
+            $envOut -split "`n" | Where-Object { $_ -match "^(ENV_|CHECK_ENV_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($envOut -match "CHECK_ENV_DEMO=OK") {
+                $godotRan += "环境示例"
+            } elseif ($envOut -match "跳过") {
+                Write-Output "（环境示例跳过）"
             } else {
                 $godotOk = $false
             }

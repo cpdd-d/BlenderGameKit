@@ -1,21 +1,34 @@
 """校验 Godot 着色器:在真实 Godot 里编译,把错误原文带行号抓出来。
 
 用法:
-    python scripts/verify_shaders.py                     # 校验 assets/godot/shaders/
+    python scripts/verify_shaders.py                     # 磁盘上的 + **代码里内嵌的**着色器
     python scripts/verify_shaders.py a.gdshader b.gdshader   # 只校验指定文件
 
 做法:临时建一个最小 Godot 工程,场景里每个着色器挂一个 ShaderMaterial。
 Godot 加载场景时会真的编译着色器,语法错误原样打到 stderr。
 
+── 为什么还要查"内嵌的"着色器(第五十一轮真机抓到)──────────────────
+『屏幕_滤镜』/『屏幕_暗角』的着色器源码是**写在 Python 里的字符串**
+(`codegen/services.py` 的 `_GD_*_SHADER`),不是 .gdshader 文件 ——
+所以只扫 shaders/ 目录这条链路**永远看不到它们**。
+
+后果实测过:滤镜里用的是 Godot 3 时代的 `SCREEN_TEXTURE`,而 Godot 4.7
+早就删掉了,导出的材质**根本编译不过**;无头探针用的是 dummy 渲染器,
+着色器编译错误不进断言,于是一直没人发现。现在这里把内嵌着色器
+按正则抽出来一起编译 —— 这类"代码里写死的着色器坏掉"就挡在门禁里了。
+
 已知坑(踩过):
   * **Godot 着色器编译器不接受注释里的非 ASCII 字符**
     (报错形如 `Tokenizer: Unknown character #22522`)，所以 .gdshader
     里只能写英文注释,中文说明放到 .md 里。
+  * **Godot 4 没有内置的 `SCREEN_TEXTURE` 了** —— 读屏必须声明
+    `uniform sampler2D x : hint_screen_texture;` 再 `texture(x, SCREEN_UV)`。
   * 场景 .tscn 的 load_steps 必须 >= 实际资源数，否则报
     `Parse Error: Unknown tag ...`，看起来像是着色器的问题，其实是场景坏了。
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +38,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 着色器放在插件包内部，这样能随 Blender 扩展一起打包
 SHADER_DIR = os.path.join(ROOT, "BlenderGameKit", "shaders")
 FIXTURE_DIR = os.path.join(ROOT, "tests")
+# 内嵌着色器写在哪个文件里(纯文本正则抽取,不需要 import 插件 / 不需要 bpy)
+SERVICES_PY = os.path.join(ROOT, "BlenderGameKit", "codegen", "services.py")
+# 在 services.py 里形如:  _GD_VIGNETTE_SHADER = """shader_type canvas_item; ..."""
+EMBEDDED_SHADER_RE = re.compile(
+    r'^(_GD_[A-Z0-9_]+_SHADER)\s*=\s*"""(.*?)"""',
+    re.MULTILINE | re.DOTALL)
 GODOT_CANDIDATES = (
     r"D:\godot\Godot_v4.7.2-stable_win64_console.exe",
     r"D:\godot\Godot_v4.7.2-stable_win64.exe",
@@ -89,16 +108,35 @@ def make_scene(shader_names):
     return "\n".join(parts) + "\n"
 
 
+def collect_embedded():
+    """从 codegen/services.py 里抽出内嵌着色器。返回 [(显示名, 源码)]。
+
+    ⚠ 名字必须**只含 ASCII 且有 .gdshader 后缀** —— 下面会用它当临时文件名。
+    """
+    if not os.path.isfile(SERVICES_PY):
+        return []
+    with open(SERVICES_PY, "r", encoding="utf-8", errors="replace") as handle:
+        text = handle.read()
+    found = []
+    for match in EMBEDDED_SHADER_RE.finditer(text):
+        const, code = match.group(1), match.group(2)
+        # 常量名里带的是大写下划线,转成小写当文件名(embedded_xxx.gdshader)
+        stem = const.lower()
+        found.append((f"embedded_{stem}.gdshader", code))
+    return found
+
+
 def collect_targets(argv):
     if argv:
         return [os.path.abspath(a) for a in argv]
-    if not os.path.isdir(SHADER_DIR):
-        return []
-    return [
-        os.path.join(SHADER_DIR, name)
-        for name in sorted(os.listdir(SHADER_DIR))
-        if name.endswith(".gdshader")
-    ]
+    targets = []
+    if os.path.isdir(SHADER_DIR):
+        targets += [
+            os.path.join(SHADER_DIR, name)
+            for name in sorted(os.listdir(SHADER_DIR))
+            if name.endswith(".gdshader")
+        ]
+    return targets
 
 
 def verify(argv):
@@ -108,7 +146,9 @@ def verify(argv):
         return 0
 
     targets = collect_targets(argv)
-    if not targets:
+    # 显式点名文件时只查那一个(方便排查);默认把内嵌着色器也一起查
+    embedded = [] if argv else collect_embedded()
+    if not targets and not embedded:
         print("没有可校验的着色器")
         return 1
 
@@ -128,6 +168,14 @@ def verify(argv):
             name = os.path.basename(target)
             shutil.copy2(target, os.path.join(work, "shaders", name))
             names.append(name)
+        for name, code in embedded:
+            with open(os.path.join(work, "shaders", name), "w",
+                      encoding="utf-8", newline="\n") as h:
+                h.write(code)
+            names.append(name)
+        if embedded:
+            print("内嵌着色器(写在 codegen/services.py 里):"
+                  + "、".join(n for n, _ in embedded))
 
         with open(os.path.join(work, "main.tscn"), "w", encoding="utf-8", newline="\n") as h:
             h.write(make_scene(names))

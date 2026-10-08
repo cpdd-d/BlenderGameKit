@@ -61,6 +61,13 @@ class GKNodeKey(B.GKExpressionNode):
         key = str(getattr(self, "gk_key", "") or "").strip()
         if not key:
             return "jump"
+        # ── 数字键要保住那个数字(第四十八轮:灯光示例踩到)────────────
+        # `snake_case("1", "key")` 会因为"以数字开头"当不合法标识符、
+        # 直接落到 fallback —— 于是 1~9 全变成同一个动作 `key_key`:
+        # **按一下 1 会把所有数字键绑的逻辑一起触发**(实测)。
+        # `key_1` 本身是合法标识符,所以数字键单独拼,不走 snake_case。
+        if key[:1].isdigit():
+            return "key_" + key.lower()
         return "key_" + snake_case(key, "key").lower()
 
     def draw_buttons(self, context, layout):

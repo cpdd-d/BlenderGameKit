@@ -1050,7 +1050,7 @@ class GKDisplayTree(bpy.types.NodeTree):
     bl_label = "游戏显示"
     bl_icon = "HIDE_OFF"
     bl_description = ("BlenderGameKit 的显示设置图 —— 物理线框 / 调试面板 / "
-                      "画面风格 / 视口预览 四张设置卡摆在这里,"
+                      "画面风格 / 视口预览 / 环境氛围 五张设置卡摆在这里,"
                       "卡上改的就是**当前场景**的设置,导出立刻生效")
 
     @classmethod
@@ -1075,7 +1075,7 @@ def _fill_display_cards(tree):
 
 
 def _new_display_tree():
-    """新建一张显示设置图,顺手把四张设置卡摆成一列。
+    """新建一张显示设置图,顺手把设置卡摆成一列。
 
     照界面设计图"新建时放一个起始控件"的做法 —— 面对一张空图,
     十个有九个不知道第一个该放什么。
@@ -1088,12 +1088,13 @@ def _new_display_tree():
 
 
 class GK_OT_OpenDisplayTree(bpy.types.Operator):
-    """打开显示设置图;没有就新建一张(带四张设置卡)。"""
+    """打开显示设置图;没有就新建一张(带五张设置卡)。"""
 
     bl_idname = "gk.open_display_tree"
     bl_label = "打开/新建显示设置图"
     bl_description = ("切到『游戏显示』图(没有就新建一张,"
-                      "带物理线框 / 调试面板 / 画面风格 / 视口预览四张设置卡)")
+                      "带物理线框 / 调试面板 / 画面风格 / 视口预览 / 环境氛围"
+                      "五张设置卡)")
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1129,7 +1130,7 @@ class GK_OT_DisplayFillCards(bpy.types.Operator):
             return {"CANCELLED"}
         added = _fill_display_cards(tree)
         if not added:
-            self.report({"INFO"}, "四张设置卡都在,没有缺的")
+            self.report({"INFO"}, "设置卡都在,没有缺的")
         else:
             self.report({"INFO"}, f"补了 {added} 张设置卡")
         return {"FINISHED"}
@@ -2475,6 +2476,38 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
         box.label(text=f"物体: {obj.name}", icon="OBJECT_DATAMODE")
         if obj.type != "MESH":
             box.label(text="只有网格物体会被导出", icon="INFO")
+
+        # ---- 灯光(第四十八轮:阶段①灯光扩展)─────────────────────────
+        # 灯不参与物理 / 静态资产那几块,选中灯时就只画这一块。
+        # 这里只报"会导成什么"和唯一的灯光专属开关(跟随相机 = 手电筒);
+        # 颜色 / 亮度 / 阴影直接用 Blender 灯光自己的设置,不另做一套。
+        if obj.type == "LIGHT":
+            box = layout.box()
+            box.label(text="灯光", icon="LIGHT")
+            kind = str(getattr(obj.data, "type", ""))
+            if kind == "SUN":
+                box.label(text="太阳光 → 平行光(方向 = 灯的朝向)", icon="INFO")
+            elif kind == "POINT":
+                box.label(text="点光 → 灯泡(会随距离变暗)", icon="INFO")
+            elif kind == "SPOT":
+                try:
+                    cone = round(float(obj.data.spot_size) * 57.29578, 1)
+                except Exception:                             # noqa: BLE001
+                    cone = 0.0
+                box.label(text=f"聚光 → 手电筒 / 聚光灯(锥角 {cone}°)", icon="INFO")
+            else:
+                box.label(text=f"『{kind}』暂不导出:请换太阳 / 点光 / 聚光",
+                          icon="ERROR")
+            col = box.column(align=True)
+            col.prop(physics, "light_follow_camera", toggle=True)
+            if physics.light_follow_camera:
+                box.label(text="运行时贴着当前相机走(手电筒)", icon="CHECKMARK")
+            box.label(text="颜色 / 亮度 / 阴影:用 Blender 灯光自己的设置",
+                      icon="INFO")
+            if float(getattr(obj.data, "energy", 1.0) or 0.0) <= 0.0:
+                box.label(text="能量是 0:这盏灯不会导出(当作关着的灯)",
+                          icon="INFO")
+            return
 
         col = box.column(align=True)
         _draw_body_type(col, physics, is_3d)
@@ -4825,7 +4858,7 @@ class GK_PT_Main(bpy.types.Panel):
                 box.label(text="还没有显示设置图", icon="INFO")
             box.operator("gk.open_display_tree", text="打开/新建显示设置图",
                          icon="FILE_NEW")
-            box.label(text="物理线框 / 调试面板 / 画面风格 / 视口预览"
+            box.label(text="物理线框 / 调试面板 / 画面风格 / 视口预览 / 环境氛围"
                            " 都在这张图里", icon="INFO")
 
         # ---- 游戏资产(独立那张图,第四十三轮)----

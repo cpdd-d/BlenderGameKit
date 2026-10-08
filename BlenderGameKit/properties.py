@@ -304,6 +304,16 @@ class GKObjectSettings(bpy.types.PropertyGroup):
                      "(本体 = 同一个资产名里没勾的那一个)"),
         default=False,
     )
+    # ── 灯光(第四十八轮:阶段①灯光扩展)─────────────────────────────
+    # 只对**灯光物体**有意义(其它物体上勾了不影响导出)。
+    # 勾上 = 这盏灯在游戏里跟着**当前相机**走 —— 手电筒 / 头灯:
+    # 位置和朝向每物理帧对齐相机,Blender 里摆的位置只在预览时有意义。
+    light_follow_camera: BoolProperty(
+        name="跟随相机(手电筒)",
+        description=("这盏灯跟着相机走(手电筒 / 头灯):位置和朝向每帧"
+                     "对齐当前相机;颜色 / 亮度 / 阴影照旧用它自己的设置"),
+        default=False,
+    )
 
 
 def physics_of(obj):
@@ -338,6 +348,21 @@ FX_TYPES = (
      "GPU 加速、效果全(颜色渐变 / 大小曲线都在材质里);Godot 默认推荐"),
     ("cpu", "CPU 粒子 CPUParticles",
      "纯 CPU 计算,兼容性最好(老显卡 / 兼容渲染器都能跑);参数略少"),
+)
+
+# 环境背景模式(第四十九轮:阶段②环境与后处理)。值 = Godot 的
+# Environment.background_mode 枚举(BG_COLOR=1 / BG_SKY=2)—— 导出时直接用。
+ENV_BACKGROUNDS = (
+    ("COLOR", "纯色", "用『背景色』铺满 —— 恐怖片的黑 / 幽暗最常用"),
+    ("SKY", "天空", "程序化天空(带地平线渐变,天空色跟着『背景色』走)"),
+)
+
+# 色调映射模式。值 = Godot 的 Environment.tonemap_mode 枚举。
+ENV_TONEMAPS = (
+    ("LINEAR", "线性", "不做色调映射(老项目默认,颜色最直白)"),
+    ("REINHARD", "Reinhard", "柔和压高光,画面不那么容易过曝"),
+    ("FILMIC", "Filmic", "电影感,暗部更沉"),
+    ("ACES", "ACES", "高动态范围,亮部过渡最自然"),
 )
 
 
@@ -633,6 +658,61 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     toon_follow_light: BoolProperty(
         name="卡通跟随场景光照", default=False,
         description="卡通材质是否跟着场景里的平行光画明暗(关掉 = 全平涂)")
+
+    # ── 环境与后处理(第四十九轮:阶段②环境与后处理)────────────────────
+    # 给这一关挂一个 WorldEnvironment + Environment 资源:背景 / 环境光 /
+    # 雾 / 泛光 / 色调。**默认关** —— 关着时产物里连节点都不多一个,
+    # 老工程导出结果一字不变(和『上帝摄像机』同一套"新能力默认不打扰"的做法)。
+    #
+    # ── 为什么这些值挂在**场景**上(和显示设置图同一个道理)──────────
+    # 一个 .blend 里好几个 Blender 场景 = 好几关,各关的场景氛围本就不一样
+    # (教室是暖光、走廊是冷雾)。挂场景上,切场景卡上的值跟着切。
+    env_enabled: BoolProperty(
+        name="环境与后处理", default=False,
+        description=("给这一关挂 WorldEnvironment:背景 / 环境光 / 雾 / 泛光 / 色调。"
+                     "关着 = 不导出(和以前完全一样)"))
+    env_background: EnumProperty(
+        name="背景", items=ENV_BACKGROUNDS, default="COLOR",
+        description="纯色 = 用下面的背景色铺满;天空 = 程序化天空(天空色跟着背景色走)")
+    env_bg_color: FloatVectorProperty(
+        name="背景色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.05, 0.06, 0.10, 1.0),
+        description="背景色(天空模式下当作天空的顶色)")
+    env_ambient_color: FloatVectorProperty(
+        name="环境光颜色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.55, 0.62, 0.80, 1.0),
+        description="全局补光颜色 —— 幽暗场景给一点冷蓝,免得背光面死黑")
+    env_ambient_energy: FloatProperty(
+        name="环境光强度", default=0.3, min=0.0, soft_max=4.0,
+        description="环境光有多亮;0 = 没有环境光(纯靠灯照)")
+    env_fog: BoolProperty(
+        name="雾", default=False,
+        description="体积雾 —— 恐怖片『空气感』的主力(走廊尽头糊掉 / 手电筒打出光柱)")
+    env_fog_color: FloatVectorProperty(
+        name="雾颜色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.30, 0.34, 0.42, 1.0))
+    env_fog_density: FloatProperty(
+        name="雾浓度", default=0.02, min=0.0, soft_max=1.0,
+        description="越大越浓(0.02 是『远处发灰』,0.1 以上就伸手不见五指)")
+    env_glow: BoolProperty(
+        name="泛光", default=False,
+        description="亮的地方往外溢光 —— 灯 / 手电筒 / 火光'毛'起来")
+    env_glow_intensity: FloatProperty(
+        name="泛光强度", default=0.8, min=0.0, soft_max=4.0)
+    env_glow_bloom: FloatProperty(
+        name="泛光溢出", default=0.1, min=0.0, soft_max=1.0,
+        description="整体画面的额外柔光(0 = 只让亮点发光)")
+    env_tonemap: EnumProperty(
+        name="色调映射", items=ENV_TONEMAPS, default="LINEAR")
+    env_adjust: BoolProperty(
+        name="色调调整", default=False,
+        description="手动调亮度 / 对比度 / 饱和度(调色)")
+    env_brightness: FloatProperty(
+        name="亮度", default=1.0, min=0.0, soft_max=2.0)
+    env_contrast: FloatProperty(
+        name="对比度", default=1.0, min=0.0, soft_max=2.0)
+    env_saturation: FloatProperty(
+        name="饱和度", default=1.0, min=0.0, soft_max=2.0)
 
     output_dir: StringProperty(
         name="导出目录",

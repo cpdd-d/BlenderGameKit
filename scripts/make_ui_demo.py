@@ -23,6 +23,7 @@
 | **界面_设置** | 每物理帧把血条调成半透明;对话结束后把"得分"改成"对话结束" |
 | **界面_暂停游戏** | **Esc** 开关暂停(世界冻住 + 菜单弹出 + 鼠标放出来) |
 | **界面_按钮** | 菜单里的『继续游戏』『退出游戏』—— 暂停的时候照样点得动 |
+| **对话_选择** | 最后一句话之后弹出**结局选择**(救她 / 自己跑 / 再想想):点第 2 个 -> 走第 2 条链 -> 结局变量 = 2 -> "得分"变成"结局:独自逃出";数字键 1~3 也能选 |
 
 ── 第二版(第三十八轮)新加的五样 ──────────────────────────────
 
@@ -447,6 +448,34 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, dim, "完成", fade_in, "执行")
     _link(tree, fade_in, "完成", focus_field, "执行")
 
+    # ── 第五十轮:剧情分支(『对话_选择』)────────────────────────────
+    # 挂在整条界面链的**最尾**:前面的检查(控件 / 暂停 / 输入框 / 设计图)
+    # 都跟"选了哪个"无关 —— 选择节点会**阻塞**在这条链上等玩家选。
+    choice = _add(tree, "GKNodeUiChoice", "结局选择", 5200.0, 0.0,
+                  gk_question="你怎么做？", gk_option_count=3,
+                  gk_options="救她|自己跑|再想想", gk_speed=0.0)
+    # 出口 1 / 2 都把『选了第几个』写进『结局』变量(演示那个整数输出),
+    # 再把"得分"改成对应结局 —— 探针点第 2 个,查的就是这条链。
+    pick_one = _add(tree, "GKNodeSetVar", "记结局", 5460.0, 120.0,
+                    gk_var_name="结局")
+    one_text = _add(tree, "GKNodeUiSet", "显示救她", 5720.0, 120.0,
+                    gk_widget="分数", gk_set_text=True, gk_text="结局:回头救她")
+    pick_two = _add(tree, "GKNodeSetVar", "记结局2", 5460.0, -300.0,
+                    gk_var_name="结局")
+    two_text = _add(tree, "GKNodeUiSet", "显示独自逃出", 5720.0, -300.0,
+                    gk_widget="分数", gk_set_text=True, gk_text="结局:独自逃出")
+    three_text = _add(tree, "GKNodeUiSet", "显示再想想", 5460.0, -700.0,
+                      gk_widget="分数", gk_set_text=True, gk_text="结局:再想想")
+
+    _link(tree, focus_field, "完成", choice, "执行")
+    _link(tree, choice, "选项1", pick_one, "执行")
+    _link(tree, choice, "选了第几个", pick_one, "值")
+    _link(tree, pick_one, "完成", one_text, "执行")
+    _link(tree, choice, "选项2", pick_two, "执行")
+    _link(tree, choice, "选了第几个", pick_two, "值")
+    _link(tree, pick_two, "完成", two_text, "执行")
+    _link(tree, choice, "选项3", three_text, "执行")
+
     # 输入框『提交』(回车):读框里的字 -> 写进"得分"
     _link(tree, read_name, "文字", write_name, "文字")
     _link(tree, nickname, "提交", write_name, "执行")
@@ -470,8 +499,8 @@ def _build_ui_chain(tree, ready, design):
     log("界面链:套用设计图(右上角 HUD,3 个控件) -> 接设计按钮行为 -> "
         "面板 -> 图片 -> 文本 -> 进度条 -> 暂停菜单(九宫格标题条 + "
         "存档列表) -> 日志列表(填充) -> 昵称输入框 -> 提示 -> 对话框 -> "
-        "淡入 + 聚焦")
-    return focus_field
+        "淡入 + 聚焦 -> 结局选择(3 个选项)")
+    return choice
 
 
 def _build_frame_chain(tree, physics):

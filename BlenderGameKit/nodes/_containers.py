@@ -388,6 +388,51 @@ class GKNodeScreenFilter(B.GKStatementNode):
         row.prop(self, "gk_softness", text="")
 
 
+@N
+class GKNodeScreenVignette(B.GKStatementNode):
+    bl_idname = "GKNodeScreenVignette"
+    bl_label = "屏幕_暗角"
+    bl_icon = "LIGHT"
+    gk_category = "屏幕效果"
+    gk_doc = ("**四角压暗**(暗角 / vignette)—— 视线收窄、气氛压下来。"
+              "恐怖片最便宜也最有效的一招:走廊尽头黑下去,玩家自己就会紧张。\n"
+              "── 和『屏幕_滤镜』的分工 ──\n"
+              "滤镜是**整屏染色**(受击变红);暗角是**只在四角压暗**、"
+              "中间保持原样。两个可以叠着用(各自一层全屏叠加)。\n"
+              "── 三个参数怎么配 ──\n"
+              "* **强度**:角上压多黑(0 = 看不出来,1 = 四角全黑);\n"
+              "* **内圈半径**:从正中心算,**越大 = 亮区越大**"
+              "(0.55 ≈ 亮区到屏幕边中点的六成);\n"
+              "* **边缘柔和**:暗角边缘糊开多少(0.1 硬边 / 0.5 很柔)。\n"
+              "── 想让暗角动起来 ──\n"
+              "『过渡秒数』> 0 = 从当前值**渐变**过去(追人时慢慢收窄视线很带感);"
+              "要『呼吸』就配合『定时_时间轴』每帧拨一点强度。\n"
+              "⚠ Godot 的 `Environment` **没有内置暗角**,所以这个是全屏着色器做的"
+              "(和『屏幕_滤镜』同一套实现)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "强度", 0.7),
+    )
+    gk_input_props = {"强度": "gk_amount"}
+    gk_prop_defs = (
+        ("gk_amount", "float", 0.7, "强度", "四角压多黑(0~1)"),
+        ("gk_radius", "float", 0.55, "内圈半径", "亮区多大;越大越亮"),
+        ("gk_edge", "float", 0.35, "边缘柔和", "暗角边缘糊开多少"),
+        ("gk_color", "color", (0.0, 0.0, 0.0, 1.0), "颜色",
+         "压下去的颜色(默认纯黑;偏紫/偏蓝更有味道)"),
+        ("gk_fade", "float", 0.0, "过渡秒数", "0 = 立刻生效"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_amount", text="强度")
+        row.prop(self, "gk_fade", text="过渡")
+        row = layout.row(align=True)
+        row.prop(self, "gk_radius", text="内圈")
+        row.prop(self, "gk_edge", text="柔和")
+        layout.prop(self, "gk_color", text="")
+
+
 # ==========================================================================
 # 实用
 # ==========================================================================

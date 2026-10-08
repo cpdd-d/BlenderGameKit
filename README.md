@@ -174,7 +174,7 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:构建 + 重装 + 192 项冒烟 + 示例体检 + Godot 端到端十层(-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 220 项冒烟 + 示例体检 + Godot 端到端十三层(-Deep 再加动画六层)
 ├── verify_anim_system.ps1      ★ 动画系统六层验证(离线/真 Blender/示例/Godot 解析/**真跑 1.5 秒**/反例)
 ├── check_gdscript.ps1          ★ 把生成的 .gd 交给真 Godot 解析(带反例)
 ├── make_anim_example.py        ★ 生成动画状态机示例 .blend
@@ -200,6 +200,8 @@ examples/
 ├── demo_ai/                    游戏AI示例(巡逻 -> 看见追 -> 追丢回)
 ├── demo_assets/                资产示例(资产库 + 跨场景共用 + 音频管线)
 ├── demo_level/                 关卡示例(多场景:关卡1 通关后切关卡2)
+├── demo_lights/                灯光示例(三种灯 + 手电筒跟相机 + 数字键开关灯)
+├── demo_env/                   环境示例(白天 / 幽暗两关:天空·纯色 / 雾 / 泛光 / 色调)
 ├── demo_anim_tree/             动画状态机示例 .blend(旧示例,仅存档)
 ├── demo_2d_blend/              2.5D 示例 .blend(旧示例,仅存档)
 ├── demo_platformer/            ★ 可玩的 2D 平台跳跃示例(相机跟随/金币/HUD/存档)
@@ -563,13 +565,14 @@ python tests\test_codegen.py
 #     默认只跑离线;-m blender / -m godot 单独跑需要真引擎的集成测试)
 pip install pytest && python -m pytest
 
-# 2. 着色器编译校验 —— 改 .gdshader 后必跑
+# 2. 着色器编译校验 —— 改 .gdshader **或** codegen/services.py 里内嵌的着色器后必跑
+#    (后者是最容易漏的:无头探针用 dummy 渲染器,着色器编译错误不进断言)
 python scripts\verify_shaders.py
 
-# 3. 一键门禁:构建 + 装进 Blender + 192 项冒烟 + 示例完整性体检 + Godot 端到端十层
+# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 220 项冒烟 + 示例完整性体检 + Godot 端到端十三层
 #    —— 改节点/UI/生成代码后必跑
-#    端到端十层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
-#                界面 / AI / 资产 / 关卡示例;产物写在 _dist(不动 examples);
+#    端到端十三层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
+#                界面 / AI / 资产 / 关卡 / 灯光 / 环境示例;产物写在 _dist(不动 examples);
 #    加 -Deep 再跑动画系统六层验证(要真 Blender、会重建 examples\demo_anim_tree,较慢)
 #    本机没装 Godot 时自动跳过;加 -SkipGodot 可显式跳过
 powershell -File scripts\build_and_test.ps1

@@ -43,6 +43,12 @@
     后两个挂在底板上、底板的位置 = "屏幕右上角 + 边距 14"(按视口现算);
   * **界面_按钮点击**:点『点我』-> "得分"变成"设计按钮被点了"
     (设计图只管长什么样,行为写在玩法图、按控件名接)。
+
+第五十轮(剧情分支,『对话_选择』)再看两样:
+  * **选择框弹出来**:整条界面链的尾巴是『对话_选择』—— 问题文字对、
+    三个选项按钮都在(选择1 / 选择2 / 选择3);
+  * **选了走哪条链**:点第 2 个 -> 面板收起 + 得分变成"结局:独自逃出"
+    + 『结局』变量 = 2(『选了第几个』这个整数输出真的写回去了)。
 """
 
 import argparse
@@ -162,6 +168,14 @@ func _physics_process(delta: float) -> void:
 	elif phase == 9 and elapsed >= 3.8:
 		phase = 10
 		_check_design_click()
+		# 第五十轮:整条界面链的尾巴是『对话_选择』—— 这时候它应该弹着
+		_check_choice_shown()
+		var option := _widget("选择2")
+		if option != null:
+			_click_at(option.get_global_rect().get_center())
+	elif phase == 10 and elapsed >= 4.2:
+		phase = 11
+		_check_choice_picked()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
@@ -390,6 +404,50 @@ func _check_design_click() -> void:
 	print("UI_DESIGN_CLICK ok=", text == "设计按钮被点了", " score=", text)
 
 
+# ── 第五十轮:剧情分支(『对话_选择』)───────────────────────────────
+
+## 选择框弹出来了没有:面板可见 + 问题文字对 + 三个选项按钮都在。
+func _check_choice_shown() -> void:
+	var panel := _widget("选择框")
+	var question := _widget("问题") as Label
+	var box: Node = null
+	if panel != null:
+		box = panel.find_child("选项", true, false)
+	var one := _widget("选择1")
+	var two := _widget("选择2")
+	var three := _widget("选择3")
+	var shown: bool = panel != null and panel.visible
+	var ok: bool = shown and question != null \\
+		and question.text == "你怎么做？" \\
+		and one != null and two != null and three != null
+	print("UI_CHOICE_SHOWN ok=", ok, " panel=", shown,
+		" question=", question.text if question != null else "<none>",
+		" options=", box.get_child_count() if box != null else -1)
+
+
+## 读宿主脚本上的『结局』变量(『选了第几个』写进去的那个)。
+func _read_ending() -> Variant:
+	if world == null:
+		return null
+	for node in world.find_children("*", "Node", true, false):
+		var value = node.get("结局")
+		if value != null:
+			return value
+	return null
+
+
+## 点完第 2 个选项:面板收起 + 走了第 2 条链(得分变了)+ 结局变量 = 2。
+func _check_choice_picked() -> void:
+	var panel := _widget("选择框")
+	var hidden: bool = panel == null or not panel.visible
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	var ended = _read_ending()
+	var ended_ok: bool = ended != null and int(ended) == 2
+	print("UI_CHOICE ok=", hidden and text == "结局:独自逃出" and ended_ok,
+		" hidden=", hidden, " score=", text, " 结局=", ended)
+
+
 func _send_key(code: int, pressed: bool) -> void:
 	var event := InputEventKey.new()
 	event.keycode = code
@@ -502,6 +560,11 @@ def main():
          "开局不是『选单态』(应该:世界暂停 + 鼠标可见,免得一上来就能转视角)"),
         (r"UI_STARTUP_RESUME paused=false",
          "开场对话点完没有恢复世界(应该继续跑)"),
+        # ---- 第五十轮:剧情分支(『对话_选择』)----
+        (r"UI_CHOICE_SHOWN ok=true",
+         "『对话_选择』没弹出来 / 问题文字或三个选项不对"),
+        (r"UI_CHOICE ok=true",
+         "点第 2 个选项没走第 2 条链(得分没变,或『选了第几个』没写进结局变量)"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -541,6 +604,12 @@ def main():
                 ("_gk_ui_设计底板", "『界面_套用设计』把设计图的控件建进脚本"),
                 ('_gk_find_widget("设计按钮")', "『界面_按钮点击』按名字找按钮"),
                 (".pressed.is_connected(", "按钮点击的幂等接线"),
+                # ---- 第五十轮:剧情分支(『对话_选择』)----
+                ("_gk_choice_show(", "『对话_选择』的辅助函数"),
+                ("match _gk_choice_picked:", "『对话_选择』的分支 match"),
+                ('button.name = "选择%d" % (index + 1)', "选项按钮"),
+                ("gk_choice_input_event(event)", "数字键 1~6 也能选"),
+                ("_gk_choice_picked", "『选了第几个』输出"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")

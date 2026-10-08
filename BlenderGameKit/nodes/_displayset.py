@@ -32,14 +32,18 @@
 
 from ._common import *  # noqa: F401,F403
 
-# 这张图能放的四个"设置卡"。名单写在这里(而不是散在类上)有两个用它的地方:
+# 这张图的"设置卡"名单(第四十九轮起五张)。写在这里(而不是散在类上)
+# 有两个用它的地方:
 #   * 侧栏『补齐缺失的设置卡』按它找缺哪张;
-#   * 测试按它断言"四张卡一张不少"。
+#   * 测试按它断言"卡片一张不少"。
 DISPLAY_CARD_IDS = (
     "GKNodeDisplayCollision",
     "GKNodeDisplayDebug",
     "GKNodeDisplayStyle",
     "GKNodeDisplayPreview",
+    # 第五张(第四十九轮:阶段②环境与后处理)—— 排在最后,前四张在图上
+    # 的位置一张都不动(老工程新建时四张卡坐标完全不变)。
+    "GKNodeDisplayEnvironment",
 )
 
 # 新建 / 补齐时卡片的竖向间距(卡上有四五行动态内容,排太紧会叠住)
@@ -87,6 +91,30 @@ def display_settings_rows(settings):
     else:
         text = "卡通材质 · 全平涂"
     rows.append(("画面风格", text, toon))
+
+    # 环境氛围(第四十九轮):背景 / 环境光 / 雾 / 泛光 / 调色 各开没开,
+    # 一行说清 —— 老工程没有这些属性时全部按"关"兜底(不能抛异常)。
+    env_on = bool(getattr(settings, "env_enabled", False))
+    if not env_on:
+        env_text = "关"
+    else:
+        marks = []
+        background = str(getattr(settings, "env_background", "COLOR") or "COLOR")
+        marks.append("天空" if background == "SKY" else "背景色")
+        try:
+            ambient = float(getattr(settings, "env_ambient_energy", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ambient = 0.0
+        if ambient > 0.0:
+            marks.append("环境光")
+        if bool(getattr(settings, "env_fog", False)):
+            marks.append("雾")
+        if bool(getattr(settings, "env_glow", False)):
+            marks.append("泛光")
+        if bool(getattr(settings, "env_adjust", False)):
+            marks.append("调色")
+        env_text = "开(" + "·".join(marks) + ")"
+    rows.append(("环境氛围", env_text, env_on))
     return rows
 
 
@@ -242,3 +270,84 @@ class GKNodeDisplayPreview(B.GKStatementNode):
                          icon="DOT")
         layout.label(text="预览只在 Blender 里看:不导出、不影响游戏",
                      icon="INFO")
+
+
+@N
+class GKNodeDisplayEnvironment(B.GKStatementNode):
+    bl_idname = "GKNodeDisplayEnvironment"
+    bl_label = "显示_环境氛围"
+    bl_icon = "WORLD"
+    gk_category = "显示设置"
+    gk_tree_type = "GKDisplayTree"
+    gk_inputs = ()
+    gk_outputs = ()
+    gk_doc = ("**环境与后处理**(第四十九轮:阶段②)—— 给这一关挂一个 "
+              "WorldEnvironment。\n"
+              "『环境与后处理』总开关:关着 = 产物里连节点都不多一个"
+              "(老工程导出结果一字不变)。\n"
+              "开着才能设这几样(卡上改 = 导出**立刻**按新值走,不用点应用):\n"
+              "* **背景**:纯色(用背景色铺满)或天空(程序化天空,顶色 = 背景色);\n"
+              "* **环境光**:全局补光颜色 + 强度(0 = 没有)—— 幽暗场景给一点\n"
+              "  冷蓝,免得背光面死黑;\n"
+              "* **雾**:体积雾 —— 恐怖片『空气感』的主力;颜色 + 浓度;\n"
+              "* **泛光**:亮的地方往外溢光(灯 / 手电筒 / 火光毛起来)+ 强度 / 溢出;\n"
+              "* **色调**:色调映射(线性 / Reinhard / Filmic / ACES)+ 可选调色\n"
+              "  (亮度 / 对比度 / 饱和度)。\n"
+              "⚠ Godot 的 Environment **没有**内置暗角(vignette),暗角要靠\n"
+              "后处理着色器 —— 留到氛围套件那一轮。\n"
+              "⚠ 只对 **3D 项目**有效(WorldEnvironment 是 3D 的东西);\n"
+              "2D 项目里开着也不会导出(卡上会红字提醒)。\n"
+              "设置挂在**场景**上:多关卡时每关各有一套,切场景卡上的值跟着切。")
+
+    def draw_buttons(self, context, layout):
+        settings = _scene_settings(context)
+        if settings is None:
+            layout.label(text="拿不到场景设置(先打开一个场景)", icon="ERROR")
+            return
+        layout.prop(settings, "env_enabled", toggle=True, icon="WORLD")
+        if not bool(getattr(settings, "env_enabled", False)):
+            layout.label(text="关着 = 不导出环境(和以前完全一样)", icon="INFO")
+            return
+        if str(getattr(settings, "dimension", "3")) == "2":
+            layout.label(text="⚠ 2D 项目不导环境(WorldEnvironment 只对 3D 有用)",
+                         icon="ERROR")
+            return
+
+        box = layout.box()
+        box.label(text="背景", icon="IMAGE_BG")
+        row = box.row(align=True)
+        row.prop(settings, "env_background", expand=True)
+        row = box.row(align=True)
+        row.prop(settings, "env_bg_color", text="")
+
+        box = layout.box()
+        box.label(text="环境光(全局补光)", icon="LIGHT")
+        row = box.row(align=True)
+        row.prop(settings, "env_ambient_color", text="")
+        row.prop(settings, "env_ambient_energy", text="强度")
+
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(settings, "env_fog", toggle=True, icon="MOD_FLUID")
+        if bool(getattr(settings, "env_fog", False)):
+            row.prop(settings, "env_fog_color", text="")
+            box.prop(settings, "env_fog_density", text="浓度")
+
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(settings, "env_glow", toggle=True, icon="LIGHT_SUN")
+        if bool(getattr(settings, "env_glow", False)):
+            box.prop(settings, "env_glow_intensity", text="强度")
+            box.prop(settings, "env_glow_bloom", text="溢出")
+
+        box = layout.box()
+        box.prop(settings, "env_tonemap", text="色调映射")
+        row = box.row(align=True)
+        row.prop(settings, "env_adjust", toggle=True, icon="COLOR")
+        if bool(getattr(settings, "env_adjust", False)):
+            box.prop(settings, "env_brightness", text="亮度")
+            box.prop(settings, "env_contrast", text="对比度")
+            box.prop(settings, "env_saturation", text="饱和度")
+
+        layout.label(text="改这里 = 导出立刻生效,不用点应用", icon="CHECKMARK")
+        layout.label(text="暗角(Godot 无内置)留到氛围套件那轮", icon="INFO")

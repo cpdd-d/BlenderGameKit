@@ -809,6 +809,78 @@ class TestDisplayNodes(Base):
         self.assertIn("@export var", code)
 
 
+class TestLightNodes(Base):
+    """第四十八轮(阶段①灯光扩展):『灯光_设置』节点 + 手电筒字段。"""
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_set_light_emits_helper_and_call(self):
+        """开关一盏灯:生成 _gk_set_light(...) 调用 + 配套小工具函数。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetLight, "关手电",
+                             gk_light="手电筒", gk_on=False, gk_energy=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_set_light(self, "手电筒", false, 0.0, null)', code)
+        # 小工具只出一次(多个『灯光_设置』不重复生成)
+        self.assertEqual(code.count("func _gk_set_light("), 1)
+        self.assert_indent_sane(code)
+
+    def test_set_light_energy_and_color(self):
+        """亮度 > 0 会写进调用;勾了『改颜色』才把 Color(...) 带上。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetLight, "开手电",
+                             gk_light="手电筒", gk_on=True, gk_energy=2.0,
+                             gk_set_color=True,
+                             gk_color=(1.0, 0.9, 0.6, 1.0))
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("_gk_set_light(self, \"手电筒\", true, 2.0, "
+                      "Color(1.0, 0.9, 0.6, 1.0))", code)
+
+    def test_set_light_helper_finds_by_name(self):
+        """小工具从 current_scene 按名字找灯(换过关卡也对得上)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSetLight, "灯", gk_light="台灯")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("host.get_tree().current_scene", code)
+        self.assertIn("light.visible = on", code)
+        self.assertIn("light.light_energy = energy", code)
+
+    def test_env_script_has_flashlight_field(self):
+        """环境脚本带 follow_lights 字段 + 每帧贴相机的实现。"""
+        from BlenderGameKit import asset_export
+        text = asset_export.render_env_script()
+        self.assertIn('follow_lights: String = ""', text)
+        self.assertIn("func _gk_follow_lights_tick() -> void:", text)
+        self.assertIn("_gk_follow_lights_tick()", text)
+        # 多光近似:亮灯收集 + 按影响挑一盏
+        self.assertIn("func _gk_lights_on() -> Array:", text)
+        self.assertIn("func _gk_pick_light(", text)
+
+    def test_light_energy_mapping(self):
+        """能量换算:太阳 ×1.2 夹 [0.2,4];点光 1000W ≈ 1.0,夹 [0.05,8]。"""
+        from BlenderGameKit import asset_export
+        sun = types.SimpleNamespace(
+            data=types.SimpleNamespace(type="SUN", energy=1.0))
+        self.assertAlmostEqual(asset_export._light_energy_for(sun), 1.2)
+        bright = types.SimpleNamespace(
+            data=types.SimpleNamespace(type="SUN", energy=10.0))
+        self.assertAlmostEqual(asset_export._light_energy_for(bright), 4.0)
+        lamp = types.SimpleNamespace(
+            data=types.SimpleNamespace(type="POINT", energy=1000.0))
+        self.assertAlmostEqual(asset_export._light_energy_for(lamp), 1.0)
+        dim = types.SimpleNamespace(
+            data=types.SimpleNamespace(type="POINT", energy=10.0))
+        self.assertAlmostEqual(asset_export._light_energy_for(dim), 0.05)
+
+
 class TestAudioNodes(Base):
     def _ready(self, tree, name="准备"):
         return tree.new_node(NN.GKNodeOnReady, name)
@@ -2382,7 +2454,13 @@ class TestScreenFilterNodes(Base):
         self.assertEqual(warnings, [], warnings)
         self.assertIn("const _GK_FILTER_SHADER :=", code)
         self.assertIn("shader_type canvas_item;", code)
-        self.assertIn("SCREEN_TEXTURE", code)
+        # ── 读屏必须走 hint_screen_texture 的 uniform(第五十一轮修)──────
+        # Godot 4.7 删掉了内置的 SCREEN_TEXTURE,原来那句
+        # `texture(SCREEN_TEXTURE, SCREEN_UV)` 让材质**根本编译不过**
+        # (真 Godot 编译报 "SCREEN_TEXTURE 已被移除")。
+        self.assertIn("hint_screen_texture", code)
+        self.assertNotIn("SCREEN_TEXTURE", code)
+        self.assertIn("texture(screen_tex, SCREEN_UV)", code)
         self.assertIn("ShaderMaterial.new()", code)
         self.assertIn("set_shader_parameter(\"amount\"", code)
         self.assertIn("set_shader_parameter(\"tint\"", code)
@@ -2416,6 +2494,143 @@ class TestScreenFilterNodes(Base):
         code, _ = gen(tree, V2)
         self.assertNotIn("_GK_FILTER_SHADER", code)
 
+
+class TestRound51ScreenVignette(Base):
+    """第五十一轮:阶段④屏幕氛围 —— 『屏幕_暗角』。
+
+    Godot 的 `Environment` **没有内置 vignette**,所以暗角只能用全屏着色器做
+    (和『屏幕_滤镜』同一套实现,但**各占一层**,两个能叠着用)。
+    判据:
+      * 生成自己的着色器常量 + 全屏 ColorRect,参数(强度/内圈/柔和/颜色)都写进去;
+      * 暗角层在**滤镜之上**(92 > 90)、闪白/转场之下(100);
+      * 『过渡秒数』> 0 走 tween,否则直接设值;
+      * 没用它的图里一个暗角字符都不多(老产物逐字不变)。
+    """
+
+    def test_builds_its_own_shader_layer(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeScreenVignette, "暗角", gk_amount=0.7,
+                             gk_radius=0.55, gk_edge=0.35, gk_fade=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("const _GK_VIGNETTE_SHADER :=", code)
+        self.assertIn("shader_type canvas_item;", code)
+        # 和滤镜同一条约定:Godot 4.7 没有内置 SCREEN_TEXTURE,读屏走 uniform
+        self.assertIn("hint_screen_texture", code)
+        self.assertNotIn("SCREEN_TEXTURE", code)
+        self.assertIn("texture(screen_tex, SCREEN_UV)", code)
+        # 到中心的距离用屏幕对角线一半归一化(0 = 中心,1 = 角)
+        self.assertIn("0.70710678", code)
+        self.assertIn("smoothstep(vignette_radius, vignette_radius + vignette_edge", code)
+        self.assertIn("func _gk_ensure_vignette(", code)
+        self.assertIn('set_shader_parameter("vignette_radius", 0.55)', code)
+        self.assertIn('set_shader_parameter("vignette_edge", 0.35)', code)
+        self.assertIn('set_shader_parameter("vignette_color", Color(0.0, 0.0, 0.0, 1.0))',
+                      code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_layer_sits_above_filter_below_flash(self):
+        """暗角 92:盖住滤镜(90)与界面(10),但低于闪白 / 转场(100)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeScreenVignette, "暗角")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn('_gk_vignette_layer.name = "GKVignette"', code)
+        self.assertIn("layer = 92", code)
+        self.assertIn("Control.MOUSE_FILTER_IGNORE", code)
+
+    def test_stacks_with_filter(self):
+        """两个能叠着用:各有各的着色器常量 / 材质 / 层。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        tint = tree.new_node(NN.GKNodeScreenFilter, "受击红", gk_amount=0.6)
+        ghost = tree.new_node(NN.GKNodeScreenVignette, "暗角", gk_amount=0.5)
+        gk_stub.connect(tree, event, "执行", tint, "执行")
+        gk_stub.connect(tree, tint, "完成", ghost, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("const _GK_FILTER_SHADER :=", code)
+        self.assertIn("const _GK_VIGNETTE_SHADER :=", code)
+        self.assertIn("layer = 90", code)
+        self.assertIn("layer = 92", code)
+
+    def test_fade_uses_tween(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeScreenVignette, "暗角", gk_amount=1.0,
+                             gk_fade=0.4)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("tween_method(", code)
+        self.assertIn('get_shader_parameter("vignette_amount")', code)
+        self.assertIn(", 0.4)", code)
+
+    def test_no_vignette_without_the_node(self):
+        """没用暗角的图里一个暗角字符都不多(老产物逐字不变)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        tint = tree.new_node(NN.GKNodeScreenFilter, "受击红")
+        gk_stub.connect(tree, event, "执行", tint, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("_GK_FILTER_SHADER", code)
+        self.assertNotIn("VIGNETTE", code)
+
+        plain = make_tree()
+        plain_event = plain.new_node(NN.GKNodeOnReady, "准备")
+        printer = plain.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(plain, plain_event, "执行", printer, "执行")
+        plain_code, _ = gen(plain, V2)
+        self.assertNotIn("VIGNETTE", plain_code)
+        self.assertNotIn("_GK_FILTER_SHADER", plain_code)
+
+    def test_node_props_and_category(self):
+        from BlenderGameKit import properties as props
+        cls = NN.GKNodeScreenVignette
+        self.assertEqual(cls.gk_category, "屏幕效果")
+        self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"))
+        names = [entry[0] for entry in cls.gk_prop_defs]
+        for wanted in ("gk_amount", "gk_radius", "gk_edge", "gk_color", "gk_fade"):
+            self.assertIn(wanted, names)
+
+    def test_embedded_shaders_follow_the_two_hard_rules(self):
+        """内嵌着色器必须守两条硬规矩 —— 两条都是真机踩出来的。
+
+        1. **只能用 ASCII**:Godot 的着色器词法分析器碰到非 ASCII 字符直接
+           报 `Tokenizer: Unknown character #22522`,整个着色器编不出来
+           (所以着色器里的注释只能写英文)。
+        2. **不能含 `\"\"\"`**:源码是塞进 GDScript 的 `const X := \"\"\"…\"\"\"`
+           里的,里面再出现三引号会提前把字符串截断 —— 整个脚本解析失败。
+
+        真编译那一步在 `scripts/verify_shaders.py`(门禁 1c 层,要真 Godot);
+        这里把"能离线查的两条"钉死,免得改着色器时又踩回去。
+        """
+        from BlenderGameKit.codegen import services
+
+        sources = {
+            "屏幕_滤镜": services._GD_FILTER_SHADER,
+            "屏幕_暗角": services._GD_VIGNETTE_SHADER,
+        }
+        for label, source in sources.items():
+            self.assertTrue(source.isascii(), f"{label} 的着色器里有非 ASCII 字符")
+            self.assertNotIn('"""', source, f"{label} 的着色器里有三引号")
+            self.assertIn("shader_type canvas_item;", source)
+            # Godot 4 读屏:必须声明 hint_screen_texture 的 uniform
+            self.assertIn("hint_screen_texture", source, label)
+            self.assertNotIn("SCREEN_TEXTURE", source, f"{label} 用了已删除的内置变量")
+
+
+class TestNodeRegistrySanity(Base):
+    """节点声明表的体检:**对所有节点**都成立的那几条。
+
+    ── 为什么单独拎出来一个类(第五十一轮)───────────────
+    这几条原来挂在 `TestScreenFilterNodes` 里,但它们跟"屏幕滤镜"没有关系 ——
+    查的是"整张节点表有没有拼错类型 / 漏登记属性"。加暗角那轮顺手分出来,
+    免得下次又有人在滤镜类里找"为什么节点注册失败"。
+    """
 
     def test_all_prop_kinds_are_supported(self):
         """每个 gk_prop_defs 里用到的类型都必须有真实的属性工厂。
@@ -3020,6 +3235,32 @@ class TestInputActions(Base):
             gk_stub.connect(tree, event, "执行", printer, "执行")
             code, _w = gen(tree, V3)
             self.assertIn(f"Input.{func}(ACTION_DASH)", code)
+
+    def test_digit_keys_get_distinct_actions(self):
+        """数字键的动作名不能撞成同一个(第四十八轮:灯光示例踩到)。
+
+        `snake_case("1", "key")` 因为"以数字开头"直接落到 fallback ——
+        于是 1~9 全变成同一个动作 `key_key`:按一下 1 会把所有数字键绑的
+        逻辑一起触发。`key_1` 本身是合法标识符,所以数字键单独拼。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        key_one = tree.new_node(NN.GKNodeKey, "键1", gk_key="1")
+        key_two = tree.new_node(NN.GKNodeKey, "键2", gk_key="2")
+        branch_one = tree.new_node(NN.GKNodeBranch, "如果1")
+        branch_two = tree.new_node(NN.GKNodeBranch, "如果2")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="d")
+        gk_stub.connect(tree, event, "执行", branch_one, "执行")
+        gk_stub.connect(tree, key_one, "结果", branch_one, "条件")
+        gk_stub.connect(tree, branch_one, "是", branch_two, "执行")
+        gk_stub.connect(tree, key_two, "结果", branch_two, "条件")
+        gk_stub.connect(tree, branch_two, "是", printer, "执行")
+        self.assertEqual(key_one.resolved_action(), "key_1")
+        self.assertEqual(key_two.resolved_action(), "key_2")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("ACTION_KEY_1", code)
+        self.assertIn("ACTION_KEY_2", code)
 
     def test_mouse_nodes(self):
         """鼠标节点(UPBGE 的『输入 ▸ 鼠标』那一栏,以前完全没有)。"""
@@ -11257,7 +11498,7 @@ class TestRound42Display(Base):
     def test_card_list_matches_classes(self):
         """DISPLAY_CARD_IDS 和真正登记的四个类对得上(防改名 / 漏登记)。"""
         from BlenderGameKit import properties as props
-        self.assertEqual(len(NN.DISPLAY_CARD_IDS), 4)
+        self.assertEqual(len(NN.DISPLAY_CARD_IDS), 5)
         for blob in NN.DISPLAY_CARD_IDS:
             cls = getattr(NN, blob, None)
             self.assertIsNotNone(cls, f"DISPLAY_CARD_IDS 里的 {blob} 没定义")
@@ -11289,7 +11530,7 @@ class TestRound42Display(Base):
                   for _cat, items in props.node_menu_entries("GKDisplayTree")
                   for cls in items]
         for wanted in ("显示_碰撞线框", "显示_调试面板", "显示_画面风格",
-                       "显示_视口预览"):
+                       "显示_视口预览", "显示_环境氛围"):
             self.assertIn(wanted, labels)
         self.assertNotIn("移动_按方向", labels)
         # 反过来:玩法图的菜单里不该冒出设置卡
@@ -11321,12 +11562,15 @@ class TestRound42Display(Base):
             debug_runtime=False, toon_materials=True, toon_follow_light=False)
         rows = NN.display_settings_rows(settings)
         self.assertEqual([row[0] for row in rows],
-                         ["调试面板", "运行日志", "画面风格"])
+                         ["调试面板", "运行日志", "画面风格", "环境氛围"])
         self.assertTrue(rows[0][2])
         self.assertIn("F1", rows[0][1])
         self.assertIn("F2", rows[0][1])
         self.assertFalse(rows[1][2])
         self.assertIn("全平涂", rows[2][1])
+        # 老设置对象没有 env_* 属性 -> 环境氛围按"关"兜底
+        self.assertFalse(rows[3][2])
+        self.assertEqual(rows[3][1], "关")
 
         # 关掉卡通 = 原样导出 PBR;打开跟随光照 = 明暗跟着太阳
         settings.toon_materials = False
@@ -11340,10 +11584,274 @@ class TestRound42Display(Base):
 
         # 缺属性的裸对象(老 .blend / 桩环境)也要有兜底,不能抛异常
         rows = NN.display_settings_rows(object())
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         self.assertFalse(rows[0][2])
         # 设置对象本身拿不到(None)= 空摘要,面板自己去报错
         self.assertEqual(NN.display_settings_rows(None), [])
+
+
+class TestRound50UiChoice(Base):
+    """第五十轮:阶段③『对话_选择』分支(剧情分支 / 二选一)。
+
+    设计文档的第三阶段:"『对话_选择』节点 —— 最多 N 个选项(选项文字 +
+    每个选项一个执行出口 + 『选了第几个』输出)"。
+    判据:
+      * 出口数量跟着『选项数』走(1~6),名字是 `选项1..选项N`;
+      * **没有『完成』出口**(有的话会"没选就往下跑" —— 和『界面_按钮』同一个坑);
+      * 生成物是 `match _gk_choice_picked:` + 每个出口一个 case;
+      * 『选了第几个』是个整数数据出口,解析成 `_gk_choice_picked`;
+      * 选项文字按 `|` 分隔,填不满的自动补『选项 N』。
+    """
+
+    def _tree_with_choice(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeUiChoice, "选一个", **props)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        return tree, node
+
+    def test_sockets_follow_option_count(self):
+        _tree, node = self._tree_with_choice(gk_option_count=3,
+                                             gk_options="救她|自己跑|再想想")
+        names = [socket.name for socket in node.outputs]
+        self.assertEqual(names, ["选项1", "选项2", "选项3", "选了第几个"])
+        # 数据出口是整数,不是执行流
+        data = node.outputs.get("选了第几个")
+        self.assertNotEqual(data.bl_idname, "NodeSocketVirtual")
+        node.gk_option_count = 5
+        node.build_sockets()
+        self.assertEqual([s.name for s in node.outputs],
+                         ["选项1", "选项2", "选项3", "选项4", "选项5",
+                          "选了第几个"])
+        # 上限 6 / 下限 1(防止用户把它调成 0 条出口)
+        node.gk_option_count = 99
+        node.build_sockets()
+        self.assertEqual(len([s for s in node.outputs
+                              if s.name.startswith("选项")]), 6)
+
+    def test_no_done_socket(self):
+        """**不能有『完成』出口** —— 有的话选都没选后面的逻辑就跑了。"""
+        _tree, node = self._tree_with_choice()
+        self.assertIsNone(node.outputs.get("完成"))
+
+    def test_option_texts_pad_and_split(self):
+        _tree, node = self._tree_with_choice(gk_option_count=4,
+                                             gk_options="救她|自己跑")
+        self.assertEqual(node.option_texts(),
+                         ["救她", "自己跑", "选项 3", "选项 4"])
+        node.gk_options = "  甲 | 乙 | 丙 | 丁 | 多出来的  "
+        self.assertEqual(node.option_texts(), ["甲", "乙", "丙", "丁"])
+
+    def test_generates_match_with_one_case_per_option(self):
+        tree, node = self._tree_with_choice(gk_option_count=3,
+                                            gk_options="救她|自己跑|再想想",
+                                            gk_question="怎么办？")
+        first = tree.new_node(NN.GKNodePrint, "选了一", gk_text="选了一")
+        second = tree.new_node(NN.GKNodePrint, "选了二", gk_text="选了二")
+        gk_stub.connect(tree, node, "选项1", first, "执行")
+        gk_stub.connect(tree, node, "选项2", second, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_choice_show(self, str(\"怎么办？\"), "
+                      "[\"救她\", \"自己跑\", \"再想想\"], 30.0, 640.0, 200.0, 48.0)",
+                      code)
+        self.assertIn("while _gk_choice_picked < 0:", code)
+        self.assertIn("await get_tree().process_frame", code)
+        self.assertIn("_gk_choice_hide()", code)
+        self.assertIn("match _gk_choice_picked:", code)
+        for case in ("        1:", "        2:", "        3:"):
+            self.assertIn(case, code)
+        # 没连线的『选项3』必须补 pass(match 的空分支是语法错)
+        self.assertIn("        3:\n            pass", code)
+        # 两条链各自落在自己的 case 里
+        self.assertIn('print("选了一")', code)
+        self.assertIn('print("选了二")', code)
+        self.assert_indent_sane(code)
+
+    def test_hides_panel_before_branch(self):
+        """先收起面板、再走分支 —— 不然选完面板还挂在屏幕上。"""
+        tree, node = self._tree_with_choice()
+        printer = tree.new_node(NN.GKNodePrint, "之后", gk_text="之后")
+        gk_stub.connect(tree, node, "选项1", printer, "执行")
+        code, _ = gen(tree, V2)
+        lines = code.splitlines()
+        hide_at = next(i for i, line in enumerate(lines)
+                       if line.strip() == "_gk_choice_hide()")
+        match_at = next(i for i, line in enumerate(lines)
+                        if line.strip() == "match _gk_choice_picked:")
+        print_at = next(i for i, line in enumerate(lines)
+                        if 'print("之后")' in line)
+        self.assertLess(hide_at, match_at)
+        self.assertLess(match_at, print_at)
+
+    def test_number_keys_and_buttons(self):
+        tree, node = self._tree_with_choice()
+        code, _ = gen(tree, V2)
+        # 鼠标:每个选项一个按钮,按下回调带序号
+        self.assertIn('button.name = "选择%d" % (index + 1)', code)
+        self.assertIn("button.pressed.connect(_gk_choice_pick.bind(index + 1))", code)
+        # 键盘:数字键 1~6,走 _input(和对话框同一套采集方式)
+        self.assertIn("func gk_choice_input_event(event: InputEvent) -> void:", code)
+        self.assertIn("gk_choice_input_event(event)", code)
+        self.assertIn("KEY_1:", code)
+        self.assertIn("KEY_6:", code)
+        # 面板自己不吃鼠标(点击要能穿到按钮上)
+        self.assertIn("_gk_choice_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE", code)
+
+    def test_picked_index_is_readable_expression(self):
+        """『选了第几个』接到『变量_设置』上 → 生成物里是 `_gk_choice_picked`。"""
+        tree, node = self._tree_with_choice(gk_option_count=2)
+        store = tree.new_node(NN.GKNodeSetVar, "记下选择", gk_var_name="选的")
+        gk_stub.connect(tree, node, "选项2", store, "执行")
+        source = tree.new_node(NN.GKNodeGetVar, "读变量", gk_var_name="选的")
+        self.assertIsNotNone(source)
+        # 直接把数据出口接到『变量_设置』的值上
+        gk_stub.connect(tree, node, "选了第几个", store, "值")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_choice_picked", code)
+        self.assertIn("var 选的: int", code)
+
+    def test_panel_helper_only_when_used(self):
+        """没用『对话_选择』时,一个选择辅助函数都不许出现(老产物一字不变)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="你好")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_gk_choice_show", code)
+        self.assertNotIn("_gk_choice_panel", code)
+        self.assertNotIn("gk_choice_input_event", code)
+
+    def test_choice_only_in_game_logic_tree(self):
+        from BlenderGameKit import properties as props
+        cls = NN.GKNodeUiChoice
+        self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"))
+        self.assertFalse(props.node_fits_tree(cls, "GKUiDesignTree"))
+        self.assertFalse(props.node_fits_tree(cls, "GKAnimationTree"))
+        # 不是"控件构建"节点:不该被『界面_套用设计』建出来
+        self.assertFalse(getattr(cls, "gk_ui_builder", False))
+
+
+class TestRound49Environment(Base):
+    """第四十九轮:阶段②环境与后处理(WorldEnvironment + Environment)。
+
+    设计文档的第二阶段:导出 WorldEnvironment —— 背景 / 环境光 / 雾 /
+    泛光 / 色调。判据(和『游戏显示』那轮一样):
+      * **默认关**:关着时 environment_scene_blocks 什么都不给
+        (老工程导出产物一字不变);
+      * 读设置是**纯函数**(喂假设置对象就能验,不碰 bpy);
+      * 枚举数值和 properties 里的枚举**顺序一致**(防两处各写一套飘掉)。
+    """
+
+    @staticmethod
+    def _scene(**overrides):
+        values = dict(
+            env_enabled=True, env_background="COLOR",
+            env_bg_color=(0.05, 0.06, 0.10, 1.0),
+            env_ambient_color=(0.5, 0.6, 0.8, 1.0), env_ambient_energy=0.5,
+            env_fog=False, env_fog_color=(0.3, 0.34, 0.42, 1.0),
+            env_fog_density=0.02,
+            env_glow=False, env_glow_intensity=0.8, env_glow_bloom=0.1,
+            env_tonemap="LINEAR", env_adjust=False,
+            env_brightness=1.0, env_contrast=1.0, env_saturation=1.0)
+        values.update(overrides)
+        return types.SimpleNamespace(gk_settings=types.SimpleNamespace(**values))
+
+    def test_off_by_default(self):
+        from BlenderGameKit import asset_export as ae
+        off = self._scene(env_enabled=False)
+        self.assertIsNone(ae.env_settings(off))
+        self.assertEqual(ae.environment_scene_blocks(off), ([], ""))
+        # 没有 gk_settings / scene 是 None 也不能炸
+        self.assertIsNone(ae.env_settings(types.SimpleNamespace()))
+        self.assertIsNone(ae.env_settings(None))
+        self.assertEqual(ae.environment_scene_blocks(None), ([], ""))
+
+    def test_2d_project_does_not_export(self):
+        """2D 项目:开着也不导(WorldEnvironment 只对 3D 有用,免得"开了没反应")。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(dimension="2")
+        self.assertIsNone(ae.env_settings(scene))
+        self.assertEqual(ae.environment_scene_blocks(scene), ([], ""))
+
+    def test_environment_fields(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(
+            env_background="COLOR", env_ambient_energy=0.42,
+            env_fog=True, env_fog_density=0.07,
+            env_glow=True, env_glow_intensity=1.5, env_glow_bloom=0.3,
+            env_tonemap="ACES", env_adjust=True,
+            env_brightness=1.1, env_contrast=1.2, env_saturation=0.8)
+        blocks, node = ae.environment_scene_blocks(scene)
+        self.assertEqual(len(blocks), 1)
+        text = blocks[0]
+        self.assertIn('[sub_resource type="Environment"', text)
+        self.assertIn("background_mode = 1", text)          # 纯色
+        self.assertIn("ambient_light_source = 3", text)     # 用颜色当环境光
+        self.assertIn("ambient_light_energy = 0.420000", text)
+        self.assertIn("fog_enabled = true", text)
+        self.assertIn("fog_density = 0.070000", text)
+        self.assertIn("glow_enabled = true", text)
+        self.assertIn("glow_intensity = 1.500000", text)
+        self.assertIn("tonemap_mode = 3", text)             # ACES
+        self.assertIn("adjustment_enabled = true", text)
+        self.assertIn("adjustment_saturation = 0.800000", text)
+        self.assertNotIn("sky =", text)
+        self.assertIn('type="WorldEnvironment"', node)
+        self.assertIn('SubResource("gk_environment")', node)
+
+    def test_fog_and_glow_off_writes_false(self):
+        from BlenderGameKit import asset_export as ae
+        blocks, _node = ae.environment_scene_blocks(self._scene())
+        text = blocks[0]
+        self.assertIn("fog_enabled = false", text)
+        self.assertIn("glow_enabled = false", text)
+        self.assertIn("adjustment_enabled = false", text)
+
+    def test_sky_background_adds_resources(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(env_background="SKY",
+                            env_bg_color=(0.2, 0.3, 0.6, 1.0))
+        blocks, _node = ae.environment_scene_blocks(scene)
+        joined = "\n".join(blocks)
+        self.assertEqual(len(blocks), 3)
+        self.assertIn('[sub_resource type="ProceduralSkyMaterial"', joined)
+        self.assertIn('[sub_resource type="Sky"', joined)
+        self.assertIn('sky = SubResource("gk_sky")', joined)
+        self.assertIn("background_mode = 2", joined)
+
+    def test_enum_values_match_properties(self):
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import properties as props
+        bg_order = [item[0] for item in props.ENV_BACKGROUNDS]
+        self.assertEqual(bg_order, list(ae.ENV_BACKGROUND_MODES))
+        tone_order = [item[0] for item in props.ENV_TONEMAPS]
+        self.assertEqual(tone_order, list(ae.ENV_TONEMAP_MODES))
+        # 数值必须从 0 连续排(和 Godot 枚举对齐)
+        self.assertEqual(list(ae.ENV_TONEMAP_MODES.values()),
+                         list(range(len(tone_order))))
+
+    def test_scene_settings_has_env_props(self):
+        """GKSceneSettings 上真的挂了这些属性(卡上才读得到)。"""
+        from BlenderGameKit import properties as props
+        annotations = props.GKSceneSettings.__annotations__ or {}
+        for name in ("env_enabled", "env_background", "env_bg_color",
+                     "env_ambient_color", "env_ambient_energy", "env_fog",
+                     "env_fog_color", "env_fog_density", "env_glow",
+                     "env_glow_intensity", "env_glow_bloom", "env_tonemap",
+                     "env_adjust", "env_brightness", "env_contrast",
+                     "env_saturation"):
+            self.assertIn(name, annotations, name)
+
+    def test_env_card_is_a_display_card(self):
+        from BlenderGameKit import properties as props
+        cls = NN.GKNodeDisplayEnvironment
+        self.assertIn("GKNodeDisplayEnvironment", NN.DISPLAY_CARD_IDS)
+        self.assertEqual(list(cls.gk_inputs), [])
+        self.assertEqual(list(cls.gk_outputs), [])
+        self.assertTrue(props.node_fits_tree(cls, "GKDisplayTree"))
+        self.assertFalse(props.node_fits_tree(cls, "GKGameLogicTree"))
 
 
 class TestRound43Assets(Base):

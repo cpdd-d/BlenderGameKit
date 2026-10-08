@@ -1477,6 +1477,105 @@ class GKNodeUiDialog(B.GKStatementNode):
         row.prop(self, "gk_margin", text="距底边")
 
 
+@N
+class GKNodeUiChoice(B.GKStatementNode):
+    bl_idname = "GKNodeUiChoice"
+    bl_label = "对话_选择"
+    bl_icon = "MENU_PANEL"
+    gk_category = "界面"
+    gk_doc = ("弹一个问题 + 一排**可点的选项**(剧情分支 / 对话选项 / 二选一):"
+              "玩家点哪个,就走哪个出口。\n"
+              "── 和『界面_对话框』的关系 ──\n"
+              "同一族(同一块面板风格),区别是对话框**只有一条路**"
+              "(点一下继续),选择**有几条路**(每个选项一个执行出口)。\n"
+              "── 怎么用 ──\n"
+              "① 『选项数』调出口个数(1~6),『选项』里按 `|` 分隔写文字"
+              "(填不满的会自动补『选项 N』);\n"
+              "② 每个『选项 N』出口接一条链 —— 选它就只走那一条;"
+              "最多 6 条,不用先连线也能改;"
+              "③ 『选了第几个』是个整数输出(第 1 个 = 1),想记档 / 判断"
+              "的时候接『变量_设置』。\n"
+              "── 怎么选 ──\n"
+              "鼠标点选项按钮,或者键盘按**数字键 1~6**(和出口号一一对应)。\n"
+              "执行流会在选择这里**停住**,等玩家选完才继续。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "问题", "你怎么做？"),
+    )
+    gk_input_props = {"问题": "gk_question"}
+    gk_prop_defs = (
+        ("gk_question", "string", "你怎么做？", "问题", "没接『问题』引脚时显示这句"),
+        # 属性名里带 "count" -> node_base 会自动挂上"重建引脚"的回调
+        ("gk_option_count", "int", 2, "选项数", "1~6 条分支",
+         None, {"min": 1, "max": 6}),
+        ("gk_options", "string", "救她|自己跑", "选项",
+         "按 | 分隔写每个选项的文字;填不满的自动补『选项 N』"),
+        ("gk_speed", "float", 30.0, "打字速度", "每秒显示几个字;0 = 直接全显示"),
+        ("gk_width", "float", 640.0, "宽", "面板宽(像素)"),
+        ("gk_height", "float", 200.0, "高", "面板高(像素)"),
+        ("gk_margin", "float", 48.0, "距底边", "面板离屏幕下边多少像素"),
+    )
+    # 出口按 gk_option_count 动态生成(见 build_sockets);这里只是默认值。
+    # ⚠ **没有『完成』出口**:emit_statement 会自动续接『完成』,
+    #   有这个出口的话"选都没选后面的逻辑就跑了"(和『界面_按钮』同一个坑)。
+    # 『选了第几个』是**数据**出口(整数),给『变量_设置』记录走哪条分支。
+    gk_outputs = (
+        S.pin(FLOW, "选项1"), S.pin(FLOW, "选项2"),
+        S.pin(INT, "选了第几个", 1),
+    )
+
+    def build_sockets(self):
+        """按 gk_option_count 重建出口:选项1..选项N + 一个『选了第几个』。
+
+        出口名就是"第几个选项"(1 起数),和『选了第几个』输出**同一个编号** ——
+        用户看图 / 看代码不用来回换算。
+        """
+        count = max(1, min(6, int(getattr(self, "gk_option_count", 2) or 2)))
+        self.inputs.clear()
+        for spec in self.gk_inputs:
+            socket = self.inputs.new(spec["kind"][0], spec["name"])
+            if spec["default"] is not None:
+                try:
+                    socket.default_value = spec["default"]
+                except Exception:
+                    pass
+        self.outputs.clear()
+        for index in range(count):
+            self.outputs.new(S.FLOW[0], f"选项{index + 1}")
+        data = self.outputs.new(S.INT[0], "选了第几个")
+        data.default_value = 1
+
+    def option_texts(self):
+        """这张卡上填的选项文字(补齐到 gk_option_count 条,不重复)。"""
+        count = max(1, min(6, int(getattr(self, "gk_option_count", 2) or 2)))
+        raw = str(getattr(self, "gk_options", "") or "")
+        items = [part.strip() for part in raw.split("|")]
+        out = []
+        for index in range(count):
+            text = items[index] if index < len(items) else ""
+            out.append(text or f"选项 {index + 1}")
+        return out
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_question", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_option_count", text="选项数")
+        row.prop(self, "gk_speed", text="字/秒")
+        # 每个选项一行:序号 + 文字(一眼看出"第几个出口对应哪句话")
+        texts = self.option_texts()
+        for index, text in enumerate(texts):
+            row = layout.row(align=True)
+            row.label(text=f"{index + 1}.", icon="RIGHTARROW")
+            row.label(text=text)
+        row = layout.row(align=True)
+        row.prop(self, "gk_options", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_margin", text="距底边")
+        layout.label(text="每个出口接一条链;数字键 1~6 也能选", icon="INFO")
+
+
 # ==========================================================================
 # 界面第二版(第三十八轮):列表 / 缓动 / 九宫格 / 输入框 / 焦点
 # ==========================================================================
@@ -2241,3 +2340,42 @@ class GKNodeTimeline(B.GKStatementNode):
             pick.node_name = self.name
             pick.curve_prop = f"gk_track{index}_curve"
         _draw_curve_row(layout, self, "gk_path_curve", "轨道")
+
+
+# ==========================================================================
+# 灯光(第四十八轮:阶段①灯光扩展)
+# ==========================================================================
+@N
+class GKNodeSetLight(B.GKStatementNode):
+    bl_idname = "GKNodeSetLight"
+    bl_label = "灯光_设置"
+    bl_icon = "LIGHT"
+    gk_category = "灯光"
+    gk_doc = ("开关 / 调亮度 / 换颜色**一盏场景灯**(手电筒开关、灯闪、"
+              "恐怖氛围都靠它)。灯名 = Blender 里灯光物体的名字 —— "
+              "导出后就是 Godot 场景里那个灯节点")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "灯名", ""),
+        S.pin(BOOL, "开启", True),
+        S.pin(FLOAT, "亮度", 0.0),
+    )
+    gk_input_props = {"灯名": "gk_light", "开启": "gk_on", "亮度": "gk_energy"}
+    gk_prop_defs = (
+        ("gk_light", "string", "", "灯名",
+         "Blender 里灯光物体的名字(导出后 Godot 场景里的节点名)"),
+        ("gk_on", "bool", True, "开启", "关掉 = visible 置 false;打开 = true"),
+        ("gk_energy", "float", 0.0, "亮度", "0 = 不改;大于 0 就把灯设成这个亮度"),
+        ("gk_set_color", "bool", False, "改颜色", "勾上才把『颜色』写进灯里"),
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "灯光颜色"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_light", text="")
+        row.prop(self, "gk_on", text="开", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_energy", text="亮度")
+        row.prop(self, "gk_set_color", text="颜色", toggle=True)
+        if self.gk_set_color:
+            layout.prop(self, "gk_color", text="")

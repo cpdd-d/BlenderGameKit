@@ -12,7 +12,8 @@ from .statements import _emit_logic_ports, _emit_logic_vars
 from .animation import _anim_category_table, _emit_state_graph, _emit_state_transitions
 from .ai import _emit_ai_graph
 from .camera import _path_name
-from .services import _FILTER_SHADER_CONST, _GD_FILTER_SHADER
+from .services import (_FILTER_SHADER_CONST, _GD_FILTER_SHADER,
+                       _GD_VIGNETTE_SHADER, _VIGNETTE_SHADER_CONST)
 from .context import GenContext
 
 
@@ -498,6 +499,38 @@ class Generator:
                     "    _gk_debug_logs.append(text)",
                     "    while _gk_debug_logs.size() > 20:",
                     "        _gk_debug_logs.pop_front()",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 灯光设置的小工具(第四十八轮:阶段①灯光扩展)------------
+        # 见 statements._stmt_set_light 的说明:运行时按名字找灯,
+        # 从 current_scene 往下找(换过关卡也对得上),找不到静默跳过。
+        if getattr(self.ctx, "need_light_helper", False):
+            sections.append({
+                "signature": "func _gk_set_light(host: Node, light_name: String, "
+                             "on: bool, energy: float, color) -> void:",
+                "lines": [
+                    "    if light_name.strip_edges().is_empty():",
+                    "        return",
+                    "    var root: Node = host",
+                    "    if host != null and host.is_inside_tree():",
+                    "        var scene := host.get_tree().current_scene",
+                    "        if scene != null:",
+                    "            root = scene",
+                    "    if root == null:",
+                    "        return",
+                    "    var found := root.find_child("
+                    'light_name.strip_edges(), true, false)',
+                    "    var light := found as Light3D",
+                    "    if light == null:",
+                    "        return",
+                    "    light.visible = on",
+                    "    if energy > 0.0:",
+                    "        light.light_energy = energy",
+                    "    if color != null:",
+                    "        light.light_color = color",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
@@ -1184,6 +1217,104 @@ class Generator:
                 "separator": True,
             })
 
+        # ---- 对话选择(第四十九轮:阶段③『对话_选择』分支)--------------
+        # 和对话框同一族的深色圆角面板,但里面是:问题 + 一列**可点的按钮**。
+        # 面板本身不吃鼠标(点击要能穿到按钮上),按钮各接各的 `_gk_choice_pick(序号)`。
+        # 数字键 1~6 走 `_input`(见 gk_choice_input_event),两条路都通。
+        if self.ctx.need_choice_helpers:
+            sections.append({
+                "signature": ("func _gk_choice_show(host: Node, question: String, "
+                              "options: Array, speed: float, width: float, "
+                              "height: float, margin: float) -> void:"),
+                "lines": [
+                    "    _gk_ensure_ui(host)",
+                    "    _gk_choice_picked = -1",
+                    "    if _gk_choice_panel == null:",
+                    "        _gk_choice_panel = Panel.new()",
+                    "        _gk_choice_panel.name = \"选择框\"",
+                    "        var box := StyleBoxFlat.new()",
+                    "        box.bg_color = Color(0.05, 0.06, 0.09, 0.88)",
+                    "        box.corner_radius_top_left = 14",
+                    "        box.corner_radius_top_right = 14",
+                    "        box.corner_radius_bottom_left = 14",
+                    "        box.corner_radius_bottom_right = 14",
+                    "        box.border_width_top = 2",
+                    "        box.border_width_bottom = 2",
+                    "        box.border_width_left = 2",
+                    "        box.border_width_right = 2",
+                    "        box.border_color = Color(1.0, 1.0, 1.0, 0.25)",
+                    "        _gk_choice_panel.add_theme_stylebox_override(\"panel\", box)",
+                    # 面板自己不吃鼠标:点击要能穿到下面的选项按钮上
+                    "        _gk_choice_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_ui_root.add_child(_gk_choice_panel)",
+                    "        _gk_choice_question = Label.new()",
+                    "        _gk_choice_question.name = \"问题\"",
+                    "        _gk_choice_question.add_theme_font_size_override(\"font_size\", 22)",
+                    "        _gk_choice_question.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER",
+                    "        _gk_choice_question.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_choice_panel.add_child(_gk_choice_question)",
+                    "        _gk_choice_box = VBoxContainer.new()",
+                    "        _gk_choice_box.name = \"选项\"",
+                    "        _gk_choice_box.add_theme_constant_override(\"separation\", 10)",
+                    "        _gk_choice_box.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "        _gk_choice_panel.add_child(_gk_choice_box)",
+                    # 上一次的按钮清掉再建新的(选项数 / 文字都可能变了)。
+                    # ⚠ 先 remove_child 再 queue_free:queue_free 要到帧末才真的摘掉,
+                    #   那一帧里新旧按钮会同时占位置(列表那边踩过同样的坑)。
+                    "    for child in _gk_choice_box.get_children():",
+                    "        _gk_choice_box.remove_child(child)",
+                    "        child.queue_free()",
+                    "    _gk_choice_panel.size = Vector2(width, height)",
+                    "    _gk_choice_panel.set_anchors_and_offsets_preset(",
+                    "        Control.PRESET_CENTER_BOTTOM, Control.PRESET_MODE_KEEP_SIZE, margin)",
+                    "    var pad := 22.0",
+                    "    _gk_choice_question.text = question",
+                    # 问题也逐字冒出来(和对话框同一种手感);按钮**立刻**可点,
+                    # 玩家不等它打完就能选 —— 打字只是好看,不挡操作。
+                    "    _gk_choice_question.visible_characters = 0",
+                    "    var chars := question.length()",
+                    "    if speed > 0.0 and chars > 0:",
+                    "        _gk_choice_question.create_tween().tween_property(",
+                    "            _gk_choice_question, \"visible_characters\", chars, float(chars) / speed)",
+                    "    else:",
+                    "        _gk_choice_question.visible_characters = -1",
+                    "    _gk_choice_question.position = Vector2(pad, pad * 0.5)",
+                    "    _gk_choice_question.size = Vector2(width - pad * 2.0, 30.0)",
+                    "    _gk_choice_box.position = Vector2(pad, pad + 34.0)",
+                    "    _gk_choice_box.size = Vector2(width - pad * 2.0, height - pad * 2.0 - 34.0)",
+                    "    for index in range(options.size()):",
+                    "        var button := Button.new()",
+                    # 名字带序号:探针 / 调试面板能按名字找到第几个选项
+                    "        button.name = \"选择%d\" % (index + 1)",
+                    "        button.text = str(options[index])",
+                    "        button.custom_minimum_size = Vector2(0.0, 38.0)",
+                    "        button.mouse_filter = Control.MOUSE_FILTER_STOP",
+                    "        button.pressed.connect(_gk_choice_pick.bind(index + 1))",
+                    "        _gk_choice_box.add_child(button)",
+                    "    _gk_choice_panel.visible = true",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_choice_pick(index: int) -> void:",
+                "lines": [
+                    "    if _gk_choice_panel == null or not _gk_choice_panel.visible:",
+                    "        return",
+                    "    _gk_choice_picked = index",
+                ],
+                "empty_body": "    pass",
+            })
+            sections.append({
+                "signature": "func _gk_choice_hide() -> void:",
+                "lines": [
+                    "    if _gk_choice_panel != null:",
+                    "        _gk_choice_panel.visible = false",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
         # ---- 手柄摇杆死区 ----
         if self.ctx.need_joy_helpers:
             sections.append({
@@ -1222,6 +1353,38 @@ class Generator:
                     "    _gk_filter_mat.set_shader_parameter(\"tint\", Color(1, 1, 1, 1))",
                     "    _gk_filter_rect.material = _gk_filter_mat",
                     "    _gk_filter_layer.add_child(_gk_filter_rect)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 屏幕暗角(第五十一轮:阶段④屏幕氛围)------------------------
+        # 和滤镜同一个套路,但**各占一层**(layer 92 > 滤镜的 90):
+        # 先染色再压暗角,两个节点能叠着用,谁也不改对方的着色器。
+        if self.ctx.need_screen_vignette:
+            sections.append({
+                "signature": "func _gk_ensure_vignette(host: Node) -> void:",
+                "lines": [
+                    "    if _gk_vignette_layer != null:",
+                    "        return",
+                    "    _gk_vignette_layer = CanvasLayer.new()",
+                    "    _gk_vignette_layer.name = \"GKVignette\"",
+                    # layer 92:盖住滤镜(90)和界面(10),但低于闪白/转场(100)
+                    "    _gk_vignette_layer.layer = 92",
+                    "    host.add_child(_gk_vignette_layer)",
+                    "    _gk_vignette_rect = ColorRect.new()",
+                    "    _gk_vignette_rect.set_anchors_preset(Control.PRESET_FULL_RECT)",
+                    "    _gk_vignette_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "    var sh := Shader.new()",
+                    "    sh.code = _GK_VIGNETTE_SHADER",
+                    "    _gk_vignette_mat = ShaderMaterial.new()",
+                    "    _gk_vignette_mat.shader = sh",
+                    "    _gk_vignette_mat.set_shader_parameter(\"vignette_amount\", 0.0)",
+                    "    _gk_vignette_mat.set_shader_parameter(\"vignette_radius\", 0.55)",
+                    "    _gk_vignette_mat.set_shader_parameter(\"vignette_edge\", 0.35)",
+                    "    _gk_vignette_mat.set_shader_parameter(\"vignette_color\", Color(0, 0, 0, 1))",
+                    "    _gk_vignette_rect.material = _gk_vignette_mat",
+                    "    _gk_vignette_layer.add_child(_gk_vignette_rect)",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
@@ -1945,6 +2108,12 @@ class Generator:
         if ctx.need_screen_filter and _GD_FILTER_SHADER not in out:
             out.append("# ---- 全屏滤镜着色器(由『屏幕_滤镜』节点使用)----")
             out.append(f'const {_FILTER_SHADER_CONST} := """{_GD_FILTER_SHADER}"""')
+            out.append("")
+
+        # 屏幕暗角同理(第五十一轮):自己的着色器常量,不动滤镜那一份
+        if ctx.need_screen_vignette and _GD_VIGNETTE_SHADER not in out:
+            out.append("# ---- 暗角着色器(由『屏幕_暗角』节点使用)----")
+            out.append(f'const {_VIGNETTE_SHADER_CONST} := """{_GD_VIGNETTE_SHADER}"""')
             out.append("")
 
         if ctx.input_actions:

@@ -197,6 +197,9 @@ class GenContext:
         self.need_pause_helpers = False
         # 对话框:生成 _gk_dialog_* 那组辅助函数 + 往 _input 里挂点按采集
         self.need_dialog_helpers = False
+        # 对话选择(第四十九轮:阶段③『对话_选择』分支):
+        # 生成 _gk_choice_* 那组辅助函数(和对话框共用 UI 容器,不冲突)
+        self.need_choice_helpers = False
         # ── UI 第二版(第三十八轮)─────────────────────────────────────
         # 列表:生成 `_gk_list_body()`(找列表里那个**排版的容器** ——
         # 子控件挂在它上面才排队,挂到滚动容器本身会浮着)
@@ -209,6 +212,9 @@ class GenContext:
         self.need_joy_helpers = False
         # 只有真的用了屏幕滤镜才生成全屏材质辅助函数
         self.need_screen_filter = False
+        # 屏幕暗角(第五十一轮:阶段④屏幕氛围)—— 和滤镜**各占一层**:
+        # 两个可以叠着用(整屏染色 + 四角压暗),互不改写对方的着色器
+        self.need_screen_vignette = False
         # 触屏拖动需要往 _input 里挂事件累积逻辑
         self.need_touch_drag = False
         self._input_handlers = []   # [(函数名, 松手是否清零)]
