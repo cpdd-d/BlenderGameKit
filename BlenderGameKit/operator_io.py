@@ -10,8 +10,9 @@ import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
 
-from . import (advisor, asset_export, codegen, curve_assets, export_report,
-               exporter, gk_log, npr_preview, packaging, project)
+from . import (advisor, advisor_tools, asset_export, codegen, curve_assets,
+               export_report, exporter, gk_log, npr_preview, packaging,
+               project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -2867,7 +2868,7 @@ class GK_OT_AskAdvisor(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        if advisor.is_busy():
+        if advisor.agent_active():
             _report(self, "ERROR", "上一条还在等 AI 回,稍等一下再发")
             return {"CANCELLED"}
 
@@ -2901,7 +2902,10 @@ class GK_OT_AskAdvisor(bpy.types.Operator):
         # advisor.build_messages 的说明:否则每轮带一份过期快照,越聊越错)
         messages = advisor.build_messages(question, context_text,
                                           advisor.HISTORY)
-        if not advisor.request_in_background(base_url, api_key, model, messages):
+        # ── 走 Agent 循环(不是普通问答)────────────────────────────
+        # 带工具之后,AI 可以自己去查节点图 / 导出报告,而不是只凭那份快照
+        # 猜。它要工具时由主线程执行,再喂回去接着问 —— 见 poll_agent_step。
+        if not advisor.start_agent(base_url, api_key, model, messages):
             _report(self, "ERROR", "上一条还在等 AI 回,稍等一下再发")
             return {"CANCELLED"}
 
@@ -2910,8 +2914,9 @@ class GK_OT_AskAdvisor(bpy.types.Operator):
                              "error": ""})
         _start_advisor_poll()
         _report(self, "INFO",
-                f"已发出(项目诊断 {len(context_text)} 字)。界面不会卡,"
-                f"回复到了会自动追加到文本块『{advisor.DIALOG_TEXT_NAME}』")
+                f"已发出(项目诊断 {len(context_text)} 字,AI 可自己查项目)。"
+                f"界面不会卡,回复到了会自动追加到文本块"
+                f"『{advisor.DIALOG_TEXT_NAME}』")
         return {"FINISHED"}
 
 
@@ -3023,6 +3028,110 @@ def _biggest_area(window):
     return best
 
 
+class GK_OT_ApplyAdvisorAction(bpy.types.Operator):
+    """执行 AI 提议的那个动作 —— **只有用户点这里才真的改项目**。
+
+    ── 这一步是整个设计的"最后一道关" ────────────────────────────
+    AI 全程**没有**修改项目的能力:它只能 `propose_action` 生成一张卡片。
+    真改发生在**用户按下这个按钮**的时候。这样"AI 能不能动我的工程"这个
+    问题的答案,永远由用户那一刻的决定给出 —— 而不是由模型的自觉给出。
+
+    执行结果会写进对话记录(用户回头看得到"我当时做了什么改动"),
+    也会记进日志。
+    """
+
+    bl_idname = "gk.apply_advisor_action"
+    bl_label = "执行 AI 提议的动作"
+    bl_description = "按 AI 的建议修改项目(点之前不会有任何改动)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        card = advisor.agent_proposal()
+        if not card:
+            _report(self, "ERROR", "没有待确认的动作(可能已经执行或忽略过了)")
+            return {"CANCELLED"}
+        ok, message = advisor_tools.apply_proposal(context, card)
+        advisor.clear_proposal()
+        LAST_ADVISOR["status"] = ("已执行:" + message) if ok else ""
+        if not ok:
+            LAST_ADVISOR["error"] = f"执行失败:{message}"
+        # 这一笔也要留痕 —— 用户回头看对话记录时知道"当时做了什么"
+        try:
+            advisor.sync_dialog_text(
+                f"[执行动作] {card.get('label', '')}"
+                + (f"({card.get('target', '')})" if card.get("target") else ""),
+                f"{'成功' if ok else '失败'}:{message}")
+        except Exception:                                 # noqa: BLE001
+            pass
+        _report(self, "INFO" if ok else "ERROR", message)
+        return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class GK_OT_DismissAdvisorAction(bpy.types.Operator):
+    """忽略 AI 提议的动作(什么都不改)。"""
+
+    bl_idname = "gk.dismiss_advisor_action"
+    bl_label = "忽略"
+    bl_description = "不采纳这个建议,项目不会有任何改动"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        advisor.clear_proposal()
+        LAST_ADVISOR["status"] = "已忽略 AI 的建议(项目没有改动)"
+        return {"FINISHED"}
+
+
+class GK_OT_RunAdvisorAction(bpy.types.Operator):
+    """手动挑一个动作执行(不经过 AI)。
+
+    ── 为什么要有这个(而不是只让 AI 提议)────────────────────────
+    提议卡片只能由 AI 发起 —— 用户可能没配 AI,也可能 AI 没想到那个动作。
+    给一个手选入口,这份动作清单就不会白做,而且用户在 AI 抽风时也有路可走。
+    """
+
+    bl_idname = "gk.run_advisor_action"
+    bl_label = "手动执行一个动作"
+    bl_description = "从已登记的安全动作里挑一个执行(不经过 AI)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    action: EnumProperty(
+        name="动作",
+        description="要执行的动作",
+        items=lambda self, context: advisor_tools.action_menu_items(self,
+                                                                    context),
+    )
+    target: StringProperty(
+        name="对象",
+        description="物体名 / 图名 / 属性名(看动作需不需要)",
+        default="",
+    )
+    value: StringProperty(name="值", description="要设成的值", default="")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "action", text="动作")
+        hint = advisor_tools.action_hint(self.action)
+        if hint:
+            for line in advisor.wrap(hint, 44)[:4]:
+                layout.label(text=line, icon="INFO")
+        needs = advisor_tools.ACTIONS.get(self.action, {}).get("needs", ())
+        if "target" in needs:
+            layout.prop(self, "target", text="对象")
+        if "value" in needs:
+            layout.prop(self, "value", text="值")
+
+    def execute(self, context):
+        card = {"action": self.action, "label": advisor_tools.action_label(
+            self.action), "target": self.target, "value": self.value,
+            "why": "(手动执行)", "hint": ""}
+        ok, message = advisor_tools.apply_proposal(context, card)
+        _report(self, "INFO" if ok else "ERROR", message)
+        return {"FINISHED"} if ok else {"CANCELLED"}
+
+
 class GK_OT_ClearAdvisor(bpy.types.Operator):
     """清空对话历史 + 对话记录文本块。"""
 
@@ -3033,7 +3142,7 @@ class GK_OT_ClearAdvisor(bpy.types.Operator):
 
     def execute(self, context):
         # 正在跑的先放弃等待,否则它回来还会往刚清空的记录里写一条
-        advisor.cancel_background()
+        advisor.cancel_agent()
         advisor.clear_history()
         advisor.save_history(context.scene)
         advisor.clear_dialog_text()
@@ -3061,19 +3170,35 @@ def _stop_advisor_poll():
 
 
 def _poll_advisor():
-    """主线程定时器:看后台请求好了没。返回 None = 注销自己。
+    """主线程定时器:推进 AI 一轮。返回 None = 注销自己。
 
-    只在**结果到了**才重画界面 —— 等待期间每秒重画几次纯属浪费,而且
-    用户看到的『正在问 AI…』本来就不需要动。
+    ── 这个函数是"AI 能自己查项目"的关键 ──────────────────────────
+    `poll_agent_step` 在**主线程**里执行 AI 要的工具(读节点图 / 导出报告…),
+    然后把结果交回后台线程发下一轮。所以"网络在线程、工具在主线程"这个交替
+    是在这里发生的 —— 后台线程碰 bpy 会崩,这一层不能省。
+
+    只在**结果到了 / 推进了一步**才重画界面 —— 干等期间反复重画纯属浪费。
     """
-    if not advisor.is_busy():
+    if not advisor.agent_active():
         return None
-    result = advisor.poll_background()
-    if result is None:
+    state, result = advisor.poll_agent_step(*_advisor_args())
+    if state != "done":
+        if state == "continue":
+            _redraw_all_areas()      # "它读了节点图"这类进度要立刻看得见
         return _ADVISOR_POLL_INTERVAL
     _apply_advisor_result(*result)
     _redraw_all_areas()
     return None
+
+
+def _advisor_args():
+    """拼 `poll_agent_step` 要的那串参数(地址 / Key / 模型 / 超时)。"""
+    context = bpy.context
+    prefs = project.preferences(context)
+    base_url = (getattr(prefs, "advisor_base_url", "") or "") if prefs else ""
+    api_key = (getattr(prefs, "advisor_api_key", "") or "") if prefs else ""
+    model = (getattr(prefs, "advisor_model", "") or "").strip() if prefs else ""
+    return context, base_url, api_key, model
 
 
 def _apply_advisor_result(ok, text):
@@ -3097,10 +3222,16 @@ def _apply_advisor_result(ok, text):
         settings = getattr(scene, "gk_settings", None) if scene else None
         if settings is not None:
             settings.advisor_question = ""
-        LAST_ADVISOR.update({"status": f"AI 已回复({len(text)} 字),"
-                                       f"已存入『{advisor.DIALOG_TEXT_NAME}』",
-                             "error": ""})
-        gk_log.info(f"AI 回答了 {len(text)} 字,已追加到对话记录")
+        steps = advisor.agent_steps()
+        # 有提议时,那把回答从"文字"升级成"带一张待确认卡片的文字"
+        if advisor.agent_proposal():
+            status = "AI 提了一个动作 —— 在下面确认或忽略"
+        else:
+            status = (f"AI 已回复({len(text)} 字),"
+                      f"已存入『{advisor.DIALOG_TEXT_NAME}』")
+        LAST_ADVISOR.update({"status": status, "error": "", "steps": steps})
+        gk_log.info(f"AI 回答了 {len(text)} 字,已追加到对话记录"
+                    + (f";它做了:{'、'.join(steps)}" if steps else ""))
     else:
         LAST_ADVISOR.update({"status": "", "error": text})
         try:
@@ -3316,6 +3447,10 @@ GK_CLASSES = (
     GK_OT_AskAdvisor,
     GK_OT_CopyAdvisorContext,
     GK_OT_ClearAdvisor,
+    # AI 提议的动作:执行 / 忽略 / 手动挑一个(只有用户点『执行』才真改项目)
+    GK_OT_ApplyAdvisorAction,
+    GK_OT_DismissAdvisorAction,
+    GK_OT_RunAdvisorAction,
     # 长内容统一从这里进文本编辑器(对话记录 / 导出报告)
     GK_OT_OpenTextBlock,
     GK_OT_RelinkProject,
@@ -3346,7 +3481,7 @@ def on_unregister():
     _unregister_handlers()
     # 定时器必须摘掉:它闭包里握着本模块的函数对象,插件注销后还在跑会报错
     _stop_advisor_poll()
-    advisor.cancel_background()
+    advisor.cancel_agent()
     advisor.clear_history()
     LAST_EXPORT.clear()
     LAST_RELEASE.clear()

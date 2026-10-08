@@ -113,6 +113,9 @@ _SUBMODULES = (
     # 项目顾问(收集项目快照 + 调 OpenAI 兼容接口)。排在 operator_io 之前,
     # 因为它 import diagnostics / export_report / packaging
     "advisor",
+    # AI 能用的工具(只读 + 提议动作)。**必须排在 advisor 之后** ——
+    # advisor.tools_payload() 会 import 它,顺序错了重载时拿到的是上一版
+    "advisor_tools",
     "exporter",
     "npr_preview",
     "asset_export",

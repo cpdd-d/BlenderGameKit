@@ -6,8 +6,8 @@ import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        IntProperty, StringProperty)
 
-from . import (advisor, codegen, diagnostics, export_report, exporter, gk_log,
-               project)
+from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
+               exporter, gk_log, project)
 from . import asset_export
 from . import operator_io as ops
 from . import properties as props
@@ -4907,7 +4907,7 @@ def _draw_advisor_box(layout, context, settings):
     prefs = project.preferences(context)
     base_url = (getattr(prefs, "advisor_base_url", "") or "").strip() if prefs else ""
     configured = bool(base_url)
-    busy = advisor.is_busy()
+    busy = advisor.agent_active()
 
     if settings is not None:
         box.prop(settings, "advisor_question", text="", icon="QUESTION")
@@ -4929,6 +4929,27 @@ def _draw_advisor_box(layout, context, settings):
     row = box.row(align=True)
     row.operator("gk.dump_diagnostics", text="导出诊断信息", icon="TEXT")
 
+    # ── 待确认的动作卡片(第五十六轮:AI 亲自操作)──────────────────
+    # 这是"AI 提建议、**人**拍板"的落点:卡片上的『执行』才真改项目。
+    # 卡片放在状态行**上面** —— 它是这一屏要你做的决定,不该被压在下面。
+    proposal = advisor.agent_proposal()
+    if proposal:
+        card = box.box()
+        card.label(text="AI 建议这样改(还没生效):", icon="QUESTION")
+        head = card.row(align=True)
+        head.label(text=proposal.get("label", ""), icon="CHECKMARK")
+        if proposal.get("target"):
+            head.label(text=f"→ {proposal['target']}")
+        if proposal.get("value"):
+            card.label(text=f"值:{proposal['value']}")
+        if proposal.get("why"):
+            for line in advisor.wrap(proposal["why"], 44)[:4]:
+                card.label(text=line, icon="DOT")
+        row = card.row(align=True)
+        row.scale_y = 1.35
+        row.operator("gk.apply_advisor_action", text="执行", icon="PLAY")
+        row.operator("gk.dismiss_advisor_action", text="忽略", icon="X")
+
     # ── 状态行 ────────────────────────────────────────────────────
     error = ops.LAST_ADVISOR.get("error", "")
     status = ops.LAST_ADVISOR.get("status", "")
@@ -4936,6 +4957,11 @@ def _draw_advisor_box(layout, context, settings):
         # 不显示"已等 N 秒":侧栏不会自己持续重画,数字会僵在那儿误导人。
         box.label(text="正在问 AI…(界面不卡,回复到了自动进对话记录)",
                   icon="TIME")
+        # AI 自己去看项目时,把它做了什么显示出来 —— 否则用户只看到"在等",
+        # 完全不知道它在干活还是在卡着
+        steps = advisor.agent_steps()
+        if steps:
+            box.label(text="它已经:" + "、".join(steps[-4:]), icon="DOT")
     elif error:
         inner = box.box()
         inner.label(text="AI 调用失败", icon="ERROR")
@@ -4951,10 +4977,11 @@ def _draw_advisor_box(layout, context, settings):
 
     row = box.row(align=True)
     row.operator("gk.clear_advisor", text="清空对话", icon="TRASH")
+    # 手选动作:AI 没想到 / 没配 AI 时也有路可走(这份动作清单不该白做)
+    row.operator("gk.run_advisor_action", text="手动改…", icon="ARROW_LEFTRIGHT")
     rounds = len(advisor.HISTORY) // 2
     if rounds:
-        row.label(text=f"已聊 {rounds} 轮(下次问会带上最近 "
-                       f"{advisor.MAX_HISTORY // 2} 轮)", icon="DOT")
+        row.label(text=f"已聊 {rounds} 轮", icon="DOT")
 
 
 def _draw_project_box(layout, context):

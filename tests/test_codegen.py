@@ -12591,5 +12591,383 @@ class TestRound53Advisor(Base):
         self.assertIn("", advisor.wrap("第一段\n\n第二段", 20))
 
 
+class TestRound56AdvisorTools(Base):
+    """AI 亲自操作(第五十六轮):只读工具 + 提议动作 + Agent 循环状态机。
+
+    用户原话:"我想让AI来亲自操作可以吗"。选的方案是**只读 + 提议动作**:
+    AI 可以自己去查,但**改必须由用户点『执行』**。
+
+    这一层能离线测是因为:`advisor` 里协议/状态机那部分不 import bpy,
+    `advisor_tools` 里"动作登记表 + 提议校验"也是纯函数(只有真正 apply
+    和读 bpy 的那几个才需要 Blender)。真执行由冒烟测。
+    """
+
+    def test_tools_schema_shape(self):
+        """工具清单必须是合法的 OpenAI tools 格式,否则请求直接被 400。"""
+        from BlenderGameKit import advisor_tools
+        tools = advisor_tools.tools_schema()
+        self.assertTrue(tools)
+        names = set()
+        for item in tools:
+            self.assertEqual(item["type"], "function")
+            function = item["function"]
+            self.assertTrue(function["name"])
+            self.assertTrue(function["description"])
+            names.add(function["name"])
+            params = function["parameters"]
+            self.assertEqual(params["type"], "object")
+            self.assertIn("properties", params)
+        # 六个只读 + 一个提议
+        self.assertEqual(names, {
+            "read_settings", "list_trees", "list_nodes", "check_export_errors",
+            "get_godot_status", "diagnose", "propose_action"})
+
+    def test_no_modifying_tool_exists(self):
+        """**核心保证**:工具清单里除了 propose_action,一个能改数据的都没有。
+
+        这条是"AI 不能擅自改项目"的第一道证据 —— 模型能调的工具里压根
+        没有"改"这个能力,它想改只能提议。
+        """
+        from BlenderGameKit import advisor_tools
+        modifying = [item["function"]["name"]
+                     for item in advisor_tools.tools_schema()
+                     if item["function"]["name"] != "propose_action"
+                     and item["function"]["name"] not in advisor_tools._READERS]
+        self.assertEqual(modifying, [], f"出现了非只读工具: {modifying}")
+        # 而且 propose_action 的参数就是"动作名 + 参数",没有可执行代码
+        propose = [item for item in advisor_tools.tools_schema()
+                   if item["function"]["name"] == "propose_action"][0]
+        props = propose["function"]["parameters"]["properties"]
+        self.assertEqual(set(props), {"action", "target", "value", "why"})
+        self.assertIn("action", propose["function"]["parameters"]["required"])
+
+    def test_action_registry_is_declared(self):
+        """动作要登记,名字/标签/所需参数都得齐全。"""
+        from BlenderGameKit import advisor_tools
+        self.assertIn("enable_script_target", advisor_tools.ACTIONS)
+        for name, entry in advisor_tools.ACTIONS.items():
+            self.assertEqual(entry["name"], name)
+            self.assertTrue(entry["label"], name)
+            self.assertTrue(entry["hint"], name)
+            self.assertTrue(callable(entry["apply"]), name)
+            self.assertIsInstance(entry["needs"], tuple)
+        # 手选入口要能列出全部动作(三条一组给 Blender 的 EnumProperty)
+        items = advisor_tools.action_menu_items(None)
+        self.assertEqual(len(items), len(advisor_tools.ACTIONS))
+        for name, label, hint in items:
+            self.assertIn(name, advisor_tools.ACTIONS)
+            self.assertTrue(label and hint)
+
+    def test_build_proposal_rejects_bad_input(self):
+        """提议要当场校验 —— 否则卡片是**假承诺**(看着能用,点了报错)。"""
+        from BlenderGameKit import advisor_tools
+        note, card = advisor_tools.build_proposal({"action": "编的动作",
+                                                   "why": "x"})
+        self.assertIsNone(card)
+        self.assertIn("没有叫", note)
+        self.assertIn("可用的动作", note)            # 要让模型知道有哪些
+        # 缺必填参数 -> 也不能出卡片
+        note2, card2 = advisor_tools.build_proposal(
+            {"action": "set_dimension", "why": "先做 2D"})
+        self.assertIsNone(card2)
+        self.assertIn("还缺参数", note2)
+        self.assertIn("value", note2)
+        # 该给 target 的没给
+        note3, card3 = advisor_tools.build_proposal(
+            {"action": "enable_script_target", "why": "角色不动"})
+        self.assertIsNone(card3)
+        self.assertIn("target", note3)
+
+    def test_build_proposal_ok(self):
+        from BlenderGameKit import advisor_tools
+        note, card = advisor_tools.build_proposal(
+            {"action": "enable_script_target", "target": "Body",
+             "why": "角色不动多半是这个"})
+        self.assertIsNotNone(card)
+        self.assertEqual(card["action"], "enable_script_target")
+        self.assertEqual(card["target"], "Body")
+        self.assertEqual(card["label"],
+                         advisor_tools.action_label("enable_script_target"))
+        self.assertIn("角色不动", card["why"])
+        # 喂回模型的话必须提醒它"别说已经改好了" —— 否则它会撒谎
+        self.assertIn("不要说已经改好了", note.replace("**", ""))
+
+    def test_extract_tool_calls(self):
+        """抠工具调用:arguments 是**字符串**里的 JSON,还得容忍它坏掉。"""
+        from BlenderGameKit import advisor
+        data = {"choices": [{"message": {"tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "list_nodes",
+                          "arguments": '{"tree_name": "玩法"}'}},
+            {"id": "c2", "type": "function",
+             "function": {"name": "list_trees", "arguments": ""}},
+        ]}}]}
+        calls = advisor.extract_tool_calls(data)
+        self.assertEqual([c["name"] for c in calls], ["list_nodes", "list_trees"])
+        self.assertEqual(calls[0]["arguments"], {"tree_name": "玩法"})
+        self.assertEqual(calls[1]["arguments"], {})
+        # 少数实现直接给对象
+        inline = {"choices": [{"message": {"tool_calls": [
+            {"id": "c", "function": {"name": "x",
+                                     "arguments": {"a": 1}}}]}}]}
+        self.assertEqual(advisor.extract_tool_calls(inline)[0]["arguments"],
+                         {"a": 1})
+        # 坏 JSON -> arguments 是 None(调用方会当成"参数有问题"喂回模型,
+        # 而不是整轮报废)
+        broken = {"choices": [{"message": {"tool_calls": [
+            {"id": "c", "function": {"name": "x", "arguments": "{oops"}}]}}]}
+        self.assertIsNone(advisor.extract_tool_calls(broken)[0]["arguments"])
+        # 没有 tool_calls / 形状不对 -> 空清单,不抛
+        for data2 in ({}, {"choices": []}, {"choices": [{}]},
+                      {"choices": [{"message": {}}]}, None, "字符串",
+                      {"choices": [{"message": {"tool_calls": "不是列表"}}]}):
+            self.assertEqual(advisor.extract_tool_calls(data2), [], data2)
+
+    def test_assistant_tool_message_round_trip(self):
+        """assistant 消息要能把工具调用原样带回去(否则下一轮请求 400)。"""
+        import json
+
+        from BlenderGameKit import advisor
+        data = {"choices": [{"message": {
+            "content": "我先看看节点图",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "list_nodes",
+                                         "arguments": '{"detail": "full"}'}}]}}]}
+        calls = advisor.extract_tool_calls(data)
+        message = advisor.assistant_tool_message(data, calls)
+        self.assertEqual(message["role"], "assistant")
+        self.assertEqual(message["content"], "我先看看节点图")
+        self.assertEqual(len(message["tool_calls"]), 1)
+        sent = message["tool_calls"][0]
+        self.assertEqual(sent["id"], "c1")
+        self.assertEqual(sent["type"], "function")
+        # arguments 必须**又变回字符串**(协议要求)
+        self.assertIsInstance(sent["function"]["arguments"], str)
+        self.assertEqual(json.loads(sent["function"]["arguments"]),
+                         {"detail": "full"})
+        # tool 结果消息的形状
+        result = advisor.tool_result_message("c1", "节点清单…")
+        self.assertEqual(result["role"], "tool")
+        self.assertEqual(result["tool_call_id"], "c1")
+
+    def test_agent_state_machine(self):
+        """Agent 循环:**网络在线程、工具在主线程**,两边交替。
+
+        这里把 `call_chat_raw` 换成假的(按脚本依次返回"要工具"和"最终回答"),
+        再手动催 `poll_agent_step` —— 断言"主线程真的执行了工具"以及
+        工具结果真的被喂回了下一轮。
+        """
+        import time
+
+        from BlenderGameKit import advisor, advisor_tools
+        advisor.cancel_agent()
+        executed = []
+
+        def fake_reader(context, params):
+            executed.append(params)
+            return "节点清单(假)"
+
+        original = advisor_tools._READERS.get("list_nodes")
+        advisor_tools._READERS["list_nodes"] = fake_reader
+
+        rounds = [
+            # 第 1 轮:模型要先看节点图
+            {"choices": [{"message": {
+                "content": "",
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "list_nodes",
+                                             "arguments": "{}"}}]}}]},
+            # 第 2 轮:看完给结论
+            {"choices": [{"message": {"content": "角色没勾挂载目标,建议勾上"}}]},
+        ]
+        sent_rounds = []
+
+        def fake_raw(base_url, api_key, model, messages, timeout=60, tools=None):
+            sent_rounds.append([dict(m) for m in messages])
+            return True, rounds[min(len(sent_rounds) - 1, len(rounds) - 1)]
+
+        original_raw = advisor.call_chat_raw
+        advisor.call_chat_raw = fake_raw
+        try:
+            self.assertTrue(advisor.start_agent("http://x", "k", "m",
+                                                [{"role": "user",
+                                                  "content": "角色不动"}]))
+            state, result = None, None
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                state, result = advisor.poll_agent_step(None)
+                if state == "done":
+                    break
+                time.sleep(0.01)
+        finally:
+            advisor.call_chat_raw = original_raw
+            if original is not None:
+                advisor_tools._READERS["list_nodes"] = original
+
+        self.assertEqual(state, "done", f"{state} {result}")
+        self.assertTrue(result[0], result)
+        self.assertIn("挂载目标", result[1])
+        # 关键断言:工具在**主线程**里被执行了
+        self.assertEqual(len(executed), 1, executed)
+        self.assertEqual(advisor.agent_steps(), ["读了节点图里的节点"])
+        # 关键断言:工具结果作为 role=tool 被喂回了第二轮
+        self.assertEqual(len(sent_rounds), 2)
+        second = sent_rounds[1]
+        tool_messages = [m for m in second if m.get("role") == "tool"]
+        self.assertEqual(len(tool_messages), 1, second)
+        self.assertEqual(tool_messages[0]["tool_call_id"], "c1")
+        self.assertIn("节点清单(假)", tool_messages[0]["content"])
+        self.assertFalse(advisor.agent_active())
+
+    def test_agent_proposal_needs_user_confirmation(self):
+        """Agent 走到 propose_action 时:卡片出现,但**数据一个字节没改**。"""
+        import time
+
+        from BlenderGameKit import advisor
+        advisor.cancel_agent()
+        advisor.clear_proposal()
+        rounds = [
+            {"choices": [{"message": {
+                "content": "",
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {
+                                    "name": "propose_action",
+                                    "arguments": '{"action": "enable_god_camera",'
+                                                 ' "why": "方便看场景"}'}}]}}]},
+            {"choices": [{"message": {"content": "建议开上帝摄像机(点确认才生效)"}}]},
+        ]
+        sent = []
+
+        def fake_raw(_b, _k, _m, messages, timeout=60, tools=None):
+            sent.append([dict(m) for m in messages])
+            return True, rounds[min(len(sent) - 1, len(rounds) - 1)]
+
+        original = advisor.call_chat_raw
+        advisor.call_chat_raw = fake_raw
+        try:
+            advisor.start_agent("http://x", "k", "m",
+                                [{"role": "user", "content": "看不全场景"}])
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                state, result = advisor.poll_agent_step(None)
+                if state == "done":
+                    break
+                time.sleep(0.01)
+        finally:
+            advisor.call_chat_raw = original
+
+        self.assertEqual(state, "done", f"{state} {result}")
+        card = advisor.agent_proposal()
+        self.assertIsNotNone(card, "提议卡片没生成")
+        self.assertEqual(card["action"], "enable_god_camera")
+        self.assertEqual(card["label"], "打开上帝摄像机")
+        # 喂回模型的说明必须**明确**它没有改动能力
+        tool_messages = [m for m in sent[1] if m.get("role") == "tool"]
+        self.assertIn("他点『执行』才会生效", tool_messages[0]["content"])
+        # 用户还没点 -> 清了卡片就什么都没发生
+        advisor.clear_proposal()
+        self.assertIsNone(advisor.agent_proposal())
+
+    def test_agent_bad_arguments_does_not_abort(self):
+        """模型给了坏 JSON 参数:不整轮报废,而是把"参数有问题"喂回去。"""
+        import time
+
+        from BlenderGameKit import advisor
+        advisor.cancel_agent()
+        rounds = [
+            {"choices": [{"message": {"tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "list_nodes", "arguments": "{坏了"}}]}}]},
+            {"choices": [{"message": {"content": "我重新问了"}}]},
+        ]
+        sent = []
+
+        def fake_raw(_b, _k, _m, messages, timeout=60, tools=None):
+            sent.append([dict(m) for m in messages])
+            return True, rounds[min(len(sent) - 1, len(rounds) - 1)]
+
+        original = advisor.call_chat_raw
+        advisor.call_chat_raw = fake_raw
+        try:
+            advisor.start_agent("http://x", "k", "m", [])
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                state, result = advisor.poll_agent_step(None)
+                if state == "done":
+                    break
+                time.sleep(0.01)
+        finally:
+            advisor.call_chat_raw = original
+        self.assertEqual(state, "done")
+        self.assertTrue(result[0], result)
+        tool_messages = [m for m in sent[1] if m.get("role") == "tool"]
+        self.assertIn("不是合法的 JSON", tool_messages[0]["content"])
+        self.assertIn("参数有问题", advisor.agent_steps()[0])
+
+    def test_agent_stops_after_max_rounds(self):
+        """模型一直要工具时要能停下 —— 否则是无底洞(烧钱 + 冻住状态)。"""
+        import time
+
+        from BlenderGameKit import advisor
+        advisor.cancel_agent()
+        sent = []
+
+        def always_tool(_b, _k, _m, messages, timeout=60, tools=None):
+            sent.append(1)
+            return True, {"choices": [{"message": {"tool_calls": [
+                {"id": "c", "type": "function",
+                 "function": {"name": "list_trees", "arguments": "{}"}}]}}]}
+
+        original = advisor.call_chat_raw
+        advisor.call_chat_raw = fake_raw = always_tool
+        try:
+            advisor.start_agent("http://x", "k", "m", [])
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                state, result = advisor.poll_agent_step(None)
+                if state == "done":
+                    break
+                time.sleep(0.005)
+        finally:
+            advisor.call_chat_raw = original
+        self.assertEqual(state, "done")
+        self.assertFalse(result[0])
+        self.assertIn("先停一下", result[1])
+        self.assertFalse(advisor.agent_active())
+        # 轮数封顶,不是无限循环
+        self.assertLessEqual(len(sent), advisor.MAX_TOOL_ROUNDS + 2)
+
+    def test_cancel_agent_stops_loop(self):
+        from BlenderGameKit import advisor
+        advisor.cancel_agent()
+        self.assertFalse(advisor.agent_active())
+        advisor._AGENT["active"] = True
+        advisor.cancel_agent()
+        self.assertFalse(advisor.agent_active())
+        # 没在跑的时候 poll 也要给一句人话,而不是抛
+        state, result = advisor.poll_agent_step(None)
+        self.assertEqual(state, "done")
+        self.assertFalse(result[0])
+
+    def test_tool_execute_reports_unknown(self):
+        """模型编了一个不存在的工具名 -> 告诉它有哪些,别静默。"""
+        from BlenderGameKit import advisor_tools
+        text, proposal = advisor_tools.execute("编的工具", {}, None)
+        self.assertIn("没有叫", text)
+        self.assertIn("read_settings", text)
+        self.assertIsNone(proposal)
+
+    def test_clip_truncates(self):
+        """喂回模型的输出必须摘要 —— 200 个节点全倒过去会撑爆上下文。"""
+        from BlenderGameKit import advisor_tools
+        short = advisor_tools._clip("短")
+        self.assertEqual(short, "短")
+        long_text = "x" * (advisor_tools.MAX_OUTPUT + 500)
+        clipped = advisor_tools._clip(long_text)
+        self.assertLess(len(clipped), len(long_text))
+        self.assertIn("已截断", clipped)
+        self.assertIn(str(len(long_text)), clipped)   # 告诉模型"还有多少"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

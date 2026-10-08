@@ -2316,7 +2316,10 @@ def main():
                     "gk.export_release", "gk.open_release_folder",
                     # 项目顾问(第五十三轮):把项目诊断交给 AI
                     "gk.ask_advisor", "gk.open_text_block",
-                    "gk.copy_advisor_context", "gk.clear_advisor"):
+                    "gk.copy_advisor_context", "gk.clear_advisor",
+                    # AI 亲自操作(第五十六轮):执行/忽略提议的动作
+                    "gk.apply_advisor_action", "gk.dismiss_advisor_action",
+                    "gk.run_advisor_action"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -2399,7 +2402,7 @@ def main():
         saved_q = settings.advisor_question
         saved_prefs = {name: getattr(prefs2, name, "") for name in (
             "advisor_base_url", "advisor_model", "advisor_api_key")}
-        saved_call = adv_mod.call_chat
+        saved_call = adv_mod.call_chat_raw
         try:
             # 先把 Key 填上 —— 这样下面"快照里不能有明文 Key"才是真的在验
             # 脱敏,而不是因为压根没配
@@ -2445,14 +2448,19 @@ def main():
             import time
             prefs2.advisor_base_url = "http://example.invalid"
             prefs2.advisor_model = "smoke-model"
-            adv_mod.call_chat = lambda *a, **k: (True, "**先把『脚本挂载目标』勾上。**")
+            # ⚠ 第五十六轮起算子走的是 **Agent 循环**(带工具),所以假的是
+            #    `call_chat_raw`(返回原始 JSON),不是上一版的 `call_chat`。
+            #    这里返回一个"不带 tool_calls 的普通回答",等于模型直接作答。
+            adv_mod.call_chat_raw = lambda *a, **k: (
+                True, {"choices": [{"message": {
+                    "content": "**先把『脚本挂载目标』勾上。**"}}]})
             settings.advisor_question = "角色不动"
             result = bpy.ops.gk.ask_advisor()
             check("『问 AI』发出就返回(异步,界面不卡)",
                   result == {"FINISHED"}, str(result))
-            check("发出后处于等待状态", adv_mod.is_busy())
+            check("发出后处于等待状态", adv_mod.agent_active())
             deadline = time.time() + 10
-            while adv_mod.is_busy() and time.time() < deadline:
+            while adv_mod.agent_active() and time.time() < deadline:
                 ops_mod._poll_advisor()
                 time.sleep(0.05)
             check("回复到了会写进对话记录文本块",
@@ -2475,8 +2483,8 @@ def main():
                   and not adv_mod.HISTORY
                   and "已清空" in bpy.data.texts[adv_mod.DIALOG_TEXT_NAME].as_string())
         finally:
-            adv_mod.call_chat = saved_call
-            adv_mod.cancel_background()
+            adv_mod.call_chat_raw = saved_call
+            adv_mod.cancel_agent()
             adv_mod.clear_history()
             for name, value in saved_prefs.items():
                 setattr(prefs2, name, value)
@@ -2487,6 +2495,108 @@ def main():
                 bpy.data.texts.remove(leftover)
     except Exception as exc:
         check("项目顾问算子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- AI 亲自操作(第五十六轮):只读工具真能读,改必须用户点 ----
+    try:
+        at_mod = __import__(f"{module_name}.advisor_tools",
+                            fromlist=["tools_schema"])
+        adv2 = __import__(f"{module_name}.advisor",
+                          fromlist=["start_agent", "poll_agent_step"])
+        settings = bpy.context.scene.gk_settings
+
+        # 1) 只读工具在**真 Blender 数据**上都要能跑(读不出东西也要给人话,
+        #    而不是抛异常 —— AI 那头会把异常文本当成工具结果继续跑)
+        for tool_name in ("read_settings", "list_trees", "list_nodes",
+                          "check_export_errors", "get_godot_status"):
+            text, _proposal = at_mod.execute(tool_name, {}, bpy.context)
+            check(f"只读工具 {tool_name} 能跑通且给了内容",
+                  isinstance(text, str) and len(text) > 0,
+                  str(text)[:80])
+
+        # 2) **核心保证**:提议**不改数据**
+        saved_cam = bool(settings.god_camera)
+        settings.god_camera = False
+        note, card = at_mod.build_proposal(
+            {"action": "enable_god_camera", "why": "方便看场景"})
+        check("提议生成了卡片", card is not None and card["action"]
+              == "enable_god_camera", str(card))
+        check("提议**没有**改数据(勾选还是关的)",
+              bool(settings.god_camera) is False, str(settings.god_camera))
+
+        # 3) 用户点『执行』才真改
+        adv2._AGENT["proposal"] = card
+        result = bpy.ops.gk.apply_advisor_action()
+        check("点『执行』才真的改了项目",
+              result == {"FINISHED"} and bool(settings.god_camera) is True,
+              f"{result} god_camera={settings.god_camera}")
+        check("执行完卡片就没了(不会重复执行)",
+              adv2.agent_proposal() is None)
+        # 没有卡片时点执行要明确拒绝
+        try:
+            bpy.ops.gk.apply_advisor_action()
+            check("没有待确认动作时『执行』被挡下", False, "竟然返回成功")
+        except RuntimeError as exc:
+            check("没有待确认动作时『执行』被挡下", "没有待确认的动作" in str(exc),
+                  str(exc)[:60])
+
+        # 4) 忽略 = 数据一动不动
+        settings.god_camera = False
+        _note, card2 = at_mod.build_proposal({"action": "enable_god_camera",
+                                              "why": "再看看"})
+        adv2._AGENT["proposal"] = card2
+        result = bpy.ops.gk.dismiss_advisor_action()
+        check("『忽略』不改数据且清掉卡片",
+              result == {"FINISHED"} and bool(settings.god_camera) is False
+              and adv2.agent_proposal() is None,
+              f"{result} god_camera={settings.god_camera}")
+
+        # 5) 手动执行入口(不经过 AI)也要能用 —— 枚举得列得出动作
+        items = at_mod.action_menu_items(None)
+        check(f"手动动作清单列得出({len(items)} 个)",
+              len(items) == len(at_mod.ACTIONS) and len(items) > 0, str(items)[:80])
+
+        # 6) Agent 循环:真只读工具在**主线程**里被执行,结果喂回下一轮
+        settings.god_camera = False
+        saved_raw = adv2.call_chat_raw
+        rounds = [
+            {"choices": [{"message": {"tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read_settings", "arguments": "{}"}}]}}]},
+            {"choices": [{"message": {"content": "看完了,god_camera 是关的"}}]},
+        ]
+        sent = []
+
+        def fake_raw(_b, _k, _m, messages, timeout=60, tools=None):
+            sent.append([dict(m) for m in messages])
+            return True, rounds[min(len(sent) - 1, len(rounds) - 1)]
+
+        adv2.call_chat_raw = fake_raw
+        try:
+            adv2.start_agent("http://x", "k", "m",
+                             [{"role": "user", "content": "现在什么设置"}])
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                state, result = adv2.poll_agent_step(bpy.context)
+                if state == "done":
+                    break
+                time.sleep(0.02)
+        finally:
+            adv2.call_chat_raw = saved_raw
+        check("Agent 循环在真 Blender 里跑完", state == "done", f"{state} {result}")
+        check("只读工具在主线程里真的执行了(读到了真设置)",
+              any("god_camera" in str(m.get("content", ""))
+                  for m in sent[1] if m.get("role") == "tool"),
+              str([m for m in sent[1] if m.get("role") == "tool"])[:150])
+        check("侧栏能看到它做了什么", adv2.agent_steps() and
+              "读了场景设置" in adv2.agent_steps(), str(adv2.agent_steps()))
+        check("整局 Agent 走完不擅自改数据",
+              bool(settings.god_camera) is False, str(settings.god_camera))
+
+        settings.god_camera = saved_cam
+        adv2.cancel_agent()
+    except Exception as exc:
+        check("AI 亲自操作", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- UI 注册:用"面板能不能被 Blender 找到"来验证 ----

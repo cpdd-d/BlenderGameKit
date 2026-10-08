@@ -71,7 +71,23 @@ BlenderGameKit 让人**在 Blender 里**用中文节点图写游戏逻辑,导出
 6. 能一两句说清就别写五段。用户是在干活,不是在读文章。
 7. **用纯文本,不要 Markdown 标记** —— 显示环境不渲染 `**加粗**`、`# 标题`、
    反引号代码块,打出来就是一堆星号。要分点就用 `1. 2. 3.` 或 `- `,
-   要强调就直接把话说清楚。"""
+   要强调就直接把话说清楚。
+
+## 你可以用工具自己去看项目
+系统消息末尾那份"项目诊断快照"是**开聊那一刻**拍的,可能已经过时。
+需要更准的信息时,**直接调用工具**去看,别让用户自己去翻:
+* `read_settings` 读本场景的导出设置;**`list_trees` / `list_nodes`** 看节点图;
+* `check_export_errors` 看上次导出的报错;**`get_godot_status`** 看 Godot
+  与导出模板;**`diagnose`** 跑一遍完整诊断(输出较长,只在需要时调)。
+先想清楚要哪个,一次调对,别把工具挨个试一遍。
+
+## 想改项目时:提议,不要假装改了
+你**没有**直接修改项目的能力。要改什么就调用 `propose_action`,把动作和
+参数说清楚 —— 侧栏会给用户一张**待确认卡片**,他点了才会真执行。
+所以:
+* **绝对不要**说"我已经帮你改好了""已经把勾选上了" —— 那是撒谎;
+* 应该说"我建议这样改,点确认就生效";
+* `propose_action` 只能用动作清单里列出的动作名,别自己编。"""
 
 
 # 对话历史最多带这么多条发给模型(一问一答算两条)。不限的话越聊越慢越贵,
@@ -177,10 +193,20 @@ def plainify(text):
     return "\n".join(lines)
 
 
-def request_payload(model, messages, temperature=0.2):
-    """OpenAI 兼容的请求体。stream=False:我们要一次拿完,不做流式。"""
-    return {"model": model, "messages": messages,
-            "temperature": temperature, "stream": False}
+def request_payload(model, messages, temperature=0.2, tools=None):
+    """OpenAI 兼容的请求体。stream=False:我们要一次拿完,不做流式。
+
+    ── 为什么用原生 `tools` 参数,不靠解析自然语言(顾问的建议)──────
+    另一种做法是"在提示里让模型说『我要调用 xxx』,再拿正则去抠"。那条路
+    **各家模型遵守程度天差地别**,换个模型就失灵。而 `tools` 是 OpenAI 的
+    标准字段,DeepSeek / 通义 / Ollama 全都实现了 —— 一次写对,到处能用。
+    """
+    payload = {"model": model, "messages": messages,
+               "temperature": temperature, "stream": False}
+    if tools:
+        payload["tools"] = list(tools)
+        payload["tool_choice"] = "auto"
+    return payload
 
 
 def parse_response(data):
@@ -208,29 +234,40 @@ def parse_response(data):
     return True, str(content).strip()
 
 
-def call_chat(base_url, api_key, model, messages, timeout=60):
-    """真发一次请求。返回 (是否成功, 回答或可读的错误说明)。
+def check_config(base_url, model):
+    """配置够不够发一次请求。返回错误说明,够就返回空串。
 
-    ── 为什么是阻塞调用 ────────────────────────────────────────────
-    算子跑在 Blender 主线程上,所以这次调用期间界面会没响应。这是**刻意**
-    和插件其它地方保持一致:『直接运行游戏』要等 Godot 起来、『打包成
-    可执行文件』要等 Godot 导出(最长 600 秒),都是"先说一声,然后等"。
-    好处是不用引线程 + 定时器轮询那套东西,少一整类难查的 bug。
-    调用方(算子)必须在调用**之前**告诉用户要等多久。
+    抽出来是因为**两条路都要用**:普通问答和带工具的 Agent 循环。分开写
+    迟早会漏其中一条(漏了就是"点下去报个看不懂的错")。
+    """
+    if not chat_url(base_url):
+        return ("还没填 AI 地址。请到 插件偏好设置 -> 『项目顾问』里填"
+                "API 地址 / 模型名 / API Key")
+    if not (model or "").strip():
+        return ("还没填模型名。请到 插件偏好设置 -> 『项目顾问』里填"
+                "(比如 deepseek-chat / qwen-plus)")
+    return ""
+
+
+def call_chat_raw(base_url, api_key, model, messages, timeout=60, tools=None):
+    """发一次请求,返回**原始 JSON**。返回 (是否成功, 数据 或 错误说明)。
+
+    ── 为什么要有"原始"这一层 ─────────────────────────────────────
+    带工具的时候,我们要的不只是 `choices[0].message.content` —— 还得看
+    `message.tool_calls`(模型要求调哪些工具)。而 `parse_response` 只负责
+    抽那段文字,看不到工具。所以拆成两层:这一层负责"把 JSON 拿回来",
+    上层决定怎么解释它。
 
     ── 错误分支都要有"下一步怎么办"────────────────────────────────
     401/403 = Key 不对(最常见),超时 / 连不上 = 地址或网络。这些如果只把
     异常原文丢出去,用户没法行动。
     """
+    problem = check_config(base_url, model)
+    if problem:
+        return False, problem
     url = chat_url(base_url)
-    if not url:
-        return False, ("还没填 AI 地址。请到 插件偏好设置 -> 『项目顾问』里填"
-                       "API 地址 / 模型名 / API Key")
-    if not (model or "").strip():
-        return False, ("还没填模型名。请到 插件偏好设置 -> 『项目顾问』里填"
-                       "(比如 deepseek-chat / qwen-plus)")
 
-    body = json.dumps(request_payload(model, messages),
+    body = json.dumps(request_payload(model, messages, tools=tools),
                       ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
@@ -260,7 +297,110 @@ def call_chat(base_url, api_key, model, messages, timeout=60):
         data = json.loads(raw)
     except ValueError:
         return False, f"AI 返回的不是 JSON(前 300 字):\n{raw[:300]}"
+    return True, data
+
+
+def call_chat(base_url, api_key, model, messages, timeout=60):
+    """发一次请求并取出回答文字。返回 (是否成功, 回答或可读的错误说明)。"""
+    ok, data = call_chat_raw(base_url, api_key, model, messages, timeout)
+    if not ok:
+        return False, data
     return parse_response(data)
+
+
+# ---------------------------------------------------------------------------
+# 纯函数:工具调用(function calling)
+# ---------------------------------------------------------------------------
+def message_of(data):
+    """取出 `choices[0].message` 字典;取不到返回 {}。"""
+    if not isinstance(data, dict):
+        return {}
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def extract_tool_calls(data):
+    """从响应里抠出模型要求调用的工具。
+
+    返回 `[{"id": ..., "name": ..., "arguments": {...}}, ...]`。
+
+    ── arguments 是**字符串**里的 JSON(必须容忍它坏掉)──────────────
+    OpenAI 协议里 `arguments` 是一个 JSON **字符串**。模型偶尔会给出不合法
+    的 JSON(少个括号、多个逗号)。这时**不能整轮报废** —— 让调用方收到
+    "解析失败"这个结果,它会把这句话当作工具返回值喂回模型,模型下一轮
+    多半就自己改对了。这比直接报错给用户好得多。
+    """
+    calls = []
+    message = message_of(data)
+    raw_calls = message.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return calls
+    for index, item in enumerate(raw_calls):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            parsed = arguments                     # 少数实现直接给对象
+        else:
+            text = str(arguments or "").strip()
+            try:
+                parsed = json.loads(text) if text else {}
+            except ValueError:
+                parsed = None
+            if parsed is not None and not isinstance(parsed, dict):
+                parsed = None
+        calls.append({
+            "id": str(item.get("id") or f"call_{index}"),
+            "name": name,
+            "arguments": parsed,
+        })
+    return calls
+
+
+def assistant_tool_message(data, tool_calls):
+    """把"模型这一轮说的话 + 它要调的工具"做成一条 assistant 消息。
+
+    下一轮请求**必须**把它原样带上,否则协议不成立(工具结果无处安放,
+    有些实现会直接报 400)。
+    """
+    content = message_of(data).get("content") or ""
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {"id": call["id"], "type": "function",
+             "function": {"name": call["name"],
+                          "arguments": json.dumps(call.get("arguments") or {},
+                                                  ensure_ascii=False)}}
+            for call in tool_calls
+        ],
+    }
+
+
+def tool_result_message(tool_call_id, content):
+    """工具执行结果的消息(协议要求 role=tool + tool_call_id)。"""
+    return {"role": "tool", "tool_call_id": tool_call_id,
+            "content": str(content or "")}
+
+
+def tools_payload():
+    """给请求用的工具清单。取不到工具模块时返回空(退化成纯聊天)。"""
+    try:
+        from . import advisor_tools
+
+        return advisor_tools.tools_schema()
+    except Exception:                                     # noqa: BLE001
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +652,13 @@ def _secrets(context):
 _REQUEST = {"active": False, "started": 0.0, "timeout": 60, "result": None}
 
 
-def request_in_background(base_url, api_key, model, messages, timeout=60):
-    """在后台线程里发请求。已经有请求在跑时返回 False。"""
+def _spawn(fn, timeout):
+    """在后台线程里跑 `fn()`。已经在跑时返回 False。
+
+    线程里**只许做网络 IO + 文本处理** —— 碰一下 bpy 就会出"偶尔崩、
+    偶尔不刷新"的鬼影 bug(见上面那段线程铁律)。结果写进 `_REQUEST`,
+    由主线程的 `poll_background()` 取走。
+    """
     if _REQUEST["active"]:
         return False
     _REQUEST.update({"active": True, "started": time.time(),
@@ -521,14 +666,22 @@ def request_in_background(base_url, api_key, model, messages, timeout=60):
 
     def worker():
         try:
-            _REQUEST["result"] = call_chat(base_url, api_key, model, messages,
-                                           timeout=timeout)
+            _REQUEST["result"] = fn()
         except Exception as exc:                          # noqa: BLE001
             _REQUEST["result"] = (
                 False, f"调用 AI 失败: {type(exc).__name__}: {exc}")
 
     threading.Thread(target=worker, daemon=True, name="GK-Advisor").start()
     return True
+
+
+def request_in_background(base_url, api_key, model, messages, timeout=60):
+    """在后台线程里发一次请求、取回答文字。已经在跑时返回 False。
+
+    (普通问答走这条;带工具的 Agent 循环走下面的 `start_agent`。)
+    """
+    return _spawn(lambda: call_chat(base_url, api_key, model, messages,
+                                    timeout=timeout), timeout)
 
 
 def is_busy():
@@ -562,6 +715,184 @@ def poll_background():
 def cancel_background():
     """放弃等待(那个线程是 daemon,会自己结束)。"""
     _REQUEST.update({"active": False, "result": None})
+
+
+# ---------------------------------------------------------------------------
+# Agent 循环:让 AI 自己看项目、并提议动作
+# ---------------------------------------------------------------------------
+# 最多来回几轮"模型要工具 -> 我们喂结果"(防止模型和人绕圈子烧钱)
+MAX_TOOL_ROUNDS = 6
+
+# Agent 状态。**所有字段只在主线程改** —— 后台线程唯一的出口是 `_REQUEST`。
+_AGENT = {
+    "active": False,     # 整轮在跑
+    "stage": "request",  # request(等网络) / tools(等主线程执行工具) / done
+    "messages": [],      # 发给模型的完整对话(含工具结果)
+    "round": 0,
+    "answer": "",        # 最终的回答文字
+    "error": "",
+    "pending": None,     # 待主线程执行的 tool_calls
+    "steps": [],         # 给用户看的"它做了什么"清单(比如"读了节点图")
+    "proposal": None,    # 待用户确认的动作(见 advisor_tools.ACTIONS)
+}
+
+
+def start_agent(base_url, api_key, model, messages, timeout=60, tools=None):
+    """开始一轮 Agent。已经在跑时返回 False。
+
+    `messages` 由 `build_messages` 拼好(系统提示 + 历史 + 快照 + 本次问题)。
+    """
+    if _AGENT["active"] or _REQUEST["active"]:
+        return False
+    if tools is None:
+        tools = tools_payload()
+    _AGENT.update({"active": True, "stage": "request",
+                   "messages": list(messages), "round": 0, "answer": "",
+                   "error": "", "pending": None, "steps": [], "proposal": None})
+    return _spawn(lambda: call_chat_raw(base_url, api_key, model,
+                                        _AGENT["messages"], timeout=timeout,
+                                        tools=tools), timeout)
+
+
+def agent_active():
+    """整轮 Agent 还在跑吗(侧栏用它显示状态)。"""
+    return bool(_AGENT["active"])
+
+
+def agent_steps():
+    """这一轮 Agent 已经做过的事(侧栏显示"它读了节点图"之类)。"""
+    return list(_AGENT["steps"])
+
+
+def agent_proposal():
+    """待用户确认的动作;没有返回 None。"""
+    return _AGENT["proposal"]
+
+
+def clear_proposal():
+    """用户执行/忽略之后清掉那张卡片。"""
+    _AGENT["proposal"] = None
+
+
+def cancel_agent():
+    """放弃整轮(后台线程是 daemon,会自己结束)。"""
+    cancel_background()
+    _AGENT.update({"active": False, "stage": "done", "pending": None})
+
+
+def poll_agent_step(context, base_url="", api_key="", model="", timeout=60):
+    """**主线程**推进 Agent 一轮。返回 (状态, 结果):
+
+        ("waiting", None)    还在等 —— 调用方继续挂定时器
+        ("continue", None)   推进了一步 —— 调用方继续挂定时器
+        ("done", (ok, 文本)) 整轮结束
+
+    ── 为什么工具必须在**这里**(主线程)执行(这一轮最关键的一点)────
+    只读工具要读节点图、场景设置、导出报告 —— 全是 Blender 数据。而后台
+    线程碰 bpy 会崩。所以循环只能这么做:
+
+        线程:发请求 ──> 主线程:看出 tool_calls,在这里执行工具
+                    ──> 线程:把结果喂回去再发一轮 ──> ...
+
+    即"网络在线程、工具在主线程",两边交替。这样既不会冻界面,也不会
+    在后台线程碰 bpy。
+    """
+    if not _AGENT["active"]:
+        return "done", (False, "没有在跑的 AI 请求")
+
+    stage = _AGENT["stage"]
+
+    if stage == "request":
+        result = poll_background()
+        if result is None:
+            return "waiting", None
+        ok, data = result
+        if not ok:
+            _AGENT.update({"active": False, "stage": "done", "error": data})
+            return "done", (False, data)
+        calls = extract_tool_calls(data)
+        if not calls:
+            text_ok, text = parse_response(data)
+            _AGENT.update({"active": False, "stage": "done",
+                           "answer": text if text_ok else "",
+                           "error": "" if text_ok else text})
+            return "done", (text_ok, text)
+        # 模型要求调工具 -> 记下它说的话 + 要调的工具,等主线程执行
+        _AGENT["messages"].append(assistant_tool_message(data, calls))
+        _AGENT["pending"] = calls
+        _AGENT["stage"] = "tools"
+        return "continue", None
+
+    if stage == "tools":
+        calls = _AGENT["pending"] or []
+        _AGENT["pending"] = None
+        for call in calls:
+            output, proposal = _execute_tool(call, context)
+            if proposal:
+                _AGENT["proposal"] = proposal
+            _AGENT["steps"].append(_step_label(call, bool(proposal)))
+            _AGENT["messages"].append(
+                tool_result_message(call["id"], output))
+        _AGENT["round"] += 1
+        if _AGENT["round"] > MAX_TOOL_ROUNDS:
+            message = (f"AI 连续要了 {MAX_TOOL_ROUNDS} 轮工具,先停一下"
+                       f"(避免绕圈子)。可以把问题拆小一点再问")
+            _AGENT.update({"active": False, "stage": "done", "error": message})
+            return "done", (False, message)
+        # 把工具结果喂回去,发下一轮
+        _AGENT["stage"] = "request"
+        started = _spawn(lambda: call_chat_raw(base_url, api_key, model,
+                                               _AGENT["messages"],
+                                               timeout=timeout,
+                                               tools=tools_payload()), timeout)
+        if not started:
+            message = "发起下一轮请求失败(上一条还在跑)"
+            _AGENT.update({"active": False, "stage": "done", "error": message})
+            return "done", (False, message)
+        return "continue", None
+
+    return "done", (not _AGENT["error"], _AGENT["answer"] or _AGENT["error"])
+
+
+def _execute_tool(call, context):
+    """执行一个工具。返回 (喂回模型的文本, 待确认动作 或 None)。
+
+    ⚠ 输出必须**摘要**再喂:比如节点图可能有 200 个节点,全倒过去会把
+    上下文撑爆(顾问特别提醒过)。截断逻辑在 advisor_tools 里。
+    """
+    name = call.get("name", "")
+    if call.get("arguments") is None:
+        # 模型给的 arguments 不是合法 JSON —— 把这件事当作工具结果告诉它,
+        # 它下一轮多半会自己改对(比直接失败给用户好得多)
+        return (f"参数不是合法的 JSON,请重新用正确的参数调用 {name}"), None
+    try:
+        from . import advisor_tools
+
+        return advisor_tools.execute(name, call["arguments"], context)
+    except Exception as exc:                              # noqa: BLE001
+        return f"工具执行失败: {type(exc).__name__}: {exc}", None
+
+
+def _step_label(call, made_proposal):
+    """给用户看的一行"它做了什么"。"""
+    name = call.get("name", "")
+    if made_proposal:
+        return "提议了一个动作(等你确认)"
+    if call.get("arguments") is None:
+        return f"{_TOOL_LABELS.get(name, name)}(参数有问题,已让它重试)"
+    return _TOOL_LABELS.get(name, name)
+
+
+# 工具 -> 给用户看的中文短句(侧栏「它做了什么」用)
+_TOOL_LABELS = {
+    "read_settings": "读了场景设置",
+    "list_trees": "看了一遍所有节点图",
+    "list_nodes": "读了节点图里的节点",
+    "check_export_errors": "查了上次导出报告",
+    "get_godot_status": "查了 Godot 与打包状况",
+    "diagnose": "跑了一遍完整诊断",
+    "propose_action": "提议了一个动作(等你确认)",
+}
 
 
 # ---------------------------------------------------------------------------
