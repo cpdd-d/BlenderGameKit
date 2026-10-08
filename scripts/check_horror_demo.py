@@ -1,25 +1,23 @@
-"""恐怖示例的自动检查(第五十九轮:阶段④收尾)。
+"""恐怖示例的自动检查(第五十九轮单场景 -> 第六十轮拆成三关)。
 
 用法:
     python scripts\\check_horror_demo.py
     python scripts\\check_horror_demo.py --godot "D:\\godot\\Godot_v4.7.2-stable_win64_console.exe"
 
-它会:
-  1. 把 `examples/demo_horror/恐怖示例_godot` 拷到 `_dist/horror_probe`(**不碰示例本身**);
-  2. 在副本里加一个探针场景(`probe.gd` + `probe.tscn`),把主场景指过去;
-  3. 用 Godot 无头跑,读探针打印的 HORROR_* 行,汇总 PASS / FAIL。
+── 怎么测三关(而不是一关)────────────────────────────────────
+一关一张 `.tscn`。**不能**在一个探针里真的走"切关卡" —— Godot 的
+`change_scene_to_file` 会把当前场景整棵换掉,探针(挂在当前场景下)会
+一起被释放,后面的断言就没机会跑。所以拆成**三个探针**,各自把对应那关的
+`.tscn` 当成子节点加载进来驱动:
 
-探针查的是"恐怖关该有的现象"(不是代码长什么样):
-  * 怪物活着且在**巡逻**(1 秒里位移 > 0.5 米);
-  * **紧张度**:玩家离怪物很远时 ≈ 0,凑到 2 米时明显升高(> 0.3),
-    而且心跳播放器跟着建起来 —— 『氛围_紧张度』+『氛围_心跳』真的联动;
-  * 走过 3 张纸条 -> `纸条数` = 3;
-  * 走过『惊吓区』-> 相机**正在震**(`_gk_shake_left` > 0)且 Master **被压低**
-    (总线音量 < -10)—— 『惊吓_事件』三连 + 『音效_总线音量』;
-  * 走到门口 -> 弹出结局选择(还没选时 `_gk_choice_picked` = -1),
-    按 **2** -> `结局` = 2,而且 `user://gk_save1.json` **真的落盘**;
-  * 生成脚本里:新节点 / AI 听觉 / 结局分支都出了码;
-  * World.tscn 里:怪物 / 巡逻点 / 3 张纸条 / 惊吓区 / 门口 都在。
+  1. 教室:拾 3 张纸条 -> `纸条数` = 3;场景里月光 / 台灯 / 去走廊 都在;
+  2. 走廊:AI 在巡逻、紧张度远低近高 + 心跳建起来、走过惊吓区 ->
+     相机在震 + Master 被压低;
+  3. 楼梯间:**先写一份"纸条数 = 3"的存档**(模拟第一关存过),再走到门口
+     -> 弹出结局选择 -> 按 2 -> `结局` = 2 且真的落盘。
+
+另外还会查三个脚本里的**跨关证据**:教室有 `change_scene_to_file` +
+`走廊.tscn`、走廊有 `楼梯间.tscn`、楼梯间有读档 + `>= 3` 的门槛。
 """
 
 import argparse
@@ -33,31 +31,31 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_horror", "恐怖示例_godot")
 OUT = os.path.join(ROOT, "_dist", "horror_probe")
+GODOT_DEFAULT = r"D:\godot\Godot_v4.7.2-stable_win64_console.exe"
 
-PROBE_GD = '''extends Node
+ROOM_SCENE = "res://scenes/教室.tscn"
+CORRIDOR_SCENE = "res://scenes/走廊.tscn"
+STAIRS_SCENE = "res://scenes/楼梯间.tscn"
 
-# 恐怖示例的探针:按 HORROR_ 前缀打印现象,Python 那边收集断言。
-# ⚠ 结局 / 纸条数 / 心跳相关变量都在**玩家脚本**上(脚本挂在玩家身上)。
+# 公共开头:加载指定场景 + 找节点 + 工具函数
+PROBE_HEAD = '''extends Node
 
+# 恐怖示例的探针。结论行统一 HORROR_ 前缀,Python 那边收集断言。
 var world: Node = null
 var player: Node = null
 var enemy: Node = null
 var elapsed := 0.0
 var phase := 0
-var enemy_start := Vector3.ZERO
-var spots := {}          # 区域名 -> 它自己的世界坐标(避开手算坐标轴)
+var spots := {}
 
 
-func _ready() -> void:
+func _boot(scene_path: String, player_name: String, enemy_name: String) -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
-	world = load("res://scenes/World.tscn").instantiate()
+	world = load(scene_path).instantiate()
 	add_child(world)
-	player = world.find_child("玩家", true, false)
-	enemy = world.find_child("怪物", true, false)
-	for name in ["纸条1", "纸条2", "纸条3", "惊吓区", "门口"]:
-		var area = world.find_child(name, true, false)
-		if area != null:
-			spots[name] = area.global_position
+	player = world.find_child(player_name, true, false)
+	if enemy_name != "":
+		enemy = world.find_child(enemy_name, true, false)
 
 
 func _state() -> String:
@@ -78,11 +76,17 @@ func _put(pos: Vector3) -> void:
 
 
 func _put_at(name: String) -> bool:
-	# 站到区域正上方 1 米(角色有重力,几帧后落到地面 = 正好压住触发板)
 	if not spots.has(name):
 		return false
 	_put(spots[name] + Vector3(0.0, 1.0, 0.0))
 	return true
+
+
+func _find_areas(names: Array) -> void:
+	for name in names:
+		var area = world.find_child(name, true, false)
+		if area != null:
+			spots[name] = area.global_position
 
 
 func _send_key(code: int, pressed: bool) -> void:
@@ -91,6 +95,50 @@ func _send_key(code: int, pressed: bool) -> void:
 	event.physical_keycode = code
 	event.pressed = pressed
 	Input.parse_input_event(event)
+'''
+
+PROBE_ROOM = PROBE_HEAD + '''
+
+func _ready() -> void:
+	_boot("%(room)s", "教室玩家", "")
+	_find_areas(["纸条1", "纸条2", "纸条3", "去走廊"])
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	match phase:
+		0:
+			if elapsed >= 0.2:
+				phase = 1
+				print("HORROR_ROOM_START player=", player != null,
+					" spots=", spots.size())
+				_put_at("纸条1")
+		1:
+			if elapsed >= 0.8:
+				phase = 2
+				_put_at("纸条2")
+		2:
+			if elapsed >= 1.4:
+				phase = 3
+				_put_at("纸条3")
+		3:
+			if elapsed >= 2.0:
+				phase = 4
+				print("HORROR_ROOM_NOTES count=",
+					snappedf(float(_var("纸条数")), 0.01))
+				print("HORROR_ROOM_DONE")
+				set_physics_process(false)
+				get_tree().quit()
+''' % {"room": ROOM_SCENE}
+
+PROBE_CORRIDOR = PROBE_HEAD + '''
+
+var enemy_start := Vector3.ZERO
+
+
+func _ready() -> void:
+	_boot("%(corridor)s", "走廊玩家", "怪物")
+	_find_areas(["惊吓区", "去楼梯间"])
 
 
 func _physics_process(delta: float) -> void:
@@ -101,10 +149,8 @@ func _physics_process(delta: float) -> void:
 				phase = 1
 				if enemy != null:
 					enemy_start = enemy.global_position
-				print("HORROR_START state=", _state(),
-					" has_player=", player != null, " has_enemy=", enemy != null,
-					" spots=", spots.size())
-				# 离怪物远一点(但仍在场内)—— 紧张度该接近 0
+				print("HORROR_CORRIDOR_START state=", _state(),
+					" has_enemy=", enemy != null, " spots=", spots.size())
 				if enemy != null:
 					_put(enemy.global_position + Vector3(0.0, 1.0, 12.0))
 		1:
@@ -125,96 +171,105 @@ func _physics_process(delta: float) -> void:
 				print("HORROR_TENSION_NEAR tension=",
 					snappedf(float(_var("_gk_heart_tension")), 0.001),
 					" heart=", _var("_gk_heart_player") != null)
-				_put_at("纸条1")
-		3:
-			if elapsed >= 2.1:
-				phase = 4
-				_put_at("纸条2")
-		4:
-			if elapsed >= 2.7:
-				phase = 5
-				_put_at("纸条3")
-		5:
-			if elapsed >= 3.2:
-				phase = 6
-				print("HORROR_NOTES count=",
-					snappedf(float(_var("纸条数")), 0.01))
 				_put_at("惊吓区")
-		6:
-			if elapsed >= 3.55:
-				phase = 7
+		3:
+			if elapsed >= 1.95:
+				phase = 4
 				print("HORROR_SCARE shake=",
 					snappedf(float(_var("_gk_shake_left")), 0.01),
 					" bus=", snappedf(AudioServer.get_bus_volume_db(0), 0.01))
+				print("HORROR_CORRIDOR_DONE")
+				set_physics_process(false)
+				get_tree().quit()
+''' % {"corridor": CORRIDOR_SCENE}
+
+PROBE_STAIRS = PROBE_HEAD + '''
+
+func _ready() -> void:
+	# ⚠ 模拟第一关"存过档":先落一份 纸条数 = 3,再加载楼梯间
+	#   (楼梯间开局的『存档_载入』就会把 3 读回来,门口才放行)。
+	var file := FileAccess.open("user://gk_save1.json", FileAccess.WRITE)
+	if file != null:
+		file.store_string('{"纸条数": 3}')
+		file.close()
+	_boot("%(stairs)s", "楼梯间玩家", "")
+	_find_areas(["门口"])
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	match phase:
+		0:
+			if elapsed >= 0.2:
+				phase = 1
+				print("HORROR_STAIRS_START player=", player != null,
+					" notes=", _var("纸条数"), " spots=", spots.size())
 				_put_at("门口")
-		7:
-			if elapsed >= 4.2:
-				phase = 8
+		1:
+			if elapsed >= 0.9:
+				phase = 2
 				var panel = _var("_gk_choice_panel")
 				print("HORROR_DOOR picked=", _var("_gk_choice_picked"),
 					" panel=", panel != null and panel.visible)
 				_send_key(KEY_2, true)
-		8:
-			if elapsed >= 4.4:
-				phase = 9
+		2:
+			if elapsed >= 1.1:
+				phase = 3
 				_send_key(KEY_2, false)
-		9:
-			if elapsed >= 4.9:
-				phase = 10
+		3:
+			if elapsed >= 1.6:
+				phase = 4
 				print("HORROR_ENDING ended=", _var("结局"),
 					" saved=", FileAccess.file_exists("user://gk_save1.json"),
-					" final_picked=", _var("_gk_choice_picked"))
-				print("HORROR_DONE")
+					" picked=", _var("_gk_choice_picked"))
+				print("HORROR_STAIRS_DONE")
 				set_physics_process(false)
 				get_tree().quit()
-'''
+''' % {"stairs": STAIRS_SCENE}
 
 PROBE_TSCN = '''; 探针(临时文件,不写回示例)
 [gd_scene load_steps=2 format=3]
 
-[ext_resource type="Script" path="res://probe.gd" id="1_probe"]
+[ext_resource type="Script" path="res://{stem}.gd" id="1_probe"]
 
-[node name="HorrorProbe" type="Node"]
+[node name="{node}" type="Node"]
 script = ExtResource("1_probe")
 '''
 
 
-def prepare():
+def _run_probe(godot, stem, script_text, node_name, quit_after):
     if not os.path.isdir(SRC):
         print(f"找不到示例工程 {SRC} —— 先跑 make_horror_demo.py")
-        return False
+        return ""
     if os.path.isdir(OUT):
         shutil.rmtree(OUT)
     shutil.copytree(SRC, OUT, ignore=shutil.ignore_patterns(".godot", "*.import"))
-    with open(os.path.join(OUT, "probe.gd"), "w",
+    with open(os.path.join(OUT, f"{stem}.gd"), "w",
               encoding="utf-8", newline="\n") as handle:
-        handle.write(PROBE_GD)
-    with open(os.path.join(OUT, "probe.tscn"), "w",
+        handle.write(script_text)
+    with open(os.path.join(OUT, f"{stem}.tscn"), "w",
               encoding="utf-8", newline="\n") as handle:
-        handle.write(PROBE_TSCN)
+        handle.write(PROBE_TSCN.format(stem=stem, node=node_name))
     project_file = os.path.join(OUT, "project.godot")
     with open(project_file, "r", encoding="utf-8") as handle:
         text = handle.read()
-    if "run/main_scene" in text:
-        text = text.replace('run/main_scene="res://scenes/World.tscn"',
-                            'run/main_scene="res://probe.tscn"')
-    else:
-        text = text.replace("[application]",
-                            '[application]\n\nrun/main_scene="res://probe.tscn"')
+    text = re.sub(r'run/main_scene="[^"]*"',
+                  f'run/main_scene="res://{stem}.tscn"', text)
     with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
-    return True
 
-
-def run_godot(godot):
     subprocess.run([godot, "--headless", "--path", OUT, "--import"],
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     run = subprocess.run([godot, "--headless", "--path", OUT,
-                          "--quit-after", "1800"],
+                          "--quit-after", str(quit_after)],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
-    return (run.stdout or "") + (run.stderr or "")
+    out = (run.stdout or "") + (run.stderr or "")
+    for line in out.splitlines():
+        if "HORROR" in line or "SCRIPT ERROR" in line or "Parse Error" in line:
+            print("    " + line.strip())
+    return out
 
 
 def _grab(text, pattern):
@@ -222,142 +277,190 @@ def _grab(text, pattern):
     return match.group(0) if match else "<没跑到>"
 
 
+def _errors(text, problems):
+    for line in text.splitlines():
+        if "SCRIPT ERROR" in line or "Parse Error" in line:
+            problems.append(f"Godot 脚本 / 解析错误: {line.strip()}")
+            return
+
+
+def _code_checks(problems):
+    checks = {
+        "scripts/game_logic_教室.gd": (
+            ("change_scene_to_file", "教室切关卡的调用"),
+            ("res://scenes/走廊.tscn", "教室切到走廊的路径"),
+            ("_gk_write_save(", "教室把纸条数落盘"),
+            ('_gk_save_data["纸条数"]', "纸条数写进存档"),
+        ),
+        "scripts/game_logic_走廊.gd": (
+            ("change_scene_to_file", "走廊切关卡的调用"),
+            ("res://scenes/楼梯间.tscn", "走廊切到楼梯间的路径"),
+            ("_gk_heart_tension", "心跳的紧张度"),
+            ("get_physics_process_delta_time()", "心跳按物理帧计时"),
+            ("AudioServer.get_bus_index(", "总线音量(受惊压低)"),
+            ("_gk_shake_cam", "惊吓的相机震动"),
+            ("ColorRect.new()", "惊吓的屏幕闪白"),
+            ('get_nodes_in_group("gk_ai_hearer")', "听觉广播"),
+            ("func _gk_hear_noise(", "听觉派发器"),
+            ('ai_state == "去查看":', "去查看行为"),
+        ),
+        "scripts/game_logic_楼梯间.gd": (
+            ("_gk_read_save(", "开局载入存档"),
+            ('_gk_save_data.get("纸条数"', "读回纸条数"),
+            ("match _gk_choice_picked:", "结局选择的分支 match"),
+            ("gk_choice_input_event(event)", "数字键 1~6 也能选"),
+            ("_gk_write_save(", "结局落盘"),
+        ),
+    }
+    for name, needles in checks.items():
+        path = os.path.join(OUT, name)
+        if not os.path.isfile(path):
+            problems.append(f"没找到生成的脚本 {name}")
+            continue
+        with open(path, "r", encoding="utf-8") as handle:
+            code = handle.read()
+        for needle, why in needles:
+            if needle not in code:
+                problems.append(f"{name} 里没有{why}: 找不到 {needle!r}")
+    # 楼梯间要有 ">= 3" 的门槛
+    path = os.path.join(OUT, "scripts/game_logic_楼梯间.gd")
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            code = handle.read()
+        if not re.search(r"纸条数\)? >= 3", code):
+            problems.append("楼梯间没有『纸条数 >= 3』的门槛")
+
+
+def _scene_checks(problems):
+    checks = {
+        "scenes/教室.tscn": (
+            ('name="纸条1"', "纸条1"),
+            ('name="纸条3"', "纸条3"),
+            ('name="去走廊" type="Area3D"', "去走廊触发区"),
+            ('name="月光" type="DirectionalLight3D"', "月光(平行光)"),
+            ('name="台灯" type="OmniLight3D"', "台灯(点光)"),
+            ('name="教室玩家" type="CharacterBody3D"', "教室角色"),
+        ),
+        "scenes/走廊.tscn": (
+            ('name="怪物" type="CharacterBody3D"', "怪物"),
+            ('name="巡逻点甲"', "巡逻点甲"),
+            ('name="惊吓区" type="Area3D"', "惊吓区"),
+            ('name="去楼梯间" type="Area3D"', "去楼梯间触发区"),
+            ('name="手电筒" type="SpotLight3D"', "手电筒(聚光)"),
+        ),
+        "scenes/楼梯间.tscn": (
+            ('name="门口" type="Area3D"', "门口触发区"),
+            ('name="楼梯间玩家" type="CharacterBody3D"', "楼梯间角色"),
+        ),
+    }
+    for name, needles in checks.items():
+        path = os.path.join(OUT, name)
+        if not os.path.isfile(path):
+            problems.append(f"没找到场景 {name}")
+            continue
+        with open(path, "r", encoding="utf-8") as handle:
+            scene = handle.read()
+        for needle, why in needles:
+            if needle not in scene:
+                problems.append(f"{name} 里没有{why}: 找不到 {needle!r}")
+
+
+def _main_scene_check(problems):
+    # ⚠ 查**源工程**:探针那几趟会把副本里的 main_scene 改指到 probe_*.tscn
+    path = os.path.join(SRC, "project.godot")
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    if 'run/main_scene="res://scenes/教室.tscn"' not in text:
+        problems.append("主场景不是教室(按 F5 进不去第一关)")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--godot", default="godot")
+    parser.add_argument("--godot", default=GODOT_DEFAULT)
     args = parser.parse_args()
-    if not prepare():
+    if not os.path.isdir(SRC):
+        print(f"找不到示例工程 {SRC} —— 先跑 make_horror_demo.py")
         return 1
-    text = run_godot(args.godot)
-    for line in text.splitlines():
-        if "HORROR_" in line or "SCRIPT ERROR" in line or "Parse Error" in line:
-            print(line.strip())
 
-    ok = True
-    if any(("SCRIPT ERROR" in line) or ("Parse Error" in line)
-           for line in text.splitlines()):
-        print("✗ Godot 里有脚本错误 / 解析错误")
-        ok = False
+    problems = []
 
-    if not re.search(r"HORROR_START state=巡逻 has_player=true has_enemy=true"
-                     r" spots=5", text):
-        print("✗ 开场不对(状态不是巡逻 / 玩家 / 敌人 / 5 个触发区没找齐):",
-              _grab(text, r"HORROR_START[^\n]*"))
-        ok = False
-    moved = re.search(r"HORROR_PATROL state=巡逻 moved=([\d.]+)", text)
-    if not moved or float(moved.group(1)) < 0.5:
-        print("✗ 怪物没有在巡逻(1 秒里位移 < 0.5 米):",
-              _grab(text, r"HORROR_PATROL[^\n]*"))
-        ok = False
-
-    # ── 紧张度:远 ≈ 0,近 > 0.3,心跳播放器跟着建起来 ──────────────────
-    far = re.search(r"HORROR_TENSION_FAR tension=([\d.]+)", text)
-    if not far or float(far.group(1)) > 0.2:
-        print("✗ 离怪物很远时紧张度没压下来:",
-              _grab(text, r"HORROR_TENSION_FAR[^\n]*"))
-        ok = False
-    near = re.search(r"HORROR_TENSION_NEAR tension=([\d.]+) heart=(\w+)", text)
-    if not near or float(near.group(1)) < 0.3:
-        print("✗ 凑近怪物后紧张度没升起来:",
-              _grab(text, r"HORROR_TENSION_NEAR[^\n]*"))
-        ok = False
-    elif near.group(2) != "true":
-        print("✗ 心跳播放器没建起来:", near.group(0))
-        ok = False
-
-    notes = re.search(r"HORROR_NOTES count=([\d.]+)", text)
+    # ── 第一关 教室 ─────────────────────────────────────────────────
+    room = _run_probe(args.godot, "probe_room", PROBE_ROOM, "HorrorRoomProbe", 900)
+    _errors(room, problems)
+    if not re.search(r"HORROR_ROOM_START player=true spots=4", room):
+        problems.append("教室开场不对(玩家 / 4 个触发区没找齐): "
+                        + _grab(room, r"HORROR_ROOM_START[^\n]*"))
+    notes = re.search(r"HORROR_ROOM_NOTES count=([\d.]+)", room)
     if not notes or float(notes.group(1)) < 2.5:
-        print("✗ 走过 3 张纸条后『纸条数』不是 3:",
-              _grab(text, r"HORROR_NOTES[^\n]*"))
-        ok = False
+        problems.append("教室拾 3 张纸条后『纸条数』不是 3: "
+                        + _grab(room, r"HORROR_ROOM_NOTES[^\n]*"))
+    if "HORROR_ROOM_DONE" not in room:
+        problems.append("教室探针没跑完")
 
-    # ── 惊吓:相机在震 + Master 被压低 ────────────────────────────────
-    scare = re.search(r"HORROR_SCARE shake=([\-\d.]+) bus=([\-\d.]+)", text)
+    # ── 第二关 走廊 ─────────────────────────────────────────────────
+    corridor = _run_probe(args.godot, "probe_corridor", PROBE_CORRIDOR,
+                          "HorrorCorridorProbe", 900)
+    _errors(corridor, problems)
+    if not re.search(r"HORROR_CORRIDOR_START state=巡逻 has_enemy=true spots=2",
+                     corridor):
+        problems.append("走廊开场不对(怪物 / 两个触发区没找齐): "
+                        + _grab(corridor, r"HORROR_CORRIDOR_START[^\n]*"))
+    moved = re.search(r"HORROR_PATROL state=巡逻 moved=([\d.]+)", corridor)
+    if not moved or float(moved.group(1)) < 0.5:
+        problems.append("怪物没有在巡逻: "
+                        + _grab(corridor, r"HORROR_PATROL[^\n]*"))
+    far = re.search(r"HORROR_TENSION_FAR tension=([\d.]+)", corridor)
+    if not far or float(far.group(1)) > 0.2:
+        problems.append("离怪物很远时紧张度没压下来: "
+                        + _grab(corridor, r"HORROR_TENSION_FAR[^\n]*"))
+    near = re.search(r"HORROR_TENSION_NEAR tension=([\d.]+) heart=(\w+)",
+                     corridor)
+    if not near or float(near.group(1)) < 0.3:
+        problems.append("凑近怪物后紧张度没升起来: "
+                        + _grab(corridor, r"HORROR_TENSION_NEAR[^\n]*"))
+    elif near.group(2) != "true":
+        problems.append("心跳播放器没建起来: " + near.group(0))
+    scare = re.search(r"HORROR_SCARE shake=([\-\d.]+) bus=([\-\d.]+)", corridor)
     if not scare:
-        print("✗ 惊吓那段没跑出来:", _grab(text, r"HORROR_SCARE[^\n]*"))
-        ok = False
+        problems.append("惊吓那段没跑出来: "
+                        + _grab(corridor, r"HORROR_SCARE[^\n]*"))
     else:
         if float(scare.group(1)) <= 0.0:
-            print("✗ 走过惊吓区但相机没在震:", scare.group(0))
-            ok = False
+            problems.append("走过惊吓区但相机没在震: " + scare.group(0))
         if float(scare.group(2)) > -10.0:
-            print("✗ 『音效_总线音量』没有压低 Master:", scare.group(0))
-            ok = False
+            problems.append("『音效_总线音量』没有压低 Master: " + scare.group(0))
+    if "HORROR_CORRIDOR_DONE" not in corridor:
+        problems.append("走廊探针没跑完")
 
-    # ── 结局:门口弹选择(-1 = 还没选),按 2 -> 结局 2 + 真落盘 ────────
-    door = re.search(r"HORROR_DOOR picked=([\-\d]+) panel=(\w+)", text)
+    # ── 第三关 楼梯间 ───────────────────────────────────────────────
+    stairs = _run_probe(args.godot, "probe_stairs", PROBE_STAIRS,
+                        "HorrorStairsProbe", 900)
+    _errors(stairs, problems)
+    if not re.search(r"HORROR_STAIRS_START player=true notes=3", stairs):
+        problems.append("楼梯间没把存档里的纸条数(3)读回来: "
+                        + _grab(stairs, r"HORROR_STAIRS_START[^\n]*"))
+    door = re.search(r"HORROR_DOOR picked=([\-\d]+) panel=(\w+)", stairs)
     if not door or int(door.group(1)) != -1 or door.group(2) != "true":
-        print("✗ 走到门口没有弹出结局选择(应该面板可见、还没选):",
-              _grab(text, r"HORROR_DOOR[^\n]*"))
-        ok = False
-    ending = re.search(r"HORROR_ENDING ended=([\d.]+) saved=(\w+)",
-                       text)
+        problems.append("走到门口没弹出结局选择: "
+                        + _grab(stairs, r"HORROR_DOOR[^\n]*"))
+    ending = re.search(r"HORROR_ENDING ended=([\d.]+) saved=(\w+)", stairs)
     if not ending or float(ending.group(1)) != 2.0:
-        print("✗ 按 2 之后『结局』不是 2:",
-              _grab(text, r"HORROR_ENDING[^\n]*"))
-        ok = False
+        problems.append("按 2 之后『结局』不是 2: "
+                        + _grab(stairs, r"HORROR_ENDING[^\n]*"))
     elif ending.group(2) != "true":
-        print("✗ 结局没有落盘(user://gk_save1.json 不存在):",
-              ending.group(0))
-        ok = False
-
-    if "HORROR_DONE" not in text:
-        print("✗ 探针没跑完(可能中途报错)")
-        ok = False
+        problems.append("结局没有落盘: " + ending.group(0))
+    if "HORROR_STAIRS_DONE" not in stairs:
+        problems.append("楼梯间探针没跑完")
 
     # ── 生成物层面的证据 ────────────────────────────────────────────
-    script_path = os.path.join(OUT, "scripts", "game_logic.gd")
-    if os.path.isfile(script_path):
-        with open(script_path, "r", encoding="utf-8") as handle:
-            code = handle.read()
-        for needle, why in (
-                ("var _gk_heart_tension: float", "心跳的紧张度成员变量"),
-                ("get_physics_process_delta_time()", "心跳按物理帧计时"),
-                ("lerpf(", "心跳越快越响(lerpf 插值)"),
-                ("clampf(((", "紧张度的 0~1 夹取"),
-                ("_gk_global_position_3d(", "紧张度用位置 reader 算距离"),
-                ("_gk_shake_cam", "惊吓的相机震动"),
-                ("ColorRect.new()", "惊吓的屏幕闪白"),
-                ('load("res://audio/sting.wav")', "惊吓音效"),
-                ("AudioServer.get_bus_index(", "总线音量(受惊压低)"),
-                ("AudioServer.set_bus_volume_db(", "总线音量真的写了"),
-                ("_gk_vignette", "屏幕暗角"),
-                ('get_nodes_in_group("gk_ai_hearer")', "听觉广播"),
-                ("func _gk_hear_noise(", "听觉派发器"),
-                ('ai_state == "去查看":', "去查看行为"),
-                ("match _gk_choice_picked:", "结局选择的分支 match"),
-                ("gk_choice_input_event(event)", "数字键 1~6 也能选"),
-                ("_gk_write_save(", "结局落盘"),
-        ):
-            if needle not in code:
-                print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")
-                ok = False
-    else:
-        print(f"✗ 没找到生成的脚本 {script_path}")
-        ok = False
+    _code_checks(problems)
+    _scene_checks(problems)
+    _main_scene_check(problems)
 
-    scene_path = os.path.join(OUT, "scenes", "World.tscn")
-    if os.path.isfile(scene_path):
-        with open(scene_path, "r", encoding="utf-8") as handle:
-            scene = handle.read()
-        for needle, why in (
-                ('[node name="怪物" type="CharacterBody3D"', "怪物在场景里"),
-                ('name="巡逻点甲"', "巡逻点甲"),
-                ('name="纸条1"', "纸条1"),
-                ('name="纸条3"', "纸条3"),
-                ('name="惊吓区"', "惊吓区"),
-                ('name="门口"', "门口"),
-                ('name="手电筒" type="SpotLight3D"', "手电筒(聚光)"),
-        ):
-            if needle not in scene:
-                print(f"✗ World.tscn 里没有{why}: 找不到 {needle!r}")
-                ok = False
-    else:
-        print(f"✗ 没找到主场景 {scene_path}")
-        ok = False
-
-    print("CHECK_HORROR_DEMO=" + ("OK" if ok else "FAIL"))
-    return 0 if ok else 1
+    for item in dict.fromkeys(problems):
+        print(f"✗ {item}")
+    print("CHECK_HORROR_DEMO=" + ("OK" if not problems else "FAIL"))
+    return 0 if not problems else 1
 
 
 if __name__ == "__main__":
