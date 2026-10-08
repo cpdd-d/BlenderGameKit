@@ -3349,6 +3349,92 @@ def main():
         check("第六十七轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- AI 图补三件(第六十九轮)----
+    # 『AI_开始』(显式入口)/『AI_输出』(对外布尔)/『AI_逻辑判断』(条件组合)。
+    # 这一层在**真 Blender** 里建图,验:三个节点注册好了、只进 AI 图、
+    # 入口真的由『AI_开始』决定、『AI_输出』没填变量名时报得出问题、卡片画得完。
+    try:
+        props_mod = __import__(f"{module_name}.properties",
+                               fromlist=["node_fits_tree"])
+        for r69_blob, r69_label in (("GKNodeAiStart", "AI_开始"),
+                                    ("GKNodeAiOutput", "AI_输出"),
+                                    ("GKNodeAiLogic", "AI_逻辑判断")):
+            r69_cls = getattr(node_lib, r69_blob, None)
+            check(f"{r69_label}:节点已注册", r69_cls is not None)
+            if r69_cls is None:
+                continue
+            check(f"{r69_label}:只进 AI 图",
+                  props_mod.node_fits_tree(r69_cls, "GKGameAiTree")
+                  and not props_mod.node_fits_tree(r69_cls, "GKGameLogicTree"))
+
+        r69_ai = bpy.data.node_groups.new("AI冒烟69", "GKGameAiTree")
+        r69_patrol = r69_ai.nodes.new("GKNodeAiState")
+        r69_patrol.gk_state_name = "巡逻"
+        r69_patrol.gk_behavior = "PATROL"
+        r69_patrol.gk_patrol_a = "点A"
+        r69_patrol.gk_patrol_b = "点B"
+        r69_chase = r69_ai.nodes.new("GKNodeAiState")
+        r69_chase.gk_state_name = "追"
+        r69_chase.gk_behavior = "CHASE"
+        r69_chase.gk_goal = "玩家"
+        r69_start = r69_ai.nodes.new("GKNodeAiStart")
+        r69_ai.links.new(r69_start.outputs["开始"], r69_patrol.inputs["进入"])
+        # 巡逻 --(看见玩家)--> 追:少了这条,『追』从入口走不到,图解析会
+        # 判它"孤立"(那是**对的**告警,不是 bug)。
+        r69_trans = r69_ai.nodes.new("GKNodeAiTransition")
+        r69_trans.gk_cond_source = "SEE"
+        r69_trans.gk_goal = "玩家"
+        r69_ai.links.new(r69_patrol.outputs["转到"], r69_trans.inputs["上游"])
+        r69_ai.links.new(r69_trans.outputs["转到"], r69_chase.inputs["进入"])
+        r69_out = r69_ai.nodes.new("GKNodeAiOutput")
+        r69_out.gk_state_name = "追"
+        r69_out.gk_var = "is_chasing_69"
+        r69_logic = r69_ai.nodes.new("GKNodeAiLogic")
+        r69_logic.gk_op = "OR"
+
+        r69_graph = node_lib.ai_tree_graph(r69_ai)
+        check("AI_开始:入口由它决定(不是猜的)",
+              r69_graph["entry"] is not None
+              and node_lib.ai_state_name(r69_graph["entry"]) == "巡逻",
+              str(r69_graph["entry"]))
+        check("AI_开始:图解析得出 starts / outputs",
+              len(r69_graph.get("starts", [])) == 1
+              and len(r69_graph.get("outputs", [])) == 1,
+              str(r69_graph.get("starts")))
+        check("AI 三件:配好了就不该有问题", not r69_graph["problems"],
+              str(r69_graph["problems"])[:200])
+
+        r69_out.gk_var = ""
+        r69_bad = node_lib.ai_tree_graph(r69_ai)
+        check("AI_输出:没填变量名时报得出问题",
+              any("变量名" in text for text in r69_bad["problems"]),
+              str(r69_bad["problems"])[:200])
+        r69_out.gk_var = "is_chasing_69"
+
+        class _R69Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r69_draw_error = ""
+        for r69_node in (r69_start, r69_out, r69_logic):
+            try:
+                r69_node.draw_buttons(bpy.context, _R69Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r69_draw_error = (f"{getattr(r69_node, 'bl_label', '?')}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("AI 三件:卡片都能画完", not r69_draw_error, r69_draw_error)
+
+        bpy.data.node_groups.remove(r69_ai)
+    except Exception as exc:
+        check("第六十九轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

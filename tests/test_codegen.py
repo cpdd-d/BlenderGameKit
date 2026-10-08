@@ -539,6 +539,10 @@ class TestNodeLibrary(unittest.TestCase):
                    "GKNodeAnimEntry"}
         no_flow |= set(NN.DISPLAY_CARD_IDS)
         no_flow |= set(NN.ASSET_CARD_IDS) | set(NN.LEGACY_ASSET_CARD_IDS)
+        # 例外三:AI 图那两件(第六十九轮)——
+        #   * 『AI_开始』是**源头**(只有『开始』出口,和动画的『开始口』一个道理);
+        #   * 『AI_输出』是**声明**(声明一个对外布尔变量),不参与执行流。
+        no_flow |= {"GKNodeAiStart", "GKNodeAiOutput"}
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
                 continue
@@ -14791,6 +14795,206 @@ class TestRound68PackagingPlatforms(Base):
                 self.assertIn("Windows", miss)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+class TestRound69AiNodes(Base):
+    """第六十九轮:AI 图补三件 —— 『AI_开始』『AI_输出』『AI_逻辑判断』。
+
+    用户原话:"游戏AI 需补充『开始』『输出』『逻辑判断』节点,对外输出布尔变量
+    以实现玩法图分支判断"。动工前确认:**都在 AI 图里** + **『AI_输出』先做
+    "是否处于某状态"的布尔**(条件布尔等真需要再加)。
+
+    补的三个缺口:
+      * 入口原来是"没有任何转场指到它"**猜**出来的 —— 循环图(每个状态都有
+        入边)就没有入口。『AI_开始』把它变成显式的;
+      * 玩法图原来只能『变量_读取』拿到状态**字符串**再自己比;
+        『AI_输出』把"在不在某个状态"直接做成布尔变量;
+      * 『AI_转场』只能挂**一个**条件,「看见 **且** 距离近」写不出来;
+        『AI_逻辑判断』在 AI 图里把条件拼起来。
+    """
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _enable(self, ai_name="敌人AI"):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return tree
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        """把 AI 图挂到 bpy.data 上再生成(用完还原,照界面那套)。"""
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    # ---- 三个节点都注册好了,而且只进 AI 图 ----
+
+    def test_nodes_registered_and_ai_tree_only(self):
+        want = ("GKNodeAiStart", "GKNodeAiOutput", "GKNodeAiLogic")
+        for blob in want:
+            cls = getattr(NN, blob, None)
+            self.assertIsNotNone(cls, f"{blob} 没注册")
+            self.assertEqual(cls.gk_category, "AI", blob)
+            self.assertEqual(str(getattr(cls, "gk_tree_type", "")), "GKGameAiTree",
+                             f"{blob} 应该只属于 AI 图")
+        self.assertEqual(NN.GKNodeAiStart.bl_label, "AI_开始")
+        self.assertEqual(NN.GKNodeAiOutput.bl_label, "AI_输出")
+        self.assertEqual(NN.GKNodeAiLogic.bl_label, "AI_逻辑判断")
+        outs = [spec["name"] for spec in NN.GKNodeAiLogic.gk_outputs]
+        self.assertIn("结果", outs)
+
+    # ---- 『AI_开始』:把"从哪开始"变成显式的 ----
+
+    def test_start_node_decides_the_entry(self):
+        """循环图(每个状态都有入边)里,入口也该由『AI_开始』说了算。"""
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B", gk_speed=3.0,
+                             gk_stop_distance=0.6)
+        chase = ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                            gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                            gk_stop_distance=1.0)
+        # 两条互为条件的转场 -> 每个状态都有入边,老办法找不到入口
+        gk_stub.connect(ai, patrol, "转到", chase, "进入")
+        gk_stub.connect(ai, chase, "转到", patrol, "进入")
+        start = ai.new_node(NN.GKNodeAiStart, "开始")
+        gk_stub.connect(ai, start, "开始", chase, "进入")
+
+        tree = self._enable()
+        code, warnings = self._gen_with_ai(ai, tree)
+        # 从『AI_开始』指的那个状态起手(不是随便挑一个)
+        self.assertIn('ai_state = "追"', code, code[:400])
+        self.assertFalse([w for w in warnings if "没有可用的状态" in w], warnings)
+
+    def test_start_without_target_warns(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL", gk_patrol_a="点A", gk_patrol_b="点B",
+                    gk_speed=3.0, gk_stop_distance=0.6)
+        ai.new_node(NN.GKNodeAiStart, "开始")
+        tree = self._enable()
+        _code, warnings = self._gen_with_ai(ai, tree)
+        self.assertTrue(any("AI_开始" in w and "接" in w for w in warnings), warnings)
+
+    def test_multiple_start_nodes_warn(self):
+        ai = self._ai_tree()
+        state = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                            gk_behavior="PATROL", gk_patrol_a="点A",
+                            gk_patrol_b="点B", gk_speed=3.0, gk_stop_distance=0.6)
+        first = ai.new_node(NN.GKNodeAiStart, "开始1")
+        ai.new_node(NN.GKNodeAiStart, "开始2")
+        gk_stub.connect(ai, first, "开始", state, "进入")
+        tree = self._enable()
+        _code, warnings = self._gen_with_ai(ai, tree)
+        self.assertTrue(any("AI_开始" in w and "一个" in w for w in warnings),
+                        warnings)
+
+    # ---- 『AI_输出』:把"在不在某个状态"做成布尔变量 ----
+
+    def test_output_declares_bool_and_updates_every_frame(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                    gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                    gk_stop_distance=1.0)
+        ai.new_node(NN.GKNodeAiOutput, "追击中", gk_state_name="追",
+                    gk_var="is_chasing")
+        tree = self._enable()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        # 声明成成员布尔(玩法图的『变量_读取』照名字读得到)
+        self.assertIn("var is_chasing: bool = false", code)
+        # 每个物理帧按当前状态重算
+        self.assertIn('is_chasing = ai_state == "追"', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_output_without_var_name_warns(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                    gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                    gk_stop_distance=1.0)
+        ai.new_node(NN.GKNodeAiOutput, "输出", gk_state_name="追", gk_var="")
+        tree = self._enable()
+        _code, warnings = self._gen_with_ai(ai, tree)
+        self.assertTrue(any("AI_输出" in w and "变量名" in w for w in warnings),
+                        warnings)
+
+    def test_output_unknown_state_warns(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                    gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                    gk_stop_distance=1.0)
+        ai.new_node(NN.GKNodeAiOutput, "输出", gk_state_name="没这个状态",
+                    gk_var="x_flag")
+        tree = self._enable()
+        _code, warnings = self._gen_with_ai(ai, tree)
+        self.assertTrue(any("AI_输出" in w and "没这个状态" in w for w in warnings),
+                        warnings)
+
+    # ---- 『AI_逻辑判断』:在 AI 图里把条件拼起来 ----
+
+    def test_logic_node_combines_two_conditions(self):
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B", gk_speed=3.0,
+                             gk_stop_distance=0.6)
+        chase = ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                            gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                            gk_stop_distance=1.0)
+        see = ai.new_node(NN.GKNodeAiSee, "近处看得见", gk_goal="玩家",
+                          gk_distance=5.0, gk_angle=0.0)
+        far = ai.new_node(NN.GKNodeAiSee, "远处也看得见", gk_goal="玩家",
+                          gk_distance=15.0, gk_angle=360.0)
+        logic = ai.new_node(NN.GKNodeAiLogic, "看见或听见", gk_op="OR")
+        trans = ai.new_node(NN.GKNodeAiTransition, "转场", gk_cond_source="PIN")
+        gk_stub.connect(ai, see, "看得见", logic, "A")
+        gk_stub.connect(ai, far, "看得见", logic, "B")
+        gk_stub.connect(ai, patrol, "转到", trans, "上游")
+        gk_stub.connect(ai, logic, "结果", trans, "条件")
+        gk_stub.connect(ai, trans, "转到", chase, "进入")
+
+        tree = self._enable()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertFalse([w for w in warnings if "没接线" in w], warnings)
+        # 与/或拼出来的条件出现在转场判定里
+        self.assertIn(" or ", code)
+        self.assert_indent_sane(code)
+
+    # ---- 不摆新节点的老图:生成物一个字都不变 ----
+
+    def test_old_graph_without_new_nodes_keeps_implicit_entry(self):
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B", gk_speed=3.0,
+                             gk_stop_distance=0.6)
+        chase = ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                            gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                            gk_stop_distance=1.0)
+        trans = ai.new_node(NN.GKNodeAiTransition, "转场", gk_cond_source="PIN")
+        gk_stub.connect(ai, patrol, "转到", trans, "上游")
+        gk_stub.connect(ai, trans, "转到", chase, "进入")
+        tree = self._enable()
+        code, warnings = self._gen_with_ai(ai, tree)
+        # 没有任何『AI_开始』-> 还是老规矩:没人指向的那个状态当起点
+        self.assertIn('ai_state = "巡逻"', code)
+        self.assertNotIn("AI_开始", code)
+        self.assertEqual([w for w in warnings if "AI_开始" in w], [], warnings)
 
 
 if __name__ == "__main__":

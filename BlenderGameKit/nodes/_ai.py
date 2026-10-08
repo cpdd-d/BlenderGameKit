@@ -372,6 +372,103 @@ class GKNodeNoise(B.GKStatementNode):
             layout.label(text="间隔 0 = 每帧都发(接物理帧会刷爆)", icon="ERROR")
 
 
+# ==========================================================================
+# 第六十九轮:AI 图补三件 —— 显式入口 / 对外布尔输出 / 条件组合
+#
+# 用户原话:"游戏AI 需补充『开始』『输出』『逻辑判断』节点,对外输出布尔变量
+# 以实现玩法图分支判断"。动工前确认:三件都在 AI 图里;『AI_输出』先做
+# "在不在某个状态"的布尔(条件布尔等真需要再加)。
+# ==========================================================================
+@N
+class GKNodeAiStart(B.GKStatementNode):
+    """AI 图的**显式入口**:一根『开始』线指向起始状态(第六十九轮)。"""
+
+    bl_idname = "GKNodeAiStart"
+    bl_label = "AI_开始"
+    bl_icon = "PLAY"
+    gk_category = "AI"
+    gk_tree_type = AI_TREE_ID
+    gk_doc = ("这张 AI 图**从哪个状态开始**。\n"
+              "不摆它也能用 —— 那时按老规矩『没有任何转场指向的那个状态』"
+              "当起点。可**循环图**(每个状态都有人指)猜不出来,只能随便挑一个,"
+              "\"我想从追击开始\"就没法表达。\n"
+              "摆一个它,把『开始』连到第一个状态的『进入』上,起点就定死了。\n"
+              "⚠ 一张图只放一个。")
+    gk_inputs = ()
+    gk_outputs = (S.pin(FLOW, "开始"),)
+
+    def draw_buttons(self, context, layout):
+        layout.label(text="把『开始』连到第一个状态", icon="INFO")
+
+
+@N
+class GKNodeAiOutput(B.GKStatementNode):
+    """把一个**状态**暴露成对外**布尔变量**(第六十九轮)。"""
+
+    bl_idname = "GKNodeAiOutput"
+    bl_label = "AI_输出"
+    bl_icon = "EXPORT"
+    gk_category = "AI"
+    gk_tree_type = AI_TREE_ID
+    gk_doc = ("把\"AI 现在在不在某个状态\"做成一个**布尔变量**,给玩法图分支用。\n"
+              "例:填『状态 = 追击』『变量名 = is_chasing』,玩法图里就能用"
+              "『变量_读取』读 is_chasing,接『如果_否则』决定放不放紧张音乐。\n"
+              "以前只能读**状态字符串**再自己比较(还得自己拼字符串),这个"
+              "把它变成现成的真假。\n"
+              "⚠ 变量名用英文 / 数字 / 下划线(中文名会被压成下划线,可能和别的"
+              "变量撞车)。图里每帧自动跟着状态更新,不用手动设。")
+    gk_inputs = ()
+    gk_outputs = ()
+    gk_prop_defs = (
+        ("gk_state_name", "string", "", "状态",
+         "要输出的那个状态(填它卡片上的『状态名』)"),
+        ("gk_var", "string", "", "变量名",
+         "玩法图用『变量_读取』照这个名字读(如 is_chasing)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_state_name", text="状态")
+        row = layout.row(align=True)
+        row.prop(self, "gk_var", text="变量名")
+        tree = getattr(getattr(context, "space_data", None), "edit_tree", None)
+        names = [ai_state_name(node) for node in ai_state_nodes(tree)] \
+            if tree is not None else []
+        names = [name for name in names if name]
+        if names:
+            layout.label(text="图里的状态:" + " / ".join(names[:4]), icon="INFO")
+        if not str(getattr(self, "gk_var", "") or "").strip():
+            layout.label(text="! 还没填变量名,玩法图读不到", icon="ERROR")
+
+
+@N
+class GKNodeAiLogic(B.GKExpressionNode):
+    """在 AI 图里把条件拼成布尔(第六十九轮)。
+
+    和玩法图的『逻辑_布尔运算』同一套,只是**它能在 AI 图里用** ——
+    转场只能挂一个条件,「看见 **且** 在射程内」得先把条件拼起来。
+    """
+
+    bl_idname = "GKNodeAiLogic"
+    bl_label = "AI_逻辑判断"
+    bl_icon = "CHECKMARK"
+    gk_category = "AI"
+    gk_tree_type = AI_TREE_ID
+    gk_doc = ("与 / 或 / 非。把几个条件拼成一个布尔,接到『AI_转场』的"
+              "『条件』引脚上(条件来源保持『自己写』)。\n"
+              "例:A 接『AI_看得见』、B 接『AI_听见』,运算选『或』——"
+              "\"看见**或**听见\"就切追击。")
+    gk_inputs = (S.pin(BOOL, "A", False), S.pin(BOOL, "B", False),)
+    gk_prop_defs = (
+        ("gk_op", "enum", "AND", "运算", "", (
+            ("AND", "与 and(都成立)", ""),
+            ("OR", "或 or(任一成立)", ""),
+            ("NOT", "非 not(A)", "只用 A 一个输入"),
+        )),
+    )
+    gk_outputs = (S.pin(BOOL, "结果", False),)
+
+
 @N
 class GKNodeAiEnable(B.GKStatementNode):
     bl_idname = "GKNodeAiEnable"

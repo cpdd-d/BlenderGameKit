@@ -219,7 +219,8 @@ def _expr_logic(ctx, node):
         if op == "AND" and not wired:
             # 与运算里一个假就全假 —— 空着的引脚会被当成假,
             # 结果整个节点恒为假。这是最容易"配了却完全没效果"的坑。
-            ctx.warn(f"『逻辑_布尔运算』的输入『{name}』没接线,按假(false)算,"
+            ctx.warn(f"『{getattr(node, 'bl_label', '逻辑_布尔运算')}』"
+                     f"的输入『{name}』没接线,按假(false)算,"
                      f"整个『与』的结果会一直是假。"
                      f"要少用一个输入就把『输入数量』调小")
         parts.append(ctx.input_bool_expr(node, name))

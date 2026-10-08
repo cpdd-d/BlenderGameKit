@@ -908,6 +908,20 @@ def action_enum_items(_self=None, _context=None):
 AI_TREE_ID = "GKGameAiTree"
 AI_STATE_ID = "GKNodeAiState"
 AI_TRANSITION_ID = "GKNodeAiTransition"
+# 第六十九轮的三件:显式入口 / 对外布尔输出 / 条件组合
+AI_START_ID = "GKNodeAiStart"
+AI_OUTPUT_ID = "GKNodeAiOutput"
+AI_LOGIC_ID = "GKNodeAiLogic"
+
+
+def ai_output_nodes(tree):
+    """AI 图里所有『AI_输出』节点(按画布顺序)。
+
+    纯读 `tree.nodes` 的 bl_idname —— 离线桩树也能喂进来测。
+    """
+    return [node for node in (getattr(tree, "nodes", ()) or ())
+            if getattr(node, "bl_idname", "") == AI_OUTPUT_ID]
+
 
 # 行为枚举:六个行为覆盖"小怪 / NPC"最常见的全部动作。
 # 这些行为都生成 `velocity + move_and_slide()`(和『移动_朝向目标』同一套),
@@ -1239,11 +1253,33 @@ def ai_tree_graph(tree):
                     f"『{getattr(target, 'bl_label', '?')}』—— "
                     f"它只能接『AI_转场』")
 
-    # ---- 入口:没有任何一条边指向它的状态 ----
+    # ---- 入口(第六十九轮:`AI_开始` 优先,否则还是"没人指向的那个")----
+    # 老规矩(没有任何一条边指向它的状态当入口)在**循环图**上直接失效 ——
+    # 每个状态都有入边时只能随便挑一个(以前是 named[0]),用户根本没法表达
+    # "我要从『追』开始"。『AI_开始』把这件事变成显式的:一根『开始』线指过去。
+    starts = [n for n in (getattr(tree, "nodes", ()) or ())
+              if getattr(n, "bl_idname", "") == AI_START_ID]
+    if len(starts) > 1:
+        problems.append(
+            f"这张图里有 {len(starts)} 个『AI_开始』—— 起始状态只能有一个,"
+            f"留一个(其余的删掉)")
+    start_entry = None
+    if starts:
+        picked = [n for n in link_targets(starts[0], "开始")
+                  if getattr(n, "bl_idname", "") == AI_STATE_ID]
+        if picked:
+            start_entry = picked[0]
+        else:
+            problems.append(
+                f"『AI_开始』的『开始』引脚还没接状态 —— 把它连到第一个状态的"
+                f"『进入』上,不然起始状态还是靠猜")
     targeted = {node_key(edge["to"]) for edge in edges if edge["to"] is not None}
     named = [s for s in states if ai_state_name(s)]
     entries = [s for s in named if node_key(s) not in targeted]
-    entry = entries[0] if entries else (named[0] if named else None)
+    if start_entry is not None:
+        entry = start_entry
+    else:
+        entry = entries[0] if entries else (named[0] if named else None)
 
     # ---- 孤立状态:从入口走不到的那些 ----
     orphans = []
@@ -1270,11 +1306,38 @@ def ai_tree_graph(tree):
             f"有 {len(orphans)} 个状态是**孤立**的(从起始状态走不到):({names})"
             f"—— 它们不会出现在导出的状态机里。用『AI_转场』把它们连起来")
 
+    # ---- 『AI_输出』(第六十九轮):变量名与状态名都得对得上 ----
+    # 这两项错一个,玩法图那边就是"永远读到假 / 读不到东西" —— 而且不报错。
+    seen_vars = {}
+    for output in ai_output_nodes(tree):
+        label = getattr(output, "name", "?")
+        var = str(getattr(output, "gk_var", "") or "").strip()
+        state_name = str(getattr(output, "gk_state_name", "") or "").strip()
+        if not var:
+            problems.append(
+                f"『AI_输出』『{label}』还没填『变量名』—— 玩法图要靠这个名字"
+                f"读它(用英文 / 数字 / 下划线,比如 is_chasing)")
+        elif var in seen_vars:
+            problems.append(
+                f"有两个『AI_输出』都用『变量名 = {var}』—— 它们会互相覆盖,"
+                f"给其中一个改个名字")
+        else:
+            seen_vars[var] = output
+        if not state_name:
+            problems.append(
+                f"『AI_输出』『{label}』还没选『状态』—— 它输出的是"
+                f"『在不在某个状态』,得先告诉它看哪个状态")
+        elif state_name not in by_name:
+            problems.append(
+                f"『AI_输出』『{label}』选的状态『{state_name}』这张图里没有")
+
     edges.sort(key=lambda e: (anim_layout_key(e["from"]), e["order"]))
     return {
         "states": states,
         "edges": edges,
         "entry": entry,
+        "starts": starts,
+        "outputs": ai_output_nodes(tree),
         "orphans": orphans,
         "by_name": by_name,
         "problems": problems,

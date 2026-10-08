@@ -439,6 +439,24 @@ def _emit_ai_graph(ctx, indent, machine):
     if emitted == 0:
         ctx.add_line(indent, "pass")
     _emit_ai_transitions(ctx, indent, machine)
+    # ── 对外布尔输出(第六十九轮)────────────────────────────────────
+    # 每帧按**当前状态**重算一次:玩法图读到的就是"这一帧它在不在追我"。
+    # 放在转场之后 —— 切完状态再算,读到的就是切完的那个状态(和肉眼看到
+    # 的一致);放前面会差一帧,表现为"音乐慢半拍"。
+    for var, state_name in machine.get("outputs") or ():
+        ctx.add_line(indent, f"{var} = {machine['var']} == {gd_string(state_name)}")
+
+
+@expr_node("GKNodeAiLogic")
+def _expr_ai_logic(ctx, node):
+    """『AI_逻辑判断』:与 / 或 / 非(和玩法图的『逻辑_布尔运算』同一套)。
+
+    单独登记一个(而不是让 `GKNodeLogic` 也能进 AI 图),是因为两张图的
+    **条件来源**不一样:AI 图里 A/B 接的是『AI_看得见』『AI_听见』这类
+    带"自己是谁"语义的条件,而玩法图里接的是玩家输入之类。
+    """
+    from .expressions import _expr_logic
+    return _expr_logic(ctx, node)
 
 
 # ==========================================================================
@@ -482,6 +500,20 @@ def _stmt_ai_enable(ctx, node, indent):
     owners[requested] = mine
     var_name = ctx.declare_var(requested, "String")
 
+    # ── 对外布尔输出(第六十九轮)────────────────────────────────────
+    # 玩法图要靠这些布尔做分支("它在追我 -> 放紧张音乐")。声明成**按名字
+    # 共享**的成员变量(不传 key)—— 玩法图的『变量_读取』照同一个名字读。
+    # 变量名 / 状态名没填对的情况图解析已经报过问题,这里跳过那一条。
+    state_names = {node_lib.ai_state_name(s) for s in graph["states"]}
+    outputs = []
+    for output in graph.get("outputs") or ():
+        var = str(getattr(output, "gk_var", "") or "").strip()
+        state_name = str(getattr(output, "gk_state_name", "") or "").strip()
+        if not var or state_name not in state_names:
+            continue
+        outputs.append((ctx.declare_var(var, "bool", initial="false"),
+                        state_name))
+
     # ── 进入起始状态 ────────────────────────────────────────────────
     # 守卫 `.is_empty()`:这个节点接在『每当_物理帧』后面也安全 ——
     # 没有守卫的话每帧都会把状态重置回起点,永远走不出起始状态。
@@ -524,6 +556,7 @@ def _stmt_ai_enable(ctx, node, indent):
         "self": target,
         "debug": bool(getattr(node, "gk_debug_print", False)),
         "flip": flip_var,
+        "outputs": outputs,
     })
     ctx.need_ai_process = True
 
