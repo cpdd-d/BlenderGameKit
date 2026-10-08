@@ -119,6 +119,9 @@ _SUBMODULES = (
     "exporter",
     "npr_preview",
     "asset_export",
+    # 资产缩略图(第六十六轮:资产卡上的小图 —— 真图 / 渲染 / 波形 / 折线)。
+    # 排在 asset_export 之后、ui 之前:它 import asset_export,而 ui 用它。
+    "asset_thumbs",
     "godot_look",
     "godot_glossary",
     "operator_io",

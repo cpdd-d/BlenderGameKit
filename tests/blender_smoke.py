@@ -1667,16 +1667,35 @@ def main():
 
         r43_tree = r43_ui._asset_tree_or_new()
         r43_counts = r43_ui._fill_asset_cards(r43_tree)
-        r43_model_cards = [getattr(node, "gk_asset", "")
-                           for node in r43_tree.nodes
-                           if getattr(node, "bl_idname", "")
-                           == "GKNodeAssetModel"]
-        check("资产:第六种图类型注册成功 + 收录出模型卡",
+        r43_cards = node_lib.card_entries(r43_tree)
+        r43_model_cards = [path for kind, _name, path, _node in r43_cards
+                           if kind == "model"]
+        check("资产:第六种图类型注册成功 + 收录出统一『资产卡』",
               getattr(r43_tree, "bl_idname", "") == "GKAssetTree"
               and "冒烟树43" in r43_model_cards,
               f"counts={r43_counts} cards={r43_model_cards}")
         check("资产:重复收录不重复加卡",
               sum(r43_ui._fill_asset_cards(r43_tree).values()) == 0)
+        # 统一卡:类型 / 名称 / 路径 / 勾选都读得出来
+        r43_model_card = next(
+            (card for kind, _name, _path, card in r43_cards if kind == "model"),
+            None)
+        check("资产:统一卡读得出类型/路径/勾选",
+              r43_model_card is not None
+              and node_lib.card_kind(r43_model_card) == "model"
+              and node_lib.card_path(r43_model_card) == "冒烟树43"
+              and node_lib.card_is_asset(r43_model_card)
+              and bool(getattr(r43_model_card, "gk_is_asset", False)),
+              f"card={getattr(r43_model_card, 'name', None)}")
+        # 取消勾选 -> 不算资产(统计 / 导出都跳过)
+        r43_model_card.gk_is_asset = False
+        r43_after = node_lib.card_entries(r43_tree)
+        check("资产:取消『标记为游戏资产』后不算资产",
+              all(path != "冒烟树43"
+                  for kind, _n, path, _c in r43_after),
+              f"cards={[(k, p) for k, _n, p, _c in r43_after]} "
+              f"counts={node_lib.card_counts(r43_tree)}")
+        r43_model_card.gk_is_asset = True
 
         # 双向拦节点(poll 把关)
         r43_before = len(r43_tree.nodes)
@@ -1689,7 +1708,7 @@ def main():
               r43_move_blocked and len(r43_tree.nodes) == r43_before)
         r43_logic = bpy.data.node_groups.new("资产玩法冒烟43", "GKGameLogicTree")
         try:
-            r43_logic.nodes.new("GKNodeAssetModel")
+            r43_logic.nodes.new("GKNodeAssetCard")
             r43_card_blocked = False
         except RuntimeError:
             r43_card_blocked = True
@@ -1727,24 +1746,61 @@ def main():
               f"source={getattr(r43_entry.get('source'), 'name', None)} "
               f"members={len(r43_entry.get('members') or [])}")
 
-        # ⑤ 音频:声音卡 -> 导出清单(名字 / 文件 / res:// 路径)
+        # ⑤ 音频:统一『资产卡』(类型=音频)-> 导出清单(名字 / 文件 / res://)
         r43_wav = os.path.join(tempfile.gettempdir(), "gk_smoke43_跳跃.wav")
-        with open(r43_wav, "wb") as r43_handle:
-            r43_handle.write(b"RIFF....WAVEfmt ")
-        r43_sound_card = r43_tree.nodes.new("GKNodeAssetSound")
+        r43_sound_ok = True
+        try:
+            import wave
+            with wave.open(r43_wav, "wb") as r43_wav_handle:
+                r43_wav_handle.setnchannels(1)
+                r43_wav_handle.setsampwidth(2)
+                r43_wav_handle.setframerate(8000)
+                r43_wav_handle.writeframes(bytes(2000))
+        except Exception:                                 # noqa: BLE001
+            r43_sound_ok = False
+        r43_sound_card = r43_tree.nodes.new("GKNodeAssetCard")
+        r43_sound_card.gk_kind = "sound"
         r43_sound_card.gk_name = "冒烟音效43"
-        r43_sound_card.gk_file = r43_wav
-        r43_sound_card.gk_res = r43_sound.sound_res_path(r43_wav)
+        r43_sound_card.gk_path = r43_wav
+        r43_sound_card.gk_is_asset = True
         r43_entries = node_lib.sound_card_entries(r43_tree)
-        check("资产:声音卡进了导出清单(名字 / 文件 / res:// 路径)",
+        check("资产:统一卡(音频)进了导出清单(名字 / 文件 / res:// 路径)",
               ("冒烟音效43", r43_wav, r43_sound.sound_res_path(r43_wav))
               in r43_entries, str(r43_entries))
         r43_planned = r43_sound.sound_files(
             "X:/proj", [(name, path) for name, path, _res in r43_entries])
         check("资产:声音卡的目标文件落在 audio/ 下",
               any(item[3].startswith("res://audio/") for item in r43_planned))
+        # 波形缩略图:真读一个 wav(离线那条单测也是这么造的)
+        r43_thumbs = import_module(f"{module_name}.asset_thumbs")
+        r43_peaks = r43_thumbs.wave_preview(r43_wav, samples=8) \
+            if r43_sound_ok else []
+        check("资产:音频缩略图能从 wav 读出波形",
+              bool(r43_peaks) and all(0.0 <= value <= 1.0
+                                      for value in r43_peaks),
+              f"peaks={r43_peaks[:4]}")
+        # 旧『资产_声音卡』仍然认(老 .blend 不坏)
+        r43_legacy_sound = r43_tree.nodes.new("GKNodeAssetSound")
+        r43_legacy_sound.gk_name = "旧声音43"
+        r43_legacy_sound.gk_file = r43_wav
+        r43_legacy_sound.gk_res = r43_sound.sound_res_path(r43_wav)
+        check("资产:旧『资产_声音卡』仍然读得出来(兼容老工程)",
+              ("旧声音43", r43_wav, r43_sound.sound_res_path(r43_wav))
+              in node_lib.sound_card_entries(r43_tree))
 
-        # ⑥ 卡片 draw + 面板注册
+        # ⑥ 卡片 draw + 缩略图叠加 + 面板注册
+        # 缩略图绘制回调:没有节点编辑器上下文时应**静默返回**(不是抛异常)
+        r43_thumb_error = ""
+        try:
+            r43_ui._asset_thumb_draw()
+        except Exception as exc:                          # noqa: BLE001
+            r43_thumb_error = f"{type(exc).__name__}: {exc}"
+        check("资产:缩略图绘制回调在没上下文时不抛异常", not r43_thumb_error,
+              r43_thumb_error)
+        check("资产:缩略图绘制回调挂上了节点编辑器",
+              bool(getattr(r43_ui, "_ASSET_THUMB_HANDLE", [])),
+              str(getattr(r43_ui, "_ASSET_THUMB_HANDLE", None)))
+
         class _R43Layout:      # 最小替身:随便怎么调都返回自己
             def __getattr__(self, name):
                 if name.startswith("_"):

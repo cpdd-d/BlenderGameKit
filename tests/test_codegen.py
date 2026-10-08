@@ -538,7 +538,7 @@ class TestNodeLibrary(unittest.TestCase):
         no_flow = {"GKNodeAnimState", "GKNodeAnimTransition",
                    "GKNodeAnimEntry"}
         no_flow |= set(NN.DISPLAY_CARD_IDS)
-        no_flow |= set(NN.ASSET_CARD_IDS)
+        no_flow |= set(NN.ASSET_CARD_IDS) | set(NN.LEGACY_ASSET_CARD_IDS)
         for cls in NN.ALL_CLASSES:
             if not issubclass(cls, NB.GKStatementNode):
                 continue
@@ -11882,18 +11882,27 @@ class TestRound43Assets(Base):
     # ---- 树归属 / 菜单 ----
     def test_card_list_matches_classes(self):
         from BlenderGameKit import properties as props
-        self.assertEqual(len(NN.ASSET_CARD_IDS), 4)
-        for blob in NN.ASSET_CARD_IDS:
+        # 第六十六轮:四张分开的卡合成一张『资产卡』(ASSET_CARD_IDS 只剩一个)
+        self.assertEqual(len(NN.ASSET_CARD_IDS), 1)
+        self.assertIn("GKNodeAssetCard", NN.ASSET_CARD_IDS)
+        # 旧四张卡保留兼容(定义还在、还认资产树),但不再进菜单
+        self.assertEqual(len(NN.LEGACY_ASSET_CARD_IDS), 4)
+        for blob in tuple(NN.ASSET_CARD_IDS) + tuple(NN.LEGACY_ASSET_CARD_IDS):
             cls = getattr(NN, blob, None)
-            self.assertIsNotNone(cls, f"ASSET_CARD_IDS 里的 {blob} 没定义")
+            self.assertIsNotNone(cls, f"资产卡名单里的 {blob} 没定义")
             self.assertEqual(cls.bl_idname, blob)
             self.assertEqual(list(cls.gk_inputs), [], blob)
             self.assertEqual(list(cls.gk_outputs), [], blob)
             self.assertTrue(props.node_fits_tree(cls, "GKAssetTree"))
+        for blob in NN.ASSET_CARD_IDS:
+            self.assertFalse(getattr(getattr(NN, blob), "gk_hidden", False))
+        for blob in NN.LEGACY_ASSET_CARD_IDS:
+            self.assertTrue(getattr(getattr(NN, blob), "gk_hidden", False),
+                            f"旧卡 {blob} 应该从菜单里藏起来")
 
     def test_asset_cards_tree_scope(self):
         from BlenderGameKit import properties as props
-        for blob in NN.ASSET_CARD_IDS:
+        for blob in tuple(NN.ASSET_CARD_IDS) + tuple(NN.LEGACY_ASSET_CARD_IDS):
             cls = getattr(NN, blob)
             for other in ("GKGameLogicTree", "GKAnimationTree",
                           "GKUiDesignTree", "GKGameAiTree", "GKDisplayTree"):
@@ -11910,18 +11919,18 @@ class TestRound43Assets(Base):
         labels = [cls.bl_label
                   for _cat, items in props.node_menu_entries("GKAssetTree")
                   for cls in items]
-        for wanted in ("资产_模型卡", "资产_图片卡", "资产_曲线卡",
-                       "资产_声音卡"):
-            self.assertIn(wanted, labels)
+        self.assertIn("资产卡", labels)
+        # 旧四张卡从菜单里藏起来了(老 .blend 仍能打开)
+        for gone in ("资产_模型卡", "资产_图片卡", "资产_曲线卡", "资产_声音卡"):
+            self.assertNotIn(gone, labels)
         self.assertNotIn("移动_按方向", labels)
 
     def test_missing_asset_cards(self):
         tree = gk_stub.StubNodeTree("游戏资产")
         self.assertEqual(NN.missing_asset_cards(tree),
                          list(NN.ASSET_CARD_IDS))
-        tree.new_node(NN.GKNodeAssetModel)
-        self.assertEqual(NN.missing_asset_cards(tree),
-                         list(NN.ASSET_CARD_IDS[1:]))
+        tree.new_node(NN.GKNodeAssetCard)
+        self.assertEqual(NN.missing_asset_cards(tree), [])
 
     # ---- "谁在用" / "收录"(纯函数)----
     def test_asset_users_finds_references(self):
@@ -14254,6 +14263,163 @@ class TestRound64Narrative(Base):
         gk_stub.connect(tree2, event2, "执行", music2, "执行")
         code2, _ = gen(tree2, V3)
         self.assertIn('.bus = "Master"', code2)
+
+
+class TestRound66AssetCard(unittest.TestCase):
+    """第六十六轮:四张资产卡合成一张『资产卡』+ 卡片缩略图。
+
+    ── 这一轮验什么 ────────────────────────────────────────────────
+      * 统一卡读得出类型 / 名称 / 路径 / 勾选(纯函数,喂桩节点);
+      * 勾掉『标记为游戏资产』的卡不算资产(统计 / 导出都跳过);
+      * 旧四张卡仍然读得懂(老 .blend 不坏)—— 类型按 bl_idname 认;
+      * `sound_card_entries` 统一卡里现算 `res://`(和复制进 audio/ 用
+        的是同一个函数);
+      * `asset_thumbs` 的纯函数(波形读 wav / 曲线投影 / 上下镜像)。
+    """
+
+    def _tree(self):
+        return gk_stub.StubNodeTree("资产")
+
+    def _card(self, tree, kind="model", path="", name="", is_asset=True):
+        return tree.new_node(NN.GKNodeAssetCard, "卡", gk_kind=kind,
+                             gk_path=path, gk_name=name, gk_is_asset=is_asset)
+
+    # ---- 读卡(纯函数)----
+
+    def test_card_kind_defaults_and_override(self):
+        tree = self._tree()
+        self.assertEqual(NN.card_kind(self._card(tree, "image")), "image")
+        self.assertEqual(NN.card_kind(self._card(tree, "sound")), "sound")
+        # 认不出来的类型 -> 空串(不是资产卡)
+        self.assertEqual(NN.card_kind(self._card(tree, "nope")), "")
+        # 旧卡按 bl_idname 认
+        self.assertEqual(
+            NN.card_kind(tree.new_node(NN.GKNodeAssetCurve, "旧")), "curve")
+        self.assertEqual(
+            NN.card_kind(tree.new_node(NN.GKNodeAssetModel, "旧")), "model")
+
+    def test_card_path_and_name(self):
+        tree = self._tree()
+        card = self._card(tree, "model", "树")
+        self.assertEqual(NN.card_path(card), "树")
+        self.assertEqual(NN.card_name(card), "树")
+        # 名称留空 = 用路径最后一段
+        self.assertEqual(
+            NN.card_name(self._card(tree, "sound", "/a/b/叮.wav")), "叮.wav")
+        # 名称填了就用名称
+        self.assertEqual(
+            NN.card_name(self._card(tree, "sound", "/a/b/叮.wav", "开门")),
+            "开门")
+        # 旧卡走各自的属性
+        old = tree.new_node(NN.GKNodeAssetImage, "旧", gk_image="头像")
+        self.assertEqual(NN.card_path(old), "头像")
+
+    def test_card_is_asset_honours_the_checkbox(self):
+        tree = self._tree()
+        self.assertTrue(NN.card_is_asset(self._card(tree, "model", "树")))
+        self.assertFalse(
+            NN.card_is_asset(self._card(tree, "model", "树", is_asset=False)))
+        # 旧卡没有这个开关,一直算数
+        self.assertTrue(NN.card_is_asset(
+            tree.new_node(NN.GKNodeAssetModel, "旧", gk_asset="树")))
+
+    def test_card_entries_and_counts_skip_unchecked(self):
+        tree = self._tree()
+        self._card(tree, "model", "树")
+        self._card(tree, "image", "头像")
+        self._card(tree, "sound", "a.wav", is_asset=False)
+        self._card(tree, "curve", "", is_asset=True)      # 没路径 -> 不算
+        entries = NN.card_entries(tree)
+        self.assertEqual([e[0] for e in entries], ["model", "image"])
+        counts = NN.card_counts(tree)
+        self.assertEqual(counts["model"], 1)
+        self.assertEqual(counts["image"], 1)
+        self.assertEqual(counts["curve"], 0)
+        self.assertEqual(counts["sound"], 0)
+        # 卡节点还在(只是没勾/没路径)
+        self.assertEqual(len(NN.card_nodes(tree)), 4)
+
+    def test_legacy_cards_still_count(self):
+        tree = self._tree()
+        tree.new_node(NN.GKNodeAssetModel, "模型", gk_asset="树")
+        tree.new_node(NN.GKNodeAssetSound, "声音",
+                      gk_res="res://audio/b.wav")
+        counts = NN.card_counts(tree)
+        self.assertEqual(counts["model"], 1)
+        self.assertEqual(counts["sound"], 1)
+
+    # ---- 声音卡 -> 导出清单 ----
+
+    def test_sound_card_entries_reads_unified_card(self):
+        from BlenderGameKit import sound_assets
+        tree = self._tree()
+        self._card(tree, "sound", "/tmp/x/叮.wav", "开门声")
+        entries = NN.sound_card_entries(tree)
+        self.assertEqual(entries,
+                         [("开门声", "/tmp/x/叮.wav",
+                           sound_assets.sound_res_path("/tmp/x/叮.wav"))])
+
+    def test_sound_card_entries_keeps_legacy_and_res_only(self):
+        tree = self._tree()
+        tree.new_node(NN.GKNodeAssetSound, "旧", gk_name="旧声",
+                      gk_file="/tmp/old.wav", gk_res="res://audio/old.wav")
+        # 路径本身就是 res:// -> 只登记,不复制
+        self._card(tree, "sound", "res://audio/registered.ogg", "只登记")
+        # 勾掉的卡不进清单
+        self._card(tree, "sound", "/tmp/skip.wav", "勾掉了", is_asset=False)
+        entries = NN.sound_card_entries(tree)
+        self.assertIn(("旧声", "/tmp/old.wav", "res://audio/old.wav"), entries)
+        self.assertIn(("只登记", "", "res://audio/registered.ogg"), entries)
+        self.assertEqual(len(entries), 2)
+
+    # ---- 缩略图的纯函数 ----
+
+    def test_wave_preview_reads_a_real_wav(self):
+        import wave
+
+        from BlenderGameKit import asset_thumbs
+        path = os.path.join(tempfile.gettempdir(), "gk_thumb66.wav")
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            frames = bytearray()
+            for index in range(800):
+                value = 20000 if (index // 40) % 2 == 0 else 0
+                frames += value.to_bytes(2, "little", signed=True)
+            handle.writeframes(bytes(frames))
+        peaks = asset_thumbs.wave_preview(path, samples=32)
+        self.assertEqual(len(peaks), 32)
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in peaks))
+        # 有响有静 -> 不是一条平线
+        self.assertGreater(max(peaks) - min(peaks), 0.3)
+        # 读不了的路径 -> 空(调用方退回色块)
+        self.assertEqual(asset_thumbs.wave_preview("X:/没有.wav"), [])
+
+    def test_project_points_keeps_the_two_widest_axes(self):
+        from BlenderGameKit import asset_thumbs
+        # 一条躺在 XY 平面上的线(Z 是常量)—— Z 轴该被丢掉
+        points = [(0, 0, 5), (10, 7, 5), (20, 14, 5)]
+        result = asset_thumbs.project_points(points)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0], (0.0, 0.0))
+        self.assertEqual(result[1], (0.5, 0.5))
+        self.assertEqual(result[2], (1.0, 1.0))
+        # 点太少 -> 空
+        self.assertEqual(asset_thumbs.project_points([(0, 0, 0)]), [])
+
+    def test_mirror_wave_is_symmetric(self):
+        from BlenderGameKit import asset_thumbs
+        mirrored = asset_thumbs.mirror_wave([0.0, 1.0])
+        self.assertEqual(len(mirrored), 4)
+        # 上下对称:后半段是前半段绕 0.5 的镜像
+        self.assertAlmostEqual(mirrored[0][1], 1.0 - mirrored[-1][1], places=6)
+        self.assertEqual(asset_thumbs.mirror_wave([]), [])
+
+    def test_preview_for_unknown_kind_is_none(self):
+        from BlenderGameKit import asset_thumbs
+        self.assertIsNone(asset_thumbs.preview_for("nope", "x"))
+        self.assertIsNone(asset_thumbs.preview_for("model", ""))
 
 
 if __name__ == "__main__":

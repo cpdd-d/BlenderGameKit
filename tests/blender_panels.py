@@ -311,15 +311,28 @@ def main():
         check("『游戏显示』面板", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
-    # ---- 5. 『游戏资产』资产库的面板 + 四张资产卡(第四十三轮)----
+    # ---- 5. 『游戏资产』资产库的面板 + 统一『资产卡』(第四十三/六十六轮)----
     print("=" * 72)
-    print("5. 『游戏资产』面板 + 四张资产卡")
+    print("5. 『游戏资产』面板 + 统一『资产卡』")
     print("=" * 72)
     try:
         tree = bpy.data.node_groups.new("面板冒烟资产43", "GKAssetTree")
-        model = tree.nodes.new("GKNodeAssetModel")
-        model.gk_asset = cube.name          # 拿上面的立方体当资产
         cube.gk_physics.asset_name = cube.name
+        # 统一卡:一份 3D 道具 + 一份图片 + 一份音频
+        model = tree.nodes.new("GKNodeAssetCard")
+        model.gk_kind = "model"
+        model.gk_path = cube.name
+        image = tree.nodes.new("GKNodeAssetCard")
+        image.gk_kind = "image"
+        image.gk_path = "不存在的图"
+        sound = tree.nodes.new("GKNodeAssetCard")
+        sound.gk_kind = "sound"
+        sound.gk_path = "res://audio/registered.ogg"
+        sound.gk_name = "只登记"
+        # 旧卡也要能画(老 .blend 不坏)
+        tree.nodes.new("GKNodeAssetImage")
+        tree.nodes.new("GKNodeAssetSound")
+
         panel = getattr(ui, "GK_PT_AssetTree", None)
         if panel is None:
             check("GK_PT_AssetTree 存在", False, "类找不到")
@@ -328,15 +341,13 @@ def main():
             holder = type("P", (), {"layout": layout})()
             panel.draw(holder, FakeNodeContext(cube, scene, tree))
             names = list(layout.operator_names)
-            for wanted in ("gk.asset_fill_cards", "gk.asset_register",
+            for wanted in ("gk.asset_add_card", "gk.asset_fill_cards",
+                           "gk.asset_register", "gk.asset_refresh_thumbs",
                            "gk.switch_tree"):
                 check(f"『游戏资产』面板画出 {wanted}", wanted in names,
                       str(sorted(set(names))))
 
-        # 四张资产卡的 draw_buttons 都要能画完
-        for blob in ("GKNodeAssetImage", "GKNodeAssetCurve",
-                     "GKNodeAssetSound"):
-            tree.nodes.new(blob)
+        # 每张卡(统一卡 + 旧卡)的 draw_buttons 都要能画完
         card_error = ""
         for card in tree.nodes:
             try:
@@ -345,7 +356,8 @@ def main():
                 card_error = (f"{getattr(card, 'bl_label', '?')}: "
                               f"{type(exc).__name__}: {exc}")
                 break
-        check("四张资产卡的 draw_buttons 都能画完", not card_error, card_error)
+        check("资产卡(统一卡 + 旧卡)的 draw_buttons 都能画完",
+              not card_error, card_error)
         bpy.data.node_groups.remove(tree)
     except Exception as exc:
         check("『游戏资产』面板", False, f"{type(exc).__name__}: {exc}")

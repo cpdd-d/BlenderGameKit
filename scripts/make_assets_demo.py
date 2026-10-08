@@ -10,10 +10,10 @@
 ── 这一屏在看什么 ────────────────────────────────────────────────
 第一关里有三棵树和一块石头 —— 它们**不是**普通物体,是"资产":
 同一个模型只导一次,摆几份就复用几次(每份各自带碰撞)。
-打开『游戏资产』图能看到资产库:
-    资产_模型卡(树 / 石头)、资产_图片卡(资产徽标)、
-    资产_曲线卡(资产轨道)、资产_声音卡(叮)
-卡上写着"本场景几份、本体在哪个场景、谁在用"。
+打开『游戏资产』图能看到资产库:**一张『资产卡』= 一份资产**
+(卡上有类型 / 名称 / 路径 + 缩略图;取消『标记为游戏资产』就不算资产)。
+示例里四张卡分别是:3D 道具(树 / 石头)、图片(资产徽标)、
+曲线(资产轨道)、音频(叮)。
 
 | 资产 | 在示例里怎么用 |
 |---|---|
@@ -347,7 +347,7 @@ def build_logic(scene, player, track_cam, wav_path):
 
 
 def build_asset_tree(wav_path):
-    """资产图:收录 + 声音卡(收录收不到"本地文件",得手动加一张)。"""
+    """资产图:收录 + 把音频卡补上本地文件(收录只认得到 res:// 路径)。"""
     from BlenderGameKit import sound_assets
     from BlenderGameKit import ui as gk_ui
 
@@ -357,19 +357,26 @@ def build_asset_tree(wav_path):
     log(f"资产图收录:模型 {counts['model']} / 图片 {counts['image']} / "
         f"曲线 {counts['curve']} / 声音 {counts['sound']}")
 
-    # 声音卡:『音效_播放』里那个路径**已经被收录成卡了**(gk_res 相同),
-    # 这里把它补成"有本地文件"的那种(收录只能看到 res:// 路径,
-    # 看不到本地文件 —— 文件得自己挑一次),而不是再加一张重复的卡。
+    # 音频卡:『音效_播放』里那个路径已经被收录成一张卡了(res:// 相同),
+    # 这里把它补成"有本地文件"的那种(收录只看得到 res:// 路径,看不到
+    # 本地文件 —— 文件得自己挑一次),而不是再加一张重复的卡。
     card = gk_ui._ensure_asset_card(
-        tree, "GKNodeAssetSound", sound_assets.sound_res_path(wav_path))
+        tree, "sound", sound_assets.sound_res_path(wav_path))
     if card is not None:
         card.gk_name = "叮"
-        card.gk_file = wav_path
-        log(f"资产图:声音卡『叮』-> {card.gk_res}(本地文件 {os.path.basename(wav_path)})")
+        card.gk_path = wav_path
+        log(f"资产图:音频卡『叮』-> {card.gk_path}"
+            f"(本地文件 {os.path.basename(wav_path)})")
 
-    cards = [node for node in tree.nodes
-             if getattr(node, "bl_idname", "").startswith("GKNodeAsset")]
-    log(f"资产图共 {len(cards)} 张卡:{[node.name for node in cards]}")
+    # 拍 3D 道具的缩略图(后台模式没 GPU 会失败,那就退回色块示意)
+    from BlenderGameKit import asset_thumbs
+    shot = asset_thumbs.refresh_missing_models(tree)
+    log(f"资产图:3D 道具缩略图拍了 {shot} 张(拍不了会退回色块+名字)")
+
+    from BlenderGameKit.nodes import nodes as node_lib
+    cards = [node for node in tree.nodes if node_lib.is_asset_card(node)]
+    log(f"资产图共 {len(cards)} 张『资产卡』:"
+        f"{[(node_lib.card_kind(node), node_lib.card_name(node)) for node in cards]}")
     return tree
 
 

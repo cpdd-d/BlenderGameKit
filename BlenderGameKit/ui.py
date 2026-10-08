@@ -1239,44 +1239,41 @@ class GKAssetTree(bpy.types.NodeTree):
                      icon="INFO")
 
 
-# 卡片类型 -> 卡上存"名字"的那个属性
-_ASSET_CARD_VALUE_PROP = {
-    "GKNodeAssetModel": "gk_asset",
-    "GKNodeAssetImage": "gk_image",
-    "GKNodeAssetCurve": "gk_curve",
-    "GKNodeAssetSound": "gk_res",
-}
+def _asset_card_icon(kind):
+    """按**类型**(model / image / curve / sound)给个图标。"""
+    return node_lib.ASSET_KIND_ICONS.get(str(kind or ""), "ASSET_MANAGER")
 
 
-def _asset_card_icon(blob):
-    return {"GKNodeAssetModel": "MESH_DATA", "GKNodeAssetImage": "IMAGE_DATA",
-            "GKNodeAssetCurve": "CURVE_DATA",
-            "GKNodeAssetSound": "SOUND"}.get(blob, "ASSET_MANAGER")
+def _ensure_asset_card(tree, kind, value, name="", select=False):
+    """保证图上有这么一张卡(同类型 + 同路径的不重复加)。加过就返回它。
 
-
-def _ensure_asset_card(tree, blob, value, extras=None):
-    """保证图上有这么一张卡(同类型 + 同名的不重复加)。加过就返回它。
-
-    extras 是"顺带写上的其它栏位"(比如声音卡的名字)—— 只在新建时写。
+    `name` 是显示名(只在新建时写);`select` 让新卡被选中(用户刚登记完
+    能一眼看到它)。
     """
-    prop = _ASSET_CARD_VALUE_PROP.get(blob)
-    if prop is None:
-        return None
     value = str(value or "").strip()
     for node in getattr(tree, "nodes", ()) or ():
-        if getattr(node, "bl_idname", "") != blob:
+        if node_lib.card_kind(node) != kind:
             continue
-        if str(getattr(node, prop, "") or "").strip() == value:
+        if node_lib.card_path(node) == value:
             return node
-    node = tree.nodes.new(blob)
+    node = tree.nodes.new(node_lib.ASSET_CARD_ID)
     try:
-        setattr(node, prop, value)
-        for key, item in (extras or {}).items():
-            setattr(node, key, item)
+        node.gk_kind = kind
+        node.gk_path = value
+        node.gk_is_asset = True
+        if name:
+            node.gk_name = str(name)
     except Exception:                                     # noqa: BLE001
         pass
     node.location = (0.0, -node_lib.ASSET_CARD_GAP
                      * max(0, len(tree.nodes) - 1))
+    if select:
+        try:
+            for other in tree.nodes:
+                other.select = other is node
+            tree.nodes.active = node
+        except Exception:                                 # noqa: BLE001
+            pass
     return node
 
 
@@ -1298,31 +1295,27 @@ def _asset_tree_or_new():
 def _fill_asset_cards(tree):
     """**收录**:把 .blend 里已有的东西登记成资产卡(不重复加)。
 
-    扫三类来源:
-      * 所有场景里填了『资产名』的物体 -> 模型卡(跨场景);
-      * 所有节点图里在用的图片 -> 图片卡;
-      * 在用的曲线 / 音频路径 -> 曲线卡 / 声音卡(声音只登记路径)。
+    扫四类来源,每个资产建**一张『资产卡』**(第六十六轮:一张卡顶
+    原来四张 —— 类型用 gk_kind 区分):
+      * 所有场景里填了『资产名』的物体 -> 类型 3D 道具(跨场景);
+      * 所有节点图里在用的图片        -> 类型 图片;
+      * 在用的曲线                    -> 类型 曲线;
+      * 在用的音频路径                -> 类型 音频。
     返回 {"model": n, "image": n, "curve": n, "sound": n}(补了几张)。
     """
     counts = {"model": 0, "image": 0, "curve": 0, "sound": 0}
+    before = len(tree.nodes)
     for name in node_lib.all_asset_names():
-        before = len(tree.nodes)
-        _ensure_asset_card(tree, "GKNodeAssetModel", name)
-        counts["model"] += len(tree.nodes) - before
+        _ensure_asset_card(tree, "model", name)
+    counts["model"] = len(tree.nodes) - before
     used = node_lib.collect_used_assets(bpy.data.node_groups)
-    for image_name in used["images"]:
+    for kind, key, values in (("image", "image", used["images"]),
+                              ("curve", "curve", used["curves"]),
+                              ("sound", "sound", used["sounds"])):
         before = len(tree.nodes)
-        _ensure_asset_card(tree, "GKNodeAssetImage", image_name)
-        counts["image"] += len(tree.nodes) - before
-    for blob, key, values in (("GKNodeAssetCurve", "curve", used["curves"]),
-                              ("GKNodeAssetSound", "sound",
-                               used["sounds"])):
         for value in values:
-            before = len(tree.nodes)
-            extras = {"gk_name": os.path.basename(value)} \
-                if blob == "GKNodeAssetSound" else None
-            _ensure_asset_card(tree, blob, value, extras)
-            counts[key] += len(tree.nodes) - before
+            _ensure_asset_card(tree, kind, value)
+        counts[key] = len(tree.nodes) - before
     return counts
 
 
@@ -1437,6 +1430,7 @@ class GK_OT_OpenAssetTree(bpy.types.Operator):
         if tree is None:
             tree = _asset_tree_or_new()
             counts = _fill_asset_cards(tree)
+            _refresh_asset_thumbs(tree)
             total = sum(counts.values())
             self.report({"INFO"}, f"已新建资产库『{tree.name}』"
                                   f"(收录了 {total} 份资产)")
@@ -1463,6 +1457,7 @@ class GK_OT_AssetFillCards(bpy.types.Operator):
     def execute(self, context):
         tree = _asset_tree_or_new()
         counts = _fill_asset_cards(tree)
+        _refresh_asset_thumbs(tree)
         total = sum(counts.values())
         if not total:
             self.report({"INFO"}, "能收的都收过了(或还没有资产)")
@@ -1474,6 +1469,73 @@ class GK_OT_AssetFillCards(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _refresh_asset_thumbs(tree):
+    """给还没缩略图的 3D 道具卡各拍一张(算子里调,失败静默)。
+
+    **绝不在绘制回调里调** —— 每帧渲染会把界面拖死(见 asset_thumbs)。
+    """
+    try:
+        from . import asset_thumbs
+        asset_thumbs.refresh_missing_models(tree)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+class GK_OT_AssetAddCard(bpy.types.Operator):
+    """往资产图里加一张『资产卡』(名字留空,等用户填)。"""
+
+    bl_idname = "gk.asset_add_card"
+    bl_label = "新建一张『资产卡』"
+    bl_description = "在资产库里加一张空卡:选类型、填名字/路径、勾『标记为游戏资产』"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _asset_tree_or_new()
+        card = _ensure_asset_card(tree, "model", "", select=True)
+        card.location = (_next_card_x(tree), -node_lib.ASSET_CARD_GAP
+                         * max(0, len(tree.nodes) - 1))
+        self.report({"INFO"}, "已加一张『资产卡』—— 在卡上选类型、填路径")
+        return {"FINISHED"}
+
+
+class GK_OT_AssetRefreshThumbs(bpy.types.Operator):
+    """重拍所有 3D 道具卡的缩略图(模型改了 / 刚摆好东西时用)。"""
+
+    bl_idname = "gk.asset_refresh_thumbs"
+    bl_label = "刷新缩略图"
+    bl_description = ("重新渲染 3D 道具卡的缩略图(其它类型的小图是实时的,"
+                      "不用刷)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import asset_thumbs
+        tree = _asset_tree_or_new()
+        done = 0
+        for kind, _name, path, _node in node_lib.card_entries(tree):
+            if kind != "model":
+                continue
+            if asset_thumbs.refresh_model_thumbnail(path) is not None:
+                done += 1
+        if done:
+            self.report({"INFO"}, f"已重拍 {done} 张 3D 道具缩略图")
+        else:
+            self.report({"WARNING"},
+                        "没能渲染出缩略图(后台模式 / 没装 GPU?)—— "
+                        "卡片会退回色块示意")
+        return {"FINISHED"}
+
+
+def _next_card_x(tree):
+    """新卡摆在右边一列(不和已有的重叠)。"""
+    columns = 0
+    for node in node_lib.card_nodes(tree):
+        try:
+            columns = max(columns, int(round(float(node.location[0]) / 320.0)))
+        except Exception:                                 # noqa: BLE001
+            continue
+    return float(columns) * 320.0
+
+
 class GK_OT_AssetRegister(bpy.types.Operator):
     """把当前选中的物体登记为资产(填名 + 收录卡 + 收进『资产』集合)。"""
 
@@ -1482,6 +1544,10 @@ class GK_OT_AssetRegister(bpy.types.Operator):
     bl_description = ("给选中物体填上『资产名』(没填的话用物体名),"
                       "在资产库建一张卡,并收进『资产』集合")
     bl_options = {"REGISTER", "UNDO"}
+
+    # 从某张『资产卡』上点『登记选中物体』时带上它的节点名 ——
+    # 这样是**填进那张卡**,而不是又建一张(用户要的"在这添加名字")。
+    card_name: StringProperty(name="卡片", default="")
 
     def execute(self, context):
         obj = getattr(context, "active_object", None) \
@@ -1496,10 +1562,19 @@ class GK_OT_AssetRegister(bpy.types.Operator):
         name = str(getattr(physics, "asset_name", "") or "").strip() or obj.name
         physics.asset_name = name
         tree = _asset_tree_or_new()
-        _ensure_asset_card(tree, "GKNodeAssetModel", name)
+        card = tree.nodes.get(self.card_name) if self.card_name else None
+        if card is not None and hasattr(card, "gk_path"):
+            card.gk_kind = "model"
+            card.gk_path = name
+            if not str(getattr(card, "gk_name", "") or "").strip():
+                card.gk_name = name
+        else:
+            card = _ensure_asset_card(tree, "model", name, select=True)
+        _refresh_asset_thumbs(tree)
         moved = move_into_asset_collection(context.scene, [obj])
         self.report({"INFO"},
-                    f"已登记资产『{name}』(卡片已建"
+                    f"已登记资产『{name}』(卡片已"
+                    + ("填好" if card is not None else "建好")
                     + (f",已收进『资产』集合" if moved else "") + ")")
         return {"FINISHED"}
 
@@ -1693,20 +1768,17 @@ class GK_PT_AssetTree(bpy.types.Panel):
             box.label(text="没有资产库", icon="INFO")
             return
 
-        # ---- 资产统计(按卡的类型数)----
-        counts = {}
-        for node in tree.nodes:
-            blob = getattr(node, "bl_idname", "")
-            if blob in _ASSET_CARD_VALUE_PROP:
-                counts[blob] = counts.get(blob, 0) + 1
+        # ---- 资产统计(按卡的类型数;勾掉『标记为游戏资产』的不算)----
+        counts = node_lib.card_counts(tree)
+        cards = node_lib.card_nodes(tree)
         box = layout.box()
-        box.label(text=f"资产库共 {sum(counts.values())} 份资产",
+        box.label(text=f"资产库共 {sum(counts.values())} 份资产"
+                       f"(共 {len(cards)} 张卡)",
                   icon="ASSET_MANAGER")
-        for blob in node_lib.ASSET_CARD_IDS:
-            label = {"GKNodeAssetModel": "3D 道具", "GKNodeAssetImage": "图片",
-                     "GKNodeAssetCurve": "曲线",
-                     "GKNodeAssetSound": "音频"}.get(blob, blob)
-            box.label(text=f"{label}: {counts.get(blob, 0)}", icon=_asset_card_icon(blob))
+        for kind in node_lib.ASSET_KIND_IDS:
+            box.label(text=f"{node_lib.ASSET_KIND_LABELS.get(kind, kind)}: "
+                           f"{counts.get(kind, 0)}", icon=_asset_card_icon(kind))
+        box.label(text="取消卡上的『标记为游戏资产』= 不算资产", icon="INFO")
 
         # ---- 本场景的资产 / 集合 ----
         local = _scene_asset_objects(context.scene)
@@ -1723,14 +1795,213 @@ class GK_PT_AssetTree(bpy.types.Panel):
 
         # ---- 收录 / 登记 ----
         box = layout.box()
+        box.operator("gk.asset_add_card", text="新建一张『资产卡』", icon="ADD")
         box.operator("gk.asset_fill_cards", text="收录已有资产", icon="ADD")
         box.operator("gk.asset_register", text="把选中物体登记为资产",
                      icon="ASSET_MANAGER")
+        box.operator("gk.asset_refresh_thumbs", text="刷新缩略图",
+                     icon="FILE_REFRESH")
+        try:
+            from . import asset_thumbs
+            if asset_thumbs.rendering_unavailable():
+                box.label(text="3D 道具渲染不了(?):缩略图用色块示意",
+                          icon="INFO")
+        except Exception:                                 # noqa: BLE001
+            pass
         box.label(text="收录会扫所有场景(资产库跨场景共用)", icon="INFO")
 
         back = box.operator("gk.switch_tree", text="← 回到游戏逻辑",
                             icon="LOOP_BACK")
         back.target = "GKGameLogicTree"
+
+
+# ---- 资产卡的缩略图叠加绘制(第六十六轮)----------------------------
+# Blender 的节点卡片**画不了图片**(节点 UI 只认 label/prop/button),
+# 所以缩略图走**叠加绘制**:卡片在 draw_buttons 末尾留了几行空白,这里
+# 按节点在屏幕上的位置把那块空白填成一张小图。
+#
+# ── 坐标怎么来的(这是本功能唯一的技术点)────────────────────────
+# 节点编辑器的 WINDOW 区域是个 View2D:`region.view2d.view_to_region()`
+# 能把**节点坐标**换成**屏幕像素**(自动带上缩放/平移)。`node.location`
+# 是节点**左上角**,`node.dimensions` 是尺寸 —— 两者一减就是右下角。
+#
+# ── 三条纪律(和界面预览一样)────────────────────────────────────
+# 1. 不许抛异常(绘制回调冒异常会刷满控制台),整段 try;
+# 2. GPU 状态用完还原(blend);
+# 3. 只在"正编辑资产图"时画,别的场合一帧都不多花。
+_ASSET_THUMB_HANDLE = []
+
+
+def _asset_thumb_draw():
+    """节点编辑器里的资产卡缩略图(POST_PIXEL 绘制回调)。"""
+    try:
+        import bpy as _bpy
+        from . import asset_thumbs
+        context = _bpy.context
+        space = getattr(context, "space_data", None)
+        region = getattr(context, "region", None)
+        if space is None or region is None:
+            return
+        if str(getattr(space, "type", "")) != "NODE_EDITOR":
+            return
+        if str(getattr(space, "tree_type", "")) != "GKAssetTree":
+            return
+        tree = getattr(space, "edit_tree", None) \
+            or getattr(space, "node_tree", None)
+        if tree is None or str(getattr(tree, "bl_idname", "")) != "GKAssetTree":
+            return
+        view = getattr(region, "view2d", None)
+        if view is None or region.width < 80 or region.height < 80:
+            return
+
+        import blf
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        try:
+            for node in getattr(tree, "nodes", ()) or ():
+                if not node_lib.is_asset_card(node):
+                    continue
+                if not node_lib.card_is_asset(node):
+                    continue
+                kind = node_lib.card_kind(node)
+                path = node_lib.card_path(node)
+                data = asset_thumbs.cached_preview(kind, path)
+                if data is None:
+                    continue
+                dims = getattr(node, "dimensions", None)
+                if dims is None or float(dims[0]) <= 1.0:
+                    continue
+                location = getattr(node, "location", (0.0, 0.0))
+                top_left = view.view_to_region(float(location[0]),
+                                               float(location[1]),
+                                               clip=False)
+                bottom_right = view.view_to_region(
+                    float(location[0]) + float(dims[0]),
+                    float(location[1]) - float(dims[1]), clip=False)
+                left = min(float(top_left[0]), float(bottom_right[0]))
+                right = max(float(top_left[0]), float(bottom_right[0]))
+                top = max(float(top_left[1]), float(bottom_right[1]))
+                bottom = min(float(top_left[1]), float(bottom_right[1]))
+                node_w = right - left
+                node_h = top - bottom
+                if node_w < 40.0 or node_h < 40.0:
+                    continue
+                zoom = node_w / max(1e-6, float(dims[0]))
+                pad = 8.0
+                side = min(float(getattr(node, "gk_thumb_size", 96.0) or 96.0)
+                           * zoom, node_w - 2.0 * pad, node_h - 2.0 * pad)
+                if side < 12.0:
+                    continue
+                x0 = left + (node_w - side) * 0.5
+                y0 = bottom + pad
+                _draw_asset_thumb(shader, batch_for_shader, gpu, blf,
+                                  data, x0, y0, side)
+        finally:
+            gpu.state.blend_set("NONE")
+    except Exception:                                     # noqa: BLE001
+        # 绘制回调的异常没有任何去处 —— 静默跳过这一帧
+        return
+
+
+def _draw_asset_thumb(shader, batch_for_shader, gpu, blf,
+                      data, x0, y0, side):
+    """画一张缩略图(底色 + 边框 + 内容)。"""
+    x1, y1 = x0 + side, y0 + side
+
+    def _fill(vertices, color):
+        batch = batch_for_shader(shader, "TRIANGLES", {"pos": vertices})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+
+    # 底板(深色)+ 边框(亮边)
+    quad = ((x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1))
+    _fill(quad, (0.06, 0.07, 0.10, 0.9))
+    frame = ((x0, y0), (x1, y0), (x1, y0), (x1, y1),
+             (x1, y1), (x0, y1), (x0, y1), (x0, y0))
+    batch = batch_for_shader(shader, "LINES", {"pos": frame})
+    shader.bind()
+    shader.uniform_float("color", (0.85, 0.92, 1.0, 0.55))
+    batch.draw(shader)
+
+    mode = str(data.get("mode", ""))
+    if mode == "image":
+        image = data.get("image")
+        _draw_thumb_image(gpu, batch_for_shader, image, x0, y0, side)
+        return
+    if mode in ("curve", "wave"):
+        points = list(data.get("points") or ())
+        if len(points) < 2:
+            return
+        inner = side - 10.0
+        origin_x, origin_y = x0 + 5.0, y0 + 5.0
+        verts = [(origin_x + float(u) * inner, origin_y + float(v) * inner)
+                 for u, v in points]
+        if mode == "wave":
+            color = (0.72, 0.62, 0.98, 0.95)
+        else:
+            color = (0.55, 0.86, 0.70, 0.95)
+        batch = batch_for_shader(shader, "LINE_STRIP", {"pos": verts})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+        return
+    # 兜底:色块 + 名字
+    color = data.get("color") or (0.4, 0.45, 0.55, 1.0)
+    _fill(((x0 + 2, y0 + 2), (x1 - 2, y0 + 2), (x1 - 2, y1 - 2),
+           (x0 + 2, y0 + 2), (x1 - 2, y1 - 2), (x0 + 2, y1 - 2)),
+          (float(color[0]), float(color[1]), float(color[2]), 0.85))
+    text = str(data.get("text", "") or "")
+    if text:
+        blf.size(0, 11.0)
+        blf.color(0, 1.0, 1.0, 1.0, 0.9)
+        blf.position(0, x0 + 5.0, y0 + 5.0, 0.0)
+        blf.draw(0, text[:14])
+
+
+def _draw_thumb_image(gpu, batch_for_shader, image, x0, y0, side):
+    """把一张 Blender 图片贴进方块(保持比例,居中)。"""
+    if image is None:
+        return
+    size = getattr(image, "size", None)
+    if not size or int(size[0]) <= 0 or int(size[1]) <= 0:
+        return
+    try:
+        texture = gpu.texture.from_image(image)
+    except Exception:                                     # noqa: BLE001
+        return
+    aspect = float(size[0]) / float(size[1])
+    width = side
+    height = side
+    if aspect >= 1.0:
+        height = side / aspect
+    else:
+        width = side * aspect
+    left = x0 + (side - width) * 0.5
+    bottom = y0 + (side - height) * 0.5
+    right, top = left + width, bottom + height
+    shader = gpu.shader.from_builtin("2D_IMAGE")
+    batch = batch_for_shader(
+        shader, "TRI_FAN",
+        {"pos": ((left, bottom), (right, bottom), (right, top), (left, top)),
+         "texCoord": ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))})
+    shader.bind()
+    shader.uniform_sampler("image", texture)
+    batch.draw(shader)
+
+
+def _remove_asset_thumb_handler():
+    """摘掉节点编辑器绘制回调(注销 / 重载时各调一次,重复调没事)。"""
+    import bpy as _bpy
+    while _ASSET_THUMB_HANDLE:
+        handle = _ASSET_THUMB_HANDLE.pop()
+        try:
+            _bpy.types.SpaceNodeEditor.draw_handler_remove(handle, "WINDOW")
+        except Exception:                                 # noqa: BLE001
+            pass
 
 
 # ---- AI 图的视口叠加预览(巡逻路线 + 感知范围圈)----------------------
@@ -4220,9 +4491,7 @@ def _draw_other_trees_box(layout):
         ("gk.open_display_tree", "游戏显示", "HIDE_OFF", "GKDisplayTree",
          "张卡", lambda g: len(g.nodes)),
         ("gk.open_asset_tree", "游戏资产", "ASSET_MANAGER", "GKAssetTree",
-         "份资产", lambda g: len([n for n in g.nodes
-                                  if getattr(n, "bl_idname", "")
-                                  in _ASSET_CARD_VALUE_PROP])),
+         "份资产", lambda g: sum(node_lib.card_counts(g).values())),
     )
     for op_name, label, icon, blob, unit, count_of in entries:
         groups = trees_of(blob)
@@ -5341,6 +5610,17 @@ def on_register():
     except Exception as exc:                              # pragma: no cover
         gk_log.warn(f"AI 预览绘制挂载失败: {exc}")
 
+    # ---- 资产卡的缩略图(第六十六轮,挂在**节点编辑器**上)----
+    # 和上面两个不同:它挂 SpaceNodeEditor(资产卡长在节点编辑器里),
+    # 只在正编辑资产图时画。
+    _remove_asset_thumb_handler()
+    try:
+        _ASSET_THUMB_HANDLE.append(
+            bpy.types.SpaceNodeEditor.draw_handler_add(
+                _asset_thumb_draw, (), "WINDOW", "POST_PIXEL"))
+    except Exception as exc:                              # pragma: no cover
+        gk_log.warn(f"资产缩略图绘制挂载失败: {exc}")
+
     # ---- 自检:确认每个分类子菜单都真的注册上了 ----
     # 动态生成的菜单类很容易因为一个小笔误(非法图标名、bl_idname 重复)
     # 而**静默**注册失败，所以这里主动查一遍并报出来。
@@ -5469,9 +5749,12 @@ GK_CLASSES = (
     GK_OT_OpenAiTree,
     GK_OT_OpenDisplayTree,
     GK_OT_DisplayFillCards,
-    # 资产库(第四十三轮):打开 / 收录 / 登记 / 收集合 / 摆一份 / 定位
+    # 资产库(第四十三/六十六轮):打开 / 收录 / 加卡 / 刷缩略图 / 登记 /
+    # 收集合 / 摆一份 / 定位
     GK_OT_OpenAssetTree,
     GK_OT_AssetFillCards,
+    GK_OT_AssetAddCard,
+    GK_OT_AssetRefreshThumbs,
     GK_OT_AssetRegister,
     GK_OT_AssetCollect,
     GK_OT_AssetPlace,
@@ -5512,6 +5795,7 @@ def on_unregister():
     # 摘掉界面预览和 AI 预览的视口绘制回调(留着的话禁用插件后它还在画)
     _remove_ui_preview_handler()
     _remove_ai_preview_handler()
+    _remove_asset_thumb_handler()
     # 摘掉菜单回调。按标记摘 —— 这样连以前重载遗留的旧函数也一起清掉,
     # 禁用插件后不会留野回调。
     for target_name in ("NODE_MT_add", "NODE_MT_context_menu"):

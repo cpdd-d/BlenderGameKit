@@ -1899,9 +1899,9 @@ def sound_asset_items(_self=None, _context=None):
                 else "只登记路径(自己放进项目)")
         items.append((res, label, hint, "SOUND", 0))
     if not items:
-        items.append(("", "(资产库里还没有声音卡)",
+        items.append(("", "(资产库里还没有声音资产)",
                       "侧栏『游戏逻辑』->『游戏资产』->『打开/新建资产库』"
-                      "-> 加一张『资产_声音卡』", "ERROR", 0))
+                      "-> 加一张『资产卡』(类型选『音频』)", "ERROR", 0))
     return items
 
 
@@ -1937,7 +1937,7 @@ class GK_OT_PickSound(bpy.types.Operator):
 
 
 class GK_OT_AssetPickSound(bpy.types.Operator):
-    """『资产_声音卡』上挑一个本地音频文件(带进 Godot 的源头)。"""
+    """『资产卡』(类型=音频)上挑一个本地音频文件(带进 Godot 的源头)。"""
 
     bl_idname = "gk.asset_pick_sound"
     bl_label = "挑音频文件"
@@ -1959,20 +1959,33 @@ class GK_OT_AssetPickSound(bpy.types.Operator):
         tree = props.current_tree(context)
         node = tree.nodes.get(self.node_name) if tree is not None else None
         path = str(self.filepath or "").strip()
-        if node is None or not hasattr(node, "gk_file"):
-            _report(self, "WARNING", "没找到那张声音卡")
+        if node is None:
+            _report(self, "WARNING", "没找到那张资产卡")
             return {"CANCELLED"}
         if not path:
             return {"CANCELLED"}
         if not sound_assets.is_sound_file(path):
             _report(self, "ERROR", f"只支持 wav / ogg / mp3: {path}")
             return {"CANCELLED"}
-        node.gk_file = path
-        node.gk_res = sound_assets.sound_res_path(path)
-        if not str(getattr(node, "gk_name", "") or "").strip():
-            node.gk_name = os.path.splitext(os.path.basename(path))[0]
-        _report(self, "INFO",
-                f"音频资产 -> {node.gk_res}(导出会复制进 audio/)")
+        if hasattr(node, "gk_path") and hasattr(node, "gk_kind"):
+            # 统一『资产卡』(第六十六轮):路径 = 本地文件,类型 = 音频
+            node.gk_kind = "sound"
+            node.gk_path = path
+            node.gk_is_asset = True
+            if not str(getattr(node, "gk_name", "") or "").strip():
+                node.gk_name = os.path.splitext(os.path.basename(path))[0]
+            res = sound_assets.sound_res_path(path)
+        elif hasattr(node, "gk_file"):
+            # 旧『资产_声音卡』:本地文件 + res:// 分开存
+            node.gk_file = path
+            node.gk_res = sound_assets.sound_res_path(path)
+            if not str(getattr(node, "gk_name", "") or "").strip():
+                node.gk_name = os.path.splitext(os.path.basename(path))[0]
+            res = node.gk_res
+        else:
+            _report(self, "WARNING", "这张卡没有音频栏位")
+            return {"CANCELLED"}
+        _report(self, "INFO", f"音频资产 -> {res}(导出会复制进 audio/)")
         return {"FINISHED"}
 
 
