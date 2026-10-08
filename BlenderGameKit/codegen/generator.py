@@ -361,57 +361,13 @@ class Generator:
         # ---- 节点引用的小工具(带兜底查找)----
         # 只要脚本里出现过 @onready 引用就要生成它。见上面 out 里那段说明:
         # 脚本挂在碰撞代理上时,相对路径找不到兄弟节点。
-        if self.ctx.onready:
-            sections.append({
-                "signature": ("func _gk_ref(host: Node, wanted: String) "
-                              "-> Node:"),
-                "lines": [
-                    "    if wanted.is_empty():",
-                    "        return null",
-                    "    var direct := host.get_node_or_null(wanted)",
-                    "    if direct != null:",
-                    "        return direct",
-                    "    if host.get_tree() == null:",
-                    "        return null",
-                    "    # 先找同名子节点(限定在 host 子树里),再全树找 ——",
-                    "    # 导出后脚本常在『碰撞代理』物体上,而用户摆的相机/角色",
-                    "    # 是它的兄弟节点,相对路径找不到",
-                    "    for found in host.find_children(wanted, \"\", true, "
-                    "false):",
-                    "        return found",
-                    "    for found in host.get_tree().root.find_children("
-                    "wanted, \"\", true, false):",
-                    "        return found",
-                    '    push_warning("[GK] 没找到节点:%s —— 检查名字拼写,'
-                    '或者它是不是没被导出" % wanted)',
-                    "    return null",
-                ],
-                "empty_body": "    return null",
-                "separator": True,
-            })
-            sections.append({
-                "signature": ("func _gk_ref_typed(host: Node, wanted: String, "
-                              "type_name: String) -> Node:"),
-                "lines": [
-                    "    # ── 为什么按类型找(用户 2026-10-04,实测)────────────────",
-                    "    # 导出后一个物体常常是**两个节点**:网格在 glb 实例里(根下面),",
-                    "    # 碰撞代理在 Colliders 下 —— 两个同名。`_gk_ref` 按树的顺序找,",
-                    "    # 拿到的往往是网格(MeshInstance3D),赋给 `area_金币1: Area3D` 直接报",
-                    "    #     Trying to assign value of type 'MeshInstance3D' to a",
-                    "    #     variable of type 'Area3D'",
-                    "    # 于是触发器的 body_entered 永远接不上(金币吃不了)。",
-                    "    # 所以先在全树里找**类型对得上**的那个,找不到再退回老逻辑。",
-                    "    if wanted.is_empty() or host.get_tree() == null:",
-                    "        return null",
-                    "    if ClassDB.class_exists(type_name):",
-                    "        for found in host.get_tree().root.find_children("
-                    "wanted, type_name, true, false):",
-                    "            return found",
-                    "    return _gk_ref(host, wanted)",
-                ],
-                "empty_body": "    return null",
-                "separator": True,
-            })
+        #
+        # ⚠ 这里**只是尽量早**地补一次;真正保证不漏的是 `generate()` 末尾
+        #   那一次(同一个方法,里面带"只补一次"的守卫):AI / 动画 / 界面
+        #   设计这几张图是"被引用时**现场展开**"的,它们里的引用要到很后面
+        #   才登记进 ctx.onready —— 只在前面补一次的话,那种脚本就会
+        #   "变量声明了、helper 没生成"。详见 _emit_reference_helpers。
+        self._emit_reference_helpers(sections)
 
         # ---- 销毁物体时把"同名网格"一起清掉 ----
         # 见 statements._stmt_queue_free。导出后一个物体常常是两个节点:
@@ -1435,7 +1391,88 @@ class Generator:
                 "separator": True,
             })
 
+        # ---- 晚来的引用也得有 helper(第六十三轮抓到的真 bug)--------
+        # 见 _emit_reference_helpers 的说明:AI / 动画 / 界面设计图是**被引用
+        # 时现场展开**的,它们动员出来的 `@onready` 引用比上面那次调用晚。
+        # 不在这儿再兜一次,"引用只来自 AI 图"的脚本就会带着一个
+        #   Parse Error: Function "_gk_ref_typed()" not found in base self
+        # 上线 —— 那不是少个功能,是整个脚本加载不了。
+        # (方法里有守卫,重复调用不会生成两份。)
+        self._emit_reference_helpers(sections)
+
         return self._assemble(sections)
+
+    def _emit_reference_helpers(self, sections):
+        """生成 `_gk_ref` / `_gk_ref_typed`(带兜底查找的节点引用工具)。
+
+        `@onready var 节点_玩家: Node = _gk_ref_typed(self, "玩家", "Node")`
+        里的 helper **必须**一起生成,否则 Godot 直接报
+        "Function _gk_ref_typed() not found in base self" —— 整个脚本加载
+        不了。而引用是**边生成边登记**的(ctx.onready),谁先谁后不确定:
+
+          * 普通节点(『移动_朝向目标』那种)在事件段里就登记好了 ——
+            `generate()` 前半段那次调用就能补上,老图产物**逐字不变**;
+          * AI 图 / 动画图 / 界面设计图是『AI_启用』『动画_状态机』
+            『界面_套用设计』**引用时现场展开**的,它们在 `generate()`
+            很靠后的位置才跑 —— 只有前面那次的话就会漏掉(实测:示例
+            `examples/demo_ai_nav` 的敌人脚本就是这么坏的)。
+
+        所以同一个方法在**前面和末尾**各调一次,靠 `_refs_emitted` 保证
+        只落一份。
+        """
+        if not self.ctx.onready or getattr(self, "_refs_emitted", False):
+            return
+        self._refs_emitted = True
+        sections.append({
+            "signature": ("func _gk_ref(host: Node, wanted: String) "
+                          "-> Node:"),
+            "lines": [
+                "    if wanted.is_empty():",
+                "        return null",
+                "    var direct := host.get_node_or_null(wanted)",
+                "    if direct != null:",
+                "        return direct",
+                "    if host.get_tree() == null:",
+                "        return null",
+                "    # 先找同名子节点(限定在 host 子树里),再全树找 ——",
+                "    # 导出后脚本常在『碰撞代理』物体上,而用户摆的相机/角色",
+                "    # 是它的兄弟节点,相对路径找不到",
+                "    for found in host.find_children(wanted, \"\", true, "
+                "false):",
+                "        return found",
+                "    for found in host.get_tree().root.find_children("
+                "wanted, \"\", true, false):",
+                "        return found",
+                '    push_warning("[GK] 没找到节点:%s —— 检查名字拼写,'
+                '或者它是不是没被导出" % wanted)',
+                "    return null",
+            ],
+            "empty_body": "    return null",
+            "separator": True,
+        })
+        sections.append({
+            "signature": ("func _gk_ref_typed(host: Node, wanted: String, "
+                          "type_name: String) -> Node:"),
+            "lines": [
+                "    # ── 为什么按类型找(用户 2026-10-04,实测)────────────────",
+                "    # 导出后一个物体常常是**两个节点**:网格在 glb 实例里(根下面),",
+                "    # 碰撞代理在 Colliders 下 —— 两个同名。`_gk_ref` 按树的顺序找,",
+                "    # 拿到的往往是网格(MeshInstance3D),赋给 `area_金币1: Area3D` 直接报",
+                "    #     Trying to assign value of type 'MeshInstance3D' to a",
+                "    #     variable of type 'Area3D'",
+                "    # 于是触发器的 body_entered 永远接不上(金币吃不了)。",
+                "    # 所以先在全树里找**类型对得上**的那个,找不到再退回老逻辑。",
+                "    if wanted.is_empty() or host.get_tree() == null:",
+                "        return null",
+                "    if ClassDB.class_exists(type_name):",
+                "        for found in host.get_tree().root.find_children("
+                "wanted, type_name, true, false):",
+                "            return found",
+                "    return _gk_ref(host, wanted)",
+            ],
+            "empty_body": "    return null",
+            "separator": True,
+        })
 
     def _emit_functions(self, sections):
         """把每个『函数_定义』节点编译成一个 `func`(用户 2026-10-05)。

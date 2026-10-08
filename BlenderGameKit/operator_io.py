@@ -731,11 +731,20 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
         from . import presets
 
         scene = context.scene
-        character = presets.resolve_character(scene, self.character)
+        # ── 这里原来还多传了一个位置参数 `character`(第六十三轮修)────
+        # `create_character_preset(scene, character, character=self.character, ...)`
+        # -> `TypeError: got multiple values for argument 'character'`。
+        # 这个算子在补登记之前**根本点不到**,所以这条一直没被人撞上;
+        # 这次把它接回侧栏按钮,冒烟当场就炸了出来。
+        # 角色由 `create_character_preset` 内部按同一个规则解析
+        # (留空 = 当前选中的网格 / 已挂脚本的物体),不用在外面再解一遍。
+        # ⚠ 空字符串要转成 None:那边判的是 `if character is None`,
+        # 传 "" 进去它会当成"已经给了角色",后面 `character.name` 就炸了
+        # (冒烟第二轮抓到的)。
         try:
             logic_tree, _anim_tree, notes = presets.create_character_preset(
-                scene, character,
-                character=self.character,
+                scene,
+                character=self.character or None,
                 camera_side=self.camera_side, camera_top=self.camera_top,
                 move_speed=self.move_speed, jump_force=self.jump_force,
                 sensitivity=self.sensitivity, arm_length=self.arm_length,
@@ -3515,6 +3524,16 @@ GK_CLASSES = (
     GK_OT_AddCommentBox,
     # 分组框的折叠 / 展开(第六十二轮)
     GK_OT_ToggleGroup,
+    # 一键生成第三人称角色(预设)。
+    # ── 第六十三轮补登记(踩过的坑,值得记一笔)──────────────────────
+    # 这个算子的**逻辑**(presets.py)从加进来那天就有离线单测,一直是绿的;
+    # 但它本人**忘了写进这张表** -> 从来没注册过 -> 侧栏『预设』盒子那句
+    # `layout.operator("gk.character_preset")` 画出来是个**空按钮**
+    # (Blender 对"不存在的算子"是静默跳过的),盒子里只剩一行说明文字。
+    # 用户的原话:"添加预设节点图的按钮,不然这里显示得没意义"。
+    # 现在面板测试里加了一条通用断言:**画出来的每个按钮 idname 都必须
+    # 是真算子** —— 这类"逻辑测了、接线忘了"的错以后当场就红。
+    GK_OT_CharacterPreset,
     # 变量集中面板:查找引用 + 放取/设节点
     GK_OT_VarFindRefs,
     GK_OT_VarMakeNode,

@@ -2345,7 +2345,9 @@ def main():
                     "gk.copy_advisor_context", "gk.clear_advisor",
                     # AI 亲自操作(第五十六轮):执行/忽略提议的动作
                     "gk.apply_advisor_action", "gk.dismiss_advisor_action",
-                    "gk.run_advisor_action"):
+                    "gk.run_advisor_action",
+                    # 分组框折叠(第六十二轮)+ 一键预设角色(第六十三轮补登记)
+                    "gk.toggle_group", "gk.character_preset"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -2926,6 +2928,46 @@ def main():
         if got != want:
             bad.append(f"{label}: 期望 {want} 得到 {got}")
     check("『等按键』认得对(8 种事件)", not bad, "; ".join(bad))
+
+    # ---- 第三人称角色预设(第六十三轮:补上"按钮接没接上算子"这一环)----
+    # ── 为什么现在才测(用户报的"这里显示得没意义")──────────────────
+    # `presets.create_character_preset` 一直有离线单测、一直是绿的,但
+    # **算子从没写进 GK_CLASSES** -> 侧栏『预设』盒子那句
+    # `layout.operator("gk.character_preset")` 是个**空按钮**
+    # (Blender 对不存在的算子是静默跳过的),盒子里只剩一行说明文字。
+    # 这一关真跑一次算子:图建出来了、连好了、脚本也编得出来。
+    #
+    # 放在最末:预设会写场景设置(dimension / 基类 / 用哪张图 / 类名),
+    # 放前面会把后面那些"按设置导出"的断言带歪。
+    try:
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+        hero = bpy.context.active_object
+        hero.name = "预设角色"
+        for obj in list(bpy.context.scene.objects):
+            obj.select_set(obj is hero)
+        bpy.context.view_layer.objects.active = hero
+        result = bpy.ops.gk.character_preset(with_god_camera=False)
+        logic = bpy.data.node_groups.get("角色逻辑(预设)")
+        anim = bpy.data.node_groups.get("角色动作(预设)")
+        check("预设:算子跑通并建出两张图",
+              result == {"FINISHED"} and logic is not None and anim is not None,
+              f"{result} logic={logic} anim={anim}")
+        check("预设:逻辑图连好了(节点 / 连线都不少)",
+              logic is not None and len(logic.nodes) > 10 and len(logic.links) > 10,
+              f"{len(logic.nodes) if logic else 0} 节点 / "
+              f"{len(logic.links) if logic else 0} 连线")
+        preset_code, preset_warn = codegen.generate(logic, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True})
+        check("预设:生成的脚本能编出角色控制",
+              "move_and_slide()" in preset_code,
+              str(preset_warn)[:200])
+        check("预设:角色被配成『脚本挂载目标』",
+              bool(getattr(getattr(hero, "gk_physics", None),
+                           "script_target", False)))
+    except Exception as exc:
+        check("预设", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
 
     # ---- 卸载不报错 ----
     try:

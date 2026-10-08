@@ -13853,5 +13853,199 @@ class TestRound62NodeGroups(Base):
         self.assertNotIn("分组", code)
 
 
+class TestRound63AiPathfinding(Base):
+    """第六十三轮:"让 AI 行为直接用寻路"。
+
+    ── 为什么是**自动**接、不再给节点加开关 ─────────────────────────
+    用户的话:"寻路应该整合到游戏AI那里去"。追人的敌人一头撞墙是这个插件
+    里最刺眼的表现,而『移动_寻路』是个**手动**节点 —— 要用户给每个追击
+    状态再拼一套寻路,基本没人会做。
+
+    所以判据收敛到一个开关:**场景设置里的『寻路』**。
+      * 没勾 -> 生成的代码**逐字不变**(老图产物不受影响);
+      * 勾了 -> 追击 / 跟随 / 去查看 / 巡逻 / 返回 改走
+        `NavigationServer.map_get_path` 算出来的方向(绕开墙和石头)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        """把 AI 图挂到 bpy.data 上再生成(用完还原,照界面那套)。"""
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _with_chase(self, ai, behavior="CHASE"):
+        """AI 图:一个『追击』(或指定行为)-> 玩法图里『AI_启用』它。"""
+        state = ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                            gk_behavior=behavior, gk_goal="玩家",
+                            gk_speed=4.0, gk_stop_distance=1.2,
+                            gk_facing="GOAL")
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return tree, state
+
+    # ---- 没勾『寻路』:一行都不能变(老图回归锁)----
+
+    def test_nav_off_keeps_straight_line(self):
+        ai = self._ai_tree()
+        tree, _state = self._with_chase(ai)
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        # 直线走(老行为),且**没有**任何导航相关的东西
+        self.assertIn("move_and_slide()", code)
+        self.assertNotIn("_gk_ai_nav_dir", code)
+        self.assertNotIn("NavigationServer", code)
+        self.assertIn(".normalized() * 4.0", code)
+
+    def test_nav_off_2d_keeps_straight_line(self):
+        ai = self._ai_tree()
+        tree, _state = self._with_chase(ai)
+        code, _ = self._gen_with_ai(ai, tree, V2)
+        self.assertNotIn("NavigationServer", code)
+
+    # ---- 勾了『寻路』:改走导航网格 ----
+
+    def test_nav_on_chase_uses_navigation_server(self):
+        ai = self._ai_tree()
+        tree, _state = self._with_chase(ai)
+        code, warnings = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertEqual(warnings, [], warnings)
+        # 顶层 helper 只生成一份
+        self.assertIn("func _gk_ai_nav_dir(host: Node, goal: Vector3) -> Vector3:",
+                      code)
+        self.assertEqual(code.count("func _gk_ai_nav_dir("), 1)
+        # 真去问导航服务器要路径,并**跳过退化点**找下一个路点
+        # (只看 path[1] 会在"自己正站在拐角上"时退回直线 -> 卡墙角)
+        self.assertIn("NavigationServer3D.map_get_path(", code)
+        self.assertIn("body.get_world_3d().navigation_map", code)
+        self.assertIn("for i in range(1, path.size()):", code)
+        self.assertIn("step.y = 0.0", code)
+        # 行为里真的用上了那个方向(而不是只剩直线)
+        self.assertIn("_gk_ai_nav_dir(", code)
+        self.assertIn("velocity = ", code)
+        self.assert_indent_sane(code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_nav_on_2d_uses_navigation_server_2d(self):
+        ai = self._ai_tree()
+        tree, _state = self._with_chase(ai)
+        code, _ = self._gen_with_ai(ai, tree, dict(V2, nav_enabled=True))
+        self.assertIn("func _gk_ai_nav_dir(host: Node, goal: Vector2) -> Vector2:",
+                      code)
+        self.assertIn("NavigationServer2D.map_get_path(", code)
+        self.assertIn("body.get_world_2d().navigation_map", code)
+        # 2D 没有"高度"这回事,不压平
+        self.assertNotIn("step.y = 0.0", code)
+
+    def test_nav_on_patrol_also_pathfinds(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL", gk_patrol_a="点A", gk_patrol_b="点B",
+                    gk_speed=3.0, gk_stop_distance=0.6)
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertIn("_gk_ai_nav_dir(", code)
+        # 巡逻两头各走一次(翻面用的三元表达式还在)
+        self.assertIn(" if ", code)
+
+    def test_nav_on_investigate_uses_the_noise_point(self):
+        """『去查看』的目标是**坐标**(不是物体),照样走导航网格。"""
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "去看看", gk_state_name="去看看",
+                    gk_behavior="INVESTIGATE", gk_speed=3.0, gk_stop_distance=0.6)
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertIn("_gk_ai_nav_dir(", code)
+
+    def test_nav_on_emits_helper_only_once_for_two_states(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL", gk_patrol_a="点A", gk_speed=3.0,
+                    gk_stop_distance=0.6)
+        ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                    gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0,
+                    gk_stop_distance=1.0)
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertEqual(code.count("func _gk_ai_nav_dir("), 1)
+        # 两个行为都在调它
+        self.assertGreaterEqual(code.count(":= _gk_ai_nav_dir("), 2)
+
+    def test_nav_on_leaves_flee_alone(self):
+        """『逃跑』不接导航 —— 它是"背对威胁跑",没有固定目标点。"""
+        ai = self._ai_tree()
+        tree, _state = self._with_chase(ai, behavior="FLEE")
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertNotIn("_gk_ai_nav_dir", code)
+
+    # ---- 顺手抓到的另一个真 bug:晚登记的引用漏 helper ----
+
+    def test_reference_helper_emitted_for_late_references(self):
+        """引用**只来自 AI 图**时,`_gk_ref_typed` 也必须生成。
+
+        ── 这个 bug 是怎么暴露的(第六十三轮)────────────────────────
+        AI 图 / 动画图 / 界面设计图是『AI_启用』『动画_状态机』
+        『界面_套用设计』**引用时现场展开**的 —— 它们在 `generate()` 很靠后
+        的位置才跑,而 `_gk_ref` / `_gk_ref_typed` 的生成写在**前半段**。
+        于是"引用全部来自 AI 图"的脚本会得到:
+
+            @onready var 节点_玩家: Node = _gk_ref_typed(self, "玩家", "Node")
+
+        却没有 `_gk_ref_typed` 这个函数 —— Godot 直接
+            Parse Error: Function "_gk_ref_typed()" not found in base self
+        **整个脚本加载不了**(不是少功能,是跑不起来)。
+
+        这个 bug 是新示例 `examples/demo_ai_nav` 在**真 Godot** 里跑出来的:
+        离线单测当时全绿,因为它们不检查"声明和定义配没配上"。
+        """
+        ai = self._ai_tree()
+        tree, _state = self._with_chase(ai)
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertIn("@onready var 角色_玩家", code)
+        self.assertIn("func _gk_ref_typed(", code)
+        self.assertIn("func _gk_ref(", code)
+        # 前面补一次、末尾再兜一次 —— 但只该落一份
+        self.assertEqual(code.count("func _gk_ref_typed("), 1)
+        self.assertEqual(code.count("func _gk_ref("), 1)
+
+    def test_reference_helper_not_duplicated_for_normal_nodes(self):
+        """普通节点的引用还是只生成一份(老路径不受"末尾兜底"影响)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        move = tree.new_node(NN.GKNodeMoveToward, "朝向", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("@onready var 节点_玩家", code)
+        self.assertEqual(code.count("func _gk_ref_typed("), 1)
+        self.assertEqual(code.count("func _gk_ref("), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

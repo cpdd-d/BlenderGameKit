@@ -223,7 +223,7 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 296 项冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端十六层(-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 302 项冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端十七层(-Deep 再加动画六层)
 ├── check_release.py            ★ 打包发布自检:真 Godot 跑 `--export-release` 出可执行文件(没装导出模板则跳过)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
@@ -254,6 +254,7 @@ examples/
 ├── demo_nav2d/                 2D 寻路示例(俯视 2D:真绕障碍追人)
 ├── demo_ui/                    界面示例(界面设计图 + 对话框 + 暂停菜单)
 ├── demo_ai/                    游戏AI示例(巡逻 -> 看见追 -> 追丢回 -> **听见动静去查看**)按住 K 弄出动静
+├── demo_ai_nav/                ★ AI 绕墙追击(纯 AI 驱动,场景勾了『寻路』就自己绕墙追你)
 ├── demo_assets/                资产示例(资产库 + 跨场景共用 + 音频管线)
 ├── demo_level/                 关卡示例(多场景:关卡1 通关后切关卡2)
 ├── demo_lights/                灯光示例(三种灯 + 手电筒跟相机 + 数字键开关灯)
@@ -585,6 +586,13 @@ python scripts\make_render_demo.py
 # 用 Godot 打开 examples\demo_render 按 F5
 # 或者直接出图，不需要打开编辑器:
 godot --path examples\demo_render --resolution 640x640
+
+# AI 绕墙追击示例(一堵 5 米宽的墙挡在中间,敌人是**纯 AI** 驱动的)
+& "D:\blender-4.5.5-windows-x64\blender.exe" -b --python scripts\make_ai_nav_demo.py
+# 用 Godot 打开 examples\demo_ai_nav\AI寻路示例_godot，按 F5(想飞着看按 Tab)
+# 想确认它真的绕过去了(绕墙横移 2.8 米以上 -> 贴到玩家 1.2 米内):
+#   场景设置里勾了『寻路』-> 敌人的追击自动走导航网格
+python scripts\check_ai_nav_demo.py
 ```
 
 ### 为什么推荐先看 `demo_platformer`
@@ -627,10 +635,10 @@ pip install pytest && python -m pytest
 #    (后者是最容易漏的:无头探针用 dummy 渲染器,着色器编译错误不进断言)
 python scripts\verify_shaders.py
 
-# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 296 项冒烟 + 示例完整性体检 + 节点手册新鲜度 + Godot 端到端十六层
+# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 302 项冒烟 + 示例完整性体检 + 节点手册新鲜度 + Godot 端到端十七层
 #    —— 改节点/UI/生成代码后必跑
-#    端到端十六层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
-#                界面 / AI / 资产 / 关卡 / 灯光 / 环境 / 恐怖示例 / 混合树示例 / 打包发布;产物写在 _dist(不动 examples);
+#    端到端十七层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
+#                界面 / AI / AI寻路绕墙 / 资产 / 关卡 / 灯光 / 环境 / 恐怖示例 / 混合树示例 / 打包发布;产物写在 _dist(不动 examples);
 #    加 -Deep 再跑动画系统六层验证(要真 Blender、会重建 examples\demo_anim_tree,较慢)
 #    本机没装 Godot 时自动跳过;加 -SkipGodot 可显式跳过
 powershell -File scripts\build_and_test.ps1

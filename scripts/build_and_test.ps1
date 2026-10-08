@@ -655,6 +655,40 @@ if ($SkipGodot) {
         }
     }
 
+# 5q. AI 绕墙追击示例(第六十三轮)—— AI 的移动行为直接走导航网格。
+#     这一层验的是"寻路整合进 AI":场景勾了『寻路』之后,纯 AI 驱动的敌人
+#     (图里一个『移动_寻路』都没有)会**绕过墙**追到人 —— 量三个数:
+#     导航网格烤出来了(polys>0)、它横着走出 2.8 米以上(around,绕墙证据)、
+#     最后贴到玩家 1.5 米以内(arrived)。
+    Write-Output ""
+    $aiNavDir = Join-Path $Root "examples\demo_ai_nav"
+    $aiNavMaker = Join-Path $Root "scripts\make_ai_nav_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过 AI 绕墙示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $aiNavDir)) {
+        Write-Output "跳过 AI 绕墙示例:还没有 examples\demo_ai_nav"
+    } else {
+        $aiNavLog = & $Blender -b --python $aiNavMaker 2>&1 | Out-String
+        if ($aiNavLog -notmatch "已保存") {
+            Write-Host "---- 重建 AI 绕墙示例失败,尾部 20 行 ----"
+            ($aiNavLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $aiNavChecker = Join-Path $Root "scripts\check_ai_nav_demo.py"
+            $aiNavOut = & python $aiNavChecker --godot $Godot 2>&1 | Out-String
+            $aiNavOut -split "`n" | Where-Object { $_ -match "^(AINAV_|CHECK_AI_NAV_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($aiNavOut -match "CHECK_AI_NAV_DEMO=OK") {
+                $godotRan += "AI绕墙示例"
+            } elseif ($aiNavOut -match "跳过") {
+                Write-Output "（AI 绕墙示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

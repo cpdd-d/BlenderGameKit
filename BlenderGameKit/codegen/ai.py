@@ -55,6 +55,109 @@ def _vector_zero(ctx):
     return "Vector2.ZERO" if ctx.dim == 2 else "Vector3.ZERO"
 
 
+# ==========================================================================
+# AI 走导航网格(第六十三轮:"让 AI 行为直接用寻路")
+# ==========================================================================
+# ── 为什么是"自动的",不再给节点加开关 ──────────────────────────────
+# 用户的原话:"寻路应该整合到游戏AI那里去"。追人的敌人一头撞墙是这个插件
+# 里最刺眼的表现之一,而『移动_寻路』只是个**手动**节点 —— 要用户自己把
+# AI 的每个追击状态再拼一套寻路,基本没人会做。
+#
+# 所以这里让 AI 的移动行为**默认就走导航网格**,开关只有一个:**场景设置
+# 里那个『寻路』**(它决定有没有导航网格可走)。没勾 -> 一行代码都不变
+# (老图产物逐字不变);勾了 -> 追击 / 跟随 / 去查看 / 巡逻 / 返回 自动
+# 绕开墙和石头。不再加节点上的开关:场景那个开关已经是"要不要寻路"的
+# 总闸,再加一层只会让人猜"到底哪个生效"。
+#
+# ⚠ 『逃跑』**没有**接:它的目标是"背对威胁跑",没有一个固定的目标点,
+#   用导航网格反而会绕到威胁那边去。这条留在文档 / 待办里。
+def _nav_dir_helper(ctx):
+    """生成 `_gk_ai_nav_dir(host, goal)` —— "下一步朝哪走"(绕开障碍)。
+
+    ── 为什么抽成顶层函数,不在每个行为里抄一遍 ─────────────────────
+    『移动_寻路』那份路径代码有二十来行(查路径 / 盯第 1 个点 / 压平 Y /
+    脚下点退化),AI 有五种行为要用。抄五遍 = 改一处要改五处。
+    抽出来之后每个行为只多一句 `var dir := _gk_ai_nav_dir(self, 目标点)`。
+
+    ── 跟服务器的路径走,不用 NavigationAgent 的 get_next_path_position ──
+    理由和『移动_寻路』完全一样(实测:agent 的内部路径状态和"贴网格点 /
+    父节点原点的高度差"纠缠,一直返回自己)。这里只借 `map_get_path`,
+    行为完全可预测;NavigationAgent 只在『移动_寻路』勾了避障时另用。
+
+    `host: Node` + 里面显式 cast:调用点的表达式可能是 `self`,也可能是
+    @onready 的引用,标成 Node 最稳(和 `_gk_heard_*` 同一个理由)。
+    """
+    from .expressions import ensure_position_helper
+    reader = ensure_position_helper(ctx)
+
+    made = getattr(ctx, "_ai_nav_helper", None)
+    if made is not None:
+        return made
+
+    if ctx.dim == 2:
+        vector = "Vector2"
+        server = "NavigationServer2D"
+        body_type = "CharacterBody2D"
+        world = "get_world_2d"
+    else:
+        vector = "Vector3"
+        server = "NavigationServer3D"
+        body_type = "CharacterBody3D"
+        world = "get_world_3d"
+
+    name = "_gk_ai_nav_dir"
+    lines = [
+        f"    var body := host as {body_type}",
+        "    if body == null:",
+        f"        return {vector}.ZERO",
+        f"    var here := {reader}(body)",
+        f"    var path := {server}.map_get_path(body.{world}().navigation_map, "
+        f"here, goal, true)",
+        f"    var step: {vector} = {vector}.ZERO",
+        "    # ── 从第 1 个点往后找**第一个真的在别处的点**────────────────",
+        "    # 不能只看 path[1]:第 0 个点是『离自己最近的网格点』,当自己正好",
+        "    # 站在拐角上时,`path[1]` 会**和自己在同一个位置**(实测:敌人卡在",
+        "    # 墙角时 `path[1] - here` 只有 0.08 米,于是退回直线 -> 直着顶墙",
+        "    # -> 卡死)。跳过这些退化点就不会。",
+        "    for i in range(1, path.size()):",
+        f"        step = path[i] - here",
+    ]
+    if ctx.dim == 3:
+        lines.append("        step.y = 0.0      # 路点高度压平,不压会上下拱")
+    lines += [
+        "        if step.length() >= 0.25:",
+        "            return step.normalized()",
+        "    # 一条路都拿不到(网格还没烤完 / 目标不可达)-> 退回直线,",
+        "    # 至少不会站着不动",
+        f"    var direct: {vector} = goal - here",
+        "    if direct.length() < 0.001:",
+        f"        return {vector}.ZERO",
+        "    return direct.normalized()",
+    ]
+    ctx.extra_sections.append({
+        "signature": f"func {name}(host: Node, goal: {vector}) -> {vector}:",
+        "lines": lines,
+        "empty_body": f"    return {vector}.ZERO",
+        "separator": True,
+    })
+    ctx._ai_nav_helper = name
+    return name
+
+
+def _walk_direction(ctx, indent, self_expr, goal_at, diff):
+    """这个行为**这一帧朝哪走** —— 返回一个 GDScript 表达式字符串。
+
+    场景勾了『寻路』-> 走导航网格算出来的方向(AI 绕开障碍);
+    没勾 -> 直线方向,生成的代码和以前**逐字一样**。
+    """
+    if not bool(getattr(ctx, "nav_enabled", False)):
+        return f"{diff}.normalized()"
+    helper = _nav_dir_helper(ctx)
+    direction = ctx.new_temp("ai_dir")
+    ctx.add_line(indent, f"var {direction} := {helper}({self_expr}, {goal_at})")
+    return direction
+
+
 def _emit_ai_facing(ctx, indent, self_expr, face_vec, facing):
     """按『朝向』档位生成转身代码。
 
@@ -128,15 +231,20 @@ def _emit_ai_behavior(ctx, indent, machine, state):
             _stop_and_slide(ctx, indent, self_expr)
             return
         here = ctx.new_temp("ai_here")
+        goal_at = ctx.new_temp("ai_goal")
         diff = ctx.new_temp("ai_diff")
         dist = ctx.new_temp("ai_dist")
         ctx.add_line(indent, f"var {here} := {reader}({self_expr})")
-        ctx.add_line(indent, f"var {diff} := {reader}({goal}) - {here}")
+        ctx.add_line(indent, f"var {goal_at} := {reader}({goal})")
+        ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
         ctx.add_line(indent, f"var {dist} := {diff}.length()")
+        # 走法:勾了『寻路』就绕开障碍,没勾就是直线(见 _walk_direction)
+        walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
         ctx.add_line(indent, f"if {dist} > {stop}:")
-        ctx.add_line(indent + 1, f"{self_expr}.velocity = {diff}.normalized() * {speed}")
+        ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
         ctx.add_line(indent, "else:")
         ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+        # 朝向仍看**目标**(不是看绕路的那个方向):追人的怪应该盯着人
         _emit_ai_facing(ctx, indent, self_expr, diff, facing)
         ctx.add_line(indent, f"{self_expr}.move_and_slide()")
         return
@@ -180,9 +288,10 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(inner, f"var {here} := {reader}({self_expr})")
         ctx.add_line(inner, f"var {diff} := {pos_var} - {here}")
         ctx.add_line(inner, f"var {dist} := {diff}.length()")
+        # 噪音点是个**坐标**(不是一个物体),同样能走导航网格
+        walk = _walk_direction(ctx, inner, self_expr, pos_var, diff)
         ctx.add_line(inner, f"if {dist} > {stop}:")
-        ctx.add_line(inner + 1,
-                     f"{self_expr}.velocity = {diff}.normalized() * {speed}")
+        ctx.add_line(inner + 1, f"{self_expr}.velocity = {walk} * {speed}")
         ctx.add_line(inner, "else:")
         ctx.add_line(inner + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
         _emit_ai_facing(ctx, inner, self_expr, diff, facing)
@@ -197,17 +306,19 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         return
     flip = machine.get("flip")
     here = ctx.new_temp("ai_here")
-    goal = ctx.new_temp("ai_goal")
+    goal_at = ctx.new_temp("ai_goal")
     diff = ctx.new_temp("ai_diff")
     ctx.add_line(indent, f"var {here} := {reader}({self_expr})")
     if point_b is not None and flip:
         # 到了哪头就往另一头走(翻面开关存在成员变量里 —— 要跨帧记)
         ctx.add_line(indent,
-                     f"var {goal} := {reader}({point_a}) if {flip} "
+                     f"var {goal_at} := {reader}({point_a}) if {flip} "
                      f"else {reader}({point_b})")
     else:
-        ctx.add_line(indent, f"var {goal} := {reader}({point_a})")
-    ctx.add_line(indent, f"var {diff} := {goal} - {here}")
+        ctx.add_line(indent, f"var {goal_at} := {reader}({point_a})")
+    ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
+    # 巡逻同样绕障碍 —— 巡逻路线穿过一堵墙是最常见的"看起来像卡住了"
+    walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
     ctx.add_line(indent, f"if {diff}.length() <= {stop}:")
     if point_b is not None and flip:
         ctx.add_line(indent + 1, f"{flip} = not {flip}")
@@ -215,7 +326,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
     # 抖动 —— 单看不明显,但"到点回头"时会看出一个小顿挫)
     ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
     ctx.add_line(indent, "else:")
-    ctx.add_line(indent + 1, f"{self_expr}.velocity = {diff}.normalized() * {speed}")
+    ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
     _emit_ai_facing(ctx, indent, self_expr, diff, facing)
     ctx.add_line(indent, f"{self_expr}.move_and_slide()")
 

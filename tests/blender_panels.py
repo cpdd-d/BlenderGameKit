@@ -21,6 +21,9 @@ import bmesh
 import bpy
 
 RESULTS = []
+# 造过的每一个假 layout(第六十三轮)。第 7 节拿它们统一验一遍
+# "画出来的按钮都是真算子" —— 自动覆盖**所有** draw 调用,不用逐个去记。
+LAYOUTS = []
 
 
 def check(name, condition, detail=""):
@@ -53,6 +56,7 @@ class RecordingLayout:
         self.calls = []
         self.operator_names = []      # 画出来的按钮 idname(第一段参数)
         self.texts = []               # 画出来的文字(给"盒子有没有反映状态"用)
+        LAYOUTS.append(self)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -254,6 +258,13 @@ def main():
         # 只测"不抛异常"不够:draw 半路 return 也不抛异常,但按钮同样没有。
         check(f"{class_name} 画出了按钮", button_count >= len(wanted),
               f"operator 调用次数={button_count},期望至少 {len(wanted)}")
+        # ── 第六十三轮:『预设』那个按钮**必须真的画出来** ─────────────
+        # 它以前是"画了,但算子在不在没人管" —— 结果算子忘了登记,
+        # Blender 静默跳过,盒子里只剩一行说明文字(用户:"显示得没意义")。
+        if class_name == "GK_PT_Main":
+            check("『预设』盒子的『生成第三人称角色』按钮画出来了",
+                  "gk.character_preset" in layout.operator_names,
+                  str(sorted(set(layout.operator_names))))
 
     # ---- 4. 『游戏显示』设置图的面板(第四十二轮)----
     # 带真树时才画按钮:缺卡 -> 『补齐』;补齐后 -> 『回到游戏逻辑』。
@@ -385,6 +396,34 @@ def main():
     except Exception as exc:
         check("『分组框』侧栏盒子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
+
+    # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
+    #
+    # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────
+    # 『预设』盒子里那句 `layout.operator("gk.character_preset")` 写了大半年,
+    # 一直是**空按钮**:算子 `GK_OT_CharacterPreset` 从没写进 `GK_CLASSES`,
+    # 于是根本没注册 —— Blender 对"不存在的算子"是**静默跳过**的,
+    # 盒子里只剩一行说明文字。它的**逻辑**(presets.py)倒是有离线单测、
+    # 一直是绿的,缺的就是"按钮和算子接上了没有"这一环。
+    #
+    # 所以这里做一条**通用**断言:凡是面板画出来的 idname,都必须能拿到
+    # RNA(`get_rna_type()` 只有真注册过的算子才给),以后再加面板 / 再加
+    # 算子,忘了登记当场就红。
+    print("=" * 72)
+    print("7. 面板画出来的按钮都得是真算子")
+    print("=" * 72)
+    drawn = sorted({name for layout in LAYOUTS
+                    for name in layout.operator_names if name.startswith("gk.")})
+    bad_ops = []
+    for idname in drawn:
+        try:
+            group, name = idname.split(".", 1)
+            getattr(getattr(bpy.ops, group), name).get_rna_type()
+        except Exception as exc:                          # noqa: BLE001
+            bad_ops.append(f"{idname}({type(exc).__name__})")
+    print(f"    面板一共画了 {len(drawn)} 个 gk.* 按钮")
+    check(f"面板画的 {len(drawn)} 个按钮都是已注册算子", not bad_ops,
+          ", ".join(bad_ops))
 
     addon_utils.disable(module_name, default_set=True)
     return 0
