@@ -2718,6 +2718,65 @@ def main():
         check("恐怖氛围套件", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 动画混合树(第六十一轮):AnimationTree + BlendSpace1D ----
+    try:
+        r61_nodes = __import__(f"{module_name}.nodes.nodes",
+                               fromlist=["ALL_CLASSES"])
+        r61_all = {cls.bl_idname for cls in r61_nodes.ALL_CLASSES}
+        check("『动画_混合树』已注册", "GKNodeBlendTree" in r61_all)
+        check("『动画_混合树』归在『动画 ▸ 播放』下",
+              r61_nodes.SUBCATEGORY_OF.get("GKNodeBlendTree") == "播放",
+              str(r61_nodes.SUBCATEGORY_OF.get("GKNodeBlendTree")))
+
+        r61_tree = bpy.data.node_groups.new("混合树冒烟61", "GKGameLogicTree")
+        r61_ready = r61_tree.nodes.new("GKNodeOnReady")
+        r61_blend = r61_tree.nodes.new("GKNodeBlendTree")
+        r61_blend.gk_points = "走:0|慢跑:1|冲刺:2"
+        r61_tree.links.new(r61_ready.outputs["执行"], r61_blend.inputs["执行"])
+
+        r61_code, r61_warn = codegen.generate(r61_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("混合树:真的建 AnimationTree + BlendSpace1D",
+              "func _gk_ensure_blend_tree(" in r61_code
+              and "AnimationTree.new()" in r61_code
+              and "AnimationNodeBlendSpace1D.new()" in r61_code
+              and "space.add_blend_point(" in r61_code,
+              r61_code[-500:])
+        check("混合树:三个混合点都带过去",
+              r61_code.count('["走", 0.0]') >= 1
+              and r61_code.count('["慢跑", 1.0]') >= 1
+              and r61_code.count('["冲刺", 2.0]') >= 1,
+              r61_code[-500:])
+        check("混合树:每物理帧推 blend_position",
+              "_physics_process(" in r61_code
+              and 'set("parameters/blend_position"' in r61_code,
+              r61_code[-500:])
+        check("混合树:生成无告警", not r61_warn, str(r61_warn)[:300])
+
+        class _R61Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r61_draw_ok = True
+        r61_draw_error = ""
+        try:
+            r61_blend.draw_buttons(bpy.context, _R61Layout())
+        except Exception as exc:                          # noqa: BLE001
+            r61_draw_ok = False
+            r61_draw_error = f"{type(exc).__name__}: {exc}"
+        check("混合树:节点卡片能画完", r61_draw_ok, r61_draw_error)
+
+        bpy.data.node_groups.remove(r61_tree)
+    except Exception as exc:
+        check("动画混合树", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- UI 注册:用"面板能不能被 Blender 找到"来验证 ----
     try:
         panel_names = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]

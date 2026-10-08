@@ -9,7 +9,8 @@ from .literals import (EVENT_KINDS, TRIGGER_KINDS, _BANNER, gd_class_name,
                        gd_number)
 from .registry import _chain, _emit_body, _next_nodes
 from .statements import _emit_logic_ports, _emit_logic_vars
-from .animation import _anim_category_table, _emit_state_graph, _emit_state_transitions
+from .animation import (_anim_category_table, _emit_blend_update,
+                        _emit_state_graph, _emit_state_transitions)
 from .ai import _emit_ai_graph
 from .camera import _path_name
 from .services import (_FILTER_SHADER_CONST, _GD_FILTER_SHADER,
@@ -762,6 +763,14 @@ class Generator:
                                   machine.get("finished"),
                                   machine.get("finish"),
                                   machine.get("gate"))
+            # ---- 动画混合树(第六十一轮)----
+            # 每物理帧把『参数』推给 AnimationTree 的 blend_position。
+            for blend in self.ctx.anim_blend_trees:
+                self.ctx._active.clear()
+                self.ctx._current_event = blend["node"].name
+                self.ctx._expr_indent = 1
+                self.ctx._current_indent = 1
+                _emit_blend_update(self.ctx, 1, blend)
             # ---- AI 状态机(『游戏AI』,第四十一轮)----
             # 和动画树同一套:每物理帧先执行当前状态的行为,再判转场。
             # 缩进同样先摆正 —— 转场条件里的表达式节点(『AI_看得见』)

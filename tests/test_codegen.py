@@ -13567,5 +13567,113 @@ class TestRound59Horror(Base):
         self.assertNotIn("_gk_global_position_", code)
 
 
+class TestRound61BlendTree(Base):
+    """第六十一轮:动画混合树。
+
+    ── 它和状态机的根本区别 ────────────────────────────────────────
+    状态机是**手写 if/elif + AnimationPlayer.play()**(离散切换);
+    混合树要的是"按参数连续混合",AnimationPlayer 做不到(它没有权重),
+    所以这一块**真的**建一个 Godot `AnimationTree` + `AnimationNodeBlendSpace1D`,
+    每物理帧把参数推给 `parameters/blend_position`。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_parse_blend_points(self):
+        parse = codegen.animation.parse_blend_points
+        self.assertEqual(parse("走:0|跑:1"), [("走", 0.0), ("跑", 1.0)])
+        self.assertEqual(parse(" 走 : 0.5 "), [("走", 0.5)])
+        # 没写位置 -> 按顺序补 0/1/2…;空段跳过
+        self.assertEqual(parse("甲||乙"), [("甲", 0.0), ("乙", 1.0)])
+        self.assertEqual(parse(""), [])
+        # 超过 6 个点只取前 6 个(BlendSpace 够用,也免得卡片画不下)
+        self.assertEqual(len(parse("|".join(f"a{i}:{i}" for i in range(9)))), 6)
+
+    def test_builds_animation_tree_and_blend_space(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "走路跑步",
+                             gk_points="走:0|慢跑:1|冲刺:2", gk_value=0.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        # 真的建 AnimationTree(不是又一段 if/elif)
+        self.assertIn("func _gk_ensure_blend_tree(host: Node, player: Node,"
+                      " points: Array, tree_name: String, loop: bool)"
+                      " -> AnimationTree:", code)
+        self.assertIn("AnimationTree.new()", code)
+        # 循环:glTF 导进来的动画默认不循环,播一遍就停在最后一帧
+        self.assertIn("anim.loop_mode == Animation.LOOP_NONE", code)
+        self.assertIn("anim.loop_mode = Animation.LOOP_LINEAR", code)
+        self.assertIn('"GKBlendTree", true)', code)
+        self.assertIn("AnimationNodeBlendSpace1D.new()", code)
+        self.assertIn("AnimationNodeAnimation.new()", code)
+        self.assertIn("space.add_blend_point(", code)
+        # 三个混合点都带过去(名 + 位置)
+        self.assertIn('["走", 0.0]', code)
+        self.assertIn('["慢跑", 1.0]', code)
+        self.assertIn('["冲刺", 2.0]', code)
+        # 接管播放器:root_node / anim_player / active 都要设
+        self.assertIn("tree.anim_player = tree.get_path_to(player)", code)
+        self.assertIn("tree.active = true", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_pushes_parameter_every_physics_frame(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "混合", gk_points="走:0|跑:1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        # 建树(在 _ready)+ 每帧推参数(在 _physics_process)
+        self.assertIn("if blend_tree == null:", code)
+        self.assertIn('blend_tree.set("parameters/blend_position", 0.0)', code)
+        self.assertIn("func _physics_process(", code)
+
+    def test_parameter_can_come_from_a_pin(self):
+        """参数接引脚 -> 用引脚上的表达式,而不是卡片里的固定值。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "混合", gk_points="走:0|跑:1")
+        value = tree.new_node(NN.GKNodeGetVar, "读速度", gk_var_name="速度")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        gk_stub.connect(tree, value, "值", node, "参数")
+        code, _ = gen(tree, V2)
+        self.assertIn('set("parameters/blend_position", 速度)', code)
+
+    def test_smooth_uses_lerp(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "混合", gk_points="走:0|跑:1",
+                             gk_smooth=0.3)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("get_physics_process_delta_time()", code)
+        self.assertIn('float(blend_tree.get("parameters/blend_position"))', code)
+        self.assertIn("/ maxf(0.3, 0.0001)", code)
+
+    def test_too_few_points_warns(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "混合", gk_points="走:0")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("至少要有" in w for w in warnings), warnings)
+        # 没生成任何混合相关代码
+        self.assertNotIn("_gk_ensure_blend_tree(", _code)
+
+    def test_no_blend_code_without_the_node(self):
+        """没用到混合树的图里一个相关字符都不多(老产物逐字不变)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("AnimationTree", code)
+        self.assertNotIn("blend_position", code)
+        self.assertNotIn("_gk_ensure_blend_tree", code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

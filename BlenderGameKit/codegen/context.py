@@ -146,6 +146,9 @@ class GenContext:
         # 动画树(独立那张图)驱动的状态机 —— 同样挂 _physics_process
         self.anim_trees = []
         self.need_anim_tree_process = False
+        # 动画混合树(第六十一轮):每帧把『参数』推给 AnimationTree 的
+        # blend_position。登记 {node, var, param, smooth, debug}
+        self.anim_blend_trees = []
         # ── AI 图(『游戏AI』,第四十一轮)────────────────────────────
         # 每台『AI_启用』登记一条:{node, graph, var, self, debug, flip} ——
         # 由 generator 统一发射到 _physics_process(先行为、后转场),

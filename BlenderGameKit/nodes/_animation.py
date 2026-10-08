@@ -741,6 +741,53 @@ class GKNodeAnimSetVar(B.GKStatementNode):
 
 
 @N
+class GKNodeBlendTree(B.GKStatementNode):
+    bl_idname = "GKNodeBlendTree"
+    bl_label = "动画_混合树"
+    bl_icon = "AUTOMERGE_ON"
+    gk_category = "动画"
+    gk_doc = ("把几段动画按一个**数值参数连续混合**(第六十一轮)。\n"
+              "── 和『动画_状态机』的区别 ──\n"
+              "状态机是**硬切**(走 -> 跑 是一瞬间换的);混合树是**连续过渡**:"
+              "参数 0 完全是第一段、1 完全是第二段、0.5 是各一半 —— "
+              "走路↔跑步、待机↔走路 这类'没有明确切换点'的地方用它。\n"
+              "── 怎么填 ──\n"
+              "『混合点』写成 `动画名:位置`,多个用 `|` 分隔,例如 "
+              "`走:0|慢跑:1|冲刺:2`(位置 = 参数取到多少时是这一段)。\n"
+              "『参数』引脚接一个浮点数(比如角色速度 / 一个变量),"
+              "它落在哪两个位置之间就混那两段。\n"
+              "── 注意 ──\n"
+              "它会在这个物体上建一个 **AnimationTree** 并接管动画 —— "
+              "同一个播放器**不要**再用『动画_播放』/『动画_状态机』驱动"
+              "(两边会互相覆盖)。动画名要和模型里的动作名一致。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "参数", 0.0),
+    )
+    gk_input_props = {"参数": "gk_value"}
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_points", "string", "走:0|跑:1", "混合点",
+         "`动画名:位置`,多个用 | 分隔(最多 6 个;位置 = 参数到多少时是这一段)"),
+        ("gk_value", "float", 0.0, "参数", "『参数』引脚没接线时用它"),
+        ("gk_smooth", "float", 0.0, "平滑秒数",
+         "0 = 参数一变立刻到;>0 = 慢慢混过去(避免抖)"),
+        ("gk_loop", "bool", True, "循环播放",
+         "把混合点里的动作设成循环 —— 走路 / 跑步这类循环动作用它"
+         "(glTF 导进来的动画默认不循环,播一遍就停)"),
+        ("gk_debug_print", "bool", False, "启动时打印",
+         "勾上后建好混合树往 Godot 输出面板打一行"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_points", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_value", text="参数")
+        row.prop(self, "gk_smooth", text="平滑")
+        layout.prop(self, "gk_debug_print", text="启动时打印", toggle=True)
+
+
+@N
 class GKNodeAnimStateMachineRef(B.GKStatementNode):
     bl_idname = "GKNodeAnimStateMachineRef"
     bl_label = "动画_状态机"

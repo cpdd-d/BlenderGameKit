@@ -623,6 +623,38 @@ if ($SkipGodot) {
         }
     }
 
+# 5p. 动画混合树示例(第六十一轮)—— 走↔跑连续过渡。
+#     这一层验的是 AnimationTree + BlendSpace1D 这套:真的建出树、混合位置
+#     0/1 时高度差得开、0.5 时落在中间(是"混"不是"二选一")、按 1/2 改参数。
+    Write-Output ""
+    $blendDir = Join-Path $Root "examples\demo_blend"
+    $blendMaker = Join-Path $Root "scripts\make_blend_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过混合树示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $blendDir)) {
+        Write-Output "跳过混合树示例:还没有 examples\demo_blend"
+    } else {
+        $blendLog = & $Blender -b --python $blendMaker 2>&1 | Out-String
+        if ($blendLog -notmatch "已保存") {
+            Write-Host "---- 重建混合树示例失败,尾部 20 行 ----"
+            ($blendLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $blendChecker = Join-Path $Root "scripts\check_blend_demo.py"
+            $blendOut = & python $blendChecker --godot $Godot 2>&1 | Out-String
+            $blendOut -split "`n" | Where-Object { $_ -match "^(BLEND_|CHECK_BLEND_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($blendOut -match "CHECK_BLEND_DEMO=OK") {
+                $godotRan += "混合树示例"
+            } elseif ($blendOut -match "跳过") {
+                Write-Output "（混合树示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

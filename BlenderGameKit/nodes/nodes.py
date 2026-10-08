@@ -173,6 +173,7 @@ SUBCATEGORY_OF = {
     "GKNodeAnimParam": "播放",   # 动画_设混合参数
     "GKNodeAnimStatus": "播放",   # 动画_运行状态
     "GKNodeAnimStateMachineRef": "播放",   # 动画_状态机
+    "GKNodeBlendTree": "播放",   # 动画_混合树
     "GKNodeAnimPlaying": "播放",   # 动画_是否在播
     "GKNodeAnimPause": "播放",   # 动画_暂停/继续
     "GKNodeAnimStop": "播放",   # 动画_停止

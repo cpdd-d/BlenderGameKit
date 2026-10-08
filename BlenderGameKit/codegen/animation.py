@@ -1014,6 +1014,163 @@ def _emit_state_graph(ctx, indent, graph, var_name, player_temp, enter_func,
     # (由 `_gk_on_anim_started` 信号和 `_gk_anim_enter` 负责清)。
 
 
+# ==========================================================================
+# 动画混合树(第六十一轮)
+# ==========================================================================
+# ── 为什么这里才第一次用 Godot 的 AnimationTree ──────────────────────
+# 状态机那套是**手写 if/elif 链 + AnimationPlayer.play()**(见上面),
+# 因为"切状态"本来就是离散的,自己写反而更短更可读。
+# 但"连续混合"是 AnimationPlayer **做不到**的:它没有权重概念,一次只能
+# 播一段。Godot 里唯一能做权重混合的就是 AnimationTree + BlendSpace。
+# 所以这一块**真的**建一个 AnimationTree(运行时用 GDScript 建,不生成
+# .tres —— 和插件"不额外产出资源文件"的一贯做法一致)。
+_BLEND_MAX_POINTS = 6
+
+
+def parse_blend_points(text):
+    """把 `走:0|跑:1` 解析成 [(动画名, 位置)]。解析不出来的跳过。"""
+    points = []
+    for chunk in str(text or "").split("|"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            name, _, pos = chunk.rpartition(":")
+        else:
+            name, pos = chunk, ""
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            value = float(pos.strip())
+        except ValueError:
+            # 没写位置(或写坏了)-> 按顺序补 0 / 1 / 2…
+            value = float(len(points))
+        points.append((name, value))
+        if len(points) >= _BLEND_MAX_POINTS:
+            break
+    return points
+
+
+def _ensure_blend_tree_helper(ctx):
+    """确保"建混合树"的辅助函数已经生成,返回它的名字。
+
+    生成的函数(挂在脚本所在节点上,树也挂在它下面):
+        _gk_ensure_blend_tree(host, player, points, tree_name) -> AnimationTree
+    """
+    made = getattr(ctx, "_blend_helper", None)
+    if made:
+        return made
+    name = "_gk_ensure_blend_tree"
+    ctx._blend_helper = name
+    ctx.extra_sections.append({
+        "signature": (f"func {name}(host: Node, player: Node, points: Array, "
+                      f"tree_name: String, loop: bool) -> AnimationTree:"),
+        "lines": [
+            "    if host == null:",
+            "        return null",
+            "    var existing: AnimationTree = host.get_node_or_null(tree_name)",
+            "    if existing != null:",
+            "        return existing",
+            "    if player == null or not (player is AnimationPlayer):",
+            '        push_warning("[GK] 混合树找不到 AnimationPlayer —— 混合不会生效")',
+            "        return null",
+            "    var player_ap := player as AnimationPlayer",
+            # ── 循环播放(第六十一轮,真机踩到)──────────────────────────
+            # 混合点里的动作(走路 / 跑步)本来就是**循环**的;可 glTF 导进来的
+            # 动画 `loop_mode` 默认是 LOOP_NONE —— 播一遍就停在最后一帧,
+            # 于是"混合位置变了但姿势不动"(探针实测:0.5 时高度回到原点)。
+            "    if loop:",
+            "        for entry in points:",
+            "            var anim: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "            if anim != null and anim.loop_mode == Animation.LOOP_NONE:",
+            "                anim.loop_mode = Animation.LOOP_LINEAR",
+            "    var tree := AnimationTree.new()",
+            "    tree.name = tree_name",
+            "    host.add_child(tree)",
+            "    var space := AnimationNodeBlendSpace1D.new()",
+            "    for entry in points:",
+            "        var anim_node := AnimationNodeAnimation.new()",
+            "        anim_node.animation = StringName(entry[0])",
+            "        space.add_blend_point(anim_node, float(entry[1]))",
+            "    tree.tree_root = space",
+            "    tree.root_node = tree.get_path_to(host)",
+            "    tree.anim_player = tree.get_path_to(player)",
+            "    tree.active = true",
+            "    return tree",
+        ],
+        "empty_body": "    return null",
+        "separator": True,
+    })
+    return name
+
+
+@stmt_node("GKNodeBlendTree")
+def _stmt_blend_tree(ctx, node, indent):
+    """『动画_混合树』:建 AnimationTree(在 _ready 里)+ 每帧推参数。"""
+    points = parse_blend_points(getattr(node, "gk_points", ""))
+    if len(points) < 2:
+        ctx.warn("『动画_混合树』至少要有**两个**混合点才会混 —— "
+                 "『混合点』写成 `走:0|跑:1` 这样(多个用 | 分隔)")
+        return
+
+    helper = _ensure_blend_tree_helper(ctx)
+    # 一个物体上可以放多棵混合树(比如"移动"一棵、"表情"一棵)——
+    # 第二棵起自动叫 blend_tree_2 / GKBlendTree_2,不会互相覆盖。
+    index = len(ctx.anim_blend_trees)
+    suffix = "" if index == 0 else f"_{index + 1}"
+    var_name = ctx.declare_var(f"blend_tree{suffix}", "AnimationTree")
+    tree_name = f"GKBlendTree{suffix}"
+
+    points_literal = "[" + ", ".join(
+        f"[{gd_string(name)}, {gd_number(pos)}]" for name, pos in points) + "]"
+    player = ctx.animation_player(node)
+    loop = "true" if bool(getattr(node, "gk_loop", True)) else "false"
+    ctx.add_line(indent, f"if {var_name} == null:")
+    ctx.add_line(indent + 1, f"{var_name} = {helper}(self, {player}, "
+                             f"{points_literal}, {gd_string(tree_name)}, "
+                             f"{loop})")
+
+    socket = ctx._socket(node, "参数")
+    if socket is not None and getattr(socket, "is_linked", False):
+        param = ctx.expr_of(socket)
+    else:
+        param = gd_number(getattr(node, "gk_value", 0.0))
+    smooth = gd_number(getattr(node, "gk_smooth", 0.0))
+    ctx.anim_blend_trees.append({
+        "node": node, "var": var_name, "param": param, "smooth": smooth,
+        "debug": bool(getattr(node, "gk_debug_print", False)),
+        "names": [name for name, _pos in points],
+    })
+    ctx.need_anim_tree_process = True
+
+    if bool(getattr(node, "gk_debug_print", False)):
+        ctx.add_line(indent, f"if {var_name} != null:")
+        ctx.add_line(indent + 1, f'print("[GK 混合树] 已建 ", '
+                                 f'{gd_string(tree_name)}, " 混合点 ", '
+                                 f'{points_literal})')
+
+
+def _emit_blend_update(ctx, indent, spec):
+    """每物理帧把参数推给 blend_position(由 generator 在物理帧段调用)。"""
+    var_name = spec["var"]
+    param = spec["param"]
+    smooth = spec["smooth"]
+    ctx.add_line(indent, f"if {var_name} != null:")
+    if smooth not in ("0.0", "0"):
+        dt = ctx.new_temp("bt_dt")
+        ctx.add_line(indent + 1, f"var {dt} := get_physics_process_delta_time()")
+        current = f'float({var_name}.get("parameters/blend_position"))'
+        ctx.add_line(indent + 1,
+                     f'{var_name}.set("parameters/blend_position", '
+                     f'lerpf({current}, {param}, '
+                     f'clampf({dt} / maxf({smooth}, 0.0001), 0.0, 1.0)))')
+    else:
+        ctx.add_line(indent + 1,
+                     f'{var_name}.set("parameters/blend_position", {param})')
+
+
 @stmt_node("GKNodeAnimStateMachine")
 def _stmt_anim_state_machine(ctx, node, indent):
     """动画状态机 —— 取代手拼分支网。
