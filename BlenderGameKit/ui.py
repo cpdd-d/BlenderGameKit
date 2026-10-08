@@ -4932,23 +4932,32 @@ def _draw_advisor_box(layout, context, settings):
     # ── 待确认的动作卡片(第五十六轮:AI 亲自操作)──────────────────
     # 这是"AI 提建议、**人**拍板"的落点:卡片上的『执行』才真改项目。
     # 卡片放在状态行**上面** —— 它是这一屏要你做的决定,不该被压在下面。
-    proposal = advisor.agent_proposal()
-    if proposal:
-        card = box.box()
-        card.label(text="AI 建议这样改(还没生效):", icon="QUESTION")
-        head = card.row(align=True)
-        head.label(text=proposal.get("label", ""), icon="CHECKMARK")
-        if proposal.get("target"):
-            head.label(text=f"→ {proposal['target']}")
-        if proposal.get("value"):
-            card.label(text=f"值:{proposal['value']}")
-        if proposal.get("why"):
-            for line in advisor.wrap(proposal["why"], 44)[:4]:
-                card.label(text=line, icon="DOT")
-        row = card.row(align=True)
-        row.scale_y = 1.35
-        row.operator("gk.apply_advisor_action", text="执行", icon="PLAY")
-        row.operator("gk.dismiss_advisor_action", text="忽略", icon="X")
+    #
+    # ⚠ **可以有好几张**:AI 常常一口气建议好几处改动。每一张各自带
+    # 『执行』『忽略』,并把**下标**传下去 —— 不传下标的话点第二张的
+    # 『忽略』清掉的是第一张(最坏的一类 bug)。
+    proposal_list = advisor.agent_proposals()
+    if proposal_list:
+        head = box.row(align=True)
+        head.label(text=f"AI 建议这样改({len(proposal_list)} 条,都还没生效):",
+                   icon="QUESTION")
+        for index, proposal in enumerate(proposal_list):
+            card = box.box()
+            title = card.row(align=True)
+            title.label(text=proposal.get("label", ""), icon="CHECKMARK")
+            if proposal.get("target"):
+                title.label(text=f"→ {proposal['target']}")
+            elif proposal.get("value"):
+                title.label(text=f"→ {proposal['value']}")
+            if proposal.get("why"):
+                for line in advisor.wrap(proposal["why"], 44)[:3]:
+                    card.label(text=line, icon="DOT")
+            row = card.row(align=True)
+            row.scale_y = 1.3
+            row.operator("gk.apply_advisor_action", text="执行",
+                         icon="PLAY").index = index
+            row.operator("gk.dismiss_advisor_action", text="忽略",
+                         icon="X").index = index
 
     # ── 状态行 ────────────────────────────────────────────────────
     error = ops.LAST_ADVISOR.get("error", "")

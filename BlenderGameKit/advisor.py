@@ -152,6 +152,12 @@ def build_messages(question, context_text, history=None, system_prompt=None):
     但换来的正确性值得。
     """
     system = system_prompt or DEFAULT_SYSTEM_PROMPT
+    # ── 把**动作清单**列给模型(否则它会自己编动作名)────────────────
+    # 系统提示里说了"只能用清单里的动作",可清单本身没给 —— 模型只能猜,
+    # 猜错就被 propose_action 的校验挡回来,白烧一轮。这里把清单摊开。
+    lines = _action_lines()
+    if lines:
+        system = f"{system}\n\n## 可用的动作(propose_action 只能用这些)\n{lines}"
     if context_text:
         system = f"{system}\n\n## 当前项目诊断快照\n{context_text}"
     messages = [{"role": "system", "content": system}]
@@ -162,6 +168,21 @@ def build_messages(question, context_text, history=None, system_prompt=None):
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": (question or "").strip()})
     return messages
+
+
+def _action_lines():
+    """动作清单的纯文本(喂给模型)。取不到工具模块时返回空串。"""
+    try:
+        from . import advisor_tools
+
+        lines = []
+        for name in advisor_tools.action_names():
+            needs = advisor_tools.ACTIONS[name]["needs"]
+            need_text = ("需要参数:" + "/".join(needs)) if needs else "不需要参数"
+            lines.append(f"* {name}({need_text})—— {advisor_tools.action_hint(name)}")
+        return "\n".join(lines)
+    except Exception:                                     # noqa: BLE001
+        return ""
 
 
 def plainify(text):
@@ -249,26 +270,45 @@ def check_config(base_url, model):
     return ""
 
 
-def call_chat_raw(base_url, api_key, model, messages, timeout=60, tools=None):
-    """发一次请求,返回**原始 JSON**。返回 (是否成功, 数据 或 错误说明)。
+# ── 这个模型不支持工具调用吗(试过一次就记住,别每轮都白试)────────
+_NO_TOOLS = {"disabled": False}
 
-    ── 为什么要有"原始"这一层 ─────────────────────────────────────
-    带工具的时候,我们要的不只是 `choices[0].message.content` —— 还得看
-    `message.tool_calls`(模型要求调哪些工具)。而 `parse_response` 只负责
-    抽那段文字,看不到工具。所以拆成两层:这一层负责"把 JSON 拿回来",
-    上层决定怎么解释它。
 
-    ── 错误分支都要有"下一步怎么办"────────────────────────────────
-    401/403 = Key 不对(最常见),超时 / 连不上 = 地址或网络。这些如果只把
-    异常原文丢出去,用户没法行动。
+def tools_disabled():
+    """是否已经确认"这个模型不支持工具调用"。"""
+    return bool(_NO_TOOLS["disabled"])
+
+
+def reset_tools_disabled():
+    """换模型 / 改地址之后要清掉这个记忆(测试也用)。"""
+    _NO_TOOLS["disabled"] = False
+
+
+def tools_unsupported_in(text):
+    """这段报错是不是在说"我不认识 tools / function 参数"。
+
+    ── 为什么必须处理这条(真会踩)──────────────────────────────────
+    不是所有本地模型都支持 function calling —— 比如 Ollama 上一个小模型,
+    请求里带上 `tools` 它会**直接 400**。对用户来说就是"AI 顾问突然坏了",
+    而且报的是一串英文,根本看不出是"这个模型不支持工具"。
+
+    所以:一旦看到这类报错,**自动退化成不带工具的纯问答**再试一次 ——
+    功能少一点,但用户还能正常问问题。这是"优雅降级"而不是"报错退出"。
     """
-    problem = check_config(base_url, model)
-    if problem:
-        return False, problem
-    url = chat_url(base_url)
+    low = (text or "").lower()
+    if not low:
+        return False
+    if "tool" not in low and "function" not in low:
+        return False
+    return any(token in low for token in
+               ("not support", "unsupported", "unknown", "invalid",
+                "unrecognized", "no such", "does not", "doesn't", "不存在",
+                "不支持", "未知", "无效"))
 
-    body = json.dumps(request_payload(model, messages, tools=tools),
-                      ensure_ascii=False).encode("utf-8")
+
+def _post_json(url, api_key, payload, timeout):
+    """发一次 POST。返回 (是否成功, 数据 或 错误说明)。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
     if api_key:
@@ -294,10 +334,46 @@ def call_chat_raw(base_url, api_key, model, messages, timeout=60, tools=None):
         return False, f"调用 AI 失败: {type(exc).__name__}: {exc}"
 
     try:
-        data = json.loads(raw)
+        return True, json.loads(raw)
     except ValueError:
         return False, f"AI 返回的不是 JSON(前 300 字):\n{raw[:300]}"
-    return True, data
+
+
+def call_chat_raw(base_url, api_key, model, messages, timeout=60, tools=None):
+    """发一次请求,返回**原始 JSON**。返回 (是否成功, 数据 或 错误说明)。
+
+    ── 为什么要有"原始"这一层 ─────────────────────────────────────
+    带工具的时候,我们要的不只是 `choices[0].message.content` —— 还得看
+    `message.tool_calls`(模型要求调哪些工具)。而 `parse_response` 只负责
+    抽那段文字,看不到工具。所以拆成两层:这一层负责"把 JSON 拿回来",
+    上层决定怎么解释它。
+
+    ── 错误分支都要有"下一步怎么办"────────────────────────────────
+    401/403 = Key 不对(最常见),超时 / 连不上 = 地址或网络。这些如果只把
+    异常原文丢出去,用户没法行动。
+    """
+    problem = check_config(base_url, model)
+    if problem:
+        return False, problem
+    url = chat_url(base_url)
+
+    # 已经确认这个模型不吃 tools -> 就别再带上去了
+    if tools and tools_disabled():
+        tools = None
+
+    ok, data = _post_json(url, api_key,
+                          request_payload(model, messages, tools=tools), timeout)
+    if ok or not tools:
+        return ok, data
+
+    # ── 带了工具却失败:可能是这个模型不支持 -> 脱掉工具重试一次 ────
+    if tools_unsupported_in(data if isinstance(data, str) else ""):
+        ok2, data2 = _post_json(url, api_key,
+                                request_payload(model, messages), timeout)
+        if ok2:
+            _NO_TOOLS["disabled"] = True
+            return True, data2
+    return ok, data
 
 
 def call_chat(base_url, api_key, model, messages, timeout=60):
@@ -733,7 +809,9 @@ _AGENT = {
     "error": "",
     "pending": None,     # 待主线程执行的 tool_calls
     "steps": [],         # 给用户看的"它做了什么"清单(比如"读了节点图")
-    "proposal": None,    # 待用户确认的动作(见 advisor_tools.ACTIONS)
+    # 待用户确认的动作(**可以有多张** —— AI 常常一次建议好几处改动,
+    # 只留最后一张会让前面的建议**静默消失**,用户根本没看到)
+    "proposals": [],
 }
 
 
@@ -748,7 +826,8 @@ def start_agent(base_url, api_key, model, messages, timeout=60, tools=None):
         tools = tools_payload()
     _AGENT.update({"active": True, "stage": "request",
                    "messages": list(messages), "round": 0, "answer": "",
-                   "error": "", "pending": None, "steps": [], "proposal": None})
+                   "error": "", "pending": None, "steps": [],
+                   "proposals": []})
     return _spawn(lambda: call_chat_raw(base_url, api_key, model,
                                         _AGENT["messages"], timeout=timeout,
                                         tools=tools), timeout)
@@ -764,14 +843,48 @@ def agent_steps():
     return list(_AGENT["steps"])
 
 
-def agent_proposal():
-    """待用户确认的动作;没有返回 None。"""
-    return _AGENT["proposal"]
+def agent_proposals():
+    """待用户确认的动作卡片清单(可能有多张,也可能为空)。"""
+    return list(_AGENT["proposals"])
 
 
-def clear_proposal():
-    """用户执行/忽略之后清掉那张卡片。"""
-    _AGENT["proposal"] = None
+def add_proposal(card):
+    """追加一张待确认卡片。"""
+    if card:
+        _AGENT["proposals"].append(card)
+
+
+def proposal_at(index):
+    """取第 index 张卡片;越界返回 None。
+
+    ── 为什么要按**下标**取,而不是"取当前那张"────────────────────
+    卡片可以有好几张(见 agent_proposals 的说明)。执行/忽略必须点名到
+    具体哪一张 —— 否则用户点第二张的『忽略』,清掉的是第一张。
+    """
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return None
+    cards = _AGENT["proposals"]
+    return cards[index] if 0 <= index < len(cards) else None
+
+
+def drop_proposal(index):
+    """丢掉第 index 张卡片(执行过 / 忽略过)。返回是否真的丢掉了。"""
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return False
+    cards = _AGENT["proposals"]
+    if 0 <= index < len(cards):
+        del cards[index]
+        return True
+    return False
+
+
+def clear_proposals():
+    """全部清掉(清空对话时用)。"""
+    _AGENT["proposals"] = []
 
 
 def cancel_agent():
@@ -828,11 +941,17 @@ def poll_agent_step(context, base_url="", api_key="", model="", timeout=60):
         _AGENT["pending"] = None
         for call in calls:
             output, proposal = _execute_tool(call, context)
-            if proposal:
-                _AGENT["proposal"] = proposal
+            # **追加**而不是覆盖:模型常常一口气建议好几处改动,
+            # 覆盖会让前面的建议静默消失(用户根本没机会看到)
+            add_proposal(proposal)
             _AGENT["steps"].append(_step_label(call, bool(proposal)))
             _AGENT["messages"].append(
                 tool_result_message(call["id"], output))
+        # 模型不支持工具调用而退化成纯问答时,得**告诉用户**为什么 AI
+        # 没去查项目 —— 否则看起来就像它偷懒
+        if tools_disabled() and not any("不支持工具" in s
+                                        for s in _AGENT["steps"]):
+            _AGENT["steps"].append("这个模型不支持工具调用,已退化成纯问答")
         _AGENT["round"] += 1
         if _AGENT["round"] > MAX_TOOL_ROUNDS:
             message = (f"AI 连续要了 {MAX_TOOL_ROUNDS} 轮工具,先停一下"

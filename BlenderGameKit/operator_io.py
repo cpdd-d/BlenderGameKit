@@ -3045,13 +3045,17 @@ class GK_OT_ApplyAdvisorAction(bpy.types.Operator):
     bl_description = "按 AI 的建议修改项目(点之前不会有任何改动)"
     bl_options = {"REGISTER", "UNDO"}
 
+    # 卡片可以有好几张,所以必须点名是哪一张 —— 否则用户点第二张的
+    # 『执行』,动的是第一张(那是最坏的一类 bug)
+    index: IntProperty(name="第几张", default=0)
+
     def execute(self, context):
-        card = advisor.agent_proposal()
+        card = advisor.proposal_at(self.index)
         if not card:
             _report(self, "ERROR", "没有待确认的动作(可能已经执行或忽略过了)")
             return {"CANCELLED"}
         ok, message = advisor_tools.apply_proposal(context, card)
-        advisor.clear_proposal()
+        advisor.drop_proposal(self.index)
         LAST_ADVISOR["status"] = ("已执行:" + message) if ok else ""
         if not ok:
             LAST_ADVISOR["error"] = f"执行失败:{message}"
@@ -3075,9 +3079,14 @@ class GK_OT_DismissAdvisorAction(bpy.types.Operator):
     bl_description = "不采纳这个建议,项目不会有任何改动"
     bl_options = {"REGISTER"}
 
+    index: IntProperty(name="第几张", default=0)
+
     def execute(self, context):
-        advisor.clear_proposal()
-        LAST_ADVISOR["status"] = "已忽略 AI 的建议(项目没有改动)"
+        remaining = len(advisor.agent_proposals()) - 1
+        advisor.drop_proposal(self.index)
+        LAST_ADVISOR["status"] = (
+            f"已忽略这个建议(项目没有改动);还剩 {remaining} 条待确认"
+            if remaining > 0 else "已忽略 AI 的建议(项目没有改动)")
         return {"FINISHED"}
 
 
@@ -3143,6 +3152,7 @@ class GK_OT_ClearAdvisor(bpy.types.Operator):
     def execute(self, context):
         # 正在跑的先放弃等待,否则它回来还会往刚清空的记录里写一条
         advisor.cancel_agent()
+        advisor.clear_proposals()
         advisor.clear_history()
         advisor.save_history(context.scene)
         advisor.clear_dialog_text()
@@ -3224,8 +3234,10 @@ def _apply_advisor_result(ok, text):
             settings.advisor_question = ""
         steps = advisor.agent_steps()
         # 有提议时,那把回答从"文字"升级成"带一张待确认卡片的文字"
-        if advisor.agent_proposal():
-            status = "AI 提了一个动作 —— 在下面确认或忽略"
+        if advisor.agent_proposals():
+            count = len(advisor.agent_proposals())
+            status = (f"AI 提了 {count} 个动作 —— 在下面逐条确认或忽略"
+                      if count > 1 else "AI 提了一个动作 —— 在下面确认或忽略")
         else:
             status = (f"AI 已回复({len(text)} 字),"
                       f"已存入『{advisor.DIALOG_TEXT_NAME}』")
@@ -3482,6 +3494,7 @@ def on_unregister():
     # 定时器必须摘掉:它闭包里握着本模块的函数对象,插件注销后还在跑会报错
     _stop_advisor_poll()
     advisor.cancel_agent()
+    advisor.clear_proposals()
     advisor.clear_history()
     LAST_EXPORT.clear()
     LAST_RELEASE.clear()

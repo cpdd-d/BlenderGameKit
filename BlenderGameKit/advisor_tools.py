@@ -224,6 +224,55 @@ def _set_base_class(context, params):
     return True, f"脚本基类已改成『{settings.base_class}』"
 
 
+@_action("create_godot_project", "创建 Godot 项目", (),
+         "在 .blend 旁边建出配套的 Godot 工程(所有导出/运行的落点)")
+def _create_godot_project(context, params):
+    from . import project
+
+    directory, reason = project.resolve(getattr(context, "scene", None),
+                                        adopt=True)
+    if not directory:
+        return False, reason or "推不出项目目录(先 Ctrl+S 存一次 .blend)"
+    try:
+        created = project.create_project(directory)
+    except OSError as exc:
+        return False, f"创建失败: {exc}"
+    return True, (f"已创建/补齐 Godot 项目:{directory}"
+                  f"({len(created)} 项)")
+
+
+@_action("set_main_camera", "指定主相机", ("target",),
+         "游戏默认用哪台相机(填场景里那台相机物体的名字)")
+def _set_main_camera(context, params):
+    import bpy
+
+    settings = getattr(context.scene, "gk_settings", None)
+    if settings is None:
+        return False, "取不到场景设置"
+    name = str(params.get("target") or "").strip()
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        return False, f"找不到物体『{name}』"
+    if getattr(obj, "type", "") != "CAMERA":
+        return False, f"『{name}』不是相机(它是 {getattr(obj, 'type', '?')})"
+    settings.main_camera = name
+    return True, f"主相机已指定为『{name}』"
+
+
+@_action("set_toon_materials", "切换卡通材质", ("value",),
+         "开 = 导出成卡通风格(好看统一);关 = 保持 Blender 原样(便于核对细节)")
+def _set_toon_materials(context, params):
+    settings = getattr(context.scene, "gk_settings", None)
+    if settings is None:
+        return False, "取不到场景设置"
+    raw = str(params.get("value") or "").strip().lower()
+    if raw not in ("true", "false", "1", "0", "on", "off", "是", "否"):
+        return False, f"要 true / false,收到『{params.get('value')}』"
+    on = raw in ("true", "1", "on", "是")
+    settings.toon_materials = on
+    return True, f"卡通材质已{'打开' if on else '关闭'}"
+
+
 @_action("export_script", "导出为 Godot 脚本", (),
          "把节点图重新生成一遍 GDScript 落进 Godot 工程")
 def _export_script(context, params):

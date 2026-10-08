@@ -12825,7 +12825,7 @@ class TestRound56AdvisorTools(Base):
 
         from BlenderGameKit import advisor
         advisor.cancel_agent()
-        advisor.clear_proposal()
+        advisor.clear_proposals()
         rounds = [
             {"choices": [{"message": {
                 "content": "",
@@ -12857,16 +12857,160 @@ class TestRound56AdvisorTools(Base):
             advisor.call_chat_raw = original
 
         self.assertEqual(state, "done", f"{state} {result}")
-        card = advisor.agent_proposal()
-        self.assertIsNotNone(card, "提议卡片没生成")
-        self.assertEqual(card["action"], "enable_god_camera")
-        self.assertEqual(card["label"], "打开上帝摄像机")
+        cards = advisor.agent_proposals()
+        self.assertEqual(len(cards), 1, cards)
+        self.assertEqual(cards[0]["action"], "enable_god_camera")
+        self.assertEqual(cards[0]["label"], "打开上帝摄像机")
         # 喂回模型的说明必须**明确**它没有改动能力
         tool_messages = [m for m in sent[1] if m.get("role") == "tool"]
         self.assertIn("他点『执行』才会生效", tool_messages[0]["content"])
         # 用户还没点 -> 清了卡片就什么都没发生
-        advisor.clear_proposal()
-        self.assertIsNone(advisor.agent_proposal())
+        advisor.clear_proposals()
+        self.assertEqual(advisor.agent_proposals(), [])
+
+    def test_multiple_proposals_are_kept(self):
+        """AI 一口气建议好几处改动时,**每一条都要留下**。
+
+        踩过的设计缺陷:原来只存一张卡片,后一张**覆盖**前一张 ——
+        模型说"建议 A,也建议 B",侧栏只显示 B,A **静默消失**,
+        用户根本没机会看到。
+        """
+        import time
+
+        from BlenderGameKit import advisor
+        advisor.cancel_agent()
+        advisor.clear_proposals()
+        # 一轮里同时提议两件事(模型一次返回两个 tool_calls)
+        rounds = [
+            {"choices": [{"message": {"tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "propose_action",
+                    "arguments": '{"action": "enable_god_camera",'
+                                 ' "why": "方便看场景"}'}},
+                {"id": "c2", "type": "function", "function": {
+                    "name": "propose_action",
+                    "arguments": '{"action": "enable_script_target",'
+                                 ' "target": "Body", "why": "角色不动"}'}},
+            ]}}]},
+            {"choices": [{"message": {"content": "我建议这两处"}}]},
+        ]
+        sent = []
+
+        def fake_raw(_b, _k, _m, messages, timeout=60, tools=None):
+            sent.append(1)
+            return True, rounds[min(len(sent) - 1, len(rounds) - 1)]
+
+        original = advisor.call_chat_raw
+        advisor.call_chat_raw = fake_raw
+        try:
+            advisor.start_agent("http://x", "k", "m", [])
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                state, result = advisor.poll_agent_step(None)
+                if state == "done":
+                    break
+                time.sleep(0.01)
+        finally:
+            advisor.call_chat_raw = original
+
+        cards = advisor.agent_proposals()
+        self.assertEqual(len(cards), 2, cards)          # 两条都在
+        self.assertEqual([c["action"] for c in cards],
+                         ["enable_god_camera", "enable_script_target"])
+        self.assertEqual(cards[1]["target"], "Body")
+
+        # ── 按下标点名:忽略第 2 张不能动到第 1 张 ────────────────
+        self.assertEqual(advisor.proposal_at(1)["action"], "enable_script_target")
+        self.assertTrue(advisor.drop_proposal(1))
+        left = advisor.agent_proposals()
+        self.assertEqual(len(left), 1, left)
+        self.assertEqual(left[0]["action"], "enable_god_camera",
+                         "忽略第二张时把第一张也弄丢了")
+        # 越界/坏下标都给 None,不抛
+        self.assertIsNone(advisor.proposal_at(9))
+        self.assertIsNone(advisor.proposal_at("不是数字"))
+        self.assertFalse(advisor.drop_proposal(9))
+        advisor.clear_proposals()
+
+    def test_tools_unsupported_degrades_gracefully(self):
+        """模型不支持工具调用时:自动脱掉 tools 重试,并**记住**别每轮都试。
+
+        真会踩:Ollama 上一个小模型收到带 tools 的请求会直接 400,
+        用户看到的就是"AI 顾问突然坏了"。
+        """
+        from BlenderGameKit import advisor
+        advisor.reset_tools_disabled()
+        self.assertFalse(advisor.tools_disabled())
+
+        # 报错文本识别(中英都要认)
+        self.assertTrue(advisor.tools_unsupported_in(
+            '{"error": {"message": "tools is not supported by this model"}}'))
+        self.assertTrue(advisor.tools_unsupported_in("该模型不支持 tools 参数"))
+        self.assertFalse(advisor.tools_unsupported_in("invalid api key"))
+        self.assertFalse(advisor.tools_unsupported_in(""))
+        # 不含 tool/function 字样的报错不该被误判
+        self.assertFalse(advisor.tools_unsupported_in("model not found"))
+
+        calls = []
+
+        def fake_post(url, api_key, payload, timeout):
+            calls.append(payload)
+            if "tools" in payload:
+                return False, ('AI 请求失败(HTTP 400)。\n'
+                               '{"error":{"message":"tools is not supported"}}')
+            return True, {"choices": [{"message": {"content": "脱掉工具也能答"}}]}
+
+        original = advisor._post_json
+        advisor._post_json = fake_post
+        try:
+            ok, data = advisor.call_chat_raw("http://x", "k", "m", [],
+                                             tools=[{"type": "function"}])
+        finally:
+            advisor._post_json = original
+
+        self.assertTrue(ok, data)
+        self.assertEqual(len(calls), 2, "应该重试一次")
+        self.assertIn("tools", calls[0])              # 第一次带工具
+        self.assertNotIn("tools", calls[1])           # 第二次脱掉了
+        self.assertTrue(advisor.tools_disabled(), "要记住,别每轮都白试")
+        advisor.reset_tools_disabled()
+
+    def test_tools_unsupported_not_swallowed_for_other_errors(self):
+        """别的 400(比如模型名写错)不能被当成"不支持工具"悄悄重试。"""
+        from BlenderGameKit import advisor
+        advisor.reset_tools_disabled()
+        calls = []
+
+        def fake_post(url, api_key, payload, timeout):
+            calls.append(payload)
+            return False, "AI 请求失败(HTTP 400)。\nmodel not found"
+
+        original = advisor._post_json
+        advisor._post_json = fake_post
+        try:
+            ok, data = advisor.call_chat_raw("http://x", "k", "m", [],
+                                             tools=[{"type": "function"}])
+        finally:
+            advisor._post_json = original
+        self.assertFalse(ok)
+        self.assertIn("model not found", data)         # 原样报给用户
+        self.assertEqual(len(calls), 1, "不该白试第二次")
+        self.assertFalse(advisor.tools_disabled())
+
+    def test_system_prompt_lists_actions(self):
+        """系统提示里必须**列出**动作清单 —— 否则模型只能编动作名。"""
+        from BlenderGameKit import advisor, advisor_tools
+        messages = advisor.build_messages("怎么改", "快照")
+        system = messages[0]["content"]
+        self.assertIn("可用的动作", system)
+        for name in ("enable_script_target", "set_dimension",
+                     "create_godot_project"):
+            self.assertIn(name, system, name)
+        # 需要参数的动作要写明要哪些参数
+        self.assertIn("target", system)
+        self.assertNotEqual(advisor._action_lines(), "")
+        self.assertEqual(len(advisor_tools.action_names()) >= 9, True,
+                         advisor_tools.action_names())
 
     def test_agent_bad_arguments_does_not_abort(self):
         """模型给了坏 JSON 参数:不整轮报废,而是把"参数有问题"喂回去。"""

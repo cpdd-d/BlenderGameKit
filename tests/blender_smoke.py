@@ -2525,31 +2525,50 @@ def main():
               bool(settings.god_camera) is False, str(settings.god_camera))
 
         # 3) 用户点『执行』才真改
-        adv2._AGENT["proposal"] = card
-        result = bpy.ops.gk.apply_advisor_action()
+        adv2.add_proposal(card)
+        result = bpy.ops.gk.apply_advisor_action(index=0)
         check("点『执行』才真的改了项目",
               result == {"FINISHED"} and bool(settings.god_camera) is True,
               f"{result} god_camera={settings.god_camera}")
         check("执行完卡片就没了(不会重复执行)",
-              adv2.agent_proposal() is None)
+              adv2.agent_proposals() == [])
         # 没有卡片时点执行要明确拒绝
         try:
-            bpy.ops.gk.apply_advisor_action()
+            bpy.ops.gk.apply_advisor_action(index=0)
             check("没有待确认动作时『执行』被挡下", False, "竟然返回成功")
         except RuntimeError as exc:
             check("没有待确认动作时『执行』被挡下", "没有待确认的动作" in str(exc),
                   str(exc)[:60])
 
-        # 4) 忽略 = 数据一动不动
+        # 4) 多张卡片时**按下标点名**:忽略第 2 张不能动到第 1 张
         settings.god_camera = False
-        _note, card2 = at_mod.build_proposal({"action": "enable_god_camera",
-                                              "why": "再看看"})
-        adv2._AGENT["proposal"] = card2
-        result = bpy.ops.gk.dismiss_advisor_action()
-        check("『忽略』不改数据且清掉卡片",
-              result == {"FINISHED"} and bool(settings.god_camera) is False
-              and adv2.agent_proposal() is None,
-              f"{result} god_camera={settings.god_camera}")
+        _n1, cam_card = at_mod.build_proposal({"action": "enable_god_camera",
+                                               "why": "看场景"})
+        _n2, toon_card = at_mod.build_proposal(
+            {"action": "set_toon_materials", "value": "false",
+             "why": "想核对细节"})
+        adv2.add_proposal(cam_card)
+        adv2.add_proposal(toon_card)
+        check("两张卡片都在(不会互相覆盖)",
+              len(adv2.agent_proposals()) == 2,
+              str([c["action"] for c in adv2.agent_proposals()]))
+        result = bpy.ops.gk.dismiss_advisor_action(index=1)
+        left = adv2.agent_proposals()
+        check("『忽略』按**下标**点名(忽略第 2 张不误伤第 1 张)",
+              result == {"FINISHED"} and len(left) == 1
+              and left[0]["action"] == "enable_god_camera"
+              and bool(settings.god_camera) is False,
+              f"{result} 剩={[c['action'] for c in left]}")
+        adv2.clear_proposals()
+
+        # 4b) 新登记的动作也要真能落地(卡通材质开关)
+        saved_toon = bool(settings.toon_materials)
+        apply_card = {"action": "set_toon_materials",
+                      "target": "", "value": "false"}
+        ok2, msg2 = at_mod.apply_proposal(bpy.context, apply_card)
+        check("新动作 set_toon_materials 能落地",
+              ok2 and bool(settings.toon_materials) is False, msg2)
+        settings.toon_materials = saved_toon
 
         # 5) 手动执行入口(不经过 AI)也要能用 —— 枚举得列得出动作
         items = at_mod.action_menu_items(None)
