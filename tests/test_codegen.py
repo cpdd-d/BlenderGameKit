@@ -23,8 +23,8 @@ import gk_stub  # noqa: E402
 gk_stub.install()
 ADDON = gk_stub.load_addon(os.path.join(ROOT, "BlenderGameKit"))
 
-from BlenderGameKit import (blender_adapter, codegen, exporter, models, paths,  # noqa: E402
-                            project)
+from BlenderGameKit import (blender_adapter, codegen, exporter, models,  # noqa: E402
+                            node_groups, paths, project)
 from BlenderGameKit.nodes import node_base as NB  # noqa: E402
 from BlenderGameKit.nodes import nodes as NN  # noqa: E402
 
@@ -13673,6 +13673,184 @@ class TestRound61BlendTree(Base):
         self.assertNotIn("AnimationTree", code)
         self.assertNotIn("blend_position", code)
         self.assertNotIn("_gk_ensure_blend_tree", code)
+
+
+class TestRound62NodeGroups(Base):
+    """第六十二轮:分组框(可折叠)。
+
+    ── 这一轮为什么"几乎没有生成逻辑"────────────────────────────────
+    用户的原话是"节点图一大就没法整理"——要的是**可读性**,不是复用
+    (复用归『折叠成函数』管)。所以做法是在 Blender 原生 `NodeFrame`
+    上补一层折叠:收起 = 框内节点 `hide = True` + 框缩成一条标题栏。
+
+    铁律:**生成的代码一个字都不能变**。`NodeFrame` 本来就不是 GK 节点,
+    codegen 会跳过它;`node.hide` 也只是显示开关,连线一条不少。
+    下面把这条锁死 —— 免得以后有人"顺手"在遍历里加一句
+    `if node.hide: continue`,把折叠变成一个会改行为的开关。
+    """
+
+    class _Frame:
+        """离线替身:只实现 node_groups 真正会碰的那几个属性。"""
+
+        def __init__(self, name="分组", height=200.0, label="分组"):
+            self.bl_idname = "NodeFrame"
+            self.name = name
+            self.label = label
+            self.location = (0.0, 0.0)
+            self.width = 300.0
+            self.height = height
+            self.hide = False
+            self.parent = None
+            self.use_custom_color = False
+            self.color = (0.16, 0.30, 0.45)
+            self._props = {}
+
+        def __getitem__(self, key):
+            return self._props[key]
+
+        def __setitem__(self, key, value):
+            self._props[key] = value
+
+        def get(self, key, default=None):
+            return self._props.get(key, default)
+
+    def _frame(self, tree, name="分组", height=200.0):
+        frame = self._Frame(name=name, height=height)
+        tree.nodes.append(frame)
+        return frame
+
+    # ---- 折叠 / 展开本身 ----
+
+    def test_collapse_hides_children_and_shrinks(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
+        frame = self._frame(tree, height=180.0)
+        event.parent = frame
+        printer.parent = frame
+
+        self.assertFalse(node_groups.is_collapsed(frame))
+        self.assertTrue(node_groups.collapse(tree, frame))
+        self.assertTrue(event.hide and printer.hide)
+        self.assertAlmostEqual(frame.height, node_groups.GROUP_BAR_HEIGHT)
+        self.assertTrue(node_groups.is_collapsed(frame))
+        # 收起态换个颜色(收着东西一眼看得出来)
+        self.assertEqual(tuple(frame.color), node_groups.COLLAPSED_COLOR)
+
+        self.assertTrue(node_groups.expand(tree, frame))
+        self.assertFalse(event.hide or printer.hide)
+        self.assertAlmostEqual(frame.height, 180.0)
+        self.assertFalse(node_groups.is_collapsed(frame))
+        self.assertEqual(tuple(frame.color), (0.16, 0.30, 0.45))
+
+    def test_collapse_twice_is_a_noop(self):
+        tree = make_tree()
+        node = tree.new_node(NN.GKNodePrint, "打印")
+        frame = self._frame(tree)
+        node.parent = frame
+        self.assertTrue(node_groups.collapse(tree, frame))
+        # 第二次不该"再记一次原高度"(记的会是收起后的 30 -> 展开就回不去)
+        self.assertFalse(node_groups.collapse(tree, frame))
+        self.assertTrue(node_groups.expand(tree, frame))
+        self.assertAlmostEqual(frame.height, 200.0)
+
+    def test_toggle_reports_resulting_state(self):
+        tree = make_tree()
+        node = tree.new_node(NN.GKNodePrint, "打印")
+        frame = self._frame(tree)
+        node.parent = frame
+        self.assertTrue(node_groups.toggle(tree, frame))     # 收起
+        self.assertTrue(node.hide)
+        self.assertFalse(node_groups.toggle(tree, frame))    # 展开
+        self.assertFalse(node.hide)
+
+    # ---- 嵌套 ----
+
+    def test_descendants_walk_nested_frames(self):
+        tree = make_tree()
+        outer = self._frame(tree, "外层")
+        inner = self._frame(tree, "内层")
+        inner.parent = outer
+        deep = tree.new_node(NN.GKNodePrint, "深处的打印")
+        deep.parent = inner
+        near = tree.new_node(NN.GKNodePrint, "外层的打印")
+        near.parent = outer
+
+        self.assertEqual([n.name for n in node_groups.direct_children(tree, outer)],
+                         ["内层", "外层的打印"])
+        self.assertEqual(sorted(n.name for n in node_groups.descendants(tree, outer)),
+                         sorted(["内层", "深处的打印", "外层的打印"]))
+        self.assertEqual(node_groups.count_nodes(tree, outer), 3)
+        # 从最里面的节点往上找,先碰到内层
+        self.assertEqual(node_groups.frame_of(deep).name, "内层")
+        self.assertEqual(node_groups.frame_of(inner).name, "外层")
+
+    def test_expanding_outer_keeps_inner_collapsed(self):
+        """外层展开时,里面那个**自己收着**的组不能被一起摊开。"""
+        tree = make_tree()
+        outer = self._frame(tree, "外层")
+        inner = self._frame(tree, "内层")
+        inner.parent = outer
+        deep = tree.new_node(NN.GKNodePrint, "深处的打印")
+        deep.parent = inner
+
+        node_groups.collapse(tree, inner)
+        self.assertTrue(deep.hide)
+        node_groups.collapse(tree, outer)
+        # 外层收起 -> 里面全藏(包括内层这个框自己)
+        self.assertTrue(deep.hide and inner.hide)
+        node_groups.expand(tree, outer)
+        self.assertFalse(inner.hide)     # 内层框本身回来了
+        self.assertTrue(deep.hide)       # 但里面那组还是收着的
+        self.assertTrue(node_groups.is_collapsed(inner))
+
+    def test_nested_collapse_hides_whole_subtree(self):
+        tree = make_tree()
+        outer = self._frame(tree, "外层")
+        inner = self._frame(tree, "内层")
+        inner.parent = outer
+        deep = tree.new_node(NN.GKNodePrint, "深处的打印")
+        deep.parent = inner
+        node_groups.collapse(tree, outer)
+        self.assertTrue(inner.hide and deep.hide)
+
+    # ---- 对代码生成零影响(这一轮最重要的一条)----
+
+    def test_collapsed_group_generates_identical_code(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="你好")
+        direction = tree.new_node(NN.GKNodeGetVector, "方向输入")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=240.0)
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        gk_stub.connect(tree, event, "执行", move, "执行")
+        gk_stub.connect(tree, direction, "方向", move, "方向")
+
+        frame = self._frame(tree, "开局", height=220.0)
+        for node in (event, printer, direction, move):
+            node.parent = frame
+
+        before, _ = gen(tree, V3)
+        self.assertIn("move_and_slide()", before)
+
+        node_groups.collapse(tree, frame)
+        after, _ = gen(tree, V3)
+        # 逐字一样:折叠只是显示,连线一条不少、事件照旧一个个都生成
+        self.assertEqual(before, after)
+
+        node_groups.expand(tree, frame)
+        again, _ = gen(tree, V3)
+        self.assertEqual(before, again)
+
+    def test_frame_alone_never_shows_up_in_code(self):
+        """一张只有框、没有 GK 节点的图 -> 不生成任何东西(不是"生成一段空壳")。"""
+        tree = make_tree()
+        frame = self._frame(tree)
+        lonely = tree.new_node(NN.GKNodePrint, "打印")
+        lonely.parent = frame
+        code, _ = gen(tree, V3)
+        self.assertNotIn("NodeFrame", code)
+        self.assertNotIn("分组", code)
 
 
 if __name__ == "__main__":

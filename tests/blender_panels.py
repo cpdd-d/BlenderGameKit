@@ -52,6 +52,7 @@ class RecordingLayout:
     def __init__(self):
         self.calls = []
         self.operator_names = []      # 画出来的按钮 idname(第一段参数)
+        self.texts = []               # 画出来的文字(给"盒子有没有反映状态"用)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -59,6 +60,11 @@ class RecordingLayout:
 
         def recorder(*args, **kwargs):
             self.calls.append(name)
+            text = kwargs.get("text")
+            if text:
+                self.texts.append(str(text))
+            elif args and isinstance(args[0], str) and name != "operator":
+                self.texts.append(args[0])
             if name == "operator" and args:
                 self.operator_names.append(str(args[0]))
             return self
@@ -334,9 +340,54 @@ def main():
         check("『游戏资产』面板", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6. 『分组框』侧栏盒子(第六十二轮)----
+    # 收起后的框只剩一条细标题栏,想再展开得先在图里找到那条细杠 ——
+    # 侧栏这一盒就是"按名字点一下就地开合"的入口,画不出来(或者计数
+    # 不跟着状态走)整块功能就白做了。
+    print("=" * 72)
+    print("6. 『分组框』侧栏盒子")
+    print("=" * 72)
+    try:
+        node_groups = import_module(f"{module_name}.node_groups")
+        tree = bpy.data.node_groups.new("面板冒烟分组62", "GKGameLogicTree")
+        first = tree.nodes.new("GKNodeOnReady")
+        second = tree.nodes.new("GKNodePrint")
+        frame = tree.nodes.new("NodeFrame")
+        frame.label = "开场"
+        frame.location = (0.0, 80.0)
+        for node in (first, second):
+            node.parent = frame
+
+        panel = getattr(ui, "GK_PT_Main", None)
+        if panel is None:
+            check("GK_PT_Main 存在", False, "类找不到")
+        else:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, tree))
+            names = list(layout.operator_names)
+            # 一个组一个开合按钮 + 『全部收起』『全部展开』= 3 个
+            check("『分组框』盒子画出了开合按钮",
+                  names.count("gk.toggle_group") >= 3, str(sorted(set(names))))
+            check("盒子标题报了组数与收起数",
+                  any("1 组" in text and "0 收起" in text for text in layout.texts),
+                  str(layout.texts[-6:]))
+
+            node_groups.collapse(tree, frame)
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, tree))
+            check("收起后盒子计数跟着变(读的是真状态)",
+                  any("1 收起" in text for text in layout.texts),
+                  str(layout.texts[-6:]))
+            node_groups.expand(tree, frame)
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『分组框』侧栏盒子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     addon_utils.disable(module_name, default_set=True)
     return 0
-
 
 try:
     code = main()

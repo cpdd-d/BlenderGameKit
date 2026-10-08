@@ -11,8 +11,8 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
 
 from . import (advisor, advisor_tools, asset_export, codegen, curve_assets,
-               export_report, exporter, gk_log, npr_preview, packaging,
-               project)
+               export_report, exporter, gk_log, node_groups, npr_preview,
+               packaging, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -400,15 +400,16 @@ def comment_box_rect(nodes):
 
 
 class GK_OT_AddCommentBox(bpy.types.Operator):
-    """把选中的节点框进一个注释框(UE 蓝图的 Comment Box)。
+    """把选中的节点框成一个**分组框**(照 UE 蓝图的 Comment Box)。
 
-    不生成任何代码 —— 它只是节点图上的排版/备注工具。
+    不生成任何代码 —— 它只是节点图上的排版工具。第六十二轮给它补上了
+    "可折叠":框起来之后可以收成一条标题栏(见 GK_OT_ToggleGroup)。
     """
 
     bl_idname = "gk.add_comment_box"
-    bl_label = "注释框"
-    bl_description = ("把选中的节点框起来:可写标题、改颜色,拖动框会带着节点一起走。"
-                      "不生成任何代码")
+    bl_label = "分组框"
+    bl_description = ("把选中的节点框成一组:可写标题、改颜色,拖动框会带着"
+                      "节点一起走;还能『折叠』收成一条标题栏。不生成任何代码")
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -420,7 +421,7 @@ class GK_OT_AddCommentBox(bpy.types.Operator):
                   if getattr(node, "select", False)
                   and getattr(node, "bl_idname", "") != "NodeFrame"]
         if not picked:
-            _report(self, "ERROR", "先选中要框住的节点,再点『注释框』")
+            _report(self, "ERROR", "先选中要框住的节点,再点『分组框』")
             return {"CANCELLED"}
 
         location, width, height = comment_box_rect(picked)
@@ -435,7 +436,7 @@ class GK_OT_AddCommentBox(bpy.types.Operator):
         frame.height = height
         frame.use_custom_color = True
         frame.color = (0.16, 0.30, 0.45)
-        frame.label = "注释"
+        frame.label = "分组"
         frame.label_size = 16
         for node in picked:
             node.parent = frame
@@ -445,7 +446,111 @@ class GK_OT_AddCommentBox(bpy.types.Operator):
         frame.select = True
         tree.nodes.active = frame
         _report(self, "INFO",
-                f"已把 {len(picked)} 个节点框进注释框。按 F2 改标题,侧栏可改颜色")
+                f"已把 {len(picked)} 个节点框成分组框。按 F2 改标题,"
+                f"右键 → 『折叠分组框』可以收起来")
+        return {"FINISHED"}
+
+
+class GK_OT_ToggleGroup(bpy.types.Operator):
+    """折叠 / 展开分组框(第六十二轮)。
+
+    收起 = 框内节点先藏起来、框缩成一条标题栏;展开 = 原样还原。
+    纯显示操作,**生成的代码一个字都不变**(NodeFrame 本来就不参与生成,
+    `node.hide` 也不会动连线)。
+
+    三种用法:
+      * 选中某个框 → 收起/展开它(点框**里面**的节点也算,自动往上找);
+      * 侧栏『分组框』里按名字点某一个 → 收起/展开那一个;
+      * 『全部收起 / 全部展开』→ 把这张图里所有分组框一锅端。
+
+    ── 为什么"全部"也放在同一个算子上 ──────────────────────────────
+    侧栏那两个按钮和逐个切换**做的事完全一样**,只是作用范围不同。
+    拆成三个算子的话,"找不到目标怎么报错""树怎么取"这些要抄三遍。
+    """
+
+    bl_idname = "gk.toggle_group"
+    bl_label = "折叠/展开分组框"
+    bl_description = ("把选中的分组框收起来(框内节点暂时隐藏、框缩成一条"
+                      "标题栏),再点一次展开。不生成任何代码")
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: EnumProperty(
+        name="方式",
+        items=(
+            ("TOGGLE", "折叠/展开", "把选中的框逐个翻转"),
+            ("COLLAPSE", "全部收起", "这张图里所有分组框都收起来"),
+            ("EXPAND", "全部展开", "这张图里所有分组框都展开"),
+        ),
+        default="TOGGLE",
+    )
+    group_name: StringProperty(
+        name="分组框名", default="",
+        description="指名操作某一个分组框;留空 = 用选中的那个")
+
+    def _targets(self, tree):
+        """这次要对哪些框动手。
+
+        名字 > 选中 > (全部模式下的)整张图。比较用 `name` 而不是对象本身 ——
+        `bpy_struct` 的 `in` / `==` 语义不值得依赖,而且同名框本来也不该有。
+        """
+        if self.group_name:
+            named = tree.nodes.get(self.group_name)
+            if named is not None and node_groups.is_frame(named):
+                return [named]
+            return []
+        if self.mode in ("COLLAPSE", "EXPAND"):
+            return node_groups.frames_in(tree)
+        picked = []
+        seen = set()
+        for node in tree.nodes:
+            if not getattr(node, "select", False):
+                continue
+            frame = node if node_groups.is_frame(node) else node_groups.frame_of(node)
+            if frame is not None and frame.name not in seen:
+                seen.add(frame.name)
+                picked.append(frame)
+        # 选中的节点可能**都在框里**却没选中框本身 —— 再看一眼当前节点
+        active = getattr(tree.nodes, "active", None)
+        if active is not None:
+            frame = (active if node_groups.is_frame(active)
+                     else node_groups.frame_of(active))
+            if frame is not None and frame.name not in seen:
+                picked.append(frame)
+        return picked
+
+    def execute(self, context):
+        tree = _tree_of(self, context)
+        if tree is None:
+            _report(self, "ERROR", "请先打开『游戏逻辑』或『游戏动画』节点图")
+            return {"CANCELLED"}
+        targets = self._targets(tree)
+        if not targets:
+            if tree is not None and not node_groups.frames_in(tree):
+                _report(self, "ERROR",
+                        "这张图还没有分组框 —— 先选中几个节点,"
+                        "右键 → 『分组框』框起来")
+            else:
+                _report(self, "ERROR", "先点一下要折叠的那个分组框,再执行")
+            return {"CANCELLED"}
+        changed = 0
+        collapsed = 0
+        for frame in targets:
+            if self.mode == "COLLAPSE":
+                changed += 1 if node_groups.collapse(tree, frame) else 0
+            elif self.mode == "EXPAND":
+                changed += 1 if node_groups.expand(tree, frame) else 0
+            else:
+                node_groups.toggle(tree, frame)
+                changed += 1
+            collapsed += 1 if node_groups.is_collapsed(frame) else 0
+        if self.mode == "EXPAND":
+            _report(self, "INFO", f"展开了 {changed} 个分组框")
+        elif self.mode == "COLLAPSE":
+            _report(self, "INFO", f"收起了 {changed} 个分组框")
+        else:
+            _report(self, "INFO",
+                    f"{'收起' if collapsed == len(targets) else '展开'}了 "
+                    f"{len(targets)} 个分组框")
         return {"FINISHED"}
 
 
@@ -3408,6 +3513,8 @@ class GK_OT_ResetSettings(bpy.types.Operator):
 GK_CLASSES = (
     GK_OT_AddNode,
     GK_OT_AddCommentBox,
+    # 分组框的折叠 / 展开(第六十二轮)
+    GK_OT_ToggleGroup,
     # 变量集中面板:查找引用 + 放取/设节点
     GK_OT_VarFindRefs,
     GK_OT_VarMakeNode,

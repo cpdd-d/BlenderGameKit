@@ -9,6 +9,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
 from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
                exporter, gk_log, project)
 from . import asset_export
+from . import node_groups
 from . import operator_io as ops
 from . import properties as props
 from .nodes import nodes as node_lib
@@ -2246,8 +2247,10 @@ def _make_tools_menu():
         layout = self.layout
         layout.operator("gk.auto_link", text="把选中的两个节点连起来",
                         icon="LINKED")
-        layout.operator("gk.add_comment_box", text="注释框(框住选中节点)",
+        layout.operator("gk.add_comment_box", text="分组框(框住选中节点)",
                         icon="PIVOT_BOUNDBOX")
+        layout.operator("gk.toggle_group", text="折叠/展开分组框(选中的)",
+                        icon="TRIA_RIGHT")
         layout.operator("gk.collapse_to_function",
                         text="折叠成函数(框住选中节点)", icon="FILE_SCRIPT")
 
@@ -2255,7 +2258,7 @@ def _make_tools_menu():
         "bl_idname": _menu_name("节点工具"),
         "bl_label": "节点工具",
         "draw": draw,
-        "__doc__": "自动连线 / 注释框 / 折叠成函数",
+        "__doc__": "自动连线 / 分组框 / 折叠成函数",
     })
 
 
@@ -3641,6 +3644,50 @@ def _draw_function_box(layout, context):
                       text="折叠选中的节点成函数", icon="FILE_SCRIPT")
 
 
+def _draw_group_box(layout, context):
+    """侧栏『分组框』盒子(第六十二轮):图里有哪些组、各收没收起。
+
+    ── 为什么需要它 ─────────────────────────────────────────────────
+    收起后的框只剩一条细标题栏 —— 想再展开得先在图里找到那条细杠、
+    再右键。**图一大,找那条杠本身就成了新负担**(折叠本来是为了好找东西)。
+    所以这里按名字把组全列出来,点一下就地展开/收起,一眼还能看到
+    "哪几组收着"。上面那行计数(`N 组 · M 收起`)也顺手回答了
+    "我这张图现在露出多少结构"。
+
+    只列**当前那张游戏逻辑图**的组 —— 和『函数』『变量』盒子一个规矩:
+    侧栏这几个盒子都是"这张图里有什么"的视角。别的树(动画 / AI / 显示)
+    里的组用右键『折叠/展开分组框』照样能收。
+    """
+    tree = _logic_tree_of(context)
+    if tree is None:
+        return
+    frames = node_groups.frames_in(tree)
+    if not frames:
+        return
+    collapsed = sum(1 for frame in frames if node_groups.is_collapsed(frame))
+    box, opened = collapsible_box(
+        layout, "groups", f"分组框 ({len(frames)} 组 · {collapsed} 收起)",
+        "PIVOT_BOUNDBOX")
+    if not opened:
+        return
+
+    for frame in frames:
+        folded = node_groups.is_collapsed(frame)
+        row = box.row(align=True)
+        op = row.operator(
+            "gk.toggle_group",
+            text=str(frame.label or frame.name),
+            icon="TRIA_RIGHT" if folded else "TRIA_DOWN")
+        op.group_name = frame.name
+        op.mode = "TOGGLE"
+        row.label(text=f"{node_groups.count_nodes(tree, frame)} 个")
+    buttons = box.row(align=True)
+    op = buttons.operator("gk.toggle_group", text="全部收起", icon="TRIA_RIGHT")
+    op.mode = "COLLAPSE"
+    op = buttons.operator("gk.toggle_group", text="全部展开", icon="TRIA_DOWN")
+    op.mode = "EXPAND"
+
+
 class GK_OT_CollapseToFunction(bpy.types.Operator):
     """把选中的一串节点**折叠成一个函数**(用户 2026-10-05 第十七轮)。
 
@@ -4739,6 +4786,9 @@ class GK_PT_Main(bpy.types.Panel):
         # ---- 函数(用户 2026-10-05 第十七轮:"查看函数,自定义函数")----
         _draw_function_box(layout, context)
 
+        # ---- 分组框(第六十二轮:"节点图一大就没法整理")----
+        _draw_group_box(layout, context)
+
         # ---- 导出脚本 ----
         settings = getattr(context.scene, "gk_settings", None)
         box, opened = collapsible_box(layout, "export_script",
@@ -5130,8 +5180,10 @@ def _draw_node_menu_contents(layout, context, nested=False):
         layout.menu(GK_MT_AddNodeCategories.bl_idname,
                     text="添加游戏逻辑节点", icon="NODETREE")
         layout.operator("gk.auto_link", text="把选中的两个节点连起来", icon="LINKED")
-        layout.operator("gk.add_comment_box", text="注释框(框住选中节点)",
+        layout.operator("gk.add_comment_box", text="分组框(框住选中节点)",
                         icon="PIVOT_BOUNDBOX")
+        layout.operator("gk.toggle_group", text="折叠/展开分组框(选中的)",
+                        icon="TRIA_RIGHT")
         return
 
     # ── flat 形态 ──────────────────────────────────────────────────

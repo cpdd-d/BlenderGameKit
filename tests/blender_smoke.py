@@ -165,9 +165,11 @@ def main():
           f"实际 {len(tree.links)} 条")
     check("第二条连同一个输入引脚会被拒绝", len(link_problems) == 1, str(link_problems))
 
-    # ---- 注释框(UE 蓝图的 Comment Box)----
+    # ---- 分组框(UE 蓝图的 Comment Box)+ 折叠(第六十二轮)----
     # 选中两个节点 -> 一键建框 -> 应该框住它们,而且**不影响代码生成**
     # (NodeFrame 不是 GK 节点,codegen 必须当它不存在)。
+    # 第六十二轮补了"折叠":收起时框内节点藏起来、框缩成一条;展开原样还原
+    # —— 全程生成的脚本必须**逐字一样**(`hide` 只是显示开关,连线一条不少)。
     try:
         for node in tree.nodes:
             node.select = False
@@ -177,15 +179,39 @@ def main():
         result = bpy.ops.gk.add_comment_box()
         frames = [n for n in tree.nodes if n.bl_idname == "NodeFrame"]
         frame = frames[0] if frames else None
-        check("注释框已创建", result == {"FINISHED"} and len(frames) == 1,
+        check("分组框已创建", result == {"FINISHED"} and len(frames) == 1,
               f"{result} frames={len(frames)}")
-        check("注释框认了两个子节点",
+        check("分组框认了两个子节点",
               frame is not None and do_jump.parent == frame and printer.parent == frame)
-        check("注释框有默认标题与颜色",
-              frame is not None and frame.label == "注释"
+        check("分组框有默认标题与颜色",
+              frame is not None and frame.label == "分组"
               and bool(frame.use_custom_color) and frame.width > 0.0)
+
+        options = {"dimension": "2", "base_class": "CharacterBody2D",
+                   "export_tunables": True}
+        before, _ = codegen.generate(tree, options)
+        full_height = float(frame.height)
+
+        # 收起:框内节点藏起来 + 框缩成一条标题栏
+        for node in tree.nodes:
+            node.select = node.name == frame.name
+        tree.nodes.active = frame
+        bpy.ops.gk.toggle_group()
+        check("折叠:框内节点都藏起来了", do_jump.hide and printer.hide,
+              f"{do_jump.hide} {printer.hide}")
+        check("折叠:框缩成一条标题栏", 0.0 < float(frame.height) < full_height,
+              f"{frame.height} <- {full_height}")
+        after, _ = codegen.generate(tree, options)
+        check("折叠前后生成的代码逐字一样", before == after)
+
+        # 展开:节点重新可见 + 框高还原
+        bpy.ops.gk.toggle_group()
+        check("展开:节点重新可见",
+              (not do_jump.hide) and (not printer.hide))
+        check("展开:框高还原", abs(float(frame.height) - full_height) < 1e-4,
+              f"{frame.height} vs {full_height}")
     except Exception as exc:
-        check("注释框", False, f"{type(exc).__name__}: {exc}")
+        check("分组框", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 碰撞形状的"智能推荐"(用户 2026-10-06:"正方体对角穿模")----
