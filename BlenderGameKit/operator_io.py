@@ -199,6 +199,13 @@ def _on_load_post(_dummy):
         restore_export(scene)
     except Exception:
         pass
+    # 对话历史也跟着文件走 —— 重开 .blend 还能接着上一轮聊(和上面
+    # restore_export 同一个理由)。**只恢复历史**,不去碰文本块:
+    # 文本块本身就在 .blend 里,Blender 自己会把它读回来。
+    try:
+        advisor.load_history(getattr(bpy.context, "scene", None))
+    except Exception:
+        pass
     # ── 引脚改名迁移必须在这里做(踩过的坑)──────────────────────────
     # Blender 加载 .blend 的顺序是"**先注册插件、再读文件**" ——
     # 注册时 `bpy.data.node_groups` 还是空的,那时候迁移什么也找不到。
@@ -2821,9 +2828,12 @@ def _auto_prepare(operator, context, directory):
         _report(operator, "WARNING", f"自动导出模型失败(继续): {exc}")
 
 
-# 项目顾问最近一次问答,供侧栏显示 / 复制。只在内存里:它是"刚才那一下"
-# 的对话,重开 Blender 后没必要留着(问题本身存在场景里,不会丢)。
+# 项目顾问的界面状态(侧栏显示用)。**对话内容**在 advisor.HISTORY 里,
+# 这里只放"现在处于什么状态"这种一会儿就过期的信息。
 LAST_ADVISOR = {}
+# 轮询后台请求的定时器间隔(秒)。0.3 是人感觉"立刻就跳"的粒度,
+# 又不至于每秒空转太多次。
+_ADVISOR_POLL_INTERVAL = 0.3
 
 
 def _copy_to_clipboard(context, operator, text, what):
@@ -2841,21 +2851,26 @@ def _copy_to_clipboard(context, operator, text, what):
 
 
 class GK_OT_AskAdvisor(bpy.types.Operator):
-    """把"项目诊断 + 你的问题"发给 AI 顾问,让它分析并给下一步。
+    """把"项目诊断 + 你的问题"发给 AI,让它分析并给下一步。
 
-    ── 为什么是阻塞调用(界面会没响应)──────────────────────────────
-    和『直接运行游戏』『打包成可执行文件』保持一致:先说一声要等,然后等。
-    好处是不用引线程 + 定时器轮询,少一整类难查的 bug。所以这里**必须**
-    在调用前把"要等多久、界面会没响应"讲清楚,否则会被当成卡死。
+    ── 为什么改成异步(用户 2026-10-08 的反馈)──────────────────────
+    第一版是**阻塞**的:点下去界面冻 60 秒 —— 只问一句还能忍,要"连续对话"
+    就完全不行,而且以后让 AI 连着调几个工具会直接冻死。现在改成后台线程发
+    请求 + 主线程定时器收结果:点完立刻返回,侧栏显示『正在问 AI…』,回复
+    到了自动追加进文本块。
     """
 
     bl_idname = "gk.ask_advisor"
     bl_label = "问 AI"
     bl_description = ("把项目诊断快照和你的问题发给 AI(需先填 AI 地址 / "
-                      "模型名 / API Key)")
+                      "模型名 / API Key)。发出后界面不会卡,回复自动进对话记录")
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        if advisor.is_busy():
+            _report(self, "ERROR", "上一条还在等 AI 回,稍等一下再发")
+            return {"CANCELLED"}
+
         settings = getattr(context.scene, "gk_settings", None)
         question = (getattr(settings, "advisor_question", "") or "").strip()
         if not question:
@@ -2882,22 +2897,21 @@ class GK_OT_AskAdvisor(bpy.types.Operator):
             _report(self, "ERROR", f"收集项目诊断失败: {type(exc).__name__}: {exc}")
             return {"CANCELLED"}
 
-        LAST_ADVISOR.clear()
-        LAST_ADVISOR.update({"question": question, "context": context_text,
-                             "answer": "", "error": ""})
-        # ── 一定要说"界面会没响应"──────────────────────────────────
-        # 不说的话,用户会以为插件挂了然后强杀 Blender。
-        _report(self, "INFO",
-                f"已收集 {len(context_text)} 字诊断,正在问 AI"
-                f"(最多等 60 秒,这期间 Blender 界面会没响应)")
-        messages = advisor.build_messages(question, context_text)
-        ok, text = advisor.call_chat(base_url, api_key, model, messages)
-        if not ok:
-            LAST_ADVISOR["error"] = text
-            _report(self, "ERROR", text)
+        # 历史 + **刚取的一份**快照(快照进系统消息,不进历史 —— 见
+        # advisor.build_messages 的说明:否则每轮带一份过期快照,越聊越错)
+        messages = advisor.build_messages(question, context_text,
+                                          advisor.HISTORY)
+        if not advisor.request_in_background(base_url, api_key, model, messages):
+            _report(self, "ERROR", "上一条还在等 AI 回,稍等一下再发")
             return {"CANCELLED"}
-        LAST_ADVISOR["answer"] = text
-        _report(self, "INFO", f"AI 回答了 {len(text)} 字,见侧栏『项目顾问』")
+
+        LAST_ADVISOR.clear()
+        LAST_ADVISOR.update({"status": "正在问 AI…", "question": question,
+                             "error": ""})
+        _start_advisor_poll()
+        _report(self, "INFO",
+                f"已发出(项目诊断 {len(context_text)} 字)。界面不会卡,"
+                f"回复到了会自动追加到文本块『{advisor.DIALOG_TEXT_NAME}』")
         return {"FINISHED"}
 
 
@@ -2931,30 +2945,171 @@ class GK_OT_CopyAdvisorContext(bpy.types.Operator):
                                   "诊断")
 
 
-class GK_OT_CopyAdvisorAnswer(bpy.types.Operator):
-    """把 AI 的回答复制到剪贴板。"""
+class GK_OT_OpenAdvisorDialog(bpy.types.Operator):
+    """在文本编辑器里打开对话记录(能滚动 / 选择 / 复制 / 搜索)。
 
-    bl_idname = "gk.copy_advisor_answer"
-    bl_label = "复制回答"
-    bl_description = "把 AI 顾问的回答整段复制到剪贴板"
+    ── 为什么"读的地方"是文本编辑器 ──────────────────────────────
+    用户的截图里,808 字的回答把侧栏撑满、没有滚动条、一行才十来个字。
+    侧栏的 label 结构上就干不了这个活(一行一个控件、不支持滚动)。
+    Blender 的文本编辑器天生能滚动/选择/复制/搜索 —— 把对话写进文本块、
+    用文本编辑器读,是插件能提供的最好形态(自定义编辑器窗口 Python 注册不了)。
+    """
+
+    bl_idname = "gk.open_advisor_dialog"
+    bl_label = "查看对话"
+    bl_description = "在文本编辑器里打开『GK 对话记录』"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        return _copy_to_clipboard(context, self, LAST_ADVISOR.get("answer", ""),
-                                  "AI 回答")
+        block = bpy.data.texts.get(advisor.DIALOG_TEXT_NAME)
+        if block is None:
+            _report(self, "ERROR",
+                    "还没有对话记录。先在『项目顾问』里写一句再点『问 AI』")
+            return {"CANCELLED"}
+
+        # 1) 已经有文本编辑器 -> 直接把内容切过去(**不动用户布局**,最不打扰)
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != "TEXT_EDITOR":
+                    continue
+                for space in area.spaces:
+                    if getattr(space, "type", "") == "TEXT_EDITOR":
+                        space.text = block
+                area.tag_redraw()
+                return {"FINISHED"}
+
+        # 2) 一块文本编辑器都没有 -> 开个新窗口,把它最大的一块改成文本编辑器
+        try:
+            bpy.ops.wm.window_new()
+        except Exception as exc:                          # noqa: BLE001
+            _report(self, "ERROR",
+                    f"开新窗口失败: {exc}\n"
+                    f"可以手动开一个文本编辑器,选『{advisor.DIALOG_TEXT_NAME}』")
+            return {"CANCELLED"}
+        window = bpy.context.window_manager.windows[-1]
+        area = _biggest_area(window)
+        if area is None:
+            _report(self, "ERROR", "新窗口里找不到可用区域,请手动开文本编辑器")
+            return {"CANCELLED"}
+        try:
+            area.type = "TEXT_EDITOR"
+            for space in area.spaces:
+                if getattr(space, "type", "") == "TEXT_EDITOR":
+                    space.text = block
+        except Exception as exc:                          # noqa: BLE001
+            _report(self, "ERROR", f"切换成文本编辑器失败: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+def _biggest_area(window):
+    """新窗口里挑面积最大的一块区域(拿它改成文本编辑器最不容易白屏)。"""
+    best = None
+    try:
+        areas = list(window.screen.areas)
+    except Exception:                                     # noqa: BLE001
+        return None
+    for area in areas:
+        if best is None or (area.width * area.height) > (best.width * best.height):
+            best = area
+    return best
 
 
 class GK_OT_ClearAdvisor(bpy.types.Operator):
-    """清掉侧栏里的问答结果。"""
+    """清空对话历史 + 对话记录文本块。"""
 
     bl_idname = "gk.clear_advisor"
-    bl_label = "清空"
-    bl_description = "清掉侧栏『项目顾问』里显示的回答"
+    bl_label = "清空对话"
+    bl_description = "清空对话历史与『GK 对话记录』文本块(下次问就不带旧上下文)"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
+        # 正在跑的先放弃等待,否则它回来还会往刚清空的记录里写一条
+        advisor.cancel_background()
+        advisor.clear_history()
+        advisor.save_history(context.scene)
+        advisor.clear_dialog_text()
         LAST_ADVISOR.clear()
+        _report(self, "INFO", "已清空对话历史与对话记录")
         return {"FINISHED"}
+
+
+def _start_advisor_poll():
+    """挂上轮询定时器(已经在挂就不重复挂)。"""
+    try:
+        if not bpy.app.timers.is_registered(_poll_advisor):
+            bpy.app.timers.register(_poll_advisor,
+                                    first_interval=_ADVISOR_POLL_INTERVAL)
+    except Exception as exc:                              # noqa: BLE001
+        gk_log.warn(f"挂 AI 轮询定时器失败(回复可能不会自动出现): {exc}")
+
+
+def _stop_advisor_poll():
+    try:
+        if bpy.app.timers.is_registered(_poll_advisor):
+            bpy.app.timers.unregister(_poll_advisor)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def _poll_advisor():
+    """主线程定时器:看后台请求好了没。返回 None = 注销自己。
+
+    只在**结果到了**才重画界面 —— 等待期间每秒重画几次纯属浪费,而且
+    用户看到的『正在问 AI…』本来就不需要动。
+    """
+    if not advisor.is_busy():
+        return None
+    result = advisor.poll_background()
+    if result is None:
+        return _ADVISOR_POLL_INTERVAL
+    _apply_advisor_result(*result)
+    _redraw_all_areas()
+    return None
+
+
+def _apply_advisor_result(ok, text):
+    """**主线程**里处理结果:写历史、写文本块、更新侧栏状态。
+
+    这一步必须回主线程做 —— 后台线程碰 bpy 会出"偶尔崩、偶尔不刷新"的
+    鬼影 bug(见 advisor 里那段说明)。
+    """
+    scene = getattr(bpy.context, "scene", None) or next(iter(bpy.data.scenes), None)
+    question = LAST_ADVISOR.get("question", "")
+    if ok:
+        # 到这一步才记进历史:失败的请求不该污染下一轮的上下文
+        advisor.remember("user", question)
+        advisor.remember("assistant", text)
+        advisor.save_history(scene)
+        try:
+            advisor.sync_dialog_text(question, text)
+        except Exception as exc:                          # noqa: BLE001
+            gk_log.warn(f"写对话记录失败(回答还在日志里): {exc}")
+        # 问完了就把输入框腾空,方便接着问下一句
+        settings = getattr(scene, "gk_settings", None) if scene else None
+        if settings is not None:
+            settings.advisor_question = ""
+        LAST_ADVISOR.update({"status": f"AI 已回复({len(text)} 字),"
+                                       f"已存入『{advisor.DIALOG_TEXT_NAME}』",
+                             "error": ""})
+        gk_log.info(f"AI 回答了 {len(text)} 字,已追加到对话记录")
+    else:
+        LAST_ADVISOR.update({"status": "", "error": text})
+        try:
+            advisor.sync_dialog_text(question, "", error=text)
+        except Exception:                                 # noqa: BLE001
+            pass
+        gk_log.error(text)
+
+
+def _redraw_all_areas():
+    """让侧栏重画(状态从『正在问 AI…』变成结果)。"""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 class GK_OT_RelinkProject(bpy.types.Operator):
@@ -3149,10 +3304,10 @@ GK_CLASSES = (
     # 打包发布:一键把工程打成可执行文件(补全流程最后断掉的一环)
     GK_OT_ExportRelease,
     GK_OT_OpenReleaseFolder,
-    # 项目顾问(AI):把项目诊断 + 你的问题交给模型分析
+    # 项目顾问(AI):把项目诊断 + 你的问题交给模型分析(异步,对话记录进文本块)
     GK_OT_AskAdvisor,
+    GK_OT_OpenAdvisorDialog,
     GK_OT_CopyAdvisorContext,
-    GK_OT_CopyAdvisorAnswer,
     GK_OT_ClearAdvisor,
     GK_OT_RelinkProject,
     GK_OT_DetectGodot,
@@ -3180,6 +3335,10 @@ def on_register():
 
 def on_unregister():
     _unregister_handlers()
+    # 定时器必须摘掉:它闭包里握着本模块的函数对象,插件注销后还在跑会报错
+    _stop_advisor_poll()
+    advisor.cancel_background()
+    advisor.clear_history()
     LAST_EXPORT.clear()
     LAST_RELEASE.clear()
     LAST_ADVISOR.clear()

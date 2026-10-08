@@ -4943,13 +4943,19 @@ class GK_PT_Main(bpy.types.Panel):
 
 
 def _draw_advisor_box(layout, context, settings):
-    """画『项目顾问』:把项目诊断交给 AI,要"下一步怎么做"。
+    """画『项目顾问』:提问 + 状态 + 『查看对话』。
+
+    ── 为什么这里**不再显示回答正文**(用户 2026-10-08 的反馈)────────
+    第一版把整段回答贴在这个盒子里,结果 808 字就把侧栏撑到看不见底、
+    **没有滚动条**、一行只放得下十来个字(用户的截图就是这样)。
+    侧栏的 label 是"一行一个控件",结构上干不了长文本这件事。
+    所以回答改到**Blender 文本块 + 文本编辑器**里读(能滚动/选择/复制/
+    搜索),这个盒子只留"问"和"状态"。请求也改成异步了,点完不卡。
 
     ── 为什么要有『复制诊断』这个不联网的按钮 ──────────────────────
     整理上下文才是这个功能里最值钱的部分 —— 一份把插件版本、碰撞体尺寸、
     节点图连线、生成的代码、导出告警全摊开的快照,**粘到任何 AI 里都能用**。
-    所以没配 API 的人也不该被挡在门外。而且它还能当"发出去之前先看一眼
-    要发什么"的检查手段。
+    所以没配 API 的人也不该被挡在门外。
     """
     box, opened = collapsible_box(layout, "advisor", "项目顾问(AI)", "HELP")
     if not opened:
@@ -4958,6 +4964,7 @@ def _draw_advisor_box(layout, context, settings):
     prefs = project.preferences(context)
     base_url = (getattr(prefs, "advisor_base_url", "") or "").strip() if prefs else ""
     configured = bool(base_url)
+    busy = advisor.is_busy()
 
     if settings is not None:
         box.prop(settings, "advisor_question", text="", icon="QUESTION")
@@ -4967,35 +4974,39 @@ def _draw_advisor_box(layout, context, settings):
     row = box.row(align=True)
     row.scale_y = 1.35
     ask = row.row(align=True)
-    # 没配 AI 就把『问 AI』置灰 —— 点了也只会报错,不如直接灰掉,
-    # 旁边留『复制诊断』这条能走通的路。
-    ask.enabled = configured and settings is not None
+    # 没配 AI、或上一条还在等回复 -> 置灰。点了也只会报错,不如直接灰掉,
+    # 旁边留『复制诊断』这条一定能走通的路。
+    ask.enabled = configured and settings is not None and not busy
     ask.operator("gk.ask_advisor", text="问 AI", icon="QUESTION")
-    row.operator("gk.copy_advisor_context", text="复制诊断", icon="COPYDOWN")
+    row.operator("gk.open_advisor_dialog", text="查看对话", icon="TEXT")
+    row.operator("gk.copy_advisor_context", text="", icon="COPYDOWN")
 
-    if not configured:
-        box.label(text="还没配 AI(偏好设置 -> 项目顾问)", icon="INFO")
-        box.label(text="也可以点『复制诊断』,粘给别处的 AI 问", icon="INFO")
-
-    # ── 结果区 ────────────────────────────────────────────────────
+    # ── 状态行 ────────────────────────────────────────────────────
     error = ops.LAST_ADVISOR.get("error", "")
-    answer = ops.LAST_ADVISOR.get("answer", "")
-    if error:
+    status = ops.LAST_ADVISOR.get("status", "")
+    if busy:
+        # 不显示"已等 N 秒":侧栏不会自己持续重画,数字会僵在那儿误导人。
+        box.label(text="正在问 AI…(界面不卡,回复到了自动进对话记录)",
+                  icon="TIME")
+    elif error:
         inner = box.box()
         inner.label(text="AI 调用失败", icon="ERROR")
-        for line in advisor.wrap(error, 46)[:12]:
+        for line in advisor.wrap(error, 46)[:8]:
             inner.label(text=line or " ")
-    elif answer:
-        inner = box.box()
-        head = inner.row(align=True)
-        head.label(text=f"AI 的回答({len(answer)} 字)", icon="CHECKMARK")
-        head.operator("gk.copy_advisor_answer", text="复制", icon="COPYDOWN")
-        head.operator("gk.clear_advisor", text="", icon="TRASH")
-        lines = advisor.wrap(answer, 46)
-        for line in lines[:60]:
-            inner.label(text=line or " ")
-        if len(lines) > 60:
-            inner.label(text="…(太长,点『复制』看全文)")
+    elif status:
+        box.label(text=status, icon="CHECKMARK")
+    elif configured:
+        box.label(text="回复会写进『GK 对话记录』,点『查看对话』读", icon="INFO")
+    else:
+        box.label(text="还没配 AI(偏好设置 -> 项目顾问)", icon="INFO")
+        box.label(text="也可以点右边那个复制按钮,粘给别处的 AI 问", icon="INFO")
+
+    row = box.row(align=True)
+    row.operator("gk.clear_advisor", text="清空对话", icon="TRASH")
+    rounds = len(advisor.HISTORY) // 2
+    if rounds:
+        row.label(text=f"已聊 {rounds} 轮(下次问会带上最近 "
+                       f"{advisor.MAX_HISTORY // 2} 轮)", icon="DOT")
 
 
 def _draw_project_box(layout, context):

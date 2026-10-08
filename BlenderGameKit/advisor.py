@@ -31,6 +31,8 @@
 """
 
 import json
+import threading
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -66,7 +68,25 @@ BlenderGameKit 让人**在 Blender 里**用中文节点图写游戏逻辑,导出
    写清在 Godot 里点哪里。
 5. **不要编造**插件里不存在的功能或节点名。快照里没有的信息就说"需要你
    确认一下…",不要猜。
-6. 能一两句说清就别写五段。用户是在干活,不是在读文章。"""
+6. 能一两句说清就别写五段。用户是在干活,不是在读文章。
+7. **用纯文本,不要 Markdown 标记** —— 显示环境不渲染 `**加粗**`、`# 标题`、
+   反引号代码块,打出来就是一堆星号。要分点就用 `1. 2. 3.` 或 `- `,
+   要强调就直接把话说清楚。"""
+
+
+# 对话历史最多带这么多条发给模型(一问一答算两条)。不限的话越聊越慢越贵,
+# 而且老消息里那些"当时的项目快照"早就过期了,留着只会误导。
+MAX_HISTORY = 12
+
+# 对话记录写进这个 Blender 文本块 —— 用户可以在文本编辑器里滚动 / 选择 /
+# 复制 / 搜索。用固定名字,下次打开同一个 .blend 还能接着看。
+DIALOG_TEXT_NAME = "GK 对话记录"
+
+# 对话历史的持久化键(存在场景自定义属性里,和 gk_last_export 同一套做法)
+HISTORY_KEY = "gk_advisor_history"
+
+# 会话内的对话历史:[{"role": "user"|"assistant", "content": str}]
+HISTORY = []
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +125,56 @@ def compose_text(question, context_text):
     )
 
 
-def build_messages(question, context_text, system_prompt=None):
-    """拼出 OpenAI 协议的 messages。"""
+def build_messages(question, context_text, history=None, system_prompt=None):
+    """拼出 OpenAI 协议的 messages(带多轮历史)。
+
+    ── 项目快照放**系统消息**里,不放用户消息里(多轮对话的关键)──────
+    一问一答都往用户消息里塞一份快照的话,聊到第五轮就有五份快照,
+    又慢又贵,而且前四份**早就过期了** —— 模型会拿着"当时的节点图"回答
+    现在的问题。放进系统消息就永远是**刚取的那一份**,历史消息则保持干净
+    的纯对话。代价是历史里 AI 说的"快照【2】写着…"要读者自己对应,
+    但换来的正确性值得。
+    """
     system = system_prompt or DEFAULT_SYSTEM_PROMPT
-    return [{"role": "system", "content": system},
-            {"role": "user", "content": compose_text(question, context_text)}]
+    if context_text:
+        system = f"{system}\n\n## 当前项目诊断快照\n{context_text}"
+    messages = [{"role": "system", "content": system}]
+    for item in list(history or [])[-MAX_HISTORY:]:
+        role = item.get("role")
+        content = (item.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": (question or "").strip()})
+    return messages
+
+
+def plainify(text):
+    """把模型爱用的 Markdown 标记抹成纯文本。
+
+    模型被训练成"回答要好看",所以张口就是 `**重点**`、`# 标题`、反引号。
+    可显示环境(Blender 文本编辑器 / 侧栏 label)**不渲染**这些东西 ——
+    用户看到的是一堆星号,截图里就是这样。
+    第一道防线是系统提示里明说"用纯文本";这里是第二道,兜住不听劝的。
+
+    ⚠ `__` 故意**不抹**:代码里的 `__init__` 会被误伤成 `init` 吗 ——
+    会。而且中文回答里 `__` 当加粗用的极少,收益远小于风险。
+    """
+    out = text or ""
+    out = out.replace("`", "")
+    lines = []
+    for line in out.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            # `## 小节` -> `■ 小节`(比一排井号干净,又保留了分隔感)
+            line = "■ " + stripped.lstrip("#").strip()
+            lines.append(line)
+            continue
+        # `**` 只在**成对出现**时抹掉 —— 单个 `**` 可能是代码里的幂运算
+        # (`2 ** 3`),抹了就把代码改错了。
+        if line.count("**") >= 2 and line.count("**") % 2 == 0:
+            line = line.replace("**", "")
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def request_payload(model, messages, temperature=0.2):
@@ -431,3 +496,181 @@ def _secrets(context):
         return [key] if key else []
     except Exception:                                     # noqa: BLE001
         return []
+
+
+# ---------------------------------------------------------------------------
+# 异步请求:后台线程只做网络 IO,结果回主线程处理
+# ---------------------------------------------------------------------------
+# ── 为什么必须异步(用户 2026-10-08 的反馈)────────────────────────
+# 原来点『问 AI』是**阻塞**的:界面冻 60 秒。只问一句还能忍,一旦要"连续
+# 对话"、甚至以后让 AI 连着调几个工具,这个模式会直接冻死 —— 体验比现在
+# 的侧栏还差。所以异步是"对话界面"和"AI 亲自操作"共同的前提,必须先做。
+#
+# ── 线程里的铁律(不遵守会出"偶尔崩、偶尔不刷新"的鬼影 bug)────────
+# 只有**主线程**能碰 bpy。所以那个线程只做两件事:网络 IO + 解析,结果写进
+# 下面这个模块级字典;碰 UI、碰 HISTORY、写文本块**一律回主线程做**。
+_REQUEST = {"active": False, "started": 0.0, "timeout": 60, "result": None}
+
+
+def request_in_background(base_url, api_key, model, messages, timeout=60):
+    """在后台线程里发请求。已经有请求在跑时返回 False。"""
+    if _REQUEST["active"]:
+        return False
+    _REQUEST.update({"active": True, "started": time.time(),
+                     "timeout": timeout, "result": None})
+
+    def worker():
+        try:
+            _REQUEST["result"] = call_chat(base_url, api_key, model, messages,
+                                           timeout=timeout)
+        except Exception as exc:                          # noqa: BLE001
+            _REQUEST["result"] = (
+                False, f"调用 AI 失败: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=worker, daemon=True, name="GK-Advisor").start()
+    return True
+
+
+def is_busy():
+    """有没有请求在跑(侧栏用它显示『正在问 AI…』)。"""
+    return bool(_REQUEST["active"])
+
+
+def poll_background():
+    """主线程调用:还没好返回 None;好了返回 (ok, text) 并清状态。
+
+    ── 为什么要自己算超时 ────────────────────────────────────────
+    `urlopen` 的 timeout 只管"连接 + 读"那一段。万一底层卡在别处(DNS /
+    代理 / TLS 握手),那个线程会一直挂着 —— 它是 daemon,不会拖住退出,
+    但"侧栏永远显示正在问 AI…"同样让人难受。所以这里用时间兜底:超了就
+    放弃等待,那个线程随它去。
+    """
+    if not _REQUEST["active"]:
+        return None
+    result = _REQUEST["result"]
+    if result is None:
+        if time.time() - _REQUEST["started"] > _REQUEST["timeout"] + 15:
+            limit = _REQUEST["timeout"]
+            _REQUEST.update({"active": False, "result": None})
+            return (False, f"AI 请求超时(超过 {limit} 秒没有回应),已放弃等待。"
+                           f"检查网络,或换个小一点的模型试试")
+        return None
+    _REQUEST.update({"active": False, "result": None})
+    return result
+
+
+def cancel_background():
+    """放弃等待(那个线程是 daemon,会自己结束)。"""
+    _REQUEST.update({"active": False, "result": None})
+
+
+# ---------------------------------------------------------------------------
+# 对话历史 / 对话记录
+# ---------------------------------------------------------------------------
+# 内存里最多留这么多条(发出去的时候再按 MAX_HISTORY 截)
+_HISTORY_CAP = 40
+
+
+def remember(role, content):
+    """往对话历史里记一条。"""
+    content = (content or "").strip()
+    if not content:
+        return
+    HISTORY.append({"role": role, "content": content})
+    del HISTORY[:-_HISTORY_CAP]
+
+
+def clear_history():
+    HISTORY.clear()
+
+
+def last_answer():
+    """最近一条 AI 回答(『复制回答』用)。"""
+    for item in reversed(HISTORY):
+        if item.get("role") == "assistant":
+            return item.get("content", "")
+    return ""
+
+
+def save_history(scene):
+    """把对话历史存进场景 —— 重开 .blend 还能接着聊。
+
+    和 `gk_last_export` 同一套做法:这些信息本来就该跟着文件走。
+    """
+    if scene is None:
+        return
+    try:
+        scene[HISTORY_KEY] = json.dumps(HISTORY[-_HISTORY_CAP:],
+                                        ensure_ascii=False)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def load_history(scene):
+    """从场景里恢复对话历史。"""
+    HISTORY.clear()
+    if scene is None:
+        return
+    raw = scene.get(HISTORY_KEY)
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(data, list):
+        return
+    for item in data[-_HISTORY_CAP:]:
+        if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
+            HISTORY.append({"role": item["role"],
+                            "content": str(item.get("content", ""))})
+
+
+def turn_text(question, answer, error=""):
+    """把一轮问答拼成要写进文本块的那几行(纯函数,好测)。"""
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    parts = [f"【我】{stamp}\n{(question or '').strip()}\n"]
+    if error:
+        parts.append(f"\n【AI 顾问】调用失败\n{plainify(error)}\n")
+    else:
+        body = plainify(answer or "")
+        parts.append(f"\n【AI 顾问】{len(body)} 字\n{body}\n")
+    return "".join(parts)
+
+
+def sync_dialog_text(question, answer, error=""):
+    """把这一轮问答追加进 Blender 文本块,返回文本块名字。
+
+    ── 为什么用文本块而不是侧栏 label(用户截图里的问题)──────────
+    侧栏 label 是**一行一个**,长回答会把侧栏撑到看不见底,而且**没有滚动
+    条**;再叠上"每行只放得下十来个字",一屏能看的字少得可怜。
+    Blender 的文本编辑器天生能滚动 / 选择 / 复制 / 搜索 —— 所以对话记录
+    写进文本块,**读的地方是文本编辑器**。
+    """
+    import bpy
+
+    block = bpy.data.texts.get(DIALOG_TEXT_NAME)
+    if block is None:
+        block = bpy.data.texts.new(DIALOG_TEXT_NAME)
+        block.write("BlenderGameKit 项目顾问 —— 对话记录\n"
+                    "(回答由 AI 生成,请自行核对。清空请点侧栏『清空对话』)\n")
+    else:
+        block.write("\n\n" + "-" * 60 + "\n")
+    block.write(turn_text(question, answer, error))
+    try:
+        block.use_fake_user = True
+    except Exception:                                     # noqa: BLE001
+        pass
+    return block.name
+
+
+def clear_dialog_text():
+    """把对话记录文本块清空(保留一句说明)。返回是否真的有这个块。"""
+    import bpy
+
+    block = bpy.data.texts.get(DIALOG_TEXT_NAME)
+    if block is None:
+        return False
+    block.clear()
+    block.write("BlenderGameKit 项目顾问 —— 对话记录\n(已清空)\n")
+    return True

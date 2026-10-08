@@ -12314,14 +12314,147 @@ class TestRound53Advisor(Base):
         self.assertIn("角色不动", text)
         self.assertIn("【5】节点图", text)
         messages = advisor.build_messages("角色不动", "快照内容")
-        self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[1]["role"], "user")
-        # user 消息就是 compose_text 的结果(两处必须一致,见它的 docstring)
-        self.assertEqual(messages[1]["content"],
-                         advisor.compose_text("角色不动", "快照内容"))
+        self.assertEqual([item["role"] for item in messages], ["system", "user"])
+        # 项目快照进**系统消息**、不进用户消息:多轮对话里就永远只有一份
+        # **刚取的**快照,不会越聊越多份过期快照(见 build_messages 的说明)
+        self.assertIn("快照内容", messages[0]["content"])
+        self.assertNotIn("快照内容", messages[1]["content"])
+        self.assertEqual(messages[1]["content"], "角色不动")
         # 系统提示里必须讲清这个插件是什么,否则模型会给 VisualScript 的建议
         self.assertIn("脚本挂载目标", messages[0]["content"])
+        # 而且要说"用纯文本" —— 显示环境不渲染 Markdown
+        self.assertIn("纯文本", messages[0]["content"])
+
+    def test_build_messages_history_window(self):
+        """多轮对话:只带**最近**若干条,老消息不进去(又慢又贵还误导)。"""
+        from BlenderGameKit import advisor
+        history = []
+        for index in range(20):
+            history.append({"role": "user", "content": f"问{index}"})
+            history.append({"role": "assistant", "content": f"答{index}"})
+        messages = advisor.build_messages("新问题", "快照", history)
+        # 1 条 system + MAX_HISTORY 条历史 + 1 条当前问题
+        self.assertEqual(len(messages), 1 + advisor.MAX_HISTORY + 1)
+        self.assertIn("问19", str(messages))
+        self.assertNotIn("问13", str(messages))        # 超出窗口的老消息
+        self.assertEqual(messages[-1]["content"], "新问题")
+
+        # 形状不对的历史项要跳过而不是炸掉:role 不是 user/assistant、
+        # 内容为空(load_history 恢复时会过滤一遍,build_messages 再兜一次)
+        dirty = [{"role": "system", "content": "不该带 system"},
+                 {"role": "user", "content": "   "},
+                 {"role": "user", "content": "好问题"}]
+        messages2 = advisor.build_messages("q", "", dirty)
+        self.assertEqual([item["role"] for item in messages2],
+                         ["system", "user", "user"])
+        self.assertEqual(messages2[1]["content"], "好问题")
+
+    def test_plainify(self):
+        """模型爱用 Markdown,显示环境不渲染 —— 要抹成纯文本。"""
+        from BlenderGameKit import advisor
+        out = advisor.plainify("**重点**\n## 小节\n用 `CodegenAbort`\n")
+        self.assertNotIn("**", out)
+        self.assertNotIn("`", out)
+        self.assertIn("重点", out)
+        self.assertIn("■ 小节", out)
+        self.assertIn("CodegenAbort", out)
+        # ⚠ 单个 `**` 可能是代码里的幂运算,抹了就把代码改错了
+        self.assertIn("2 ** 3", advisor.plainify("面积是 2 ** 3"))
+        # `__` 故意不抹:否则会把代码里的 __init__ 误伤成 init
+        self.assertIn("__init__", advisor.plainify("调用 __init__"))
+
+    def test_turn_text(self):
+        from BlenderGameKit import advisor
+        text = advisor.turn_text("角色不动", "**先看这个**")
+        self.assertIn("【我】", text)
+        self.assertIn("角色不动", text)
+        self.assertIn("【AI 顾问】", text)
+        self.assertNotIn("**", text)              # 写进去之前就顺手抹了
+        err = advisor.turn_text("角色不动", "", error="连不上 AI 服务")
+        self.assertIn("调用失败", err)
+        self.assertIn("连不上", err)
+
+    def test_history_cap_and_last_answer(self):
+        from BlenderGameKit import advisor
+        advisor.clear_history()
+        self.assertEqual(advisor.last_answer(), "")
+        for index in range(60):
+            advisor.remember("user", f"问{index}")
+            advisor.remember("assistant", f"答{index}")
+        self.assertLessEqual(len(advisor.HISTORY), advisor._HISTORY_CAP)
+        self.assertIn("答59", advisor.last_answer())
+        # 空内容不记(免得白占窗口额度)
+        before = len(advisor.HISTORY)
+        advisor.remember("user", "   ")
+        advisor.remember("assistant", "")
+        self.assertEqual(len(advisor.HISTORY), before)
+        advisor.clear_history()
+        self.assertEqual(advisor.HISTORY, [])
+
+    def test_background_request_lifecycle(self):
+        """异步状态机:发出去 -> 还没好 -> 好了 -> 取走。
+
+        这一层是"界面不卡"的地基 —— 发请求的线程只做网络 IO,结果回主线程
+        取(见 advisor 里那段线程铁律)。
+        """
+        import threading
+        import time
+
+        from BlenderGameKit import advisor
+        advisor.cancel_background()
+        self.assertFalse(advisor.is_busy())
+        self.assertIsNone(advisor.poll_background())      # 没在跑 -> None
+
+        gate = threading.Event()
+
+        def slow(*_args, **_kwargs):
+            gate.wait(5)
+            return True, "慢回答"
+
+        with mock.patch.object(advisor, "call_chat", side_effect=slow):
+            self.assertTrue(
+                advisor.request_in_background("http://x", "k", "m", []))
+            # 同一时间只许有一条在飞(否则界面状态和回复会串)
+            self.assertFalse(
+                advisor.request_in_background("http://x", "k", "m", []))
+            self.assertTrue(advisor.is_busy())
+            self.assertIsNone(advisor.poll_background())   # 还没好
+            gate.set()
+            deadline = time.time() + 5
+            result = None
+            while result is None and time.time() < deadline:
+                result = advisor.poll_background()
+                time.sleep(0.01)
+        self.assertEqual(result, (True, "慢回答"))
+        self.assertFalse(advisor.is_busy())
+
+    def test_background_timeout_gives_up(self):
+        """底层卡住时不能永远等:超时后放弃等待,并给一句人话。
+
+        直接改 `_REQUEST` 把"开始时间"往回拨,免得真等 75 秒。
+        """
+        import time
+
+        from BlenderGameKit import advisor
+        advisor.cancel_background()
+        advisor._REQUEST.update({"active": True,
+                                 "started": time.time() - 999,
+                                 "timeout": 60, "result": None})
+        result = advisor.poll_background()
+        self.assertIsNotNone(result)
+        ok, note = result
+        self.assertFalse(ok)
+        self.assertIn("超时", note)
+        self.assertFalse(advisor.is_busy())
+
+    def test_cancel_background(self):
+        from BlenderGameKit import advisor
+        advisor._REQUEST.update({"active": True, "started": 0.0,
+                                 "timeout": 60, "result": None})
+        self.assertTrue(advisor.is_busy())
+        advisor.cancel_background()
+        self.assertFalse(advisor.is_busy())
+        self.assertIsNone(advisor.poll_background())
 
     def test_request_payload(self):
         from BlenderGameKit import advisor

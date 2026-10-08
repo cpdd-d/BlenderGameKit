@@ -2306,8 +2306,8 @@ def main():
                     # 打包发布(第五十二轮):一键出可执行文件 + 打开打包目录
                     "gk.export_release", "gk.open_release_folder",
                     # 项目顾问(第五十三轮):把项目诊断交给 AI
-                    "gk.ask_advisor", "gk.copy_advisor_context",
-                    "gk.copy_advisor_answer", "gk.clear_advisor"):
+                    "gk.ask_advisor", "gk.open_advisor_dialog",
+                    "gk.copy_advisor_context", "gk.clear_advisor"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -2405,6 +2405,10 @@ def main():
                     return str(exc)
                 return "" if outcome == {"CANCELLED"} else f"竟然返回了 {outcome}"
 
+            # 0) 还没聊过时『查看对话』要明确拒绝(而不是静默什么都不发生)
+            why0 = blocked_reason(bpy.ops.gk.open_advisor_dialog)
+            check("还没对话记录时『查看对话』被挡下并说明",
+                  "还没有对话记录" in why0, why0)
             # 1) 没写问题 -> 明确拒绝
             settings.advisor_question = ""
             why1 = blocked_reason(bpy.ops.gk.ask_advisor)
@@ -2425,23 +2429,52 @@ def main():
                   f"{len(snapshot)} 字")
             check("快照里没有明文 API Key(脱敏生效)",
                   "sk-smoke-should-never-appear" not in snapshot)
-            # 4) 配好地址 + 假模型 -> 走完整条路(不联网)
+            # 4) 配好地址 + 假模型 -> 走完整条路(不联网)。
+            #    ⚠ 现在是**异步**的:算子发出去就返回,结果由主线程定时器收。
+            #    `-b` 无事件循环,定时器不会自己跑,所以这里手动催 `_poll_advisor()`。
+            import time
             prefs2.advisor_base_url = "http://example.invalid"
             prefs2.advisor_model = "smoke-model"
-            adv_mod.call_chat = lambda *a, **k: (True, "先把『脚本挂载目标』勾上。")
+            adv_mod.call_chat = lambda *a, **k: (True, "**先把『脚本挂载目标』勾上。**")
+            settings.advisor_question = "角色不动"
             result = bpy.ops.gk.ask_advisor()
-            check("『问 AI』接线通(假模型)", result == {"FINISHED"}, str(result))
-            answer = ops_mod.LAST_ADVISOR.get("answer", "")
-            check("回答存进了 LAST_ADVISOR 供侧栏显示",
-                  "脚本挂载目标" in answer, answer[:40])
-            check("清空能清掉结果",
+            check("『问 AI』发出就返回(异步,界面不卡)",
+                  result == {"FINISHED"}, str(result))
+            check("发出后处于等待状态", adv_mod.is_busy())
+            deadline = time.time() + 10
+            while adv_mod.is_busy() and time.time() < deadline:
+                ops_mod._poll_advisor()
+                time.sleep(0.05)
+            check("回复到了会写进对话记录文本块",
+                  adv_mod.DIALOG_TEXT_NAME in [t.name for t in bpy.data.texts],
+                  str([t.name for t in bpy.data.texts])[:120])
+            block = bpy.data.texts.get(adv_mod.DIALOG_TEXT_NAME)
+            dialog = block.as_string() if block else ""
+            check("对话记录里有我的问题",
+                  "角色不动" in dialog, dialog[:60])
+            check("对话记录里有 AI 的回答(且已抹掉 Markdown 星号)",
+                  "脚本挂载目标" in dialog and "**" not in dialog,
+                  dialog[:120])
+            check("这一轮进了对话历史(下次问会带上)",
+                  len(adv_mod.HISTORY) >= 2, str(len(adv_mod.HISTORY)))
+            check("问完把输入框腾空,方便接着问下一句",
+                  (settings.advisor_question or "") == "",
+                  settings.advisor_question)
+            check("清空对话能同时清历史与记录",
                   bpy.ops.gk.clear_advisor() == {"FINISHED"}
-                  and not ops_mod.LAST_ADVISOR)
+                  and not adv_mod.HISTORY
+                  and "已清空" in bpy.data.texts[adv_mod.DIALOG_TEXT_NAME].as_string())
         finally:
             adv_mod.call_chat = saved_call
+            adv_mod.cancel_background()
+            adv_mod.clear_history()
             for name, value in saved_prefs.items():
                 setattr(prefs2, name, value)
             settings.advisor_question = saved_q
+            # 测试留下的文本块要清掉,免得污染后面的检查 / 被存进文件
+            leftover = bpy.data.texts.get(adv_mod.DIALOG_TEXT_NAME)
+            if leftover is not None:
+                bpy.data.texts.remove(leftover)
     except Exception as exc:
         check("项目顾问算子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
