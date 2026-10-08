@@ -548,11 +548,9 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="额外生成一个最小 .tscn 与 project.godot，导出目录可直接用 Godot 打开",
         default=True,
     )
-    show_log: BoolProperty(
-        name="显示日志",
-        description="在侧栏显示最近一次导出的日志",
-        default=True,
-    )
+    # (原 `show_log` 第五十五轮删掉:侧栏那份日志块删了,它没有使用者了。
+    #  属性留着会让面板出现一个点了没反应的开关。)
+
     # ── 项目顾问(第五十三轮)────────────────────────────────────────
     # 用户在这里写"我卡在哪",点『问 AI』才把问题 + 项目诊断快照发出去。
     # 存在**场景**上:重开 .blend 问题还在,不用重打一遍(写到一半去改图,

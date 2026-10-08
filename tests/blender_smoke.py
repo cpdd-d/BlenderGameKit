@@ -2014,6 +2014,15 @@ def main():
         bpy.ops.gk.export_report_focus(node_name="报警节点")
         check("导出报告:『定位』选中了那个节点", bool(report_node.select),
               f"select={report_node.select}")
+
+        # ── 第五十五轮:整份报告也写进文本块(侧栏只留摘要 + 定位按钮)──
+        # 用户:"显示的信息太多了"。正文搬进文本块,用文本编辑器读。
+        block = bpy.data.texts.get(export_report.EXPORT_REPORT_TEXT_NAME)
+        check("导出报告:整份写进了文本块(可在文本编辑器里滚动着看)",
+              block is not None and "怎么修:" in block.as_string(),
+              str([t.name for t in bpy.data.texts])[:120])
+        if block is not None:
+            bpy.data.texts.remove(block)
         export_report.clear()
     except Exception as exc:
         check("导出报告", False, f"{type(exc).__name__}: {exc}")
@@ -2306,7 +2315,7 @@ def main():
                     # 打包发布(第五十二轮):一键出可执行文件 + 打开打包目录
                     "gk.export_release", "gk.open_release_folder",
                     # 项目顾问(第五十三轮):把项目诊断交给 AI
-                    "gk.ask_advisor", "gk.open_advisor_dialog",
+                    "gk.ask_advisor", "gk.open_text_block",
                     "gk.copy_advisor_context", "gk.clear_advisor"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
@@ -2406,9 +2415,10 @@ def main():
                 return "" if outcome == {"CANCELLED"} else f"竟然返回了 {outcome}"
 
             # 0) 还没聊过时『查看对话』要明确拒绝(而不是静默什么都不发生)
-            why0 = blocked_reason(bpy.ops.gk.open_advisor_dialog)
+            why0 = blocked_reason(lambda: bpy.ops.gk.open_text_block(
+                text_name=adv_mod.DIALOG_TEXT_NAME))
             check("还没对话记录时『查看对话』被挡下并说明",
-                  "还没有对话记录" in why0, why0)
+                  "还没有" in why0, why0)
             # 1) 没写问题 -> 明确拒绝
             settings.advisor_question = ""
             why1 = blocked_reason(bpy.ops.gk.ask_advisor)

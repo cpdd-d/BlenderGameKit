@@ -2945,26 +2945,34 @@ class GK_OT_CopyAdvisorContext(bpy.types.Operator):
                                   "诊断")
 
 
-class GK_OT_OpenAdvisorDialog(bpy.types.Operator):
-    """在文本编辑器里打开对话记录(能滚动 / 选择 / 复制 / 搜索)。
+class GK_OT_OpenTextBlock(bpy.types.Operator):
+    """在文本编辑器里打开一个文本块(能滚动 / 选择 / 复制 / 搜索)。
 
-    ── 为什么"读的地方"是文本编辑器 ──────────────────────────────
-    用户的截图里,808 字的回答把侧栏撑满、没有滚动条、一行才十来个字。
-    侧栏的 label 结构上就干不了这个活(一行一个控件、不支持滚动)。
-    Blender 的文本编辑器天生能滚动/选择/复制/搜索 —— 把对话写进文本块、
-    用文本编辑器读,是插件能提供的最好形态(自定义编辑器窗口 Python 注册不了)。
+    ── 为什么长内容都往这里送(用户第五十四、五十五两轮的反馈)────────
+    截图里 808 字的回答把侧栏撑满、**没有滚动条**、一行才十来个字;导出报告
+    一出问题也能有十几条。侧栏的 label 结构上就干不了长文本(一行一个控件、
+    不支持滚动),而 Blender 的文本编辑器天生能滚动/选择/复制/搜索。
+    所以『GK 对话记录』『GK 导出报告』都写进文本块,用文本编辑器读 ——
+    这是插件能提供的最好形态(自定义编辑器窗口 Python 注册不了)。
     """
 
-    bl_idname = "gk.open_advisor_dialog"
-    bl_label = "查看对话"
-    bl_description = "在文本编辑器里打开『GK 对话记录』"
+    bl_idname = "gk.open_text_block"
+    bl_label = "查看文本"
+    bl_description = "在文本编辑器里打开指定的文本块"
     bl_options = {"REGISTER"}
 
+    text_name: StringProperty(
+        name="文本块",
+        description="要打开的文本块名字",
+        default="",
+    )
+
     def execute(self, context):
-        block = bpy.data.texts.get(advisor.DIALOG_TEXT_NAME)
+        name = (self.text_name or "").strip() or advisor.DIALOG_TEXT_NAME
+        block = bpy.data.texts.get(name)
         if block is None:
             _report(self, "ERROR",
-                    "还没有对话记录。先在『项目顾问』里写一句再点『问 AI』")
+                    f"还没有『{name}』,先做一次会生成它的操作(问 AI / 导出一次)")
             return {"CANCELLED"}
 
         # 1) 已经有文本编辑器 -> 直接把内容切过去(**不动用户布局**,最不打扰)
@@ -3306,9 +3314,10 @@ GK_CLASSES = (
     GK_OT_OpenReleaseFolder,
     # 项目顾问(AI):把项目诊断 + 你的问题交给模型分析(异步,对话记录进文本块)
     GK_OT_AskAdvisor,
-    GK_OT_OpenAdvisorDialog,
     GK_OT_CopyAdvisorContext,
     GK_OT_ClearAdvisor,
+    # 长内容统一从这里进文本编辑器(对话记录 / 导出报告)
+    GK_OT_OpenTextBlock,
     GK_OT_RelinkProject,
     GK_OT_DetectGodot,
     GK_OT_Export,

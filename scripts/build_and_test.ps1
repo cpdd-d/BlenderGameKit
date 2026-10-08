@@ -145,6 +145,28 @@ $text -split "`n" | Select-String -Pattern "^\[(PASS|FAIL)\]|^结果:|^失败项
     ForEach-Object { $_.Line }
 $smokeOk = $text -match "SMOKE_RESULT=OK"
 
+# ---------- 4b. 侧栏面板 draw() ----------
+# ── 为什么要单列这一关(第五十五轮真机抓到)────────────────────────
+# 侧栏瘦身时把 `_draw_other_trees_box(layout)` 误写成需要 context —— 冒烟
+# 全绿,**但侧栏整块画不出来**(draw() 直接抛异常,面板变空)。
+# 原因:冒烟测的是"算子在不在、逻辑对不对",而 `draw()` 只在**真画一次**
+# 的时候才会执行。这一关就是真调一次 `GK_PT_Main.draw()`,专抓这类错。
+$panelsScript = Join-Path $Root "tests\blender_panels.py"
+if (Test-Path $panelsScript) {
+    Step "4b/6 侧栏面板 draw()"
+    $panelOut = & $Blender -b --python $panelsScript 2>&1
+    $panelText = $panelOut | Out-String
+    $panelText -split "`n" | Select-String -Pattern "^\[(PASS|FAIL)\]|^结果:|^失败项:" |
+        ForEach-Object { $_.Line }
+    # 脚本失败时退出码是 1(它以 `sys.exit(0 if ... else 1)` 收尾)
+    if ($LASTEXITCODE -ne 0) {
+        # 这一关失败 = 侧栏可能整个画不出来,比冒烟里的逻辑错更严重
+        $smokeOk = $false
+    }
+} else {
+    Step "4b/6 跳过侧栏面板 draw()(没有 tests\blender_panels.py)"
+}
+
 # ---------- 5. Godot 端到端 ----------
 # ── 为什么要单列这一关 ──────────────────────────────────────────────
 # 前面 1~4 步都停在"Blender 里看起来对"。可生成物**是给 Godot 吃的** ——

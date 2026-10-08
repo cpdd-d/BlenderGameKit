@@ -4123,7 +4123,67 @@ def _draw_tree_list_box(layout, context):
         row.label(text=f"{kind} · {len(group.nodes)} 节点")
     if disabled:
         box.label(text=f"有 {disabled} 张图已停用(不会导出)", icon="INFO")
-    box.label(text="大纲视图切到 Blend File 也能看到这些图", icon="INFO")
+    # ── 当前这棵树的规模(第五十五轮:从原来独立的『节点图』块并进来)──
+    # 单开一块只为了显示"节点总数 / 事件 / 动作"太占地方,并到这里一行写完。
+    current = props.current_tree(context)
+    if current is not None:
+        events, statements = props.event_summary(current)
+        box.separator()
+        box.label(text=f"当前『{current.name}』:节点 {len(current.nodes)} · "
+                       f"事件 {events} · 动作 {statements}", icon="DOT")
+        if events == 0:
+            box.label(text="还没有事件节点,脚本不会执行任何逻辑", icon="ERROR")
+
+
+def _draw_other_trees_box(layout):
+    """五张独立图的入口,合并成一块(第五十五轮)。
+
+    ── 为什么要合(用户:"显示的信息太多了")────────────────────────
+    动画 / 界面 / AI / 显示 / 资产 原来各占一块,而五块的**形状完全一样**:
+    列一下树名、一个『打开/新建 xxx 图』按钮、一句说明。加起来 20 来行,
+    但它们**只在建图那一次**才需要看 —— 建完就再也不会点。
+
+    合并后每张图一行:『打开/新建 xx 图』按钮 + (已有的话)树名和规模。
+    说明文字删掉 —— 那些内容 README 里有,而且按钮名字本身已经说清了。
+    """
+    box, opened = collapsible_box(layout, "other_trees", "其他图", "NODETREE")
+    if not opened:
+        return
+
+    def trees_of(blob):
+        return [g for g in bpy.data.node_groups
+                if getattr(g, "bl_idname", "") == blob]
+
+    def summary(groups, unit, count_of):
+        """树名 + 规模;没有就返回空串。"""
+        if not groups:
+            return ""
+        return " · ".join(f"{g.name}({count_of(g)}{unit})" for g in groups)
+
+    entries = (
+        ("gk.open_anim_tree", "动画系统", "ARMATURE_DATA", "GKAnimationTree",
+         "个状态", lambda g: len([n for n in g.nodes if getattr(n, "bl_idname", "")
+                                  in ("GKNodeAnimTransition", "GKNodeAnimState")])),
+        ("gk.open_ui_design_tree", "界面设计", "WINDOW", "GKUiDesignTree",
+         "个控件", lambda g: len([n for n in g.nodes
+                                  if getattr(n, "gk_ui_builder", False)])),
+        ("gk.open_ai_tree", "游戏AI", "TRACKER", "GKGameAiTree",
+         "个状态", lambda g: len([n for n in g.nodes
+                                  if getattr(n, "bl_idname", "") == "GKNodeAiState"])),
+        ("gk.open_display_tree", "游戏显示", "HIDE_OFF", "GKDisplayTree",
+         "张卡", lambda g: len(g.nodes)),
+        ("gk.open_asset_tree", "游戏资产", "ASSET_MANAGER", "GKAssetTree",
+         "份资产", lambda g: len([n for n in g.nodes
+                                  if getattr(n, "bl_idname", "")
+                                  in _ASSET_CARD_VALUE_PROP])),
+    )
+    for op_name, label, icon, blob, unit, count_of in entries:
+        groups = trees_of(blob)
+        row = box.row(align=True)
+        row.operator(op_name, text=f"打开/新建{label}图", icon=icon)
+        note = summary(groups, unit, count_of)
+        if note:
+            row.label(text=note)
 
 
 def _draw_preset_box(layout, context):
@@ -4554,7 +4614,17 @@ def _wrap_text(text, width=34):
 
 
 def _draw_export_report(box, report):
-    """画一份导出报告。"""
+    """画一份导出报告的**摘要**(正文在文本块里,第五十五轮)。
+
+    ── 为什么正文搬走了(用户:"显示的信息太多了")──────────────────
+    一出问题就有十几条(每条还带"怎么修"),全铺在侧栏会把面板撑得很长。
+    正文进文本块『GK 导出报告』,用文本编辑器读 —— 能滚动/选择/复制/搜索。
+
+    侧栏这里只留三样:
+      * 一行摘要(成功/失败 · 行数 · 文件数 · 耗时);
+      * **出错时的『定位』按钮**(点了跳到出问题的节点 —— 文本块替代不了);
+      * 进文本块 / 复制文本 / 打开目录 三个入口。
+    """
     if not report:
         box.label(text="还没有导出过 —— 点上面的『导出为 Godot 脚本』导一次",
                   icon="INFO")
@@ -4570,52 +4640,43 @@ def _draw_export_report(box, report):
               icon="CHECKMARK" if report.get("ok") else "ERROR")
     if report.get("error"):
         stage = f"[{report['stage']}] " if report.get("stage") else ""
-        for index, line in enumerate(_wrap_text(stage + report["error"])):
-            if index == 0:
-                box.label(text=line, icon="ERROR")
-            else:
-                box.label(text="    " + line)
+        for index, line in enumerate(_wrap_text(stage + report["error"], 30)):
+            if index > 2:                     # 长报错截断,全文在文本块里
+                box.label(text="    …(全文见『查看报告』)", icon="INFO")
+                break
+            box.label(text=line if index == 0 else "    " + line,
+                      icon="ERROR" if index == 0 else "NONE")
     if report.get("at"):
         box.label(text=f"{report['at']}", icon="TIME")
-    if not (errors or warnings or infos):
-        box.label(text="这次导出没有任何问题", icon="CHECKMARK")
-    for level, label, icon in (("error", "错误", "ERROR"),
-                               ("warning", "警告", "ERROR"),
-                               ("info", "提示", "INFO")):
-        items = export_report.items_of(report, level)
-        if not items:
-            continue
-        box.separator()
-        box.label(text=f"{label}({len(items)})", icon=icon)
-        for item in items:
-            _draw_report_item(box, item)
+
+    counts_line = f"错误 {errors} · 警告 {warnings} · 提示 {infos}"
+    box.label(text=counts_line,
+              icon="ERROR" if (errors or warnings) else "CHECKMARK")
     if report.get("dropped"):
-        box.label(text=f"(还有 {report['dropped']} 条没列出来)", icon="INFO")
+        counts_line += f" (+{report['dropped']} 条未列)"
+        box.label(text=f"还有 {report['dropped']} 条,全文见『查看报告』",
+                  icon="INFO")
+
+    # ── 出错时的『定位』按钮留在侧栏(文本块里的字点不动)──
+    # 只列**带节点名的**错误/警告 —— 那是能跳过去的,也是用户最想跳的。
+    jumpable = [item for level in ("error", "warning")
+                for item in export_report.items_of(report, level)
+                if item.get("node_name")]
+    if jumpable:
+        box.separator()
+        box.label(text="跳到出问题的节点:", icon="VIEWZOOM")
+        for item in jumpable[:6]:
+            row = box.row(align=True)
+            op = row.operator("gk.export_report_focus", text=item["node_name"],
+                              icon="TRACKER")
+            op.node_name = item["node_name"]
+            row.label(text=str(item.get("message", ""))[:18])
+
     row = box.row(align=True)
-    row.operator("gk.export_report_copy", icon="COPYDOWN")
+    op = row.operator("gk.open_text_block", text="查看报告", icon="TEXT")
+    op.text_name = export_report.EXPORT_REPORT_TEXT_NAME
+    row.operator("gk.export_report_copy", text="复制", icon="COPYDOWN")
     row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
-    box.label(text="出问题时点『复制导出报告』,粘出来就能发", icon="INFO")
-
-
-def _draw_report_item(box, item):
-    """报告里的一条:消息 + 怎么修 + (有节点名就给)定位按钮。"""
-    lines = _wrap_text(item.get("message", ""))
-    for index, line in enumerate(lines):
-        if index > 0:
-            box.label(text="    " + line)
-        elif str(item.get("level")) == "error":
-            box.label(text=line, icon="ERROR")
-        else:
-            box.label(text=line, icon="DOT")
-    if item.get("hint"):
-        for index, line in enumerate(_wrap_text("怎么修:" + item["hint"], 32)):
-            box.label(text=("    " if index else "  ") + line, icon="INFO")
-    if item.get("node_name"):
-        row = box.row(align=True)
-        focus = row.operator("gk.export_report_focus",
-                             text=f"定位到『{item['node_name']}』",
-                             icon="VIEWZOOM")
-        focus.node_name = item["node_name"]
 
 
 class GK_PT_Main(bpy.types.Panel):
@@ -4706,13 +4767,13 @@ class GK_PT_Main(bpy.types.Panel):
                              icon="CAMERA_DATA")
                 cameras = [o.name for o in context.scene.objects
                            if getattr(o, "type", "") == "CAMERA"]
+                # 说明压成一行(第五十五轮):原来是 3 行的按键清单,
+                # 但按键提示在 README 和示例关卡里都有 —— 侧栏这里没必要重复。
                 if getattr(settings, "god_camera", False):
-                    box.label(text="运行时按 Tab 切换玩家相机 / "
-                                   "上帝摄像机(WASD + 空格/Shift + 鼠标;"
-                                   "上帝视角按 T 时停)",
+                    box.label(text="运行时按 Tab 切回来(WASD+空格/Shift+鼠标)",
                               icon="INFO")
                 elif not cameras:
-                    box.label(text="场景里没有相机 —— 运行时会自动造一台观察机",
+                    box.label(text="场景里没相机 —— 运行时会自动造一台",
                               icon="INFO")
                 else:
                     box.label(text=f"自动:跟着视口当前相机({cameras[0]})",
@@ -4724,25 +4785,18 @@ class GK_PT_Main(bpy.types.Panel):
                 nav_row = box.row(align=True)
                 nav_row.prop(settings, "nav_enabled", toggle=True,
                              icon="TRACKER")
+                # 说明压成一行(第五十五轮):原来是 3~5 行。2D 那条"按障碍物烤"
+                # 是**最容易踩的坑**(把整块地板烤成不可走区),所以留一行短的。
                 if getattr(settings, "nav_enabled", False):
-                    if str(getattr(settings, "dimension", "3")) == "2":
-                        # 2D:碰撞体按"障碍物"解析 —— 这是和 3D 最大的差异,
-                        # 用户不看到这句就会把整块地板也烤成不可走区。
-                        nums = box.row(align=True)
-                        nums.prop(settings, "nav_agent_radius", text="半径")
-                        box.label(text="2D 按障碍物烤:给墙 / 箱子加碰撞体,"
-                                       "整块地板不要加", icon="INFO")
-                        box.label(text="启动时烤;门挪了用『移动_重烤导航』重烤",
-                                  icon="INFO")
-                    else:
-                        nums = box.row(align=True)
-                        nums.prop(settings, "nav_agent_radius", text="半径")
+                    nums = box.row(align=True)
+                    nums.prop(settings, "nav_agent_radius", text="半径")
+                    if str(getattr(settings, "dimension", "3")) != "2":
                         nums.prop(settings, "nav_agent_height", text="高度")
                         nums.prop(settings, "nav_max_slope", text="爬坡°")
-                        box.label(text="启动时按静态碰撞体烤网格;改完要重新导出",
+                        box.label(text="按静态碰撞体烤;挪了东西用『移动_重烤导航』",
                                   icon="INFO")
-                        box.label(text="门 / 平台挪了用『移动_重烤导航』重烤",
-                                  icon="INFO")
+                    else:
+                        box.label(text="2D 按障碍物烤:地板不要加碰撞体", icon="ERROR")
                 else:
                     box.label(text="关着:『移动_寻路』退化成直线走", icon="INFO")
 
@@ -4757,16 +4811,15 @@ class GK_PT_Main(bpy.types.Panel):
             row = box.row(align=True)
             row.scale_y = 1.4
             row.operator("gk.export_assets", icon="EXPORT")
+            # 三条说明压成一条(第五十五轮):后两条("没材质用白色"
+            # "描边请在 Godot 里加")属于**看一眼就知道**的事,删掉。
             box.label(text="选中网格 = 只导选中的；不选 = 导出全部", icon="INFO")
-            box.label(text="没材质的物体会用默认白色材质", icon="INFO")
-            box.label(text="导出会带上卡通材质；描边等额外效果请在 Godot 里加",
-                      icon="INFO")
 
             # ── 上次导出报告(用户 2026-10-05 第二十三轮:导出报告可视化)──
-            # 以前这里只列**前 4 条**警告、还把每条压成一行普通 label ——
-            # 诊断里附的"怎么修"(hint)完全看不见,而且转头就找不到了。
-            # 现在是独立的可折叠盒子:按级别分组、带修复建议、能定位到
-            # 出问题的那个节点、能一键复制成文本发出来。
+            # 第五十五轮("侧栏显示的信息太多了"):**正文搬进文本块**,
+            # 用文本编辑器读(能滚动/复制/搜索);侧栏只留摘要 + 交互按钮。
+            # ⚠ 出错时的『定位』按钮**留在侧栏** —— 点了能跳到出问题的那个
+            # 节点,这是文本块替代不了的(文本块里的字点不动)。
             report = export_report.load(context.scene)
             report_box, report_open = collapsible_box(
                 layout, "export_report", _report_title(report), "TEXT",
@@ -4774,112 +4827,15 @@ class GK_PT_Main(bpy.types.Panel):
             if report_open:
                 _draw_export_report(report_box, report)
 
-        # ---- 节点树状态 ----
-        box, opened = collapsible_box(layout, "tree_status", "节点图", "NODETREE")
-        if opened:
-            if tree is None:
-                box.label(text="当前没有游戏逻辑节点树", icon="INFO")
-                box.operator("node.new_node_tree", text="新建节点树",
-                             icon="ADD").type = "GKGameLogicTree"
-            else:
-                events, statements = props.event_summary(tree)
-                col = box.column(align=True)
-                col.label(text=f"节点总数:{len(tree.nodes)}")
-                col.label(text=f"事件:{events}    动作:{statements}")
-                if events == 0:
-                    col.label(text="还没有事件节点，脚本不会执行任何逻辑", icon="ERROR")
-                # 「添加节点」按钮删掉(用户第 25 轮):Shift+A 和右键菜单都在,
-                # 侧栏再放一个是重复的,而且它常年占着最显眼的位置。
+        # ---- (原『节点图』统计块第五十五轮并进『节点图总览』)----------
+        # 它只显示"节点总数 / 事件 / 动作",单开一块太占地方。
+        # 现在并进上面『节点图』那块的最后一行(见 _draw_tree_list_box)。
 
-        # ---- 动画系统(独立那张树)----
-        box, opened = collapsible_box(layout, "anim_system",
-                                      "动画系统(单独一张图)", "ARMATURE_DATA")
-        if opened:
-            anim_trees = [g for g in bpy.data.node_groups
-                          if getattr(g, "bl_idname", "") == "GKAnimationTree"]
-            if anim_trees:
-                for anim_tree in anim_trees:
-                    count = len([n for n in anim_tree.nodes
-                                 if getattr(n, "bl_idname", "") in
-                                 ("GKNodeAnimTransition", "GKNodeAnimState")])
-                    box.label(text=f"{anim_tree.name}  ({count} 个状态)",
-                              icon="NODETREE")
-            else:
-                box.label(text="还没有动画树", icon="INFO")
-            box.operator("gk.open_anim_tree", text="打开/新建动画树",
-                         icon="FILE_NEW")
-
-        # ---- 界面设计(独立那张图,第四十轮)----
-        box, opened = collapsible_box(layout, "ui_design",
-                                      "界面设计(单独一张图)", "WINDOW")
-        if opened:
-            design_trees = [g for g in bpy.data.node_groups
-                            if getattr(g, "bl_idname", "") == "GKUiDesignTree"]
-            if design_trees:
-                for design in design_trees:
-                    count = len([n for n in design.nodes
-                                 if getattr(n, "gk_ui_builder", False)])
-                    box.label(text=f"{design.name}  ({count} 个控件)",
-                              icon="NODETREE")
-            else:
-                box.label(text="还没有界面设计图", icon="INFO")
-            box.operator("gk.open_ui_design_tree", text="打开/新建界面设计图",
-                         icon="FILE_NEW")
-
-        # ---- AI(独立那张图,第四十一轮)----
-        box, opened = collapsible_box(layout, "ai_design",
-                                      "游戏AI(单独一张图)", "TRACKER")
-        if opened:
-            ai_trees = [g for g in bpy.data.node_groups
-                        if getattr(g, "bl_idname", "") == "GKGameAiTree"]
-            if ai_trees:
-                for ai_tree in ai_trees:
-                    count = len([n for n in ai_tree.nodes
-                                 if getattr(n, "bl_idname", "") == "GKNodeAiState"])
-                    box.label(text=f"{ai_tree.name}  ({count} 个状态)",
-                              icon="NODETREE")
-            else:
-                box.label(text="还没有 AI 图", icon="INFO")
-            box.operator("gk.open_ai_tree", text="打开/新建 AI 图",
-                         icon="FILE_NEW")
-            box.label(text="玩法图放『AI_启用』引用它", icon="INFO")
-
-        # ---- 游戏显示设置(独立那张图,第四十二轮)----
-        box, opened = collapsible_box(layout, "display_settings",
-                                      "游戏显示设置(单独一张图)", "HIDE_OFF")
-        if opened:
-            display_trees = [g for g in bpy.data.node_groups
-                             if getattr(g, "bl_idname", "") == "GKDisplayTree"]
-            if display_trees:
-                for display_tree in display_trees:
-                    box.label(text=f"{display_tree.name}"
-                                   f"  ({len(display_tree.nodes)} 张设置卡)",
-                              icon="HIDE_OFF")
-            else:
-                box.label(text="还没有显示设置图", icon="INFO")
-            box.operator("gk.open_display_tree", text="打开/新建显示设置图",
-                         icon="FILE_NEW")
-            box.label(text="物理线框 / 调试面板 / 画面风格 / 视口预览 / 环境氛围"
-                           " 都在这张图里", icon="INFO")
-
-        # ---- 游戏资产(独立那张图,第四十三轮)----
-        box, opened = collapsible_box(layout, "asset_library",
-                                      "游戏资产(单独一张图)", "ASSET_MANAGER")
-        if opened:
-            asset_trees = _asset_trees()
-            if asset_trees:
-                for asset_tree in asset_trees:
-                    count = len([n for n in asset_tree.nodes
-                                 if getattr(n, "bl_idname", "")
-                                 in _ASSET_CARD_VALUE_PROP])
-                    box.label(text=f"{asset_tree.name}  ({count} 份资产)",
-                              icon="ASSET_MANAGER")
-            else:
-                box.label(text="还没有资产库", icon="INFO")
-            box.operator("gk.open_asset_tree", text="打开/新建资产库",
-                         icon="FILE_NEW")
-            box.label(text="3D 道具 / 图片 / 曲线 / 音频;跨场景共用",
-                      icon="INFO")
+        # ---- 其他图:五张独立图的入口(第五十五轮合并成一块)----------
+        # 原来动画 / 界面 / AI / 显示 / 资产各占一块,形状一模一样
+        # (列树名 + 一个『打开/新建』按钮 + 一句说明),加起来 20 来行,
+        # 而它们**只在建图那一次**才需要看。现在收成一块。
+        _draw_other_trees_box(layout)
 
         # 「动作分类」删掉(用户第 24、25 轮两次点名):
         # 它只是给动作打个标签,而标签现在没有任何地方用到 ——
@@ -4913,37 +4869,23 @@ class GK_PT_Main(bpy.types.Panel):
                 row.prop(settings, "export_tunables", toggle=True)
                 row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
 
-        # ---- 诊断(用户第 26 轮:"每次又错误时加入调试信息")----
-        # 出问题时点一下:插件版本、每个物体的网格/碰撞尺寸、节点图内容、
-        # 主相机解析结果、导出告警 —— 全写进一个 txt,直接发我。
-        diag, opened = collapsible_box(layout, "diagnostics", "出问题了?", "QUESTION")
-        if opened:
-            diag.operator("gk.dump_diagnostics", text="导出诊断信息",
-                          icon="TEXT")
-
-        # ---- 项目顾问(AI)(第五十三轮)----
-        # 和上面『出问题了?』是一对:那个把诊断**导出成文件**,这个把诊断
-        # **交给 AI 分析并给下一步**。做成可折叠是因为回答可能很长。
+        # ---- 出问题了? + 项目顾问(第五十五轮合成一块)----------------
+        # 两者本来就是一对:一个把诊断**导出成文件**,一个把诊断
+        # **交给 AI 分析并给下一步**。各占一块反而让人以为要做两个选择,
+        # 所以并成一块:两个按钮放一排。
+        #
+        # 『日志』块(最近 8 条)第五十五轮**删掉**了 —— Blender 控制台里
+        # 本来就有全部日志,现在又有『导出诊断信息』和 AI 顾问两条路。
         _draw_advisor_box(layout, context, settings)
-
-        # ---- 日志 ----
-        if settings is not None and settings.show_log:
-            box, opened = collapsible_box(
-                layout, "log", "日志", "TEXT",
-                header_extra=lambda row: row.prop(
-                    settings, "show_log", text="", icon="TRASH"))
-            if opened:
-                records = gk_log.records()[-8:]
-                if not records:
-                    box.label(text="(还没有日志)")
-                for level, line in records:
-                    icon = {"ERROR": "ERROR", "WARN": "ERROR"}.get(level, "INFO")
-                    box.label(text=line[11:] if len(line) > 11 else line,
-                              icon=icon)
 
 
 def _draw_advisor_box(layout, context, settings):
-    """画『项目顾问』:提问 + 状态 + 『查看对话』。
+    """画『出问题了? / 项目顾问』:提问 + 状态 + 『查看对话』。
+
+    ── 为什么和『出问题了?』合成一块(第五十五轮)────────────────────
+    用户说"显示的信息太多了"。这两块本来是一对(一个导出诊断成文件、
+    一个交给 AI 分析),各占一块会让人以为要做两个选择。并成一块后:
+    第一排是"问 AI / 查看对话",第二排是"导出诊断信息"。
 
     ── 为什么这里**不再显示回答正文**(用户 2026-10-08 的反馈)────────
     第一版把整段回答贴在这个盒子里,结果 808 字就把侧栏撑到看不见底、
@@ -4957,7 +4899,8 @@ def _draw_advisor_box(layout, context, settings):
     节点图连线、生成的代码、导出告警全摊开的快照,**粘到任何 AI 里都能用**。
     所以没配 API 的人也不该被挡在门外。
     """
-    box, opened = collapsible_box(layout, "advisor", "项目顾问(AI)", "HELP")
+    box, opened = collapsible_box(layout, "advisor", "出问题了? / 项目顾问",
+                                 "HELP")
     if not opened:
         return
 
@@ -4978,8 +4921,13 @@ def _draw_advisor_box(layout, context, settings):
     # 旁边留『复制诊断』这条一定能走通的路。
     ask.enabled = configured and settings is not None and not busy
     ask.operator("gk.ask_advisor", text="问 AI", icon="QUESTION")
-    row.operator("gk.open_advisor_dialog", text="查看对话", icon="TEXT")
+    view = row.operator("gk.open_text_block", text="查看对话", icon="TEXT")
+    view.text_name = advisor.DIALOG_TEXT_NAME
     row.operator("gk.copy_advisor_context", text="", icon="COPYDOWN")
+
+    # 第二排:把诊断导出成文件(原来单独一块『出问题了?』,第五十五轮并进来)
+    row = box.row(align=True)
+    row.operator("gk.dump_diagnostics", text="导出诊断信息", icon="TEXT")
 
     # ── 状态行 ────────────────────────────────────────────────────
     error = ops.LAST_ADVISOR.get("error", "")

@@ -128,7 +128,7 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 ├── __init__.py                 注册入口(按依赖顺序注册所有类)
 ├── blender_manifest.toml       Blender 扩展清单
 ├── gk_sockets.py               引脚类型:执行流 / 任意值 + 内置类型语义表
-├── gk_log.py                   日志(面板里能看最近 200 条)
+├── gk_log.py                   日志(环形缓冲最近 200 条;写在 Blender 控制台)
 ├── models.py                   共享数据模型:ExportSettings / CodegenResult / Diagnostic
 ├── paths.py                    路径工具(纯标准库):res:// 归一化、目录穿越防护
 ├── blender_adapter.py          Blender 适配层:集中 bpy 访问(.blend 路径 / 当前场景)
@@ -179,6 +179,7 @@ docs/
 
 tests/
 ├── gk_stub.py                  离线 bpy 打桩(让 codegen 脱离 Blender 可测)
+├── blender_panels.py           侧栏面板 draw() 测试(真画一次,专抓"面板画不出来")
 ├── test_codegen.py             321 个回归测试,秒级跑完,不需要 Blender
 ├── blender_smoke.py            63 项冒烟测试,在真实 Blender 里跑(含菜单结构、按键捕获与插件偏好设置注册/读取)
 ├── blender_anim_tree.py        ★ 动画/输入/相机/骨骼(真 Blender 建图导出,59 项)

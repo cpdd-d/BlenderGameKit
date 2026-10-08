@@ -31,6 +31,8 @@ import time
 MAX_ITEMS = 60
 # 报告在 .blend 里的键(场景自定义属性)
 PERSIST_KEY = "gk_last_report"
+# 整份报告也写进这个文本块 —— 用文本编辑器读长报告(见 sync_text_block)
+EXPORT_REPORT_TEXT_NAME = "GK 导出报告"
 
 # 内存里的最近一份(会话内;和 .blend 那份互为备份)
 LAST_REPORT = {}
@@ -98,7 +100,7 @@ def build(result):
 
 
 def record(scene, result):
-    """记住一份导出报告(内存 + .blend)。返回报告字典。"""
+    """记住一份导出报告(内存 + .blend + 文本块)。返回报告字典。"""
     report = build(result)
     LAST_REPORT.clear()
     if report:
@@ -108,7 +110,39 @@ def record(scene, result):
             scene[PERSIST_KEY] = json.dumps(report, ensure_ascii=False)
         except Exception:                                 # noqa: BLE001
             pass          # 存不进去不影响导出本身(只是重开看不到)
+    if report:
+        try:
+            sync_text_block(report)
+        except Exception:                                 # noqa: BLE001
+            pass          # 写不进文本块不影响导出本身
     return report
+
+
+def sync_text_block(report):
+    """把整份报告写进 Blender 文本块『GK 导出报告』。
+
+    ── 为什么搬到这里来(用户第五十五轮:"侧栏显示的信息太多了")────────
+    报告一出问题就能有十几条(带"怎么修"),全部铺在侧栏会把面板撑得很长。
+    现在正文进文本块,用**文本编辑器**看 —— 能滚动 / 选择 / 复制 / 搜索,
+    侧栏只留一行摘要 + 几个按钮。
+
+    ⚠ 但侧栏**保留**出错时的『定位』按钮:点了能跳到出问题的那个节点 ——
+    这是文本块替代不了的(文本块里的字点不动)。所以是"正文搬走、
+    交互留下",不是全删。
+    """
+    import bpy
+
+    block = bpy.data.texts.get(EXPORT_REPORT_TEXT_NAME)
+    if block is None:
+        block = bpy.data.texts.new(EXPORT_REPORT_TEXT_NAME)
+    else:
+        block.clear()
+    block.write(report_text(report))
+    try:
+        block.use_fake_user = True
+    except Exception:                                     # noqa: BLE001
+        pass
+    return block.name
 
 
 def load(scene):
