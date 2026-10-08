@@ -9,12 +9,17 @@
 
 步骤(全程在 `_dist/release_probe` 里,不碰 examples):
   1. 建一个最小的 Godot 项目(main.tscn + project.godot);
-  2. 用 `packaging.ensure_export_presets()` 生成导出预设;
-  3. 探导出模板:没装就打印"跳过"并返回 0(**不判红** —— 本机没装模板
-     是环境问题,不是代码问题;装了模板的机器才会真正跑到第 4 步);
+  2. 用 `packaging.append_missing_presets()` 一次补上**多个平台**的预设
+     (第六十八轮起:Windows / Linux / Web);
+  3. 逐个平台探模板:没装那个平台的模板就打印"跳过"并接着看下一个
+     (**不判红** —— 本机没装模板是环境问题,不是代码问题);
   4. `godot --headless --path <项目> --import`(让资源进缓存);
-  5. `godot --headless --path <项目> --export-release "Windows Desktop" <产物>`;
-  6. 断言产物文件真的躺在磁盘上。
+  5. 逐个平台真跑 `godot --headless --path <项目> --export-release "<预设>" <产物>`;
+  6. 断言每个产出的文件真的躺在磁盘上。
+
+只验 Windows / Linux / Web 这三个**纯模板**导出:Android 还要签名
+(keystore)、macOS 只能在 macOS 主机上导 —— 拿它们判红会把"本机没配签名"
+误判成代码错。
 
 `packaging` 是纯标准库模块,所以这个脚本**不需要 Blender**。
 """
@@ -89,11 +94,20 @@ def main():
         return 0
 
     project = build_project()
-    output = packaging.default_output_path(project, "GKReleaseProbe")
-    preset_file, created = packaging.ensure_export_presets(
-        project, title="GKReleaseProbe",
-        export_path=packaging.rel_output_path(project, output))
-    print(f"RELEASE_PRESET created={created} path={preset_file}")
+    title = "GKReleaseProbe"
+
+    # 第六十八轮:一次补上多个平台的预设(Windows / Linux / Web)。
+    # 只验这三个 —— 它们是**纯模板**导出;Android 还要签名(keystore)、
+    # macOS 只能在 macOS 上导,拿它们判红会把"本机没配签名"误判成代码错。
+    probed = ["windows", "linux", "web"]
+    output_paths = {key: packaging.platform_output_path(project, title, key)
+                    for key in probed}
+    added = packaging.append_missing_presets(
+        project, probed, title=title,
+        output_paths={key: packaging.rel_output_path(project, path)
+                      for key, path in output_paths.items()})
+    preset_file = os.path.join(project, packaging.EXPORT_PRESETS_NAME)
+    print(f"RELEASE_PRESET added={added} path={preset_file}")
 
     version = godot_version(args.godot)
     ready, template_dir, note = packaging.templates_status(version)
@@ -104,40 +118,49 @@ def main():
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
 
-    # ── 无论有没有模板都**真跑一次导出** ─────────────────────────────
-    # 为什么不等探测到"没装模板"就早退:真跑一次能额外证明一件事 ——
-    # Godot **认得出我们生成的预设**(报错若是"找不到模板",说明预设已经
-    # 被解析、预设名也对上了;若预设写坏了,它会报别的错)。所以没装模板的
-    # 机器上这一步也不是白跑。
-    ok, log = packaging.run_release(args.godot, project,
-                                    packaging.WINDOWS_PRESET_NAME, output)
-    exists = os.path.isfile(output)
-    size = os.path.getsize(output) if exists else 0
-    print(f"RELEASE_RUN ok={ok} exists={exists} size={size} path={output}")
+    failures = []
+    successes = []
+    for key in probed:
+        label = packaging.platform_label(key)
+        output = output_paths[key]
+        # ── 没装这个平台的模板:跳过(本机环境问题,不判红)──────────────
+        # 但仍然**真跑一次** —— 能额外证明 Godot 认得出我们补的那段预设
+        # (报错若是"找不到模板",说明预设已被解析、预设名也对上了)。
+        plat_ready, _d, plat_note = packaging.templates_status(version, key)
+        ok, log = packaging.run_release(
+            args.godot, project, packaging.PLATFORMS[key]["preset_name"], output)
+        exists = os.path.isfile(output)
+        size = os.path.getsize(output) if exists else 0
+        print(f"RELEASE_RUN_{key} ok={ok} exists={exists} size={size} path={output}")
+        if exists:
+            if size < 1024:
+                failures.append(f"{label}:产物太小({size} 字节),多半不是真的可执行文件")
+            else:
+                successes.append(label)
+            continue
+        if packaging.template_missing_in_log(log):
+            print(f"跳过:{label} 没装导出模板"
+                  f"({'模板已就绪' if plat_ready else '且模板缺失'})")
+            for line in [ln for ln in (plat_note or "").splitlines() if ln.strip()][:1]:
+                print("  " + line)
+            continue
+        failures.append(f"{label}:打包失败(报错不是『缺模板』)")
+        for line in [ln for ln in (log or "").splitlines() if ln.strip()][-10:]:
+            print("   " + line)
 
-    if exists:
-        # embed_pck=true 时产物是单个 exe,怎么也不该小于 1KB
-        if size < 1024:
-            print(f"✗ 产物太小({size} 字节),多半不是真的可执行文件")
-            print("CHECK_RELEASE=FAIL")
-            return 1
-        print("CHECK_RELEASE=OK")
-        return 0
-
-    # 没出文件:分清"模板没装(本机环境,跳过)"还是"预设/命令有问题(判红)"
-    if packaging.template_missing_in_log(log):
-        print(f"跳过:没装 Godot 导出模板(版本 {version});"
+    if failures:
+        print("✗ " + ";".join(failures))
+        print("CHECK_RELEASE=FAIL")
+        return 1
+    if not successes:
+        print(f"跳过:没装任何导出模板(版本 {version});"
               f"但预设名与命令已被 Godot 接受(只差模板文件)")
         for line in [ln for ln in (note or "").splitlines() if ln.strip()][:2]:
             print("  " + line)
         return 0
-
-    print("✗ 打包失败(报错不是『缺模板』,可能预设或命令有问题)。"
-          "Godot 输出(尾部 20 行):")
-    for line in [ln for ln in (log or "").splitlines() if ln.strip()][-20:]:
-        print("   " + line)
-    print("CHECK_RELEASE=FAIL")
-    return 1
+    print(f"RELEASE_OK {successes}")
+    print("CHECK_RELEASE=OK")
+    return 0
 
 
 if __name__ == "__main__":

@@ -38,32 +38,156 @@ DIST_DIR = "dist"
 
 
 # ---------------------------------------------------------------------------
+# 平台表(第六十八轮:从"只有 Windows"扩到多平台)
+# ---------------------------------------------------------------------------
+# ── 为什么是一张表,而不是一堆 if ──────────────────────────────────
+# 每个平台要的东西是**同一组**:Godot 认的平台名、预设名、产物扩展名、
+# 发布模板文件名、在哪台主机上能导。写在一起,加平台 = 加一行。
+#
+# `hosts` 是**主机**限制:macOS 的导出 Godot 只在 macOS 上做(它要调
+# codesign / hdiutil),别的平台点了也是白等 —— 界面上要明说。
+PLATFORM_ORDER = ("windows", "linux", "web", "android", "macos")
+
+_ALL_HOSTS = ("win32", "linux", "darwin")
+
+PLATFORMS = {
+    "windows": {
+        "label": "Windows (.exe)",
+        "preset_name": "Windows Desktop",
+        "godot_platform": "Windows Desktop",
+        "ext": ".exe",
+        "template": "windows_release_x86_64.exe",
+        "template_ext": ".exe",
+        "template_tokens": ("windows", "release"),
+        "hosts": _ALL_HOSTS,
+    },
+    "linux": {
+        "label": "Linux (.x86_64)",
+        "preset_name": "Linux",
+        "godot_platform": "Linux",
+        "ext": ".x86_64",
+        "template": "linux_release.x86_64",
+        "template_ext": ".x86_64",
+        "template_tokens": ("linux", "release"),
+        "hosts": _ALL_HOSTS,
+    },
+    "web": {
+        "label": "Web (HTML5 .zip)",
+        "preset_name": "Web",
+        "godot_platform": "Web",
+        "ext": ".zip",
+        "template": "web_release.zip",
+        "template_ext": ".zip",
+        "template_tokens": ("web", "release"),
+        "hosts": _ALL_HOSTS,
+    },
+    "android": {
+        "label": "Android (.apk)",
+        "preset_name": "Android",
+        "godot_platform": "Android",
+        "ext": ".apk",
+        "template": "android_release.apk",
+        "template_ext": ".apk",
+        "template_tokens": ("android", "release"),
+        "hosts": _ALL_HOSTS,
+    },
+    "macos": {
+        "label": "macOS (.zip)",
+        "preset_name": "macOS",
+        "godot_platform": "macOS",
+        "ext": ".zip",
+        "template": "macos.zip",
+        "template_ext": ".zip",
+        "template_tokens": ("macos",),
+        # Godot 只在 macOS 上导 macOS(要 codesign / hdiutil)
+        "hosts": ("darwin",),
+    },
+}
+
+
+def platform_label(platform):
+    """给人看的平台名;认不出来就原样返回。"""
+    spec = PLATFORMS.get(platform)
+    return spec["label"] if spec else str(platform)
+
+
+def platform_buildable(platform, host=None):
+    """这个平台在**当前主机**上能不能导出(macOS 只能在 macOS 上)。"""
+    spec = PLATFORMS.get(platform)
+    if spec is None:
+        return False
+    return (host or sys.platform) in spec["hosts"]
+
+
+def selected_platforms(settings):
+    """场景设置里勾了哪些平台(按 PLATFORM_ORDER 排序)。
+
+    **纯读 getattr**(不碰 bpy),离线喂个假对象就能测。一个都没勾 / 老工程
+    没有这些字段 -> 空表 —— 由调用方给出"没勾任何平台"的提示,不瞎猜。
+    """
+    if settings is None:
+        return []
+    return [key for key in PLATFORM_ORDER
+            if bool(getattr(settings, f"package_{key}", False))]
+
+
+
+# ---------------------------------------------------------------------------
 # 预设文件
 # ---------------------------------------------------------------------------
+def platform_options(platform, android_id="", version=""):
+    """`[preset.N.options]` 里除了 product_name 还要写哪些键。
+
+    ── 为什么捏着这么几个键 ────────────────────────────────────────
+    Godot 读预设时**没写的键用该平台默认值**。写得越少,跨 4.x 小版本
+    (有些键改过名)越不容易踩到"类型对不上导致整份文件解析失败"。
+    所以这里只写"不写就会出事"的那几个:
+      * Windows / Linux:embed_pck —— 打进可执行文件里,产物是**单个文件**,
+        拷给别人就能跑(否则会多一个同名 .pck,用户容易漏拷);
+      * Android:包名(不写 Godot 直接拒)+ 版本号 + **不走 gradle**
+        (走它就要 Android SDK / gradle 那一整套,门槛太高);
+      * macOS:bundle 架构。
+    """
+    if platform in ("windows", "linux"):
+        return ["debug/export_console_wrapper=1",
+                "binary_format/embed_pck=true",
+                'binary_format/architecture="x86_64"',
+                "codesign/enable=false"]
+    if platform == "android":
+        return [
+            "gradle_build/use_gradle_build=false",
+            f'package/unique_name="{android_id or "com.example.game"}"',
+            f'version/name="{version or "1.0"}"',
+            "version/code=1",
+        ]
+    if platform == "macos":
+        return ['binary_format/architecture="universal"']
+    return []
+
+
 def export_presets_text(title="game", preset_name=WINDOWS_PRESET_NAME,
-                        export_path=""):
-    """生成一份 Windows Desktop 导出预设的文本。
+                        export_path="", platform="windows", index=0,
+                        android_id="", version=""):
+    """生成一段 `<platform>` 的导出预设文本。
 
-    ── 为什么只写这么几个键 ────────────────────────────────────────
-    Godot 读 `export_presets.cfg` 时,**没写的键会用该平台的默认值**。
-    键写得越少,跨 Godot 小版本(4.2 / 4.4 / 4.7 之间有些键改过名)越不容易
-    踩到"类型对不上导致整个文件解析失败"。所以这里只写那些跨 4.x 稳定、
-    且确实必要的键,其余交给 Godot 自己补。
-
-    `binary_format/embed_pck=true`:把资源打进 exe 里,出来的是**单个文件**,
-    拷给别人就能跑 —— 否则会多一个同名 .pck,用户容易漏拷。
+    `index` 是 `[preset.N]` 里的那个 N —— 一份 `export_presets.cfg` 可以装
+    **多个预设**(多平台就靠这个);第六十八轮的"追加缺失平台"会传 0、1、2…
     """
     title = title or "game"
     path = (export_path or "").replace("\\", "/")
+    spec = PLATFORMS.get(platform) or PLATFORMS["windows"]
+    options = platform_options(platform, android_id=android_id, version=version)
+    body = "\n".join(options + [f'application/product_name="{title}"'])
     return f"""; 由 BlenderGameKit 自动生成 —— 只在项目里**没有** export_presets.cfg
-; 时创建一次。之后你在 Godot 编辑器『项目 -> 导出』里改的设置都写在这个
-; 文件里,插件不会再覆盖它。
-; 想重置成默认:把这个文件删掉,再回 Blender 点一次『打包成可执行文件』。
+; 时创建一次;已经有的话,缺哪个平台就**追加**哪一段(写前会备份一份 .bak)。
+; 之后你在 Godot 编辑器『项目 -> 导出』里改的设置都写在这个文件里,
+; 插件不会再覆盖它。
+; 想重置成默认:把这个文件删掉,再回 Blender 点一次『打包』。
 
-[preset.0]
+[preset.{index}]
 
 name="{preset_name}"
-platform="Windows Desktop"
+platform="{spec['godot_platform']}"
 runnable=true
 advanced_options=false
 dedicated_server=false
@@ -77,16 +201,23 @@ encryption_exclude_filters=""
 encrypt_pck=false
 encrypt_directory=false
 
-[preset.0.options]
+[preset.{index}.options]
 
-custom_template/debug=""
-custom_template/release=""
-debug/export_console_wrapper=1
-binary_format/embed_pck=true
-binary_format/architecture="x86_64"
-codesign/enable=false
-application/product_name="{title}"
+{body}
 """
+
+
+def platform_presets_text(platform, title="game", preset_name="",
+                          export_path="", index=0, android_id="", version=""):
+    """按平台生成预设文本(预设名留空 = 用该平台的默认名)。"""
+    spec = PLATFORMS.get(platform)
+    if spec is None:
+        raise ValueError(f"未知平台: {platform}")
+    return export_presets_text(title=title,
+                               preset_name=preset_name or spec["preset_name"],
+                               export_path=export_path, platform=platform,
+                               index=index, android_id=android_id,
+                               version=version)
 
 
 def read_preset_name(directory):
@@ -113,9 +244,113 @@ def read_export_path(directory):
     return match.group(1).strip()
 
 
+def read_platform_preset(directory, platform):
+    """已有预设里跟这个平台对得上的那一条:(预设名, export_path)。
+
+    ── 为什么不能"读第一条"了(第六十八轮)──────────────────────────
+    一份 `export_presets.cfg` 里可以有多个预设(多平台就靠这个)。原来只会
+    读第一条,扩到多平台后就会拿**别的平台**的预设名去导 —— 命令行报
+    "找不到预设";或者把产物丢到用户没预期的地方。
+
+    用户在 Godot 编辑器里配过的东西优先:他可能把输出路径改到别处了。
+    没配过 -> (None, None),由调用方用默认预设名 / 默认路径。
+    """
+    text = _read(directory, EXPORT_PRESETS_NAME)
+    spec = PLATFORMS.get(platform)
+    if not text or spec is None:
+        return None, None
+    parts = re.split(r'^\[preset\.(\d+)\]\s*$', text, flags=re.MULTILINE)
+    # parts[0] 是文件头;之后每两段是一份预设(序号, 正文)
+    for index in range(1, len(parts) - 1, 2):
+        body = parts[index + 1]
+        found = re.search(r'^platform="([^"]*)"', body, re.MULTILINE)
+        if not found or found.group(1) != spec["godot_platform"]:
+            continue
+        name = re.search(r'^name="([^"]*)"', body, re.MULTILINE)
+        path = re.search(r'^export_path="([^"]*)"', body, re.MULTILINE)
+        configured = path.group(1).strip() if path else ""
+        return (name.group(1) if name else None, configured or None)
+    return None, None
+
+
+def read_preset_platforms(directory):
+    """从已有预设里读出已经**有**哪些平台(按文件里的先后顺序)。
+
+    纯读文件 + 正则;文件不在 / 读不到 -> 空表(用空表当"什么平台都没有")。
+    """
+    return _platforms_in_text(_read(directory, EXPORT_PRESETS_NAME) or "")
+
+
+def _platforms_in_text(text):
+    """预设文本里出现过哪些 `platform="..."`。"""
+    return re.findall(r'^platform="([^"]*)"', text or "", re.MULTILINE)
+
+
+def _next_preset_index(text):
+    """下一个可用的 `[preset.N]` 序号(空文件 -> 0)。"""
+    numbers = [int(value) for value in
+               re.findall(r'^\[preset\.(\d+)(?:\.options)?\]', text or "",
+                          re.MULTILINE)]
+    return (max(numbers) + 1) if numbers else 0
+
+
+def append_missing_presets(directory, platforms, title="game",
+                           android_id="", version="", output_paths=None):
+    """把**缺的平台**追加进 `export_presets.cfg`,返回补了哪些平台。
+
+    ── 为什么是"追加"而不是"重写"(用户第六十八轮选的)──────────────
+    用户在 Godot 编辑器里调过的东西(图标 / 权限 / 架构 / 输出路径)全写在
+    这个文件里,**重写等于把它们抹掉**。所以这里只做一件事:看文件里
+    已经有哪些 `platform="..."`,缺哪段补哪段 —— 老内容**一个字节不动**。
+
+    ── 备份 ───────────────────────────────────────────────────────
+    写之前把原文另存一份 `<文件>.bak`(叫 .bak 是为了不和 Godot 的
+    `export_presets.cfg` 混起来)。文件本来就不存在时**不留**空备份。
+
+    返回补上的平台 key 列表(顺序同传入);一个都没缺 -> 空表。
+    """
+    path = os.path.join(directory, EXPORT_PRESETS_NAME)
+    had_file = os.path.isfile(path)
+    existing = (_read(directory, EXPORT_PRESETS_NAME) or "") if had_file else ""
+    present = _platforms_in_text(existing)
+    wanted = [key for key in platforms if key in PLATFORMS]
+    missing = [key for key in wanted
+               if PLATFORMS[key]["godot_platform"] not in present]
+    if not missing:
+        return []
+
+    index = _next_preset_index(existing)
+    blocks = []
+    for offset, key in enumerate(missing):
+        blocks.append(platform_presets_text(
+            key, title=title, export_path=(output_paths or {}).get(key, ""),
+            index=index + offset, android_id=android_id, version=version))
+
+    os.makedirs(directory, exist_ok=True)
+    if had_file:
+        try:
+            with open(path + ".bak", "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(existing)
+        except OSError:
+            pass
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n".join(blocks)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    return missing
+
+
 def default_output_path(directory, name, ext=".exe"):
-    """默认的打包产物路径: `<项目>/dist/<名字>.exe`(绝对路径)。"""
+    """默认的打包产物路径: `<项目>/dist/<名字><扩展名>`(绝对路径)。"""
     return os.path.join(directory, DIST_DIR, f"{name}{ext}")
+
+
+def platform_output_path(directory, name, platform):
+    """按平台算默认产物路径(扩展名跟着平台走:.exe / .apk / .zip / .x86_64)。"""
+    spec = PLATFORMS.get(platform) or PLATFORMS["windows"]
+    return default_output_path(directory, name, ext=spec["ext"])
 
 
 def rel_output_path(directory, path):
@@ -184,36 +419,57 @@ def find_template_dir(version, root=None):
     return matched[-1] if matched else None
 
 
-def windows_release_template(directory):
-    """版本目录里的 Windows 发布模板文件名;没有返回 None。
+def platform_template_file(platform, directory):
+    """版本目录里这个平台的**发布**模板文件名;没有返回 None。
 
-    文件名在各版本间变过(`windows_64_release.exe` / `windows_release_x86_64.exe`),
-    所以按"含 windows 且含 release"来认,不写死具体名字。
+    ── 两步走(名字在各版本间变过)────────────────────────────────────
+    1. 先认**精确名**(Godot 4.7 就是 `windows_release_x86_64.exe` 这一套);
+    2. 认不出再退回**关键词**匹配:文件名要带全 tokens、扩展名要对,
+       并且**排除 debug / console** —— 它们也在同一个目录里
+       (`windows_release_arm64_console.exe`、`android_debug.apk`),
+       错认成 debug 版会打出"带控制台 / 不能发布"的东西。
+       多个都命中时取**最短**的那个:web 目录里有
+       `web_release.zip` / `web_dlink_release.zip` / `web_nothreads_release.zip`,
+       最短的正是那份最朴素的。
     """
-    if not directory or not os.path.isdir(directory):
+    spec = PLATFORMS.get(platform)
+    if spec is None or not directory or not os.path.isdir(directory):
         return None
     try:
         entries = os.listdir(directory)
     except OSError:
         return None
+    if spec["template"] in entries:
+        return spec["template"]
+    hits = []
     for entry in entries:
         low = entry.lower()
         if "readme" in low or low.endswith(".txt"):
             continue
-        if "windows" in low and "release" in low:
-            return entry
-    return None
+        if not low.endswith(spec["template_ext"]):
+            continue
+        if "debug" in low or "console" in low:
+            continue
+        if all(token in low for token in spec["template_tokens"]):
+            hits.append(entry)
+    return min(hits, key=len) if hits else None
 
 
-def template_install_hint(version=""):
+def windows_release_template(directory):
+    """版本目录里的 Windows 发布模板文件名;没有返回 None。"""
+    return platform_template_file("windows", directory)
+
+
+def template_install_hint(version="", platform="windows"):
     """模板缺失时给用户看的"去哪儿装"说明(要能照着做)。"""
     root = export_templates_root()
+    spec = PLATFORMS.get(platform) or PLATFORMS["windows"]
     return (
         f"没装 Godot 导出模板(需要版本 {version or '?'})。\n"
-        f"Godot 会去这里找: {root}\\<版本>\\windows_release_x86_64.exe\n"
+        f"Godot 会去这里找: {root}\\<版本>\\{spec['template']}\n"
         "装法:打开 Godot 编辑器 -> 顶部菜单『编辑器』->『管理导出模板』-> "
         "点『下载并安装』;\n"
-        f"它会自动装到 {root}。装完再回 Blender 点一次『打包成可执行文件』。"
+        f"它会自动装到 {root}。装完再回 Blender 点一次『打包』。"
     )
 
 
@@ -234,20 +490,26 @@ def template_missing_in_log(log):
     return "导出模板" in low and ("未找到" in low or "找不到" in low)
 
 
-def templates_status(version):
-    """导出模板是否就绪。返回 (是否就绪, 版本目录, 说明文字)。"""
+def templates_status(version, platform="windows"):
+    """这个平台的导出模板是否就绪。返回 (是否就绪, 版本目录, 说明文字)。
+
+    第六十八轮起按平台查 —— 模板是**一个平台一份**的:装了 Windows 不等于
+    装了 Android,所以界面上的状态也得分平台显示。
+    """
+    spec = PLATFORMS.get(platform) or PLATFORMS["windows"]
     root = export_templates_root()
     directory = find_template_dir(version, root)
     if directory is None:
         return False, None, (
             f"没装 Godot 导出模板:在 {root} 里找不到版本 {version or '?'}。\n"
-            + template_install_hint(version))
-    found = windows_release_template(directory)
+            + template_install_hint(version, platform))
+    found = platform_template_file(platform, directory)
     if found is None:
         return False, directory, (
-            f"{directory} 里没有 Windows 发布模板文件。\n"
-            + template_install_hint(version))
-    return True, directory, f"导出模板已就绪: {found}"
+            f"{directory} 里没有 {spec['label']} 的发布模板"
+            f"(需要 {spec['template']})。\n"
+            + template_install_hint(version, platform))
+    return True, directory, f"{spec['label']} 导出模板已就绪: {found}"
 
 
 # ---------------------------------------------------------------------------

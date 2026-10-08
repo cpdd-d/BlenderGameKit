@@ -11,6 +11,7 @@ from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
 from . import asset_export
 from . import node_groups
 from . import operator_io as ops
+from . import packaging
 from . import properties as props
 from .nodes import nodes as node_lib
 from .nodes import node_base as NB
@@ -5030,6 +5031,11 @@ class GK_PT_Main(bpy.types.Panel):
         # ---- 项目绑定(最上面,因为它是所有导出的落点)----
         _draw_project_box(layout, context)
 
+        # ---- 打包设置(第六十八轮:勾平台 + 一键打出多个平台)--------
+        # 单开一盒:勾平台跟"项目建没建"没关系(先想好发哪些平台很正常),
+        # 塞进『Godot 项目』盒里会在"还没保存 / 还没建项目"时整块看不到。
+        _draw_packaging_box(layout, context)
+
         # ---- 节点图总览 + 参与导出开关(用户 2026-10-03 第五轮)--------
         # 用户原话:"可以在场景集合那里添加节点图显示,可隐藏,可失效的场景功能"。
         # 大纲视图里加不了自定义条目,但**侧栏能列全**:所有逻辑图 / 动画图
@@ -5382,22 +5388,6 @@ def _draw_project_box(layout, context):
         else:
             box.label(text="运行前不会自动导出(改完记得手动导)", icon="ERROR")
 
-        # ── 打包发布(补全流程最后一环:出可执行文件)──────────────────
-        # 以前这里到"运行游戏"为止 —— 要 exe 还得自己开 Godot 配导出预设、
-        # 装导出模板、再点一次导出。现在一个按钮走完:
-        # 导出工程 -> 生成预设(不覆盖已有的)-> godot --export-release。
-        row = box.row(align=True)
-        row.scale_y = 1.4
-        row.operator("gk.export_release", text="打包成可执行文件",
-                     icon="EXPORT")
-        released = ops.LAST_RELEASE.get("output", "")
-        if released:
-            row = box.row(align=True)
-            row.label(text=f"上次打包: {os.path.basename(released)}", icon="CHECKMARK")
-            row.operator("gk.open_release_folder", text="", icon="FILE_FOLDER")
-        else:
-            box.label(text="打出可直接运行的 exe(需装导出模板)", icon="INFO")
-
         row = box.row(align=True)
         row.operator("gk.relink_project", text="改位置", icon="FILE_FOLDER")
         row.operator("gk.reset_settings", text="重置", icon="LOOP_BACK")
@@ -5429,6 +5419,50 @@ def _draw_project_box(layout, context):
             row.scale_y = 1.3
             row.operator("gk.fix_base_class", text="改成『自动』修好",
                          icon="CHECKMARK")
+
+
+def _draw_packaging_box(layout, context):
+    """『打包设置』(第六十八轮)—— 勾平台 + 一键逐个平台打包。
+
+    用户原话:"在侧边栏添加打包为 .exe,.apk 等的打包设置"。
+
+    ── 为什么**不塞进『Godot 项目』盒** ──────────────────────────────
+    那个盒在"`.blend` 还没保存 / 项目还没建"时会早退,而"这次要发哪些平台"
+    跟项目建没建**没关系**(先想好目标平台很正常)。所以单开一盒,一直可见。
+
+    ── 为什么这里不查导出模板 ──────────────────────────────────────
+    查一次要跑 `godot --version`(起进程),而 draw() 会被反复调用 ——
+    侧栏会卡住。模板状态改成**打包时逐个平台报**(见 operator_io 那个算子)。
+    """
+    box, opened = collapsible_box(layout, "packaging", "打包设置", "EXPORT")
+    if not opened:
+        return
+    settings = getattr(context.scene, "gk_settings", None)
+    if settings is None:
+        box.label(text="拿不到场景设置(先打开一个场景)", icon="ERROR")
+        return
+    box.label(text="打哪几个平台(可多选):", icon="INFO")
+    for key in packaging.PLATFORM_ORDER:
+        row = box.row(align=True)
+        row.prop(settings, f"package_{key}",
+                 text=packaging.PLATFORMS[key]["label"])
+        if not packaging.platform_buildable(key):
+            row.label(text="只能在 macOS 上导", icon="ERROR")
+    row = box.row(align=True)
+    row.prop(settings, "package_app_name", text="应用名")
+    row = box.row(align=True)
+    row.prop(settings, "package_version", text="版本")
+    row = box.row(align=True)
+    row.prop(settings, "package_android_id", text="安卓包名")
+    row = box.row(align=True)
+    row.scale_y = 1.4
+    row.operator("gk.export_release", text="开始打包", icon="EXPORT")
+    released = ops.LAST_RELEASE.get("output", "")
+    if released:
+        row = box.row(align=True)
+        row.label(text=f"上次打包: {os.path.basename(released)}", icon="CHECKMARK")
+        row.operator("gk.open_release_folder", text="", icon="FILE_FOLDER")
+    box.label(text="缺哪个平台的预设会自动补上(写前备份)", icon="INFO")
 
 
 def _draw_node_menu_contents(layout, context, nested=False):

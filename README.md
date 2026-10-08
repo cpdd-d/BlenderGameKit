@@ -51,7 +51,7 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 | 做恐怖游戏 | **氛围套件**:心跳随危险变快变响(『氛围_紧张度』『氛围_心跳』)、一键**惊吓三连**(震屏 + 闪白 + 音效)、总线音量压低;配上**听觉 AI** 就是"扔石头把怪物引开"那套 |
 | 动作过渡生硬(走↔跑硬切) | **动画混合树** —— 几段动画按一个参数**连续混合**(走↔跑步↔冲刺),不是"啪"地换过去 |
 | 卡住了不知道问谁 | 侧栏**『项目顾问』** —— 把项目诊断(节点图与连线 / 碰撞体尺寸 / 生成的代码 / 导出告警 / 最近报错)整理成快照交给 AI,要"下一步怎么做"。也支持**不联网**只复制快照 |
-| 只能导出工程、出不了可执行文件 | 点一下**打包成可执行文件**,在 Blender 里直接出 `.exe`(自动生成导出预设,不覆盖你已有的) |
+| 只能导出工程、出不了可执行文件 | 点一下**打包**(侧栏『打包设置』里勾平台),在 Blender 里直接出 `.exe` / `.apk` / Linux / Web —— 自动补导出预设(**已有的一个字不动**,只在旁边留个 `.bak`) |
 
 不是运行时解释器，是**代码生成器**：节点图 → 标准 GDScript 4 → 随便改、随便读、Godot 原生调试。
 渲染也不是"通用 PBR 降级版"，而是按日式动画赛璐璐的做法写的。
@@ -71,7 +71,8 @@ World       [instance glb]         ← 网格 + 层级 + 变换
    > 放哪几个节点、怎么连、看哪个示例、会踩什么坑。
 6. 侧栏 **导出为 Godot 脚本** / **导出模型到 Godot**
 7. 想测试时点 **打开 Godot 编辑器**(或 **直接运行游戏**)
-8. 要发出去/给别人玩:点 **打包成可执行文件** —— 在 Blender 里一步出 `.exe`
+8. 要发出去/给别人玩:去侧栏 **『打包设置』** 勾上目标平台(Windows / Linux /
+   Web / Android;macOS 只能在 macOS 上导),点 **开始打包** —— 一步出可执行文件
    (需要先在 Godot 里装一次**导出模板**:编辑器菜单『编辑器 → 管理导出模板 → 下载并安装』)
 9. 卡住了不知道问谁:侧栏 **项目顾问** 里写一句你卡在哪,点 **问 AI** ——
    插件会先把项目诊断(节点图/连线、碰撞体尺寸、生成的代码、导出告警、最近报错)
@@ -170,7 +171,7 @@ BlenderGameKit/                 插件本体(这个文件夹就是要安装的�
 ├── curve_assets.py             曲线资产 -> curves/*.tres(运镜 / 时间轴)
 ├── sound_assets.py             音频资产 -> audio/(『资产卡』挑的音频文件)
 ├── npr_preview.py              ★ Blender 端 NPR 预览材质(EEVEE 里调卡通参数)
-├── packaging.py                ★ 打包发布:生成导出预设 + 调 Godot `--export-release` 出可执行文件(纯标准库,离线可测)
+├── packaging.py                ★ 打包:多平台(Windows/Linux/Web/Android/macOS)导出预设 + 调 Godot `--export-release` 出产物(纯标准库,离线可测)
 ├── advisor.py                  ★ 项目顾问:把项目诊断交给 AI 分析 + Agent 工具循环(OpenAI 兼容协议/function calling;纯函数离线可测)
 ├── advisor_tools.py            ★ AI 能用的工具:6 个**只读**(自己去看项目)+ 提议动作(改必须用户点『执行』才生效)
 ├── project/                    ★ 一个 .blend 一个 Godot 项目
@@ -224,7 +225,7 @@ tests/
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
 ├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 307 项冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端十七层(-Deep 再加动画六层)
-├── check_release.py            ★ 打包发布自检:真 Godot 跑 `--export-release` 出可执行文件(没装导出模板则跳过)
+├── check_release.py            ★ 打包自检:真 Godot 逐个平台跑 `--export-release`(Windows/Linux/Web;没装那个平台的导出模板则跳过)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
 ├── make_horror_demo.py         ★ 生成恐怖示例(氛围套件 + 听觉怪物 + 结局分支;现生成音频)

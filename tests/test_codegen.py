@@ -14522,5 +14522,276 @@ class TestRound67DisplaySwitch(Base):
         self.assertNotIn("_gk_env_backup", code)
 
 
+class TestRound68PackagingPlatforms(Base):
+    """第六十八轮:侧栏『打包设置』—— 一次打出多个平台(.exe / .apk / …)。
+
+    用户确认的三点(原话"1 全上;2 场景;3 追加"):
+      * 平台全做:Windows / Linux / Web / Android;macOS **只能在 macOS 主机**
+        上导出(Godot 的限制),界面上要明说,不能让人点了白等;
+      * 设置存**场景**(和 `dimension` / `logic_tree` 一样随 .blend 走);
+      * 项目里已经有 `export_presets.cfg` 时**追加**缺失的平台段(写前先备份),
+        只增不改 —— 用户在 Godot 编辑器里调过的东西一个字都不能动。
+    """
+
+    # ---- 平台表 ----
+
+    def test_platform_table_covers_five_with_required_fields(self):
+        from BlenderGameKit import packaging
+        self.assertEqual(list(packaging.PLATFORM_ORDER),
+                         ["windows", "linux", "web", "android", "macos"])
+        for key in packaging.PLATFORM_ORDER:
+            spec = packaging.PLATFORMS[key]
+            for field in ("label", "preset_name", "godot_platform", "ext",
+                          "template", "template_ext", "template_tokens",
+                          "hosts"):
+                self.assertIn(field, spec, f"{key} 缺字段 {field}")
+
+    def test_macos_only_buildable_on_macos(self):
+        from BlenderGameKit import packaging
+        self.assertTrue(packaging.platform_buildable("macos", "darwin"))
+        self.assertFalse(packaging.platform_buildable("macos", "win32"))
+        self.assertFalse(packaging.platform_buildable("macos", "linux"))
+        # 其余平台在 Windows 上都能打
+        for key in ("windows", "linux", "web", "android"):
+            self.assertTrue(packaging.platform_buildable(key, "win32"))
+
+    def test_selected_platforms_reads_scene_settings(self):
+        """勾了哪些平台 = 读场景设置上的 5 个开关(纯 getattr,离线可测)。"""
+        from BlenderGameKit import packaging
+        settings = types.SimpleNamespace(package_windows=True, package_linux=False,
+                                         package_web=True, package_android=True,
+                                         package_macos=False)
+        self.assertEqual(packaging.selected_platforms(settings),
+                         ["windows", "web", "android"])
+        # 老工程没这些字段 / 一个都没勾 -> 空表(交给调用方给提示,不瞎猜)
+        self.assertEqual(packaging.selected_platforms(types.SimpleNamespace()), [])
+        self.assertEqual(packaging.selected_platforms(None), [])
+
+    # ---- 预设文本 ----
+
+    def test_preset_text_per_platform(self):
+        from BlenderGameKit import packaging
+        for key in packaging.PLATFORM_ORDER:
+            spec = packaging.PLATFORMS[key]
+            text = packaging.platform_presets_text(
+                key, title="我的游戏", preset_name="P", export_path="dist/x")
+            self.assertIn("[preset.0]", text)
+            self.assertIn(f'platform="{spec["godot_platform"]}"', text)
+            self.assertIn('export_path="dist/x"', text)
+            self.assertIn('application/product_name="我的游戏"', text)
+
+    def test_android_preset_carries_package_name(self):
+        """Android 导出**必须**有包名,否则 Godot 直接拒;版本号也写进去。"""
+        from BlenderGameKit import packaging
+        text = packaging.platform_presets_text(
+            "android", title="我的游戏", preset_name="Android",
+            export_path="dist/a.apk", android_id="com.example.mygame",
+            version="1.2.3")
+        self.assertIn('package/unique_name="com.example.mygame"', text)
+        self.assertIn('version/name="1.2.3"', text)
+        # 不走 gradle 构建:走它就要 Android SDK / gradle 那套,门槛太高
+        self.assertIn("gradle_build/use_gradle_build=false", text)
+
+    def test_windows_preset_still_embeds_pck(self):
+        from BlenderGameKit import packaging
+        text = packaging.export_presets_text(title="x", preset_name="P")
+        self.assertIn("binary_format/embed_pck=true", text)
+
+    # ---- 追加缺失平台(用户选"追加")----
+
+    def _write_presets(self, folder, body):
+        from BlenderGameKit import packaging
+        path = os.path.join(folder, packaging.EXPORT_PRESETS_NAME)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(body)
+        return path
+
+    def _read_text(self, path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_append_adds_missing_platform_and_backs_up(self):
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_append68_")
+        try:
+            existing = ('[preset.0]\nname="我的预设"\n'
+                        'platform="Windows Desktop"\n'
+                        'export_path="dist/a.exe"\n\n'
+                        '[preset.0.options]\n'
+                        'application/product_name="我自己改的名字"\n')
+            path = self._write_presets(folder, existing)
+            added = packaging.append_missing_presets(
+                folder, ["windows", "android"], title="game")
+            self.assertEqual(added, ["android"])
+            text = self._read_text(path)
+            # 老内容一个字没动
+            self.assertIn('name="我的预设"', text)
+            self.assertIn('application/product_name="我自己改的名字"', text)
+            # 缺的那段补在 [preset.1] 上
+            self.assertIn("[preset.1]", text)
+            self.assertIn('platform="Android"', text)
+            # 写之前备份了一份原样
+            self.assertTrue(os.path.isfile(path + ".bak"))
+            self.assertEqual(self._read_text(path + ".bak"), existing)
+            # windows 已经在了 -> 不重复加(全文里还是只有原来那一条)
+            self.assertEqual(text.count('platform="Windows Desktop"'), 1)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_append_is_idempotent(self):
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_append68b_")
+        try:
+            first = packaging.append_missing_presets(
+                folder, ["windows", "android"], title="g")
+            self.assertEqual(first, ["windows", "android"])
+            second = packaging.append_missing_presets(
+                folder, ["windows", "android"], title="g")
+            self.assertEqual(second, [])
+            text = self._read_text(
+                os.path.join(folder, packaging.EXPORT_PRESETS_NAME))
+            self.assertEqual(text.count('platform="Android"'), 1)
+            self.assertEqual(text.count('platform="Windows Desktop"'), 1)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_append_creates_file_without_backup_when_missing(self):
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_append68c_")
+        try:
+            added = packaging.append_missing_presets(
+                folder, ["linux"], title="g")
+            self.assertEqual(added, ["linux"])
+            path = os.path.join(folder, packaging.EXPORT_PRESETS_NAME)
+            self.assertTrue(os.path.isfile(path))
+            # 本来就没有文件 -> 没东西可备份,不许留个空的 .bak
+            self.assertFalse(os.path.isfile(path + ".bak"))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_read_preset_platforms(self):
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_plat68_")
+        try:
+            self.assertEqual(packaging.read_preset_platforms(folder), [])
+            self._write_presets(folder, '[preset.0]\nname="A"\n'
+                                        'platform="Windows Desktop"\n'
+                                        '[preset.1]\nname="B"\n'
+                                        'platform="Android"\n')
+            self.assertEqual(packaging.read_preset_platforms(folder),
+                             ["Windows Desktop", "Android"])
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_read_platform_preset_prefers_user_config(self):
+        """已有预设里跟这个平台对得上的那条:名字 + 输出路径都听用户的。
+
+        多平台之后不能再"读第一条" —— 文件里可能既有 Windows 又有 Android,
+        拿错条就会用别人的预设名去导(命令行会报找不到预设),或者把产物
+        丢到用户没预期的地方。
+        """
+        from BlenderGameKit import packaging
+        folder = tempfile.mkdtemp(prefix="gk_plpreset68_")
+        try:
+            self.assertEqual(packaging.read_platform_preset(folder, "windows"),
+                             (None, None))
+            self._write_presets(folder,
+                                '[preset.0]\nname="我的Windows"\n'
+                                'platform="Windows Desktop"\n'
+                                'export_path="out/win.exe"\n'
+                                '[preset.0.options]\n'
+                                'application/product_name="x"\n'
+                                '[preset.1]\nname="安卓"\n'
+                                'platform="Android"\n'
+                                'export_path="out/a.apk"\n'
+                                '[preset.1.options]\n'
+                                'package/unique_name="com.a.b"\n')
+            self.assertEqual(packaging.read_platform_preset(folder, "android"),
+                             ("安卓", "out/a.apk"))
+            self.assertEqual(packaging.read_platform_preset(folder, "windows"),
+                             ("我的Windows", "out/win.exe"))
+            # 没配过的平台 -> (None, None),由调用方用默认名 / 默认路径
+            self.assertEqual(packaging.read_platform_preset(folder, "web"),
+                             (None, None))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    # ---- 产物路径与模板文件 ----
+
+    def test_output_path_per_platform(self):
+        from BlenderGameKit import packaging
+        self.assertTrue(packaging.platform_output_path(
+            r"D:\proj", "我的游戏", "android").endswith(
+                os.path.join("dist", "我的游戏.apk")))
+        self.assertTrue(packaging.platform_output_path(
+            r"D:\proj", "g", "linux").endswith(".x86_64"))
+        self.assertTrue(packaging.platform_output_path(
+            r"D:\proj", "g", "web").endswith(".zip"))
+
+    def test_template_file_per_platform(self):
+        """按平台认发布模板:先精确名,认不出再退回关键词(名字改过)。"""
+        from BlenderGameKit import packaging
+        root = tempfile.mkdtemp(prefix="gk_tpl68_")
+        try:
+            for name in ("windows_release_x86_64.exe", "windows_debug_x86_64.exe",
+                         "linux_release.x86_64", "web_release.zip",
+                         "web_dlink_release.zip", "android_release.apk",
+                         "android_debug.apk", "macos.zip", "version.txt"):
+                with open(os.path.join(root, name), "wb") as handle:
+                    handle.write(b"x")
+            self.assertEqual(packaging.platform_template_file("windows", root),
+                             "windows_release_x86_64.exe")
+            self.assertEqual(packaging.platform_template_file("linux", root),
+                             "linux_release.x86_64")
+            # web 有好几份(dlink / nothreads),要挑最"朴素"的那个
+            self.assertEqual(packaging.platform_template_file("web", root),
+                             "web_release.zip")
+            self.assertEqual(packaging.platform_template_file("android", root),
+                             "android_release.apk")
+            self.assertEqual(packaging.platform_template_file("macos", root),
+                             "macos.zip")
+            # 精确名不在(Godot 换过名字)-> 退回关键词,且不挑 console / debug
+            fallback = tempfile.mkdtemp(prefix="gk_tpl68b_")
+            try:
+                for name in ("windows_release_arm64.exe",
+                             "windows_release_arm64_console.exe",
+                             "windows_debug_arm64.exe"):
+                    with open(os.path.join(fallback, name), "wb") as handle:
+                        handle.write(b"x")
+                self.assertEqual(
+                    packaging.platform_template_file("windows", fallback),
+                    "windows_release_arm64.exe")
+            finally:
+                shutil.rmtree(fallback, ignore_errors=True)
+            # 一个都没有 -> None
+            empty = tempfile.mkdtemp(prefix="gk_tpl68c_")
+            try:
+                self.assertIsNone(packaging.platform_template_file("web", empty))
+            finally:
+                shutil.rmtree(empty, ignore_errors=True)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_templates_status_names_the_platform(self):
+        from BlenderGameKit import packaging
+        root = tempfile.mkdtemp(prefix="gk_tpl68d_")
+        try:
+            version_dir = os.path.join(root, "4.7.2.stable")
+            os.makedirs(version_dir, exist_ok=True)
+            with open(os.path.join(version_dir, "android_release.apk"),
+                      "wb") as handle:
+                handle.write(b"x")
+            with mock.patch.object(packaging, "export_templates_root",
+                                   return_value=root):
+                ready, _d, note = packaging.templates_status("4.7.2", "android")
+                self.assertTrue(ready, note)
+                # Windows 那份没装 -> 说明里要点名是哪个平台、缺哪个文件
+                missing, _d2, miss = packaging.templates_status("4.7.2", "windows")
+                self.assertFalse(missing)
+                self.assertIn("Windows", miss)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

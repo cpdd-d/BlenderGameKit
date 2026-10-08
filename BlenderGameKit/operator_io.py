@@ -2804,7 +2804,7 @@ class GK_OT_OpenGodot(bpy.types.Operator):
 
 
 class GK_OT_ExportRelease(bpy.types.Operator):
-    """一键打包:导出工程 + 调 Godot 打出可执行文件(Windows .exe)。
+    """一键打包:导出工程 + 调 Godot 逐个平台打出可执行文件。
 
     ── 为什么要有这个按钮 ──────────────────────────────────────────────
     插件以前导出到 Godot **工程**为止。要拿到"能双击运行的游戏",用户还得
@@ -2813,9 +2813,15 @@ class GK_OT_ExportRelease(bpy.types.Operator):
 
     流程(和『直接运行游戏』尽量共用同一条路,减少"两处不一致"):
       1. 保存 .blend 并把脚本 / 模型重新导出到 Godot 工程;
-      2. 检查导出模板(没装就直接给"去哪儿装"的人话,不再往下走);
-      3. 缺 export_presets.cfg 就生成一份(已有的一律不覆盖);
-      4. `godot --headless --path <项目> --export-release "<预设>" <产物>`。
+      2. 读侧栏『打包设置』里勾的平台(第六十八轮:一个或多个);
+      3. 缺哪个平台的预设就**追加**哪一段(写前备份,已有的一个字不动);
+      4. 对每个平台:先查它的导出模板,再
+         `godot --headless --path <项目> --export-release "<预设>" <产物>`。
+
+    ── 一个平台失败不影响别的 ──────────────────────────────────────
+    多平台最怕"第一个挂了后面全不跑"。所以这里**逐个平台独立判断**:
+    模板没装 / 这台主机不能导(macOS)/ 签名没配 —— 都只记一笔、继续下一个,
+    最后统一汇报"成了几个、跳了哪些、哪些失败"。
     """
 
     bl_idname = "gk.export_release"
@@ -2850,61 +2856,109 @@ class GK_OT_ExportRelease(bpy.types.Operator):
                     "(侧栏『项目』->『自动查找 Godot』)")
             return {"CANCELLED"}
 
-        # 3) 导出模板检查 —— 头号失败模式,提前拦下并给出装法
-        version = project.godot_version(executable, context)
-        if version:
-            ready, _template_dir, note = packaging.templates_status(version)
-            if not ready:
-                _report(self, "ERROR", note)
-                return {"CANCELLED"}
-        else:
-            _report(self, "WARNING",
-                    "读不到 Godot 版本号,跳过导出模板预检;"
-                    "如果下面打包失败,多半是模板没装")
-
-        # 4) 预设:优先沿用用户已有的(绝不覆盖),没有才生成一份
-        project_name = project.safe_project_name(
-            os.path.basename(directory.rstrip("\\/")))
-        preset_name = packaging.read_preset_name(directory)
-        output_path = None
-        if not preset_name:
-            preset_name = packaging.WINDOWS_PRESET_NAME
-            output_path = packaging.default_output_path(directory, project_name)
-            preset_path, created = packaging.ensure_export_presets(
-                directory, title=project_name, preset_name=preset_name,
-                export_path=packaging.rel_output_path(directory, output_path))
-            if created:
-                _report(self, "INFO",
-                        f"已生成导出预设(Windows Desktop): {preset_path}")
-        else:
-            # 用户预设里可能自带输出路径;有就用它,别把产物丢到他没预期的地方
-            configured = packaging.read_export_path(directory)
-            if configured:
-                output_path = configured if os.path.isabs(configured) \
-                    else os.path.join(directory, configured)
-        if not output_path:
-            output_path = packaging.default_output_path(directory, project_name)
-
-        try:
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        except OSError as exc:
-            _report(self, "ERROR", f"创建打包输出目录失败: {exc}")
+        # 3) 这次要打哪几个平台(侧栏『打包设置』里勾的,第六十八轮)
+        settings = getattr(context.scene, "gk_settings", None)
+        wanted = packaging.selected_platforms(settings)
+        if not wanted:
+            _report(self, "ERROR",
+                    "一个平台都没勾。去侧栏『打包设置』勾上要打的目标平台"
+                    "(Windows / Linux / Web / Android;macOS 只能在 macOS 上导)")
             return {"CANCELLED"}
 
-        # 5) 真打包。这一步要等 Godot 起来(几秒到十几秒),先说一声。
-        _report(self, "INFO",
-                f"正在打包(预设『{preset_name}』,Godot 启动约 3~6 秒)...")
-        ok_run, log = packaging.run_release(executable, directory, preset_name,
-                                            output_path)
-        if not ok_run or not os.path.isfile(output_path):
-            hint = packaging.failure_hint(log, version)
-            _report(self, "ERROR", f"打包失败。\n{hint}")
+        project_name = project.safe_project_name(
+            os.path.basename(directory.rstrip("\\/")))
+        title = str(getattr(settings, "package_app_name", "") or "") or project_name
+        version_text = str(getattr(settings, "package_version", "") or "") or "1.0"
+        android_id = (str(getattr(settings, "package_android_id", "") or "")
+                      or "com.example.game")
+        godot_version = project.godot_version(executable, context)
+
+        # 4) 每个平台各自的预设名与产物路径。
+        #    ── 优先级 ──────────────────────────────────────────────────
+        #    ① 用户在这个项目的预设里配过该平台 -> 用他的**预设名与输出路径**;
+        #    ② 老工程 / 手写的单预设文件里没有 `platform=` 行 -> 第一个平台
+        #       沿用它(第五十二轮那条"沿用用户预设"的行为不能丢);
+        #    ③ 都没有 -> 默认预设名 + `dist/<项目名><扩展名>`。
+        legacy_name = packaging.read_preset_name(directory)
+        legacy_single = (not packaging.read_preset_platforms(directory)
+                         and legacy_name is not None)
+        plans = {}
+        needs_append = []
+        for index, key in enumerate(wanted):
+            preset_name, configured = packaging.read_platform_preset(directory, key)
+            if not preset_name and legacy_single and index == 0:
+                preset_name = legacy_name
+                configured = packaging.read_export_path(directory)
+            if not preset_name:
+                needs_append.append(key)
+            plans[key] = (preset_name, configured)
+
+        # 5) 缺的平台补预设(写前备份,老内容一个字节不动)
+        default_outputs = {key: packaging.platform_output_path(
+            directory, project_name, key) for key in wanted}
+        added = packaging.append_missing_presets(
+            directory, needs_append, title=title, android_id=android_id,
+            version=version_text,
+            output_paths={key: packaging.rel_output_path(directory, path)
+                          for key, path in default_outputs.items()})
+        if added:
+            names = "、".join(packaging.platform_label(key) for key in added)
+            _report(self, "INFO",
+                    f"已补上导出预设:{names}(原文件备份在 "
+                    f"{packaging.EXPORT_PRESETS_NAME}.bak)")
+
+        # 6) 逐个平台真打包。一个平台失败**不影响**别的。
+        done, failed, skipped = [], [], []
+        for key in wanted:
+            label = packaging.platform_label(key)
+            if not packaging.platform_buildable(key):
+                skipped.append(label)
+                continue
+            if godot_version:
+                ready, _template_dir, note = packaging.templates_status(
+                    godot_version, key)
+                if not ready:
+                    failed.append(f"{label}(导出模板没装)")
+                    _report(self, "WARNING", note)
+                    continue
+            preset_name, configured = plans[key]
+            preset_name = preset_name or packaging.PLATFORMS[key]["preset_name"]
+            output_path = default_outputs[key]
+            if configured:
+                # 用户预设里可能自带输出路径 —— 有就用它,别把产物丢到他没预期的地方
+                output_path = configured if os.path.isabs(configured) \
+                    else os.path.join(directory, configured)
+            try:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            except OSError as exc:
+                failed.append(f"{label}(建目录失败:{exc})")
+                continue
+            # 这一步要等 Godot 起来(几秒到十几秒),先说一声。
+            _report(self, "INFO",
+                    f"正在打包 {label}(预设『{preset_name}』,"
+                    f"Godot 启动约 3~6 秒)...")
+            ok_run, log = packaging.run_release(executable, directory,
+                                                preset_name, output_path)
+            if ok_run and os.path.isfile(output_path):
+                done.append(output_path)
+            else:
+                failed.append(f"{label}({packaging.failure_hint(log, godot_version)})")
+
+        if not done:
+            detail = "、".join(failed + [f"{name}(这台主机上不能导)" for name in skipped])
+            _report(self, "ERROR", f"一个平台都没打成。{detail}")
             return {"CANCELLED"}
 
         LAST_RELEASE.clear()
-        LAST_RELEASE.update({"output": output_path, "directory": directory,
-                             "preset": preset_name})
-        _report(self, "INFO", f"打包完成: {output_path}")
+        LAST_RELEASE.update({"output": done[0], "directory": directory,
+                             "outputs": list(done)})
+        summary = "、".join(os.path.basename(path) for path in done)
+        extra = ""
+        if skipped:
+            extra += "\n跳过(这台主机上不能导):" + "、".join(skipped)
+        if failed:
+            extra += "\n失败:" + "、".join(failed)
+        _report(self, "INFO", f"打包完成({len(done)} 个平台):{summary}{extra}")
         return {"FINISHED"}
 
 

@@ -434,6 +434,33 @@ def main():
         check("『显示_效果开关』卡片", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6c. 『打包设置』盒子(第六十八轮)----
+    #
+    # ── 为什么单列 ──────────────────────────────────────────────────
+    # 这个盒子里是 5 个平台开关 + 3 个文本框 + 一个打包按钮,全靠
+    # `layout.prop(settings, ...)` 画出来。属性名写错(或者场景设置拿不到)
+    # 就是**整块画不出来** —— 冒烟那层只验"打包算子跑得通",看不见画的事。
+    print("=" * 72)
+    print("6c. 『打包设置』盒子")
+    print("=" * 72)
+    try:
+        panel = getattr(ui, "GK_PT_Main", None)
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        panel.draw(holder, FakeContext(cube, scene))
+        names = list(layout.operator_names)
+        check("『打包设置』盒子画出了『开始打包』",
+              "gk.export_release" in names, str(sorted(set(names))))
+        texts = " ".join(str(item) for item in layout.texts)
+        labels = [ui.packaging.PLATFORMS[key]["label"]
+                  for key in ui.packaging.PLATFORM_ORDER]
+        check("『打包设置』盒子列出了 5 个平台",
+              all(label in texts for label in labels),
+              str([label for label in labels if label not in texts]))
+    except Exception as exc:
+        check("『打包设置』盒子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

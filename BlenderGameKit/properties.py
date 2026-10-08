@@ -551,6 +551,48 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     # (原 `show_log` 第五十五轮删掉:侧栏那份日志块删了,它没有使用者了。
     #  属性留着会让面板出现一个点了没反应的开关。)
 
+    # ── 打包设置(第六十八轮)────────────────────────────────────────
+    # 用户原话:"在侧边栏添加打包为 .exe,.apk 等的打包设置"。
+    # 勾哪个 = 这次要打哪几个平台(一个都不勾 -> 打包时明确报错,不瞎猜)。
+    #
+    # ── 为什么存在**场景**上 ────────────────────────────────────────
+    # 和 `dimension` / `logic_tree` 一个道理:随 .blend 走,换台电脑打开还在。
+    # 放插件偏好里会变成"全局一份",两个项目互相串。
+    # ⚠ 一个 .blend 里有好几个 Scene 时,用的是**当前场景**这一份。
+    #
+    # Windows 默认勾上:这是绝大多数人的目标平台,也保证老工程点『打包』
+    # 的行为和以前**一模一样**(不会因为新增开关就变成"一个平台都没勾")。
+    package_windows: BoolProperty(
+        name="Windows (.exe)", default=True,
+        description="打出 Windows 可执行文件(单个文件,拷走就能跑)")
+    package_linux: BoolProperty(
+        name="Linux (.x86_64)", default=False,
+        description="打出 Linux 可执行文件")
+    package_web: BoolProperty(
+        name="Web (HTML5)", default=False,
+        description="打出 Web 版(.zip,解压后用本地服务器打开)")
+    package_android: BoolProperty(
+        name="Android (.apk)", default=False,
+        description=("打出安卓安装包。⚠ 需要先配好签名(keystore),"
+                     "插件不替你生成密钥"))
+    package_macos: BoolProperty(
+        name="macOS", default=False,
+        description=("⚠ Godot **只能在 macOS 主机上**导出 macOS,"
+                     "别的系统点了会被跳过"))
+    package_app_name: StringProperty(
+        name="应用名",
+        description="写进导出预设的应用名(留空 = 用项目文件夹名)",
+        default="")
+    package_version: StringProperty(
+        name="版本",
+        description="写进导出预设的版本号(主要给 Android 用)",
+        default="1.0")
+    package_android_id: StringProperty(
+        name="Android 包名",
+        description=("安卓的应用 ID,形如 com.example.mygame。"
+                     "**必须**是唯一的,不填会用一个占位名"),
+        default="com.example.game")
+
     # ── 项目顾问(第五十三轮)────────────────────────────────────────
     # 用户在这里写"我卡在哪",点『问 AI』才把问题 + 项目诊断快照发出去。
     # 存在**场景**上:重开 .blend 问题还在,不用重打一遍(写到一半去改图,

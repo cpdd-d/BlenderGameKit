@@ -2527,7 +2527,7 @@ def main():
         try:
             proj_mod.find_godot_executable = lambda *a, **k: "godot-fake"
             proj_mod.godot_version = lambda *a, **k: "4.7.2"
-            packaging_mod.templates_status = lambda v: (True, work, "ok")
+            packaging_mod.templates_status = lambda v, p="windows": (True, work, "ok")
             packaging_mod.run_release = fake_run
             settings.project_dir = work
 
@@ -2555,6 +2555,112 @@ def main():
             settings.project_dir = saved_dir
     except Exception as exc:
         check("打包发布算子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 打包设置:多平台(第六十八轮)----
+    # 用户原话:"在侧边栏添加打包为 .exe,.apk 等的打包设置";动工前确认过
+    # "全上 / 存场景 / 已有预设就追加"。这一层用**假 Godot + 假打包**验接线:
+    #   * 场景设置上有 5 个平台开关(存场景,随 .blend 走);
+    #   * 勾了 windows/linux/web/macos -> 能打的都打了,预设名各是各的;
+    #   * 缺的平台预设被**追加**,老内容一个字不动,旁边留 .bak;
+    #   * macOS 在这台主机上被跳过(不报错,只记一笔);
+    #   * 某个平台失败**不影响**别的(linux 没模板 -> 另外两个照打)。
+    try:
+        packaging_mod = __import__(f"{module_name}.packaging",
+                                   fromlist=["EXPORT_PRESETS_NAME"])
+        ops_mod = __import__(f"{module_name}.operator_io",
+                             fromlist=["LAST_RELEASE"])
+        proj_mod = __import__(f"{module_name}.project",
+                              fromlist=["find_godot_executable"])
+        work = tempfile.mkdtemp(prefix="gk_smoke_pkg68_")
+        proj_mod.create_project(work, title="多平台冒烟")
+
+        settings = bpy.context.scene.gk_settings
+        check("打包设置:场景设置上有 5 个平台开关",
+              all(hasattr(settings, f"package_{key}")
+                  for key in packaging_mod.PLATFORM_ORDER),
+              str([key for key in packaging_mod.PLATFORM_ORDER
+                   if not hasattr(settings, f"package_{key}")]))
+        check("打包设置:应用名 / 版本 / 安卓包名都在",
+              all(hasattr(settings, name) for name in (
+                  "package_app_name", "package_version", "package_android_id")))
+        check("打包设置:Windows 默认勾上(老工程点打包行为不变)",
+              bool(settings.package_windows))
+
+        saved = (proj_mod.find_godot_executable, proj_mod.godot_version,
+                 packaging_mod.templates_status, packaging_mod.run_release)
+        saved_dir = settings.project_dir
+        saved_flags = {f"package_{key}":
+                       bool(getattr(settings, f"package_{key}", False))
+                       for key in packaging_mod.PLATFORM_ORDER}
+        made = []
+
+        def fake_run(exe, directory, preset, output, timeout=600):
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            with open(output, "wb") as handle:
+                handle.write(b"MZ")
+            made.append((preset, os.path.basename(output)))
+            return True, ""
+
+        def fake_templates(version, platform="windows"):
+            # linux 那份**故意**说没装 -> 验"一个平台失败不影响别的"
+            return (platform != "linux", work, f"{platform} 没装")
+
+        try:
+            proj_mod.find_godot_executable = lambda *a, **k: "godot-fake"
+            proj_mod.godot_version = lambda *a, **k: "4.7.2"
+            packaging_mod.templates_status = fake_templates
+            packaging_mod.run_release = fake_run
+            settings.project_dir = work
+            for key in packaging_mod.PLATFORM_ORDER:
+                setattr(settings, f"package_{key}",
+                        key in ("windows", "linux", "web", "macos"))
+            settings.package_app_name = "多平台游戏"
+            settings.package_version = "2.0"
+
+            # 先放一份"用户自己的"预设(带 platform= 行)-> 要沿用它、不覆盖它
+            preset_file = os.path.join(work,
+                                       packaging_mod.EXPORT_PRESETS_NAME)
+            with open(preset_file, "w", encoding="utf-8", newline="\n") as h:
+                h.write('[preset.0]\nname="我改过的名字"\n'
+                        'platform="Windows Desktop"\n\n'
+                        '[preset.0.options]\n'
+                        'application/product_name="我自己改的"\n')
+
+            result = bpy.ops.gk.export_release(auto_export=False)
+            check("打包设置:算子跑通(有一个平台失败也跑到头)",
+                  result == {"FINISHED"}, str(result))
+            names = [preset for preset, _name in made]
+            check("打包设置:能打的平台各打一次(linux 因没模板被跳过)",
+                  names == ["我改过的名字", "Web"], str(made))
+            check("打包设置:产物扩展名跟着平台走",
+                  any(name.endswith(".exe") for _p, name in made)
+                  and any(name.endswith(".zip") for _p, name in made),
+                  str(made))
+            check("打包设置:macOS 在这台主机上被跳过",
+                  all(preset != "macOS" for preset, _name in made), str(made))
+
+            with open(preset_file, encoding="utf-8") as h:
+                preset_text = h.read()
+            check("打包设置:用户那条预设一个字没动",
+                  "我改过的名字" in preset_text
+                  and "我自己改的" in preset_text
+                  and preset_text.count('platform="Windows Desktop"') == 1,
+                  preset_text[:200])
+            check("打包设置:缺的平台预设被追加",
+                  'platform="Web"' in preset_text
+                  and 'platform="Linux"' in preset_text, preset_text[:200])
+            check("打包设置:追加前留了备份",
+                  os.path.isfile(preset_file + ".bak"))
+        finally:
+            (proj_mod.find_godot_executable, proj_mod.godot_version,
+             packaging_mod.templates_status,
+             packaging_mod.run_release) = saved
+            settings.project_dir = saved_dir
+            for name, value in saved_flags.items():
+                setattr(settings, name, value)
+    except Exception as exc:
+        check("打包设置(第六十八轮)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 项目顾问(AI)(第五十三轮):接线 + 不联网 + 上下文收集 ----
