@@ -1,0 +1,35 @@
+# ── 二进制资产:显式声明,禁止任何行尾 / 编码转换 ─────────────────────
+#
+# ── 为什么必须有这个文件(第五十一轮核对提交时发现)────────────────
+# 本仓库的 `core.autocrlf = true`(Windows 上的常见设置)。没有
+# .gitattributes 时,git 只能靠"前 8000 字节里有没有 NUL"来**猜**一个文件
+# 是不是文本;猜错了就会把它当文本处理,`git add` 时把里面的 CR 字节抽掉 ——
+# 二进制资产**当场损坏**,而 .blend / .glb 这种损坏从"文件变小了"几乎看不
+# 出来,要等打开才发现。
+#
+# 那一次提交里两个新 .blend 都没有损坏(魔数仍是 `BLENDER-v40`),是**侥幸**:
+# .blend 开头一带就有 NUL,git 正好猜对了。与其继续赌,不如在这里写死。
+#
+# `binary` 是 git 的内置宏 = `-diff -merge -text`:
+#   * `-text`  不做行尾转换(CRLF↔LF 一律不碰)
+#   * `-diff`  不参与文本 diff(二进制按"文件已变更"显示)
+#   * `-merge` 不做内容合并(冲突时老老实实选一边,不去做逐行合并)
+*.blend          binary
+*.blend1         binary
+*.blend2         binary
+*.glb            binary
+*.gltf           binary
+*.png            binary
+*.jpg            binary
+*.jpeg           binary
+*.webp           binary
+*.wav            binary
+*.ogg            binary
+*.mp3            binary
+*.zip            binary
+
+# ── 这里的立场:只声明"是二进制的" ──────────────────────────────────
+# **不要**顺手给 *.py / *.gd / *.ps1 加 `text eol=lf`。本仓库的源码在
+# 工作区里就是 CRLF(`core.autocrlf=true` 的正常表现),一旦声明 eol=lf,
+# 所有源码会立刻变成"已修改"、得整仓库重新 add 一遍 —— 纯属自找churn。
+# 需要的时候再单独、显式地改那一个类型。
