@@ -15,7 +15,13 @@
   * 把玩家送到敌人 5 米外 -> `ai_state` 变成**追击**,而且**真的追近了**
     (停下来时距离缩到 3 米以内);
   * 把玩家挪到 11 米外 -> `ai_state` 回到**巡逻**(追丢了自己回去);
-  * 生成脚本里:状态变量 / 起始赋值 / 看见-丢失的距离条件 / 巡逻折返;
+  * **听觉(第五十七轮)**:把玩家放到噪音能传到的地方,**按住 K 弄出动静**
+    -> `ai_state` 变成**去查看**,而且敌人**真的朝噪音点走过去**
+    (距离缩了近、量出"朝噪音方向走"的位移);
+  * **松开 K 之后**:等超过『记忆秒数』-> `ai_state` 回到**巡逻**
+    (安静下来了,不查了);
+  * 生成脚本里:状态变量 / 起始赋值 / 看见-丢失的距离条件 / 巡逻折返 /
+    听觉三件套(广播 / 登记进组 / 去查看朝噪音点);
   * .tscn 里:'敌人' 是 CharacterBody3D、两个巡逻点都在(静态体)。
 """
 
@@ -46,6 +52,9 @@ var enemy: Node = null
 var elapsed := 0.0
 var phase := 0
 var start_pos := Vector3.ZERO
+# 听觉那一段:噪音点的位置、以及"开始朝它走"之前的敌人位置
+var noise_at := Vector3.ZERO
+var noise_start := Vector3.ZERO
 
 
 func _ready() -> void:
@@ -93,6 +102,35 @@ func _physics_process(delta: float) -> void:
 	elif phase == 3 and elapsed >= 2.75:
 		phase = 4
 		print("AI_LOST state=", _state())
+		# ── 听觉:把玩家放到 13 米外 —— **看不见**(视野 9)但**听得见**
+		# (响度 16)。这个窗口是故意留的:看得见的话敌人会直接切『追击』,
+		# 听觉那条路就轮不到了(踩过:一开始放 6 米,结果直接追过来)。
+		if player != null and enemy != null:
+			player.global_position = enemy.global_position \\
+				+ Vector3(13.0, 0.0, 0.0)
+			noise_start = enemy.global_position
+			noise_at = player.global_position
+		Input.action_press("key_k")
+	elif phase == 4 and elapsed >= 4.15:
+		phase = 5
+		# 这一秒里敌人应该"听见动静 -> 去查看",并且朝噪音点走过去
+		Input.action_release("key_k")
+		var came := -1.0
+		if enemy != null and noise_at != Vector3.ZERO:
+			came = enemy.global_position.distance_to(noise_at)
+		var walked := 0.0
+		if enemy != null:
+			walked = enemy.global_position.distance_to(noise_start)
+		print("AI_HEARD state=", _state(), " to_noise=", snappedf(came, 0.01),
+			" walked=", snappedf(walked, 0.01))
+		# ⚠ 把玩家挪到很远处再等"安静下来" —— 不挪的话,敌人一边往噪音点
+		#   走一边就走进 9 米视野了,会切『追击』,测不到『安靜回巡逻』。
+		if player != null:
+			player.global_position = Vector3(-40.0, 1.0, -40.0)
+	elif phase == 5 and elapsed >= 5.75:
+		phase = 6
+		# 松手 + 超过记忆秒数(1.2 秒)-> 应该"安静下来"回巡逻
+		print("AI_CALM state=", _state())
 		print("AI_DONE")
 		set_physics_process(false)
 		get_tree().quit()
@@ -190,6 +228,29 @@ def main():
         print("✗ 跟丢后没回到巡逻:",
               [line for line in text.splitlines() if line.startswith("AI_LOST")])
         ok = False
+    # ── 听觉:听见动静 -> 去查看 -> 真的走过去 -> 安静回巡逻 ────────────
+    heard = re.search(r"AI_HEARD state=(\S+) to_noise=([\d.]+) walked=([\d.]+)",
+                      text)
+    if not heard:
+        print("✗ 听觉那段没跑出来:",
+              [line for line in text.splitlines() if line.startswith("AI_HEARD")])
+        ok = False
+    else:
+        if heard.group(1) != "去查看":
+            print(f"✗ 弄出动静后没切到『去查看』(状态是 {heard.group(1)}):",
+                  heard.group(0))
+            ok = False
+        # 噪音点在 13 米外,走过去之后应该明显更近了(查看速度 4 米/秒,
+        # 1.4 秒足够走 3 米以上;留足余量判 1 米)
+        if float(heard.group(3)) < 1.0:
+            print(f"✗ 敌人听见动静但没有朝噪音点走(位移只有 "
+                  f"{heard.group(3)} 米):", heard.group(0))
+            ok = False
+    if not re.search(r"AI_CALM state=巡逻", text):
+        print("✗ 松手 + 过了『记忆秒数』后没回到巡逻:",
+              [line for line in text.splitlines() if line.startswith("AI_CALM")])
+        ok = False
+
     if "AI_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")
         ok = False
@@ -209,6 +270,16 @@ def main():
                 (".length() > 11.0", "『丢失目标』的距离条件"),
                 ("_gk_ai_patrol_1 = not _gk_ai_patrol_1", "巡逻到点折返"),
                 ("[AI] 切到状态", "调试打印(『打印状态变化』)"),
+                # ── 听觉三件套(第五十七轮)───────────────────────────
+                ('get_nodes_in_group("gk_ai_hearer")', "噪音广播到听觉体组"),
+                ('has_method("_gk_hear_noise")', "广播前先确认对方能收"),
+                ('add_to_group("gk_ai_hearer")', "敌人把自己登记成听觉体"),
+                ("func _gk_hear_noise(", "接收噪音的派发器(名字固定)"),
+                ("func _gk_heard_", "『听得见吗』判据"),
+                ('ai_state == "去查看":', "去查看行为"),
+                ("ai_state_hear_pos", "『去查看』朝记住的噪音点走"),
+                ("not _gk_heard_", "『安静下来』= 听不见"),
+                ("[GK 噪音]", "噪音的调试打印"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")

@@ -18,11 +18,20 @@ AI 的规则**不在玩法图里**,画在一张独立的『游戏AI』节点图�
 | **AI_状态(巡逻)** | 敌人在『巡逻点甲』『巡逻点乙』之间来回走(到了就折返) |
 | **AI_状态(追击)** | 看见你之后朝你走,贴近 1.6 米就停下(面向你) |
 | **AI_转场(看见 / 丢失目标)** | 条件就填在卡片上(视野距离),不用拼"距离 + 比较"两个节点 |
+| **AI_状态(去查看)** | **听见动静**但看不见你时,走到那个位置看看(第五十七轮) |
+| **AI_转场(听见动静 / 安静下来)** | 也是填在卡片上:记住多久、耳朵多远 |
+| **声音_发出噪音** | 玩家脚本里:按住 **K** = 弄出动静(响度 16 米,最快 0.2 秒一次) |
 | **AI_启用** | 玩法图里唯一的 AI 入口 —— 作用在『敌人』身上(AI 代码在玩家脚本里,和追击怪同一个做法) |
 | **打印状态变化** | 勾上了 —— Godot 输出面板里能看到 "切到状态: 追击" |
 | **上帝机(Tab)** | 飞起来看一眼它的巡逻路线 |
 
-按键:WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / Tab 上帝机。
+按键:WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / Tab 上帝机 /
+**按住 K 弄出动静**(引出听觉那条路)。
+
+> **听觉和视觉的区别(这张图里最能看出门道的一处)**:『看见』才 9 米,
+> 『听见』有 16 米 —— 所以**站在 13 米外、按住 K**,敌人会**朝着声音过来**
+> 而不是直冲你(它只知道"那边有响动",不知道你在哪)。这就是恐怖游戏里
+> "扔石头把怪物引开"的那个机制。
 
 跑法(Godot):打开 `AI示例_godot` 直接 F5。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ai_demo.py`
@@ -53,6 +62,18 @@ LOST_RANGE = 11.0      # 跟丢(米)
 PATROL_SPEED = 3.0
 CHASE_SPEED = 4.6
 CHASE_STOP = 1.6
+
+# ── 听觉(第五十七轮)─────────────────────────────────────────────
+NOISE_KEY = "K"        # 按 K = 弄出动静(跑步 / 踢到东西)
+NOISE_ACTION = "key_k"
+# ⚠ 响度(16)必须**大于**『看见』的距离(9)—— 否则"听得见"的那个距离上
+#   敌人早就**看得见**你了,会直接切『追击』,听觉那条路根本轮不到。
+#   16 > 9 才有"看不见但听得见"的窗口(13 米处:看不见、听得见)。
+NOISE_LOUD = 16.0      # 这声音能传 16 米
+NOISE_INTERVAL = 0.2   # 最快 0.2 秒发一次(按住 K 就是连续动静)
+EAR_MEMORY = 1.2       # 听到之后记 1.2 秒 —— 也就是"去查看"会持续这么久
+LOOK_SPEED = 4.0
+LOOK_STOP = 1.0
 
 
 def log(message):
@@ -183,18 +204,40 @@ def build_ai_tree():
                  gk_state_name="追击", gk_behavior="CHASE",
                  gk_goal=PLAYER, gk_speed=CHASE_SPEED,
                  gk_stop_distance=CHASE_STOP, gk_facing="GOAL")
+    # ── 听觉:听到动静就过去看看(第五十七轮)──────────────────────────
+    # 别和『追击』混:追击是"看见你"直接冲过来;去查看是"听见响动但不知道
+    # 你在哪",走到那个位置看看 —— 恐怖游戏里最经典的那个"引开 / 被引开"。
+    look = _add(tree, "GKNodeAiState", "去查看", 700.0, 340.0,
+                gk_state_name="去查看", gk_behavior="INVESTIGATE",
+                gk_speed=LOOK_SPEED, gk_stop_distance=LOOK_STOP,
+                gk_facing="MOVE")
     see = _add(tree, "GKNodeAiTransition", "看见玩家", 320.0, 180.0,
                gk_cond_source="SEE", gk_goal=PLAYER, gk_sight=SIGHT)
     back = _add(tree, "GKNodeAiTransition", "丢失玩家", 320.0, -210.0,
                 gk_cond_source="LOST", gk_goal=PLAYER, gk_sight=LOST_RANGE)
+    heard = _add(tree, "GKNodeAiTransition", "听见动静", 320.0, 340.0,
+                 gk_cond_source="HEARD", gk_ear=0.0, gk_memory=EAR_MEMORY)
+    calm = _add(tree, "GKNodeAiTransition", "安静下来", 700.0, 480.0,
+                gk_cond_source="CALM", gk_ear=0.0, gk_memory=EAR_MEMORY)
 
     # 环用连线搭(实测 Blender 4.5.5 允许,保存 / 读回都正常)
     _link(tree, patrol, "转到", see, "上游")
     _link(tree, see, "转到", chase, "进入")
     _link(tree, chase, "转到", back, "上游")
     _link(tree, back, "转到", patrol, "进入")
+    # 听觉那条支路:巡逻 --听见动静--> 去查看 --安静下来--> 巡逻
+    _link(tree, patrol, "转到", heard, "上游")
+    _link(tree, heard, "转到", look, "进入")
+    _link(tree, look, "转到", calm, "上游")
+    # ⚠ 巡逻现在有**两条**转场指进来(『丢失玩家』和『安静下来』)——
+    #   Blender 的 links.new 接一个**已经接过线的输入**是**替换**旧线,
+    #   所以第二条必须用『进入 2』(『入口数量』默认 2,正好够)。
+    #   不这么做的话『丢失玩家』那条会**无声消失**。
+    _link(tree, calm, "转到", patrol, "进入 2")
     log(f"AI 图『{tree.name}』:巡逻 --看见({SIGHT:g} 米)--> 追击 "
-        f"--丢失({LOST_RANGE:g} 米)--> 巡逻({len(tree.nodes)} 个节点,"
+        f"--丢失({LOST_RANGE:g} 米)--> 巡逻;"
+        f"巡逻 --听见动静({NOISE_LOUD:g} 米内)--> 去查看 "
+        f"--安静({EAR_MEMORY:g} 秒)--> 巡逻({len(tree.nodes)} 个节点,"
         f"起始状态 = 巡逻)")
     return tree
 
@@ -233,8 +276,26 @@ def build_graph(scene, player, enemy, ai_tree):
                   gk_target=enemy.name,
                   gk_debug_print=True)
     _link(logic, ready, "执行", enable, "执行")
-    log(f"玩家逻辑:预设 + 『AI_启用』(引用『{ai_tree.name}』,"
-        f"作用在『{enemy.name}』上,打印状态变化)")
+
+    # ── 弄出动静(第五十七轮:AI 听觉)──────────────────────────────
+    # 接在**物理帧**后面 + 填『间隔秒』:这就是"跑步声/心跳声"的写法 ——
+    # 不填间隔的话每帧都广播,敌人的"最后听到时间"永远是刚发生的,
+    # 『安静下来』永远不成立,它会一直黏在噪音点。
+    physics = _add(logic, "GKNodeOnPhysicsProcess", "每当物理帧", 0.0, -980.0)
+    # ⚠ 『输入_按键』是**表达式**节点(输出真假),没有执行引脚 —— 要经过
+    #   『流程_分支』才能驱动执行流(和 chase 示例里"R 键重开"同一套接法)。
+    noise_key = _add(logic, "GKNodeKey", "按K弄出动静", -340.0, -980.0,
+                     gk_key=NOISE_KEY, gk_action=NOISE_ACTION,
+                     gk_trigger="PRESSED")
+    noise_branch = _add(logic, "GKNodeBranch", "按住K?", -140.0, -980.0)
+    noise = _add(logic, "GKNodeNoise", "弄出动静", 60.0, -980.0,
+                 gk_loudness=NOISE_LOUD, gk_interval=NOISE_INTERVAL,
+                 gk_target=player.name, gk_debug_print=True)
+    _link(logic, noise_key, "结果", noise_branch, "条件")
+    _link(logic, physics, "执行", noise_branch, "执行")
+    _link(logic, noise_branch, "是", noise, "执行")
+    log(f"玩家逻辑:『每当_物理帧』->『按键 {NOISE_KEY}』->『弄出动静』"
+        f"(响度 {NOISE_LOUD:g} 米,间隔 {NOISE_INTERVAL:g} 秒)")
     return logic
 
 

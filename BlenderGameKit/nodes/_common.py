@@ -919,6 +919,8 @@ AI_BEHAVIORS = (
     ("FLEE", "逃跑", "目标近到『停在多远』以内就往反方向跑"),
     ("FOLLOW", "跟随", "跟着『目标』走,保持『停在多远』的距离(宠物)"),
     ("RETURN", "返回", "走回『巡逻点 A』(追丢了回岗位)"),
+    # 第四十一轮的听觉配套:听到动静过去看看(恐怖游戏最常见的那个"追声")
+    ("INVESTIGATE", "去查看", "朝**最近听到的噪音点**走过去(听声辨位)"),
 )
 
 # 朝向:走的时候头朝哪
@@ -928,8 +930,18 @@ AI_FACINGS = (
     ("KEEP", "不转", "自己另外用『移动_设置朝向』控"),
 )
 
-# 『AI_转场』的条件来源:自己写 / 看见目标 / 丢失目标
-AI_COND_SOURCES = ("SEE", "LOST")
+# 『AI_转场』的条件来源:自己写 / 看见目标 / 丢失目标 / 听见声音 / 安静下来
+# ── 为什么把听觉也做成"内置条件"(和看见/丢失同一套)────────────────
+# 恐怖游戏最常写的两条规则是"巡逻 -> 听见动静 -> 去查看"和"去查看 ->
+# 没动静了 -> 回巡逻"。为了这两条去拉『AI_听见』+ 连线,状态一多整张图
+# 全是线;内置成条件来源后,填个"听觉距离"就能用。
+AI_COND_SOURCES = ("SEE", "LOST", "HEARD", "CALM")
+
+# 需要**指定目标**的条件来源(听觉的两个不需要 —— 噪音不来自某个特定目标)
+AI_GOAL_COND_SOURCES = ("SEE", "LOST")
+
+# 需要**听觉参数**(听觉距离 / 记忆秒数)的条件来源
+AI_HEAR_COND_SOURCES = ("HEARD", "CALM")
 
 
 def ai_tree_items():
@@ -1058,6 +1070,10 @@ def ai_edge_label(edge):
         return "条件:看见目标"
     if kind == "LOST":
         return "条件:丢失目标"
+    if kind == "HEARD":
+        return "条件:听见动静"
+    if kind == "CALM":
+        return "条件:安静下来"
     if kind == "pin":
         return "条件:接引脚"
     return "条件:?"
@@ -1180,14 +1196,17 @@ def ai_tree_graph(tree):
             problems.append(
                 f"转场『{label}』没有条件:『条件来源』是『自己写』,但"
                 f"『条件』引脚空着 —— 这条规则不会生效。"
-                f"接一个判断节点上去(比如『AI_看得见』),或者把"
-                f"『条件来源』改成『看见目标』/『丢失目标』")
+                f"接一个判断节点上去(比如『AI_看得见』/『AI_听见』),"
+                f"或者把『条件来源』改成『看见目标』/『丢失目标』/"
+                f"『听见动静』/『安静下来』")
         if source_kind in AI_COND_SOURCES and pin_used:
             problems.append(
                 f"转场『{label}』既接了『条件』引脚,又把『条件来源』选成了"
-                f"『看见 / 丢失目标』—— **以『条件来源』为准**,"
-                f"接的那根线被忽略了")
-        if source_kind in AI_COND_SOURCES and not str(
+                f"内置条件 —— **以『条件来源』为准**,接的那根线被忽略了")
+        # ⚠ 只有"看见 / 丢失目标"需要选目标 —— 听觉那两个不需要
+        # (噪音不来自某个特定目标)。以前这里对所有非 PIN 来源都要求目标,
+        # 加了听觉之后会把合法的听觉转场误报成问题。
+        if source_kind in AI_GOAL_COND_SOURCES and not str(
                 getattr(trans, "gk_goal", "") or "").strip():
             problems.append(
                 f"转场『{label}』选了『看见 / 丢失目标』但没选『目标』—— "

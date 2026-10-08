@@ -153,11 +153,19 @@ class GKNodeAiTransition(B.GKStatementNode):
          "『自己写』= 用左边的条件引脚;其它选项都在节点上直接填",
          (("PIN", "自己写(接引脚)", "想多复杂都行:视野角度、血量、组合条件"),
           ("SEE", "看见目标", "目标进入『视野距离』就算看见"),
-          ("LOST", "丢失目标", "目标离开『视野距离』就算跟丢"))),
+          ("LOST", "丢失目标", "目标离开『视野距离』就算跟丢"),
+          ("HEARD", "听见动静", "最近『记忆秒数』内听到过噪音(配『声音_发出噪音』)"),
+          ("CALM", "安静下来", "『记忆秒数』内**没有**新噪音 —— 用来"
+                              "『去查看』完了回岗位"))),
         ("gk_goal", "node", "", "目标",
          "『看见目标 / 丢失目标』看的是谁(一般选玩家)"),
         ("gk_sight", "float", 12.0, "视野距离",
          "目标和自己的距离小于它 = 看见(米 / 像素)"),
+        # ── 听觉参数(第四十一轮:条件来源 = 听见动静 / 安静下来)────────
+        ("gk_ear", "float", 0.0, "听觉距离",
+         "耳朵最远能听多远;0 = 不限制(只看噪音自己的『响度』)"),
+        ("gk_memory", "float", 3.0, "记忆秒数",
+         "听到之后记多久 —— 也就是『去查看』能持续多久"),
         # ── 备用下拉:连线忘了也能用(照『动画_转场』)────────────────
         ("gk_from_state", "string", "", "从状态",
          "备用:『上游』没接线时用这个(下拉里是这张图的状态)"),
@@ -183,6 +191,12 @@ class GKNodeAiTransition(B.GKStatementNode):
             layout.prop(self, "gk_from_state", text="从")
         if source == "PIN":
             layout.label(text="条件 <- 接判断节点的输出", icon="LINKED")
+        elif source in ("HEARD", "CALM"):
+            # 听觉:不用选目标(噪音不来自某个特定目标),填耳朵参数就行
+            row = layout.row(align=True)
+            row.prop(self, "gk_ear", text="听觉距离")
+            row.prop(self, "gk_memory", text="记忆秒")
+            layout.label(text="配『声音_发出噪音』用;0 = 不限距离", icon="INFO")
         else:
             row = layout.row(align=True)
             row.label(text="目标")
@@ -250,6 +264,106 @@ class GKNodeAiSee(B.GKExpressionNode):
             socket = socket.get("目标") if socket is not None else None
             if socket is None or not getattr(socket, "is_linked", False):
                 layout.label(text="! 没选目标", icon="ERROR")
+
+
+@N
+class GKNodeAiHear(B.GKExpressionNode):
+    bl_idname = "GKNodeAiHear"
+    bl_label = "AI_听见"
+    bl_icon = "SOUND"
+    gk_category = "AI"
+    # 和『AI_看得见』一样:玩法图里也能用(比如"玩家在附近弄出动静就开门")
+    gk_tree_type = ("GKGameLogicTree", AI_TREE_ID)
+    gk_doc = ("'听见动静'了吗 —— 输出布尔。\n"
+              "── 得先有人出声 ──\n"
+              "在玩法图里放**『声音_发出噪音』**(跑步 / 开门 / 摔碎东西时调它),"
+              "它会把噪音的**位置和响度**广播给所有'听觉体'。\n"
+              "── 两个距离都要满足 ──\n"
+              "* 噪音自己的『响度』= 这个声音能传多远(在『声音_发出噪音』上填);\n"
+              "* 这里的『听觉距离』= 这个敌人的耳朵最远能听多远"
+              "(**0 = 不限制**,只看噪音响度)。\n"
+              "『记忆秒数』= 听到之后记多久 —— 声音过去了还'算听见'。\n"
+              "── 想让它过去看 ──\n"
+              "接『AI_转场』的『条件』引脚即可;或者更快:把转场的"
+              "『条件来源』直接选成『听见动静』,再接『AI_状态』的一个"
+              "『去查看』行为。")
+    gk_inputs = (
+        S.pin(FLOAT, "听觉距离", 0.0),
+        S.pin(FLOAT, "记忆秒数", 3.0),
+    )
+    gk_input_props = {"听觉距离": "gk_ear", "记忆秒数": "gk_memory"}
+    gk_outputs = (S.pin(BOOL, "听见", False),)
+    gk_prop_defs = (
+        ("gk_ear", "float", 0.0, "听觉距离",
+         "耳朵最远能听多远;0 = 不限制(只看噪音自己的『响度』)"),
+        ("gk_memory", "float", 3.0, "记忆秒数",
+         "听到之后记多久(秒)—— 用来做'过去看看'的持续时间"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_ear", text="听觉距离")
+        row.prop(self, "gk_memory", text="记忆秒")
+        if float(getattr(self, "gk_ear", 0.0) or 0.0) <= 0.0:
+            layout.label(text="0 = 不限距离(看噪音响度)", icon="INFO")
+
+
+@N
+class GKNodeNoise(B.GKStatementNode):
+    """『声音_发出噪音』:游戏里"弄出动静",让听得见的 AI 过去查看。
+
+    ── 和『音效_播放』的分工(要说清楚,否则用户会以为重复了)────────
+    『音效_播放』= **给玩家听的**(扬声器出声);
+    『声音_发出噪音』= **给 AI 听的**(一个玩法事件:谁在哪弄出多大声)。
+    两者互不影响 —— 想"跑步又有脚步音效、又能被怪物听见",
+    两个节点都放(间隔填成一样就不会错拍)。
+    """
+
+    bl_idname = "GKNodeNoise"
+    bl_label = "声音_发出噪音"
+    bl_icon = "SOUND"
+    gk_category = "AI"
+    gk_tree_type = "GKGameLogicTree"
+    gk_doc = ("弄出一点动静 —— 听得见的 AI 会**记下这个位置**"
+              "(用『AI_转场』的『听见动静』+『AI_状态』的『去查看』行为"
+              "就能让它过来找)。\n"
+              "── 三个参数 ──\n"
+              "* 『响度』= 这声音能传多远(米 / 像素)。跑步 8、开门 12、"
+              "摔碎东西 20 —— 越吵引来的范围越大;\n"
+              "* 『间隔秒』= 最快多久发一次。**脚步声接在『每当_物理帧』"
+              "后面必须填**(不填就每帧都喊,敌人永远'刚听到');\n"
+              "* 『从哪发出』= 噪音的位置,默认脚本所在物体"
+              "(一般就是玩家 / 那个道具)。\n"
+              "── 注意 ──\n"
+              "它**不出声**(玩家听不到),要出声请另接一个『音效_播放』。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "响度", 8.0),
+    )
+    gk_input_props = {"响度": "gk_loudness"}
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_loudness", "float", 8.0, "响度",
+         "这声音能传多远(米 / 像素):跑步 8 / 开门 12 / 摔碎 20"),
+        ("gk_interval", "float", 0.5, "间隔秒",
+         "最快多久发一次;接在『每当_物理帧』后面时**必须填**"
+         "(0 = 每帧都发)"),
+        ("gk_target", "node", TARGET_SELF, "从哪发出",
+         "噪音的位置(默认脚本所在物体)"),
+        ("gk_debug_print", "bool", False, "打印",
+         "每次发声往输出面板打一行(含位置和通知了几个听觉体),调试听觉时用"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_loudness", text="响度")
+        row.prop(self, "gk_interval", text="间隔秒")
+        row = layout.row(align=True)
+        row.label(text="从哪发出")
+        B.draw_target_picker(self, row, "gk_target")
+        row.prop(self, "gk_debug_print", text="", icon="CONSOLE")
+        if float(getattr(self, "gk_interval", 0.5) or 0.0) <= 0.0:
+            layout.label(text="间隔 0 = 每帧都发(接物理帧会刷爆)", icon="ERROR")
 
 
 @N

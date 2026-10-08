@@ -13113,5 +13113,264 @@ class TestRound56AdvisorTools(Base):
         self.assertIn(str(len(long_text)), clipped)   # 告诉模型"还有多少"
 
 
+class TestRound57AiHearing(Base):
+    """AI 听觉(第五十七轮):『声音_发出噪音』+『AI_听见』+『去查看』。
+
+    用户选的方向:"AI 听觉(恐怖游戏关键能力)" —— 玩家跑步/开门弄出动静,
+    敌人听见了就过去查看。
+
+    ── 为什么走"分组广播" ──────────────────────────────────────────
+    出声的和听声的通常**不是同一个物体**(玩家 -> 怪物),需要一条跨物体
+    通道。三条路里选了**分组广播**(`gk_ai_hearer` 组 + 挨个调
+    `_gk_hear_noise`):零配置、跨场景有效、出问题一眼能查(在 Godot 里
+    看那只怪在不在组里)。
+    """
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _patrol_investigate(self, ai):
+        """巡逻 -> 听见动静 -> 去查看 -> 安静下来 -> 巡逻。
+
+        这正是恐怖游戏里那个最经典的"追声"循环。
+        """
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B")
+        look = ai.new_node(NN.GKNodeAiState, "去查看", gk_state_name="去查看",
+                           gk_behavior="INVESTIGATE", gk_speed=4.0,
+                           gk_stop_distance=1.0)
+        heard = ai.new_node(NN.GKNodeAiTransition, "听见动静",
+                            gk_cond_source="HEARD", gk_ear=0.0,
+                            gk_memory=3.0,
+                            gk_from_state="巡逻", gk_to_state="去查看")
+        calm = ai.new_node(NN.GKNodeAiTransition, "安静下来",
+                           gk_cond_source="CALM", gk_ear=0.0,
+                           gk_memory=3.0,
+                           gk_from_state="去查看", gk_to_state="巡逻")
+        return patrol, look, heard, calm
+
+    # ---- 树归属 / 菜单 ----
+    def test_hearing_nodes_tree_scope(self):
+        from BlenderGameKit import properties as props
+        # 『AI_听见』:和『AI_看得见』一样,两棵树都能放
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiHear, "GKGameAiTree"))
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiHear, "GKGameLogicTree"))
+        # 『声音_发出噪音』:玩法图的东西(出声的是玩法物体)
+        self.assertTrue(props.node_fits_tree(NN.GKNodeNoise, "GKGameLogicTree"))
+        self.assertFalse(props.node_fits_tree(NN.GKNodeNoise, "GKGameAiTree"))
+
+    def test_menu_lists_hearing_nodes(self):
+        from BlenderGameKit import properties as props
+        labels = [cls.bl_label
+                  for _cat, items in props.node_menu_entries("GKGameLogicTree")
+                  for cls in items]
+        self.assertIn("声音_发出噪音", labels)
+        self.assertIn("AI_听见", labels)
+
+    def test_behavior_and_condition_enums(self):
+        """新行为 / 新条件来源要进枚举,而且标签是人话。"""
+        # ⚠ 不要在这里 `from BlenderGameKit import nodes as NN` —— 那会把
+        # 模块级的 `NN`(nodes.nodes 门面)覆盖成**包**,读不到这些常量
+        # 枚举项是 (标识, 显示名, 说明) 三条一组
+        behaviors = {item[0]: item[1] for item in NN.AI_BEHAVIORS}
+        self.assertIn("INVESTIGATE", behaviors)
+        self.assertIn("去查看", behaviors["INVESTIGATE"])
+        self.assertIn("HEARD", NN.AI_COND_SOURCES)
+        self.assertIn("CALM", NN.AI_COND_SOURCES)
+        # 只有看见/丢失需要目标 —— 听觉不需要
+        self.assertEqual(tuple(NN.AI_GOAL_COND_SOURCES), ("SEE", "LOST"))
+        self.assertEqual(tuple(NN.AI_HEAR_COND_SOURCES), ("HEARD", "CALM"))
+        self.assertIn("听见", NN.ai_edge_label({"kind": "HEARD"}))
+        self.assertIn("安静", NN.ai_edge_label({"kind": "CALM"}))
+
+    # ---- 生成物:噪音广播 ----
+    def test_noise_node_emits_broadcast(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        noise = tree.new_node(NN.GKNodeNoise, "跑步声", gk_loudness=8.0,
+                              gk_interval=0.5)
+        gk_stub.connect(tree, event, "执行", noise, "执行")
+        code = gen(tree, V3)[0]
+        # 广播到听觉体组 + 调用固定名字的方法(跨物体通道的关键)
+        self.assertIn('get_nodes_in_group("gk_ai_hearer")', code)
+        self.assertIn('has_method("_gk_hear_noise")', code)
+        self.assertIn("._gk_hear_noise(", code)
+        # 间隔:必须按时间戳判,否则接在物理帧后面会每帧都喊
+        self.assertIn("float(Time.get_ticks_msec()) * 0.001", code)
+        self.assertIn(">= 0.5", code)
+        # 位置被传出去(听方要知道"哪")
+        self.assertIn("_gk_noise_at", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_noise_interval_uses_member_var(self):
+        """间隔要跨帧记 -> 必须是**成员变量**,不能是局部 var。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        noise = tree.new_node(NN.GKNodeNoise, "跑步声")
+        gk_stub.connect(tree, event, "执行", noise, "执行")
+        code = gen(tree, V3)[0]
+        names = [line.strip() for line in code.splitlines()]
+        declared = [line for line in names if line.startswith("var _gk_noise_stamp_")]
+        self.assertTrue(declared, "时间戳没有声明成成员变量")
+        # 成员变量声明必须带类型(生成器里其他成员变量都这样)
+        for line in declared:
+            self.assertIn(": float", line)
+
+    def test_noise_debug_print_optional(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        noise = tree.new_node(NN.GKNodeNoise, "跑步声", gk_debug_print=True)
+        gk_stub.connect(tree, event, "执行", noise, "执行")
+        code = gen(tree, V3)[0]
+        self.assertIn("[GK 噪音]", code)
+
+    # ---- 生成物:听觉运行时 ----
+    def test_hearing_runtime_generated_for_investigate(self):
+        """『去查看』行为要连带生成听觉运行时(否则它没法知道去哪)。"""
+        ai = self._ai_tree()
+        self._patrol_investigate(ai)
+        tree, enable = self._make_enable()
+        # ⚠ gen() 返回 (代码, 告警) —— 不拆开的话 assertIn 是在**元组**里找
+        code, _warnings = self._gen_with_ai(ai, tree)
+        # 派发器名字固定(广播方按这个名字调)
+        self.assertIn("func _gk_hear_noise(", code)
+        self.assertIn("func _gk_heard_", code)
+        self.assertIn('add_to_group("gk_ai_hearer")', code)
+        # 去查看:朝记住的噪音点走
+        self.assertIn("_hear_pos", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_hearing_conditions_use_helpers(self):
+        """HEARD / CALM 生成成 helper 调用,而且 CALM 是 HEARD 的反面。"""
+        ai = self._ai_tree()
+        self._patrol_investigate(ai)
+        tree, enable = self._make_enable()
+        code, _warnings = self._gen_with_ai(ai, tree)
+        self.assertIn("_gk_heard_", code)
+        self.assertIn("not _gk_heard_", code)      # 安静下来 = 听不见
+        # 听觉条件不需要目标 —— 生成里不该出现"目标的距离"那套
+        self.assertNotIn("ai_hear(点", code)
+
+    def test_ai_hear_expression_node(self):
+        """『AI_听见』在玩法图里也能用(不经过 AI 图)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        hear = tree.new_node(NN.GKNodeAiHear, "听见了吗", gk_ear=0.0,
+                             gk_memory=2.0)
+        branch = tree.new_node(NN.GKNodeBranch, "分支")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, hear, "听见", branch, "条件")
+        code = gen(tree, V3)[0]
+        self.assertIn("_gk_heard_", code)
+        self.assertIn("func _gk_hear_noise(", code)   # 顺带把运行时生成出来
+        self.assert_no_chinese_identifiers(code)
+
+    # ---- 校验:不能把听觉转场误报成"没选目标" ----
+    def test_hearing_transition_does_not_require_goal(self):
+        """⚠ 听觉转场**不需要**目标 —— 别误报。
+
+        以前"只要条件来源不是『自己写』就必须选目标",加了听觉之后
+        会把合法的听觉转场刷一屏假告警。
+        """
+        ai = self._ai_tree()
+        self._patrol_investigate(ai)
+        graph = NN.ai_tree_graph(ai)
+        goal_problems = [p for p in graph["problems"] if "没选『目标』" in p]
+        self.assertEqual(goal_problems, [], goal_problems)
+        # 而"看见/丢失"该报还是要报
+        ai2 = self._ai_tree("敌人AI2")
+        patrol = ai2.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻")
+        chase = ai2.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                             gk_behavior="CHASE", gk_goal="玩家")
+        ai2.new_node(NN.GKNodeAiTransition, "看见",
+                     gk_cond_source="SEE", gk_from_state="巡逻",
+                     gk_to_state="追击")
+        problems2 = NN.ai_tree_graph(ai2)["problems"]
+        self.assertTrue(any("没选『目标』" in p for p in problems2), problems2)
+
+    def test_hearing_edges_labelled(self):
+        ai = self._ai_tree()
+        self._patrol_investigate(ai)
+        graph = NN.ai_tree_graph(ai)
+        kinds = sorted(edge["kind"] for edge in graph["edges"])
+        self.assertEqual(kinds, ["CALM", "HEARD"])
+        labels = [NN.ai_edge_label(edge) for edge in graph["edges"]]
+        self.assertTrue(any("听见" in text for text in labels), labels)
+        self.assertTrue(any("安静" in text for text in labels), labels)
+
+    # ---- 2D 也要能用(向量维度要对) ----
+    def test_hearing_works_in_2d(self):
+        """2D 项目里噪音位置得是 Vector2 —— 用 Vector3 会编译不过。"""
+        ai = self._ai_tree()
+        self._patrol_investigate(ai)
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        noise = tree.new_node(NN.GKNodeNoise, "跑步声")
+        gk_stub.connect(tree, enable, "完成", noise, "执行")
+        options = dict(dimension="2", base_class="CharacterBody2D")
+        code, _warnings = self._gen_with_ai(ai, tree, options)
+        self.assertIn("Vector2.ZERO", code)
+        self.assertNotIn("Vector3.ZERO", code)
+        self.assertIn("func _gk_hear_noise(at: Vector2", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_two_physics_events_only_declare_unused_delta_once(self):
+        """⚠ 树里有两个『每当_物理帧』时,`_unused_delta` **只能声明一次**。
+
+        真机踩到(这轮的 AI 示例探针里):两个物理帧节点各往**同一个
+        函数体**里塞一句 `var _unused_delta := delta`,Godot 直接
+        `Parse Error: There is already a variable named "_unused_delta"
+        declared in this scope.` —— **整个脚本编译不过、游戏不跑**,
+        而且只报这一句,很难联想到"是因为放了两个物理帧节点"。
+
+        (角色预设自带一个物理帧,再自己加一个就必现 —— 这条路径很常见。)
+        """
+        tree = make_tree()
+        first = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧1")
+        second = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧2")
+        noise1 = tree.new_node(NN.GKNodeNoise, "动静1")
+        noise2 = tree.new_node(NN.GKNodeNoise, "动静2")
+        gk_stub.connect(tree, first, "执行", noise1, "执行")
+        gk_stub.connect(tree, second, "执行", noise2, "执行")
+        code = gen(tree, V3)[0]
+        declared = [line for line in code.splitlines()
+                    if "_unused_delta" in line and line.strip().startswith("var ")]
+        self.assertEqual(len(declared), 1,
+                         f"`_unused_delta` 声明了 {len(declared)} 次(Godot 会报"
+                         f"重复声明、整个脚本编不过): {declared}")
+        # 两段都还在(不能为了去重把第二个事件吞掉)
+        self.assertIn("另一个同类事件", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def _make_enable(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return tree, enable
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

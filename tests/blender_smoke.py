@@ -2618,6 +2618,31 @@ def main():
         check("AI 亲自操作", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- AI 听觉(第五十七轮):新节点 + 新行为 + 新条件来源 ----
+    try:
+        # ⚠ 要 `nodes.nodes`(门面),不是 `nodes`(包)—— 常量在门面里
+        nodes_mod = __import__(f"{module_name}.nodes.nodes",
+                               fromlist=["ALL_CLASSES"])
+        all_nodes = {cls.bl_idname for cls in nodes_mod.ALL_CLASSES}
+        check("『声音_发出噪音』已注册", "GKNodeNoise" in all_nodes)
+        check("『AI_听见』已注册", "GKNodeAiHear" in all_nodes)
+        behaviors = {item[0]: item[1] for item in nodes_mod.AI_BEHAVIORS}
+        check("AI 行为多了『去查看』",
+              behaviors.get("INVESTIGATE") == "去查看", str(behaviors)[:80])
+        check("AI 条件来源多了『听见动静 / 安静下来』",
+              {"HEARD", "CALM"} <= set(nodes_mod.AI_COND_SOURCES),
+              str(nodes_mod.AI_COND_SOURCES))
+        # 听觉转场**不该**被要求选目标(踩过的误报)
+        check("听觉条件不要求选目标",
+              tuple(nodes_mod.AI_GOAL_COND_SOURCES) == ("SEE", "LOST")
+              and tuple(nodes_mod.AI_HEAR_COND_SOURCES) == ("HEARD", "CALM"))
+        check("边的标签念得出听觉",
+              "听见" in nodes_mod.ai_edge_label({"kind": "HEARD"})
+              and "安静" in nodes_mod.ai_edge_label({"kind": "CALM"}))
+    except Exception as exc:
+        check("AI 听觉节点", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- UI 注册:用"面板能不能被 Blender 找到"来验证 ----
     try:
         panel_names = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]

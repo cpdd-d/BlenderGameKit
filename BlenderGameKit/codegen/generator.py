@@ -111,13 +111,24 @@ class Generator:
             # 用 `get_script()` 比对而不是 `has_method("_ready")` ——
             # 后者任何脚本都有,区分不出是不是同一个。
             lines = self.ctx.new_section()
+            # ── `var _unused_delta` 一个函数里**只能声明一次** ──────────
+            # 真机踩到(第五十七轮,AI 示例的探针里):树里有两个
+            # 『每当_物理帧』时,每个都往**同一个函数体**里塞一句
+            # `var _unused_delta := delta` -> Godot:
+            #     Parse Error: There is already a variable named
+            #     "_unused_delta" declared in this scope.
+            # **整个脚本编译不过**,游戏直接不跑(而且只报这一句,很难联想到
+            # "是因为放了两个物理帧节点")。所以这里记一下声明过没有。
+            declared_unused = False
             for index, node in enumerate(nodes):
                 if index > 0:
                     lines.add(1, "# ---- 另一个同类事件 ----")
                 self.ctx._active.clear()
                 self.ctx._current_event = node.name
-                if delta_name and self._delta_missing(node):
+                if (delta_name and not declared_unused
+                        and self._delta_missing(node)):
                     lines.add(1, f"var _unused_{delta_name} := {delta_name}")
+                    declared_unused = True
                 self._emit_event_body(node, 1)
             sections.append({
                 "signature": signature,

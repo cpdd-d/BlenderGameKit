@@ -164,6 +164,31 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(indent, f"{self_expr}.move_and_slide()")
         return
 
+    # ---- 去查看:朝**最近听到的噪音点**走(第四十一轮:听觉)----------
+    if behavior == "INVESTIGATE":
+        prefix = _hear_prefix(machine["var"])
+        _heard_fn, pos_var, at_var = _ensure_ai_hear_helper(ctx, prefix)
+        # 从没听到过声音就别乱跑 —— 不判的话它会一路走向世界原点
+        # (Vector 零值),看起来像"AI 发疯了"。
+        ctx.add_line(indent, f"if {at_var} < {_NEVER_HEARD} * 0.5:")
+        _stop_and_slide(ctx, indent + 1, self_expr)
+        ctx.add_line(indent, "else:")
+        inner = indent + 1
+        here = ctx.new_temp("ai_here")
+        diff = ctx.new_temp("ai_diff")
+        dist = ctx.new_temp("ai_dist")
+        ctx.add_line(inner, f"var {here} := {reader}({self_expr})")
+        ctx.add_line(inner, f"var {diff} := {pos_var} - {here}")
+        ctx.add_line(inner, f"var {dist} := {diff}.length()")
+        ctx.add_line(inner, f"if {dist} > {stop}:")
+        ctx.add_line(inner + 1,
+                     f"{self_expr}.velocity = {diff}.normalized() * {speed}")
+        ctx.add_line(inner, "else:")
+        ctx.add_line(inner + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+        _emit_ai_facing(ctx, inner, self_expr, diff, facing)
+        ctx.add_line(inner, f"{self_expr}.move_and_slide()")
+        return
+
     # ---- 巡逻 / 返回:去巡逻点(A / B 或只去 A)----
     point_a = _ai_point(ctx, state, "gk_patrol_a")
     point_b = _ai_point(ctx, state, "gk_patrol_b") if behavior == "PATROL" else None
@@ -215,6 +240,20 @@ def _ai_edge_condition(ctx, edge, machine):
         return (f"{distance} <= {sight}" if kind == "SEE"
                 else f"{distance} > {sight}")
 
+    # ---- 听见动静 / 安静下来(第四十一轮:听觉)------------------------
+    # 和"看见 / 丢失"完全对称的一对,只是判断的依据从"和目标的距离"换成
+    # "最近有没有听到噪音"(『声音_发出噪音』广播过来的)。
+    if kind in node_lib.AI_HEAR_COND_SOURCES:
+        prefix = _hear_prefix(machine["var"])
+        heard_fn, _pos, _at = _ensure_ai_hear_helper(ctx, prefix)
+        ear = gd_number(float(getattr(trans, "gk_ear", 0.0) or 0.0))
+        memory = gd_number(float(getattr(trans, "gk_memory", 3.0) or 0.0))
+        heard = f"{heard_fn}({machine['self']}, {ear}, {memory})"
+        # 『安静下来』就是"听不见" —— 两个条件互为反面,和 SEE/LOST 一样。
+        # 但必须**先听过才能"安静下来"**吗?不用:从没听到过声音时,
+        # 『听见动静』为假、『安静下来』为真,正好是"没什么事、该干嘛干嘛"。
+        return heard if kind == "HEARD" else f"not {heard}"
+
     # kind == "pin":接在『条件』引脚上的表达式。
     socket = ctx._socket(trans, "条件")
     if socket is None or not getattr(socket, "is_linked", False):
@@ -225,10 +264,14 @@ def _ai_edge_condition(ctx, edge, machine):
     # 用上下文变量把这个身份带进表达式生成(见 _expr_ai_see)。
     saved = getattr(ctx, "_ai_self_expr", None)
     ctx._ai_self_expr = machine["self"]
+    # 『AI_听见』要知道该写进哪一份听觉状态(一台机器一份,见 _hear_prefix)
+    saved_var = getattr(ctx, "_ai_hear_var", None)
+    ctx._ai_hear_var = machine["var"]
     try:
         return ctx.expr_of(socket)
     finally:
         ctx._ai_self_expr = saved
+        ctx._ai_hear_var = saved_var
 
 
 def _emit_ai_transitions(ctx, indent, machine):
@@ -344,6 +387,25 @@ def _stmt_ai_enable(ctx, node, indent):
         flip_var = ctx.declare_var(f"_gk_ai_patrol_{index}", "bool",
                                    initial="false")
 
+    # ── 听觉运行时(第四十一轮)────────────────────────────────────
+    # 图里用到听觉就先把它生成出来 —— 广播方(machine['self'])得是
+    # `gk_ai_hearer` 组的成员、并且有 `_gk_hear_noise` 可以被调到;
+    # 而登记进组是**懒登记**(在 `_gk_heard` 里做),所以这里只要保证
+    # 那套函数存在即可。
+    #
+    # ⚠ 必须在 `ctx.ai_machines.append` **之前**:转场/行为是稍后在
+    #   `_emit_ai_graph` 里生成的,那时 `_ai_hear_helpers` 要已经能查到。
+    if _ai_uses_hearing(graph):
+        _ensure_ai_hear_helper(ctx, _hear_prefix(var_name))
+        # ── 显式登记进"听觉体"组 ──────────────────────────────────
+        # 光靠 `_gk_heard` 里的懒登记**不够**:如果这张图只有『去查看』
+        # 行为、没有『听见动静』那个转场,`_gk_heard` 从头到尾不会被调用,
+        # AI 就**永远收不到噪音**(表现为"怪物像聋子",而且不报错)。
+        # 所以这里在启用时明确登记一次。
+        ctx.add_line(indent,
+                     f'if not {target}.is_in_group("{HEAR_GROUP}"):')
+        ctx.add_line(indent + 1, f'{target}.add_to_group("{HEAR_GROUP}")')
+
     ctx.ai_machines.append({
         "node": node,
         "graph": graph,
@@ -443,3 +505,206 @@ def _ensure_ai_see_helper(ctx):
         "separator": True,
     })
     return name
+
+
+# ==========================================================================
+# 听觉:『声音_发出噪音』喊一声,听得见的 AI 记下位置
+# ==========================================================================
+# ── 为什么走"分组广播"而不是自动加载单例 ────────────────────────────
+# 出声的和听声的通常**不是同一个物体**(玩家跑步 -> 怪物听见),所以需要
+# 一条跨物体的通道。三种做法里:
+#   * 自动加载单例(autoload):得改 project.godot,还要保证导出顺序;
+#   * 信号总线节点:得让用户在场景里摆一个,忘了就没声音;
+#   * **分组广播**(选这个):声音去 `get_tree().get_nodes_in_group(
+#     "gk_ai_hearer")` 里挨个调方法。零配置、跨场景都有效、出问题一眼能查
+#     (在 Godot 里看那个怪物在不在这个组里就知道)。
+# 代价是"每帧遍历一组"—— 但一组通常只有几个敌人,而且发声本来就有间隔。
+HEAR_GROUP = "gk_ai_hearer"
+
+# 没听到过任何声音时的时间戳(用一个很负的数当哨兵,比 null 好判)
+_NEVER_HEARD = "-1000000000.0"
+
+
+def _hear_prefix(var_name):
+    """听觉变量名的前缀 —— 按"哪个状态机"分开。
+
+    ── 为什么要分(踩过的坑)────────────────────────────────────────
+    一个脚本里可能有两台『AI_启用』(比如巡逻兵 + 狗)。如果听觉状态共用
+    一份成员变量,两台机器就会互相覆盖 —— 狗听到的声音会把巡逻兵也引过去。
+    所以按下发它们的『状态变量名』各存一份。
+    """
+    return f"{snake_case(str(var_name or 'ai_state'), 'ai_state')}_hear"
+
+
+def _dim_vector(ctx):
+    return ("Vector2", "Vector2.ZERO") if ctx.dim == 2 else ("Vector3",
+                                                            "Vector3.ZERO")
+
+
+def _ensure_ai_hear_helper(ctx, prefix):
+    """确保听觉运行时已生成,返回 (查询函数名, 位置变量名, 时间变量名)。
+
+    生成的东西(都挂在**脚本所在节点**上):
+      * `{prefix}_pos` / `{prefix}_loud` / `{prefix}_at` —— 记住了什么声音;
+      * `_gk_hear_noise(at, loudness)` —— 『声音_发出噪音』广播时调它;
+        名字**固定**,因为广播方不知道听方的前缀是什么 —— 它只按
+        `gk_ai_hearer` 组挨个调,所以这个函数的签名必须统一(见下面"派发器");
+      * `_gk_heard_{prefix}(host, ear, memory)` —— "听得见吗",顺带把自己
+        登记进 `gk_ai_hearer` 组(**懒登记**:不依赖 _ready 的执行顺序)。
+    """
+    from .expressions import ensure_position_helper
+    reader = ensure_position_helper(ctx)
+
+    made = getattr(ctx, "_ai_hear_helpers", None)
+    if made is None:
+        made = {}
+        ctx._ai_hear_helpers = made
+    if prefix in made:
+        return made[prefix]
+
+    vector, zero = _dim_vector(ctx)
+    pos_var = ctx.declare_var(f"{prefix}_pos", vector, initial=zero)
+    loud_var = ctx.declare_var(f"{prefix}_loud", "float", initial="0.0")
+    at_var = ctx.declare_var(f"{prefix}_at", "float", initial=_NEVER_HEARD)
+    heard_fn = f"_gk_heard_{prefix}"
+
+    ctx.extra_sections.append({
+        "signature": f"func {heard_fn}(host: Node, ear: float, "
+                     f"memory: float) -> bool:",
+        "lines": [
+            # ── 懒登记(而不是写在 _ready 里)─────────────────────────
+            # 谁用听觉谁自己加进组。写在 _ready 里的话得知道"哪些脚本要听",
+            # 而『AI_听见』可能出现在玩法图、也可能只在 AI 图里 —— 各处去补
+            # _ready 迟早漏一处(漏了就是"敌人像聋子",而且**不报错**)。
+            f'    if not is_in_group("{HEAR_GROUP}"):',
+            f'        add_to_group("{HEAR_GROUP}")',
+            f"    if {at_var} < {_NEVER_HEARD} * 0.5:",
+            "        return false      # 从来没听到过任何声音",
+            "    if memory > 0.0:",
+            f"        var age := float(Time.get_ticks_msec()) * 0.001 - {at_var}",
+            "        if age > memory:",
+            "            return false",
+            f"    var d := ({reader}(host) - {pos_var}).length()",
+            f"    if d > {loud_var}:",
+            "        return false      # 太远了:这个声音传不到这儿",
+            "    if ear > 0.0 and d > ear:",
+            "        return false      # 太远了:这只耳朵听不到",
+            "    return true",
+        ],
+        "empty_body": "    return false",
+        "separator": True,
+    })
+    made[prefix] = (heard_fn, pos_var, at_var)
+    _rebuild_hear_dispatcher(ctx)
+    return made[prefix]
+
+
+def _rebuild_hear_dispatcher(ctx):
+    """重建 `_gk_hear_noise` —— 它要把噪音写进**本脚本所有**听觉前缀。
+
+    ── 为什么要有"派发器"这一层(名字必须固定)──────────────────────
+    『声音_发出噪音』是**跨物体**广播的:它不知道对面脚本里用的是哪个前缀,
+    只知道自己在一堆 `gk_ai_hearer` 组成员里挨个调。所以函数名必须统一
+    (`_gk_hear_noise`),而"具体写进哪几个变量"由各脚本自己决定。
+
+    一个脚本里可能有多台 AI(前缀不同),所以这个函数要**汇总所有前缀** ——
+    每发现一个新前缀就重写一遍它的函数体(直接改 extra_sections 里那个
+    dict,生成器最后才读它)。
+    """
+    made = getattr(ctx, "_ai_hear_helpers", None) or {}
+    names = sorted(made)
+    if not names:
+        return
+    vector, _zero = _dim_vector(ctx)
+    lines = [f"    var now := float(Time.get_ticks_msec()) * 0.001"]
+    for prefix in names:
+        _heard_fn, pos_var, at_var = made[prefix]
+        loud_var = ctx.declare_var(f"{prefix}_loud", "float", initial="0.0")
+        lines.append(f"    {pos_var} = at")
+        lines.append(f"    {loud_var} = loudness")
+        lines.append(f"    {at_var} = now")
+    section = getattr(ctx, "_ai_hear_dispatcher", None)
+    if section is None:
+        section = {
+            "signature": f"func _gk_hear_noise(at: {vector}, "
+                         f"loudness: float) -> void:",
+            "lines": lines,
+            "empty_body": "    pass",
+            "separator": True,
+        }
+        ctx._ai_hear_dispatcher = section
+        ctx.extra_sections.append(section)
+    else:
+        section["lines"] = lines
+
+
+def _ai_uses_hearing(graph):
+    """这张 AI 图用不用听觉(用来决定要不要生成那套运行时)。
+
+    两条路都算:有状态用『去查看』、有转场用『听见动静 / 安静下来』。
+    (条件引脚上接了『AI_听见』的情况,表达式生成时自己会 ensure ——
+     那时"前缀"才知道,提前扫不出来。)
+    """
+    for state in graph.get("states") or ():
+        if str(getattr(state, "gk_behavior", "") or "") == "INVESTIGATE":
+            return True
+    for edge in graph.get("edges") or ():
+        if edge.get("kind") in node_lib.AI_HEAR_COND_SOURCES:
+            return True
+    return False
+
+
+@stmt_node("GKNodeNoise")
+def _stmt_noise(ctx, node, indent):
+    """『声音_发出噪音』:按间隔把"谁在哪弄出多大声"广播给听觉体。
+
+    ── 间隔为什么必须存在(不是可选优化)────────────────────────────
+    脚步声的写法是"接在『每当_物理帧』后面",也就是每秒 60 次。没有间隔
+    的话 —— 每帧都广播一次,听觉体的"最后一次听到"永远是最新的一帧,
+    『安静下来』**永远不会成立**,敌人会一直黏在噪音点。所以这里用成员
+    变量记时间戳,默认 0.5 秒发一次。
+    """
+    from .expressions import ensure_position_helper
+    reader = ensure_position_helper(ctx)
+
+    loudness = ctx.input_number(node, "响度", "8.0")
+    interval = gd_number(float(getattr(node, "gk_interval", 0.5) or 0.0))
+    target = ctx.target_expr(node, "gk_target", hint="物体")
+    debug = bool(getattr(node, "gk_debug_print", False))
+
+    # 时间戳要**跨帧**记 -> 成员变量。每个『声音_发出噪音』各占一个
+    # (用节点名加后缀),两个节点各发各的、互不影响间隔。
+    stamp = ctx.declare_var(f"_gk_noise_stamp_{snake_case(node.name, 'n')}",
+                            "float", initial=_NEVER_HEARD)
+    now = ctx.new_temp("gk_now")
+    at = ctx.new_temp("gk_noise_at")
+    hearer = ctx.new_temp("gk_hearer")
+
+    ctx.add_line(indent, f"var {now} := float(Time.get_ticks_msec()) * 0.001")
+    ctx.add_line(indent, f"if {now} - {stamp} >= {interval}:")
+    ctx.add_line(indent + 1, f"{stamp} = {now}")
+    ctx.add_line(indent + 1, f"var {at} := {reader}({target})")
+    ctx.add_line(indent + 1, f'var {hearer}s := '
+                             f'get_tree().get_nodes_in_group("{HEAR_GROUP}")')
+    if debug:
+        ctx.add_line(indent + 1,
+                     f'print("[GK 噪音] 位置=", {at}, " 响度=", {loudness},'
+                     f' " 听觉体=", {hearer}s.size())')
+    ctx.add_line(indent + 1, f"for {hearer} in {hearer}s:")
+    # 听不听得到由**听方**自己判断(它有自己的耳朵距离和记忆时长)——
+    # 广播方只管把"哪、多大声"送到。
+    ctx.add_line(indent + 2,
+                 f'if {hearer}.has_method("_gk_hear_noise"):')
+    ctx.add_line(indent + 3, f"{hearer}._gk_hear_noise({at}, {loudness})")
+    _chain(ctx, node, indent, "完成")
+
+
+@expr_node("GKNodeAiHear")
+def _expr_ai_hear(ctx, node):
+    """『AI_听见』:距离 + 记忆 -> 布尔。"""
+    prefix = _hear_prefix(getattr(ctx, "_ai_hear_var", "ai_state"))
+    heard_fn, _pos, _at = _ensure_ai_hear_helper(ctx, prefix)
+    self_expr = getattr(ctx, "_ai_self_expr", None) or "self"
+    ear = ctx.input_number(node, "听觉距离", "0.0")
+    memory = ctx.input_number(node, "记忆秒数", "3.0")
+    return f"{heard_fn}({self_expr}, {ear}, {memory})"
