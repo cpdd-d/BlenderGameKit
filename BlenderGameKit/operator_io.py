@@ -292,9 +292,35 @@ def node_tree_error(cls, tree):
             f"不能放进当前的图。{hint}")
 
 
+# ── 每张图只允许一个的节点(第六十七轮)──────────────────────────────
+# 这些节点管的是"**整张图 / 整个关卡**"级别的东西,放两个的话谁说了算说不清,
+# 而且生成出来两条都会执行、顺序不同结果就不同。用户明确要求
+# "同一类节点仅允许添加一个(不允许两个一样的)"。
+#
+# 导出侧还有一道兜底(codegen/validation.py 的 `_check_display_switch`)——
+# 老 .blend 复制粘贴节点、脚本建图都可能绕过界面这一道。
+_SINGLETON_NODES = {
+    "GKNodeDisplaySwitch": ("它管的是**整关**的显示效果"
+                            "(环境氛围 / 画面风格 / 调试面板)"),
+}
+
+
+def singleton_error(cls, tree):
+    """这张图里已经有同类节点了吗?有则返回一句人话,否则 None。"""
+    bl_idname = getattr(cls, "bl_idname", "")
+    why = _SINGLETON_NODES.get(bl_idname)
+    if why is None:
+        return None
+    for node in getattr(tree, "nodes", ()) or ():
+        if getattr(node, "bl_idname", "") == bl_idname:
+            return (f"这张图里已经有一个『{getattr(cls, 'bl_label', bl_idname)}』了"
+                    f"(『{getattr(node, 'name', '?')}』)。{why},"
+                    f"两个同时在说不清以哪个为准 —— 每张图只放一个。")
+    return None
+
+
 class GK_OT_AddNode(bpy.types.Operator):
     """按分类添加一个 GK 节点。"""
-
     bl_idname = "gk.add_node"
     bl_label = "添加游戏逻辑节点"
     bl_description = "在鼠标位置添加一个节点"
@@ -325,6 +351,14 @@ class GK_OT_AddNode(bpy.types.Operator):
         # 所以在这里先拦一道,给一句人话:告诉他该去哪种树。
         # 判断本身在 node_tree_error 里(那里解释了元组树类型的坑)。
         problem = node_tree_error(cls, tree)
+        if problem:
+            _report(self, "ERROR", problem)
+            return {"CANCELLED"}
+
+        # ── 只允许一个的节点(第六十七轮)────────────────────────────
+        # 用户要的"同一类节点仅允许添加一个":在这里拦,说的是人话
+        # (告诉他哪个节点已经占了、为什么只能一个)。
+        problem = singleton_error(cls, tree)
         if problem:
             _report(self, "ERROR", problem)
             return {"CANCELLED"}

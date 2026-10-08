@@ -13,7 +13,9 @@
 from ..models import CodegenResult, Diagnostic, render_warnings
 from .context import CodegenAbort
 from .generator import Generator
-from .validation import _check_animation_targets, _check_base_class_supports_graph
+from .validation import (_check_animation_targets,
+                         _check_base_class_supports_graph,
+                         _check_display_switch)
 
 # 上一次生成用到的输入动作 [(动作名, 捕获的键), ...] 与提示(兼容用)
 last_used_actions = []
@@ -36,6 +38,7 @@ def generate_result(tree, options=None):
     collected = list(generator.ctx.warnings)
     _check_base_class_supports_graph(tree, options or {}, collected)
     _check_animation_targets(tree, collected)
+    _check_display_switch(tree, collected)
     warnings = render_warnings(collected)
     diagnostics = [item for item in collected if isinstance(item, Diagnostic)]
     # 登记本次用到的输入动作，供导出流程写进 project.godot

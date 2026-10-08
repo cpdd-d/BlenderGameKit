@@ -1307,6 +1307,86 @@ def _stmt_set_paused(ctx, node, indent):
     ctx.add_line(indent, f"{ctx.target_expr(node)}.process_mode = Node.{mode}")
 
 
+# ── 『显示_效果开关』(第六十七轮)─────────────────────────────────────
+# 生成物分两半:一个 helper(只生成一次)+ 每个调用点一行。
+#
+# 为什么要 helper 而不是把几十行摊在调用点:这个节点**每张玩法图只放一个**,
+# 但它可能被接在『每当_准备』上、也可能挂在触发器 / 按键上 —— 摊开的话
+# 每多一个调用点就多几十行。helper 一次定义、多处调用,读起来也清楚。
+#
+# 三项各自怎么"关":
+#   * 环境氛围  = 把 WorldEnvironment 的 environment 摘掉(原来的资源先存起来,
+#                再开时原样还回去 —— 直接置 null 是回不来的);
+#   * 画面风格  = 卡通材质是**材质覆盖**(material_override),摘掉就回到模型
+#                自带材质;同样先存后还;
+#   * 调试面板  = 环境脚本上那个 @export 开关(场景根上有这一项才动它)。
+#
+# ⚠ 侧栏的『显示_碰撞线框』**不在这里** —— 它只在 Blender 里看、不导出,
+#   运行时没有对应物,列进来只会让人以为"能关掉游戏里的线框"。
+_DISPLAY_SWITCH_LINES = (
+    "    # 走到这里时,按勾选把本关的显示效果开 / 关。",
+    "    var _gk_scene := get_tree().current_scene",
+    "    if _gk_scene == null:",
+    "        return",
+    "    # ① 环境氛围:主场景上的 WorldEnvironment",
+    "    var _gk_env_node := _gk_scene.get_node_or_null(\"WorldEnvironment\") as WorldEnvironment",
+    "    if _gk_env_node != null:",
+    "        if env_on:",
+    "            if _gk_env_backup != null:",
+    "                _gk_env_node.environment = _gk_env_backup",
+    "        else:",
+    "            if _gk_env_node.environment != null:",
+    "                _gk_env_backup = _gk_env_node.environment",
+    "            _gk_env_node.environment = null",
+    "    # ② 调试面板:场景根上的环境脚本有这一项才动它",
+    "    if typeof(_gk_scene.get(\"debug_panel\")) == TYPE_BOOL:",
+    "        _gk_scene.set(\"debug_panel\", debug_on)",
+    "    # ③ 画面风格:卡通材质是材质覆盖,摘掉 = 回到模型自带材质",
+    "    var _gk_stack: Array = [_gk_scene]",
+    "    while not _gk_stack.is_empty():",
+    "        var _gk_cur: Node = _gk_stack.pop_back()",
+    "        if _gk_cur is MeshInstance3D:",
+    "            var _gk_mesh := _gk_cur as MeshInstance3D",
+    "            if toon_on:",
+    "                if _gk_toon_backup.has(_gk_mesh):",
+    "                    _gk_mesh.material_override = _gk_toon_backup[_gk_mesh]",
+    "            elif _gk_mesh.material_override is ShaderMaterial:",
+    "                _gk_toon_backup[_gk_mesh] = _gk_mesh.material_override",
+    "                _gk_mesh.material_override = null",
+    "        for _gk_child in _gk_cur.get_children():",
+    "            _gk_stack.append(_gk_child)",
+)
+
+
+def _display_effects_helper(ctx):
+    """生成(或复用)那个开 / 关显示效果的 helper,返回函数名。"""
+    name = getattr(ctx, "_gk_display_effects_fn", "")
+    if name:
+        return name
+    name = ctx.declare_func_name("_gk_display_effects")
+    ctx._gk_display_effects_fn = name
+    # 两个"先存后还"的备份:_gk_env_backup 存环境资源,_gk_toon_backup 存
+    # 每个网格原来的材质覆盖(网格当键)。
+    ctx.declare_var("_gk_env_backup", "Environment", initial="null")
+    ctx.declare_var("_gk_toon_backup", "Dictionary", initial="{}")
+    ctx.extra_sections.append({
+        "signature": (f"func {name}(env_on: bool, toon_on: bool, "
+                      f"debug_on: bool) -> void:"),
+        "lines": list(_DISPLAY_SWITCH_LINES),
+        "empty_body": "    pass",
+    })
+    return name
+
+
+@stmt_node("GKNodeDisplaySwitch")
+def _stmt_display_switch(ctx, node, indent):
+    """『显示_效果开关』:走到这里按勾选开 / 关本关的显示效果。"""
+    helper = _display_effects_helper(ctx)
+    flags = ["true" if bool(getattr(node, attr, True)) else "false"
+             for attr in ("gk_env_on", "gk_toon_on", "gk_debug_on")]
+    ctx.add_line(indent, f"{helper}({', '.join(flags)})")
+
+
 @stmt_node("GKNodeSetTimeScale")
 def _stmt_set_time_scale(ctx, node, indent):
     scale = _tunable_number(ctx, node, "倍速", "1.0", "time_scale")

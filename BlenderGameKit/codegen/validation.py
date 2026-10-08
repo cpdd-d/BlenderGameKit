@@ -109,6 +109,35 @@ def _check_animation_targets(tree, warnings):
             ))
 
 
+def _check_display_switch(tree, warnings):
+    """『显示_效果开关』每张玩法图只允许一个。
+
+    ── 为什么要拦(用户明确要求)────────────────────────────────────
+    这个节点管的是**整关**的显示效果(环境氛围 / 画面风格 / 调试面板),
+    不是某一个物体。图里放两个的话,"到底以哪个为准"没有合理解 ——
+    生成出来还会两条都执行,顺序不同结果就不同,极难排查。
+
+    用户原话:"同一类节点仅允许添加一个(不允许两个一样的)"。
+    Blender 那边『添加节点』也会拦一次(见 operator_io),这里是导出侧的兜底
+    —— 老 .blend 复制粘贴节点 / 脚本建图都可能绕过界面。
+    """
+    names = [str(getattr(node, "name", "") or "?")
+             for node in getattr(tree, "nodes", ()) or ()
+             if getattr(node, "bl_idname", "") == "GKNodeDisplaySwitch"]
+    if len(names) <= 1:
+        return
+    warnings.append(Diagnostic(
+        level="warning",
+        code="DISPLAY_SWITCH_DUPLICATE",
+        message=(f"这张图里有 {len(names)} 个『显示_效果开关』"
+                 f"({'、'.join(names)})。它们都管**整关**的显示效果,"
+                 f"同时存在时说不清以哪个为准。"),
+        hint=("只留一个。想控制**某个物体**的显隐,用『显示_设置可见』"
+              "(它才是按物体一个个来的)"),
+        node_name=names[0],
+    ))
+
+
 def required_base_class(tree, options=None):
     """扫一遍节点图,返回 (需要的基类, 为什么) —— 不需要就 (None, "")。
 

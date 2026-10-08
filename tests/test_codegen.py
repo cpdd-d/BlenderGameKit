@@ -14422,5 +14422,105 @@ class TestRound66AssetCard(unittest.TestCase):
         self.assertIsNone(asset_thumbs.preview_for("model", ""))
 
 
+class TestRound67DisplaySwitch(Base):
+    """第六十七轮:『显示_效果开关』—— 每张玩法图一个,运行时开/关本关的显示效果。
+
+    用户原话:"添加开关按钮控制显示节点的开启与关闭,节点需绑定游戏逻辑
+    (如不同关卡显示效果),且同一类节点仅允许添加一个"。
+    动工前确认的三点:玩法图里的**开关节点**(不是物体显隐)、
+    **接执行流**(游戏里可反复切)、**每张玩法图最多一个**(绑定靠"放在哪张图")。
+
+    ── 它和『显示_设置可见』的分工 ───────────────────────────────────
+    『显示_设置可见』管**某一个物体**:选目标 + 设 visible,一个个摆。
+    这个管**本关的显示效果**(环境氛围 / 画面风格 / 调试面板)——
+    一个节点把一关的效果一起开关,所以"每图一个"才有意义。
+    """
+
+    def _graph(self, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeDisplaySwitch, "显示开关", **props)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        return tree, node
+
+    # ---- 节点本身 ----
+
+    def test_node_registered_with_flow_pins(self):
+        cls = getattr(NN, "GKNodeDisplaySwitch", None)
+        self.assertIsNotNone(cls, "『显示_效果开关』没注册进节点表")
+        self.assertEqual(cls.bl_label, "显示_效果开关")
+        self.assertEqual(cls.gk_category, "显示")
+        ins = [spec["name"] for spec in cls.gk_inputs]
+        outs = [spec["name"] for spec in cls.gk_outputs]
+        self.assertIn("执行", ins)
+        self.assertIn("完成", outs)
+
+    # ---- 三种效果一起开关 ----
+
+    def test_toggles_all_three_effects(self):
+        tree, _node = self._graph()
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # helper 只有一份,调用点带上三个开关
+        self.assertEqual(code.count("func _gk_display_effects("), 1)
+        self.assertIn("_gk_display_effects(true, true, true)", code)
+        # ① 环境氛围:主场景上的 WorldEnvironment
+        self.assertIn("as WorldEnvironment", code)
+        # ② 调试面板:场景根上的环境脚本(有这一项才动它)
+        self.assertIn('set("debug_panel"', code)
+        # ③ 画面风格:摘掉 / 还原卡通材质的覆盖
+        self.assertIn("material_override", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_members_declared_once(self):
+        tree, _node = self._graph()
+        code, _ = gen(tree, V3)
+        self.assertEqual(code.count("var _gk_env_backup"), 1)
+        self.assertEqual(code.count("var _gk_toon_backup"), 1)
+
+    def test_unchecked_effects_pass_false(self):
+        tree, _node = self._graph(gk_toon_on=False, gk_debug_on=False)
+        code, _ = gen(tree, V3)
+        self.assertIn("_gk_display_effects(true, false, false)", code)
+
+    def test_all_off_is_allowed(self):
+        """三个都不勾 = 走到这里把本关的显示效果全关掉(不算错)。"""
+        tree, _node = self._graph(gk_env_on=False, gk_toon_on=False,
+                                  gk_debug_on=False)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_display_effects(false, false, false)", code)
+
+    # ---- 每张玩法图只允许一个 ----
+
+    def test_two_switches_in_one_graph_warn(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        first = tree.new_node(NN.GKNodeDisplaySwitch, "开关A")
+        second = tree.new_node(NN.GKNodeDisplaySwitch, "开关B")
+        gk_stub.connect(tree, event, "执行", first, "执行")
+        gk_stub.connect(tree, first, "完成", second, "执行")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(
+            any("显示_效果开关" in w and "一个" in w for w in warnings), warnings)
+
+    def test_one_switch_does_not_warn(self):
+        tree, _node = self._graph()
+        _code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+
+    # ---- 不摆这个节点时,生成物一个字都不变(老图回归锁)----
+
+    def test_graph_without_switch_is_untouched(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "打招呼", gk_text="hi")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("_gk_display_effects", code)
+        self.assertNotIn("_gk_env_backup", code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

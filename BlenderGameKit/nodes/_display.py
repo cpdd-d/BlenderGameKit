@@ -33,6 +33,43 @@ class GKNodeSetVisible(B.GKStatementNode):
 
 
 @N
+class GKNodeDisplaySwitch(B.GKStatementNode):
+    bl_idname = "GKNodeDisplaySwitch"
+    bl_label = "显示_效果开关"
+    bl_icon = "HIDE_OFF"
+    gk_category = "显示"
+    gk_doc = ("运行时开 / 关**本关的显示效果**:环境氛围 / 画面风格 / 调试面板。\n"
+              "『显示_设置可见』管**某一个物体**(选目标 + 设 visible);"
+              "这个管**整关** —— 一个节点把一关的效果一起开关,"
+              "所以**每张玩法图只放一个**(放两个说不清以哪个为准)。\n"
+              "绑定是天然的:节点放在哪张玩法图里,就管那张图对应的关卡"
+              "(不同关卡各放各的,互不影响)。\n"
+              "『执行』走到它时才生效 —— 想开局就定下来,接在『每当_准备』后面;"
+              "也可以挂到触发器 / 按键上,游戏里随时切。\n"
+              "⚠ 三项都只对**导出的东西**起作用:环境氛围 = 场景里的 "
+              "WorldEnvironment;画面风格 = 卡通材质的材质覆盖;"
+              "调试面板 = 环境脚本上的面板开关。\n"
+              "⚠ 侧栏『显示_碰撞线框』**不在这里** —— 那是 Blender 里的排查工具,"
+              "不导出、不影响游戏,运行时也就没得开关。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_env_on", "bool", True, "环境氛围",
+         "场景里的 WorldEnvironment(背景 / 环境光 / 雾 / 泛光 / 色调)"),
+        ("gk_toon_on", "bool", True, "画面风格",
+         "卡通材质(摘掉材质覆盖 = 回到模型自带的材质)"),
+        ("gk_debug_on", "bool", True, "调试面板",
+         "环境脚本上那个运行时调试 HUD(3D 项目才有)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.label(text="本关的显示效果(勾 = 开)", icon="HIDE_OFF")
+        layout.prop(self, "gk_env_on", toggle=True, icon="WORLD")
+        layout.prop(self, "gk_toon_on", toggle=True, icon="MATERIAL")
+        layout.prop(self, "gk_debug_on", toggle=True, icon="INFO")
+        layout.label(text="每张玩法图只放一个", icon="INFO")
+
+
+@N
 class GKNodeSetPaused(B.GKStatementNode):
     bl_idname = "GKNodeSetPaused"
     bl_label = "显示_暂停节点"

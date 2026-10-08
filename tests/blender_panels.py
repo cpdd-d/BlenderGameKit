@@ -409,6 +409,31 @@ def main():
         check("『分组框』侧栏盒子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6b. 『显示_效果开关』的卡片(第六十七轮)----
+    #
+    # ── 为什么单独画一次 ────────────────────────────────────────────
+    # 这张卡的 draw_buttons 里是三行 `layout.prop(...)` + 两行 label。
+    # 属性名打错 / 参数写错,在 Blender 里是**当场抛异常、卡片整块画不出来**,
+    # 而冒烟那层只验"节点在不在、生成对不对",发现不了画的事
+    # (第五十五轮侧栏就是这么漏的:冒烟全绿,面板整块是空的)。
+    print("=" * 72)
+    print("6b. 『显示_效果开关』卡片")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟显示开关67", "GKGameLogicTree")
+        switch = tree.nodes.new("GKNodeDisplaySwitch")
+        card_error = ""
+        try:
+            switch.draw_buttons(bpy.context, RecordingLayout())
+        except Exception as exc:                          # noqa: BLE001
+            card_error = f"{type(exc).__name__}: {exc}"
+        check("『显示_效果开关』卡片的 draw_buttons 能画完", not card_error,
+              card_error)
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『显示_效果开关』卡片", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

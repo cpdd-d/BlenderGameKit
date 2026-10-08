@@ -3142,6 +3142,107 @@ def main():
         check("预设", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 『显示_效果开关』(第六十七轮)----
+    # 用户在玩法图里放一个开关,按勾选开 / 关本关的显示效果;每张图只许一个。
+    # 这一轮验的是:**节点真注册进 Blender**、生成物里 helper 只有一份、
+    # 界面与导出两侧都拦得住"放第二个"。
+    try:
+        r67_tree = bpy.data.node_groups.new("显示开关测试", "GKGameLogicTree")
+        r67_ready = r67_tree.nodes.new("GKNodeOnReady")
+        r67_switch = r67_tree.nodes.new("GKNodeDisplaySwitch")
+        r67_out = r67_ready.outputs.get("执行")
+        r67_in = r67_switch.inputs.get("执行")
+        r67_tree.links.new(r67_out, r67_in)
+
+        check("显示开关:节点能建出来 + 三个勾选项都在",
+              hasattr(r67_switch, "gk_env_on")
+              and hasattr(r67_switch, "gk_toon_on")
+              and hasattr(r67_switch, "gk_debug_on"))
+        check("显示开关:三项默认都是开",
+              bool(r67_switch.gk_env_on) and bool(r67_switch.gk_toon_on)
+              and bool(r67_switch.gk_debug_on))
+        r67_ins = [spec["name"] for spec in r67_switch.gk_inputs]
+        r67_outs = [spec["name"] for spec in r67_switch.gk_outputs]
+        check("显示开关:执行进 / 完成出",
+              "执行" in r67_ins and "完成" in r67_outs, f"{r67_ins} {r67_outs}")
+
+        # 卡面画得完(侧栏瘦身那次的教训:画不出来的卡片没人会发现)
+        class _R67Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r67_draw_error = ""
+        try:
+            r67_switch.draw_buttons(bpy.context, _R67Layout())
+        except Exception as exc:                          # noqa: BLE001
+            r67_draw_error = f"{type(exc).__name__}: {exc}"
+        check("显示开关:节点卡片能画完", not r67_draw_error, r67_draw_error)
+
+        r67_options = {"dimension": "3", "base_class": "CharacterBody3D",
+                       "export_tunables": True}
+        r67_code, r67_warn = codegen.generate(r67_tree, r67_options)
+        check("显示开关:生成无告警", not r67_warn, str(r67_warn)[:200])
+        check("显示开关:helper 只生成一份 + 调用点带上三个开关",
+              r67_code.count("func _gk_display_effects(") == 1
+              and "_gk_display_effects(true, true, true)" in r67_code)
+        check("显示开关:三项各生成对应的关闭动作",
+              "as WorldEnvironment" in r67_code
+              and 'set("debug_panel"' in r67_code
+              and "material_override" in r67_code)
+
+        # ① 导出侧兜底:手工再塞一个 -> 生成时报警(绕过界面也要拦得住)
+        r67_extra = r67_tree.nodes.new("GKNodeDisplaySwitch")
+        r67_extra.name = "多余的开关"
+        _r67_dup_code, r67_dup_warn = codegen.generate(r67_tree, r67_options)
+        check("显示开关:导出侧拦得住第二个(告警)",
+              any("显示_效果开关" in w and "一个" in w for w in r67_dup_warn),
+              str(r67_dup_warn)[:200])
+        r67_tree.nodes.remove(r67_extra)
+
+        # ② 界面侧:再点『添加』应被拒绝(只留一个)
+        r67_block = operator_io.singleton_error(type(r67_switch), r67_tree)
+        check("显示开关:界面侧判定得出『已经有一个』", bool(r67_block),
+              str(r67_block))
+        # 让 _tree_of 认准这棵树:只让这一棵里有选中节点
+        for r67_group in bpy.data.node_groups:
+            for r67_node in getattr(r67_group, "nodes", ()) or ():
+                try:
+                    r67_node.select = False
+                except Exception:                          # noqa: BLE001
+                    pass
+        r67_switch.select = True
+        r67_tree.nodes.active = r67_switch
+        r67_before = len(r67_tree.nodes)
+        r67_rejected = False
+        try:
+            r67_result = bpy.ops.gk.add_node(node_type="GKNodeDisplaySwitch")
+            r67_rejected = r67_result == {"CANCELLED"}
+        except RuntimeError as exc:
+            # ⚠ Blender 对 report({'ERROR'}) 的算子是**抛 RuntimeError**,
+            #   不是返回 CANCELLED(和"找不到 Godot"那些算子一个行为)。
+            #   抛出来的那句就是给用户看的人话,所以这也算"被拦下"。
+            r67_rejected = "显示_效果开关" in str(exc)
+        check("显示开关:再点『添加』被拒绝(每图只一个)",
+              r67_rejected and len(r67_tree.nodes) == r67_before,
+              f"rejected={r67_rejected} {len(r67_tree.nodes)} <- {r67_before}")
+
+        # ③ 不摆这个节点的图 -> 判定为空(不许误报)
+        r67_plain = bpy.data.node_groups.new("没开关的图", "GKGameLogicTree")
+        check("显示开关:没有它时不拦(不误报)",
+              operator_io.singleton_error(type(r67_switch), r67_plain) is None
+              and operator_io.singleton_error(node_lib.GKNodePrint, r67_tree) is None)
+
+        bpy.data.node_groups.remove(r67_tree)
+        bpy.data.node_groups.remove(r67_plain)
+    except Exception as exc:
+        check("第六十七轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)
