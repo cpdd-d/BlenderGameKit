@@ -3511,6 +3511,94 @@ def main():
         check("第七十轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 2D 混合树 + 混合点编辑器(第七十二轮,G 组)----
+    # 『动画_混合树2D』(BlendSpace2D)+ 混合点从"手打"变成"下拉挑动画"。
+    # 真 Blender 里验:节点/算子/行 PropertyGroup 都注册好了、菜单归类对、
+    # 两张卡片画得完、拼串规则和解析一致(读一遍再写一遍还是原样)。
+    try:
+        r72_nodes = __import__(f"{module_name}.nodes.nodes",
+                               fromlist=["ALL_CLASSES"])
+        r72_all = {cls.bl_idname for cls in r72_nodes.ALL_CLASSES}
+        check("混合树2D:节点已注册", "GKNodeBlendTree2D" in r72_all)
+        check("混合树2D:归在『动画 ▸ 播放』下",
+              r72_nodes.SUBCATEGORY_OF.get("GKNodeBlendTree2D") == "播放",
+              str(r72_nodes.SUBCATEGORY_OF.get("GKNodeBlendTree2D")))
+        r72_cls = getattr(node_lib, "GKNodeBlendTree2D", None)
+        check("混合树2D:X / Y 两个参数引脚都在",
+              r72_cls is not None and
+              {spec["name"] for spec in r72_cls.gk_inputs} >= {"执行", "X", "Y"},
+              str([spec["name"] for spec in
+                   getattr(r72_cls, "gk_inputs", ())]))
+        # 『动画_混合树』(1D)这轮加了『动画播放器』(挑动画时分析归属用)
+        r72_1d = getattr(node_lib, "GKNodeBlendTree", None)
+        check("混合树:多了『动画播放器』栏位",
+              r72_1d is not None and
+              any(entry[0] == "gk_player" for entry in r72_1d.gk_prop_defs),
+              str([entry[0] for entry in getattr(r72_1d, "gk_prop_defs", ())]))
+
+        # 混合点编辑器:算子 + 行结构
+        check("混合点:算子已注册", hasattr(bpy.ops.gk, "edit_blend_points"))
+        try:
+            r72_props = bpy.ops.gk.edit_blend_points.get_rna_type().properties
+            r72_is_collection = r72_props["points"].type == "COLLECTION"
+            # ⚠ 别查 `dir(bpy.types)`:PropertyGroup 注册后**不一定**出现在那里
+            #   (实测没有)。查集合属性的元素类型才是真的"行结构注册好了"。
+            r72_row_id = getattr(getattr(r72_props["points"], "fixed_type", None),
+                                 "identifier", "")
+        except Exception as exc:                          # noqa: BLE001
+            r72_is_collection = False
+            r72_row_id = ""
+            check("混合点:算子 RNA 读得到", False, f"{type(exc).__name__}: {exc}")
+        check("混合点:对话框里那一列点是集合属性", r72_is_collection)
+        check("混合点:行结构 GK_BlendPointRow 已注册",
+              r72_row_id == "GK_BlendPointRow", r72_row_id)
+
+        # 两张卡片画得完(侧栏瘦身那次的教训:画不出来的卡片没人会发现)
+        r72_tree = bpy.data.node_groups.new("混合树冒烟72", "GKGameLogicTree")
+        r72_ready = r72_tree.nodes.new("GKNodeOnReady")
+        r72_one_d = r72_tree.nodes.new("GKNodeBlendTree")
+        r72_two_d = r72_tree.nodes.new("GKNodeBlendTree2D")
+        for r72_node, r72_pin in ((r72_one_d, "执行"), (r72_two_d, "执行")):
+            r72_tree.links.new(r72_ready.outputs.get("执行"),
+                               r72_node.inputs.get(r72_pin))
+
+        class _R72Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r72_draw_error = ""
+        for r72_card in (r72_one_d, r72_two_d):
+            try:
+                r72_card.draw_buttons(bpy.context, _R72Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r72_draw_error = (f"{r72_card.bl_label}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("混合点:1D / 2D 两张卡片都画得完", not r72_draw_error,
+              r72_draw_error)
+
+        # 读一遍再写一遍 = 原样(界面写回用的就是这对函数)
+        r72_codegen = __import__(f"{module_name}.codegen",
+                                 fromlist=["format_blend_points"])
+        r72_text = "走:0|慢跑:1|冲刺:2"
+        check("混合点:1D 拼串和解析一致",
+              r72_codegen.format_blend_points(
+                  r72_codegen.parse_blend_points(r72_text)) == r72_text)
+        r72_text2 = "待机:0:0|前走:0:1|右走:1:0"
+        check("混合点:2D 拼串和解析一致",
+              r72_codegen.format_blend_points(
+                  r72_codegen.parse_blend_points_2d(r72_text2), dim=2)
+              == r72_text2)
+        bpy.data.node_groups.remove(r72_tree)
+    except Exception as exc:
+        check("第七十二轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

@@ -7,8 +7,8 @@ import sys
 import time
 
 import bpy
-from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
-                       StringProperty)
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
+                       FloatProperty, IntProperty, StringProperty)
 
 from . import (advisor, advisor_tools, asset_export, codegen, curve_assets,
                export_report, exporter, gk_log, node_groups, npr_preview,
@@ -1496,6 +1496,154 @@ class GK_OT_PickAnimName(bpy.types.Operator):
             op = self.layout.operator("gk.pick_anim_name", text=label)
             op.node_name = self.node_name
             op.choice = ident
+
+
+# ── 混合点编辑器(第七十二轮)────────────────────────────────────────
+# 『动画_混合树』/『动画_混合树2D』的『混合点』原来是**手打**字符串
+# (`走:0|跑:1` / `待机:0:0|前走:0:1`)。格式记不住、动画名还容易打错,而打错的
+# 表现只是"混不起来"(不报错)。这里给一个小对话框:**一行一个点**,
+# 动画名从**下拉**里挑。文本框仍然保留 —— 老 .blend 打开就是那个样子,
+# 想直接改也行。
+_BLEND_MAX_ROWS = 6
+
+
+def blend_anim_items(self=None, _context=None):
+    """下拉里的候选动画(★ 开头的是**这个物体自己的**)。
+
+    末一项永远是空的"不用" —— 想把哪一行去掉,把它选成这个就行。
+    """
+    items = [("", "— 不用 —", "这一行不算混合点")]
+    name = str(getattr(self, "group_target", "") or "")
+    target = bpy.data.objects.get(name) if name else None
+    try:
+        entries = node_lib.discover_actions(target)
+    except Exception:                                     # noqa: BLE001
+        entries = []
+    for ident, label, desc in entries:
+        items.append((str(ident), str(label), str(desc or "")))
+    return items
+
+
+class GK_BlendPointRow(bpy.types.PropertyGroup):
+    """混合点编辑器里的一行(动画名 + 位置;2D 用 X / Y)。"""
+
+    group_target: StringProperty(name="目标物体", default="")
+    anim: EnumProperty(name="动画", items=blend_anim_items)
+    pos: FloatProperty(name="位置", default=0.0)
+    x: FloatProperty(name="X", default=0.0)
+    y: FloatProperty(name="Y", default=0.0)
+
+
+class GK_OT_EditBlendPoints(bpy.types.Operator):
+    """混合点:一行一个,动画名从下拉里挑。
+
+    `mode` 由节点卡片上那个按钮传进来 —— "1D" 写回 `动画名:位置`,
+    "2D" 写回 `动画名:X:Y`。解析 / 拼串都走 codegen 里**同一个**解析器,
+    免得界面和导出两套规则对不上。
+    """
+
+    bl_idname = "gk.edit_blend_points"
+    bl_label = "编辑混合点"
+    bl_description = "一行一个混合点;动画名从下拉里挑,不用手打"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(name="节点", default="")
+    mode: StringProperty(name="模式", default="1D")
+    points: CollectionProperty(type=GK_BlendPointRow)
+
+    def _node(self, context):
+        tree = props.current_tree(context)
+        return tree.nodes.get(self.node_name) if tree is not None else None
+
+    def _target_name(self, node):
+        """拿它分析"哪些动作是这个物体的"(给下拉里的 ★ 用)。
+
+        节点上的『动画播放器』填了就优先用它;没填就退回**当前场景的
+        脚本挂载物体**(混合树一般就挂在角色身上)。都拿不到 = 列全部动作。
+        """
+        raw = str(getattr(node, "gk_player", "") or "").strip()
+        if raw and raw in bpy.data.objects:
+            return raw
+        try:
+            obj = exporter.script_target_object(bpy.context.scene)
+        except Exception:                                 # noqa: BLE001
+            obj = None
+        return getattr(obj, "name", "")
+
+    def invoke(self, context, _event):
+        node = self._node(context)
+        if node is None:
+            _report(self, "WARNING", "没找到节点(先选中它,再点这个按钮)")
+            return {"CANCELLED"}
+        target = self._target_name(node)
+        rows = self._parse(str(getattr(node, "gk_points", "") or ""))
+        self.points.clear()
+        for anim, x, y in rows:
+            row = self.points.add()
+            row.group_target = target
+            row.anim = anim
+            row.x = x
+            row.y = y
+            row.pos = x
+        # 多留一行空的当"再加一个"的入口(最多 6 行);至少两行,
+        # 免得用户看到一行的对话框不知道该往哪添。
+        if len(self.points) < 2:
+            while len(self.points) < 2:
+                row = self.points.add()
+                row.group_target = target
+        if len(self.points) < _BLEND_MAX_ROWS:
+            row = self.points.add()
+            row.group_target = target
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    # ---- 字符串 <-> 行(和导出用同一个解析器)--------------------------
+    def _parse(self, text):
+        if self.mode == "2D":
+            return [(name, x, y)
+                    for name, x, y in codegen.parse_blend_points_2d(text)]
+        return [(name, pos, 0.0)
+                for name, pos in codegen.parse_blend_points(text)]
+
+    def _build(self):
+        """行 -> 字符串。拼串规则和导出**同一份**(codegen.format_blend_points)。"""
+        if self.mode == "2D":
+            rows = [(str(row.anim or "").strip(), row.x, row.y)
+                    for row in self.points]
+            rows = [item for item in rows if item[0]]
+            return codegen.format_blend_points(rows, dim=2)
+        rows = [(str(row.anim or "").strip(), row.pos) for row in self.points]
+        rows = [item for item in rows if item[0]]
+        return codegen.format_blend_points(rows, dim=1)
+
+    def execute(self, context):
+        node = self._node(context)
+        if node is None or not hasattr(node, "gk_points"):
+            _report(self, "WARNING", "没找到目标节点,混合点没写进去")
+            return {"CANCELLED"}
+        text = self._build()
+        was = str(getattr(node, "gk_points", "") or "")
+        node.gk_points = text
+        if text != was:
+            _report(self, "INFO", f"混合点 -> {text or '(空)'}")
+        return {"FINISHED"}
+
+    def draw(self, context):
+        layout = self.layout
+        if self.mode == "2D":
+            layout.label(text="一行一个点:动画名 + X / Y(3 个以上才围得成面)")
+        else:
+            layout.label(text="一行一个点:动画名 + 位置(参数到多少时是这一段)")
+        for index, row in enumerate(self.points):
+            line = layout.row(align=True)
+            line.label(text=f"{index + 1}.")
+            line.prop(row, "anim", text="")
+            if self.mode == "2D":
+                line.prop(row, "x", text="X")
+                line.prop(row, "y", text="Y")
+            else:
+                line.prop(row, "pos", text="位置")
+        layout.label(text="选『— 不用 —』= 去掉这一行;只有填了动画的行才算数",
+                     icon="INFO")
 
 
 class GK_OT_PickAnimTree(bpy.types.Operator):
@@ -3643,6 +3791,11 @@ GK_CLASSES = (
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
     GK_OT_PickAnimName,
     GK_OT_PickAnimTree,
+    # 混合点编辑器(第七十二轮):一行一个点,动画名从下拉里挑。
+    # ⚠ 行 PropertyGroup 必须**排在算子前面**注册(算子的 CollectionProperty
+    #   指的就是它,反了 Blender 会报 "type not found")。
+    GK_BlendPointRow,
+    GK_OT_EditBlendPoints,
     # 界面设计图选择器(『界面_套用设计』用,第四十轮)
     GK_OT_PickUiDesign,
     # AI 图选择器(『AI_启用』用)+ AI 转场的『从』/『到』状态选择器(第四十一轮)

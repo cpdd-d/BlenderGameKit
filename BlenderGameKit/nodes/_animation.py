@@ -7,6 +7,21 @@
 from ._common import *  # noqa: F401,F403
 
 
+def edit_blend_points_row(layout, node, prop, mode="1D"):
+    """混合点那一行:**文本框** + 『挑动画…』按钮(第七十二轮)。
+
+    文本框保持老习惯(直接手打 `走:0|跑:1` 照样能用,老 .blend 打开就长这样);
+    按钮打开一个小对话框,一行一个混合点,**动画名从下拉里挑** ——
+    不用再手打,也就不会把动画名打错(打错只会得到"混合不起来")。
+    """
+    row = layout.row(align=True)
+    row.prop(node, prop, text="")
+    pick = row.operator("gk.edit_blend_points", text="", icon="PRESET")
+    pick.node_name = node.name
+    pick.mode = mode
+    return row
+
+
 
 # ==========================================================================
 # 动画
@@ -777,14 +792,72 @@ class GKNodeBlendTree(B.GKStatementNode):
          "(glTF 导进来的动画默认不循环,播一遍就停)"),
         ("gk_debug_print", "bool", False, "启动时打印",
          "勾上后建好混合树往 Godot 输出面板打一行"),
+        # 第七十二轮:挑动画时用它分析"哪些动作是这个物体的"(带 ★),
+        # 导出侧 `ctx.animation_player` 本来就读这个属性,留空 = 自动查找。
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
     )
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "gk_points", text="")
+        # 混合点:能手打,也能点按钮**挑动画**(第七十二轮)
+        edit_blend_points_row(layout, self, "gk_points", "1D")
         row = layout.row(align=True)
         row.prop(self, "gk_value", text="参数")
         row.prop(self, "gk_smooth", text="平滑")
         layout.prop(self, "gk_debug_print", text="启动时打印", toggle=True)
+        B.draw_target_picker(self, layout, "gk_player")
+
+
+@N
+class GKNodeBlendTree2D(B.GKStatementNode):
+    bl_idname = "GKNodeBlendTree2D"
+    bl_label = "动画_混合树2D"
+    bl_icon = "AUTOMERGE_ON"
+    gk_category = "动画"
+    gk_doc = ("两参数的**二维混合**(第七十二轮):走/跑 × 左/右、前后左右八个方向的"
+              "走跑过渡都靠它。\n"
+              "── 和『动画_混合树』(1D)的区别 ──\n"
+              "1D 只有一个参数(按速度混走↔跑);2D 用 **X / Y 两个参数**当平面"
+              "坐标,四个角各放一段动画,角色往哪边动就混哪边 —— "
+              "这就是 UE 里那个 `Blend Space 2D`。\n"
+              "── 怎么填 ──\n"
+              "『混合点』写成 `动画名:X:Y`,多个用 `|` 分隔,例如\n"
+              "  `待机:0:0|前走:0:1|后走:0:-1|左走:-1:0|右走:1:0`\n"
+              "(X 一般给左右、Y 一般给前后;和 1D 一样最多 6 个点)。\n"
+              "**至少 3 个点**才围得成面 —— 少于 3 个(或全在一条线上)"
+              "混出来会怪。\n"
+              "── 注意 ──\n"
+              "和 1D 一样会在物体上建一个 AnimationTree 并接管动画;"
+              "同一个播放器不要再用『动画_播放』/『动画_状态机』驱动。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "X", 0.0),
+        S.pin(FLOAT, "Y", 0.0),
+    )
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_points", "string", "待机:0:0|前走:0:1|左走:-1:0|右走:1:0",
+         "混合点",
+         "`动画名:X:Y`,多个用 | 分隔(最多 6 个;3 个以上才围得成面)"),
+        ("gk_x", "float", 0.0, "X", "『X』引脚没接线时用它(一般给左右)"),
+        ("gk_y", "float", 0.0, "Y", "『Y』引脚没接线时用它(一般给前后)"),
+        ("gk_smooth", "float", 0.0, "平滑秒数",
+         "0 = 参数一变立刻到;>0 = 慢慢混过去(避免抖)"),
+        ("gk_loop", "bool", True, "循环播放",
+         "把混合点里的动作设成循环(走路 / 跑步这类循环动作用它)"),
+        ("gk_debug_print", "bool", False, "启动时打印",
+         "勾上后建好混合树往 Godot 输出面板打一行"),
+        ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+    )
+
+    def draw_buttons(self, context, layout):
+        edit_blend_points_row(layout, self, "gk_points", "2D")
+        row = layout.row(align=True)
+        row.prop(self, "gk_x", text="X")
+        row.prop(self, "gk_y", text="Y")
+        row.prop(self, "gk_smooth", text="平滑")
+        layout.prop(self, "gk_debug_print", text="启动时打印", toggle=True)
+        B.draw_target_picker(self, layout, "gk_player")
 
 
 @N

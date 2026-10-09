@@ -15184,6 +15184,107 @@ class TestRound70ReadyAwaitOrder(Base):
         self.assert_indent_sane(code)
 
 
+class TestRound72BlendSpaces(Base):
+    """第七十二轮(G 组):2D 混合树 + 混合点解析。
+
+    『动画_混合树』(1D)按一个参数混走↔跑;2D 那版用 X / Y 两个参数当平面
+    坐标(UE 的 Blend Space 2D),八个方向的走跑过渡都靠它。
+    验收线两条:2D 生成的是 `AnimationNodeBlendSpace2D` + Vector2 参数,
+    而**只用 1D 的老图生成物一字不变**(所以 2D 的辅助函数是单独一份)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_parse_points_2d(self):
+        from BlenderGameKit import codegen
+        points = codegen.parse_blend_points_2d("待机:0:0|前走:0:1|右走:1:0")
+        self.assertEqual(points, [("待机", 0.0, 0.0), ("前走", 0.0, 1.0),
+                                  ("右走", 1.0, 0.0)])
+        # 坏数据不抛异常:Y 缺了当 0,位置缺了按序号补
+        loose = codegen.parse_blend_points_2d("甲|乙:2")
+        self.assertEqual(loose, [("甲", 0.0, 0.0), ("乙", 2.0, 0.0)])
+        self.assertEqual(codegen.parse_blend_points_2d(""), [])
+
+    def test_points_round_trip(self):
+        """对话框写回用的拼串,和解析**同一套规则**(不然界面一按就变形)。
+
+        界面(`gk.edit_blend_points`)读用 `parse_blend_points*`、写用
+        `format_blend_points` —— 这里锁住"读一遍再写一遍还是原样"。
+        """
+        from BlenderGameKit import codegen
+        one_d = "走:0|慢跑:1|冲刺:2"
+        self.assertEqual(
+            codegen.format_blend_points(
+                codegen.parse_blend_points(one_d), dim=1), one_d)
+        two_d = "待机:0:0|前走:0:1|右走:1:0"
+        self.assertEqual(
+            codegen.format_blend_points(
+                codegen.parse_blend_points_2d(two_d), dim=2), two_d)
+        # 整数位置别写成 0.0 —— 保持读起来干净
+        self.assertEqual(codegen.format_blend_points([("走", 0.0)], dim=1), "走:0")
+
+    def test_node_registered_with_two_axes(self):
+        cls = getattr(NN, "GKNodeBlendTree2D", None)
+        self.assertIsNotNone(cls, "『动画_混合树2D』没注册")
+        self.assertEqual(cls.bl_label, "动画_混合树2D")
+        self.assertEqual(cls.gk_category, "动画")
+        pins = [spec["name"] for spec in cls.gk_inputs]
+        self.assertIn("X", pins)
+        self.assertIn("Y", pins)
+
+    def test_generates_blend_space_2d(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree2D, "八向混合",
+                             gk_points="待机:0:0|前走:0:1|右走:1:0")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ensure_blend_tree_2d(", code)
+        self.assertIn("AnimationNodeBlendSpace2D.new()", code)
+        self.assertIn("space.add_blend_point(anim_node, Vector2(", code)
+        # 每帧推的是 Vector2(BlendSpace2D 的 blend_position 就是二维的)
+        self.assertIn('set("parameters/blend_position", Vector2(', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_two_points_warns(self):
+        """少于三个点围不成面 —— 要说得出话,而不是生成一棵怪树。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree2D, "两个点",
+                             gk_points="待机:0:0|前走:0:1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("至少" in w and "三个" in w for w in warnings), warnings)
+        self.assertNotIn("AnimationNodeBlendSpace2D", code)
+
+    def test_smooth_uses_vector_lerp(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree2D, "八向混合",
+                             gk_points="甲:0:0|乙:1:0|丙:0:1", gk_smooth=0.3)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".lerp(Vector2(", code)
+        self.assertIn("/ maxf(0.3, 0.0001)", code)
+
+    def test_1d_output_untouched(self):
+        """只用 1D 的老图:生成物里不许出现 2D 那份 helper / BlendSpace2D。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "走跑", gk_points="走:0|跑:1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ensure_blend_tree(self,", code)
+        self.assertNotIn("_gk_ensure_blend_tree_2d", code)
+        self.assertNotIn("AnimationNodeBlendSpace2D", code)
+        self.assertIn("AnimationNodeBlendSpace1D.new()", code)
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 

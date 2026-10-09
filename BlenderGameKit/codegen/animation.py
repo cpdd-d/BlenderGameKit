@@ -1106,6 +1106,113 @@ def _ensure_blend_tree_helper(ctx):
     return name
 
 
+def parse_blend_points_2d(text):
+    """把 `待机:0:0|前走:0:1` 解析成 [(动画名, x, y)](第七十二轮)。
+
+    和 1D 的 `名:位置` 只差"多一个数";解析不出来的照样跳过,不抛异常 ——
+    用户手打错一个字符不该让整个导出失败。
+    """
+    points = []
+    for chunk in str(text or "").split("|"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [piece.strip() for piece in chunk.split(":")]
+        name = parts[0]
+        if not name:
+            continue
+        values = []
+        for piece in parts[1:3]:
+            try:
+                values.append(float(piece))
+            except ValueError:
+                values.append(None)
+        # 补齐两位(`甲` 这种只写了名字的不能下标越界)
+        values = (values + [None, None])[:2]
+        if values[0] is None:
+            values[0] = float(len(points))
+        if values[1] is None:
+            values[1] = 0.0
+        points.append((name, values[0], values[1]))
+        if len(points) >= _BLEND_MAX_POINTS:
+            break
+    return points
+
+
+def format_blend_points(points, dim=1):
+    """把 [(名, 位置)] / [(名, x, y)] 拼回 `混合点` 字符串(第七十二轮)。
+
+    对话框(『挑动画…』)按这个写回节点;解析用上面那两个 —— 一进一出**同一套
+    规则**,免得界面和导出各说各话(界面用 :g 去掉多余小数位,读起来干净)。
+    """
+    chunks = []
+    for point in points:
+        if dim == 2:
+            name, x, y = point
+            chunks.append(f"{name}:{float(x):g}:{float(y):g}")
+        else:
+            name, pos = point
+            chunks.append(f"{name}:{float(pos):g}")
+        if len(chunks) >= _BLEND_MAX_POINTS:
+            break
+    return "|".join(chunks)
+
+
+def _ensure_blend_tree_2d_helper(ctx):
+    """确保"建 2D 混合树"的辅助函数已经生成,返回它的名字。
+
+    ⚠ **单独一份**,不跟 1D 那份合并:合并要改签名,而老图(只用了 1D)的
+      生成物必须一字不变 —— 这是本项目的验收线之一。
+    """
+    made = getattr(ctx, "_blend_2d_helper", None)
+    if made:
+        return made
+    name = "_gk_ensure_blend_tree_2d"
+    ctx._blend_2d_helper = name
+    ctx.extra_sections.append({
+        "signature": (f"func {name}(host: Node, player: Node, points: Array, "
+                      f"tree_name: String, loop: bool) -> AnimationTree:"),
+        "lines": [
+            "    if host == null:",
+            "        return null",
+            "    var existing: AnimationTree = host.get_node_or_null(tree_name)",
+            "    if existing != null:",
+            "        return existing",
+            "    if player == null or not (player is AnimationPlayer):",
+            '        push_warning("[GK] 混合树找不到 AnimationPlayer —— 混合不会生效")',
+            "        return null",
+            "    var player_ap := player as AnimationPlayer",
+            # 循环:和 1D 同一个坑(glTF 的动画默认 LOOP_NONE,播一遍就停在最后
+            # 一帧 -> "混合位置变了但姿势不动")
+            "    if loop:",
+            "        for entry in points:",
+            "            var anim: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "            if anim != null and anim.loop_mode == Animation.LOOP_NONE:",
+            "                anim.loop_mode = Animation.LOOP_LINEAR",
+            "    var tree := AnimationTree.new()",
+            "    tree.name = tree_name",
+            "    host.add_child(tree)",
+            # 顺序和 1D 那份一致:先把树挂进场景树,再往里放点 ——
+            # BlendSpace2D 放点时要做三角化,让树已经"在世"上最稳。
+            "    var space := AnimationNodeBlendSpace2D.new()",
+            "    for entry in points:",
+            "        var anim_node := AnimationNodeAnimation.new()",
+            "        anim_node.animation = StringName(entry[0])",
+            "        space.add_blend_point(anim_node, Vector2(float(entry[1]), "
+            "float(entry[2])))",
+            "    tree.tree_root = space",
+            "    tree.root_node = tree.get_path_to(host)",
+            "    tree.anim_player = tree.get_path_to(player)",
+            "    tree.active = true",
+            "    return tree",
+        ],
+        "empty_body": "    return null",
+        "separator": True,
+    })
+    return name
+
+
 @stmt_node("GKNodeBlendTree")
 def _stmt_blend_tree(ctx, node, indent):
     """『动画_混合树』:建 AnimationTree(在 _ready 里)+ 每帧推参数。"""
@@ -1152,12 +1259,85 @@ def _stmt_blend_tree(ctx, node, indent):
                                  f'{points_literal})')
 
 
+@stmt_node("GKNodeBlendTree2D")
+def _stmt_blend_tree_2d(ctx, node, indent):
+    """『动画_混合树2D』:建 AnimationNodeBlendSpace2D + 每帧推 Vector2 参数。
+
+    和 1D 那棵共用"每帧推参数"的下游(`ctx.anim_blend_trees` ->
+    `_emit_blend_update`),只是 spec 里多一个 `dim=2` 和 X / Y 两个参数。
+    """
+    points = parse_blend_points_2d(getattr(node, "gk_points", ""))
+    if len(points) < 3:
+        ctx.warn("『动画_混合树2D』至少要**三个**混合点才围得成面 —— "
+                 "『混合点』写成 `待机:0:0|前走:0:1|左走:-1:0|右走:1:0` 这样"
+                 "(只想按一个参数混走↔跑,用『动画_混合树』)")
+        return
+
+    helper = _ensure_blend_tree_2d_helper(ctx)
+    # 1D / 2D 一起数:一个物体上放多棵混合树时名字不能撞。
+    index = len(ctx.anim_blend_trees)
+    suffix = "" if index == 0 else f"_{index + 1}"
+    var_name = ctx.declare_var(f"blend_tree{suffix}", "AnimationTree")
+    tree_name = f"GKBlendTree{suffix}"
+
+    points_literal = "[" + ", ".join(
+        f"[{gd_string(name)}, {gd_number(x)}, {gd_number(y)}]"
+        for name, x, y in points) + "]"
+    player = ctx.animation_player(node)
+    loop = "true" if bool(getattr(node, "gk_loop", True)) else "false"
+    ctx.add_line(indent, f"if {var_name} == null:")
+    ctx.add_line(indent + 1, f"{var_name} = {helper}(self, {player}, "
+                             f"{points_literal}, {gd_string(tree_name)}, "
+                             f"{loop})")
+
+    def _axis(socket_name, prop, default):
+        socket = ctx._socket(node, socket_name)
+        if socket is not None and getattr(socket, "is_linked", False):
+            return ctx.expr_of(socket)
+        return gd_number(getattr(node, prop, default))
+
+    ctx.anim_blend_trees.append({
+        "node": node, "var": var_name, "dim": 2,
+        "param_x": _axis("X", "gk_x", 0.0),
+        "param_y": _axis("Y", "gk_y", 0.0),
+        "smooth": gd_number(getattr(node, "gk_smooth", 0.0)),
+        "debug": bool(getattr(node, "gk_debug_print", False)),
+        "names": [name for name, _x, _y in points],
+    })
+    ctx.need_anim_tree_process = True
+
+    if bool(getattr(node, "gk_debug_print", False)):
+        ctx.add_line(indent, f"if {var_name} != null:")
+        ctx.add_line(indent + 1, f'print("[GK 混合树2D] 已建 ", '
+                                 f'{gd_string(tree_name)}, " 混合点 ", '
+                                 f'{points_literal})')
+
+
 def _emit_blend_update(ctx, indent, spec):
     """每物理帧把参数推给 blend_position(由 generator 在物理帧段调用)。"""
     var_name = spec["var"]
-    param = spec["param"]
     smooth = spec["smooth"]
     ctx.add_line(indent, f"if {var_name} != null:")
+    if spec.get("dim") == 2:
+        # 2D 的 blend_position 是 **Vector2** —— lerpf 只认标量,得用 Vector2.lerp
+        param = f"Vector2({spec['param_x']}, {spec['param_y']})"
+        if smooth not in ("0.0", "0"):
+            dt = ctx.new_temp("bt_dt")
+            now = ctx.new_temp("bt_now")
+            ctx.add_line(indent + 1,
+                         f"var {dt} := get_physics_process_delta_time()")
+            ctx.add_line(indent + 1,
+                         f"var {now}: Vector2 = "
+                         f'{var_name}.get("parameters/blend_position")')
+            ctx.add_line(indent + 1,
+                         f'{var_name}.set("parameters/blend_position", '
+                         f"{now}.lerp({param}, "
+                         f'clampf({dt} / maxf({smooth}, 0.0001), 0.0, 1.0)))')
+        else:
+            ctx.add_line(indent + 1,
+                         f'{var_name}.set("parameters/blend_position", {param})')
+        return
+    param = spec["param"]
     if smooth not in ("0.0", "0"):
         dt = ctx.new_temp("bt_dt")
         ctx.add_line(indent + 1, f"var {dt} := get_physics_process_delta_time()")
