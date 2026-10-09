@@ -3435,6 +3435,60 @@ def main():
         check("第六十九轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 紧张度『被看见』(第七十轮)----
+    # 『氛围_紧张度』多了『被看见』(布尔) + 『被看见下限』:被盯上时把紧张度
+    # 至少抬到下限。真 Blender 里验:引脚 / 属性都在、勾上真出 maxf 兜底、
+    # 不勾时和以前一样(不多一个字符)、卡片画得完。
+    try:
+        r70_tree = bpy.data.node_groups.new("紧张度冒烟70", "GKGameLogicTree")
+        r70_phys = r70_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r70_heart = r70_tree.nodes.new("GKNodeHeartbeat")
+        r70_tense = r70_tree.nodes.new("GKNodeTension")
+        r70_tense.gk_threat = "冒烟怪"
+        r70_tree.links.new(r70_phys.outputs["执行"], r70_heart.inputs["执行"])
+        r70_tree.links.new(r70_tense.outputs["紧张度"],
+                           r70_heart.inputs["紧张度"])
+
+        r70_ins = [spec["name"] for spec in r70_tense.gk_inputs]
+        check("紧张度:多了『被看见』输入引脚", "被看见" in r70_ins, str(r70_ins))
+        check("紧张度:『被看见下限』默认 0.8",
+              hasattr(r70_tense, "gk_seen_floor")
+              and abs(float(r70_tense.gk_seen_floor) - 0.8) < 0.001,
+              str(getattr(r70_tense, "gk_seen_floor", None)))
+
+        r70_options = {"dimension": "3", "base_class": "CharacterBody3D"}
+        r70_off, _r70_warn = codegen.generate(r70_tree, r70_options)
+        check("紧张度:没勾『被看见』= 老行为(没有 maxf 兜底)",
+              "maxf(clampf(" not in r70_off)
+
+        r70_tense.inputs.get("被看见").default_value = True
+        r70_on, r70_on_warn = codegen.generate(r70_tree, r70_options)
+        check("紧张度:勾上『被看见』-> 和下限取大",
+              "maxf(clampf(" in r70_on and "0.8" in r70_on,
+              r70_on[-400:])
+        check("紧张度:勾上后生成无告警", not r70_on_warn, str(r70_on_warn)[:200])
+
+        class _R70Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r70_draw_error = ""
+        try:
+            r70_tense.draw_buttons(bpy.context, _R70Layout())
+        except Exception as exc:                          # noqa: BLE001
+            r70_draw_error = f"{type(exc).__name__}: {exc}"
+        check("紧张度:卡片能画完", not r70_draw_error, r70_draw_error)
+
+        bpy.data.node_groups.remove(r70_tree)
+    except Exception as exc:
+        check("第七十轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

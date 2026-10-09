@@ -1,23 +1,25 @@
-"""恐怖示例的自动检查(第五十九轮单场景 -> 第六十轮拆成三关)。
+"""恐怖示例的自动检查(第五十九轮单场景 -> 六十轮拆三关 -> 七十轮补标题页)。
 
 用法:
     python scripts\\check_horror_demo.py
     python scripts\\check_horror_demo.py --godot "D:\\godot\\Godot_v4.7.2-stable_win64_console.exe"
 
-── 怎么测三关(而不是一关)────────────────────────────────────
-一关一张 `.tscn`。**不能**在一个探针里真的走"切关卡" —— Godot 的
+── 怎么测四幕(而不是一幕)────────────────────────────────────
+一幕一张 `.tscn`。**不能**在一个探针里真的走"切关卡" —— Godot 的
 `change_scene_to_file` 会把当前场景整棵换掉,探针(挂在当前场景下)会
-一起被释放,后面的断言就没机会跑。所以拆成**三个探针**,各自把对应那关的
+一起被释放,后面的断言就没机会跑。所以拆成**四个探针**,各自把对应那幕的
 `.tscn` 当成子节点加载进来驱动:
 
-  1. 教室:拾 3 张纸条 -> `纸条数` = 3;场景里月光 / 台灯 / 去走廊 都在;
+  0. 标题:加载后屏幕上出现标题字 + 『开始游戏』按钮(UI 真建起来了);
+  1. 教室:**开场曲线运镜真的在飞**(相机位置在动)、拾 3 张纸条 -> `纸条数` = 3;
   2. 走廊:AI 在巡逻、紧张度远低近高 + 心跳建起来、走过惊吓区 ->
      相机在震 + Master 被压低;
   3. 楼梯间:**先写一份"纸条数 = 3"的存档**(模拟第一关存过),再走到门口
      -> 弹出结局选择 -> 按 2 -> `结局` = 2 且真的落盘。
 
-另外还会查三个脚本里的**跨关证据**:教室有 `change_scene_to_file` +
-`走廊.tscn`、走廊有 `楼梯间.tscn`、楼梯间有读档 + `>= 3` 的门槛。
+另外还会查脚本里的**跨幕证据**:标题有 `change_scene_to_file` + `教室.tscn`,
+教室有运镜曲线(`_gk_cam_fly_curve`)+ 切走廊,走廊切楼梯间,楼梯间有读档 +
+`>= 3` 的门槛 + 演完切回标题。主场景必须是**标题页**(按 F5 先看到标题)。
 """
 
 import argparse
@@ -33,6 +35,7 @@ SRC = os.path.join(ROOT, "examples", "demo_horror", "恐怖示例_godot")
 OUT = os.path.join(ROOT, "_dist", "horror_probe")
 GODOT_DEFAULT = r"D:\godot\Godot_v4.7.2-stable_win64_console.exe"
 
+TITLE_SCENE = "res://scenes/标题.tscn"
 ROOM_SCENE = "res://scenes/教室.tscn"
 CORRIDOR_SCENE = "res://scenes/走廊.tscn"
 STAIRS_SCENE = "res://scenes/楼梯间.tscn"
@@ -97,11 +100,47 @@ func _send_key(code: int, pressed: bool) -> void:
 	Input.parse_input_event(event)
 '''
 
+PROBE_TITLE = PROBE_HEAD + '''
+
+var labels := 0
+var buttons := 0
+
+
+func _count_ui(node: Node) -> void:
+	for child in node.get_children():
+		if child is Label:
+			labels += 1
+		if child is Button:
+			buttons += 1
+		_count_ui(child)
+
+
+func _ready() -> void:
+	_boot("%(title)s", "标题管理", "")
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	if phase == 0 and elapsed >= 0.3:
+		phase = 1
+		_count_ui(world)
+		print("HORROR_TITLE_UI labels=", labels, " buttons=", buttons,
+			" cam=", world.find_child("标题机位", true, false) != null)
+		print("HORROR_TITLE_DONE")
+		set_physics_process(false)
+		get_tree().quit()
+''' % {"title": TITLE_SCENE}
+
 PROBE_ROOM = PROBE_HEAD + '''
+
+var cam: Node = null
+var cam_start := Vector3.ZERO
+
 
 func _ready() -> void:
 	_boot("%(room)s", "教室玩家", "")
 	_find_areas(["纸条1", "纸条2", "纸条3", "去走廊"])
+	cam = world.find_child("教室特写", true, false)
 
 
 func _physics_process(delta: float) -> void:
@@ -110,12 +149,18 @@ func _physics_process(delta: float) -> void:
 		0:
 			if elapsed >= 0.2:
 				phase = 1
+				if cam != null:
+					cam_start = cam.global_position
 				print("HORROR_ROOM_START player=", player != null,
-					" spots=", spots.size())
+					" spots=", spots.size(), " cam=", cam != null)
 				_put_at("纸条1")
 		1:
 			if elapsed >= 0.8:
 				phase = 2
+				var flew := 0.0
+				if cam != null:
+					flew = cam.global_position.distance_to(cam_start)
+				print("HORROR_ROOM_OPENING flew=", snappedf(flew, 0.01))
 				_put_at("纸条2")
 		2:
 			if elapsed >= 1.4:
@@ -286,11 +331,21 @@ def _errors(text, problems):
 
 def _code_checks(problems):
     checks = {
+        "scripts/game_logic_标题.gd": (
+            ("change_scene_to_file", "标题切关卡的调用"),
+            ("res://scenes/教室.tscn", "标题切到教室的路径"),
+            ("Button.new()", "『开始游戏』按钮"),
+            ("Label.new()", "标题文字"),
+        ),
         "scripts/game_logic_教室.gd": (
             ("change_scene_to_file", "教室切关卡的调用"),
             ("res://scenes/走廊.tscn", "教室切到走廊的路径"),
             ("_gk_write_save(", "教室把纸条数落盘"),
             ('_gk_save_data["纸条数"]', "纸条数写进存档"),
+            # 开场曲线运镜(第七十轮):曲线采样成 Curve3D 资源,相机沿它飞
+            ("_gk_cam_fly_curve", "开场运镜的曲线轨道"),
+            ("res://curves/", "运镜曲线资源(res://curves/)"),
+            ("_gk_curve3d_load(", "曲线加载助手"),
         ),
         "scripts/game_logic_走廊.gd": (
             ("change_scene_to_file", "走廊切关卡的调用"),
@@ -310,6 +365,8 @@ def _code_checks(problems):
             ("match _gk_choice_picked:", "结局选择的分支 match"),
             ("gk_choice_input_event(event)", "数字键 1~6 也能选"),
             ("_gk_write_save(", "结局落盘"),
+            ("res://scenes/标题.tscn", "演完切回标题页"),
+            ("await", "结局停留(等待_秒)"),
         ),
     }
     for name, needles in checks.items():
@@ -333,6 +390,11 @@ def _code_checks(problems):
 
 def _scene_checks(problems):
     checks = {
+        "scenes/标题.tscn": (
+            ('name="标题管理"', "标题管理(挂脚本)"),
+            # 相机在 glb 里(glTF 带相机),.tscn 只记"当前机位叫什么"
+            ('camera_name = "标题机位"', "标题机位"),
+        ),
         "scenes/教室.tscn": (
             ('name="纸条1"', "纸条1"),
             ('name="纸条3"', "纸条3"),
@@ -370,8 +432,8 @@ def _main_scene_check(problems):
     path = os.path.join(SRC, "project.godot")
     with open(path, "r", encoding="utf-8") as handle:
         text = handle.read()
-    if 'run/main_scene="res://scenes/教室.tscn"' not in text:
-        problems.append("主场景不是教室(按 F5 进不去第一关)")
+    if 'run/main_scene="res://scenes/标题.tscn"' not in text:
+        problems.append("主场景不是标题页(按 F5 应该先看到标题 + 开始按钮)")
 
 
 def main():
@@ -384,12 +446,35 @@ def main():
 
     problems = []
 
+    # ── 第零幕 标题页 ───────────────────────────────────────────────
+    title = _run_probe(args.godot, "probe_title", PROBE_TITLE,
+                       "HorrorTitleProbe", 300)
+    _errors(title, problems)
+    title_ui = re.search(r"HORROR_TITLE_UI labels=(\d+) buttons=(\d+) cam=(\w+)",
+                         title)
+    if not title_ui:
+        problems.append("标题页 UI 没跑出来: "
+                        + _grab(title, r"HORROR_TITLE_UI[^\n]*"))
+    else:
+        if int(title_ui.group(1)) < 2:
+            problems.append("标题页没出现文字标签: " + title_ui.group(0))
+        if int(title_ui.group(2)) < 1:
+            problems.append("标题页没出现『开始游戏』按钮: " + title_ui.group(0))
+        if title_ui.group(3) != "true":
+            problems.append("标题页没有相机: " + title_ui.group(0))
+    if "HORROR_TITLE_DONE" not in title:
+        problems.append("标题页探针没跑完")
+
     # ── 第一关 教室 ─────────────────────────────────────────────────
     room = _run_probe(args.godot, "probe_room", PROBE_ROOM, "HorrorRoomProbe", 900)
     _errors(room, problems)
-    if not re.search(r"HORROR_ROOM_START player=true spots=4", room):
-        problems.append("教室开场不对(玩家 / 4 个触发区没找齐): "
+    if not re.search(r"HORROR_ROOM_START player=true spots=4 cam=true", room):
+        problems.append("教室开场不对(玩家 / 4 个触发区 / 特写机位没找齐): "
                         + _grab(room, r"HORROR_ROOM_START[^\n]*"))
+    flew = re.search(r"HORROR_ROOM_OPENING flew=([\d.]+)", room)
+    if not flew or float(flew.group(1)) < 2.0:
+        problems.append("开场曲线运镜没在飞(相机没动): "
+                        + _grab(room, r"HORROR_ROOM_OPENING[^\n]*"))
     notes = re.search(r"HORROR_ROOM_NOTES count=([\d.]+)", room)
     if not notes or float(notes.group(1)) < 2.5:
         problems.append("教室拾 3 张纸条后『纸条数』不是 3: "

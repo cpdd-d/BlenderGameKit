@@ -1170,11 +1170,16 @@ class GKNodeTension(B.GKExpressionNode):
               "『屏幕_暗角』的强度 / 『屏幕_滤镜』,让画面随危险压暗。\n"
               "── 它是纯计算 ──\n"
               "每帧读它 = 当前瞬间的紧张度(**不平滑**);平滑在"
-              "『氛围_心跳』内部做,这样一张图里只在需要的地方平滑一次。")
+              "『氛围_心跳』内部做,这样一张图里只在需要的地方平滑一次。\n"
+              "── 被看见时更紧张(第七十轮)──\n"
+              "『被看见』接一个布尔(比如『AI_输出』的 `is_chasing` 或"
+              "『逻辑_比较』的结果);它为真时紧张度**至少抬到『被看见下限』**"
+              "—— 被盯上比单纯『离得近』更慌。不接、不勾 = 只看距离(老行为)。")
     gk_inputs = (
         S.pin(OBJECT, "威胁", None),
         S.pin(FLOAT, "近距", 3.0),
         S.pin(FLOAT, "远距", 15.0),
+        S.pin(BOOL, "被看见", False),
     )
     gk_input_props = {"近距": "gk_near", "远距": "gk_far"}
     gk_outputs = (S.pin(FLOAT, "紧张度", 0.0),)
@@ -1183,6 +1188,8 @@ class GKNodeTension(B.GKExpressionNode):
          "离谁越近越紧张(一般选那只怪;『威胁』引脚没接线时用它)"),
         ("gk_near", "float", 3.0, "近距", "这个距离以内 = 紧张度 1"),
         ("gk_far", "float", 15.0, "远距", "这个距离以外 = 紧张度 0"),
+        ("gk_seen_floor", "float", 0.8, "被看见下限",
+         "『被看见』为真时,紧张度至少抬到这么多(0 = 不用这个功能)"),
     )
 
 
@@ -1190,6 +1197,7 @@ class GKNodeTension(B.GKExpressionNode):
         row = layout.row(align=True)
         row.prop(self, "gk_near", text="")
         row.prop(self, "gk_far", text="")
+        layout.prop(self, "gk_seen_floor", text="被看见下限")
         B.draw_target_picker(self, layout, "gk_threat")
 
 

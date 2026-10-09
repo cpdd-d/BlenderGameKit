@@ -169,6 +169,7 @@ def _expr_tension(ctx, node):
     """
     from .expressions import ensure_position_helper
     socket = ctx._socket(node, "威胁")
+    base = None
     if socket is not None and getattr(socket, "is_linked", False):
         threat = ctx.expr_of(socket)
     else:
@@ -176,14 +177,43 @@ def _expr_tension(ctx, node):
         if not raw or raw == TARGET_SELF:
             ctx.warn("『氛围_紧张度』没有指定『威胁』—— 它永远返回 0"
                      "(请在卡片里选一个『威胁』物体,或把引脚接上)")
-            return "0.0"
-        threat = ctx.target_expr(node, "gk_threat", hint="威胁")
-    reader = ensure_position_helper(ctx)
-    near = ctx.input_number(node, "近距", gd_number(getattr(node, "gk_near", 3.0)))
-    far = ctx.input_number(node, "远距", gd_number(getattr(node, "gk_far", 15.0)))
-    dist = f"({reader}({threat}) - {reader}(self)).length()"
-    return (f"clampf((({far}) - {dist}) / "
-            f"maxf(({far}) - ({near}), 0.0001), 0.0, 1.0)")
+            base = "0.0"
+        else:
+            threat = ctx.target_expr(node, "gk_threat", hint="威胁")
+    if base is None:
+        reader = ensure_position_helper(ctx)
+        near = ctx.input_number(node, "近距", gd_number(getattr(node, "gk_near", 3.0)))
+        far = ctx.input_number(node, "远距", gd_number(getattr(node, "gk_far", 15.0)))
+        dist = f"({reader}({threat}) - {reader}(self)).length()"
+        base = (f"clampf((({far}) - {dist}) / "
+                f"maxf(({far}) - ({near}), 0.0001), 0.0, 1.0)")
+    return _apply_seen_floor(ctx, node, base)
+
+
+def _apply_seen_floor(ctx, node, base):
+    """把『被看见』/『被看见下限』套到紧张度表达式上(第七十轮)。
+
+    『被看见』为真时,紧张度**至少抬到下限** —— 被盯上比单纯"离得近"更慌。
+
+    ── 三种情形 ────────────────────────────────────────────────────
+      * 没接引脚、也没勾(默认 false)-> **原样返回**,老图生成物一个字不变;
+      * 勾上了(固定 true)-> `maxf(base, 下限)`(不需要三元);
+      * 接了引脚 -> `maxf(base, 下限 if 被看见 else 0.0)`(没被看见就退回距离)。
+
+    『被看见下限』填 0 = 不用这个功能(同样原样返回)。
+    """
+    try:
+        floor = float(getattr(node, "gk_seen_floor", 0.8))
+    except (TypeError, ValueError):
+        floor = 0.8
+    if floor <= 0.0:
+        return base
+    seen = ctx.input_bool_expr(node, "被看见", "false")
+    if seen == "false":
+        return base
+    if seen == "true":
+        return f"maxf({base}, {gd_number(floor)})"
+    return f"maxf({base}, ({gd_number(floor)}) if {seen} else 0.0)"
 
 
 @stmt_node("GKNodeHeartbeat")

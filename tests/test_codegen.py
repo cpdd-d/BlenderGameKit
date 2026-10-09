@@ -14997,5 +14997,85 @@ class TestRound69AiNodes(Base):
         self.assertEqual([w for w in warnings if "AI_开始" in w], [], warnings)
 
 
+class TestRound70TensionSeen(Base):
+    """第七十轮(阶段④/⑤ 收尾)①:紧张度支持"被看见时更紧张"。
+
+    『氛围_紧张度』原来只按"离威胁的距离"算;恐怖游戏里"被它看见了"比
+    "离得近"更慌。加一个可选输入『被看见』(布尔)和『被看见下限』:
+    为真时紧张度**至少抬到下限**(其余仍按距离)。不接引脚、也没勾 = 老行为
+    一个字都不变。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _heart(self, tree):
+        event = self._ready(tree)
+        heart = tree.new_node(NN.GKNodeHeartbeat, "心跳")
+        gk_stub.connect(tree, event, "执行", heart, "执行")
+        return heart
+
+    def test_seen_pin_and_floor_exist(self):
+        ins = [spec["name"] for spec in NN.GKNodeTension.gk_inputs]
+        self.assertIn("被看见", ins)
+        props = {entry[0]: entry for entry in NN.GKNodeTension.gk_prop_defs}
+        self.assertIn("gk_seen_floor", props)
+        self.assertEqual(props["gk_seen_floor"][2], 0.8)
+
+    def test_seen_linked_picks_the_higher_of_distance_and_floor(self):
+        tree = make_tree()
+        heart = self._heart(tree)
+        tension = tree.new_node(NN.GKNodeTension, "紧张", gk_threat="怪物",
+                                gk_near=3.0, gk_far=15.0, gk_seen_floor=0.8)
+        spotted = tree.new_node(NN.GKNodeCompare, "被发现了吗")
+        gk_stub.connect(tree, spotted, "结果", tension, "被看见")
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 距离算出来的值再和下限取大(下限随『被看见』这个布尔现算)
+        self.assertIn("maxf(clampf(", code)
+        self.assertIn("0.8", code)
+        self.assertIn(" else 0.0", code)      # 三元:看见才抬到下限
+        self.assert_indent_sane(code)
+
+    def test_seen_toggled_on_socket_uses_floor(self):
+        tree = make_tree()
+        heart = self._heart(tree)
+        tension = tree.new_node(NN.GKNodeTension, "紧张", gk_threat="怪物",
+                                gk_seen_floor=0.9)
+        tension.inputs.get("被看见").default_value = True
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("maxf(clampf(", code)
+        self.assertIn("0.9", code)
+        self.assertNotIn(" else 0.0", code)   # 固定下限,不需要三元
+
+    def test_floor_zero_is_ignored(self):
+        """下限填 0 = 不用这个功能 —— 生成物回到纯距离那一版。"""
+        tree = make_tree()
+        heart = self._heart(tree)
+        tension = tree.new_node(NN.GKNodeTension, "紧张", gk_threat="怪物",
+                                gk_seen_floor=0.0)
+        tension.inputs.get("被看见").default_value = True
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, _warnings = gen(tree, V3)
+        self.assertNotIn("maxf(clampf(", code)
+        self.assertIn("_gk_heart_tension += (clampf(", code)
+
+    def test_seen_off_keeps_old_output(self):
+        """没接『被看见』、也没勾 -> 生成物和以前一模一样,不多一个字符。"""
+        tree = make_tree()
+        heart = self._heart(tree)
+        tension = tree.new_node(NN.GKNodeTension, "紧张", gk_threat="怪物",
+                                gk_near=3.0, gk_far=15.0)
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_heart_tension += (clampf(", code)
+        self.assertNotIn("maxf(clampf(", code)
+        self.assertNotIn(" else 0.0", code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

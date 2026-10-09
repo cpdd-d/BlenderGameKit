@@ -1,30 +1,29 @@
-"""恐怖示例(第五十九 / 六十轮:阶段④⑤)—— 熄灯的教学楼(三关短篇)。
-
+"""恐怖示例(第五十九 / 六十 / 七十轮:阶段④⑤)—— 熄灯的教学楼(短篇)。
 用法:
     blender -b --python scripts\\make_horror_demo.py
 产出:
-    examples/demo_horror/恐怖示例.blend          (一个 .blend,**三个 Blender 场景**)
+    examples/demo_horror/恐怖示例.blend          (一个 .blend,**四个 Blender 场景**)
     examples/demo_horror/恐怖示例_godot/         (可用 Godot 直接打开;每关一张 .tscn)
 
-── 三关怎么来的(第六十轮)──────────────────────────────────────
-第五十九轮先做成**单场景**;这一轮按蓝图拆成三关 —— 在 Blender 里
-"一关 = 一个场景",每个场景用场景设置里的 `logic_tree` 指到自己的
-『游戏逻辑』图,`asset_export.export_all_scenes()` 就会一关导一张 .tscn,
-关底用『场景_切换关卡』切过去。
+── 四关(第六十轮拆三关 + 第七十轮补标题页)────────────────────────
+在 Blender 里"一关 = 一个场景",每个场景用场景设置里的 `logic_tree` 指到
+自己的『游戏逻辑』图,`asset_export.export_all_scenes()` 就会一关导一张
+.tscn,关底用『场景_切换关卡』切过去。
 
-| 关 | Blender 场景 | 内容 | 用到的 |
+| 幕 | Blender 场景 | 内容 | 用到的 |
 |---|---|---|---|
-| 1 | 教室 | 月光(平行光淡)+ 台灯(点光)、3 张纸条、门口通往走廊 | 灯光 / 触发区 / 变量 / 存档 / 切关卡 |
+| 0 | 标题 | 标题 + 『开始游戏』按钮 | 界面_文本 / 界面_按钮 / 切关卡 |
+| 1 | 教室 | **开场俯冲曲线运镜** + 月光/台灯、3 张纸条、门口通往走廊 | 相机_切换(沿曲线)/ 灯光 / 触发区 / 存档 |
 | 2 | 走廊 | 手电筒(聚光跟相机)、雾、**巡逻怪物(会听动静)**、惊吓区 | 听觉 AI / 心跳紧张度 / 惊吓三连 / 总线音量 |
-| 3 | 楼梯间 | 门口 + 结局分支(回头救同学 / 独自逃出)+ 存档 | 对话_选择 / 存档 / 比较分支 |
+| 3 | 楼梯间 | 门口 + 结局分支 + 存档,**演完回标题** | 对话_选择 / 存档 / 比较分支 |
 
 **跨关的数据**(纸条数)走**存档**:教室拾满时 `存档_保存` 落盘,
 楼梯间开局 `存档_载入` + `存档_读取到变量` 读回来,门口按时判"够不够 3 张"。
 
-按键:WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 / Tab 上帝机 /
-**按住 K 弄出动静** / 门口按 **1 或 2** 选结局。
+按键:标题页点『开始游戏』/ 游戏里 WASD 移动 / 空格 跳 / 鼠标转视角 /
+C·V 切机位 / Tab 上帝机 / **按住 K 弄出动静** / 门口按 **1 或 2** 选结局。
 
-跑法(Godot):打开 `恐怖示例_godot` 直接 F5。
+跑法(Godot):打开 `恐怖示例_godot` 直接 F5(主场景是标题页)。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_horror_demo.py`
 """
 
@@ -44,11 +43,15 @@ if ROOT not in sys.path:
 OUT_DIR = os.path.join(ROOT, "examples", "demo_horror")
 BLEND_PATH = os.path.join(OUT_DIR, "恐怖示例.blend")
 
-# ── 三关(Blender 场景名 = 导出的 .tscn 名)──────────────────────────
+# ── 四关(Blender 场景名 = 导出的 .tscn 名)──────────────────────────
+# 第七十轮加了**标题页**:开局进标题,点『开始游戏』进教室;两个结局演完
+# 都回标题(一段可循环的短篇)。
+TITLE = "标题"
 ROOM = "教室"
 CORRIDOR = "走廊"
 STAIRS = "楼梯间"
 
+TITLE_RES = "res://scenes/标题.tscn"
 ROOM_RES = "res://scenes/教室.tscn"
 CORRIDOR_RES = "res://scenes/走廊.tscn"
 STAIRS_RES = "res://scenes/楼梯间.tscn"
@@ -63,6 +66,18 @@ PATROL_A = "巡逻点甲"
 PATROL_B = "巡逻点乙"
 TORCH = "手电筒"
 AI_TREE_NAME = "怪物AI"
+
+# 开场运镜(第七十轮):一条 3D 曲线当轨道 + 一台门口特写机位。
+# 相机从『教室机位』起飞,鼓个弯越过课桌,**俯冲**到门口特写。
+ROOM_TRACK = "教室运镜轨道"
+ROOM_CLOSE = "教室特写"
+ROOM_CLOSE_POS = (0.0, -12.0, 3.2)
+ROOM_TRACK_POINTS = [
+    (0.0, -15.0, 5.5),     # 贴着『教室机位』(起点)
+    (5.0, -8.0, 12.0),     # 升起来
+    (-4.0, 1.0, 9.0),      # 越过课桌(侧面鼓出去,一眼看出是曲线)
+    ROOM_CLOSE_POS,        # 俯冲到门口特写(终点)
+]
 
 NOTE_GOAL = 3
 SIGHT = 9.0
@@ -97,7 +112,7 @@ def log(message):
 def clear_all():
     """清空所有数据块,**不能用 `read_factory_settings`**(会把插件一起卸载)。
 
-    清完把唯一剩下的场景命名为『教室』(另外两关在后面新建)。
+    清完把唯一剩下的场景命名为『教室』(另外几关在后面新建)。
     """
     for obj in list(bpy.data.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
@@ -105,6 +120,8 @@ def clear_all():
         bpy.data.node_groups.remove(group)
     for action in list(bpy.data.actions):
         bpy.data.actions.remove(action)
+    for curve in list(bpy.data.curves):
+        bpy.data.curves.remove(curve)
     for mesh in list(bpy.data.meshes):
         bpy.data.meshes.remove(mesh)
     for scene in list(bpy.data.scenes)[1:]:
@@ -149,6 +166,24 @@ def make_camera(name, location, rotation, scene, lens=50.0):
     camera.location = location
     camera.rotation_euler = rotation
     return camera
+
+
+def make_curve(name, points, scene):
+    """一条贝塞尔曲线(自动手柄)—— 当运镜轨道用(『相机_切换』的 CURVE 模式)。
+
+    导出时会被采样成 Godot 的 `Curve3D` 资源(curves/*.tres),相机沿它飞。
+    """
+    data = bpy.data.curves.new(f"{name}数据", type="CURVE")
+    data.dimensions = "3D"
+    spline = data.splines.new("BEZIER")
+    spline.bezier_points.add(len(points) - 1)
+    for handle, co in zip(spline.bezier_points, points):
+        handle.co = co
+        handle.handle_left_type = "AUTO"
+        handle.handle_right_type = "AUTO"
+    obj = bpy.data.objects.new(name, data)
+    scene.collection.objects.link(obj)
+    return obj
 
 
 def make_light(name, kind, location, energy, color, scene,
@@ -224,6 +259,21 @@ ENV_STAIRS = (
     ("env_glow_bloom", 0.25),
     ("env_tonemap", "ACES"),
 )
+# 标题页:几乎全黑(只有 UI 亮着),一点雾把背景压住
+ENV_TITLE = (
+    ("env_enabled", True),
+    ("env_background", "COLOR"),
+    ("env_bg_color", (0.01, 0.01, 0.02, 1.0)),
+    ("env_ambient_color", (0.30, 0.34, 0.50, 1.0)),
+    ("env_ambient_energy", 0.10),
+    ("env_fog", True),
+    ("env_fog_color", (0.10, 0.11, 0.18, 1.0)),
+    ("env_fog_density", 0.03),
+    ("env_glow", True),
+    ("env_glow_intensity", 0.8),
+    ("env_glow_bloom", 0.2),
+    ("env_tonemap", "ACES"),
+)
 
 
 # ==========================================================================
@@ -255,6 +305,10 @@ def build_room(scene):
                        (math.radians(72.0), 0.0, 0.0), scene)
     make_camera("教室俯瞰", (0.0, -6.0, 18.0), (math.radians(22.0), 0.0, 0.0),
                 scene)
+    # 开场运镜的落点(门口特写)+ 轨道曲线(相机沿它从『教室机位』俯冲过来)
+    make_camera(ROOM_CLOSE, ROOM_CLOSE_POS,
+                (math.radians(74.0), 0.0, 0.0), scene)
+    make_curve(ROOM_TRACK, ROOM_TRACK_POINTS, scene)
     scene.camera = side
     make_light("月光", "SUN", (5.0, -5.0, 10.0), 1.4, (0.65, 0.72, 0.95),
                scene, rotation=(math.radians(52.0), 0.0, math.radians(28.0)),
@@ -325,6 +379,30 @@ def build_stairs():
                scene, cutoff=12.0)
     log(f"{STAIRS}:地面 + 4 级台阶 + 玩家 + {DOOR_AREA} + 楼梯间灯 + 两台相机")
     return scene, player
+
+
+def build_title():
+    """第零幕 标题页:一块"看不见的管理器"(挂脚本)+ 地面 + 相机 + 灯。
+
+    ⚠ 『脚本挂载目标』必须是**网格物体**(`exporter.script_targets` 只认
+      `obj.type == "MESH"`),所以这里用一个缩得很小、摆在画面外的方盒当
+      管理器 —— 不用 Empty。
+    ⚠ 管理器不要用 StaticBody3D:AI 图是**全局**的,`required_base_class`
+      会把它扫成 CharacterBody3D(脚本 extends 对不上节点类型,Godot 拒载)。
+      直接用角色体最省事 —— 标题脚本里没有任何移动代码,它就一直站着。
+    """
+    scene = bpy.data.scenes.new(TITLE)
+    make_box("标题地面", (20.0, 20.0, 0.4), (0.0, 0.0, -0.2),
+             (0.06, 0.06, 0.09, 1.0), scene=scene)
+    target = make_box("标题管理", (0.3, 0.3, 0.3), (0.0, 0.0, -6.0),
+                      (0.10, 0.10, 0.14, 1.0), scene=scene)
+    camera = make_camera("标题机位", (0.0, -10.0, 2.4),
+                         (math.radians(76.0), 0.0, 0.0), scene)
+    scene.camera = camera
+    make_light("标题灯", "SUN", (3.0, -4.0, 6.0), 1.0, (0.70, 0.75, 0.92),
+               scene, rotation=(math.radians(50.0), 0.0, math.radians(25.0)))
+    log(f"{TITLE}:标题管理(挂脚本)+ 标题地面 + 标题机位 + 标题灯")
+    return scene, target
 
 
 def write_physics(scene, player, enemy=None, torch=None, triggers=()):
@@ -452,9 +530,15 @@ def build_room_logic(scene, player):
                gk_path=BGM_FILE, gk_volume=-18.0, gk_fade=2.0)
     vignette = _add(logic, "GKNodeScreenVignette", "教室暗角", -300.0, 720.0,
                     gk_amount=0.35, gk_radius=0.65, gk_edge=0.40)
+    # 开场运镜(第七十轮):相机沿『教室运镜轨道』从『教室机位』俯冲到
+    # 『教室特写』(2.5 秒 · 缓出)。这就是 demo_curve 那套做法。
+    opening = _add(logic, "GKNodeCameraSetCurrent", "开场运镜", -300.0, 560.0,
+                   gk_target=ROOM_CLOSE, gk_blend=2.5,
+                   gk_blend_trans="EASE_OUT",
+                   gk_path_mode="CURVE", gk_path_curve=ROOM_TRACK)
     _link(logic, ready, "执行", hint, "执行")
     tail = hint
-    for node in (goal, bgm, vignette):
+    for node in (goal, bgm, vignette, opening):
         _link(logic, tail, "完成", node, "执行")
         tail = node
 
@@ -486,7 +570,40 @@ def build_room_logic(scene, player):
     _link(logic, door, "执行", write, "执行")
     _link(logic, write, "完成", save, "执行")
     _link(logic, save, "完成", change, "执行")
-    log(f"{ROOM}逻辑:提示/BGM/暗角 + 3 张纸条 + 门口存纸条数 -> 切 {CORRIDOR_RES}")
+    log(f"{ROOM}逻辑:提示/BGM/暗角/开场运镜 + 3 张纸条 + "
+        f"门口存纸条数 -> 切 {CORRIDOR_RES}")
+    return logic
+
+
+def build_title_logic(scene):
+    """标题页逻辑:显示标题 + 『开始游戏』按钮 -> 切到教室。"""
+    logic = bpy.data.node_groups.new("标题逻辑", "GKGameLogicTree")
+    logic.use_fake_user = True
+    ready = _add(logic, "GKNodeOnReady", "每当_准备", -300.0, 0.0)
+    title = _add(logic, "GKNodeUiText", "标题文字", -60.0, 0.0,
+                 gk_text="恐怖示例 · 熄灯的教学楼", gk_align="TOP_CENTER",
+                 gk_margin=120.0, gk_size=42)
+    tip = _add(logic, "GKNodeUiText", "提示文字", 200.0, 0.0,
+               gk_text="点『开始游戏』走进教室", gk_align="TOP_CENTER",
+               gk_margin=196.0, gk_size=20)
+    start = _add(logic, "GKNodeUiButton", "开始按钮", 460.0, 0.0,
+                 gk_text="开始游戏", gk_align="CENTER", gk_margin=0.0,
+                 gk_width=220.0, gk_height=56.0)
+    change = _add(logic, "GKNodeChangeScene", "去教室", 720.0, 0.0,
+                  gk_scene_path=ROOM_RES)
+    _link(logic, ready, "执行", title, "执行")
+    _link(logic, title, "完成", tip, "执行")
+    _link(logic, tip, "完成", start, "执行")
+    # ⚠ 按钮用『点击』出口:『完成』= 按钮建好了(建完就往下跑会把游戏立刻切走)
+    _link(logic, start, "点击", change, "执行")
+    _apply_settings(scene, (("dimension", "3"), ("toon_follow_light", True)))
+    settings = getattr(scene, "gk_settings", None)
+    if settings is not None and hasattr(settings, "logic_tree"):
+        try:
+            settings.logic_tree = logic.name
+        except Exception:                                 # noqa: BLE001
+            pass
+    log(f"{TITLE}逻辑:标题 + 开始按钮 -> 切 {ROOM_RES}")
     return logic
 
 
@@ -618,13 +735,20 @@ def build_stairs_logic(scene, player):
                     gk_slot="save1")
         text = _add(logic, "GKNodeUiText", f"结局文字{number}", 1820.0, y,
                     gk_text=f"结局:{label}", gk_x=18.0, gk_y=60.0, gk_size=26)
+        # 演完停 3 秒让玩家看清,再回标题页(一段可循环的短篇)
+        wait = _add(logic, "GKNodeWait", f"停留{number}", 2060.0, y)
+        wait.inputs["秒"].default_value = 3.0
+        back = _add(logic, "GKNodeChangeScene", f"回标题{number}", 2300.0, y,
+                    gk_scene_path=TITLE_RES)
         _link(logic, value, "值", set_end, "值")
         _link(logic, value, "值", write, "值")
         _link(logic, choice, pin, set_end, "执行")
         _link(logic, set_end, "完成", write, "执行")
         _link(logic, write, "完成", save, "执行")
         _link(logic, save, "完成", text, "执行")
-    log(f"{STAIRS}逻辑:载入纸条数 + 门口判 >=3 + 两结局 + 存档")
+        _link(logic, text, "完成", wait, "执行")
+        _link(logic, wait, "完成", back, "执行")
+    log(f"{STAIRS}逻辑:载入纸条数 + 门口判 >=3 + 两结局 + 存档 + 回标题")
     return logic
 
 
@@ -678,7 +802,7 @@ def save_blend(path):
         return
     blocks = set(bpy.data.objects) | set(bpy.data.meshes) | \
         set(bpy.data.materials) | set(bpy.data.node_groups) | \
-        set(bpy.data.cameras) | set(bpy.data.lights)
+        set(bpy.data.cameras) | set(bpy.data.lights) | set(bpy.data.curves)
     scenes = list(bpy.data.scenes)
     bpy.data.libraries.write(path, blocks | set(scenes), fake_user=True)
 
@@ -688,6 +812,13 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
     room = clear_all()
+
+    # ---- 第零幕 标题页(开局进这里)----
+    # ⚠ 先建在**最后**也行:导出时场景名 = .tscn 名,主场景最后显式指过去。
+    title, title_target = build_title()
+    write_physics(title, title_target)
+    build_title_logic(title)
+    _apply_settings(title, (("dimension", "3"),) + ENV_TITLE)
 
     # ---- 第一关 教室(用已有的那个场景)----
     room_player = build_room(room)
@@ -727,7 +858,12 @@ def main():
         log(f"告警: {warning}")
     if result.get("deleted"):
         log(f"清理旧文件: {result['deleted']}")
-    log(f"主场景: {result.get('main_scene', '')}")
+    # 主场景显式指到**标题页**:开局先给标题,点『开始游戏』才进教室
+    exported = {f"res://scenes/{e['scene_name']}.tscn"
+                for e in result.get("scenes", []) if e.get("ok")}
+    if TITLE_RES in exported:
+        project.set_main_scene(directory, TITLE_RES)
+    log(f"主场景: {TITLE_RES}")
 
     write_audio(directory)
 
