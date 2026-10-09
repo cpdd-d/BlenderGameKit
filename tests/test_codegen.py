@@ -15514,6 +15514,60 @@ class TestRound73OverlayLayer(Base):
         self.assertNotIn('set("parameters/base/', code)
 
 
+class TestRound74NamedBlendPoints(Base):
+    """第七十四轮:给混合点起名字,消掉 Godot 4.7 的弃用警告。
+
+    Godot 4.7 给混合点加了"名字";不传的话每次建树都会在输出面板打一条
+
+        AnimationNodeBlendSpace1D::add_blend_point: No name provided,
+        using safe index as reference. In the future, empty names will be
+        deprecated, so explicitly passing a name is recommended.
+
+    满屏都是,用户会以为是插件生成的代码有问题。
+
+    `add_blend_point` 的**第 4 个参数就是名字**(真机探针读的方法签名:
+    `add_blend_point(node, pos, at_index, name)`,name 是 StringName)——
+    所以不用再补一句 `set_blend_point_name`,一次调用就把名字带上了。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_1d_points_are_named(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "走跑", gk_points="走:0|跑:1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("AnimationNodeBlendSpace1D.new()", code)
+        self.assertIn("space.add_blend_point(anim_node, float(entry[1]), "
+                      "-1, StringName(entry[0]))", code)
+
+    def test_2d_points_are_named(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree2D, "八向",
+                             gk_points="甲:0:0|乙:1:0|丙:0:1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("AnimationNodeBlendSpace2D.new()", code)
+        self.assertIn("float(entry[2])), -1, StringName(entry[0]))", code)
+
+    def test_layered_helper_names_points_on_both_axes(self):
+        """带叠层那份 helper 里 1D / 2D 两条分支都要带上名字。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "走跑", gk_points="走:0|跑:1",
+                             gk_overlay="受击")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ensure_blend_tree_layer(", code)
+        self.assertEqual(code.count("-1, StringName(entry[0]))"), 2)
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 

@@ -1117,7 +1117,11 @@ def _ensure_blend_tree_helper(ctx):
             #   Animation 资源上的 loop_mode 在这种情况下不生效)
             "                if loop:",
             "                    anim_node.loop_mode = Animation.LOOP_LINEAR",
-            "        space.add_blend_point(anim_node, float(entry[1]))",
+            # 第 4 个参数是**这个混合点的名字**。不给的话 Godot 4.7 会打一条
+            # 弃用警告(add_blend_point: No name provided ...),
+            # 满屏都是,用户会以为是我们的 bug。
+            "        space.add_blend_point(anim_node, float(entry[1]), "
+            "-1, StringName(entry[0]))",
             "    tree.tree_root = space",
             "    tree.root_node = tree.get_path_to(host)",
             "    tree.anim_player = tree.get_path_to(player)",
@@ -1245,7 +1249,7 @@ def _ensure_blend_tree_2d_helper(ctx):
             "                if loop:",
             "                    anim_node.loop_mode = Animation.LOOP_LINEAR",
             "        space.add_blend_point(anim_node, Vector2(float(entry[1]), "
-            "float(entry[2])))",
+            "float(entry[2])), -1, StringName(entry[0]))",
             "    tree.tree_root = space",
             "    tree.root_node = tree.get_path_to(host)",
             "    tree.anim_player = tree.get_path_to(player)",
@@ -1476,7 +1480,7 @@ def _ensure_blend_tree_layer_helper(ctx):
             "                    if loop:",
             "                        node2.loop_mode = Animation.LOOP_LINEAR",
             "            space2.add_blend_point(node2, Vector2(float(entry[1]), "
-            "float(entry[2])))",
+            "float(entry[2])), -1, StringName(entry[0]))",
             "        space = space2",
             "    else:",
             "        var space1 := AnimationNodeBlendSpace1D.new()",
@@ -1492,7 +1496,8 @@ def _ensure_blend_tree_layer_helper(ctx):
             "                    node1.stretch_time_scale = true",
             "                    if loop:",
             "                        node1.loop_mode = Animation.LOOP_LINEAR",
-            "            space1.add_blend_point(node1, float(entry[1]))",
+            "            space1.add_blend_point(node1, float(entry[1]), "
+            "-1, StringName(entry[0]))",
             "        space = space1",
             "    var shot := AnimationNodeAnimation.new()",
             "    shot.animation = StringName(overlay)",

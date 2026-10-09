@@ -3695,6 +3695,30 @@ def main():
         check("第七十三轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 混合点起名字(第七十四轮)----
+    # 不传名字的话 Godot 4.7 每次建树都在输出面板打一条弃用警告
+    # (add_blend_point: No name provided ...),用户会以为是我们生成的代码坏了。
+    # `add_blend_point` 的第 4 个参数就是名字(真机读过方法签名),一次带上。
+    try:
+        r74_tree = bpy.data.node_groups.new("混合点起名74", "GKGameLogicTree")
+        r74_ready = r74_tree.nodes.new("GKNodeOnReady")
+        r74_one = r74_tree.nodes.new("GKNodeBlendTree")
+        r74_two = r74_tree.nodes.new("GKNodeBlendTree2D")
+        r74_tree.links.new(r74_ready.outputs["执行"], r74_one.inputs["执行"])
+        r74_tree.links.new(r74_one.outputs["完成"], r74_two.inputs["执行"])
+        r74_code, r74_warn = codegen.generate(
+            r74_tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("混合点名字:1D 带上第 4 个参数",
+              "add_blend_point(anim_node, float(entry[1]), "
+              "-1, StringName(entry[0]))" in r74_code)
+        check("混合点名字:2D 带上第 4 个参数",
+              "float(entry[2])), -1, StringName(entry[0]))" in r74_code)
+        check("混合点名字:生成无告警", not r74_warn, str(r74_warn)[:200])
+        bpy.data.node_groups.remove(r74_tree)
+    except Exception as exc:
+        check("第七十四轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)
