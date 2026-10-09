@@ -138,7 +138,12 @@ class GenContext:
         # 其中"每帧"那个还要在 _process 里插一段检查。
         self.need_anim_signals = False
         self.need_anim_running = False
-        # 每次播放登记一条:{player, name, func, node, output, kind, signal}
+        # 『动画_事件』(播到第 N 秒触发一次)也要在 _process 里插一段检查
+        # (第七十六轮)—— 同样登记进 anim_events,kind = "time"。
+        self.need_anim_time = False
+        # 每次播放 / 每个动画事件登记一条:
+        #   {player_expr, name_expr, func, node, output, kind, signal}
+        # 注意存的是**表达式**不是局部变量名 —— 这些代码要落到别的函数里
         self.anim_events = []
         # 动画状态机(『每帧检查』模式)- 整段逻辑挂进 _physics_process
         self.anim_state_machines = []

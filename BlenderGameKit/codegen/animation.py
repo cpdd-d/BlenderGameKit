@@ -1640,6 +1640,77 @@ def _ensure_overlay_helpers(ctx):
     return fire_name, stop_name
 
 
+def _anim_event_name(node):
+    """『动画_事件』盯的那段动画名(已经是 GDScript 字符串字面量)。
+
+    优先级:卡片上**选中的动作** > 手填的 `gk_anim_name` > 空串(调用方告警)。
+
+    ── 为什么不复用 `_animation_name_of` ──────────────────────────
+    那个函数是先看**引脚**再看动作再手填 —— 而这个节点只有『执行』一个
+    引脚(动画名走卡片上的选择器),所以直接读那两个属性更直白。
+    """
+    action = getattr(node, "gk_anim_action", None)
+    name = str(getattr(action, "name", "") or "") if action is not None else ""
+    if not name:
+        name = str(getattr(node, "gk_anim_name", "") or "").strip()
+    return gd_string(name) if name else '""'
+
+
+@stmt_node("GKNodeAnimEvent")
+def _stmt_anim_event(ctx, node, indent):
+    """『动画_事件』:某段动画播到第 N 秒时触发一次(第七十六轮)。
+
+    ── 为什么是"每帧查"────────────────────────────────────────────
+    Godot 的 AnimationPlayer 只有 `animation_started` / `animation_finished`
+    两个信号,**没有**"播到第 N 秒"。想精确到时间点,只有每帧读一下
+    `current_animation_position` 跟目标时刻比 —— 和『动画_播放』那个
+    『每帧』出口是同一套做法(见 generator 里 kind == "running" 那段)。
+
+    ── 只响一次 / 重播再响 ────────────────────────────────────────
+    每个节点两个成员变量:
+        `_gk_ev_armed`  这一轮响过没有(响过就置 false)
+        `_gk_ev_last`   上一帧的播放进度
+    进度**回退**(pos < last)说明这段动画从头又播了一遍(或循环了一圈),
+    于是重新武装 —— "重播会再响、循环每圈响一次"就是这么来的。
+
+    ── 本节点自己**一行语句都不生成**──────────────────────────────
+    它只是"登记一个监听":真正的判定代码由 generate() 统一放进 `_process`
+    (和『每帧』出口同一个地方),所以卡片挂在哪条执行流上都一样。
+    """
+    if not _next_nodes(node, "触发时"):
+        ctx.warn(f"节点『{node.bl_label}』的『触发时』没有接东西 —— "
+                 f"它被跳过了(到点要做的事接在那个口上)")
+        return
+    name = _anim_event_name(node)
+    if name == '""':
+        ctx.warn(f"节点『{node.bl_label}』没填『动画』(或『动画名』)—— "
+                 f"它不知道该盯哪段动画,被跳过了")
+        return
+    try:
+        seconds = float(getattr(node, "gk_event_time", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds <= 0.0:
+        ctx.warn(f"节点『{node.bl_label}』的『第几秒』要**大于 0**"
+                 f"(填的是'等到这段动画播到第几秒'),被跳过了")
+        return
+    # 变量按**节点**各占一份 —— 同一张图可以盯好几段动画、好几个时间点,
+    # 共用一个"响过没有"的话后面的会把前面的覆盖掉。
+    tag = ctx.node_tag(node, "anim_event")
+    armed = ctx.declare_var(f"_gk_ev_armed{tag}", "bool", initial="true")
+    last = ctx.declare_var(f"_gk_ev_last{tag}", "float", initial="0.0")
+    ctx.need_anim_time = True
+    ctx.anim_events.append({
+        "kind": "time", "node": node, "output": "触发时",
+        # 存**表达式**(播放器自带缓存,在哪个函数里都算得出)
+        "player_expr": ctx.animation_player(node),
+        "name_expr": name,
+        "time": gd_number(seconds),
+        "armed": armed, "last": last,
+        "func": f"_gk_anim_event{tag or '_1'}",
+    })
+
+
 @stmt_node("GKNodeAnimOverlay")
 def _stmt_anim_overlay(ctx, node, indent):
     """『动画_叠层』:触发某棵混合树上的那一层一次性动作。"""

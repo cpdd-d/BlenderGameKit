@@ -920,6 +920,70 @@ class GKNodeAnimOverlay(B.GKStatementNode):
 
 
 @N
+class GKNodeAnimEvent(B.GKStatementNode):
+    bl_idname = "GKNodeAnimEvent"
+    bl_label = "动画_事件"
+    bl_icon = "TIME"
+    gk_category = "动画"
+    gk_doc = (
+        "**某段动画播到第几秒**时触发一次 —— 攻击挥到一半出判定框、"
+        "脚步落地出声、开门拧到底'咔哒'一下。\n"
+        "── 怎么用 ──\n"
+        "接在执行流后面(『每当_物理帧』);『动画』选那段动作、"
+        "『第几秒』填时刻;到点要执行的东西接在**『触发时』**上。\n"
+        "── 什么时候会再响 ──\n"
+        "一段动画只响**一次**;同一段动画**重播**(进度回到开头又往前)"
+        "会再响;循环动画**每圈响一次** —— 走路脚步声挂一个就够了,"
+        "不用自己数圈数。\n"
+        "── 多个时间点 ──\n"
+        "一个时间点一个节点,用『完成』口把几个串成一条线"
+        "(比如挥砍的『0.4 秒出判定』+『0.8 秒收判定』)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+    )
+    # 只有『执行』一个引脚 —— 动画名走**卡片上的选择器**(两个属性)。
+    # 特意**不加**『动画名』引脚:它只用来填一段固定的动画名,
+    # 多一个常驻空引脚只会让卡片更乱(也没有 `gk_input_props` ——
+    # 那东西的键必须是真引脚,库级测试会查)。
+    gk_outputs = (
+        S.pin(FLOW, "完成"),
+        # ── 事件出口:播到那个点的那一刻才执行(第七十六轮)────────────
+        # 代码落在 `_process` 里 —— AnimationPlayer 只有 started / finished
+        # 两个信号,**没有**"播到第 N 秒",只能每帧比一下播放进度。
+        S.pin(FLOW, "触发时"),
+    )
+    gk_prop_defs = (
+        # 动画名用**原生动作选择器**(和『动画_播放』同一套):
+        # 手打名字打错了要到 Godot 运行时才发现。
+        ("gk_anim_action", "action", None, "动画",
+         "盯哪段动画(原生选择器,能搜索)"),
+        ("gk_anim_name", "string", "", "动画名(手填兜底)",
+         "没选『动画』时才用它"),
+        ("gk_event_time", "float", 0.0, "第几秒",
+         "这段动画播到第几秒时触发一次(秒,要大于 0)"),
+        ("gk_player", "node", "", "动画播放器",
+         "留空 = 自动查找(推荐);也可以填场景里的节点名"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_anim_action", text="")
+        if self.gk_anim_action is not None:
+            layout.label(text=f"盯:{self.gk_anim_action.name}", icon="CHECKMARK")
+        else:
+            row = layout.row(align=True)
+            row.prop(self, "gk_anim_name", text="", icon="SORTALPHA")
+            picker = row.operator("gk.pick_anim_name", text="", icon="VIEWZOOM")
+            picker.node_name = self.name
+        layout.prop(self, "gk_event_time", text="第几秒")
+        layout.label(text="触发时 -> 接要做的事", icon="PLAY")
+        layout.label(text="完成 -> 串下一个『动画_事件』", icon="FORWARD")
+
+    def draw_buttons_ext(self, context, layout):
+        layout.label(text="动画播放器:留空 = 自动查找(推荐)")
+        B.draw_target_picker(self, layout, "gk_player")
+
+
+@N
 class GKNodeAnimStateMachineRef(B.GKStatementNode):
     bl_idname = "GKNodeAnimStateMachineRef"
     bl_label = "动画_状态机"

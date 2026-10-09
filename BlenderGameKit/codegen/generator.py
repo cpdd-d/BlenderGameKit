@@ -798,6 +798,39 @@ class Generator:
                                "func _process(_delta: float) -> void:",
                                list(lines.lines))
 
+        # ---- 『动画_事件』:每帧比一下播放进度,跨过那一刻就触发一次 ----
+        # 和上面那段同源(都放 _process):AnimationPlayer 没有"播到第 N 秒"
+        # 的信号,只能每帧读 current_animation_position 跟目标时刻比。
+        #
+        # 只响一次靠 `_gk_ev_armed`;进度**回退**说明这段动画从头又播了
+        # (重播 / 循环了一圈)-> 重新武装,于是"循环每圈响一次"。
+        if self.ctx.need_anim_time:
+            lines = self.ctx.new_section()
+            for event in self.ctx.anim_events:
+                if event.get("kind") != "time":
+                    continue
+                holder = self.ctx.new_temp("ap")
+                armed = event["armed"]
+                last = event["last"]
+                at = event["time"]
+                name = event["name_expr"]
+                lines.add(1, f"var {holder} := {event['player_expr']}")
+                lines.add(1, f"if {holder} != null "
+                             f"and {holder}.current_animation == {name}:")
+                lines.add(2, f"if {armed} and "
+                             f"{holder}.current_animation_position >= {at} "
+                             f"and {last} < {at}:")
+                lines.add(3, f"{armed} = false")
+                self.ctx._active.clear()
+                self.ctx._current_event = event["func"]
+                _chain(self.ctx, event["node"], 3, event["output"])
+                lines.add(2, f"if {holder}.current_animation_position < {last}:")
+                lines.add(3, f"{armed} = true")
+                lines.add(2, f"{last} = {holder}.current_animation_position")
+            self._append_block(sections, "_process",
+                               "func _process(_delta: float) -> void:",
+                               list(lines.lines))
+
         # ---- 动画事件出口的回调函数 ----
         # 见 _stmt_play_anim。每个接了线的事件出口生成一个函数,
         # 函数体就是那个出口后面连的节点。

@@ -15757,6 +15757,103 @@ class TestRound75TransitionBlend(Base):
         self.assertIn(".play(next_state, blend, _gk_anim_speed(next_state))", code)
 
 
+class TestRound76AnimEvents(Base):
+    """第七十六轮(G 组 21b):**动画事件** —— 播到某一秒时触发一次。
+
+    典型用法:攻击动画播到 0.4 秒 -> 生成判定框 / 播音效;脚步动画播到
+    0.1 秒 -> 脚步音;开门动画播到 0.8 秒 -> "咔哒"一声。
+
+    ── 机制(用户 2026-10-09 拍板)──────────────────────────────────
+      * 一个事件一个**节点**『动画_事件』,填『动画名 + 第几秒』;
+      * 接在执行流后面(和『动画_叠层』一样),靠**每帧查**动画进度判定 ——
+        Godot 的 AnimationPlayer 没有"播到第 N 秒"这种信号;
+      * 一段动画只响**一次**;同一段动画**重播**(进度回到 0 又往前)会再响;
+        循环动画**每圈响一次**(脚步音就是这么用的);
+      * 出口两个:『触发时』接要做的事,『完成』用来把多个事件串成一条线。
+    """
+
+    def _build(self, anim_name="攻击", seconds=0.4, chained=None,
+               wire_trigger=True):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧", gk_order=0)
+        nodes = [tree.new_node(NN.GKNodeAnimEvent, f"事件{i}",
+                               gk_anim_name=name, gk_event_time=time)
+                 for i, (name, time) in enumerate(
+                     chained or [(anim_name, seconds)])]
+        gk_stub.connect(tree, physics, "执行", nodes[0], "执行")
+        for prev, nxt in zip(nodes, nodes[1:]):
+            gk_stub.connect(tree, prev, "完成", nxt, "执行")
+        for index, node in enumerate(nodes):
+            hit = tree.new_node(NN.GKNodePrint, f"触发{index}", gk_text="触发了")
+            if wire_trigger:
+                gk_stub.connect(tree, node, "触发时", hit, "执行")
+        return gen(tree, V3)
+
+    def test_node_registered_in_play_group(self):
+        cls = getattr(NN, "GKNodeAnimEvent", None)
+        self.assertIsNotNone(cls, "『动画_事件』没注册")
+        self.assertEqual(cls.bl_label, "动画_事件")
+        self.assertEqual(cls.gk_category, "动画")
+        self.assertEqual(NN.SUBCATEGORY_OF.get("GKNodeAnimEvent"), "播放",
+                         "要登记进『动画 ▸ 播放』,否则菜单里看不到")
+        outputs = [spec["name"] for spec in cls.gk_outputs]
+        self.assertIn("触发时", outputs)
+        self.assertIn("完成", outputs)
+        props = {entry[0] for entry in cls.gk_prop_defs}
+        self.assertIn("gk_event_time", props)
+        self.assertIn("gk_anim_action", props, "要用动作选择器,别只给手填框")
+
+    def test_generates_time_check_in_process(self):
+        code, warnings = self._build()
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _process(", code)
+        # 盯着"当前播的是不是这段""播到第几秒了"
+        self.assertIn('.current_animation == "攻击"', code)
+        self.assertIn(".current_animation_position", code)
+        self.assertIn(">= 0.4", code)
+        # 两个成员变量:响过没有 / 上一帧的进度
+        self.assertIn("var _gk_ev_armed:", code)
+        self.assertIn("var _gk_ev_last:", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_trigger_chain_lands_in_process(self):
+        """『触发时』接的东西要落在 `_process` 里(每帧查出来的那一刻)。"""
+        code, _ = self._build()
+        funcs = self.functions(code)
+        self.assertIn("触发了", funcs["_process"])
+        self.assertNotIn("触发了", funcs.get("_physics_process", ""))
+
+    def test_complete_chain_stays_in_execution_flow(self):
+        """『完成』是执行流,接的东西还在原来的地方。"""
+        code, _ = self._build()
+        funcs = self.functions(code)
+        # 上一帧的进度要**在 _process 里**更新(不能留在别处)
+        self.assertIn("_gk_ev_last = ", funcs["_process"])
+
+    def test_two_events_get_their_own_vars(self):
+        """同一张图放两个事件 -> 各管各的"响过没有",不能互相覆盖。"""
+        code, _ = self._build(chained=[("攻击", 0.4), ("攻击", 0.8)])
+        self.assertIn("var _gk_ev_armed:", code)
+        self.assertIn("var _gk_ev_armed_2:", code)
+        self.assertIn(">= 0.4", code)
+        self.assertIn(">= 0.8", code)
+
+    def test_empty_anim_name_warns(self):
+        code, warnings = self._build(anim_name="")
+        self.assertTrue(any("动画" in w for w in warnings), warnings)
+        self.assertNotIn("current_animation_position", code)
+
+    def test_zero_seconds_warns(self):
+        code, warnings = self._build(seconds=0.0)
+        self.assertTrue(any("大于 0" in w for w in warnings), warnings)
+        self.assertNotIn("current_animation_position", code)
+
+    def test_unwired_trigger_warns(self):
+        _code, warnings = self._build(wire_trigger=False)
+        self.assertTrue(any("触发时" in w for w in warnings), warnings)
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 

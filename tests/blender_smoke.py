@@ -3839,6 +3839,73 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 『动画_事件』(第七十六轮,G 组 21b)----
+    # 某段动画播到第 N 秒触发一次。Godot 没有"播到第 N 秒"的信号,
+    # 所以是每帧比 `current_animation_position`;靠"进度回退"重新武装,
+    # 于是**循环动画每圈响一次**(脚步音就靠这个)。
+    try:
+        r76b_nodes = __import__(f"{module_name}.nodes.nodes",
+                                fromlist=["SUBCATEGORY_OF"])
+        check("动画事件:节点已注册并归在『动画 ▸ 播放』下",
+              r76b_nodes.SUBCATEGORY_OF.get("GKNodeAnimEvent") == "播放",
+              str(r76b_nodes.SUBCATEGORY_OF.get("GKNodeAnimEvent")))
+
+        r76b_tree = bpy.data.node_groups.new("动画事件76", "GKGameLogicTree")
+        r76b_physics = r76b_tree.nodes.new("GKNodeOnPhysicsProcess")
+        r76b_event = r76b_tree.nodes.new("GKNodeAnimEvent")
+        r76b_event.gk_anim_name = "攻击"
+        r76b_event.gk_event_time = 0.4
+        r76b_tree.links.new(r76b_physics.outputs["执行"],
+                            r76b_event.inputs["执行"])
+        r76b_printer = r76b_tree.nodes.new("GKNodePrint")
+        r76b_printer.gk_text = "打到了"
+        r76b_tree.links.new(r76b_event.outputs["触发时"],
+                            r76b_printer.inputs["执行"])
+
+        check("动画事件:卡片上两个属性都在(动画名 / 第几秒)",
+              hasattr(r76b_event, "gk_anim_name")
+              and hasattr(r76b_event, "gk_event_time")
+              and hasattr(r76b_event, "gk_anim_action"))
+
+        r76b_code, r76b_warn = codegen.generate(
+            r76b_tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("动画事件:生成无告警", not r76b_warn, str(r76b_warn)[:200])
+        check("动画事件:每帧比播放进度",
+              "current_animation_position" in r76b_code
+              and '.current_animation == "攻击"' in r76b_code
+              and ">= 0.4" in r76b_code,
+              r76b_code[-300:])
+        check("动画事件:进度回退时重新武装(循环每圈响一次)",
+              "var _gk_ev_armed: bool = true" in r76b_code
+              and "_gk_ev_armed = true" in r76b_code
+              and "_gk_ev_last < 0.4" in r76b_code)
+        r76b_at = r76b_code.find("func _process(")
+        check("动画事件:『触发时』接的东西落在 _process 里",
+              r76b_at >= 0 and "打到了" in r76b_code[r76b_at:],
+              r76b_code[-300:])
+
+        # 卡片画得完(侧栏瘦身那次的教训:画不出来的卡片没人会发现)
+        class _R76Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r76b_draw_error = ""
+        try:
+            r76b_event.draw_buttons(bpy.context, _R76Layout())
+        except Exception as exc:                      # noqa: BLE001
+            r76b_draw_error = f"{type(exc).__name__}: {exc}"
+        check("动画事件:卡片画得完", not r76b_draw_error, r76b_draw_error)
+
+        bpy.data.node_groups.remove(r76b_tree)
+    except Exception as exc:
+        check("第七十六轮(动画_事件)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)
