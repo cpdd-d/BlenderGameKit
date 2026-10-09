@@ -31,18 +31,27 @@ class GKNodeAiState(B.GKStatementNode):
     gk_category = "AI"
     gk_tree_type = AI_TREE_ID
     gk_doc = ("一个 AI 状态:『行为』决定它在这个状态里做什么"
-              "(巡逻 / 追击 / 逃跑 / 待机 / 跟随 / 返回)。\n"
+              "(待机 / 巡逻 / 追击 / 逃跑 / 跟随 / 返回 / 去查看 / 攻击)。\n"
               "左边『进入』接上一个『AI_转场』的『转到』;"
               "右边『转到』接一个『AI_转场』写“什么条件下切走”。\n"
               "『进入』没被任何『转到』指到的状态 = **起始状态**(一进游戏就跑它)。\n"
+              "── 在这个状态里做点事(进入时 / 离开时)──\n"
+              "右边还有两条**执行流**出口:『进入时』= 进这个状态后要做的事"
+              "(放音效、改标志),『离开时』= 切走前要做的事。"
+              "接『变量_设置』『音效_播放』『信号_发出』这些节点。\n"
+              "⚠ 『攻击』状态的『进入时』是**每打一下跑一次**(见下)。\n"
+              "── 攻击 ──\n"
+              "行为选『攻击』:走进『攻击距离』就停下、面向目标,"
+              "每『冷却』秒“打一下” —— 打什么由『进入时』出口决定"
+              "(插件**不带**血量系统,扣血那套在玩法图里用『变量_增减』拼)。\n"
               "── 作用在谁 ──\n"
               "AI 控制**『AI_启用』节点上选的那个物体**(默认脚本所在物体)。"
               "所以这个物体必须是角色体(3D 角色 / 2D 角色),"
               "行为都是 velocity + move_and_slide 那一套。\n"
               "── 会绕墙吗 ──\n"
-              "**会**。追击 / 跟随 / 去查看 / 巡逻 / 返回这几个『走路』的行为,"
-              "只要**场景设置里勾了『寻路』**,就会自动走导航网格算出来的方向"
-              "(绕开墙 / 石头 / 台子)—— 不需要你再拼一个『移动_寻路』。"
+              "**会**。追击 / 跟随 / 去查看 / 巡逻 / 返回 / 攻击这几个『走路』的"
+              "行为,只要**场景设置里勾了『寻路』**,就会自动走导航网格算出来"
+              "的方向(绕开墙 / 石头 / 台子)—— 不需要你再拼一个『移动_寻路』。"
               "没勾『寻路』时它们退回**直线走**(和以前一样)。\n"
               "⚠ 『逃跑』不走导航(它是“背对威胁跑”,没有固定目标点)。")
     gk_inputs = (
@@ -50,6 +59,18 @@ class GKNodeAiState(B.GKStatementNode):
     )
     gk_outputs = (
         S.pin(FLOW, "转到"),
+        # ── 状态自己的执行流(第七十九轮,照『动画_状态』的做法)────────
+        # 用户要的:AI 的状态里也能"做点事" —— 看见玩家放个音效、进攻击
+        # 范围扣一滴血、切走前清个标志。以前 AI 状态只有『转到』(那是
+        # "去下一个状态"的意思,接别的只会报错)。
+        #
+        #   『进入时』-> 进入这个状态之后要执行的语句
+        #   『离开时』-> 切走之前要执行的语句
+        #
+        # ⚠ 『攻击』状态的『进入时』是**每打一下跑一次**(不是进状态跑一次):
+        #   否则"看见玩家 -> 切进攻击状态"会在它还在赶路时就先打一下。
+        S.pin(FLOW, "进入时"),
+        S.pin(FLOW, "离开时"),
     )
     gk_prop_defs = (
         ("gk_state_name", "string", "巡逻", "状态名",
@@ -78,6 +99,13 @@ class GKNodeAiState(B.GKStatementNode):
          "巡逻 / 返回:离巡逻点多近算“到了”;"
          "追击 / 跟随:离目标这么近就停下;"
          "逃跑:目标进到这个距离以内才开始跑"),
+        # ── 攻击(第七十九轮)────────────────────────────────────────
+        # 『攻击距离』留 0 = 用上面的『停在多远』(常见写法:贴到停距就打)。
+        # 『冷却』是"两次打之间至少隔多久" —— 免得每帧都打一下。
+        ("gk_attack_range", "float", 0.0, "攻击距离",
+         "『攻击』行为:离目标多近算进了攻击范围;0 = 用『停在多远』"),
+        ("gk_cooldown", "float", 1.5, "冷却(秒)",
+         "『攻击』行为:两次“打一下”之间至少隔多久"),
         ("gk_facing", "enum", "GOAL", "朝向", "走路时头朝哪", AI_FACINGS),
         # 入口数量:Blender 一个输入引脚只允许一条连线 ——
         # "巡逻"被好几条转场指着时要多开几个入口(和『动画_状态』同一个做法)
@@ -106,9 +134,9 @@ class GKNodeAiState(B.GKStatementNode):
         layout.prop(self, "gk_behavior", text="")
         behavior = str(getattr(self, "gk_behavior", "PATROL"))
 
-        # 只画这个行为用得到的参数 —— 六种行为的参数不完全一样,
+        # 只画这个行为用得到的参数 —— 七种行为的参数不完全一样,
         # 全画出来每张卡都是七八行,图一多就糊(用户抱怨过的那种)。
-        if behavior in ("CHASE", "FOLLOW", "FLEE"):
+        if behavior in ("CHASE", "FOLLOW", "FLEE", "ATTACK"):
             row = layout.row(align=True)
             row.label(text="目标")
             B.draw_target_picker(self, row, "gk_goal")
@@ -130,6 +158,10 @@ class GKNodeAiState(B.GKStatementNode):
             row.prop(self, "gk_speed", text="速度")
             row.prop(self, "gk_stop_distance", text="停距")
             layout.prop(self, "gk_facing", text="")
+        if behavior == "ATTACK":
+            row = layout.row(align=True)
+            row.prop(self, "gk_attack_range", text="攻击距离")
+            row.prop(self, "gk_cooldown", text="冷却")
 
         row = layout.row(align=True)
         row.prop(self, "gk_in_count", text="入口")
@@ -138,6 +170,11 @@ class GKNodeAiState(B.GKStatementNode):
         if full and int(getattr(self, "gk_in_count", 2) or 2) < 8:
             row.label(text="已满,调大再接", icon="ERROR")
         layout.label(text="转到 -> 接『AI_转场』的『上游』", icon="FORWARD")
+        if behavior == "ATTACK":
+            layout.label(text="进入时 -> 每打一下跑一次(扣血 / 音效)",
+                         icon="PLAY")
+        else:
+            layout.label(text="进入时 / 离开时 -> 接要执行的语句", icon="PLAY")
 
 
 @N

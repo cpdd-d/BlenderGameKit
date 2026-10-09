@@ -16075,6 +16075,222 @@ class TestRound78PatrolWaypoints(Base):
         self.assertNotIn("_gk_ai_wp_index", code)
 
 
+class TestRound79AiAttack(Base):
+    """第七十九轮(D 组 9 + 10):『攻击』行为 + 状态的『进入时』/『离开时』出口。
+
+    D-9:『AI_状态』多一个行为『攻击』—— 走进『攻击距离』就停下、面向目标,
+         每『冷却』秒"打一下"。插件**不建血量系统**:打一下具体做什么
+         由用户接在『进入时』出口上(设变量 / 播音效 / 发信号)。
+    D-10:状态卡多了『进入时』『离开时』两条执行流(照动画状态的做法),
+         于是 AI 图里也能接玩法图节点了。
+
+    两条最容易踩的规矩:
+      * 『攻击』状态的『进入时』= **每打一下跑一次**(不是进状态跑一次),
+        否则"看见玩家 -> 进攻击状态"会在还在赶路时就打一下;
+      * 没接任何钩子的老图,生成物**一字不变**。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _enable(self, tree):
+        """玩法图:『每当_准备』->『AI_启用』(AI 图的唯一入口)。"""
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return enable
+
+    def _attack_state(self, ai, **props):
+        props.setdefault("gk_goal", "玩家")
+        return ai.new_node(NN.GKNodeAiState, "攻击", gk_state_name="攻击",
+                           gk_behavior="ATTACK", **props)
+
+    # ---- 枚举 / 属性 / 引脚 ----
+    def test_attack_in_behavior_table(self):
+        behaviors = {item[0]: item[1] for item in NN.AI_BEHAVIORS}
+        self.assertEqual(behaviors.get("ATTACK"), "攻击")
+
+    def test_attack_props_declared(self):
+        props = {entry[0] for entry in NN.GKNodeAiState.gk_prop_defs}
+        self.assertIn("gk_attack_range", props)
+        self.assertIn("gk_cooldown", props)
+
+    def test_state_has_enter_exit_outputs(self):
+        names = [pin["name"] for pin in NN.GKNodeAiState.gk_outputs]
+        self.assertIn("转到", names)
+        self.assertIn("进入时", names)
+        self.assertIn("离开时", names)
+
+    # ---- 攻击行为的生成 ----
+    def test_attack_generates_range_and_cooldown(self):
+        ai = self._ai_tree()
+        self._attack_state(ai, gk_attack_range=2.0, gk_cooldown=1.5,
+                           gk_speed=3.0, gk_stop_distance=0.6)
+        tree = make_tree()
+        self._enable(tree)
+        code, warnings = self._gen_with_ai(ai, tree)
+        # 没接『进入时』-> 提醒"打不出效果",但生成物本身要是对的
+        self.assertTrue(any("进入时" in w for w in warnings), warnings)
+        # 冷却计时器是成员变量(要跨帧记)
+        self.assertIn("var _gk_ai_atk_1: float = 0.0", code)
+        # 走进攻击距离就停下,超出就朝目标走(临时变量带序号,用正则)
+        self.assertRegex(code, r"if _ai_dist\d+ > 2\.0:")
+        self.assertRegex(code, r"\.velocity = _ai_diff\d+\.normalized\(\) \* 3\.0")
+        self.assertIn(".velocity = Vector3.ZERO", code)
+        # 冷却到点才"打一下"
+        self.assertIn("_gk_ai_atk_1 > 0.0", code)
+        self.assertIn("_gk_ai_atk_1 -= delta", code)
+        self.assertIn("_gk_ai_atk_1 = 1.5", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_attack_range_zero_falls_back_to_stop_distance(self):
+        ai = self._ai_tree()
+        self._attack_state(ai, gk_attack_range=0.0, gk_stop_distance=0.9)
+        tree = make_tree()
+        self._enable(tree)
+        code, _ = self._gen_with_ai(ai, tree)
+        self.assertRegex(code, r"if _ai_dist\d+ > 0\.9:")
+
+    def test_attack_without_target_warns(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "攻击", gk_state_name="攻击",
+                    gk_behavior="ATTACK")           # 没选目标
+        graph = NN.ai_tree_graph(ai)
+        joined = "\n".join(graph["problems"])
+        self.assertIn("目标", joined)
+
+    def test_attack_without_enter_hook_warns(self):
+        ai = self._ai_tree()
+        self._attack_state(ai)
+        graph = NN.ai_tree_graph(ai)
+        joined = "\n".join(graph["problems"])
+        self.assertIn("进入时", joined)
+
+    def test_strike_runs_enter_hook_every_cooldown(self):
+        """『进入时』= 每打一下跑一次(攻击状态),不是进状态跑一次。"""
+        ai = self._ai_tree()
+        atk = self._attack_state(ai, gk_attack_range=2.0, gk_cooldown=1.5)
+        setter = ai.new_node(NN.GKNodeSetVar, "打一下", gk_var_name="攻击中",
+                             gk_value=1.0)
+        gk_stub.connect(ai, atk, "进入时", setter, "执行")
+        tree = make_tree()
+        self._enable(tree)
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ai_enter_攻击() -> void:", code)
+        self.assertIn("攻击中 = 1.0", code)
+        # 触发点在冷却到点那一支里
+        strike_line = "_gk_ai_atk_1 = 1.5"
+        hook_line = "_gk_ai_enter_攻击()"
+        self.assertLess(code.index(strike_line), code.index(hook_line))
+        # 起始状态就是攻击状态时,进状态**不**额外打一下(免得赶路时先打空拳)
+        self.assertNotIn('ai_state = "攻击"\n        _gk_ai_enter_攻击()', code)
+
+    def test_enter_hook_runs_on_entry_for_normal_states(self):
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B")
+        setter = ai.new_node(NN.GKNodeSetVar, "开工", gk_var_name="巡逻中",
+                             gk_value=1.0)
+        gk_stub.connect(ai, patrol, "进入时", setter, "执行")
+        tree = make_tree()
+        self._enable(tree)
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ai_enter_巡逻() -> void:", code)
+        # 进起始状态(巡逻)时跑一次
+        self.assertIn('ai_state = "巡逻"\n        _gk_ai_enter_巡逻()', code)
+
+    def test_exit_hook_runs_before_switch(self):
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B")
+        atk = self._attack_state(ai, gk_attack_range=2.0)
+        leaving = ai.new_node(NN.GKNodeSetVar, "收工", gk_var_name="巡逻中",
+                              gk_value=0.0)
+        gk_stub.connect(ai, patrol, "离开时", leaving, "执行")
+        # 攻击状态接了『进入时』(打一下)-> 免得"没接钩子"的提醒混进来
+        hitting = ai.new_node(NN.GKNodeSetVar, "打一下", gk_var_name="攻击中",
+                              gk_value=1.0)
+        gk_stub.connect(ai, atk, "进入时", hitting, "执行")
+        ai.new_node(NN.GKNodeAiTransition, "看见玩家", gk_cond_source="SEE",
+                    gk_goal="玩家", gk_sight=10.0,
+                    gk_from_state="巡逻", gk_to_state="攻击")
+        tree = make_tree()
+        self._enable(tree)
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ai_exit_巡逻() -> void:", code)
+        # 『离开时』必须在状态变量被改写**之前**跑
+        self.assertLess(code.index("_gk_ai_exit_巡逻()"),
+                        code.index('ai_state = "攻击"'))
+
+    def test_no_hooks_means_no_extra_lines(self):
+        """一张没接任何钩子的老图:一个钩子函数都不多。"""
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL", gk_patrol_a="点A", gk_patrol_b="点B")
+        tree = make_tree()
+        self._enable(tree)
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_ai_enter_", code)
+        self.assertNotIn("_gk_ai_exit_", code)
+        self.assertNotIn("_gk_ai_atk_", code)
+
+    def test_only_attack_states_declare_cooldown_timer(self):
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL", gk_patrol_a="点A", gk_patrol_b="点B")
+        tree = make_tree()
+        self._enable(tree)
+        code, _ = self._gen_with_ai(ai, tree)
+        self.assertNotIn("_gk_ai_atk_", code)
+
+    # ---- AI 图里能放"做事的"节点(D-10 的前提)----
+    def test_ai_tree_now_allows_flow_nodes(self):
+        from BlenderGameKit import properties as props
+        for cls in (NN.GKNodeSetVar, NN.GKNodeAddVar, NN.GKNodePlaySound,
+                    NN.GKNodeEmitSignal):
+            self.assertTrue(props.node_fits_tree(cls, "GKGameAiTree"),
+                            cls.bl_label + " 应该能放进 AI 图(状态的钩子里用)")
+            self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"),
+                            cls.bl_label + " 不该从玩法图里消失")
+            # 动画树**不能**跟着被带开(不然又是一个"放了用不了"的坑)
+            self.assertFalse(props.node_fits_tree(cls, "GKAnimationTree"),
+                             cls.bl_label + " 不该出现在动画树里")
+
+    def test_ai_menu_lists_flow_nodes(self):
+        from BlenderGameKit import properties as props
+        labels = [cls.bl_label
+                  for _cat, items in props.node_menu_entries("GKGameAiTree")
+                  for cls in items]
+        self.assertIn("变量_设置", labels)
+        self.assertIn("音效_播放", labels)
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 

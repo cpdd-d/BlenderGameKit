@@ -17,6 +17,9 @@ AI 的规则**不在玩法图里**,画在一张独立的『游戏AI』节点图�
 | **游戏AI(单独一张图)** | Blend 里叫『敌人AI』:巡逻 --看见玩家(9 米)--> 追击 --丢失玩家(11 米)--> 巡逻 |
 | **AI_状态(巡逻)** | 敌人在『巡逻点甲』『巡逻点乙』之间来回走(到了就折返) |
 | **AI_状态(追击)** | 看见你之后朝你走,贴近 1.6 米就停下(面向你) |
+| **AI_状态(攻击)** | **贴近到 2.5 米就开打**:站住、看着你,每 0.8 秒"打一下"(第七十九轮) |
+| **状态的『进入时』出口** | "打一下"做的事挂在这里 —— 示例里给『被打次数』+1(想扣血就把变量名换成玩家血量) |
+| **AI_转场(贴近了 / 又跑远)** | 距离条件也填在卡片上:进 2.5 米开打,跑出 4 米继续追 |
 | **AI_转场(看见 / 丢失目标)** | 条件就填在卡片上(视野距离),不用拼"距离 + 比较"两个节点 |
 | **AI_状态(去查看)** | **听见动静**但看不见你时,走到那个位置看看(第五十七轮) |
 | **AI_转场(听见动静 / 安静下来)** | 也是填在卡片上:记住多久、耳朵多远 |
@@ -63,6 +66,13 @@ LOST_RANGE = 11.0      # 跟丢(米)
 PATROL_SPEED = 3.0
 CHASE_SPEED = 4.6
 CHASE_STOP = 1.6
+# ── 攻击(第七十九轮)─────────────────────────────────────────────
+# 追上之后贴近到 2.5 米就切『攻击』:站住、看着玩家,每 0.8 秒"打一下"。
+# "打一下"做的事接在状态的『进入时』出口上 —— 这里给变量『被打次数』+1
+# (插件**不带**血量系统;真要扣血,把『变量_增减』的变量名换成玩家血量即可)。
+ATTACK_RANGE = 2.5     # 进到 2.5 米内就开打
+ATTACK_COOLDOWN = 0.8  # 每 0.8 秒打一下
+HIT_VAR = "被打次数"    # 每打一下 +1(探针读它证明"真的打到了")
 
 # ── 听觉(第五十七轮)─────────────────────────────────────────────
 NOISE_KEY = "K"        # 按 K = 弄出动静(跑步 / 踢到东西)
@@ -225,6 +235,24 @@ def build_ai_tree():
     calm = _add(tree, "GKNodeAiTransition", "安静下来", 700.0, 480.0,
                 gk_cond_source="CALM", gk_ear=0.0, gk_memory=EAR_MEMORY)
 
+    # ── 攻击(第七十九轮,D 组 9 + 10)─────────────────────────────────
+    # 追上之后贴近到 2.5 米 = 开打:站住、看着玩家,每 0.8 秒"打一下"。
+    # "打一下"的动作接在状态的『进入时』出口上 —— 这就是 D 组 10:
+    # AI 状态里也能挂玩法图节点了(这里挂『变量_增减』)。
+    attack = _add(tree, "GKNodeAiState", "攻击", 1080.0, 0.0,
+                  gk_state_name="攻击", gk_behavior="ATTACK",
+                  gk_goal=PLAYER, gk_speed=CHASE_SPEED,
+                  gk_stop_distance=ATTACK_RANGE,
+                  gk_attack_range=ATTACK_RANGE,
+                  gk_cooldown=ATTACK_COOLDOWN, gk_facing="GOAL")
+    hit = _add(tree, "GKNodeAddVar", "打一下", 1080.0, -260.0,
+               gk_var_name=HIT_VAR, gk_amount=1.0)
+    close = _add(tree, "GKNodeAiTransition", "贴近了", 1040.0, 180.0,
+                 gk_cond_source="SEE", gk_goal=PLAYER, gk_sight=ATTACK_RANGE)
+    away = _add(tree, "GKNodeAiTransition", "又跑远", 1040.0, -430.0,
+                gk_cond_source="LOST", gk_goal=PLAYER,
+                gk_sight=ATTACK_RANGE + 1.5)
+
     # 环用连线搭(实测 Blender 4.5.5 允许,保存 / 读回都正常)
     _link(tree, patrol, "转到", see, "上游")
     _link(tree, see, "转到", chase, "进入")
@@ -239,8 +267,19 @@ def build_ai_tree():
     #   所以第二条必须用『进入 2』(『入口数量』默认 2,正好够)。
     #   不这么做的话『丢失玩家』那条会**无声消失**。
     _link(tree, calm, "转到", patrol, "进入 2")
+    # 攻击那条环:追击 --贴近(2.5 米)--> 攻击 --又跑远(4 米)--> 追击。
+    # ⚠ 『转到』是**输出**引脚,可以 fan-out 两条(输入才只许一条),
+    #   所以『追击』的『转到』同时接着『丢失玩家』和『贴近了』。
+    # ⚠ 而『追击』的『进入』已经被『看见玩家』占着了 —— 再往它上面接
+    #   会**无声顶掉**那条线(和上面『进入 2』同一个坑),所以这里用『进入 2』。
+    _link(tree, attack, "进入时", hit, "执行")
+    _link(tree, chase, "转到", close, "上游")
+    _link(tree, close, "转到", attack, "进入")
+    _link(tree, attack, "转到", away, "上游")
+    _link(tree, away, "转到", chase, "进入 2")
     log(f"AI 图『{tree.name}』:巡逻 --看见({SIGHT:g} 米)--> 追击 "
-        f"--丢失({LOST_RANGE:g} 米)--> 巡逻;"
+        f"--贴近({ATTACK_RANGE:g} 米)--> 攻击(每 {ATTACK_COOLDOWN:g} 秒"
+        f"『{HIT_VAR}』+1) --又跑远--> 追击;"
         f"巡逻 --听见动静({NOISE_LOUD:g} 米内)--> 去查看 "
         f"--安静({EAR_MEMORY:g} 秒)--> 巡逻({len(tree.nodes)} 个节点,"
         f"起始状态 = 巡逻)")

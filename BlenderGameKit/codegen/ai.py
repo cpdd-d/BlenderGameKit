@@ -29,7 +29,7 @@ from ..nodes.node_base import (TARGET_SELF, gd_string, snake_case)
 from ..nodes import nodes as node_lib
 
 from .literals import gd_number
-from .registry import expr_node, stmt_node
+from .registry import _chain, expr_node, stmt_node
 
 
 # ==========================================================================
@@ -77,6 +77,18 @@ def _patrol_uses_waypoints(state):
         return False
     return (_patrol_point_filled(state, "gk_patrol_a")
             and _patrol_has_extra_points(state))
+
+
+def _ai_enter_on_entry(state):
+    """"进入这个状态"要不要跑它的『进入时』?
+
+    ── 为什么『攻击』例外(第七十九轮)────────────────────────────────
+    『攻击』状态的『进入时』= **每打一下跑一次**(见 `_emit_ai_behavior`)。
+    要是进状态时也照常跑一遍,那"看见玩家 -> 切进攻击状态"就会在怪还在
+    往玩家那边赶路的时候先打一下空拳(表现:凭空掉血 / 响一声)。
+    所以攻击状态只在"冷却到点 + 已在攻击范围内"时跑它。
+    """
+    return str(getattr(state, "gk_behavior", "") or "") != "ATTACK"
 
 
 def _emit_patrol_waypoints(ctx, indent, self_expr, reader, stop, speed, facing,
@@ -280,6 +292,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
     reader = ensure_position_helper(ctx)
 
     behavior = str(getattr(state, "gk_behavior", "PATROL") or "PATROL")
+    state_name = node_lib.ai_state_name(state)
     self_expr = machine["self"]
     facing = str(getattr(state, "gk_facing", "GOAL") or "GOAL")
     speed = gd_number(float(getattr(state, "gk_speed", 3.0) or 0.0))
@@ -311,6 +324,51 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(indent, "else:")
         ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
         # 朝向仍看**目标**(不是看绕路的那个方向):追人的怪应该盯着人
+        _emit_ai_facing(ctx, indent, self_expr, diff, facing)
+        ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+        return
+
+    # ---- 攻击:走进攻击距离就停,每『冷却』秒"打一下"(第七十九轮)----
+    # "打一下"= 跑该状态的『进入时』出口。插件**不带**血量系统:用户把
+    # 『变量_增减』(扣目标血) / 『音效_播放』 / 『信号_发出』接在出口上。
+    if behavior == "ATTACK":
+        goal = _ai_goal_expr(ctx, state)
+        timer = machine.get("attack_timer")
+        if goal is None or not timer:
+            # 图解析已经报过"没选目标";这里退化,免得生成出指向空物的代码
+            _stop_and_slide(ctx, indent, self_expr)
+            return
+        # 攻击距离留 0 = 用『停在多远』(贴到停距就打是最常见的写法)
+        reach = float(getattr(state, "gk_attack_range", 0.0) or 0.0)
+        if reach <= 0.0:
+            reach = float(getattr(state, "gk_stop_distance", 0.6) or 0.0)
+        reach_str = gd_number(reach)
+        cooldown = gd_number(float(getattr(state, "gk_cooldown", 1.5) or 0.0))
+        here = ctx.new_temp("ai_here")
+        goal_at = ctx.new_temp("ai_goal")
+        diff = ctx.new_temp("ai_diff")
+        dist = ctx.new_temp("ai_dist")
+        ctx.add_line(indent, f"var {here} := {reader}({self_expr})")
+        ctx.add_line(indent, f"var {goal_at} := {reader}({goal})")
+        ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
+        ctx.add_line(indent, f"var {dist} := {diff}.length()")
+        # 还没进范围就照常走过去(勾了『寻路』就绕开障碍,见 _walk_direction)
+        walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
+        ctx.add_line(indent, f"if {dist} > {reach_str}:")
+        ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
+        # 走出范围就把冷却蓄满 —— 追出去再回来能马上打,不用干等
+        ctx.add_line(indent + 1, f"{timer} = 0.0")
+        ctx.add_line(indent, "else:")
+        ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+        # 冷却没到就只是数秒;到点了打一下,并把冷却重新压满
+        ctx.add_line(indent + 1, f"if {timer} > 0.0:")
+        ctx.add_line(indent + 2, f"{timer} -= delta")
+        ctx.add_line(indent + 1, "else:")
+        ctx.add_line(indent + 2, f"{timer} = {cooldown}")
+        strike = (machine.get("enter_hooks") or {}).get(state_name)
+        if strike:
+            ctx.add_line(indent + 2, f"{strike}()")
+        # 打的时候仍然看着目标(甩头打不像话)
         _emit_ai_facing(ctx, indent, self_expr, diff, facing)
         ctx.add_line(indent, f"{self_expr}.move_and_slide()")
         return
@@ -467,10 +525,69 @@ def _ai_edge_condition(ctx, edge, machine):
         ctx._ai_hear_var = saved_var
 
 
+def _emit_ai_state_hooks(ctx, graph, machine):
+    """给接了『进入时』/『离开时』的状态各生成一个函数(第七十九轮)。
+
+    返回 ({状态名: 进入函数名}, {状态名: 离开函数名})。
+
+    ── 为什么拆成函数而不是内联(照『动画_状态』的理由)──────────────
+    内联的话,每个状态的钩子语句会被抄进**每一处**引用它的地方(起始状态
+    初始化 / 每一条转场)。拆成函数之后,"进状态"和"出状态"各只有一个
+    定义点,状态一多也不会把 `_physics_process` 撑成一坨。
+
+    ── 『攻击』的『进入时』是特例 ────────────────────────────────────
+    它是"每打一下跑一次"(由 `_emit_ai_behavior` 调),所以这里照常生成
+    函数;什么时候调由调用方按 `_ai_enter_on_entry` 决定。
+    """
+    enter_hooks = {}
+    exit_hooks = {}
+    self_expr = machine["self"]
+    var_name = machine["var"]
+    for state in graph["states"]:
+        name = node_lib.ai_state_name(state)
+        if not name:
+            continue
+        safe = snake_case(name, "state")
+        for pin_name, hooks, prefix in (
+                ("进入时", enter_hooks, "_gk_ai_enter"),
+                ("离开时", exit_hooks, "_gk_ai_exit")):
+            if not node_lib.link_targets(state, pin_name):
+                continue
+            with ctx.capture() as lines:
+                ctx._active.clear()
+                ctx._current_event = f"AI状态{name}{pin_name}"
+                ctx._expr_indent = 1
+                ctx._current_indent = 1
+                # 钩子里可能用到『AI_看得见』这类要"自己是谁"的表达式 ——
+                # 和转场条件同一处理(见 _ai_edge_condition)
+                saved_self = getattr(ctx, "_ai_self_expr", None)
+                saved_hear = getattr(ctx, "_ai_hear_var", None)
+                ctx._ai_self_expr = self_expr
+                ctx._ai_hear_var = var_name
+                try:
+                    _chain(ctx, state, 1, pin_name)
+                finally:
+                    ctx._ai_self_expr = saved_self
+                    ctx._ai_hear_var = saved_hear
+                if len(lines) == 0:
+                    lines.add(1, "pass")
+            func_name = ctx.declare_func_name(f"{prefix}_{safe}")
+            ctx.extra_sections.append({
+                "signature": f"func {func_name}() -> void:",
+                "lines": list(lines.lines),
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            hooks[name] = func_name
+    return enter_hooks, exit_hooks
+
+
 def _emit_ai_transitions(ctx, indent, machine):
     """状态内按画布顺序判转场:第一个成立的就切(和动画状态机同一套)。"""
     graph = machine["graph"]
     var = machine["var"]
+    enter_hooks = machine.get("enter_hooks") or {}
+    exit_hooks = machine.get("exit_hooks") or {}
     emitted = 0
     for state in graph["states"]:
         name = node_lib.ai_state_name(state)
@@ -493,7 +610,19 @@ def _emit_ai_transitions(ctx, indent, machine):
             if not target:
                 continue
             ctx.add_line(indent + 1, f"{'if' if first else 'elif'} {condition}:")
+            # ── 『离开时』必须在状态变量被改写**之前**跑 ──────────────
+            # 和动画状态机同一条理由:钩子里要是判断"现在在哪个状态",
+            # 改完了读到的就是新状态了。
+            exit_hook = exit_hooks.get(name)
+            if exit_hook:
+                ctx.add_line(indent + 2, f"{exit_hook}()")
             ctx.add_line(indent + 2, f"{var} = {gd_string(target)}")
+            # 进新状态跑『进入时』—— 攻击状态除外(它的『进入时』是
+            # "每打一下",由攻击行为自己调,见 _ai_enter_on_entry)
+            if _ai_enter_on_entry(edge["to"]):
+                enter_hook = enter_hooks.get(target)
+                if enter_hook:
+                    ctx.add_line(indent + 2, f"{enter_hook}()")
             if machine["debug"]:
                 # 打印**变量本身**(状态名是用户填的,可能带引号 ——
                 # 直接拼进字符串字面量会把生成的脚本弄坏)
@@ -596,12 +725,22 @@ def _stmt_ai_enable(ctx, node, indent):
         outputs.append((ctx.declare_var(var, "bool", initial="false"),
                         state_name))
 
+    # ── 状态的『进入时』/『离开时』钩子(第七十九轮)────────────────
+    # 必须在"填起始状态"之前生成 —— 起始状态那一句后面要跟着它的『进入时』。
+    enter_hooks, exit_hooks = _emit_ai_state_hooks(
+        ctx, graph, {"self": target, "var": var_name})
+
     # ── 进入起始状态 ────────────────────────────────────────────────
     # 守卫 `.is_empty()`:这个节点接在『每当_物理帧』后面也安全 ——
     # 没有守卫的话每帧都会把状态重置回起点,永远走不出起始状态。
     entry_name = node_lib.ai_state_name(graph["entry"])
     ctx.add_line(indent, f"if {var_name}.is_empty():")
     ctx.add_line(indent + 1, f"{var_name} = {gd_string(entry_name)}")
+    # 起始状态也要跑一次它的『进入时』(攻击状态除外,见 _ai_enter_on_entry)
+    if _ai_enter_on_entry(graph["entry"]):
+        entry_hook = enter_hooks.get(entry_name)
+        if entry_hook:
+            ctx.add_line(indent + 1, f"{entry_hook}()")
 
     # ── 巡逻的"当前去哪头"开关(要跨帧记 -> 成员变量)────────────────
     has_patrol = any(str(getattr(s, "gk_behavior", "") or "") == "PATROL"
@@ -619,6 +758,16 @@ def _stmt_ai_enable(ctx, node, indent):
                                        initial="0")
             wp_dir = ctx.declare_var(f"_gk_ai_wp_dir_{index}", "bool",
                                      initial="true")
+
+    # ── 攻击的冷却计时器(第七十九轮)────────────────────────────────
+    # 一个 AI 机器一个就够(同一时刻只有一个状态在跑);0 = 冷却好了。
+    # 没有攻击状态的图**不声明** —— 老图产物一字不变。
+    attack_timer = None
+    if any(str(getattr(s, "gk_behavior", "") or "") == "ATTACK"
+           for s in graph["states"]):
+        index = len(getattr(ctx, "ai_machines", ()) or ()) + 1
+        attack_timer = ctx.declare_var(f"_gk_ai_atk_{index}", "float",
+                                       initial="0.0")
 
     # ── 听觉运行时(第四十一轮)────────────────────────────────────
     # 图里用到听觉就先把它生成出来 —— 广播方(machine['self'])得是
@@ -649,6 +798,10 @@ def _stmt_ai_enable(ctx, node, indent):
         "wp_index": wp_index,
         "wp_dir": wp_dir,
         "outputs": outputs,
+        # 第七十九轮:攻击冷却 + 状态自己的『进入时』/『离开时』钩子
+        "attack_timer": attack_timer,
+        "enter_hooks": enter_hooks,
+        "exit_hooks": exit_hooks,
     })
     ctx.need_ai_process = True
 

@@ -4044,6 +4044,107 @@ def main():
         check("第七十八轮(巡逻路径点)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 攻击行为 + 状态的进入时/离开时(第七十九轮,D 组 9 + 10)----
+    # D-9:『AI_状态』多一个行为『攻击』—— 走进『攻击距离』停下、面向目标,
+    #      每『冷却』秒"打一下"(打什么由『进入时』出口决定,插件不带血量)。
+    # D-10:状态卡多了『进入时』/『离开时』两条执行流(照动画状态),
+    #      AI 图里也能放『变量_设置』这类"做事的"节点了。
+    try:
+        ai_nodes = __import__(f"{module_name}.nodes.nodes",
+                              fromlist=["GKNodeAiState"])
+        r79_props = [entry[0] for entry in ai_nodes.GKNodeAiState.gk_prop_defs]
+        check("攻击:卡片上多了『攻击距离』『冷却』两个属性",
+              "gk_attack_range" in r79_props and "gk_cooldown" in r79_props,
+              str(r79_props))
+        r79_behaviors = {item[0] for item in ai_nodes.AI_BEHAVIORS}
+        check("攻击:行为表里多了 ATTACK",
+              "ATTACK" in r79_behaviors, str(sorted(r79_behaviors)))
+        r79_outputs = [pin["name"] for pin in ai_nodes.GKNodeAiState.gk_outputs]
+        check("进入时/离开时:状态卡上多了两条执行流出口",
+              "进入时" in r79_outputs and "离开时" in r79_outputs,
+              str(r79_outputs))
+
+        r79_ai = bpy.data.node_groups.new("攻击冒烟79", "GKGameAiTree")
+        r79_patrol = r79_ai.nodes.new("GKNodeAiState")
+        r79_patrol.name = "巡逻"
+        r79_patrol.gk_state_name = "巡逻"
+        r79_patrol.gk_behavior = "PATROL"
+        r79_patrol.gk_patrol_a = "点A"
+        r79_patrol.gk_patrol_b = "点B"
+        r79_attack = r79_ai.nodes.new("GKNodeAiState")
+        r79_attack.name = "攻击"
+        r79_attack.gk_state_name = "攻击"
+        r79_attack.gk_behavior = "ATTACK"
+        r79_attack.gk_goal = "玩家"
+        r79_attack.gk_attack_range = 2.0
+        r79_attack.gk_cooldown = 1.5
+
+        # AI 图里现在能放『变量_设置』(钩子里用),但放不进玩法动作
+        r79_flow_ok = True
+        try:
+            r79_hit = r79_ai.nodes.new("GKNodeSetVar")
+            r79_hit.name = "打一下"
+            r79_hit.gk_var_name = "攻击中"
+            r79_hit.gk_value = 1.0
+            r79_ai.links.new(r79_attack.outputs["进入时"],
+                             r79_hit.inputs["执行"])
+        except Exception:                              # noqa: BLE001
+            r79_flow_ok = False
+        check("进入时:AI 图里能放『变量_设置』并接上入口", r79_flow_ok)
+
+        r79_trans = r79_ai.nodes.new("GKNodeAiTransition")
+        r79_trans.name = "看见玩家"
+        r79_trans.gk_cond_source = "SEE"
+        r79_trans.gk_goal = "玩家"
+        r79_trans.gk_sight = 10.0
+        r79_ai.links.new(r79_patrol.outputs["转到"], r79_trans.inputs["上游"])
+        r79_ai.links.new(r79_trans.outputs["转到"], r79_attack.inputs["进入"])
+
+        r79_graph = node_lib.ai_tree_graph(r79_ai)
+        check("攻击:图解析无问题(目标 + 进入时都齐了)",
+              not r79_graph["problems"], str(r79_graph["problems"])[:300])
+
+        r79_logic = bpy.data.node_groups.new("攻击逻辑79", "GKGameLogicTree")
+        r79_event = r79_logic.nodes.new("GKNodeOnReady")
+        r79_enable = r79_logic.nodes.new("GKNodeAiEnable")
+        r79_logic.links.new(r79_event.outputs["执行"], r79_enable.inputs["执行"])
+        r79_code, r79_warn = codegen.generate(
+            r79_logic, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("攻击:生成冷却计时器 + 走进攻击距离就停",
+              "var _gk_ai_atk_1: float = 0.0" in r79_code
+              and "_gk_ai_atk_1 -= delta" in r79_code
+              and "_gk_ai_atk_1 = 1.5" in r79_code
+              and "> 2.0" in r79_code,
+              r79_code[-500:])
+        check("攻击:『进入时』钩子在每打一下时被调",
+              "func _gk_ai_enter_攻击() -> void:" in r79_code
+              and "攻击中 = 1.0" in r79_code,
+              r79_code[-500:])
+        check("攻击:生成无告警", not r79_warn, str(r79_warn)[:300])
+
+        # 卡片画得完(侧栏瘦身那次的教训)
+        class _R79Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r79_draw_error = ""
+        try:
+            r79_attack.draw_buttons(bpy.context, _R79Layout())
+        except Exception as exc:                       # noqa: BLE001
+            r79_draw_error = f"{type(exc).__name__}: {exc}"
+        check("攻击:攻击卡片画得完", not r79_draw_error, r79_draw_error)
+
+        bpy.data.node_groups.remove(r79_logic)
+        bpy.data.node_groups.remove(r79_ai)
+    except Exception as exc:
+        check("第七十九轮(攻击 + 进入时)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

@@ -14,6 +14,9 @@
   * 敌人真的**在走**(1 秒里位置变化 > 0.5 米)—— 巡逻行为在跑;
   * 把玩家送到敌人 5 米外 -> `ai_state` 变成**追击**,而且**真的追近了**
     (停下来时距离缩到 3 米以内);
+  * **攻击(第七十九轮)**:继续贴身 -> `ai_state` 变成**攻击**,
+    并且**真的打到了**(玩家脚本上的『被打次数』变大了 —— 那是挂在
+    状态『进入时』出口上的『变量_增减』干的);
   * 把玩家挪到 11 米外 -> `ai_state` 回到**巡逻**(追丢了自己回去);
   * **听觉(第五十七轮)**:把玩家放到噪音能传到的地方,**按住 K 弄出动静**
     -> `ai_state` 变成**去查看**,而且敌人**真的朝噪音点走过去**
@@ -58,6 +61,9 @@ var noise_start := Vector3.ZERO
 # 三点巡逻(第七十八轮):把敌人挪到当前那个点上,索引应该前进 1
 var wp_before := -1
 var wp_after := -2
+# 攻击(第七十九轮):进追击前记一下"被打次数",开打后再记一次,要变大
+var hits_before := -1.0
+var hits_after := -2.0
 
 
 func _wp() -> int:
@@ -65,6 +71,14 @@ func _wp() -> int:
 	if player == null:
 		return -1
 	return int(player.get("_gk_ai_wp_index_1"))
+
+
+func _hits() -> float:
+	# 『被打次数』也是玩家脚本上的成员变量(『变量_增减』在 AI 状态的
+	# 『进入时』出口里,AI 代码就生成在玩家脚本里)。
+	if player == null:
+		return -1.0
+	return float(player.get("被打次数"))
 
 
 func _ready() -> void:
@@ -112,17 +126,34 @@ func _physics_process(delta: float) -> void:
 			# 而且因为停距是 1.6,敌人会真的追近一段
 			player.global_position = enemy.global_position \\
 				+ Vector3(5.0, 0.0, 0.0)
+			# 记下"还没被打到"的次数(攻击要在这个基准上变大)
+			hits_before = _hits()
 	elif phase == 2 and elapsed >= 1.85:
 		phase = 3
 		var dist := -1.0
 		if player != null and enemy != null:
 			dist = enemy.global_position.distance_to(player.global_position)
+		# ⚠ 这一帧状态可能是『追击』也可能是**已经贴近切成的『攻击』**
+		#   (追击速度 4.6,0.8 秒就够从 5 米走到 2.5 米开打)—— 两个都算过,
+		#   关键看"真的追近了"(dist 缩到 3.5 米以内)。
 		print("AI_CHASE state=", _state(), " dist=", snappedf(dist, 0.01))
-		if player != null:
-			# 挪到 11 米外(超出丢失距离 11)-> 应该回到巡逻
-			player.global_position = Vector3(-11.0, 1.0, -11.0)
-	elif phase == 3 and elapsed >= 2.75:
+	elif phase == 3 and elapsed >= 2.85:
 		phase = 4
+		# ── 攻击(第七十九轮)────────────────────────────────────────
+		# 这一秒里敌人应该已经贴身开打:状态 = 攻击,『被打次数』变大。
+		hits_after = _hits()
+		var at_dist := -1.0
+		if player != null and enemy != null:
+			at_dist = enemy.global_position.distance_to(player.global_position)
+		print("AI_ATTACK state=", _state(),
+			" hits_before=", snappedf(hits_before, 0.01),
+			" hits_after=", snappedf(hits_after, 0.01),
+			" dist=", snappedf(at_dist, 0.01))
+		if player != null:
+			# 挪到 11 米外(超出丢失距离 11)-> 攻击 -> 追击 -> 巡逻
+			player.global_position = Vector3(-11.0, 1.0, -11.0)
+	elif phase == 4 and elapsed >= 3.75:
+		phase = 5
 		print("AI_LOST state=", _state())
 		# ── 听觉:把玩家放到 13 米外 —— **看不见**(视野 9)但**听得见**
 		# (响度 16)。这个窗口是故意留的:看得见的话敌人会直接切『追击』,
@@ -133,8 +164,8 @@ func _physics_process(delta: float) -> void:
 			noise_start = enemy.global_position
 			noise_at = player.global_position
 		Input.action_press("key_k")
-	elif phase == 4 and elapsed >= 4.15:
-		phase = 5
+	elif phase == 5 and elapsed >= 5.15:
+		phase = 6
 		# 这一秒里敌人应该"听见动静 -> 去查看",并且朝噪音点走过去
 		Input.action_release("key_k")
 		var came := -1.0
@@ -149,8 +180,8 @@ func _physics_process(delta: float) -> void:
 		#   走一边就走进 9 米视野了,会切『追击』,测不到『安靜回巡逻』。
 		if player != null:
 			player.global_position = Vector3(-40.0, 1.0, -40.0)
-	elif phase == 5 and elapsed >= 5.75:
-		phase = 6
+	elif phase == 6 and elapsed >= 6.75:
+		phase = 7
 		# 松手 + 超过记忆秒数(1.2 秒)-> 应该"安静下来"回巡逻
 		print("AI_CALM state=", _state())
 		print("AI_DONE")
@@ -237,15 +268,32 @@ def main():
         print("✗ 敌人没有在巡逻走(1 秒里位移 < 0.5 米):",
               moved.group(0) if moved else "<没跑到>")
         ok = False
-    if not re.search(r"AI_CHASE state=追击", text):
-        print("✗ 玩家靠近后没切到追击:",
+    chase = re.search(r"AI_CHASE state=(\S+) dist=([\d.]+)", text)
+    # ⚠ 这一帧状态可能是『追击』,也可能**已经贴近切成了『攻击』**
+    #   (追击速度 4.6,0.8 秒就够从 5 米走到 2.5 米开打)—— 两个都算过。
+    if not chase or chase.group(1) not in ("追击", "攻击"):
+        print("✗ 玩家靠近后没切到追击(或紧跟着的攻击):",
               [line for line in text.splitlines() if line.startswith("AI_CHASE")])
         ok = False
-    dist = re.search(r"AI_CHASE state=追击 dist=([\d.]+)", text)
-    if not dist or float(dist.group(1)) > 3.5:
-        print("✗ 切到追击后没有真的追近(停在 3.5 米外):",
-              dist.group(0) if dist else "<没跑到>")
+    elif float(chase.group(2)) > 3.5:
+        print(f"✗ 切到追击后没有真的追近(停在 3.5 米外):", chase.group(0))
         ok = False
+    # ── 攻击:贴身 -> 状态 = 攻击,而且『被打次数』真的变大了(第七十九轮)──
+    atk = re.search(r"AI_ATTACK state=(\S+) hits_before=([\d.-]+) "
+                    r"hits_after=([\d.-]+) dist=([\d.]+)", text)
+    if not atk:
+        print("✗ 攻击那段没跑出来:",
+              [line for line in text.splitlines() if line.startswith("AI_ATTACK")])
+        ok = False
+    else:
+        if atk.group(1) != "攻击":
+            print(f"✗ 贴身之后没切到『攻击』(状态是 {atk.group(1)}):",
+                  atk.group(0))
+            ok = False
+        if float(atk.group(3)) <= float(atk.group(2)):
+            print(f"✗ 进了攻击状态却没有真的打一下(『被打次数』没变大):",
+                  atk.group(0))
+            ok = False
     if not re.search(r"AI_LOST state=巡逻", text):
         print("✗ 跟丢后没回到巡逻:",
               [line for line in text.splitlines() if line.startswith("AI_LOST")])
@@ -304,6 +352,12 @@ def main():
                 ("_gk_ai_wp_index_1 -= 1", "回头时索引往回走"),
                 ("巡逻点丙", "第三个巡逻点进了引用表"),
                 ("[AI] 切到状态", "调试打印(『打印状态变化』)"),
+                # ── 攻击 + 状态的『进入时』出口(第七十九轮)─────────────
+                ("var _gk_ai_atk_1: float = 0.0", "攻击的冷却计时器"),
+                ("_gk_ai_atk_1 -= delta", "冷却在数秒"),
+                ('ai_state == "攻击":', "攻击行为"),
+                ("func _gk_ai_enter_攻击() -> void:", "状态的『进入时』钩子函数"),
+                ("被打次数", "钩子里给『被打次数』加一(『变量_增减』)"),
                 # ── 听觉三件套(第五十七轮)───────────────────────────
                 ('get_nodes_in_group("gk_ai_hearer")', "噪音广播到听觉体组"),
                 ('has_method("_gk_hear_noise")', "广播前先确认对方能收"),
