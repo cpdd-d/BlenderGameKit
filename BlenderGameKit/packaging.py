@@ -490,6 +490,27 @@ def template_missing_in_log(log):
     return "导出模板" in low and ("未找到" in low or "找不到" in low)
 
 
+# ── Android 缺签名密钥库时的引导(第七十一轮)──────────────────────────
+# 以前只会把 Godot 那句 "keystore" 原样丢回面板 —— 用户根本不知道要干什么。
+# 这里把三条路一次说清,keytool 那条能直接复制粘贴(Android 官方调试密钥库
+# 就是这套参数,别名/口令都是固定的 android / androiddebugkey)。
+KEYSTORE_HINT = (
+    "Android 打包要一个**签名密钥库**(keystore),Godot 现在找不到它。三选一:\n"
+    "  1) 最省事 —— 在 Godot 里『编辑器 → 编辑器设置 → 导出 → Android』"
+    "把『调试密钥库』填上(路径 + 别名 + 口令);\n"
+    "  2) 还没有密钥库 —— 装过 JDK 就有 keytool,跑这一行生成一个调试用的"
+    "(参数是 Android 官方那套,直接复制):\n"
+    "     keytool -genkeypair -v -keystore debug.keystore "
+    "-alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 "
+    "-storepass android -keypass android "
+    '-dname "CN=Android Debug,O=Android,C=US"\n'
+    "     生成后回 Godot 的编辑器设置里把『调试密钥库』指到它;\n"
+    "  3) 已经有正式签名 —— 在 Godot『项目 → 导出 → Android』里填 "
+    "release 那三项(Godot 会写进 export_presets.cfg,插件不再覆盖它)。\n"
+    "配好之后回 Blender 再点一次『打包』。"
+)
+
+
 def templates_status(version, platform="windows"):
     """这个平台的导出模板是否就绪。返回 (是否就绪, 版本目录, 说明文字)。
 
@@ -570,6 +591,13 @@ def failure_hint(log, version=""):
     low = text.lower()
     if template_missing_in_log(text):
         return template_install_hint(version)
+    # ── Android 缺签名密钥库(第七十一轮)────────────────────────────
+    # Godot 对这种情况只丢一句 "keystore"(中英都有可能),用户看到完全不知道
+    # 下一步该干什么。这里给一段**能照着做**的引导(keytool 那条命令可以直接
+    # 复制粘贴)。放在"找不到预设"前面:keystore 的日志里也可能出现 preset
+    # 字样,但缺密钥库才是真原因。
+    if "keystore" in low or "密钥库" in text or "签名文件" in text:
+        return KEYSTORE_HINT
     if ("preset" in low and any(token in low for token in
                                 ("not found", "couldn", "can't", "invalid",
                                  "no preset"))

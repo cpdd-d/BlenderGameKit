@@ -37,5 +37,10 @@ examples/**/*.import
 examples/**/*.uid
 examples/**/.gk_generated
 
+# 打包产物:『打包设置』默认写到 <Godot 工程>/dist/(.exe / .apk / .zip,
+# 动辄几十上百 MB)。examples 那些工程已经整目录忽略了,这条是给"工程建在
+# 别处"的情况兜底 —— 产物不该进版本库。
+dist/
+
 # Blender 资产目录文件(打开带资产的 .blend 时自动生成,不是源文件)
 blender_assets.cats.txt

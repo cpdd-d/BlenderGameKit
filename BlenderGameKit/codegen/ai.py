@@ -29,7 +29,7 @@ from ..nodes.node_base import (TARGET_SELF, gd_string, snake_case)
 from ..nodes import nodes as node_lib
 
 from .literals import gd_number
-from .registry import _chain, expr_node, stmt_node
+from .registry import expr_node, stmt_node
 
 
 # ==========================================================================
@@ -560,7 +560,11 @@ def _stmt_ai_enable(ctx, node, indent):
     })
     ctx.need_ai_process = True
 
-    _chain(ctx, node, indent, "完成")
+    # ⚠ 这里**不能**自己再 `_chain` 一次(第七十一轮清账):`emit_statement()`
+    #   调完处理器**已经**会沿『完成』往下走,再走一遍下游整段就生成两遍。
+    #   小游戏示例里表现为『界面_套用设计』的三个控件各建两遍;下游要是
+    #   『变量_增减』『音效_播放』这种有副作用的节点,游戏里就是真跑两次。
+    #   (同样的坑『等待_秒』踩过,见 statements._stmt_wait 的注释。)
 
 
 @expr_node("GKNodeAiSee")
@@ -840,7 +844,7 @@ def _stmt_noise(ctx, node, indent):
     ctx.add_line(indent + 2,
                  f'if {hearer}.has_method("_gk_hear_noise"):')
     ctx.add_line(indent + 3, f"{hearer}._gk_hear_noise({at}, {loudness})")
-    _chain(ctx, node, indent, "完成")
+    # ⚠ 同上:不许自己再走一遍下游(见 _stmt_ai_enable 的说明)。
 
 
 @expr_node("GKNodeAiHear")

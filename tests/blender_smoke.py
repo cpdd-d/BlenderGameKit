@@ -3242,6 +3242,28 @@ def main():
               and "with_god_camera" not in preset_props
               and "move_speed" in preset_props,
               str(sorted(preset_props)))
+        # ---- 第七十一轮:把 **invoke** 那条路也真跑一遍 ──────────────────
+        # 侧栏那个按钮是 `layout.operator("gk.character_preset")` —— 默认走
+        # INVOKE,进的是 `invoke()`(弹小对话框)。以前冒烟只跑 `execute`,
+        # invoke 里写坏(属性名打错 / `invoke_props_dialog` 用法变了)没人会
+        # 发现,用户点按钮就炸。真机实测:`-b` 下没有窗口,Blender 会把
+        # `invoke_props_dialog` 回落成"直接执行",所以返回 {'FINISHED'};
+        # 有窗口时是 {'RUNNING_MODAL'} —— 两种都算通。
+        preset_before = {group.name for group in bpy.data.node_groups}
+        invoke_result = None
+        invoke_error = ""
+        try:
+            invoke_result = bpy.ops.gk.character_preset("INVOKE_DEFAULT")
+        except Exception as exc:                          # noqa: BLE001
+            invoke_error = f"{type(exc).__name__}: {exc}"
+        check("预设:invoke(点按钮弹对话框)那条路走得通",
+              invoke_result in ({"FINISHED"}, {"RUNNING_MODAL"}),
+              invoke_error or str(invoke_result))
+        # 这一趟会**再建一套**图(名字带 .001),清掉它,别影响后面的断言
+        for name in {g.name for g in bpy.data.node_groups} - preset_before:
+            extra = bpy.data.node_groups.get(name)
+            if extra is not None:
+                bpy.data.node_groups.remove(extra)
         check("预设:没有顺手打开场景的『上帝摄像机』",
               settings is None or not bool(getattr(settings, "god_camera", False)))
     except Exception as exc:

@@ -12254,6 +12254,27 @@ class TestRound52Packaging(Base):
         other = packaging.failure_hint("ERROR: something else went wrong")
         self.assertIn("something else", other)
 
+    def test_failure_hint_explains_android_keystore(self):
+        """Android 缺签名密钥库:要给出**能照着做**的引导,不能只丢一句原文。
+
+        第七十一轮清账:以前 Godot 打一句 "keystore" 就原样回面板,用户不
+        知道下一步该干什么。现在给三条路 + 一条能直接复制的 keytool 命令。
+        """
+        from BlenderGameKit import packaging
+        hint = packaging.failure_hint(
+            "ERROR: No keystore configured, unable to export APK."
+            " Please check the Android export settings.", "4.7.2")
+        self.assertIn("keystore", hint)
+        self.assertIn("keytool", hint)
+        self.assertIn("编辑器设置", hint)
+        self.assertIn("export_presets.cfg", hint)
+        # 中文界面的 Godot:"未找到密钥库"
+        zh = packaging.failure_hint("错误:未找到密钥库,无法导出 Android")
+        self.assertIn("keytool", zh)
+        # 别把"安装导出模板"那条抢走(模板缺失优先)
+        tmpl = packaging.failure_hint("No export template found", "4.7.2")
+        self.assertIn("管理导出模板", tmpl)
+
     def test_run_release_uses_returncode(self):
         """退出码判成败:Godot 会打一些非致命的 ERROR 字样,不能拿它当判据。"""
         from BlenderGameKit import packaging
@@ -15161,6 +15182,70 @@ class TestRound70ReadyAwaitOrder(Base):
                         code.index("await get_tree().create_timer("),
                         "触发器的信号连接必须排在 `await` 之前")
         self.assert_indent_sane(code)
+
+
+class TestRound71SingleChain(Base):
+    """第七十一轮:处理器**不许自己再走一遍下游**。
+
+    `emit_statement()` 调完处理器之后**已经**会沿『完成』往下走。
+    处理器里再 `_chain(ctx, node, indent)` 就会把下游整段生成**两遍** ——
+    『等待_秒』早就踩过(`_stmt_wait` 的注释),但这两处一直没清:
+
+      * `_stmt_ai_enable`(『AI_启用』)—— 小游戏示例里表现为
+        『界面_套用设计』的三个控件各建两遍(第四十四轮起就在);
+      * `_stmt_noise`(『声音_发出噪音』)。
+
+    不只是白占行数:下游要是『变量_加』『音效_播放』『实例_生成』这种
+    **有副作用**的节点,游戏里就是真的执行两次。
+    """
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        state = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                            gk_behavior="PATROL", gk_patrol_a="点A",
+                            gk_patrol_b="点B", gk_speed=3.0,
+                            gk_stop_distance=0.6)
+        return ai
+
+    def _gen_with(self, groups, tree):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=groups))
+        try:
+            return gen(tree, V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def test_chain_after_ai_enable_runs_once(self):
+        ai = self._ai_tree()
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        # 下游放一个"看得见"的节点:带副作用的节点会被真的执行两次
+        mark = tree.new_node(NN.GKNodePrint, "标记", gk_text="唯一标记")
+        gk_stub.connect(tree, ready, "执行", enable, "执行")
+        gk_stub.connect(tree, enable, "完成", mark, "执行")
+        code, _warnings = self._gen_with([ai], tree)
+        self.assertEqual(code.count("唯一标记"), 1,
+                         "『AI_启用』下游只该走一遍:\n" + code[-600:])
+
+    def test_chain_after_noise_runs_once(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        noise = tree.new_node(NN.GKNodeNoise, "弄出动静",
+                              gk_loudness=12.0, gk_target="玩家")
+        mark = tree.new_node(NN.GKNodePrint, "标记", gk_text="唯一标记")
+        gk_stub.connect(tree, ready, "执行", noise, "执行")
+        gk_stub.connect(tree, noise, "完成", mark, "执行")
+        code, _warnings = gen(tree, V3)
+        self.assertEqual(code.count("唯一标记"), 1,
+                         "『声音_发出噪音』下游只该走一遍:\n" + code[-600:])
 
 
 if __name__ == "__main__":
