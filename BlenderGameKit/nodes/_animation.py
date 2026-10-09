@@ -795,6 +795,14 @@ class GKNodeBlendTree(B.GKStatementNode):
         # 第七十二轮:挑动画时用它分析"哪些动作是这个物体的"(带 ★),
         # 导出侧 `ctx.animation_player` 本来就读这个属性,留空 = 自动查找。
         ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        # ── 叠一层(第七十三轮)──────────────────────────────────────
+        # 受击 / 挥砍这种**一次性**动作叠在走动之上,不打断走路。
+        # 真正那层建在混合树里(BlendTree: base + OneShot),这里只是配置;
+        # 触发用节点『动画_叠层』。
+        ("gk_overlay", "string", "", "叠层动画",
+         "填一个动画名(如 受击)就多一层;留空 = 不叠。用『动画_叠层』触发"),
+        ("gk_overlay_in", "float", 0.15, "叠层淡入", "叠上来用几秒"),
+        ("gk_overlay_out", "float", 0.25, "叠层淡出", "收回去用几秒"),
     )
 
     def draw_buttons(self, context, layout):
@@ -848,6 +856,11 @@ class GKNodeBlendTree2D(B.GKStatementNode):
         ("gk_debug_print", "bool", False, "启动时打印",
          "勾上后建好混合树往 Godot 输出面板打一行"),
         ("gk_player", "node", "", "动画播放器", "留空 = 自动查找"),
+        # 叠一层(第七十三轮):同 1D 那版
+        ("gk_overlay", "string", "", "叠层动画",
+         "填一个动画名(如 受击)就多一层;留空 = 不叠。用『动画_叠层』触发"),
+        ("gk_overlay_in", "float", 0.15, "叠层淡入", "叠上来用几秒"),
+        ("gk_overlay_out", "float", 0.25, "叠层淡出", "收回去用几秒"),
     )
 
     def draw_buttons(self, context, layout):
@@ -858,6 +871,37 @@ class GKNodeBlendTree2D(B.GKStatementNode):
         row.prop(self, "gk_smooth", text="平滑")
         layout.prop(self, "gk_debug_print", text="启动时打印", toggle=True)
         B.draw_target_picker(self, layout, "gk_player")
+
+
+@N
+class GKNodeAnimOverlay(B.GKStatementNode):
+    bl_idname = "GKNodeAnimOverlay"
+    bl_label = "动画_叠层"
+    bl_icon = "ONIONSKIN_ON"
+    gk_category = "动画"
+    gk_doc = ("**触发**那一层一次性动作(受击 / 挥砍 / 拾取):叠在走路之上,"
+              "不打断走路,播完自己收回去。\n"
+              "── 先配,再触发 ──\n"
+              "这一句只管触发;那层动画是在『动画_混合树』/『动画_混合树2D』的"
+              "**『叠层动画』**里填的(填了才会多出那一层)。\n"
+              "『保持秒数』= 0 就按那段动画自己的长度收回去;\n"
+              "『哪一棵混合树』= 同一物体上有多棵时选第几棵(从 0 数)。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_action", "enum", "FIRE", "动作", "",
+         (("FIRE", "播放叠层", "放一次(受击 / 挥砍)"),
+          ("STOP", "立刻收起", "不等播完,马上回到基准动画"))),
+        ("gk_hold", "float", 0.0, "保持秒数", "0 = 按那段动画自己的长度"),
+        ("gk_tree_index", "int", 0, "哪一棵混合树",
+         "同一物体上有多棵混合树时选第几棵(从 0 数)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_action", text="")
+        row.prop(self, "gk_hold", text="保持")
+        layout.prop(self, "gk_tree_index", text="哪一棵")
 
 
 @N

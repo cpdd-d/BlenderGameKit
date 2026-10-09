@@ -1028,25 +1028,31 @@ _BLEND_MAX_POINTS = 6
 
 
 def parse_blend_points(text):
-    """把 `走:0|跑:1` 解析成 [(动画名, 位置)]。解析不出来的跳过。"""
+    """把 `走:0` / `走:0:1.5` 解析成 [(动画名, 位置, 速度)]。解析不出来的跳过。
+
+    第三个字段(速度)是第七十三轮加的:**每个混合点各自播多快**,不写 = 1.0
+    (原速)。位置 / 速度解析不出来时按老规矩兜底(位置 = 序号、速度 = 1)。
+    """
     points = []
     for chunk in str(text or "").split("|"):
         chunk = chunk.strip()
         if not chunk:
             continue
-        if ":" in chunk:
-            name, _, pos = chunk.rpartition(":")
-        else:
-            name, pos = chunk, ""
-        name = name.strip()
+        parts = [piece.strip() for piece in chunk.split(":")]
+        name = parts[0]
         if not name:
             continue
-        try:
-            value = float(pos.strip())
-        except ValueError:
-            # 没写位置(或写坏了)-> 按顺序补 0 / 1 / 2…
-            value = float(len(points))
-        points.append((name, value))
+        values = []
+        for piece in parts[1:3]:
+            try:
+                values.append(float(piece))
+            except ValueError:
+                values.append(None)
+        values = (values + [None, None])[:2]
+        if values[0] is None:
+            values[0] = float(len(points))
+        points.append((name, values[0],
+                       1.0 if values[1] is None else values[1]))
         if len(points) >= _BLEND_MAX_POINTS:
             break
     return points
@@ -1093,6 +1099,24 @@ def _ensure_blend_tree_helper(ctx):
             "    for entry in points:",
             "        var anim_node := AnimationNodeAnimation.new()",
             "        anim_node.animation = StringName(entry[0])",
+            # ── 这个点自己的播放速度(第七十三轮)────────────────────────
+            # ⚠ 没用 AnimationNodeTimeScale:它的 scale 是**参数**(没有属性),
+            #   而混合点里的子节点没有可寻址的名字,设不进去(真机实测:
+            #   `AnimationNodeTimeScale` 的属性列表是空的)。
+            #   改走 AnimationNodeAnimation 自带的"自定义时间轴":
+            #   timeline_length = 原长 / 速度,再把 stretch_time_scale 打开。
+            "        if entry.size() > 2 and float(entry[2]) != 1.0:",
+            "            var _src: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "            if _src != null:",
+            "                anim_node.use_custom_timeline = true",
+            "                anim_node.timeline_length = _src.length / float(entry[2])",
+            "                anim_node.stretch_time_scale = true",
+            # ⚠ 走了自定义时间轴,**循环要看节点自己的 loop_mode**(真机实测:
+            #   不补这一行,2 倍速那段播到 0.5 秒就冻在最后一帧不动了 ——
+            #   Animation 资源上的 loop_mode 在这种情况下不生效)
+            "                if loop:",
+            "                    anim_node.loop_mode = Animation.LOOP_LINEAR",
             "        space.add_blend_point(anim_node, float(entry[1]))",
             "    tree.tree_root = space",
             "    tree.root_node = tree.get_path_to(host)",
@@ -1107,9 +1131,10 @@ def _ensure_blend_tree_helper(ctx):
 
 
 def parse_blend_points_2d(text):
-    """把 `待机:0:0|前走:0:1` 解析成 [(动画名, x, y)](第七十二轮)。
+    """把 `待机:0:0` / `待机:0:0:1.5` 解析成 [(动画名, x, y, 速度)](第七十二轮)。
 
-    和 1D 的 `名:位置` 只差"多一个数";解析不出来的照样跳过,不抛异常 ——
+    和 1D 的 `名:位置` 只差"多一个数";第四个数是**这个点自己的播放速度**
+    (第七十三轮,不写 = 1.0)。解析不出来的照样跳过,不抛异常 ——
     用户手打错一个字符不该让整个导出失败。
     """
     points = []
@@ -1122,37 +1147,46 @@ def parse_blend_points_2d(text):
         if not name:
             continue
         values = []
-        for piece in parts[1:3]:
+        for piece in parts[1:4]:
             try:
                 values.append(float(piece))
             except ValueError:
                 values.append(None)
-        # 补齐两位(`甲` 这种只写了名字的不能下标越界)
-        values = (values + [None, None])[:2]
+        # 补齐三位(`甲` 这种只写了名字的不能下标越界)
+        values = (values + [None, None, None])[:3]
         if values[0] is None:
             values[0] = float(len(points))
         if values[1] is None:
             values[1] = 0.0
-        points.append((name, values[0], values[1]))
+        points.append((name, values[0], values[1],
+                       1.0 if values[2] is None else values[2]))
         if len(points) >= _BLEND_MAX_POINTS:
             break
     return points
 
 
 def format_blend_points(points, dim=1):
-    """把 [(名, 位置)] / [(名, x, y)] 拼回 `混合点` 字符串(第七十二轮)。
+    """把 [(名, 位置[, 速度])] / [(名, x, y[, 速度])] 拼回 `混合点` 字符串。
 
     对话框(『挑动画…』)按这个写回节点;解析用上面那两个 —— 一进一出**同一套
     规则**,免得界面和导出各说各话(界面用 :g 去掉多余小数位,读起来干净)。
+
+    ⚠ 速度 = 1 时**不写**那个字段:老 .blend 打开是 `走:0|跑:1`,改一下位置
+      不该平白多出一串 `:1`。
     """
     chunks = []
     for point in points:
         if dim == 2:
-            name, x, y = point
-            chunks.append(f"{name}:{float(x):g}:{float(y):g}")
+            name, x, y = point[0], point[1], point[2]
+            speed = point[3] if len(point) > 3 else 1.0
+            chunk = f"{name}:{float(x):g}:{float(y):g}"
         else:
-            name, pos = point
-            chunks.append(f"{name}:{float(pos):g}")
+            name, pos = point[0], point[1]
+            speed = point[2] if len(point) > 2 else 1.0
+            chunk = f"{name}:{float(pos):g}"
+        if abs(float(speed) - 1.0) > 0.0001:
+            chunk += f":{float(speed):g}"
+        chunks.append(chunk)
         if len(chunks) >= _BLEND_MAX_POINTS:
             break
     return "|".join(chunks)
@@ -1199,6 +1233,17 @@ def _ensure_blend_tree_2d_helper(ctx):
             "    for entry in points:",
             "        var anim_node := AnimationNodeAnimation.new()",
             "        anim_node.animation = StringName(entry[0])",
+            # 单点倍速:同 1D(见上面那份的说明)
+            "        if entry.size() > 3 and float(entry[3]) != 1.0:",
+            "            var _src: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "            if _src != null:",
+            "                anim_node.use_custom_timeline = true",
+            "                anim_node.timeline_length = _src.length / float(entry[3])",
+            "                anim_node.stretch_time_scale = true",
+            # 循环要补节点自己的 loop_mode(见 1D 那份的说明)
+            "                if loop:",
+            "                    anim_node.loop_mode = Animation.LOOP_LINEAR",
             "        space.add_blend_point(anim_node, Vector2(float(entry[1]), "
             "float(entry[2])))",
             "    tree.tree_root = space",
@@ -1213,6 +1258,30 @@ def _ensure_blend_tree_2d_helper(ctx):
     return name
 
 
+def _points_literal(points, dim=1):
+    """混合点 -> GDScript 字面量(第七十三轮:带上"每点速度")。
+
+    ⚠ **速度全是 1 时不加那一列** —— 老图(没写速度)的生成物要和以前逐字
+      一致;只有真写了速度才补上(helper 里用 `entry.size()` 判断有没有)。
+    """
+    def _speed(point):
+        return point[3] if dim == 2 else point[2]
+
+    with_speed = any(abs(float(_speed(item)) - 1.0) > 0.0001 for item in points)
+    items = []
+    for point in points:
+        if dim == 2:
+            name, x, y = point[0], point[1], point[2]
+            body = f"{gd_string(name)}, {gd_number(x)}, {gd_number(y)}"
+        else:
+            name, pos = point[0], point[1]
+            body = f"{gd_string(name)}, {gd_number(pos)}"
+        if with_speed:
+            body += f", {gd_number(_speed(point))}"
+        items.append(f"[{body}]")
+    return "[" + ", ".join(items) + "]"
+
+
 @stmt_node("GKNodeBlendTree")
 def _stmt_blend_tree(ctx, node, indent):
     """『动画_混合树』:建 AnimationTree(在 _ready 里)+ 每帧推参数。"""
@@ -1222,7 +1291,6 @@ def _stmt_blend_tree(ctx, node, indent):
                  "『混合点』写成 `走:0|跑:1` 这样(多个用 | 分隔)")
         return
 
-    helper = _ensure_blend_tree_helper(ctx)
     # 一个物体上可以放多棵混合树(比如"移动"一棵、"表情"一棵)——
     # 第二棵起自动叫 blend_tree_2 / GKBlendTree_2,不会互相覆盖。
     index = len(ctx.anim_blend_trees)
@@ -1230,14 +1298,25 @@ def _stmt_blend_tree(ctx, node, indent):
     var_name = ctx.declare_var(f"blend_tree{suffix}", "AnimationTree")
     tree_name = f"GKBlendTree{suffix}"
 
-    points_literal = "[" + ", ".join(
-        f"[{gd_string(name)}, {gd_number(pos)}]" for name, pos in points) + "]"
+    points_literal = _points_literal(points, dim=1)
     player = ctx.animation_player(node)
     loop = "true" if bool(getattr(node, "gk_loop", True)) else "false"
+    # 配了『叠层动画』-> 换成"带一层 one-shot"的那份 helper(老图用它原来的)
+    overlay = str(getattr(node, "gk_overlay", "") or "").strip()
+    if overlay:
+        helper = _ensure_blend_tree_layer_helper(ctx)
+        call = (f"{helper}(self, {player}, {points_literal}, "
+                f"{gd_string(tree_name)}, {loop}, {gd_string(overlay)}, "
+                f"{gd_number(getattr(node, 'gk_overlay_in', 0.15))}, "
+                f"{gd_number(getattr(node, 'gk_overlay_out', 0.25))}, 1)")
+        pos_path = "base/blend_position"
+    else:
+        helper = _ensure_blend_tree_helper(ctx)
+        call = (f"{helper}(self, {player}, {points_literal}, "
+                f"{gd_string(tree_name)}, {loop})")
+        pos_path = "blend_position"
     ctx.add_line(indent, f"if {var_name} == null:")
-    ctx.add_line(indent + 1, f"{var_name} = {helper}(self, {player}, "
-                             f"{points_literal}, {gd_string(tree_name)}, "
-                             f"{loop})")
+    ctx.add_line(indent + 1, f"{var_name} = {call}")
 
     socket = ctx._socket(node, "参数")
     if socket is not None and getattr(socket, "is_linked", False):
@@ -1248,7 +1327,8 @@ def _stmt_blend_tree(ctx, node, indent):
     ctx.anim_blend_trees.append({
         "node": node, "var": var_name, "param": param, "smooth": smooth,
         "debug": bool(getattr(node, "gk_debug_print", False)),
-        "names": [name for name, _pos in points],
+        "names": [item[0] for item in points],
+        "overlay": overlay, "pos_path": pos_path,
     })
     ctx.need_anim_tree_process = True
 
@@ -1273,22 +1353,31 @@ def _stmt_blend_tree_2d(ctx, node, indent):
                  "(只想按一个参数混走↔跑,用『动画_混合树』)")
         return
 
-    helper = _ensure_blend_tree_2d_helper(ctx)
     # 1D / 2D 一起数:一个物体上放多棵混合树时名字不能撞。
     index = len(ctx.anim_blend_trees)
     suffix = "" if index == 0 else f"_{index + 1}"
     var_name = ctx.declare_var(f"blend_tree{suffix}", "AnimationTree")
     tree_name = f"GKBlendTree{suffix}"
 
-    points_literal = "[" + ", ".join(
-        f"[{gd_string(name)}, {gd_number(x)}, {gd_number(y)}]"
-        for name, x, y in points) + "]"
+    points_literal = _points_literal(points, dim=2)
     player = ctx.animation_player(node)
     loop = "true" if bool(getattr(node, "gk_loop", True)) else "false"
+    # 配了『叠层动画』-> 走"带一层 one-shot"的那份 helper(第七十三轮)
+    overlay = str(getattr(node, "gk_overlay", "") or "").strip()
+    if overlay:
+        helper = _ensure_blend_tree_layer_helper(ctx)
+        call = (f"{helper}(self, {player}, {points_literal}, "
+                f"{gd_string(tree_name)}, {loop}, {gd_string(overlay)}, "
+                f"{gd_number(getattr(node, 'gk_overlay_in', 0.15))}, "
+                f"{gd_number(getattr(node, 'gk_overlay_out', 0.25))}, 2)")
+        pos_path = "base/blend_position"
+    else:
+        helper = _ensure_blend_tree_2d_helper(ctx)
+        call = (f"{helper}(self, {player}, {points_literal}, "
+                f"{gd_string(tree_name)}, {loop})")
+        pos_path = "blend_position"
     ctx.add_line(indent, f"if {var_name} == null:")
-    ctx.add_line(indent + 1, f"{var_name} = {helper}(self, {player}, "
-                             f"{points_literal}, {gd_string(tree_name)}, "
-                             f"{loop})")
+    ctx.add_line(indent + 1, f"{var_name} = {call}")
 
     def _axis(socket_name, prop, default):
         socket = ctx._socket(node, socket_name)
@@ -1302,7 +1391,8 @@ def _stmt_blend_tree_2d(ctx, node, indent):
         "param_y": _axis("Y", "gk_y", 0.0),
         "smooth": gd_number(getattr(node, "gk_smooth", 0.0)),
         "debug": bool(getattr(node, "gk_debug_print", False)),
-        "names": [name for name, _x, _y in points],
+        "names": [item[0] for item in points],
+        "overlay": overlay, "pos_path": pos_path,
     })
     ctx.need_anim_tree_process = True
 
@@ -1313,10 +1403,211 @@ def _stmt_blend_tree_2d(ctx, node, indent):
                                  f'{points_literal})')
 
 
+def _ensure_blend_tree_layer_helper(ctx):
+    """『叠层』那棵树的辅助函数(第七十三轮)。
+
+    结构(真 Godot 4.7.2 探针实测出来的一版):
+
+        AnimationNodeBlendTree
+          ├─ base    = BlendSpace1D / 2D(混合点那套)
+          ├─ shot    = AnimationNodeAnimation(叠层动画)
+          ├─ oneshot = AnimationNodeOneShot(fadein/fadeout)
+          │      输入 0 "in"   ← base
+          │      输入 1 "shot" ← shot
+          └─ output  ← oneshot
+
+    ── 为什么是这个接法(两个坑都踩过了)──────────────────────────
+    1. `AnimationNodeOneShot` 的两个输入**按名字**是 `in`(0)/ `shot`(1)。
+       第一版把叠层动画接到了 0 上(以为 0 就是"那一段"),于是那个 one-shot
+       根本没有可播的东西 —— 探针实测:触发后画面纹丝不动
+       (`during=0.14`,和基准一模一样)。
+    2. 官网上那版是把 oneshot 直接接到 `output` 的 0 / 1 **两个**输入上;
+      可 4.7.2 的 `output` 节点**只吃一个输入**(探针报
+       `Index p_input_index = 1 is out of bounds ... connections.size() = 1`)。
+       所以中间那层 `AnimationNodeBlend2` + 触发时推 `blend_amount` 是**绕路**
+       —— 现在不需要了:`oneshot` 自己就会"没触发时透传 `in`、触发时混进
+       `shot`、播完按 `fadeout_time` 退回 `in`"。探针实测:基准 0.1 ->
+       触发后 1.88 -> 1.2 秒后回到 0.07。
+
+    ⚠ 参数路径:空间成了子节点 -> `parameters/base/blend_position`。
+    """
+    made = getattr(ctx, "_blend_layer_helper", None)
+    if made:
+        return made
+    name = "_gk_ensure_blend_tree_layer"
+    ctx._blend_layer_helper = name
+    ctx.extra_sections.append({
+        "signature": (f"func {name}(host: Node, player: Node, points: Array, "
+                      f"tree_name: String, loop: bool, overlay: String, "
+                      f"fade_in: float, fade_out: float, dim: int) "
+                      f"-> AnimationTree:"),
+        "lines": [
+            "    if host == null:",
+            "        return null",
+            "    var existing: AnimationTree = host.get_node_or_null(tree_name)",
+            "    if existing != null:",
+            "        return existing",
+            "    if player == null or not (player is AnimationPlayer):",
+            '        push_warning("[GK] 混合树找不到 AnimationPlayer —— 混合不会生效")',
+            "        return null",
+            "    var player_ap := player as AnimationPlayer",
+            "    if loop:",
+            "        for entry in points:",
+            "            var anim: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "            if anim != null and anim.loop_mode == Animation.LOOP_NONE:",
+            "                anim.loop_mode = Animation.LOOP_LINEAR",
+            "    var tree := AnimationTree.new()",
+            "    tree.name = tree_name",
+            "    host.add_child(tree)",
+            "    var space: AnimationRootNode",
+            "    if dim == 2:",
+            "        var space2 := AnimationNodeBlendSpace2D.new()",
+            "        for entry in points:",
+            "            var node2 := AnimationNodeAnimation.new()",
+            "            node2.animation = StringName(entry[0])",
+            "            if entry.size() > 3 and float(entry[3]) != 1.0:",
+            "                var src2: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "                if src2 != null:",
+            "                    node2.use_custom_timeline = true",
+            "                    node2.timeline_length = src2.length / float(entry[3])",
+            "                    node2.stretch_time_scale = true",
+            "                    if loop:",
+            "                        node2.loop_mode = Animation.LOOP_LINEAR",
+            "            space2.add_blend_point(node2, Vector2(float(entry[1]), "
+            "float(entry[2])))",
+            "        space = space2",
+            "    else:",
+            "        var space1 := AnimationNodeBlendSpace1D.new()",
+            "        for entry in points:",
+            "            var node1 := AnimationNodeAnimation.new()",
+            "            node1.animation = StringName(entry[0])",
+            "            if entry.size() > 2 and float(entry[2]) != 1.0:",
+            "                var src1: Animation = player_ap.get_animation("
+            "StringName(entry[0]))",
+            "                if src1 != null:",
+            "                    node1.use_custom_timeline = true",
+            "                    node1.timeline_length = src1.length / float(entry[2])",
+            "                    node1.stretch_time_scale = true",
+            "                    if loop:",
+            "                        node1.loop_mode = Animation.LOOP_LINEAR",
+            "            space1.add_blend_point(node1, float(entry[1]))",
+            "        space = space1",
+            "    var shot := AnimationNodeAnimation.new()",
+            "    shot.animation = StringName(overlay)",
+            # ⚠ 叠层那段**必须播一次**(LOOP_NONE)。要是它带循环(资产里原本
+            #   就是循环的,或者用户拿走路动作当叠层),OneShot 永远等不到它
+            #   结束,人就一直僵在叠层姿势上 —— 而且不报任何错,很难查
+            #   (真机实测:循环的叠层会让它每 0.4 秒重来一遍,停不下来)。
+            "    var shot_anim: Animation = player_ap.get_animation("
+            "StringName(overlay))",
+            "    if shot_anim != null:",
+            "        shot_anim.loop_mode = Animation.LOOP_NONE",
+            "    var oneshot := AnimationNodeOneShot.new()",
+            "    oneshot.fadein_time = fade_in",
+            "    oneshot.fadeout_time = fade_out",
+            "    var bt := AnimationNodeBlendTree.new()",
+            "    bt.add_node(\"base\", space, Vector2(0.0, 0.0))",
+            "    bt.add_node(\"shot\", shot, Vector2(0.0, 120.0))",
+            "    bt.add_node(\"oneshot\", oneshot, Vector2(200.0, 60.0))",
+            "    bt.connect_node(\"oneshot\", 0, \"base\")",
+            "    bt.connect_node(\"oneshot\", 1, \"shot\")",
+            "    bt.connect_node(\"output\", 0, \"oneshot\")",
+            "    tree.tree_root = bt",
+            "    tree.root_node = tree.get_path_to(host)",
+            "    tree.anim_player = tree.get_path_to(player)",
+            "    tree.active = true",
+            "    return tree",
+        ],
+        "empty_body": "    return null",
+        "separator": True,
+    })
+    return name
+
+
+def _ensure_overlay_helpers(ctx):
+    """叠层的"播放 / 收起"两个小函数,返回它们的名字。
+
+    ── 为什么没有 `blend_amount` 了(第七十三轮真机探针改的)────────
+    原来是"显式 Blend2 + 触发时把 blend_amount 推成 1、播完再推回 0"。
+    探针证明 `AnimationNodeOneShot` 自己就会:没触发时透传 `in`(基准)、
+    触发时把 `shot` 混进来、播完按 `fadeout_time` 退回 `in` ——
+    所以那两层管子纯属绕路,现在只有一句"发个请求"。
+
+    ⚠ 『保持秒数』= 0 时**不排定时器**:让那段动画自己播完(OneShot 会按
+      自己的长度退回去)。> 0 才排一个"到点强制收起"。
+      ⚠ 播放那个**故意不是协程**:收尾用 `SceneTreeTimer` + lambda,而不是
+      `await`。协程不 await 直接用,Godot 会警告"coroutine called without
+      await" —— 用户上一轮才因为一串生成代码的告警来找过账。
+    """
+    made = getattr(ctx, "_overlay_helpers", None)
+    if made:
+        return made
+    fire_name = "_gk_overlay_fire"
+    stop_name = "_gk_overlay_stop"
+    ctx._overlay_helpers = (fire_name, stop_name)
+    ctx.extra_sections.append({
+        "signature": f"func {fire_name}(tree: AnimationTree, hold: float) -> void:",
+        "lines": [
+            "    if tree == null:",
+            "        return",
+            "    tree.set(\"parameters/oneshot/request\", "
+            "AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE)",
+            "    if hold <= 0.0:",
+            "        return",
+            "    var timer := tree.get_tree().create_timer(hold)",
+            "    timer.timeout.connect(func() -> void:",
+            "        if tree != null and is_instance_valid(tree):",
+            "            tree.set(\"parameters/oneshot/request\", "
+            "AnimationNodeOneShot.ONE_SHOT_REQUEST_ABORT))",
+        ],
+        "empty_body": "    pass",
+        "separator": True,
+    })
+    ctx.extra_sections.append({
+        "signature": f"func {stop_name}(tree: AnimationTree) -> void:",
+        "lines": [
+            "    if tree == null:",
+            "        return",
+            "    tree.set(\"parameters/oneshot/request\", "
+            "AnimationNodeOneShot.ONE_SHOT_REQUEST_ABORT)",
+        ],
+        "empty_body": "    pass",
+        "separator": True,
+    })
+    return fire_name, stop_name
+
+
+@stmt_node("GKNodeAnimOverlay")
+def _stmt_anim_overlay(ctx, node, indent):
+    """『动画_叠层』:触发某棵混合树上的那一层一次性动作。"""
+    index = int(getattr(node, "gk_tree_index", 0) or 0)
+    trees = getattr(ctx, "anim_blend_trees", ()) or ()
+    if index < 0 or index >= len(trees):
+        ctx.warn("『动画_叠层』找不到要叠的那棵混合树 —— 同一张图里先放一个"
+                 "『动画_混合树』/『动画_混合树2D』;有多棵时用『哪一棵混合树』选")
+        return
+    spec = trees[index]
+    if not spec.get("overlay"):
+        ctx.warn("『动画_叠层』要叠的那棵混合树**没有配『叠层动画』** —— "
+                 "先在那张卡片上填一个动画名(比如 受击),再回来触发")
+        return
+    fire_name, stop_name = _ensure_overlay_helpers(ctx)
+    tree_var = spec["var"]
+    if str(getattr(node, "gk_action", "FIRE") or "FIRE") == "STOP":
+        ctx.add_line(indent, f"{stop_name}({tree_var})")
+        return
+    hold = gd_number(getattr(node, "gk_hold", 0.0))
+    ctx.add_line(indent, f"{fire_name}({tree_var}, {hold})")
+
+
 def _emit_blend_update(ctx, indent, spec):
     """每物理帧把参数推给 blend_position(由 generator 在物理帧段调用)。"""
     var_name = spec["var"]
     smooth = spec["smooth"]
+    # 配了叠层的树,空间成了子节点 -> 参数路径多一层 `base/`(第七十三轮)
+    path = spec.get("pos_path", "blend_position")
     ctx.add_line(indent, f"if {var_name} != null:")
     if spec.get("dim") == 2:
         # 2D 的 blend_position 是 **Vector2** —— lerpf 只认标量,得用 Vector2.lerp
@@ -1328,27 +1619,27 @@ def _emit_blend_update(ctx, indent, spec):
                          f"var {dt} := get_physics_process_delta_time()")
             ctx.add_line(indent + 1,
                          f"var {now}: Vector2 = "
-                         f'{var_name}.get("parameters/blend_position")')
+                         f'{var_name}.get("parameters/{path}")')
             ctx.add_line(indent + 1,
-                         f'{var_name}.set("parameters/blend_position", '
+                         f'{var_name}.set("parameters/{path}", '
                          f"{now}.lerp({param}, "
                          f'clampf({dt} / maxf({smooth}, 0.0001), 0.0, 1.0)))')
         else:
             ctx.add_line(indent + 1,
-                         f'{var_name}.set("parameters/blend_position", {param})')
+                         f'{var_name}.set("parameters/{path}", {param})')
         return
     param = spec["param"]
     if smooth not in ("0.0", "0"):
         dt = ctx.new_temp("bt_dt")
         ctx.add_line(indent + 1, f"var {dt} := get_physics_process_delta_time()")
-        current = f'float({var_name}.get("parameters/blend_position"))'
+        current = f'float({var_name}.get("parameters/{path}"))'
         ctx.add_line(indent + 1,
-                     f'{var_name}.set("parameters/blend_position", '
+                     f'{var_name}.set("parameters/{path}", '
                      f'lerpf({current}, {param}, '
                      f'clampf({dt} / maxf({smooth}, 0.0001), 0.0, 1.0)))')
     else:
         ctx.add_line(indent + 1,
-                     f'{var_name}.set("parameters/blend_position", {param})')
+                     f'{var_name}.set("parameters/{path}", {param})')
 
 
 @stmt_node("GKNodeAnimStateMachine")

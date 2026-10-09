@@ -3599,6 +3599,102 @@ def main():
         check("第七十二轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 受击叠层 + 混合点倍速(第七十三轮,G 组)----
+    # 『动画_混合树』卡片上填『叠层动画』-> 多出一层 one-shot(受击 / 挥砍叠在
+    # 走路之上,播完自己收回);『动画_叠层』节点负责触发 / 立刻收起。
+    # 真 Blender 里验:注册 / 归类 / 卡片画得完,以及"填没填动画"时生成物
+    # 换不换 helper(填了才换成带 Blend2 + OneShot 的那份,参数路径多一层 base/)。
+    try:
+        r73_nodes = __import__(f"{module_name}.nodes.nodes",
+                               fromlist=["ALL_CLASSES"])
+        r73_all = {cls.bl_idname for cls in r73_nodes.ALL_CLASSES}
+        check("叠层:节点已注册", "GKNodeAnimOverlay" in r73_all)
+        check("叠层:归在『动画 ▸ 播放』下",
+              r73_nodes.SUBCATEGORY_OF.get("GKNodeAnimOverlay") == "播放",
+              str(r73_nodes.SUBCATEGORY_OF.get("GKNodeAnimOverlay")))
+
+        r73_tree = bpy.data.node_groups.new("叠层冒烟73", "GKGameLogicTree")
+        r73_ready = r73_tree.nodes.new("GKNodeOnReady")
+        r73_blend = r73_tree.nodes.new("GKNodeBlendTree")
+        r73_over = r73_tree.nodes.new("GKNodeAnimOverlay")
+        r73_tree.links.new(r73_ready.outputs["执行"], r73_blend.inputs["执行"])
+        r73_tree.links.new(r73_blend.outputs["完成"], r73_over.inputs["执行"])
+
+        r73_props = [entry[0] for entry in r73_blend.gk_prop_defs]
+        check("叠层:混合树卡片多了三个叠层栏位",
+              {"gk_overlay", "gk_overlay_in", "gk_overlay_out"} <= set(r73_props),
+              str(r73_props))
+
+        r73_options = {"dimension": "3", "base_class": "CharacterBody3D"}
+        # ① 没填『叠层动画』:老那份 helper,参数路径也不多一层
+        r73_plain, r73_plain_warn = codegen.generate(r73_tree, r73_options)
+        check("叠层:没填动画时用老 helper",
+              "_gk_ensure_blend_tree(self," in r73_plain and
+              "_gk_ensure_blend_tree_layer" not in r73_plain)
+        check("叠层:没填动画时『动画_叠层』会告警",
+              any("叠层动画" in w for w in r73_plain_warn),
+              str(r73_plain_warn)[:200])
+
+        # ② 填上『叠层动画』:换成带 one-shot 的那份 helper
+        r73_blend.gk_overlay = "受击"
+        r73_layered, r73_layered_warn = codegen.generate(r73_tree, r73_options)
+        check("叠层:填了动画后换成带叠层的 helper",
+              "_gk_ensure_blend_tree_layer(self," in r73_layered)
+        check("叠层:叠层树里有 OneShot 且接在 output 上",
+              "AnimationNodeOneShot.new()" in r73_layered and
+              'bt.connect_node("oneshot", 0, "base")' in r73_layered and
+              'bt.connect_node("oneshot", 1, "shot")' in r73_layered and
+              'bt.connect_node("output", 0, "oneshot")' in r73_layered and
+              "AnimationNodeBlend2" not in r73_layered)
+        check("叠层:参数路径多了一层 base/",
+              "parameters/base/blend_position" in r73_layered)
+        check("叠层:填了动画后生成无告警", not r73_layered_warn,
+              str(r73_layered_warn)[:200])
+
+        # 两张卡片都画得完(侧栏瘦身那次的教训:画不出来的卡片没人会发现)
+        class _R73Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r73_draw_error = ""
+        for r73_card in (r73_blend, r73_over):
+            try:
+                r73_card.draw_buttons(bpy.context, _R73Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r73_draw_error = (f"{r73_card.bl_label}: "
+                                  f"{type(exc).__name__}: {exc}")
+                break
+        check("叠层:两张卡片都画得完", not r73_draw_error, r73_draw_error)
+
+        # 混合点倍速:读一遍写一遍还是原样(速度 = 1 时不写那一段)
+        r73_codegen = __import__(f"{module_name}.codegen",
+                                 fromlist=["format_blend_points"])
+        r73_text = "走:0|跑:1:1.5"
+        check("倍速:混合点带速度能原样往返",
+              r73_codegen.format_blend_points(
+                  r73_codegen.parse_blend_points(r73_text)) == r73_text)
+        r73_blend.gk_points = "走:0|跑:1:1.5"
+        r73_speed_code, _r73_speed_warn = codegen.generate(r73_tree, r73_options)
+        # ⚠ 变量名在"带叠层"那份 helper 里是 src1 / node1(不带叠层那份是
+        #   _src),所以只比"共有的那半句",别把变量名写死。
+        check("倍速:生成里带上 use_custom_timeline",
+              "use_custom_timeline = true" in r73_speed_code and
+              ".length / float(entry[2])" in r73_speed_code and
+              "stretch_time_scale = true" in r73_speed_code and
+              # 自定义时间轴下循环要看节点自己的 loop_mode(真机踩到)
+              "loop_mode = Animation.LOOP_LINEAR" in r73_speed_code,
+              r73_speed_code[-200:])
+
+        bpy.data.node_groups.remove(r73_tree)
+    except Exception as exc:
+        check("第七十三轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

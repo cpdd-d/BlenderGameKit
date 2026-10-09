@@ -13619,10 +13619,13 @@ class TestRound61BlendTree(Base):
 
     def test_parse_blend_points(self):
         parse = codegen.animation.parse_blend_points
-        self.assertEqual(parse("走:0|跑:1"), [("走", 0.0), ("跑", 1.0)])
-        self.assertEqual(parse(" 走 : 0.5 "), [("走", 0.5)])
+        # 第三个数是**这个点自己的速度**(第七十三轮),不写 = 1.0
+        self.assertEqual(parse("走:0|跑:1"),
+                         [("走", 0.0, 1.0), ("跑", 1.0, 1.0)])
+        self.assertEqual(parse(" 走 : 0.5 "), [("走", 0.5, 1.0)])
+        self.assertEqual(parse("走:0:1.5"), [("走", 0.0, 1.5)])
         # 没写位置 -> 按顺序补 0/1/2…;空段跳过
-        self.assertEqual(parse("甲||乙"), [("甲", 0.0), ("乙", 1.0)])
+        self.assertEqual(parse("甲||乙"), [("甲", 0.0, 1.0), ("乙", 1.0, 1.0)])
         self.assertEqual(parse(""), [])
         # 超过 6 个点只取前 6 个(BlendSpace 够用,也免得卡片画不下)
         self.assertEqual(len(parse("|".join(f"a{i}:{i}" for i in range(9)))), 6)
@@ -15199,11 +15202,15 @@ class TestRound72BlendSpaces(Base):
     def test_parse_points_2d(self):
         from BlenderGameKit import codegen
         points = codegen.parse_blend_points_2d("待机:0:0|前走:0:1|右走:1:0")
-        self.assertEqual(points, [("待机", 0.0, 0.0), ("前走", 0.0, 1.0),
-                                  ("右走", 1.0, 0.0)])
+        self.assertEqual(points, [("待机", 0.0, 0.0, 1.0),
+                                  ("前走", 0.0, 1.0, 1.0),
+                                  ("右走", 1.0, 0.0, 1.0)])
+        # 第四个数 = 这个点自己的速度(第七十三轮)
+        self.assertEqual(codegen.parse_blend_points_2d("走:0:1:2.5"),
+                         [("走", 0.0, 1.0, 2.5)])
         # 坏数据不抛异常:Y 缺了当 0,位置缺了按序号补
         loose = codegen.parse_blend_points_2d("甲|乙:2")
-        self.assertEqual(loose, [("甲", 0.0, 0.0), ("乙", 2.0, 0.0)])
+        self.assertEqual(loose, [("甲", 0.0, 0.0, 1.0), ("乙", 2.0, 0.0, 1.0)])
         self.assertEqual(codegen.parse_blend_points_2d(""), [])
 
     def test_points_round_trip(self):
@@ -15283,6 +15290,228 @@ class TestRound72BlendSpaces(Base):
         self.assertNotIn("_gk_ensure_blend_tree_2d", code)
         self.assertNotIn("AnimationNodeBlendSpace2D", code)
         self.assertIn("AnimationNodeBlendSpace1D.new()", code)
+
+
+class TestRound73PointSpeed(Base):
+    """第七十三轮(G 组):**每个混合点自己播多快**。
+
+    ⚠ 实现走的是 `AnimationNodeAnimation.use_custom_timeline` +
+      `timeline_length = 原长 / 速度`,**不是** `AnimationNodeTimeScale` ——
+      后者的 scale 是"参数"而不是属性,而混合点里的子节点没有可寻址的名字
+      (真机实测:它的属性列表是空的)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_speed_field_round_trip(self):
+        from BlenderGameKit import codegen
+        # 速度 = 1 时不写那一段:老文本改个位置不该平白多出一串 :1
+        self.assertEqual(
+            codegen.format_blend_points([("走", 0.0, 1.0)], dim=1), "走:0")
+        self.assertEqual(
+            codegen.format_blend_points([("走", 0.0, 1.6)], dim=1), "走:0:1.6")
+        self.assertEqual(
+            codegen.format_blend_points([("待机", 0.0, 0.0, 1.0)], dim=2),
+            "待机:0:0")
+        self.assertEqual(
+            codegen.format_blend_points([("待机", 0.0, 0.0, 0.5)], dim=2),
+            "待机:0:0:0.5")
+        text = "走:0|跑:1:1.5"
+        self.assertEqual(
+            codegen.format_blend_points(codegen.parse_blend_points(text)), text)
+
+    def test_speed_generates_custom_timeline(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "走跑", gk_points="走:0|跑:1:1.5")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("use_custom_timeline = true", code)
+        self.assertIn("timeline_length = _src.length / float(entry[2])", code)
+        self.assertIn("stretch_time_scale = true", code)
+        # ⚠ 真机探针:走了自定义时间轴,**循环得看节点自己的 loop_mode** ——
+        #   不补这一行,2 倍速那段播到 0.5 秒就冻在最后一帧不动了。
+        self.assertIn("anim_node.loop_mode = Animation.LOOP_LINEAR", code)
+        # 带速度那一列的点和不带速度的点在同一个字面量里
+        self.assertIn('["走", 0.0, 1.0]', code)
+        self.assertIn('["跑", 1.0, 1.5]', code)
+
+    def test_without_speed_literal_stays_two_fields(self):
+        """没写速度 -> 字面量还是两段式(老图产物逐字不变)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree, "走跑", gk_points="走:0|跑:1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('[["走", 0.0], ["跑", 1.0]]', code)
+        # helper 里那段是"有速度才生效"的守卫,不写速度时是空操作
+        self.assertIn("if entry.size() > 2 and float(entry[2]) != 1.0:", code)
+
+    def test_2d_speed_uses_fourth_field(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeBlendTree2D, "八向",
+                             gk_points="甲:0:0|乙:1:0|丙:0:1:2.0")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('["丙", 0.0, 1.0, 2.0]', code)
+        self.assertIn("timeline_length = _src.length / float(entry[3])", code)
+
+
+class TestRound73OverlayLayer(Base):
+    """第七十三轮(G 组):**受击叠层** —— 一次性动作叠在走动之上。
+
+    受击 / 挥砍这种动作要"叠"在走路之上(走路不中断),播完自己收回去。
+
+    ── 结构(真 Godot 4.7.2 探针实测出来的一版)────────────────────
+        BlendTree ─ base    = BlendSpace 1D / 2D(混合点那套)
+                    shot    = AnimationNodeAnimation(叠层动画)
+                    oneshot = AnimationNodeOneShot
+                                 输入 0 "in"   ← base
+                                 输入 1 "shot" ← shot
+                    output ← oneshot
+
+    ⚠ 两个坑都是探针抓出来的:
+      1. `AnimationNodeOneShot` 的两个输入按名字是 `in`(0)/`shot`(1)。
+         第一版把叠层动画接到 0 上(以为 0 是"那一段"),触发后画面纹丝
+         不动(`during=0.14`,和基准一样)。
+      2. `output` 节点**只吃一个输入** —— 官网上"把 oneshot 接到 output 的
+         0 / 1 两个输入"那版接不上,所以第一版绕了一圈显式 `Blend2` +
+         推 `blend_amount`。其实 `oneshot` 自己就会"没触发透传 in、触发混进
+         shot、播完按 fadeout 退回 in",那层管子不需要。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _blend(self, tree, event, points="走:0|跑:1", overlay=None):
+        """放一个混合树并接上执行线;overlay 非空 = 配了叠层动画。"""
+        kwargs = {"gk_points": points}
+        if overlay is not None:
+            kwargs["gk_overlay"] = overlay
+        node = tree.new_node(NN.GKNodeBlendTree, "走跑", **kwargs)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        return node
+
+    def test_node_registered(self):
+        cls = getattr(NN, "GKNodeAnimOverlay", None)
+        self.assertIsNotNone(cls, "『动画_叠层』没注册")
+        self.assertEqual(cls.bl_label, "动画_叠层")
+        self.assertEqual(cls.gk_category, "动画")
+        self.assertEqual([spec["name"] for spec in cls.gk_inputs], ["执行"])
+        self.assertEqual([spec["name"] for spec in cls.gk_outputs], ["完成"])
+
+    def test_overlay_tree_structure(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        self._blend(tree, event, overlay="受击")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_ensure_blend_tree_layer(", code)
+        self.assertIn("AnimationNodeOneShot.new()", code)
+        # oneshot 的 0 是 "in"(基准)、1 是 "shot"(叠层);output 只吃一个输入
+        self.assertIn('bt.connect_node("oneshot", 0, "base")', code)
+        self.assertIn('bt.connect_node("oneshot", 1, "shot")', code)
+        self.assertIn('bt.connect_node("output", 0, "oneshot")', code)
+        # 不再绕 Blend2 / 推 blend_amount(oneshot 自己会退回去)
+        self.assertNotIn("AnimationNodeBlend2", code)
+        self.assertNotIn("blend_amount", code)
+        # 叠层那段必须"播一次":循环的话 OneShot 永远等不到它结束,
+        # 人会一直僵在叠层姿势上(真机实测)
+        self.assertIn("shot_anim.loop_mode = Animation.LOOP_NONE", code)
+        # 空间成了子节点 -> 参数路径多一层 base/
+        self.assertIn('set("parameters/base/blend_position"', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_fire_plays_overlay(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        self._blend(tree, event, overlay="受击")
+        fire = tree.new_node(NN.GKNodeAnimOverlay, "挨打", gk_action="FIRE",
+                             gk_hold=0.4, gk_tree_index=0)
+        gk_stub.connect(tree, event, "执行", fire, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_overlay_fire(", code)
+        self.assertIn("_gk_overlay_fire(blend_tree, 0.4)", code)
+        self.assertIn("ONE_SHOT_REQUEST_FIRE", code)
+        # 『保持秒数』不是 0 -> 到点强制收起
+        self.assertIn("create_timer(hold)", code)
+        # 收尾**不是协程**(用 SceneTreeTimer + lambda):不 await 的协程
+        # 会让 Godot 打一条"coroutine called without await"的告警。
+        self.assertNotIn("await ", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_hold_zero_lets_it_finish(self):
+        """『保持秒数』= 0:不排定时器,让那段动画自己播完再退回去。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        self._blend(tree, event, overlay="受击")
+        fire = tree.new_node(NN.GKNodeAnimOverlay, "挨打", gk_action="FIRE")
+        gk_stub.connect(tree, event, "执行", fire, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_overlay_fire(blend_tree, 0.0)", code)
+        self.assertIn("if hold <= 0.0:", code)
+
+    def test_stop_aborts_overlay(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        self._blend(tree, event, overlay="受击")
+        stop = tree.new_node(NN.GKNodeAnimOverlay, "收手", gk_action="STOP")
+        gk_stub.connect(tree, event, "执行", stop, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_overlay_stop(blend_tree)", code)
+        self.assertIn("ONE_SHOT_REQUEST_ABORT", code)
+        # 『立刻收起』不该顺手放一遍(比的是**调用**,函数定义本来就一起带上)
+        self.assertNotIn("_gk_overlay_fire(blend_tree", code)
+
+    def test_warns_without_tree(self):
+        """图里根本没有混合树 —— 要说得出话,而不是生成一处空引用。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        fire = tree.new_node(NN.GKNodeAnimOverlay, "挨打", gk_action="FIRE")
+        gk_stub.connect(tree, event, "执行", fire, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("找不到" in w and "混合树" in w for w in warnings),
+                        warnings)
+        # 告警了就连那两个小函数都不该生成
+        self.assertNotIn("func _gk_overlay_fire(", code)
+
+    def test_warns_when_overlay_not_configured(self):
+        """树在,但那张卡片没填『叠层动画』—— 叠层建不起来,要说清楚。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        self._blend(tree, event)  # 没配 overlay
+        fire = tree.new_node(NN.GKNodeAnimOverlay, "挨打", gk_action="FIRE")
+        gk_stub.connect(tree, event, "执行", fire, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("叠层动画" in w for w in warnings), warnings)
+        self.assertNotIn("func _gk_overlay_fire(", code)
+
+    def test_without_overlay_keeps_old_output(self):
+        """没配叠层的老图:用的还是原来那份 helper,参数路径也不多一层。
+
+        这是本项目的验收线 —— 老 .blend 重新导出,生成物要逐字不变。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        self._blend(tree, event)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ensure_blend_tree(self,", code)
+        self.assertNotIn("_gk_ensure_blend_tree_layer", code)
+        self.assertNotIn("AnimationNodeOneShot", code)
+        # 参数路径**不带** base/(带引号比对,免得被 base/ 那串蹭到)
+        self.assertIn('set("parameters/blend_position"', code)
+        self.assertNotIn('set("parameters/base/', code)
 
 
 class TestRound71SingleChain(Base):

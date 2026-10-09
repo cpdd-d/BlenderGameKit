@@ -175,6 +175,7 @@ SUBCATEGORY_OF = {
     "GKNodeAnimStateMachineRef": "播放",   # 动画_状态机
     "GKNodeBlendTree": "播放",   # 动画_混合树
     "GKNodeBlendTree2D": "播放",  # 动画_混合树2D(第七十二轮)
+    "GKNodeAnimOverlay": "播放",  # 动画_叠层(第七十三轮)
     "GKNodeAnimPlaying": "播放",   # 动画_是否在播
     "GKNodeAnimPause": "播放",   # 动画_暂停/继续
     "GKNodeAnimStop": "播放",   # 动画_停止

@@ -1525,13 +1525,15 @@ def blend_anim_items(self=None, _context=None):
 
 
 class GK_BlendPointRow(bpy.types.PropertyGroup):
-    """混合点编辑器里的一行(动画名 + 位置;2D 用 X / Y)。"""
+    """混合点编辑器里的一行(动画名 + 位置 + 速度;2D 用 X / Y)。"""
 
     group_target: StringProperty(name="目标物体", default="")
     anim: EnumProperty(name="动画", items=blend_anim_items)
     pos: FloatProperty(name="位置", default=0.0)
     x: FloatProperty(name="X", default=0.0)
     y: FloatProperty(name="Y", default=0.0)
+    speed: FloatProperty(name="速度", default=1.0, min=0.05, max=10.0,
+                         description="这一段自己播多快(1 = 原速)")
 
 
 class GK_OT_EditBlendPoints(bpy.types.Operator):
@@ -1578,13 +1580,14 @@ class GK_OT_EditBlendPoints(bpy.types.Operator):
         target = self._target_name(node)
         rows = self._parse(str(getattr(node, "gk_points", "") or ""))
         self.points.clear()
-        for anim, x, y in rows:
+        for anim, x, y, speed in rows:
             row = self.points.add()
             row.group_target = target
             row.anim = anim
             row.x = x
             row.y = y
             row.pos = x
+            row.speed = speed
         # 多留一行空的当"再加一个"的入口(最多 6 行);至少两行,
         # 免得用户看到一行的对话框不知道该往哪添。
         if len(self.points) < 2:
@@ -1598,20 +1601,23 @@ class GK_OT_EditBlendPoints(bpy.types.Operator):
 
     # ---- 字符串 <-> 行(和导出用同一个解析器)--------------------------
     def _parse(self, text):
+        """解析成 (动画名, 位置/x, y, 速度) —— 两种模式都补齐四位。"""
         if self.mode == "2D":
-            return [(name, x, y)
-                    for name, x, y in codegen.parse_blend_points_2d(text)]
-        return [(name, pos, 0.0)
-                for name, pos in codegen.parse_blend_points(text)]
+            return [(name, x, y, speed)
+                    for name, x, y, speed in
+                    codegen.parse_blend_points_2d(text)]
+        return [(name, pos, 0.0, speed)
+                for name, pos, speed in codegen.parse_blend_points(text)]
 
     def _build(self):
         """行 -> 字符串。拼串规则和导出**同一份**(codegen.format_blend_points)。"""
         if self.mode == "2D":
-            rows = [(str(row.anim or "").strip(), row.x, row.y)
+            rows = [(str(row.anim or "").strip(), row.x, row.y, row.speed)
                     for row in self.points]
             rows = [item for item in rows if item[0]]
             return codegen.format_blend_points(rows, dim=2)
-        rows = [(str(row.anim or "").strip(), row.pos) for row in self.points]
+        rows = [(str(row.anim or "").strip(), row.pos, row.speed)
+                for row in self.points]
         rows = [item for item in rows if item[0]]
         return codegen.format_blend_points(rows, dim=1)
 
@@ -1642,8 +1648,10 @@ class GK_OT_EditBlendPoints(bpy.types.Operator):
                 line.prop(row, "y", text="Y")
             else:
                 line.prop(row, "pos", text="位置")
+            line.prop(row, "speed", text="速度")
         layout.label(text="选『— 不用 —』= 去掉这一行;只有填了动画的行才算数",
                      icon="INFO")
+        layout.label(text="速度 1 = 原速;想让跑更快 / 慢动作,调这一列", icon="INFO")
 
 
 class GK_OT_PickAnimTree(bpy.types.Operator):
