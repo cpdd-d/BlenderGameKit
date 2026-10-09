@@ -778,11 +778,17 @@ class Generator:
                 if event.get("kind") != "running":
                     continue
                 var = event.get("var", "_gk_running")
-                lines.add(1, f"if {event['player']} != null "
-                             f"and not {event['name']}.is_empty():")
+                # ── 播放器引用在**本函数里**重新取一份(第七十六轮的编译错)──
+                # `_stmt_play_anim` 里那个 `_ap2` 是 _ready 的**局部变量**,
+                # 拿到 _process 里用就是 "Identifier not declared"。
+                # 表达式本身在哪儿都算得出(而且自带缓存,不重复查找)。
+                holder = self.ctx.new_temp("ap")
+                lines.add(1, f"var {holder} := {event['player_expr']}")
+                lines.add(1, f"if {holder} != null "
+                             f"and not {event['name_expr']}.is_empty():")
                 lines.add(2, f"var {var}: bool = "
-                             f"{event['player']}.current_animation == {event['name']} "
-                             f"and {event['player']}.is_playing()")
+                             f"{holder}.current_animation == {event['name_expr']} "
+                             f"and {holder}.is_playing()")
                 lines.add(2, f"if {var}:")
                 self.ctx._active.clear()
                 self.ctx._current_event = event["func"]
@@ -806,7 +812,8 @@ class Generator:
                 lines.add(1, "var _name: String = String(__name)")
                 # 比对名字,避免"别的代码播了同一个播放器上的另一个动画"
                 # 时误触发这段逻辑。
-                lines.add(1, f"if {event['name']} != _name:")
+                # ⚠ 这里同样是**表达式**不是 _ready 的局部变量(第七十六轮)。
+                lines.add(1, f"if {event['name_expr']} != _name:")
                 lines.add(2, "return")
                 self.ctx._active.clear()
                 self.ctx._current_event = event["func"]

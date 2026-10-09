@@ -3780,6 +3780,65 @@ def main():
         check("第七十五轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 动画_播放三个事件出口的编译错(第七十六轮,顺手修的老毛病)----
+    # 三个出口的代码分别落在 _process / 信号回调里,却引用了 _ready 的
+    # **局部变量**(`_ap2` / `_anim1`)—— 真 Godot 直接报
+    #     Parse Error: Identifier "_ap2" not declared in the current scope
+    # 整份脚本加载不了(离线测试只 grep 字符串,所以一直没抓到)。
+    try:
+        r76_tree = bpy.data.node_groups.new("动画事件出口76", "GKGameLogicTree")
+        r76_ready = r76_tree.nodes.new("GKNodeOnReady")
+        r76_play = r76_tree.nodes.new("GKNodePlayAnim")
+        r76_play.gk_anim_name = "攻击"
+        r76_tree.links.new(r76_ready.outputs["执行"], r76_play.inputs["执行"])
+        for r76_socket, r76_text in (("开始时", "开始"), ("每帧", "每帧中"),
+                                     ("结束时", "完了")):
+            r76_printer = r76_tree.nodes.new("GKNodePrint")
+            r76_printer.gk_text = r76_text
+            r76_tree.links.new(r76_play.outputs[r76_socket],
+                               r76_printer.inputs["执行"])
+        r76_code, _r76_warn = codegen.generate(
+            r76_tree, {"dimension": "3", "base_class": "CharacterBody3D"})
+
+        # 生成物按函数切开 —— 跨函数引用只有切开才看得见
+        # (整份 grep 是抓不到的:名字确实出现过,只是不在这个作用域里)
+        r76_funcs, r76_cur, r76_buf = {}, None, []
+        for r76_line in r76_code.splitlines():
+            if r76_line.startswith("func "):
+                if r76_cur:
+                    r76_funcs[r76_cur] = "\n".join(r76_buf)
+                r76_cur = r76_line.split("(")[0][len("func "):]
+                r76_buf = []
+            elif r76_cur:
+                r76_buf.append(r76_line)
+        if r76_cur:
+            r76_funcs[r76_cur] = "\n".join(r76_buf)
+
+        r76_borrowed = []
+        for r76_fn, r76_src in r76_funcs.items():
+            for r76_var in re.findall(r"(?<!_gk)_(?:ap|anim)\d+", r76_src):
+                if f"var {r76_var}" not in r76_src:
+                    r76_borrowed.append(f"{r76_fn}:{r76_var}")
+        check("事件出口:_process/回调不再借用别处的局部变量",
+              not r76_borrowed, str(r76_borrowed))
+
+        r76_lines = r76_code.splitlines()
+        r76_play_at = next((i for i, ln in enumerate(r76_lines)
+                            if ".play(" in ln), -1)
+        r76_conn_at = next((i for i, ln in enumerate(r76_lines)
+                            if "animation_started.connect(" in ln), -1)
+        check("事件出口:先接信号再 play(否则『开始时』漏掉第一次)",
+              0 <= r76_conn_at < r76_play_at,
+              f"connect@{r76_conn_at} play@{r76_play_at}")
+        check("事件出口:三个出口的代码都生成了",
+              "每帧中" in r76_code and "开始" in r76_code
+              and "完了" in r76_code)
+        bpy.data.node_groups.remove(r76_tree)
+    except Exception as exc:
+        check("第七十六轮(事件出口编译错)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

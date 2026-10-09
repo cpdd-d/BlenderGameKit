@@ -167,7 +167,14 @@ def _stmt_play_anim(ctx, node, indent):
         var_name = f"_gk_run_{plain}"
         numbered.append((suffix, handler, signal_name, var_name))
         ctx.anim_events.append({
-            "player": player_temp, "name": name_temp,
+            # ── 这里存的是**表达式**,不是 _ready 里那两个局部变量 ────────
+            # 这三个出口的代码落在**别的函数**里(_process / 信号回调),
+            # 而 `player_temp` / `name_temp` 只活在当前这个函数的作用域里。
+            # 第一版存的是它们,真 Godot 直接报
+            #     Identifier "_ap2" not declared in the current scope
+            # 整份脚本加载不了(第七十六轮修)。表达式在哪个函数里都算得出:
+            # 播放器那一串自带缓存(_gk_find_animation_player 查过就记下)。
+            "player_expr": player, "name_expr": anim,
             "func": handler, "node": node, "output": output_name,
             "indent": indent,
             "kind": "running" if suffix == "running" else "signal",
@@ -191,6 +198,20 @@ def _stmt_play_anim(ctx, node, indent):
                      f"if {player_temp}.current_animation != {name_temp} "
                      f"or not {player_temp}.is_playing():")
         body = indent + 2
+    # ── 接线必须在**成功分支内**,而且在 play() **之前**(踩过两次坑)────
+    # 坑一:上一版把 connect 写在下面的 `else:` 里 —— 那是"动画不存在"的
+    #       分支,于是信号只在**播放失败**时接上,正常播放永远不接。
+    # 坑二(第七十六轮真机抓到):`play()` 会**同步**发 animation_started,
+    #       先 play 再 connect 就漏掉这一次。而『动画_播放』接在
+    #       每当_准备 后面时,**那就是唯一的一次** —— 于是『开始时』永远不响
+    #       (真 Godot 探针:开始=0,结束=1,每帧=48)。
+    # 用 CONNECT_ONE_SHOT:触发一次自动断开,重复播放不会累积连接。
+    for _suffix, handler, signal_name, _var in numbered:
+        if signal_name is None:
+            continue
+        ctx.add_line(body,
+                     f"{player_temp}.{signal_name}.connect({handler}, "
+                     f"CONNECT_ONE_SHOT)")
     if end_sec > 0:
         # 有结束帧 -> 用 play_section 一次把 起始/结束/Blend-In/速度 全给它。
         # (Godot 4.3+ 的 API:`play_section(名, 起, 止, 混合, 速度)`)
@@ -206,16 +227,6 @@ def _stmt_play_anim(ctx, node, indent):
             # 第二个参数 true = 立刻刷新姿势,不然要等下一帧才跳过去。
             ctx.add_line(body,
                          f"{player_temp}.seek({gd_number(start_sec)}, true)")
-    # ── 接线必须在**成功分支内**、紧挨着 play()(踩过的坑)──────────
-    # 上一版把 connect 写在下面的 `else:` 里 —— 那是"动画不存在"的分支,
-    # 于是信号只在**播放失败**时接上,正常播放永远不接。
-    # 用 CONNECT_ONE_SHOT:触发一次自动断开,重复播放不会累积连接。
-    for _suffix, handler, signal_name, _var in numbered:
-        if signal_name is None:
-            continue
-        ctx.add_line(body,
-                     f"{player_temp}.{signal_name}.connect({handler}, "
-                     f"CONNECT_ONE_SHOT)")
     ctx.add_line(indent, "else:")
 
     # 动画不存在时的警告

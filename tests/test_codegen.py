@@ -82,6 +82,30 @@ class Base(unittest.TestCase):
             spaces = len(line) - len(line.lstrip(" "))
             self.assertEqual(spaces % 4, 0, f"第 {number} 行缩进不是 4 的倍数: {line!r}")
 
+    @staticmethod
+    def functions(code):
+        """把生成物切成 {函数名: 函数体} —— 用来查"跨函数引用"。
+
+        ── 为什么要按函数切(真机抓到的 bug)────────────────────────
+        生成物里同一个名字可能**在 _ready 里声明、却在 _process 里用** ——
+        这种"看起来有,其实没在作用域里"的问题,grep 整份文件是抓不到的
+        (名字确实出现过),只有按函数切开看才暴露。
+        """
+        funcs = {}
+        name = None
+        body = []
+        for line in code.splitlines():
+            if line.startswith("func "):
+                if name is not None:
+                    funcs[name] = "\n".join(body)
+                name = line.split("(")[0][len("func "):]
+                body = []
+            elif name is not None:
+                body.append(line)
+        if name is not None:
+            funcs[name] = "\n".join(body)
+        return funcs
+
 
 class TestBasic(Base):
     def test_empty_tree_warns(self):
@@ -4336,14 +4360,19 @@ class TestAnimationEvents(Base):
 
         踩过的坑:第一版把 connect 写在 `else:` 里 —— 那是"动画不存在"
         的分支,于是信号只在**播放失败**时接上,正常播放永远不接。
+
+        ⚠ 第七十六轮把顺序改了:connect 从 play() **之后**挪到**之前** ——
+        见 test_started_listener_is_registered_before_play。判据变成
+        "在 『有这段动画』 那条分支里、在警告之前"。
         """
         code, _ = self._build({"结束时": "播完了"})
         lines = code.splitlines()
-        play_at = next(i for i, ln in enumerate(lines) if ".play(" in ln)
+        has_at = next(i for i, ln in enumerate(lines)
+                      if ".has_animation(" in ln)
         connect_at = next(i for i, ln in enumerate(lines)
                           if "animation_finished.connect(" in ln)
         warn_at = next(i for i, ln in enumerate(lines) if "push_warning" in ln)
-        self.assertGreater(connect_at, play_at, "接线应该在 play() 之后")
+        self.assertGreater(connect_at, has_at, "接线要在『有这段动画』分支里")
         self.assertLess(connect_at, warn_at, "接线不能在警告(else 分支)里")
 
     def test_running_generates_process_check(self):
@@ -4390,6 +4419,52 @@ class TestAnimationEvents(Base):
         code, _ = self._build({"结束时": "播完了"})
         self.assertIn("StringName", code)
         self.assertIn("!= _name", code)
+
+    # ── 第七十六轮:顺手修的真机 bug ────────────────────────────────
+    # 三个事件出口的代码分别落在**别的函数**里(_process / 信号回调),
+    # 而它们引用的 `_ap2`(播放器)/ `_anim1`(动画名)是 **_ready 里的局部
+    # 变量** —— 真 Godot 报
+    #     Parse Error: Identifier "_ap2" not declared in the current scope
+    # 整份脚本加载不了。老测试只 grep 字符串(`is_playing()` 在不在),
+    # 名字确实出现过,所以这条一直没被抓到。
+
+    def test_running_block_is_self_contained(self):
+        """`_process` 里用到的播放器必须**在 _process 里自己声明**。"""
+        code, _ = self._build({"每帧": "播放中"})
+        body = self.functions(code)["_process"]
+        used = set(re.findall(r"(?<!_gk)_(?:ap|anim)\d+", body))
+        self.assertTrue(used, "『每帧』那段应该引用播放器/动画名")
+        for name in sorted(used):
+            self.assertIn(f"var {name}", body,
+                          f"_process 用了 {name},却没在本函数里声明 —— "
+                          f"跨函数引用会让 Godot 拒绝整份脚本")
+
+    def test_started_listener_is_registered_before_play(self):
+        """『开始时』的回调必须在 `play()` **之前**接上。
+
+        真机验过(第七十六轮):`play()` 会**同步**发 `animation_started` ——
+        先 play 再 connect 就漏掉这一次。而『动画_播放』接在 每当_准备 后面
+        时那**就是唯一的一次**,于是『开始时』永远不响。
+        """
+        code, _ = self._build({"开始时": "开始"})
+        lines = code.splitlines()
+        play_at = next(i for i, ln in enumerate(lines) if ".play(" in ln)
+        connect_at = next(i for i, ln in enumerate(lines)
+                          if "animation_started.connect(" in ln)
+        self.assertLess(connect_at, play_at,
+                        "要先接信号再 play,否则第一次播放接不到")
+
+    def test_signal_callbacks_do_not_borrow_locals(self):
+        """信号回调里不许引用别的函数的局部变量。"""
+        code, _ = self._build({"开始时": "开始", "结束时": "完了"})
+        funcs = self.functions(code)
+        callbacks = {name: body for name, body in funcs.items()
+                     if name.startswith(("_gk_started_", "_gk_finished_"))}
+        self.assertEqual(len(callbacks), 2, sorted(funcs))
+        for name, body in callbacks.items():
+            borrowed = re.findall(r"(?<!_gk)_(?:ap|anim)\d+", body)
+            self.assertEqual(borrowed, [],
+                             f"{name} 引用了别的函数的局部变量 {borrowed}")
 
 
 class TestAnimationStateMachine(Base):
