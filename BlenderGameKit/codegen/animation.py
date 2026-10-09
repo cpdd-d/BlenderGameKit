@@ -528,6 +528,36 @@ def _anim_speed_func(ctx, graph, node_lib):
     return func_name
 
 
+def _state_blend_time(state):
+    """状态上的『过渡时长』(秒)。读不出来当 0 = 硬切。"""
+    try:
+        return float(getattr(state, "gk_blend_time", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _edge_blend_time(edge):
+    """这条转移该用几秒过渡(第七十五轮)。
+
+    用户 2026-10-09 拍板:**两处都要** ——
+      * 转场上填了(>0)就用它(可以按"从哪来"分开调)
+      * 没填就用**目标状态**上那个兜底值(直连边、起始状态也照顾到)
+      * 两处都是 0 -> 硬切(老图一字不变)
+    """
+    trans = edge.get("transition")
+    if trans is not None:
+        try:
+            value = float(getattr(trans, "gk_blend_time", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    target = edge.get("to")
+    if target is None:
+        return 0.0
+    return _state_blend_time(target)
+
+
 def _emit_state_hooks(ctx, graph, player_temp, speed_func=None):
     """给每个"有事要做"的状态生成『进入时』『离开时』函数。
 
@@ -789,6 +819,10 @@ def _stmt_anim_tree_ref(ctx, node, indent):
     # 变成一大坨;拆成函数之后,每个状态自己的逻辑在脚本里也是**分开的一块**。
     # ── 状态速率(第三十九轮):有状态填了非 1.0 才生成速度函数 ──────
     speed_func = _anim_speed_func(ctx, graph, node_lib)
+    # ── 过渡时长(第七十五轮)─────────────────────────────────────────
+    # 只有**真的会用到**才给进入函数加 blend 参数:谁都没填(= 全是硬切)
+    # 时,签名还是 `(next_state: String)`,老图生成物一字不变。
+    has_blend = any(_edge_blend_time(edge) > 0 for edge in graph["edges"])
     enter_hooks, exit_hooks = _emit_state_hooks(ctx, graph, player_temp,
                                                 speed_func=speed_func)
 
@@ -801,7 +835,8 @@ def _stmt_anim_tree_ref(ctx, node, indent):
                                            finished_var,
                                            enter_hooks=enter_hooks,
                                            exit_hooks=exit_hooks,
-                                           speed_func=speed_func)
+                                           speed_func=speed_func,
+                                           blend_param=has_blend)
 
     # 起始状态 = 图里**没有任何边指向**的那个状态(照 UE5 的 Entry 节点);
     # 放了『动画_开始』就以它连的那个为准(显式指定,不用猜)。
@@ -854,12 +889,13 @@ def _stmt_anim_tree_ref(ctx, node, indent):
             "node": node, "graph": graph, "var": var_name,
             "player": player_temp, "enter": enter_func, "debug": debug,
             "finished": finished_var, "gate": started,
-            "finish": finish_func,
+            "finish": finish_func, "blend": has_blend,
         })
         ctx.need_anim_tree_process = True
         return
     _emit_state_graph(ctx, indent, graph, var_name, player_temp, enter_func,
-                      finished_var, finish_func, started)
+                      finished_var, finish_func, started,
+                      blend_enabled=has_blend)
 
 
 def _find_animation_tree(name):
@@ -940,7 +976,8 @@ def _edge_condition(ctx, edge, player_temp, finished_var=None):
 
 
 def _emit_state_graph(ctx, indent, graph, var_name, player_temp, enter_func,
-                      finished_var=None, finish_func=None, gate=None):
+                      finished_var=None, finish_func=None, gate=None,
+                      blend_enabled=False):
     """把状态图生成成 if/elif 链。
 
     每个状态一段,状态内部按画布上下顺序判转移:
@@ -999,7 +1036,15 @@ def _emit_state_graph(ctx, indent, graph, var_name, player_temp, enter_func,
                 continue
             ctx.add_line(body_indent + 1,
                          f"{'if' if first else 'elif'} {condition}:")
-            ctx.add_line(body_indent + 2, f"{enter_func}({gd_string(target)})")
+            # 过渡时长:只有本次生成**开了 blend 参数**时才带上(老图不带,
+            # 生成物一字不变)。填 0 的那条走默认值 = 硬切,也不带。
+            arg = ""
+            if blend_enabled:
+                blend = _edge_blend_time(edge)
+                if blend > 0:
+                    arg = f", {gd_number(blend)}"
+            ctx.add_line(body_indent + 2,
+                         f"{enter_func}({gd_string(target)}{arg})")
             first = False
         if first:
             # 这一段一条转移都没生成出来 —— 留个 pass 免得语法错误

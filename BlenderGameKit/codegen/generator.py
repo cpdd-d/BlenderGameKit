@@ -724,7 +724,8 @@ class Generator:
                                   machine["enter"],
                                   machine.get("finished"),
                                   machine.get("finish"),
-                                  machine.get("gate"))
+                                  machine.get("gate"),
+                                  machine.get("blend", False))
             # ---- 动画混合树(第六十一轮)----
             # 每物理帧把『参数』推给 AnimationTree 的 blend_position。
             for blend in self.ctx.anim_blend_trees:

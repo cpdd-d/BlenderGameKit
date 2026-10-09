@@ -1076,7 +1076,8 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
 
     def enter_anim_state_func(self, node, var_name, player_temp, debug=False,
                               finished_var=None, enter_hooks=None,
-                              exit_hooks=None, speed_func=None):
+                              exit_hooks=None, speed_func=None,
+                              blend_param=False):
         """生成/复用一个"进入动画状态"的成员函数,返回它的名字。
 
         ── 为什么抽成一个函数(而不是每处切换内联四行)──────────────
@@ -1114,8 +1115,9 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         exit_hooks = exit_hooks or {}
         # speed_func 也要进缓存键:同一张图被两台状态机驱动时,
         # 一台带速度表一台不带,生成出来的函数体是不一样的
+        # (blend_param 同理 —— 一个带过渡时长参数、一个不带)
         key = (var_name, finished_var, tuple(sorted(enter_hooks.items())),
-               tuple(sorted(exit_hooks.items())), speed_func)
+               tuple(sorted(exit_hooks.items())), speed_func, blend_param)
         existing = self.anim_enter_funcs.get(key)
         if existing:
             return existing
@@ -1149,8 +1151,17 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         # 状态的『播放速度』填了非 1.0 时,play() 带上它 ——
         # 有速度表就走 `_gk_anim_speed(状态名)`,没有就还是原来的
         # `play(名字)`(老图一字不变)。
+        # ── 过渡时长(第七十五轮)────────────────────────────────────────
+        # 开了 blend 参数时,play 的第二个参数(custom_blend,单位秒)用传进来的
+        # 那个 —— 于是走↔跑这种切换是**交叉淡化**而不是硬切。没开(老图)时
+        # 一字不变:还是 `play(next_state)` / `play(next_state, -1.0, 速度)`。
         play_line = f"        {player_temp}.play(next_state)"
-        if speed_func:
+        if blend_param and speed_func:
+            play_line = (f"        {player_temp}.play(next_state, blend, "
+                         f"{speed_func}(next_state))")
+        elif blend_param:
+            play_line = f"        {player_temp}.play(next_state, blend)"
+        elif speed_func:
             play_line = (f"        {player_temp}.play(next_state, -1.0, "
                          f"{speed_func}(next_state))")
         body += [
@@ -1176,8 +1187,14 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             for name, hook in sorted(enter_hooks.items()):
                 body.append(f"        {gd_string(name)}:")
                 body.append(f"            {hook}()")
+        signature = f"func {func_name}(next_state: String) -> void:"
+        if blend_param:
+            # 过渡时长(秒)由**调用方**给(每条转移可能不一样)——
+            # 默认 -1.0 = 用 Godot 自己的默认混合时间,等价于原来的硬切。
+            signature = (f"func {func_name}(next_state: String, "
+                         f"blend: float = -1.0) -> void:")
         self.extra_sections.append({
-            "signature": f"func {func_name}(next_state: String) -> void:",
+            "signature": signature,
             "lines": body,
             "empty_body": "    pass",
             "separator": True,

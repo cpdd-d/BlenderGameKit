@@ -353,6 +353,14 @@ class GKNodeAnimState(B.GKStatementNode):
         ("gk_speed", "float", 1.0, "播放速度",
          "1.0 为原速;0.5 = 慢放一半,2.0 = 快一倍。"
          "状态切换后按这个速度播(『同时播』的那几段也跟着)"),
+        # ── 过渡时长(第七十五轮,用户 2026-10-09 拍板)──────────────────
+        # 以前切状态是**硬切**(走 -> 跑 一瞬间换)。这里填"切进本状态时
+        # 用几秒淡入"(交叉淡化)。0 = 硬切(默认,老图一字不变)。
+        # 「转场」上也能填一份:填了就**盖过**这里 —— 于是
+        # "idle→run 慢一点、jump→run 快一点"这种也能表达。
+        ("gk_blend_time", "float", 0.0, "过渡时长(秒)",
+         "切进本状态时用几秒淡入(交叉淡化),0 = 硬切。"
+         "某条转场上自己填了就用它的"),
         # ── 为什么要好几个『进入』(Blender 的硬限制)────────────────────
         # **一个输入引脚只允许一条连线**(踩过的坑,README 第 9 条)。
         # 于是"待机"被 走/跑/跳/受击/攻击 五条转场指着时,只有**最后接的
@@ -449,6 +457,7 @@ class GKNodeAnimState(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_in_count", text="入口")
         row.prop(self, "gk_speed", text="速度")
+        row.prop(self, "gk_blend_time", text="过渡")
         full = all(
             bool(getattr(socket, "is_linked", False))
             for socket in (getattr(self, "inputs", ()) or ()))
@@ -631,6 +640,11 @@ class GKNodeAnimTransition(B.GKStatementNode):
           ("ACTION_RELEASED", "选输入:松开", "按键松开期间为真"))),
         ("gk_cond_action", "string", "move_right", "输入动作",
          "只有『条件来源』选了输入类才用得上"),
+        # ── 过渡时长(第七十五轮)──────────────────────────────────────
+        # 0 = 用**目标状态**上填的那个(默认,等于没填);填了就盖过它。
+        # 于是"同一段走->跑,从受击切过来快、从待机切过去慢"能分开调。
+        ("gk_blend_time", "float", 0.0, "过渡时长(秒)",
+         "这条转场用几秒淡入,盖过目标状态上填的那个。0 = 用目标状态上的"),
     )
 
     def condition_expr(self, ctx):
@@ -686,6 +700,7 @@ class GKNodeAnimTransition(B.GKStatementNode):
         if source != "PIN" and link_sources(self, "条件"):
             layout.label(text="! 条件引脚接的线被忽略了", icon="ERROR")
             layout.label(text="   以『条件来源』为准")
+        layout.prop(self, "gk_blend_time", text="过渡时长(秒)")
         if wired_to:
             layout.label(text="转到 -> 下一个状态的『进入』", icon="CHECKMARK")
         else:

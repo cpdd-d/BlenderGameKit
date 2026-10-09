@@ -15568,6 +15568,120 @@ class TestRound74NamedBlendPoints(Base):
         self.assertEqual(code.count("-1, StringName(entry[0]))"), 2)
 
 
+class TestRound75TransitionBlend(Base):
+    """第七十五轮(G 组 21 的前一半):**切状态时的过渡时长**(交叉淡化)。
+
+    现在切状态是**硬切** —— 统一走 `_gk_anim_enter(next_state)`,里面就一句
+    `play(next_state)`,走↔跑之间是瞬间换、没有过渡。
+
+    ── 填法(用户 2026-10-09 拍板:两处都要)────────────────────────
+      * **状态上**填『过渡时长』= 兜底(任何方式切进这个状态都用它)
+      * **转场上**填『过渡时长』= 覆盖目标状态上的(0 = 用状态的)
+
+    默认 0 = 硬切,所以老图(谁都没填)生成物**一字不变**:进入函数的签名
+    还是 `(next_state: String)`,一句 `blend` 都不多。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _run(self, states, edges, state_blends=None, state_speeds=None,
+             edge_blends=None):
+        """搭一张最小的动画树:states 第一个当起始;edges 写 (从, 到, 条件)。
+
+        条件填 `None` = 状态直连(播完就切),没有转场节点;
+        其它值 = 『条件来源』(比如 ACTION_PRESSED)。
+        """
+        anim = gk_stub.StubNodeTree("角色动画")
+        anim.bl_idname = "GKAnimationTree"
+        made = {}
+        for name in states:
+            node = anim.new_node(NN.GKNodeAnimState, "状态" + name)
+            node.gk_state_name = name
+            node.gk_blend_time = float((state_blends or {}).get(name, 0.0))
+            node.gk_speed = float((state_speeds or {}).get(name, 1.0))
+            made[name] = node
+        for number, (src, dst, cond) in enumerate(edges):
+            if cond is None:
+                # 直连 = 播完就切(没有转场节点)
+                gk_stub.connect(anim, made[src], "转到", made[dst], "进入")
+                continue
+            trans = anim.new_node(NN.GKNodeAnimTransition, f"T{number}")
+            gk_stub.connect(anim, made[src], "转到", trans, "上游")
+            gk_stub.connect(anim, trans, "转到", made[dst], "进入")
+            trans.gk_cond_source = cond
+            trans.gk_blend_time = float((edge_blends or {}).get((src, dst), 0.0))
+        logic = make_tree()
+        event = self._ready(logic)
+        ref = logic.new_node(NN.GKNodeAnimStateMachineRef, "状态机")
+        gk_stub.connect(logic, event, "执行", ref, "执行")
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[anim]))
+        try:
+            return gen(logic, V3)
+        finally:
+            detach_anim_tree(original)
+
+    def test_both_nodes_declare_blend_time(self):
+        """『过渡时长』必须真的声明在节点上(否则卡片画不出来)。"""
+        state_props = {entry[0] for entry in NN.GKNodeAnimState.gk_prop_defs}
+        trans_props = {entry[0] for entry in NN.GKNodeAnimTransition.gk_prop_defs}
+        self.assertIn("gk_blend_time", state_props)
+        self.assertIn("gk_blend_time", trans_props)
+
+    def test_state_blend_adds_param_and_value(self):
+        code, warnings = self._run(
+            ["idle", "run"], [("idle", "run", "ACTION_PRESSED")],
+            state_blends={"run": 0.2})
+        self.assertEqual(warnings, [], warnings)
+        # 进入函数多一个带默认值的 blend 参数
+        self.assertIn("func _gk_anim_enter(next_state: String, "
+                      "blend: float = -1.0) -> void:", code)
+        # 切过去时把秒数带上
+        self.assertIn('_gk_anim_enter("run", 0.2)', code)
+        self.assertIn(".play(next_state, blend)", code)
+        # 起始状态在 _ready 里播 —— 没有"上一个动作"可混,不塞秒数
+        self.assertIn('_gk_anim_enter("idle")', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_transition_overrides_state(self):
+        code, warnings = self._run(
+            ["idle", "run"], [("idle", "run", "ACTION_PRESSED")],
+            state_blends={"run": 0.2},
+            edge_blends={("idle", "run"): 0.05})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_anim_enter("run", 0.05)', code)
+        self.assertNotIn('_gk_anim_enter("run", 0.2)', code)
+
+    def test_direct_edge_uses_target_state(self):
+        """直连边(播完就切)没有转场节点 -> 用目标状态上那个兜底值。"""
+        code, warnings = self._run(
+            ["idle", "run"], [("idle", "run", None)],
+            state_blends={"run": 0.3})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_anim_enter("run", 0.3)', code)
+
+    def test_no_blend_keeps_old_output(self):
+        """谁都没填 -> 生成物一字不变(签名不带参数、play 不带 blend)。"""
+        code, warnings = self._run(
+            ["idle", "run"], [("idle", "run", "ACTION_PRESSED")])
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_anim_enter(next_state: String) -> void:", code)
+        self.assertNotIn("blend: float", code)
+        self.assertNotIn(".play(next_state, blend", code)
+        self.assertIn('_gk_anim_enter("run")', code)
+        self.assertIn(".play(next_state)", code)
+
+    def test_blend_and_speed_together(self):
+        """过渡时长和播放速度并存时,play 的三段参数都得对。"""
+        code, warnings = self._run(
+            ["idle", "run"], [("idle", "run", "ACTION_PRESSED")],
+            state_blends={"run": 0.2}, state_speeds={"run": 1.5})
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".play(next_state, blend, _gk_anim_speed(next_state))", code)
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 

@@ -3719,6 +3719,67 @@ def main():
         check("第七十四轮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 切状态的过渡时长(第七十五轮,G 组 21 的一半)----
+    # 以前切状态是**硬切**(走↔跑一瞬间换)。现在『动画_状态』和『动画_转场』
+    # 上都能填『过渡时长』(秒):转场填了盖过状态上的;都不填 = 硬切(老图不变)。
+    try:
+        r75_anim = bpy.data.node_groups.new("过渡时长冒烟75", "GKAnimationTree")
+        r75_idle = r75_anim.nodes.new("GKNodeAnimState")
+        r75_idle.gk_state_name = "idle"
+        r75_run = r75_anim.nodes.new("GKNodeAnimState")
+        r75_run.gk_state_name = "run"
+        r75_trans = r75_anim.nodes.new("GKNodeAnimTransition")
+        check("过渡:『动画_状态』有『过渡时长』(默认 0 = 硬切)",
+              hasattr(r75_idle, "gk_blend_time")
+              and abs(float(r75_idle.gk_blend_time)) < 1e-9,
+              str(getattr(r75_idle, "gk_blend_time", "<没有这个属性>")))
+        check("过渡:『动画_转场』有『过渡时长』(默认 0 = 用状态上的)",
+              hasattr(r75_trans, "gk_blend_time")
+              and abs(float(r75_trans.gk_blend_time)) < 1e-9,
+              str(getattr(r75_trans, "gk_blend_time", "<没有这个属性>")))
+        r75_anim.links.new(r75_idle.outputs["转到"], r75_trans.inputs["上游"])
+        r75_anim.links.new(r75_trans.outputs["转到"], r75_run.inputs["进入"])
+        r75_trans.gk_cond_source = "ACTION_PRESSED"
+
+        r75_logic = bpy.data.node_groups.new("过渡逻辑75", "GKGameLogicTree")
+        r75_ready = r75_logic.nodes.new("GKNodeOnReady")
+        r75_ref = r75_logic.nodes.new("GKNodeAnimStateMachineRef")
+        r75_ref.gk_tree_name = "过渡时长冒烟75"
+        r75_logic.links.new(r75_ready.outputs["执行"], r75_ref.inputs["执行"])
+        r75_options = {"dimension": "3", "base_class": "CharacterBody3D"}
+
+        # ① 都不填 -> 老样子(签名不带参数、play 不带 blend)
+        r75_plain, r75_plain_warn = codegen.generate(r75_logic, r75_options)
+        check("过渡:都不填时保持老签名(硬切)",
+              "func _gk_anim_enter(next_state: String) -> void:" in r75_plain
+              and "blend: float" not in r75_plain,
+              r75_plain[-200:])
+        check("过渡:都不填时无告警", not r75_plain_warn, str(r75_plain_warn)[:200])
+
+        # ② 状态上填 -> 多一个 blend 参数,切过去带上秒数
+        r75_run.gk_blend_time = 0.2
+        r75_state, _r75_w1 = codegen.generate(r75_logic, r75_options)
+        check("过渡:状态上填了 -> 进入函数多一个 blend 参数",
+              "func _gk_anim_enter(next_state: String, "
+              "blend: float = -1.0) -> void:" in r75_state)
+        check("过渡:切过去时带上秒数",
+              '_gk_anim_enter("run", 0.2)' in r75_state)
+        check("过渡:play 用传进来的 blend",
+              ".play(next_state, blend)" in r75_state)
+
+        # ③ 转场上填 -> 盖过状态上的
+        r75_trans.gk_blend_time = 0.05
+        r75_edge, _r75_w2 = codegen.generate(r75_logic, r75_options)
+        check("过渡:转场上填了 -> 盖过状态上的",
+              '_gk_anim_enter("run", 0.05)' in r75_edge
+              and '_gk_anim_enter("run", 0.2)' not in r75_edge)
+
+        bpy.data.node_groups.remove(r75_logic)
+        bpy.data.node_groups.remove(r75_anim)
+    except Exception as exc:
+        check("第七十五轮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)
