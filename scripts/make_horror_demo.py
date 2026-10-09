@@ -68,7 +68,11 @@ TORCH = "手电筒"
 AI_TREE_NAME = "怪物AI"
 
 # 开场运镜(第七十轮):一条 3D 曲线当轨道 + 一台门口特写机位。
-# 相机从『教室机位』起飞,鼓个弯越过课桌,**俯冲**到门口特写。
+# 相机从『教室机位』起飞,鼓个弯越过课桌,**俯冲**到门口特写;
+# 特写停 1.5 秒,**再切回第三人称**(不切回去玩家就没了跟随机位 ——
+# 表现是"人还能动,但视角钉在特写上不肯走",用户实测报过)。
+ROOM_SIDE = "教室机位"
+ROOM_TOP = "教室俯瞰"
 ROOM_TRACK = "教室运镜轨道"
 ROOM_CLOSE = "教室特写"
 ROOM_CLOSE_POS = (0.0, -12.0, 3.2)
@@ -78,6 +82,11 @@ ROOM_TRACK_POINTS = [
     (-4.0, 1.0, 9.0),      # 越过课桌(侧面鼓出去,一眼看出是曲线)
     ROOM_CLOSE_POS,        # 俯冲到门口特写(终点)
 ]
+OPENING_BLEND = 2.5        # 开场运镜时长(秒)
+RETURN_BLEND = 1.0         # 切回第三人称的过渡(秒)
+# ⚠ 『相机_切换』的『完成』是"开始过渡了"就返回(过渡异步跑),所以要**等够**
+#   运镜的时长再停 1.5 秒,然后才切回来。
+OPENING_HOLD = OPENING_BLEND + 1.5
 
 NOTE_GOAL = 3
 SIGHT = 9.0
@@ -301,9 +310,9 @@ def build_room(scene):
                  (0.92, 0.90, 0.72, 1.0), scene=scene)
     make_box(TO_ROOM, (5.0, 5.0, 0.2), (0.0, -10.0, 0.1),
              (0.22, 0.32, 0.30, 1.0), scene=scene)
-    side = make_camera("教室机位", (0.0, -15.0, 5.5),
+    side = make_camera(ROOM_SIDE, (0.0, -15.0, 5.5),
                        (math.radians(72.0), 0.0, 0.0), scene)
-    make_camera("教室俯瞰", (0.0, -6.0, 18.0), (math.radians(22.0), 0.0, 0.0),
+    make_camera(ROOM_TOP, (0.0, -6.0, 18.0), (math.radians(22.0), 0.0, 0.0),
                 scene)
     # 开场运镜的落点(门口特写)+ 轨道曲线(相机沿它从『教室机位』俯冲过来)
     make_camera(ROOM_CLOSE, ROOM_CLOSE_POS,
@@ -516,9 +525,9 @@ def _preset(scene, player, logic_name, class_name, side_cam, top_cam):
 
 
 def build_room_logic(scene, player):
-    """第一关逻辑:提示 + 3 张纸条 + (存档)切到走廊。"""
+    """第一关逻辑:提示 + 3 张纸条 + 开场运镜 + (存档)切到走廊。"""
     logic, ready = _preset(scene, player, "教室逻辑", "HorrorRoomPlayer",
-                           "教室机位", "教室俯瞰")
+                           ROOM_SIDE, ROOM_TOP)
     hint = _add(logic, "GKNodeUiText", "教室提示", -300.0, 1200.0,
                 gk_text=("WASD 移动 / 空格 跳 / 鼠标转视角 / Tab 上帝机 / "
                          "按住 K 弄出动静"),
@@ -533,12 +542,20 @@ def build_room_logic(scene, player):
     # 开场运镜(第七十轮):相机沿『教室运镜轨道』从『教室机位』俯冲到
     # 『教室特写』(2.5 秒 · 缓出)。这就是 demo_curve 那套做法。
     opening = _add(logic, "GKNodeCameraSetCurrent", "开场运镜", -300.0, 560.0,
-                   gk_target=ROOM_CLOSE, gk_blend=2.5,
+                   gk_target=ROOM_CLOSE, gk_blend=OPENING_BLEND,
                    gk_blend_trans="EASE_OUT",
                    gk_path_mode="CURVE", gk_path_curve=ROOM_TRACK)
+    # ⚠ **必须切回来**:『相机_切换』把当前相机换成了特写机位,而预设的弹簧臂
+    #   只驱动『教室机位』—— 不切回来的话人还能走、视角却钉在特写上不动,
+    #   看起来就是"卡住"(用户实测报过)。留 1.5 秒给玩家看清,再 1 秒切回。
+    hold = _add(logic, "GKNodeWait", "特写停留", -300.0, 400.0)
+    hold.inputs["秒"].default_value = OPENING_HOLD
+    back = _add(logic, "GKNodeCameraSetCurrent", "回第三人称", -300.0, 260.0,
+                gk_target=ROOM_SIDE, gk_blend=RETURN_BLEND,
+                gk_blend_trans="EASE_OUT")
     _link(logic, ready, "执行", hint, "执行")
     tail = hint
-    for node in (goal, bgm, vignette, opening):
+    for node in (goal, bgm, vignette, opening, hold, back):
         _link(logic, tail, "完成", node, "执行")
         tail = node
 

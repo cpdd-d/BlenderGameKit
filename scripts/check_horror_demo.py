@@ -171,6 +171,19 @@ func _physics_process(delta: float) -> void:
 				phase = 4
 				print("HORROR_ROOM_NOTES count=",
 					snappedf(float(_var("纸条数")), 0.01))
+				# 挪到一块空地(别踩到门口 / 纸条那些触发区),看视角跟不跟人
+				_put(Vector3(-8.0, 0.8, 0.0))
+		4:
+			# 开场运镜 2.5s + 特写停留 1.5s + 切回第三人称 1.0s —— 5.4s 早就切回来了
+			if elapsed >= 5.4:
+				phase = 5
+				var cur := get_viewport().get_camera_3d()
+				if cur == null:
+					print("HORROR_ROOM_CAM cur=<null>")
+				else:
+					print("HORROR_ROOM_CAM cur=", cur.name,
+						" dist=", snappedf(cur.global_position.distance_to(
+							player.global_position), 0.01))
 				print("HORROR_ROOM_DONE")
 				set_physics_process(false)
 				get_tree().quit()
@@ -479,6 +492,19 @@ def main():
     if not notes or float(notes.group(1)) < 2.5:
         problems.append("教室拾 3 张纸条后『纸条数』不是 3: "
                         + _grab(room, r"HORROR_ROOM_NOTES[^\n]*"))
+    # 开场运镜**必须切回第三人称**:不切回来视角钉在特写上,人还能走但看不
+    # 见自己 = "卡住"(用户实测报过)。这里断言当前相机是『教室机位』且在跟人。
+    back = re.search(r"HORROR_ROOM_CAM cur=(\S+) dist=([\d.]+)", room)
+    if not back:
+        problems.append("教室没跑出『切回第三人称』的结论行: "
+                        + _grab(room, r"HORROR_ROOM_CAM[^\n]*"))
+    else:
+        if back.group(1) != "教室机位":
+            problems.append("开场运镜之后当前相机不是第三人称机位(卡住了): "
+                            + back.group(0))
+        if float(back.group(2)) > 8.0:
+            problems.append("第三人称机位没有跟着角色(视角还钉在特写上): "
+                            + back.group(0))
     if "HORROR_ROOM_DONE" not in room:
         problems.append("教室探针没跑完")
 

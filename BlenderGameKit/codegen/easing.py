@@ -136,8 +136,12 @@ def need_ease_helper(ctx):
             "    # 不用建 Tween 也能拿到缓动后的比例",
             "    if curve != null:",
             "        return curve.sample(clampf(t, 0.0, 1.0))",
+            # ⚠ trans / ease 是 int 成员变量,直接喂给要枚举的形参会报
+            #   "Integer used when an enum value is expected" —— 按 Godot
+            #   提示用 `as` 显式转成枚举(第七十轮用户截图里的告警之一)。
             "    return float(Tween.interpolate_value("
-            "0.0, 1.0, t, 1.0, trans, ease))",
+            "0.0, 1.0, t, 1.0, trans as Tween.TransitionType, "
+            "ease as Tween.EaseType))",
         ],
         "empty_body": "    return t",
         "separator": True,

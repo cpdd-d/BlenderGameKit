@@ -6679,7 +6679,10 @@ class TestPlayAnimParams(Base):
         code, warnings = self._build(gk_layer=1)
         self.assertEqual(warnings, [], warnings)
         self.assertIn("_gk_layer_player(", code)
-        self.assertIn("func _gk_layer_player(base: Node, layer: int) -> Node:", code)
+        # ⚠ 形参叫 `base` 会被 Godot 报"与内置函数同名"(第七十轮告警修复)
+        self.assertIn("func _gk_layer_player(host: Node, layer: int) -> Node:",
+                      code)
+        self.assertNotIn("_gk_layer_player(base:", code)
 
     def test_layer_zero_generates_no_helper(self):
         code, _ = self._build()
@@ -15075,6 +15078,89 @@ class TestRound70TensionSeen(Base):
         self.assertIn("_gk_heart_tension += (clampf(", code)
         self.assertNotIn("maxf(clampf(", code)
         self.assertNotIn(" else 0.0", code)
+
+
+class TestRound70NoGodotWarnings(Base):
+    """第七十轮:把用户截图里那几条**生成代码自己招来的 Godot 告警**修掉。
+
+    用户报"放完曲线动画后卡住",顺手截了 Godot 调试器的 10 条记录,其中三条
+    是生成器写出来的、Godot 判定为问题的东西:
+
+      * `The local variable "basis" is shadowing an already-declared property
+        in the base class "Node3D"` —— 兜底飞行机里 `var basis := ...basis`;
+      * `The function parameter "base" has the same name as a built-in
+        function` —— 动画层播放器 `_gk_layer_player(base: Node, ...)`;
+      * `Integer used when an enum value is expected` —— `_gk_ease` 把 int
+        成员直接喂给要枚举的 `Tween.interpolate_value`。
+    """
+
+    def test_fly_camera_does_not_shadow_basis(self):
+        """兜底飞行机的局部变量不能叫 `basis`(Node3D 有同名属性)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        branch = tree.new_node(NN.GKNodeBranch, "如果")
+        status = tree.new_node(NN.GKNodeCameraStatus, "相机状态")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, status, "开着吗", branch, "条件")
+        code, _warnings = gen(tree, V3)
+        self.assertIn("_gk_fly_cam", code)
+        self.assertIn("var _gk_basis := ", code)
+        self.assertNotIn("var basis := ", code)
+
+    def test_ease_casts_int_to_enum(self):
+        """`_gk_ease` 把 int 显式转枚举(否则 Godot 报"该给枚举值")。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        switch = tree.new_node(NN.GKNodeCameraSetCurrent, "推镜",
+                               gk_target="特写机位", gk_blend=0.8,
+                               gk_blend_trans="EASE_OUT")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("trans as Tween.TransitionType", code)
+        self.assertIn("ease as Tween.EaseType", code)
+        self.assert_indent_sane(code)
+
+
+class TestRound70ReadyAwaitOrder(Base):
+    """第七十轮:『每当_准备』链里有『等待_秒』时,**触发器连接不能被它拖后**。
+
+    真机上踩到:示例给开场运镜后面接了个『等待_秒』,生成的 `_ready()` 是
+
+        func _ready() -> void:
+            ...开场运镜...
+            await get_tree().create_timer(4.0).timeout     # 等特写演完
+            ...切回第三人称...
+            if area_纸条1 != null ...:                      # ← 排在 await 后面
+                area_纸条1.body_entered.connect(_gk_on_area_entered_4)
+
+    于是开局那 4 秒里**所有触发区都不响应**(纸条拾不起来、计数一直 0)。
+    修法:信号连接插到 `_ready` 最前面。
+    """
+
+    def test_trigger_connect_comes_before_await(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        wait = tree.new_node(NN.GKNodeWait, "等一下")
+        wait.inputs.get("秒").default_value = 4.0
+        gk_stub.connect(tree, ready, "执行", wait, "执行")
+        touch = tree.new_node(NN.GKNodeOnAreaEntered, "碰到纸条",
+                              gk_area="纸条1", gk_filter="玩家")
+        tree.new_node(NN.GKNodePrint, "提示", gk_text="拾到一张纸条……")
+        printer = None
+        for node in tree.nodes:
+            if node.bl_idname == "GKNodePrint":
+                printer = node
+        gk_stub.connect(tree, touch, "执行", printer, "执行")
+
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("await get_tree().create_timer(4.0).timeout", code)
+        self.assertIn("body_entered.connect(", code)
+        self.assertLess(code.index("body_entered.connect("),
+                        code.index("await get_tree().create_timer("),
+                        "触发器的信号连接必须排在 `await` 之前")
+        self.assert_indent_sane(code)
 
 
 if __name__ == "__main__":

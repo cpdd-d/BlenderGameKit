@@ -904,15 +904,18 @@ func _gk_god_tick(delta: float) -> void:
 		_gk_god_possess = null      # 角色被删了 / 切场景了,自动放手
 	# WASD 平移 + 空格/Shift 升降(**不走碰撞**,想穿墙就穿墙)
 	var fly := Vector3.ZERO
-	var basis := _gk_god_cam.global_transform.basis
+	# ⚠ 名字不能叫 `basis`:Node3D 自己就有 `basis` 属性,Godot 报
+	#   "The local variable "basis" is shadowing an already-declared property"
+	#   (第七十轮用户截图里那一串告警之一)。
+	var _gk_basis := _gk_god_cam.global_transform.basis
 	if Input.is_key_pressed(KEY_W):
-		fly -= basis.z
+		fly -= _gk_basis.z
 	if Input.is_key_pressed(KEY_S):
-		fly += basis.z
+		fly += _gk_basis.z
 	if Input.is_key_pressed(KEY_A):
-		fly -= basis.x
+		fly -= _gk_basis.x
 	if Input.is_key_pressed(KEY_D):
-		fly += basis.x
+		fly += _gk_basis.x
 	if Input.is_key_pressed(KEY_SPACE):
 		fly += Vector3.UP
 	if Input.is_key_pressed(KEY_SHIFT):
@@ -1038,16 +1041,16 @@ func _gk_god_release() -> void:
 ## 走的是角色的碰撞体,和它自己走路一模一样。所以这里只替它写 velocity。
 func _gk_god_possess_tick(delta: float) -> void:
 	var body := _gk_god_possess
-	var basis := _gk_god_cam.global_transform.basis
+	var _gk_basis := _gk_god_cam.global_transform.basis
 	var move := Vector3.ZERO
 	if Input.is_key_pressed(KEY_W):
-		move -= basis.z
+		move -= _gk_basis.z
 	if Input.is_key_pressed(KEY_S):
-		move += basis.z
+		move += _gk_basis.z
 	if Input.is_key_pressed(KEY_A):
-		move -= basis.x
+		move -= _gk_basis.x
 	if Input.is_key_pressed(KEY_D):
-		move += basis.x
+		move += _gk_basis.x
 	move.y = 0.0
 	if move != Vector3.ZERO:
 		move = move.normalized()

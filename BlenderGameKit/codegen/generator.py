@@ -244,8 +244,11 @@ class Generator:
                 ]
 
         if trigger_ready:
+            # ⚠ 必须插到 `_ready` **最前面**:『每当_准备』链里可能有『等待_秒』
+            #   (`await`),排在它后面的 connect 会晚好几秒才挂上 —— 那段时间
+            #   触发区完全不响应(第七十轮踩到)。
             self._append_block(sections, "_ready", "func _ready() -> void:",
-                               trigger_ready)
+                               trigger_ready, at_front=True)
 
         # ---- 自由飞行相机(兜底观察机)──────────────────────────────
         # **必须**放在 process_hooks / physics_hooks 落盘**之前**:
@@ -659,22 +662,25 @@ class Generator:
         # 前提是动作按部位拆开(上半身动作只含上半身骨骼)—— 这属于用户
         # 的用法约定,不是我们能在导出时替他判断的。
         if self.ctx.need_layer_player:
+            # ⚠ 形参不能叫 `base` —— Godot 报
+            #   "The function parameter "base" has the same name as a
+            #    built-in function"(第七十轮用户截图里的告警之一)。
             sections.append({
-                "signature": "func _gk_layer_player(base: Node, layer: int) -> Node:",
+                "signature": "func _gk_layer_player(host: Node, layer: int) -> Node:",
                 "lines": [
-                    "    if base == null or base.get_parent() == null:",
-                    "        return base",
+                    "    if host == null or host.get_parent() == null:",
+                    "        return host",
                     # 缓存:同一个层只复制一次,反复播放不会一直堆节点
                     '    var cache_name := "_gk_layer_%d" % layer',
-                    "    var existing: Node = base.get_parent().get_node_or_null(cache_name)",
+                    "    var existing: Node = host.get_parent().get_node_or_null(cache_name)",
                     "    if existing is AnimationPlayer:",
                     "        return existing",
-                    "    var copy: Node = base.duplicate()",
+                    "    var copy: Node = host.duplicate()",
                     "    copy.name = cache_name",
-                    "    base.get_parent().add_child(copy)",
+                    "    host.get_parent().add_child(copy)",
                     "    return copy",
                 ],
-                "empty_body": "    return base",
+                "empty_body": "    return host",
                 "separator": True,
             })
 
@@ -1960,8 +1966,20 @@ class Generator:
                 return section
         return None
 
-    def _append_block(self, sections, func_name, signature, lines):
-        """把我们生成的代码块并进已有的同名函数,没有才新建一段。"""
+    def _append_block(self, sections, func_name, signature, lines,
+                      at_front=False):
+        """把我们生成的代码块并进已有的同名函数,没有才新建一段。
+
+        `at_front=True` 插到函数体**最前面**。给"必须在任何 await 之前跑完"
+        的代码用 —— 触发器的信号连接就是这种:
+
+        ── 踩过的坑(第七十轮)──────────────────────────────────────
+        『每当_准备』后面接一个『等待_秒』,生成的是 `_ready()` 里的
+        `await get_tree().create_timer(4.0).timeout`。连接语句原来排在链子
+        **后面**,于是要等 4 秒才 connect —— 那几秒里走过触发区**一点反应
+        都没有**(示例里表现为"纸条拾不起来,计数一直是 0")。连接是
+        "进了场就该挂上"的东西,不能排在用户的等待后面。
+        """
         target = self._section_for(sections, func_name)
         if target is None:
             sections.append({
@@ -1970,6 +1988,8 @@ class Generator:
                 "empty_body": "    pass",
                 "separator": True,
             })
+        elif at_front:
+            target["lines"][0:0] = list(lines)
         else:
             target["lines"].extend(lines)
 
@@ -2267,15 +2287,16 @@ class Generator:
             "        (_gk_fly_cam as Node3D).rotation_degrees = rot",
             "    # WASD 平移 + 空格/Shift 升降(**不走碰撞**)",
             "    var fly := Vector3.ZERO",
-            "    var basis := (_gk_fly_cam as Node3D).global_transform.basis",
+            "    # ⚠ 别叫 `basis` —— Node3D 有同名属性,Godot 会报 shadowing",
+            "    var _gk_basis := (_gk_fly_cam as Node3D).global_transform.basis",
             "    if Input.is_key_pressed(KEY_W):",
-            "        fly -= basis.z",
+            "        fly -= _gk_basis.z",
             "    if Input.is_key_pressed(KEY_S):",
-            "        fly += basis.z",
+            "        fly += _gk_basis.z",
             "    if Input.is_key_pressed(KEY_A):",
-            "        fly -= basis.x",
+            "        fly -= _gk_basis.x",
             "    if Input.is_key_pressed(KEY_D):",
-            "        fly += basis.x",
+            "        fly += _gk_basis.x",
             "    if Input.is_key_pressed(KEY_SPACE):",
             "        fly += Vector3.UP",
             "    if Input.is_key_pressed(KEY_SHIFT):",
