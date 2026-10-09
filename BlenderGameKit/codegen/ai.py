@@ -55,6 +55,72 @@ def _vector_zero(ctx):
     return "Vector2.ZERO" if ctx.dim == 2 else "Vector3.ZERO"
 
 
+def _patrol_point_filled(state, prop):
+    """这个巡逻点填了吗?空 / 『自身』都算没填(和 `_ai_point` 同一套判断)。"""
+    raw = str(getattr(state, prop, "") or "").strip()
+    return bool(raw) and raw != TARGET_SELF
+
+
+def _patrol_has_extra_points(state):
+    """填了『巡逻点 C / D』吗?(填了才需要"索引 + 方向"那套)"""
+    return any(_patrol_point_filled(state, prop)
+               for prop in ("gk_patrol_c", "gk_patrol_d"))
+
+
+def _patrol_uses_waypoints(state):
+    """这个状态会走"索引 + 方向"那条往返路吗?
+
+    要求"**填了 A** 且填了 C / D":A 都没填的话 `_emit_ai_behavior` 会
+    直接站着不动(图解析已经报过),那种时候别白白声明两个用不上的成员变量。
+    """
+    if str(getattr(state, "gk_behavior", "") or "") != "PATROL":
+        return False
+    return (_patrol_point_filled(state, "gk_patrol_a")
+            and _patrol_has_extra_points(state))
+
+
+def _emit_patrol_waypoints(ctx, indent, self_expr, reader, stop, speed, facing,
+                           points, index_var, dir_var):
+    """三点以上的巡逻:按**填了的点**往返走(第七十八轮)。
+
+    A→B→C→D 然后 D→C→B→A。当前第几个点 + 往前往后各占一个成员变量 ——
+    两点那套"翻面布尔"表达不了四个点(它只有"在哪一头"这个信息)。
+
+    点的顺序就是 A→B→C→D 里**填了的那些**(跳着填 = 中间那点不存在,
+    不会走一个空引用)。
+    """
+    here = ctx.new_temp("ai_here")
+    goal_at = ctx.new_temp("ai_goal")
+    diff = ctx.new_temp("ai_diff")
+    last = len(points) - 1
+    ctx.add_line(indent, f"var {here} := {reader}({self_expr})")
+    # 先按第 0 个点取一次,再按索引覆盖 —— 比一串嵌套三元好读
+    ctx.add_line(indent, f"var {goal_at} := {reader}({points[0]})")
+    for order, point in enumerate(points[1:], start=1):
+        ctx.add_line(indent,
+                     f"{'if' if order == 1 else 'elif'} {index_var} == {order}:")
+        ctx.add_line(indent + 1, f"{goal_at} = {reader}({point})")
+    ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
+    # 巡逻同样绕障碍(和两点那条一样)
+    walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
+    ctx.add_line(indent, f"if {diff}.length() <= {stop}:")
+    # 到两头的边界就掉头,其余沿当前方向继续 —— 于是 A→B→C→D→C→B→A
+    ctx.add_line(indent + 1, f"if {index_var} >= {last}:")
+    ctx.add_line(indent + 2, f"{dir_var} = false")
+    ctx.add_line(indent + 1, f"elif {index_var} <= 0:")
+    ctx.add_line(indent + 2, f"{dir_var} = true")
+    ctx.add_line(indent + 1, f"if {dir_var}:")
+    ctx.add_line(indent + 2, f"{index_var} += 1")
+    ctx.add_line(indent + 1, "else:")
+    ctx.add_line(indent + 2, f"{index_var} -= 1")
+    # 到点这一帧**刹住**(和两点那条一样:不清速度会多滑一步)
+    ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
+    _emit_ai_facing(ctx, indent, self_expr, diff, facing)
+    ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+
+
 # ==========================================================================
 # AI 走导航网格(第六十三轮:"让 AI 行为直接用寻路")
 # ==========================================================================
@@ -298,11 +364,27 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(inner, f"{self_expr}.move_and_slide()")
         return
 
-    # ---- 巡逻 / 返回:去巡逻点(A / B 或只去 A)----
+    # ---- 巡逻 / 返回:去巡逻点(A / B / C / D,或只去 A)----
     point_a = _ai_point(ctx, state, "gk_patrol_a")
     point_b = _ai_point(ctx, state, "gk_patrol_b") if behavior == "PATROL" else None
     if point_a is None:
         _stop_and_slide(ctx, indent, self_expr)
+        return
+    # ── 第三 / 第四个巡逻点(第七十八轮)────────────────────────────
+    # 填了才走"索引 + 方向"那条往返路;只填 A / B 的老图**不走这条**,
+    # 还是下面那个翻面布尔 —— 生成物一字不变。
+    extra_points = []
+    if behavior == "PATROL":
+        extra_points = [point for point in (
+            _ai_point(ctx, state, "gk_patrol_c"),
+            _ai_point(ctx, state, "gk_patrol_d")) if point is not None]
+    wp_index = machine.get("wp_index")
+    if extra_points and wp_index:
+        _emit_patrol_waypoints(
+            ctx, indent, self_expr, reader, stop, speed, facing,
+            [point for point in (point_a, point_b) if point is not None]
+            + extra_points,
+            wp_index, machine.get("wp_dir"))
         return
     flip = machine.get("flip")
     here = ctx.new_temp("ai_here")
@@ -525,10 +607,18 @@ def _stmt_ai_enable(ctx, node, indent):
     has_patrol = any(str(getattr(s, "gk_behavior", "") or "") == "PATROL"
                      for s in graph["states"])
     flip_var = None
+    wp_index = wp_dir = None
     if has_patrol:
         index = len(getattr(ctx, "ai_machines", ()) or ()) + 1
         flip_var = ctx.declare_var(f"_gk_ai_patrol_{index}", "bool",
                                    initial="false")
+        # ── 三个点以上的巡逻:还要"当前第几个点 + 往前往后"(第七十八轮)──
+        # 只填 A / B 的图**不声明**这两个 —— 老图产物一字不变。
+        if any(_patrol_uses_waypoints(s) for s in graph["states"]):
+            wp_index = ctx.declare_var(f"_gk_ai_wp_index_{index}", "int",
+                                       initial="0")
+            wp_dir = ctx.declare_var(f"_gk_ai_wp_dir_{index}", "bool",
+                                     initial="true")
 
     # ── 听觉运行时(第四十一轮)────────────────────────────────────
     # 图里用到听觉就先把它生成出来 —— 广播方(machine['self'])得是
@@ -556,6 +646,8 @@ def _stmt_ai_enable(ctx, node, indent):
         "self": target,
         "debug": bool(getattr(node, "gk_debug_print", False)),
         "flip": flip_var,
+        "wp_index": wp_index,
+        "wp_dir": wp_dir,
         "outputs": outputs,
     })
     ctx.need_ai_process = True

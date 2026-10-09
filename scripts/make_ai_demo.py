@@ -55,6 +55,7 @@ PLAYER = "玩家"
 ENEMY = "敌人"
 PATROL_A = "巡逻点甲"
 PATROL_B = "巡逻点乙"
+PATROL_C = "巡逻点丙"
 AI_TREE_NAME = "敌人AI"
 
 SIGHT = 9.0            # 看见玩家(米)
@@ -131,6 +132,9 @@ def build_scene():
              (0.30, 0.75, 0.40, 1.0))
     make_box(PATROL_B, (0.6, 0.6, 1.8), (6.0, 0.0, 0.9),
              (0.30, 0.75, 0.40, 1.0))
+    # 第三个巡逻点(第七十八轮):巡逻变成 甲 -> 乙 -> 丙 -> 乙 -> 甲
+    make_box(PATROL_C, (0.6, 0.6, 1.8), (9.5, 0.0, 0.9),
+             (0.30, 0.75, 0.40, 1.0))
     side = make_camera("侧视机位", (0.0, -15.0, 5.0),
                        (math.radians(72.0), 0.0, 0.0))
     make_camera("俯瞰机位", (0.0, -7.0, 17.0), (math.radians(20.0), 0.0, 0.0))
@@ -140,8 +144,8 @@ def build_scene():
     light = bpy.data.objects.new("太阳光", light_data)
     scene.collection.objects.link(light)
     light.rotation_euler = (math.radians(50.0), 0.0, math.radians(30.0))
-    log(f"场景:地面 + {PLAYER} + {ENEMY} + 两个巡逻点"
-        f"({PATROL_A} / {PATROL_B})+ 两台相机")
+    log(f"场景:地面 + {PLAYER} + {ENEMY} + 三个巡逻点"
+        f"({PATROL_A} / {PATROL_B} / {PATROL_C})+ 两台相机")
     return scene, player, enemy
 
 
@@ -198,6 +202,7 @@ def build_ai_tree():
     patrol = _add(tree, "GKNodeAiState", "巡逻", -60.0, 0.0,
                   gk_state_name="巡逻", gk_behavior="PATROL",
                   gk_patrol_a=PATROL_A, gk_patrol_b=PATROL_B,
+                  gk_patrol_c=PATROL_C,
                   gk_speed=PATROL_SPEED, gk_stop_distance=0.7,
                   gk_facing="MOVE")
     chase = _add(tree, "GKNodeAiState", "追击", 700.0, 0.0,

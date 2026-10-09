@@ -3965,6 +3965,85 @@ def main():
         check("第七十七轮(场景开局 BGM)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 巡逻路径点 3 个以上(第七十八轮,D 组 8)----
+    # 『AI_状态』的巡逻点从两个扩到四个(都是物体选择器)。只填 A / B 时
+    # 还是原来那套"翻面布尔"(老图产物一字不变);填了 C / D 就换成
+    # "索引 + 方向"的往返:A→B→C→D→C→B→A。
+    try:
+        ai_nodes = __import__(f"{module_name}.nodes.nodes",
+                              fromlist=["GKNodeAiState"])
+        r78_props = [entry[0] for entry in ai_nodes.GKNodeAiState.gk_prop_defs]
+        check("巡逻点:卡片上多了 C / D 两个选择器",
+              "gk_patrol_c" in r78_props and "gk_patrol_d" in r78_props,
+              str(r78_props))
+
+        def _r78_code(*patrol):
+            ai = bpy.data.node_groups.new("巡逻点冒烟78", "GKGameAiTree")
+            state = ai.nodes.new("GKNodeAiState")
+            state.gk_state_name = "巡逻"
+            state.gk_behavior = "PATROL"
+            state.gk_speed = 3.0
+            state.gk_stop_distance = 0.7
+            for prop, value in patrol:
+                setattr(state, prop, value)
+            logic = bpy.data.node_groups.new("巡逻逻辑78", "GKGameLogicTree")
+            event = logic.nodes.new("GKNodeOnReady")
+            enable = logic.nodes.new("GKNodeAiEnable")
+            logic.links.new(event.outputs["执行"], enable.inputs["执行"])
+            code, warnings = codegen.generate(
+                logic, {"dimension": "3", "base_class": "CharacterBody3D"})
+            bpy.data.node_groups.remove(logic)
+            bpy.data.node_groups.remove(ai)
+            return code, warnings
+
+        r78_two, r78_two_warn = _r78_code(("gk_patrol_a", "点A"),
+                                          ("gk_patrol_b", "点B"))
+        check("巡逻点:只填 A / B 还是老的翻面布尔",
+              "var _gk_ai_patrol_1: bool = false" in r78_two
+              and "_gk_ai_patrol_1 = not _gk_ai_patrol_1" in r78_two
+              and "_gk_ai_wp_index" not in r78_two,
+              r78_two[-200:])
+        check("巡逻点:两点时无告警", not r78_two_warn, str(r78_two_warn)[:200])
+
+        r78_three, r78_three_warn = _r78_code(("gk_patrol_a", "点A"),
+                                              ("gk_patrol_b", "点B"),
+                                              ("gk_patrol_c", "点C"))
+        check("巡逻点:三点走往返(索引 + 方向)",
+              "var _gk_ai_wp_index_1: int = 0" in r78_three
+              and "_gk_ai_wp_index_1 >= 2" in r78_three
+              and "_gk_ai_wp_index_1 <= 0" in r78_three
+              and "_gk_ai_wp_index_1 += 1" in r78_three
+              and "_gk_ai_wp_index_1 -= 1" in r78_three,
+              r78_three[-300:])
+        check("巡逻点:三点时三个点都进了引用表",
+              all(name in r78_three for name in ("点A", "点B", "点C")))
+        check("巡逻点:三点时无告警", not r78_three_warn,
+              str(r78_three_warn)[:200])
+
+        # 卡片画得完(侧栏瘦身那次的教训)
+        class _R78Layout:      # 最小替身:随便怎么调都返回自己
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r78_ai = bpy.data.node_groups.new("巡逻卡片78", "GKGameAiTree")
+        r78_state = r78_ai.nodes.new("GKNodeAiState")
+        r78_state.gk_behavior = "PATROL"
+        r78_draw_error = ""
+        try:
+            r78_state.draw_buttons(bpy.context, _R78Layout())
+        except Exception as exc:                      # noqa: BLE001
+            r78_draw_error = f"{type(exc).__name__}: {exc}"
+        check("巡逻点:巡逻卡片画得完", not r78_draw_error, r78_draw_error)
+        bpy.data.node_groups.remove(r78_ai)
+    except Exception as exc:
+        check("第七十八轮(巡逻路径点)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

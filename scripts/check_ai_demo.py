@@ -55,6 +55,16 @@ var start_pos := Vector3.ZERO
 # 听觉那一段:噪音点的位置、以及"开始朝它走"之前的敌人位置
 var noise_at := Vector3.ZERO
 var noise_start := Vector3.ZERO
+# 三点巡逻(第七十八轮):把敌人挪到当前那个点上,索引应该前进 1
+var wp_before := -1
+var wp_after := -2
+
+
+func _wp() -> int:
+	# ⚠ 成员变量在**玩家脚本**上(代码生成在挂脚本的物体上,见文件头)
+	if player == null:
+		return -1
+	return int(player.get("_gk_ai_wp_index_1"))
 
 
 func _ready() -> void:
@@ -75,7 +85,17 @@ func _physics_process(delta: float) -> void:
 	elapsed += delta
 	if phase == 0 and elapsed >= 0.15:
 		phase = 1
+		# ── 三点巡逻(第七十八轮)────────────────────────────────────
+		# 把敌人**直接挪到当前那个巡逻点**上(甲是列表里的第 0 个)->
+		# 下一帧就该"到了 -> 索引 +1"。
+		# ⚠ 必须在**玩家还远**的时候挪:同一帧里挪敌人 + 把玩家挪近的话,
+		#   状态当帧就切『追击』了,巡逻的"到点"根本轮不到(实测踩过)。
+		wp_before = _wp()
+		var spot := world.find_child("巡逻点甲", true, false)
+		if enemy != null and spot != null:
+			enemy.global_position = (spot as Node3D).global_position
 		if enemy != null:
+			# 位移基准记在**挪完**之后 —— 否则量到的是这一下瞬移
 			start_pos = enemy.global_position
 		print("AI_START state=", _state(),
 			" has_player=", player != null, " has_enemy=", enemy != null)
@@ -84,7 +104,9 @@ func _physics_process(delta: float) -> void:
 		var moved := 0.0
 		if enemy != null:
 			moved = enemy.global_position.distance_to(start_pos)
+		wp_after = _wp()
 		print("AI_PATROL state=", _state(), " moved=", snappedf(moved, 0.01))
+		print("AI_WP before=", wp_before, " after=", wp_after)
 		if player != null and enemy != null:
 			# 把玩家放到敌人 5 米外(9 米视野内)-> 应该转追击,
 			# 而且因为停距是 1.6,敌人会真的追近一段
@@ -228,6 +250,12 @@ def main():
         print("✗ 跟丢后没回到巡逻:",
               [line for line in text.splitlines() if line.startswith("AI_LOST")])
         ok = False
+    # ── 三点巡逻:把敌人挪到当前那个点上,索引要前进 1(第七十八轮)────────
+    wp = re.search(r"AI_WP before=(-?\d+) after=(-?\d+)", text)
+    if not wp or int(wp.group(2)) != int(wp.group(1)) + 1:
+        print("✗ 三点巡逻的索引没有前进(挪到当前巡逻点后应该 +1):",
+              wp.group(0) if wp else "<没跑到>")
+        ok = False
     # ── 听觉:听见动静 -> 去查看 -> 真的走过去 -> 安静回巡逻 ────────────
     heard = re.search(r"AI_HEARD state=(\S+) to_noise=([\d.]+) walked=([\d.]+)",
                       text)
@@ -268,7 +296,13 @@ def main():
                 ('elif ai_state == "追击":', "追击行为"),
                 (".length() <= 9.0", "『看见目标』的距离条件"),
                 (".length() > 11.0", "『丢失目标』的距离条件"),
-                ("_gk_ai_patrol_1 = not _gk_ai_patrol_1", "巡逻到点折返"),
+                # ── 三个点以上的巡逻(第七十八轮)───────────────────────
+                # 老的两点翻面(`_gk_ai_patrol_1 = not ...`)在三点图上**不生成**,
+                # 换成"索引 + 方向"那套
+                ("var _gk_ai_wp_index_1: int = 0", "三点巡逻的索引变量"),
+                ("_gk_ai_wp_index_1 >= 2", "走到头上就掉头"),
+                ("_gk_ai_wp_index_1 -= 1", "回头时索引往回走"),
+                ("巡逻点丙", "第三个巡逻点进了引用表"),
                 ("[AI] 切到状态", "调试打印(『打印状态变化』)"),
                 # ── 听觉三件套(第五十七轮)───────────────────────────
                 ('get_nodes_in_group("gk_ai_hearer")', "噪音广播到听觉体组"),

@@ -1148,7 +1148,11 @@ def ai_tree_graph(tree):
             problems.append(
                 f"状态『{name}』的行为是『{label}』,但没填『巡逻点 A』—— "
                 f"它哪儿也不去。在场景里摆两个空物体当巡逻点,再选上")
-        if behavior == "PATROL" and not str(
+        # 填了 C / D 时 B 可以是空的(跳着填 = 走 A↔C,D 也同理)
+        filled_extra = any(
+            str(getattr(state, prop, "") or "").strip()
+            for prop in ("gk_patrol_c", "gk_patrol_d"))
+        if behavior == "PATROL" and not filled_extra and not str(
                 getattr(state, "gk_patrol_b", "") or "").strip():
             problems.append(
                 f"状态『{name}』没填『巡逻点 B』—— 只在 A 点待着不算巡逻,"

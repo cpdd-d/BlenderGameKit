@@ -64,6 +64,14 @@ class GKNodeAiState(B.GKStatementNode):
          "巡逻的起点 / 返回的岗位(在场景里摆两个空物体当巡逻点)"),
         ("gk_patrol_b", "node", "", "巡逻点 B",
          "巡逻的另一头(不填 = 只在 A 点附近待着)"),
+        # ── 第三 / 第四个巡逻点(第七十八轮)──────────────────────────
+        # 只填 A / B 时走的是原来那套"翻面布尔"(生成物一字不变);
+        # 填了 C 或 D 就改成**往返**:A→B→C→D→C→B→A。
+        # 跳着填也行(比如 A、C 两点,中间 B 空着 = 走 A↔C)。
+        ("gk_patrol_c", "node", "", "巡逻点 C",
+         "第三个巡逻点(不填 = 只走 A↔B)"),
+        ("gk_patrol_d", "node", "", "巡逻点 D",
+         "第四个巡逻点(最多四个点,走法都是往返)"),
         ("gk_speed", "float", 3.0, "速度",
          "移动速度(3D 米/秒,一般 2~6;2D 项目的单位是像素/秒,要填大得多)"),
         ("gk_stop_distance", "float", 0.6, "停在多远",
@@ -109,9 +117,14 @@ class GKNodeAiState(B.GKStatementNode):
             row.label(text="巡逻点 A")
             B.draw_target_picker(self, row, "gk_patrol_a")
             if behavior == "PATROL":
-                row = layout.row(align=True)
-                row.label(text="巡逻点 B")
-                B.draw_target_picker(self, row, "gk_patrol_b")
+                # A / B / C / D 最多四个点(第七十八轮)——
+                # 填了 C 或 D 就从"A↔B 翻面"换成"往返走完全程"
+                for prop, label in (("gk_patrol_b", "巡逻点 B"),
+                                    ("gk_patrol_c", "巡逻点 C"),
+                                    ("gk_patrol_d", "巡逻点 D")):
+                    row = layout.row(align=True)
+                    row.label(text=label)
+                    B.draw_target_picker(self, row, prop)
         if behavior != "STAND":
             row = layout.row(align=True)
             row.prop(self, "gk_speed", text="速度")

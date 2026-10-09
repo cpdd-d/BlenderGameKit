@@ -15967,6 +15967,114 @@ class TestRound77SceneBgm(Base):
         self.assertIn(res, ae.ENVIRONMENT_SCRIPT.format(**fields))
 
 
+class TestRound78PatrolWaypoints(Base):
+    """第七十八轮(D 组 8):**巡逻路径点(3 个以上)**。
+
+    以前巡逻只有两点(『巡逻点 A』『巡逻点 B』)+ 一个翻面布尔 ——
+    来回一条直线。现在卡片上多了『巡逻点 C』『巡逻点 D』(同样是物体
+    选择器,最多四个点),走法是**往返**:A→B→C→D→C→B→A。
+
+    判据:**只填了 A / B 的老图走原来那条路,生成物一字不变**。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _run(self, **patrol):
+        """一张最小 AI 图:只有一个巡逻状态 + 一个『AI_启用』。"""
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                    gk_behavior="PATROL", gk_speed=3.0, gk_stop_distance=0.6,
+                    **patrol)
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return self._gen_with_ai(ai, tree)
+
+    def test_waypoint_props_declared(self):
+        props = {entry[0] for entry in NN.GKNodeAiState.gk_prop_defs}
+        self.assertIn("gk_patrol_c", props)
+        self.assertIn("gk_patrol_d", props)
+
+    def test_two_points_keep_the_old_flip(self):
+        """只填 A / B:还是原来那个翻面布尔,一个新变量都不多。"""
+        code, warnings = self._run(gk_patrol_a="点A", gk_patrol_b="点B")
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var _gk_ai_patrol_1: bool = false", code)
+        self.assertIn("_gk_ai_patrol_1 = not _gk_ai_patrol_1", code)
+        self.assertNotIn("_gk_ai_wp_index", code)
+        self.assertNotIn("_gk_ai_wp_dir", code)
+
+    def test_three_points_ping_pong(self):
+        code, warnings = self._run(gk_patrol_a="点A", gk_patrol_b="点B",
+                                   gk_patrol_c="点C")
+        self.assertEqual(warnings, [], warnings)
+        # 当前第几个点 + 往前往后(都要跨帧记 -> 成员变量)
+        self.assertIn("var _gk_ai_wp_index_1: int = 0", code)
+        self.assertIn("var _gk_ai_wp_dir_1: bool = true", code)
+        # 三个点 = 索引 0/1/2,两头的边界各翻一次方向
+        self.assertIn("_gk_ai_wp_index_1 >= 2:", code)
+        self.assertIn("_gk_ai_wp_index_1 <= 0:", code)
+        self.assertIn("_gk_ai_wp_index_1 += 1", code)
+        self.assertIn("_gk_ai_wp_index_1 -= 1", code)
+        for name in ("点A", "点B", "点C"):
+            self.assertIn(name, code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_four_points(self):
+        code, _ = self._run(gk_patrol_a="点A", gk_patrol_b="点B",
+                            gk_patrol_c="点C", gk_patrol_d="点D")
+        self.assertIn("_gk_ai_wp_index_1 >= 3:", code)
+        self.assertIn("点D", code)
+
+    def test_gap_between_points_is_skipped(self):
+        """跳着填(A + C,B 空)也走:a→c→a,不是站着不动。"""
+        code, warnings = self._run(gk_patrol_a="点A", gk_patrol_c="点C")
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ai_wp_index_1 >= 1:", code)
+        self.assertIn("点C", code)
+
+    def test_no_waypoint_path_without_point_a(self):
+        """只填了 C 没填 A —— 走不了。要么告警、要么别生成那条路。"""
+        code, warnings = self._run(gk_patrol_c="点C")
+        self.assertTrue(any("巡逻点 A" in w for w in warnings), warnings)
+        self.assertNotIn("_gk_ai_wp_index", code)
+
+    def test_return_behavior_still_goes_to_a_only(self):
+        """『返回』还是只回 A 点 —— 巡逻点 C / D 不掺和。"""
+        ai = self._ai_tree()
+        ai.new_node(NN.GKNodeAiState, "回岗", gk_state_name="回岗",
+                    gk_behavior="RETURN", gk_patrol_a="点A", gk_patrol_c="点C")
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_ai_wp_index", code)
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 
