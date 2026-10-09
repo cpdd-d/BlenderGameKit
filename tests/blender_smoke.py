@@ -3906,6 +3906,65 @@ def main():
         check("第七十六轮(动画_事件)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 场景开局 BGM(第七十七轮,C 组『场景规则』)----
+    # 侧栏选一首 -> 环境脚本开局自己造播放器播着(**循环**);音频走
+    # 『资产_声音卡』同一条管线复制进项目的 audio/。
+    try:
+        r77_ae = __import__(f"{module_name}.asset_export",
+                            fromlist=["scene_bgm_path", "scene_bgm_card"])
+        r77_scene = bpy.context.scene
+        r77_settings = r77_scene.gk_settings
+        check("场景BGM:侧栏两个属性都挂上了",
+              hasattr(r77_settings, "scene_bgm")
+              and hasattr(r77_settings, "scene_bgm_volume"),
+              str([n for n in dir(r77_settings) if n.startswith("scene_bgm")]))
+
+        r77_old = (getattr(r77_settings, "scene_bgm", ""),
+                   getattr(r77_settings, "scene_bgm_volume", -6.0),
+                   getattr(r77_settings, "dimension", "3"))
+
+        r77_settings.scene_bgm = ""
+        check("场景BGM:没选就当作没开",
+              r77_ae.scene_bgm_path(r77_scene) == ""
+              and r77_ae.scene_bgm_card(r77_scene) is None)
+        r77_off = r77_ae.ENVIRONMENT_SCRIPT.format(
+            **r77_ae._env_fields(r77_scene, camera_name="", fov=0.0))
+        check("场景BGM:没选时脚本里是空路径",
+              'bgm_path: String = ""' in r77_off)
+        check("场景BGM:模板里有播放器和循环那套",
+              "AudioStreamPlayer.new()" in r77_off
+              and "AudioStreamWAV.LOOP_FORWARD" in r77_off
+              and "Engine.is_editor_hint()" in r77_off)
+
+        # 选一首(路径只要以 wav/ogg/mp3 结尾就算音频 —— 这里不必真存在)
+        r77_fake = os.path.join(tempfile.gettempdir(), "gk_开局BGM.wav")
+        r77_settings.scene_bgm = r77_fake
+        r77_settings.scene_bgm_volume = -12.5
+        check("场景BGM:选了就认它",
+              r77_ae.scene_bgm_path(r77_scene) == r77_fake)
+        r77_card = r77_ae.scene_bgm_card(r77_scene)
+        check("场景BGM:生成声音卡(才会被复制进 audio/)",
+              r77_card is not None and r77_card[1] == r77_fake,
+              str(r77_card))
+        r77_on = r77_ae.ENVIRONMENT_SCRIPT.format(
+            **r77_ae._env_fields(r77_scene, camera_name="", fov=0.0))
+        check("场景BGM:脚本里写的是 res://audio/ 下的路径",
+              "res://audio/" in r77_on and "-12.5" in r77_on)
+
+        # 2D 场景本来只在"有活要干"时才写环境脚本 —— BGM 也算一件活
+        r77_settings.dimension = "2"
+        r77_node, r77_files, _r77_cam = r77_ae.build_environment_nodes(
+            r77_scene, is_3d=False, scene_name="BGM冒烟")
+        check("场景BGM:2D 场景只开了 BGM 也会写环境脚本",
+              bool(r77_files) and "bgm_path" in list(r77_files.values())[0],
+              str(list(r77_files)))
+
+        (r77_settings.scene_bgm, r77_settings.scene_bgm_volume,
+         r77_settings.dimension) = r77_old
+    except Exception as exc:
+        check("第七十七轮(场景开局 BGM)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

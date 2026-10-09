@@ -28,6 +28,7 @@ from . import generated_files
 from . import gk_log
 from . import npr_preview
 from . import project
+from . import sound_assets
 from .nodes.node_base import gd_node_path, snake_case
 
 # 导出的 .tscn 里，脚本与模型各自的 res:// 路径
@@ -192,6 +193,21 @@ extends Node
 ## 想指定用哪盏灯就填它的名字;留空 = 自动挑(见 _gk_lights_on)。
 @export var light_name: String = ""
 
+## ── 场景开局 BGM(第七十七轮,C 组『场景规则』)──────────────────────
+## 在侧栏『导出为 Godot 脚本』里选一首:开局自动播、**循环**。
+## 音频走和『资产_声音卡』同一条管线(导出时复制进项目的 audio/),
+## 所以这里是一条能直接 load 的 res:// 路径。
+##
+## 留空 = 不播(照旧:自己接『每当_准备 → 音效_音乐』)。
+##
+## ── 为什么自己造播放器而不是在 .tscn 里摆一个节点 ────────────────
+## 环境脚本是**每场景一份** —— BGM 摆节点的话每个场景都要重复一遍;
+## 造在这里:选了就有、清空就没了,只此一处。
+@export var bgm_path: String = "{bgm_path}"
+
+## 开局 BGM 的音量(dB)。0 = 原始,负数是调小。
+@export var bgm_volume_db: float = {bgm_volume}
+
 ## ── 手电筒:跟着相机走的灯(第四十八轮:阶段①灯光扩展)──────────────
 ## 在 Blender 里给灯勾上『跟随相机(手电筒)』(『游戏物理』面板 -> 灯光),
 ## 导出会把这盏灯的名字写进来(多盏用竖线分隔)。运行时**每物理帧**把
@@ -350,6 +366,57 @@ func _ready() -> void:
 	# 但越短越好)。编辑器里不烤(和上面几个开关一致)。
 	if nav_bake and not Engine.is_editor_hint():
 		_gk_bake_navigation()
+	# 开局 BGM(第七十七轮):和上面几个一样 —— @tool 脚本在编辑器里
+	# 也会走 _ready,编辑器里放音乐会很烦。
+	if not bgm_path.is_empty() and not Engine.is_editor_hint():
+		_gk_start_bgm()
+
+
+## 开局 BGM:造一个常驻播放器,循环播。
+##
+## ── 为什么要自己开循环 ──────────────────────────────────────────
+## Godot 的 AudioStreamPlayer 播完就停,而 BGM 是要一直有的。
+## 三种格式的循环开关**不在同一个地方**(实测):
+##   .ogg / .mp3 -> `loop` 属性
+##   .wav        -> `loop_mode` + `loop_end`(单位是**采样帧**,不是秒;
+##                  不填 loop_end 的话循环区间是空的,等于没循环)
+func _gk_start_bgm() -> void:
+	var stream := load(bgm_path) as AudioStream
+	if stream == null:
+		push_warning("[GK] 找不到开局 BGM 文件: %s" % bgm_path)
+		return
+	if stream is AudioStreamOggVorbis:
+		(stream as AudioStreamOggVorbis).loop = true
+	elif stream is AudioStreamMP3:
+		(stream as AudioStreamMP3).loop = true
+	elif stream is AudioStreamWAV:
+		var wav := stream as AudioStreamWAV
+		wav.loop_mode = AudioStreamWAV.LOOP_FORWARD
+		wav.loop_begin = 0
+		wav.loop_end = _gk_wav_frames(wav)
+	var player := AudioStreamPlayer.new()
+	player.name = "GKBgm"
+	player.stream = stream
+	player.volume_db = bgm_volume_db
+	# 暂停(ESC 菜单 / 上帝机时停)时 BGM 不该跟着停 —— 它是"这一关的
+	# 背景",不是某个角色的动作。
+	player.process_mode = Node.PROCESS_MODE_ALWAYS
+	add_child(player)
+	player.play()
+
+
+## .wav 一共多少**采样帧**(AudioStreamWAV.loop_end 要的就是帧数)。
+##
+## 帧数 = 时长(秒) × 采样率。
+##
+## ── 为什么**不能**拿 `wav.data.size()` 去推(真机踩过)──────────────
+## Godot 导入 wav 时默认会**压缩**(设置里的 `compress/mode`),实测一个
+## 8kHz / 单声道 / 16bit 的 0.2 秒 wav 导进来是 `format = 3`(**QOA**)、
+## `data.size() = 672`。按"16bit 单声道 = 每帧 2 字节"去推就得到 336 帧,
+## 而真实长度是 1600 帧 —— 算出来的 loop_end 只有 21%,听起来就是
+## "每次都在半路回头"。时长和采样率是**导入器给的**,不受压缩方式影响。
+func _gk_wav_frames(wav: AudioStreamWAV) -> int:
+	return int(round(wav.get_length() * float(wav.mix_rate)))
 
 
 ## 把 Blender 里调好的材质挂到对应的网格上。
@@ -1467,6 +1534,11 @@ ENV_SCRIPT_DEFAULTS = dict(
     esc_quit="true",
     nav_bake="false",
     follow_lights="",
+    # 开局 BGM(第七十七轮)。这两个键和 `_env_fields` 里那两行**必须一一对应**:
+    # 只加 `_env_fields` 忘了加这里 -> 模板渲染 KeyError,而且只在
+    # `render_env_script()` 那条路(测试 / 工具)上炸 —— 导出反而好好的。
+    # 有 `TestRound77SceneBgm.test_defaults_cover_every_placeholder` 锁着。
+    bgm_path="", bgm_volume="-6.0",
 )
 
 
@@ -1893,6 +1965,59 @@ def _nav_on(scene):
     return bool(getattr(settings, "nav_enabled", False))
 
 
+def _gd_float(value):
+    """GDScript 里的浮点写法(不是 .tscn 那套 6 位小数)。
+
+    `@export var x: float = -6.000000` 看着很脏;整数也补一个 `.0`
+    (写 `-6` 也能跑,但和这个文件的其它浮点风格不统一)。
+    """
+    number = float(value)
+    if number == 0.0:
+        number = 0.0                     # -0.0 -> 0.0
+    text = f"{number:.4f}".rstrip("0").rstrip(".")
+    if "." not in text:
+        text += ".0"
+    return text
+
+
+def scene_bgm_path(scene):
+    """侧栏『开局 BGM』选的**本地文件路径**(没选 / 不是音频 -> `""`)。
+
+    ── 为什么要把"不是音频"也当没选 ────────────────────────────────
+    `subtype="FILE_PATH"` 的选择器**不按扩展名过滤**,用户可能挑到一个
+    .txt。与其在 Godot 里得到一句"找不到文件",不如干脆不生成 ——
+    它本来就不会响。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    path = str(getattr(settings, "scene_bgm", "") or "").strip()
+    if not path or not sound_assets.is_sound_file(path):
+        return ""
+    return path
+
+
+def scene_bgm_card(scene):
+    """开局 BGM 的**声音卡**(形状和『资产_声音卡』一样:`(名字, 本地路径)`)。
+
+    导出时拿它喂 `sound_assets.copy_sounds()`,音频才会真的被复制进项目的
+    `audio/` —— 环境脚本里那条 `res://audio/...` 才有东西可 load。
+    (『资产_声音卡』那条路只服务**脚本**导出;场景导出不复制音频,
+     所以这里单独给场景导出用。)
+    """
+    path = scene_bgm_path(scene)
+    return ("开局BGM", path) if path else None
+
+
+def _bgm_fields(scene):
+    """(res:// 路径, dB) —— 环境脚本那两个字段。没选 -> ("", 默认)。"""
+    settings = getattr(scene, "gk_settings", None)
+    try:
+        volume = float(getattr(settings, "scene_bgm_volume", -6.0))
+    except (TypeError, ValueError):
+        volume = -6.0
+    path = scene_bgm_path(scene)
+    return (sound_assets.sound_res_path(path) if path else "", volume)
+
+
 def _nav_settings(scene):
     """导航网格的参数(交给 .tscn 的子资源 + 环境脚本)。
 
@@ -2041,9 +2166,12 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
     加字段时只改一边,另一条分支就会 NameError / 少字段(这次加调试面板时
     第一版就是这么撞的)。现在两边都调这个函数,加字段只改一处。
     """
+    bgm_path, bgm_volume = _bgm_fields(scene)
     return dict(
         camera_name=camera_name,
         fov=_fmt(fov),
+        bgm_path=bgm_path,
+        bgm_volume=_gd_float(bgm_volume),
         materials=_material_table(material_files),
         follow_scene_light="true" if _toon_follow_light(scene) else "false",
         god_camera="true" if _god_camera_on(scene) else "false",
@@ -3015,7 +3143,7 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         # 只有**有活要干**时(寻路 / 上帝机 / 调试面板)才写这个节点。
         files = {}
         if (_nav_on(scene) or _god_camera_on(scene)
-                or _debug_panel_on(scene)):
+                or _debug_panel_on(scene) or scene_bgm_path(scene)):
             fields = _env_fields(scene, camera_name="", fov=_fmt(0.0),
                                  material_files=material_files)
             files[env_script_rel(scene_name)] = \
@@ -6135,6 +6263,24 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     except OSError as exc:
         result["warnings"].append(f"包装场景生成失败: {exc}")
         return result
+
+    # ---- 3b) 开局 BGM 的音频文件(第七十七轮)--------------------------
+    # 环境脚本里写的是一条 `res://audio/...`,所以音频必须真的进项目 ——
+    # 不复制的话 Godot 里就是一句"找不到文件",而且**只在运行时**才发现。
+    # 走和『资产_声音卡』同一个管线(`sound_assets`),名字算得一模一样。
+    bgm_card = scene_bgm_card(scene)
+    if bgm_card is not None:
+        try:
+            written_sounds, missing_sounds = sound_assets.copy_sounds(
+                directory, [bgm_card])
+            for rel in written_sounds:
+                result["written"].append(os.path.join(directory, rel))
+            for _name, path in missing_sounds:
+                result["warnings"].append(
+                    f"开局 BGM 的文件找不到了:{path}"
+                    f"(在侧栏『导出为 Godot 脚本』里重新挑一次)")
+        except OSError as exc:
+            result["warnings"].append(f"开局 BGM 复制失败: {exc}")
 
     # 相机 / 灯光数量(面板上要报告,用户靠这个判断"会不会又是一片灰")
     # 相机 / 灯光数量(面板上要报告,用户靠这个判断"会不会又是一片灰")

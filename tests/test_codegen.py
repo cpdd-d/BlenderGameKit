@@ -15854,6 +15854,119 @@ class TestRound76AnimEvents(Base):
         self.assertTrue(any("触发时" in w for w in warnings), warnings)
 
 
+class TestRound77SceneBgm(Base):
+    """第七十七轮(C 组 7):**场景开局 BGM**(『场景规则』)。
+
+    以前要自己接『每当_准备 → 音效_音乐』。现在侧栏选一首就行 ——
+    落的点是**环境脚本**(每场景一份,天然就是"场景规则"该待的地方):
+    开局自动造一个常驻 AudioStreamPlayer 播着、循环。
+
+    判据:**没选就一行都不多**(老工程导出产物一字不变)。
+    """
+
+    @staticmethod
+    def _scene(**overrides):
+        values = dict(dimension="3", scene_bgm="", scene_bgm_volume=-6.0)
+        values.update(overrides)
+        return types.SimpleNamespace(gk_settings=types.SimpleNamespace(**values))
+
+    def test_off_by_default(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.scene_bgm_path(self._scene()), "")
+        # 没有 gk_settings / scene 是 None 都不能炸
+        self.assertEqual(ae.scene_bgm_path(types.SimpleNamespace()), "")
+        self.assertEqual(ae.scene_bgm_path(None), "")
+
+    def test_non_audio_file_is_ignored(self):
+        """选了个不是音频的文件(比如 .txt)-> 当没选,别去 load 它。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.scene_bgm_path(self._scene(scene_bgm=r"D:\a.txt")),
+                         "")
+
+    def test_env_script_gets_the_bgm_player(self):
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import sound_assets
+        scene = self._scene(scene_bgm=r"D:\snd\主题曲.ogg")
+        fields = ae._env_fields(scene, camera_name="", fov=0.0)
+        text = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        # 音频走和『资产_声音卡』同一条路 —— 路径必须算得一模一样
+        self.assertIn(sound_assets.sound_res_path(r"D:\snd\主题曲.ogg"), text)
+        self.assertIn("bgm_volume_db: float = -6.0", text)
+        self.assertIn("AudioStreamPlayer.new()", text)
+        # @tool 脚本在编辑器里也会 _ready —— 编辑器里不许自己放音乐
+        self.assertIn("if not bgm_path.is_empty() and not Engine.is_editor_hint()",
+                      text)
+
+    def test_empty_bgm_keeps_script_quiet(self):
+        from BlenderGameKit import asset_export as ae
+        fields = ae._env_fields(self._scene(), camera_name="", fov=0.0)
+        text = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        self.assertIn('bgm_path: String = ""', text)
+        # 空路径也要有守卫,不然会去 load("")
+        self.assertIn("if not bgm_path.is_empty()", text)
+
+    def test_volume_is_written_through(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(scene_bgm=r"D:\snd\bgm.wav", scene_bgm_volume=-12.5)
+        fields = ae._env_fields(scene, camera_name="", fov=0.0)
+        self.assertIn("bgm_volume_db: float = -12.5",
+                      ae.ENVIRONMENT_SCRIPT.format(**fields))
+
+    def test_2d_scene_with_bgm_still_gets_env_script(self):
+        """2D 场景本来只在"有活要干"时才写环境脚本 —— BGM 也算一件活。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(dimension="2", scene_bgm=r"D:\snd\bgm.wav")
+        _node, files, _cam = ae.build_environment_nodes(
+            scene, is_3d=False, scene_name="World")
+        self.assertTrue(files, "只开了 BGM 的 2D 场景也该有环境脚本")
+        self.assertIn("bgm_path: String = ", list(files.values())[0])
+
+    def test_2d_scene_without_bgm_has_nothing(self):
+        """没开任何东西的 2D 场景:还是一份环境脚本都不写(老行为不变)。"""
+        from BlenderGameKit import asset_export as ae
+        _node, files, _cam = ae.build_environment_nodes(
+            self._scene(dimension="2"), is_3d=False, scene_name="World")
+        self.assertFalse(files)
+
+    def test_bgm_becomes_a_sound_card(self):
+        """选了 BGM 就得进音频管线 —— 导出时它会被复制进 audio/。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(scene_bgm=r"D:\snd\主题曲.ogg")
+        card = ae.scene_bgm_card(scene)
+        self.assertIsNotNone(card, "没生成声音卡的话 BGM 不会被复制进 audio/")
+        self.assertEqual(card[1], r"D:\snd\主题曲.ogg")
+        self.assertIsNone(ae.scene_bgm_card(self._scene()))
+
+    def test_defaults_cover_every_placeholder(self):
+        """模板里的占位符必须都能被 `ENV_SCRIPT_DEFAULTS` 兜住。
+
+        加字段时只改 `_env_fields` 忘了改 DEFAULTS -> `render_env_script()`
+        渲染 KeyError,而导出走 `_env_fields` 反而是好的 —— 这种"一边好
+        一边炸"最容易漏。
+        """
+        from BlenderGameKit import asset_export as ae
+        placeholders = set(re.findall(r"\{(\w+)\}", ae.ENVIRONMENT_SCRIPT))
+        missing = placeholders - set(ae.ENV_SCRIPT_DEFAULTS)
+        self.assertEqual(missing, set(), f"模板占位符没有默认值: {missing}")
+
+    def test_copy_target_matches_the_script_path(self):
+        """环境脚本里写的 res:// 路径,必须和**真的被复制过去**的文件一致。
+
+        这两处以前在资产卡那条路上就是这么锁的(名字算两遍迟早飘掉)——
+        脚本说 `res://audio/主题曲_ab12cd34.ogg`,复制却叫别的名,
+        运行时就只是"找不到文件"。
+        """
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import sound_assets
+        scene = self._scene(scene_bgm=r"D:\snd\主题曲.ogg")
+        with tempfile.TemporaryDirectory() as folder:
+            planned = sound_assets.sound_files(folder, [ae.scene_bgm_card(scene)])
+        self.assertEqual(len(planned), 1, planned)
+        _name, _path, _target, res = planned[0]
+        fields = ae._env_fields(scene, camera_name="", fov=0.0)
+        self.assertIn(res, ae.ENVIRONMENT_SCRIPT.format(**fields))
+
+
 class TestRound71SingleChain(Base):
     """第七十一轮:处理器**不许自己再走一遍下游**。
 

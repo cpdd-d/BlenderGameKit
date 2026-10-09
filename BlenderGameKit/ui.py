@@ -5125,6 +5125,22 @@ class GK_PT_Main(bpy.types.Panel):
                 else:
                     box.label(text="关着:『移动_寻路』退化成直线走", icon="INFO")
 
+                # ── 开局 BGM(第七十七轮,C 组『场景规则』)────────────────
+                # 选一首 = 开局自动播(循环),音频会被复制进项目的 audio/。
+                # 落的点是**环境脚本**(每场景一份)—— 所以"每关一首"这件事
+                # 天然跟着 Blender 场景走,切场景卡上的值也跟着切。
+                bgm_row = box.row(align=True)
+                bgm_row.prop(settings, "scene_bgm", text="开局BGM")
+                bgm_row.prop(settings, "scene_bgm_volume", text="dB")
+                raw_bgm = str(getattr(settings, "scene_bgm", "") or "").strip()
+                if not raw_bgm:
+                    box.label(text="留空 = 开局不放音乐(想自己控就接『音效_音乐』)",
+                              icon="INFO")
+                elif not asset_export.scene_bgm_path(context.scene):
+                    # 挑了 wav / ogg / mp3 之外的东西 —— 那个导进 Godot 也
+                    # load 不出来,这里直接说清楚
+                    box.label(text="选的不是音频(wav / ogg / mp3)", icon="ERROR")
+
         # ---- 模型导出:把 Blender 的网格 / 材质 / 贴图一起带进 Godot ----
         #
         # 材质跟着模型一起导出:没设材质就自动给默认白色。

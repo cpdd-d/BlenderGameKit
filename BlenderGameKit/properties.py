@@ -688,6 +688,25 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         default="F2",
     )
 
+    # ── 场景开局 BGM(第七十七轮,C 组 7『场景规则』)────────────────────
+    # 以前想在开局放背景音乐,得自己接『每当_准备 → 音效_音乐』
+    # (还得先把音频拷进 Godot 项目)。现在侧栏选一首就行。
+    #
+    # ── 为什么落在**环境脚本**(每场景一份)──────────────────────────
+    # "开局放哪首歌"本来就是**一关一个**的规则(教室一首、走廊一首),
+    # 而环境脚本天然就是每场景一份 —— 挂场景上、写进它,切场景自动跟着切。
+    #
+    # 选了它 = 导出时把音频**复制进项目的 audio/**(和『资产_声音卡』
+    # 同一条管线、同一个命名规则),所以不会出现"Godot 里找不到文件"。
+    scene_bgm: StringProperty(
+        name="开局 BGM", default="", subtype="FILE_PATH",
+        description="场景一开始就播的背景音乐(wav / ogg / mp3),循环播放。\n"
+                    "留空 = 不播(想自己控制就照旧接『音效_音乐』节点)")
+    scene_bgm_volume: FloatProperty(
+        name="BGM 音量", default=-6.0,
+        soft_min=-40.0, soft_max=6.0,
+        description="开局 BGM 的音量(dB)。0 = 原始,负数是调小")
+
     show_export_settings: BoolProperty(
         name="展开导出设置", default=False,
         description="侧栏『导出设置』默认收起 —— 那几项开一次就不用再动")
