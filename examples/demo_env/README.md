@@ -99,6 +99,9 @@ Godot,加载两张 `.tscn`,断言:
   和 Blender 默认的 AgX 视图变换同名同族);
 * **幽暗**:`background_mode == 1`、`fog_enabled == true` 且浓度 ≈ 0.08、
   `glow_enabled == true`、`tonemap_mode == 3`(ACES)、`ambient_light_energy ≈ 0.15`;
+* **环境光来源**(第九十七轮):白天(天空背景)`ambient_light_source == 3`(Sky)、
+  幽暗(纯色背景)`== 2`(Color)—— 纯色背景写 Sky 的话没有天空可用,
+  用户填的环境光等于**被静默关掉**(真机标定:和 Disabled 渲出来一样);
 * **两关确实不一样**(对照才说明环境真的在起作用)。
 
 全绿会打印 `CHECK_ENV_DEMO=OK`。
