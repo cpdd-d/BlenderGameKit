@@ -84,10 +84,13 @@ BlenderGameKit 让人**在 Blender 里**用中文节点图写游戏逻辑,导出
 ## 想改项目时:提议,不要假装改了
 你**没有**直接修改项目的能力。要改什么就调用 `propose_action`,把动作和
 参数说清楚 —— 侧栏会给用户一张**待确认卡片**,他点了才会真执行。
-所以:
+**一次要改好几处**(比如"勾上脚本挂载目标" + "打开寻路")就用
+`propose_actions` 一次全提出来,别分好几轮一条一条提 —— 用户那边侧栏会
+一起摆出来,一个『全部执行』就能做完。所以:
 * **绝对不要**说"我已经帮你改好了""已经把勾选上了" —— 那是撒谎;
 * 应该说"我建议这样改,点确认就生效";
-* `propose_action` 只能用动作清单里列出的动作名,别自己编。"""
+* `propose_action` / `propose_actions` 只能用动作清单里列出的动作名,
+  别自己编。"""
 
 
 # 对话历史最多带这么多条发给模型(一问一答算两条)。不限的话越聊越慢越贵,
@@ -943,8 +946,18 @@ def poll_agent_step(context, base_url="", api_key="", model="", timeout=60):
             output, proposal = _execute_tool(call, context)
             # **追加**而不是覆盖:模型常常一口气建议好几处改动,
             # 覆盖会让前面的建议静默消失(用户根本没机会看到)
-            add_proposal(proposal)
-            _AGENT["steps"].append(_step_label(call, bool(proposal)))
+            #
+            # 第九十轮:proposal 可能是**一批**(`propose_actions` 一次提多条)
+            # —— 统一按列表拍平,别的地方不用关心是哪种工具提的。
+            if isinstance(proposal, dict):
+                batch = [proposal]
+            elif isinstance(proposal, (list, tuple)):
+                batch = [card for card in proposal if card]
+            else:
+                batch = []
+            for card in batch:
+                add_proposal(card)
+            _AGENT["steps"].append(_step_label(call, batch))
             _AGENT["messages"].append(
                 tool_result_message(call["id"], output))
         # 模型不支持工具调用而退化成纯问答时,得**告诉用户**为什么 AI
@@ -992,10 +1005,18 @@ def _execute_tool(call, context):
         return f"工具执行失败: {type(exc).__name__}: {exc}", None
 
 
-def _step_label(call, made_proposal):
-    """给用户看的一行"它做了什么"。"""
+def _step_label(call, proposals):
+    """给用户看的一行"它做了什么"。
+
+    `proposals` 是这一条工具调用**产出**的卡片清单(第九十轮起可能一批
+    好几张 —— 侧栏那一行就说清楚几张)。
+    """
     name = call.get("name", "")
-    if made_proposal:
+    count = len(proposals) if isinstance(proposals, (list, tuple)) else (
+        1 if proposals else 0)
+    if count > 1:
+        return f"提议了 {count} 个动作(等你确认)"
+    if count == 1:
         return "提议了一个动作(等你确认)"
     if call.get("arguments") is None:
         return f"{_TOOL_LABELS.get(name, name)}(参数有问题,已让它重试)"
@@ -1011,6 +1032,7 @@ _TOOL_LABELS = {
     "get_godot_status": "查了 Godot 与打包状况",
     "diagnose": "跑了一遍完整诊断",
     "propose_action": "提议了一个动作(等你确认)",
+    "propose_actions": "提议了几个动作(等你确认)",
 }
 
 

@@ -110,7 +110,8 @@ def tools_schema():
                 "name": "propose_action",
                 "description": ("**提议**一个修改动作。注意:这不会真的改项目 —— "
                                 "用户会在侧栏看到一张待确认卡片,点了才执行。"
-                                "不要在回答里说『我已经改好了』。"),
+                                "不要在回答里说『我已经改好了』。"
+                                "要一次改好几处时用 `propose_actions`(整批一起提)。"),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -134,6 +135,49 @@ def tools_schema():
                         },
                     },
                     "required": ["action", "why"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_actions",
+                "description": ("**一次提议多条**修改(看完项目后,把要改的"
+                                "一次全提出来 —— 别一条一条分好几轮)。"
+                                "同样不会真的改项目:侧栏会一起摆出这几张"
+                                "待确认卡片,用户点『全部执行』或逐张点才生效。"),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "actions": {
+                            "type": "array",
+                            "description": "要提议的动作清单(1~6 条)",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": sorted(ACTIONS),
+                                        "description": "动作名(只能是这些之一)",
+                                    },
+                                    "target": {
+                                        "type": "string",
+                                        "description": "对象名(不需要就留空)",
+                                    },
+                                    "value": {
+                                        "type": "string",
+                                        "description": "要设成的值(不需要就留空)",
+                                    },
+                                    "why": {
+                                        "type": "string",
+                                        "description": "为什么建议这么改(一句话)",
+                                    },
+                                },
+                                "required": ["action", "why"],
+                            },
+                        },
+                    },
+                    "required": ["actions"],
                 },
             },
         },
@@ -325,22 +369,20 @@ def action_menu_items(self, context=None):
             for name in sorted(ACTIONS)]
 
 
-def build_proposal(params):
-    """把模型给的参数变成一张待确认卡片。返回 (喂回模型的说明, 卡片 或 None)。
+def _validate_card(params):
+    """校验一条提议 -> (错误说明 或 "", 卡片 或 None)。
 
-    ── 为什么要在这里**校验**而不是等用户点了再报错 ────────────────
-    模型可能编一个不存在的动作名、或者该给 target 却没给。如果等用户点
-    『执行』才发现,那张卡片就是**假承诺**(看着像能用,点了却报错)。
-    所以当场校验:不合格就只把错误喂回模型让它重来,卡片根本不出现。
+    校验放在**提议**这一步(而不是等用户点『执行』)是为了不让卡片变成
+    **假承诺** —— 点了才发现参数不对,用户会失去对这套动作的信任。
     """
     name = str(params.get("action") or "").strip()
     entry = ACTIONS.get(name)
     if entry is None:
-        return (f"没有叫『{name}』的动作。可用的动作:{action_names()}", None)
-    missing = [key for key in entry["needs"] if not str(params.get(key) or "").strip()]
+        return f"没有叫『{name}』的动作。可用的动作:{action_names()}", None
+    missing = [key for key in entry["needs"]
+               if not str(params.get(key) or "").strip()]
     if missing:
-        return (f"动作『{name}』还缺参数:{missing}。请补齐后重新提议。", None)
-
+        return f"动作『{name}』还缺参数:{missing}。请补齐后重新提议。", None
     target = str(params.get("target") or "").strip()
     value = str(params.get("value") or "").strip()
     card = {
@@ -351,8 +393,62 @@ def build_proposal(params):
         "why": str(params.get("why") or "").strip(),
         "hint": entry["hint"],
     }
+    return "", card
+
+
+def build_proposal(params):
+    """把模型给的参数变成一张待确认卡片。返回 (喂回模型的说明, 卡片 或 None)。
+
+    ── 为什么要在这里**校验**而不是等用户点了再报错 ────────────────
+    模型可能编一个不存在的动作名、或者该给 target 却没给。如果等用户点
+    『执行』才发现,那张卡片就是**假承诺**(看着像能用,点了却报错)。
+    所以当场校验:不合格就只把错误喂回模型让它重来,卡片根本不出现。
+    """
+    error, card = _validate_card(params or {})
+    if error:
+        return error, None
     return ("已经把这张卡片展示给用户了,他点『执行』才会生效。"
             "请在回答里说明你建议这么改的理由,但**不要说已经改好了**。"), card
+
+
+def build_proposals(params):
+    """批量提议(第九十轮:待办 31 "AI 连续调多个工具后一起提议")。
+
+    返回 (喂回模型的说明, [卡片, …])。**逐条校验**:合格的进清单,
+    不合格的在说明里点名(模型下一轮能补对,而不是整批作废)。
+
+    ── 为什么要一个批量工具(而不是让模型连调几次 propose_action)────
+    连调多次当然也能出多张卡片(循环里是**追加**),但:
+      * 模型常常"提一条、等结果、再提一条",白烧好几轮;
+      * 用户那边要一张张点『执行』 —— 一次清洁的修改(勾上挂载目标 +
+        打开寻路)要点两次。
+    有了它:一次工具调用把**整批**摆出来,侧栏一个『全部执行』一键做完
+    (见 GK_OT_ApplyAllAdvisorActions)。
+    """
+    items = params.get("actions") if isinstance(params, dict) else None
+    if not isinstance(items, list) or not items:
+        return ("`propose_actions` 需要一个非空的 `actions` 数组"
+                "(每项含 action / target / value / why)。"), []
+    cards = []
+    errors = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"第 {index} 条不是对象,已跳过")
+            continue
+        error, card = _validate_card(item)
+        if error:
+            errors.append(f"第 {index} 条:{error}")
+            continue
+        cards.append(card)
+    if not cards:
+        return ("这一批**一条都不合格**,没有卡片出现。问题:\n- "
+                + "\n- ".join(errors)), []
+    note = (f"已经把 {len(cards)} 张卡片一起展示给用户了 —— 他可以逐张点"
+            f"『执行』,也可以一次『全部执行』。**不要**说已经改好了。")
+    if errors:
+        note += "\n这几条不合格(没生成卡片,请补对后可以再提):\n- " \
+                + "\n- ".join(errors)
+    return note, cards
 
 
 def apply_proposal(context, card):
@@ -372,7 +468,10 @@ def apply_proposal(context, card):
 # 只读工具的实现
 # ---------------------------------------------------------------------------
 def execute(name, params, context):
-    """执行一个工具。返回 (喂回模型的文本, 待确认动作 或 None)。
+    """执行一个工具。返回 (喂回模型的文本, 待确认动作)。
+
+    待确认动作这一项可能是:单张卡片(dict)/ 一批卡片(list)/ 没有(None)——
+    `propose_actions` 是批量的(第九十轮),调用方按"列表"统一处理。
 
     **在主线程里调用**(只读工具要读 bpy 数据)。
     """
@@ -380,8 +479,10 @@ def execute(name, params, context):
     if handler is None:
         if name == "propose_action":
             return build_proposal(params or {})
+        if name == "propose_actions":
+            return build_proposals(params or {})
         return (f"没有叫『{name}』的工具。可用:"
-                f"{sorted(list(_READERS) + ['propose_action'])}"), None
+                f"{sorted(list(_READERS) + ['propose_action', 'propose_actions'])}"), None
     try:
         return _clip(handler(context, params or {})), None
     except Exception as exc:                              # noqa: BLE001

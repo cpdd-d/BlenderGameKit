@@ -2493,6 +2493,9 @@ def main():
                     # AI 亲自操作(第五十六轮):执行/忽略提议的动作
                     "gk.apply_advisor_action", "gk.dismiss_advisor_action",
                     "gk.run_advisor_action",
+                    # 批量:一次全执行 / 全忽略(第九十轮)
+                    "gk.apply_all_advisor_actions",
+                    "gk.dismiss_all_advisor_actions",
                     # 分组框折叠(第六十二轮)+ 一键预设角色(第六十三轮补登记)
                     "gk.toggle_group", "gk.character_preset",
                     # 变量 / 函数改名 + 资产改名(第八十九轮:I 组 27+28)
@@ -2900,6 +2903,105 @@ def main():
         adv2.cancel_agent()
     except Exception as exc:
         check("AI 亲自操作", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 第九十轮(待办 31):批量提议 + 『全部执行』 ----
+    # 真 Blender 里验四件事:
+    #   ① `propose_actions` 一次提多条:合格的都出卡片,不合格的点名;
+    #   ② 『全部执行』按顺序落地(勾挂载目标 + 开上帝机都真的改了),
+    #      执行完卡片清掉;
+    #   ③ 失败的那条**留在侧栏**(不吞掉):换一张会失败的动作(目标物体
+    #      不存在)一起提,执行后成功 1 条、留 1 条;
+    #   ④ 『全部忽略』什么都不改。
+    try:
+        at3 = __import__(f"{module_name}.advisor_tools",
+                         fromlist=["build_proposals"])
+        adv3 = __import__(f"{module_name}.advisor",
+                          fromlist=["add_proposal"])
+        settings = bpy.context.scene.gk_settings
+        scene = bpy.context.scene
+
+        # 造一个真网格当"角色"(勾脚本挂载目标用)
+        r90_mesh = bpy.data.meshes.new("R90角色网格")
+        r90_body = bpy.data.objects.new("R90角色", r90_mesh)
+        scene.collection.objects.link(r90_body)
+
+        saved_cam3 = bool(settings.god_camera)
+        saved_target3 = bool(r90_body.gk_physics.script_target)
+        settings.god_camera = False
+        r90_body.gk_physics.script_target = False
+
+        note, cards = at3.build_proposals({"actions": [
+            {"action": "enable_script_target", "target": "R90角色",
+             "why": "角色得挂脚本才会动"},
+            {"action": "enable_god_camera", "why": "方便看场景"},
+            {"action": "编的动作", "why": "故意的"},
+        ]})
+        check("第九十轮:批量提议一次出 2 张卡,坏的点名",
+              len(cards) == 2 and "第 3 条" in note, f"{len(cards)} {note[:120]}")
+        check("第九十轮:提议**没改数据**(两张卡都还没生效)",
+              bool(settings.god_camera) is False
+              and bool(r90_body.gk_physics.script_target) is False)
+        for card in cards:
+            adv3.add_proposal(card)
+        adv3._AGENT["steps"].append(adv3._step_label(
+            {"name": "propose_actions", "arguments": {}}, cards))
+        check("第九十轮:侧栏步数报出张数",
+              adv3.agent_steps()[-1] == "提议了 2 个动作(等你确认)",
+              str(adv3.agent_steps()[-1:]))
+
+        result = bpy.ops.gk.apply_all_advisor_actions()
+        check("第九十轮:『全部执行』把两条都落地了",
+              result == {"FINISHED"}
+              and bool(settings.god_camera) is True
+              and bool(r90_body.gk_physics.script_target) is True,
+              f"{result} cam={settings.god_camera} "
+              f"target={r90_body.gk_physics.script_target}")
+        check("第九十轮:执行完卡片清掉了(不会重复执行)",
+              adv3.agent_proposals() == [],
+              str(adv3.agent_proposals()))
+
+        # ③ 失败的那条留着:目标物体不存在(提议时校验只看"填没填")
+        settings.god_camera = False
+        good = {"action": "enable_god_camera", "label": "打开上帝摄像机",
+                "target": "", "value": "", "why": "看场景"}
+        bad = at3.build_proposal({"action": "enable_script_target",
+                                  "target": "不存在的物体", "why": "故意"})[1]
+        adv3.add_proposal(good)
+        adv3.add_proposal(bad)
+        bpy.ops.gk.apply_all_advisor_actions()
+        left = adv3.agent_proposals()
+        check("第九十轮:成功后失败的卡片留着(不吞掉)",
+              bool(settings.god_camera) is True and len(left) == 1
+              and left[0]["action"] == "enable_script_target",
+              f"cam={settings.god_camera} 剩={[c['action'] for c in left]}")
+        check("第九十轮:侧栏状态说清了几成几败",
+              "1 条" in ops_mod.LAST_ADVISOR.get("status", "")
+              and "失败" in ops_mod.LAST_ADVISOR.get("status", ""),
+              ops_mod.LAST_ADVISOR.get("status", ""))
+
+        # ④ 全部忽略:什么都不改
+        settings.god_camera = False
+        adv3.add_proposal(at3.build_proposal(
+            {"action": "enable_god_camera", "why": "看场景"})[1])
+        result = bpy.ops.gk.dismiss_all_advisor_actions()
+        check("第九十轮:『全部忽略』清空且一个都不改",
+              result == {"FINISHED"} and adv3.agent_proposals() == []
+              and bool(settings.god_camera) is False,
+              f"{result} cam={settings.god_camera}")
+
+        # 清理
+        settings.god_camera = saved_cam3
+        r90_body.gk_physics.script_target = saved_target3
+        bpy.data.objects.remove(r90_body, do_unlink=True)
+        bpy.data.meshes.remove(r90_mesh)
+        left_block = bpy.data.texts.get(adv3.DIALOG_TEXT_NAME)
+        if left_block is not None:
+            bpy.data.texts.remove(left_block)
+        adv3.clear_proposals()
+    except Exception as exc:
+        check("第九十轮(批量提议 + 全部执行)", False,
+              f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- AI 听觉(第五十七轮):新节点 + 新行为 + 新条件来源 ----

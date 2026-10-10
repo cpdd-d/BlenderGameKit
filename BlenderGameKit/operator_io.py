@@ -3568,6 +3568,81 @@ class GK_OT_DismissAdvisorAction(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_ApplyAllAdvisorActions(bpy.types.Operator):
+    """把待确认的 AI 建议**一次全执行**(第九十轮:待办 31)。
+
+    ── 为什么要有它 ────────────────────────────────────────────────
+    AI 常常一次提几条(「勾上脚本挂载目标」+「打开寻路」+「开上帝机」)。
+    一条条点『执行』要点三下,而且点着后面忘了前面 —— 一次清洁的修改
+    本该是一次操作。
+
+    ── 失败的那几条**留着**(不吞掉)────────────────────────────────
+    逐条落地;成功的清掉,失败的卡片留在侧栏让用户看清 / 重试 / 忽略。
+    每条都写进对话记录 —— 事后能查"当时一口气改了什么"。
+    """
+
+    bl_idname = "gk.apply_all_advisor_actions"
+    bl_label = "全部执行"
+    bl_description = "按顺序执行所有待确认的 AI 建议(失败的会留在侧栏)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        cards = advisor.agent_proposals()
+        if not cards:
+            _report(self, "ERROR", "没有待确认的动作(可能已经执行或忽略过了)")
+            return {"CANCELLED"}
+        done = 0
+        failed = []
+        kept = []
+        lines = []
+        for card in list(cards):
+            ok, message = advisor_tools.apply_proposal(context, card)
+            lines.append(f"- {card.get('label', '')}:"
+                         f"{'成功' if ok else '失败'} —— {message}")
+            if ok:
+                done += 1
+            else:
+                failed.append(message)
+                kept.append(card)
+        # 成功的清掉、失败的留回去(用现有 API:清空 + 重加 —— 下标会变,
+        # 但卡片本来就靠下标点名,重排后界面跟着重画,不会点错)
+        advisor.clear_proposals()
+        for card in kept:
+            advisor.add_proposal(card)
+        summary = f"已执行 {done} 条 AI 建议"
+        if failed:
+            summary += f",{len(failed)} 条失败(卡片留着,可以重试或忽略)"
+        LAST_ADVISOR["status"] = summary
+        LAST_ADVISOR["error"] = ("执行失败:" + ";".join(failed)) if failed else ""
+        try:
+            advisor.sync_dialog_text(
+                f"[执行动作] 全部执行({len(cards)} 条)",
+                "\n".join(lines))
+        except Exception:                                 # noqa: BLE001
+            pass
+        _report(self, "WARNING" if failed else "INFO", summary)
+        return {"FINISHED"}
+
+
+class GK_OT_DismissAllAdvisorActions(bpy.types.Operator):
+    """忽略**所有**待确认的 AI 建议(什么都不改)。"""
+
+    bl_idname = "gk.dismiss_all_advisor_actions"
+    bl_label = "全部忽略"
+    bl_description = "不采纳这些建议,项目不会有任何改动"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        count = len(advisor.agent_proposals())
+        if not count:
+            _report(self, "ERROR", "没有待确认的动作(可能已经执行或忽略过了)")
+            return {"CANCELLED"}
+        advisor.clear_proposals()
+        LAST_ADVISOR["status"] = f"已忽略 {count} 条建议(项目没有任何改动)"
+        LAST_ADVISOR["error"] = ""
+        return {"FINISHED"}
+
+
 class GK_OT_RunAdvisorAction(bpy.types.Operator):
     """手动挑一个动作执行(不经过 AI)。
 
@@ -3959,6 +4034,9 @@ GK_CLASSES = (
     # AI 提议的动作:执行 / 忽略 / 手动挑一个(只有用户点『执行』才真改项目)
     GK_OT_ApplyAdvisorAction,
     GK_OT_DismissAdvisorAction,
+    # 一次全执行 / 全忽略(第九十轮:AI 一次提好几条时不用一条条点)
+    GK_OT_ApplyAllAdvisorActions,
+    GK_OT_DismissAllAdvisorActions,
     GK_OT_RunAdvisorAction,
     # 长内容统一从这里进文本编辑器(对话记录 / 导出报告)
     GK_OT_OpenTextBlock,

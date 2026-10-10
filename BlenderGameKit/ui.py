@@ -5876,6 +5876,16 @@ def _draw_advisor_box(layout, context, settings):
         head = box.row(align=True)
         head.label(text=f"AI 建议这样改({len(proposal_list)} 条,都还没生效):",
                    icon="QUESTION")
+        # ── 多条时给『全部执行』(第九十轮:待办 31)────────────────────
+        # AI 一次提三条(勾挂载目标 + 开寻路 + 开上帝机)时,一条条点要点三下,
+        # 而且点着后面忘了前面。失败的那几条会**留在侧栏**,不吞掉。
+        if len(proposal_list) > 1:
+            bulk = box.row(align=True)
+            bulk.scale_y = 1.3
+            bulk.operator("gk.apply_all_advisor_actions",
+                          text=f"全部执行({len(proposal_list)})", icon="PLAY")
+            bulk.operator("gk.dismiss_all_advisor_actions",
+                          text="全部忽略", icon="X")
         for index, proposal in enumerate(proposal_list):
             card = box.box()
             title = card.row(align=True)

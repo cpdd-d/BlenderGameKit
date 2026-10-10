@@ -615,6 +615,48 @@ def main():
         check("『变量』『函数』盒子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6e. AI 建议卡片:多条时画出『全部执行』(第九十轮:待办 31)----
+    # 侧栏那一排"全部执行(N) / 全部忽略"只有**画**出来才点得到 ——
+    # 属性名写错 / 参数配错就是整块消失,冒烟那层看不见(它只验算子行为)。
+    print("=" * 72)
+    print("6e. AI 建议卡片的批量按钮")
+    print("=" * 72)
+    try:
+        advisor = import_module(f"{module_name}.advisor")
+        advisor.clear_proposals()
+        panel = getattr(ui, "GK_PT_Main", None)
+
+        def _draw_advisor():
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeContext(cube, scene))
+            return layout
+
+        # 一条建议:不该出现批量按钮(单条点它自己的『执行』就够了)
+        advisor.add_proposal({"action": "enable_god_camera",
+                              "label": "打开上帝摄像机", "why": "看场景"})
+        names = list(_draw_advisor().operator_names)
+        check("单条建议时**不**画『全部执行』",
+              "gk.apply_all_advisor_actions" not in names
+              and "gk.apply_advisor_action" in names,
+              str(sorted(set(names)))[:200])
+
+        # 两条建议:批量按钮出现,且带张数
+        advisor.add_proposal({"action": "enable_nav",
+                              "label": "打开寻路导航网格", "why": "绕开墙"})
+        layout = _draw_advisor()
+        names = list(layout.operator_names)
+        texts = " ".join(str(item) for item in layout.texts)
+        check("两条建议时画出『全部执行(2)』/『全部忽略』",
+              "gk.apply_all_advisor_actions" in names
+              and "gk.dismiss_all_advisor_actions" in names
+              and "全部执行(2)" in texts,
+              f"{str(sorted(set(names)))[:200]} texts={texts[:120]}")
+        advisor.clear_proposals()
+    except Exception as exc:
+        check("AI 建议卡片的批量按钮", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

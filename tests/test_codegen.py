@@ -12774,21 +12774,23 @@ class TestRound56AdvisorTools(Base):
             params = function["parameters"]
             self.assertEqual(params["type"], "object")
             self.assertIn("properties", params)
-        # 六个只读 + 一个提议
+        # 六个只读 + 两个提议(第九十轮起多了批量提议)
         self.assertEqual(names, {
             "read_settings", "list_trees", "list_nodes", "check_export_errors",
-            "get_godot_status", "diagnose", "propose_action"})
+            "get_godot_status", "diagnose", "propose_action",
+            "propose_actions"})
 
     def test_no_modifying_tool_exists(self):
-        """**核心保证**:工具清单里除了 propose_action,一个能改数据的都没有。
+        """**核心保证**:工具清单里除了两个**提议**工具,一个能改数据的都没有。
 
         这条是"AI 不能擅自改项目"的第一道证据 —— 模型能调的工具里压根
         没有"改"这个能力,它想改只能提议。
         """
         from BlenderGameKit import advisor_tools
+        proposal_tools = {"propose_action", "propose_actions"}
         modifying = [item["function"]["name"]
                      for item in advisor_tools.tools_schema()
-                     if item["function"]["name"] != "propose_action"
+                     if item["function"]["name"] not in proposal_tools
                      and item["function"]["name"] not in advisor_tools._READERS]
         self.assertEqual(modifying, [], f"出现了非只读工具: {modifying}")
         # 而且 propose_action 的参数就是"动作名 + 参数",没有可执行代码
@@ -12797,6 +12799,11 @@ class TestRound56AdvisorTools(Base):
         props = propose["function"]["parameters"]["properties"]
         self.assertEqual(set(props), {"action", "target", "value", "why"})
         self.assertIn("action", propose["function"]["parameters"]["required"])
+        # 批量那条也一样:只有"动作清单"这一个数组参数(同样没有可执行代码)
+        batch = [item for item in advisor_tools.tools_schema()
+                 if item["function"]["name"] == "propose_actions"][0]
+        self.assertEqual(set(batch["function"]["parameters"]["properties"]),
+                         {"actions"})
 
     def test_action_registry_is_declared(self):
         """动作要登记,名字/标签/所需参数都得齐全。"""
@@ -18007,6 +18014,128 @@ class TestRound89BlueprintAudit(Base):
         text = er.report_text(report)
         self.assertIn("资产清单(14 份)", text)
         self.assertIn("…(还有 4 个)", text)
+
+
+# ==========================================================================
+# 第九十轮(待办 31):AI 批量提议 + 『全部执行』
+# ==========================================================================
+class TestRound90AdviceBatch(Base):
+    """AI 一次提好几条(待办 31)。
+
+    * `propose_actions` 批量工具:逐条校验,合格的进清单、不合格的点名;
+    * 循环里"一张卡片 / 一批卡片"拍平成同一个处理(ai 那层不关心是哪种);
+    * 步数标签报出张数(侧栏"它已经:提议了 3 个动作")。
+    """
+
+    def _actions(self):
+        from BlenderGameKit import advisor_tools
+        return advisor_tools
+
+    def test_batch_tool_schema_present(self):
+        from BlenderGameKit import advisor_tools
+        names = [entry["function"]["name"]
+                 for entry in advisor_tools.tools_schema()]
+        self.assertIn("propose_action", names)
+        self.assertIn("propose_actions", names)
+        # 批量那条的动作名枚举要和登记表一致(AI 才编不出不存在的动作)
+        spec = next(entry for entry in advisor_tools.tools_schema()
+                    if entry["function"]["name"] == "propose_actions")
+        enum = (spec["function"]["parameters"]["properties"]["actions"]
+                ["items"]["properties"]["action"]["enum"])
+        self.assertEqual(enum, advisor_tools.action_names())
+
+    def test_batch_builds_all_valid_cards(self):
+        at = self._actions()
+        note, cards = at.build_proposals({"actions": [
+            {"action": "enable_god_camera", "why": "看场景"},
+            {"action": "set_toon_materials", "value": "false", "why": "核对细节"},
+        ]})
+        self.assertEqual([card["action"] for card in cards],
+                         ["enable_god_camera", "set_toon_materials"])
+        self.assertIn("2 张卡片", note)
+        self.assertIn("全部执行", note)
+        # 说明里必须提醒模型**别说"已经改好了"**(那是撒谎)
+        self.assertIn("不要", note)
+        self.assertIn("改好", note)
+        # 卡片形状和单条那条路一致(执行侧不用区分来源)
+        self.assertEqual(cards[1]["value"], "false")
+        self.assertTrue(cards[0]["label"])
+
+    def test_batch_reports_bad_items_but_keeps_good(self):
+        at = self._actions()
+        note, cards = at.build_proposals({"actions": [
+            {"action": "enable_god_camera", "why": "看场景"},
+            {"action": "没这个动作", "why": "编的"},
+            {"action": "enable_script_target", "why": "忘了给对象名"},
+            "不是对象",
+        ]})
+        self.assertEqual(len(cards), 1)
+        self.assertIn("第 2 条", note)      # 动作名不存在
+        self.assertIn("第 3 条", note)      # 缺 target
+        self.assertIn("第 4 条", note)      # 不是对象
+        self.assertIn("补对", note)
+
+    def test_batch_all_bad_gives_no_cards(self):
+        at = self._actions()
+        note, cards = at.build_proposals({"actions": [
+            {"action": "没这个动作", "why": "编的"}]})
+        self.assertEqual(cards, [])
+        self.assertIn("一条都不合格", note)
+
+    def test_batch_needs_non_empty_array(self):
+        at = self._actions()
+        for params in ({}, {"actions": []}, {"actions": "x"},
+                       None):
+            note, cards = at.build_proposals(params or {})
+            self.assertEqual(cards, [], params)
+            self.assertIn("数组", note)
+
+    def test_execute_returns_cards_for_batch_tool(self):
+        at = self._actions()
+        text, cards = at.execute("propose_actions", {"actions": [
+            {"action": "enable_god_camera", "why": "看场景"},
+            {"action": "set_toon_materials", "value": "false", "why": "核对"}]},
+            None)
+        self.assertIsInstance(cards, list)
+        self.assertEqual(len(cards), 2)
+        self.assertIn("2 张卡片", text)
+        # 单条那条路还是老样子:一张 dict(不是列表)
+        text1, card = at.execute("propose_action",
+                                 {"action": "enable_god_camera",
+                                  "why": "看场景"}, None)
+        self.assertIsInstance(card, dict)
+        self.assertEqual(card["action"], "enable_god_camera")
+        # 名字拼错时的报错要把两个都列出来
+        text2, nothing = at.execute("propose_actions_x", {}, None)
+        self.assertIsNone(nothing)
+        self.assertIn("propose_actions", text2)
+
+    def test_step_label_reports_count(self):
+        from BlenderGameKit import advisor
+        # `arguments` 有值 = 正常一次调用(缺了才算"参数有问题")
+        call = {"name": "propose_actions", "arguments": {}}
+        self.assertEqual(advisor._step_label(call, []),
+                         "提议了几个动作(等你确认)")
+        self.assertEqual(advisor._step_label(call, [{"action": "x"}]),
+                         "提议了一个动作(等你确认)")
+        self.assertEqual(
+            advisor._step_label(call, [{"action": "x"}, {"action": "y"},
+                                       {"action": "z"}]),
+            "提议了 3 个动作(等你确认)")
+
+    def test_proposals_keep_batch_appended(self):
+        """一批卡片要**追加**进待确认清单(不能被上一批覆盖掉)。"""
+        from BlenderGameKit import advisor
+        advisor.clear_proposals()
+        try:
+            advisor.add_proposal({"action": "a"})
+            for card in ({"action": "b"}, {"action": "c"}):
+                advisor.add_proposal(card)
+            self.assertEqual([card["action"]
+                              for card in advisor.agent_proposals()],
+                             ["a", "b", "c"])
+        finally:
+            advisor.clear_proposals()
 
 
 if __name__ == "__main__":
