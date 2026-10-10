@@ -435,12 +435,17 @@ ENV_BACKGROUNDS = (
     ("SKY", "天空", "程序化天空(带地平线渐变,天空色跟着『背景色』走)"),
 )
 
-# 色调映射模式。值 = Godot 的 Environment.tonemap_mode 枚举。
+# 色调映射模式。值 = Godot 的 Environment.tonemap_mode 枚举
+# (第九十五轮真机核对:hint = Linear,Reinhard,Filmic,ACES,AgX)。
+# 顺序 / 取值要和 asset_export.ENV_TONEMAP_MODES 一致(离线测试锁着)。
+# AgX 是第九十五轮补的 —— 它和 Blender 默认的 AgX 视图变换同一条曲线,
+# 选它"预览↔运行时"能精确对齐(其余几个只能挑同族近似,见 godot_look)。
 ENV_TONEMAPS = (
     ("LINEAR", "线性", "不做色调映射(老项目默认,颜色最直白)"),
     ("REINHARD", "Reinhard", "柔和压高光,画面不那么容易过曝"),
     ("FILMIC", "Filmic", "电影感,暗部更沉"),
     ("ACES", "ACES", "高动态范围,亮部过渡最自然"),
+    ("AGX", "AgX", "和 Blender 默认视图变换同名同族 —— 预览对齐首选"),
 )
 
 

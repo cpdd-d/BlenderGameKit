@@ -18293,5 +18293,82 @@ class TestRound94BackfaceCulling(Base):
                              "用户自己放的着色器不该被认领")
 
 
+class TestRound95PreviewAlign(Base):
+    """第九十五轮:预览跟着『环境』设置卡对齐(不再写死 Godot 出厂值)。
+
+    —— 以前『Godot 观感』把预览钉死在"出厂画面"(Standard / 0.30 平灰),
+    用户在设置卡上换成 AgX / 换个背景色之后,预览和运行时又对不上了。
+    现在对齐表读的是**导出用的同一份**场景设置。
+    """
+
+    def _settings(self, **values):
+        class Fake:
+            pass
+
+        fake = Fake()
+        fake.env_enabled = True
+        fake.dimension = "3"
+        for name, value in values.items():
+            setattr(fake, name, value)
+        return fake
+
+    def _scene(self, settings):
+        class FakeScene:
+            pass
+
+        scene = FakeScene()
+        scene.gk_settings = settings
+        return scene
+
+    def test_disabled_falls_back_to_factory(self):
+        """没开设置卡 -> Godot 出厂画面(老行为,不是空值)。"""
+        from BlenderGameKit import godot_look
+        for settings in (None, self._settings(env_enabled=False)):
+            values = godot_look.env_display(self._scene(settings))
+            self.assertFalse(values["enabled"])
+            self.assertEqual(values["view_transform"], "Standard")
+            self.assertEqual(values["tonemap"], "LINEAR")
+            self.assertEqual(values["backdrop"][0],
+                             godot_look.GODOT_CLEAR_COLOR_SRGB[0])
+
+    def test_tonemap_picks_view_transform(self):
+        """五种色调映射都要有映射,且和 properties 的选项一一对上。"""
+        from BlenderGameKit import godot_look
+        from BlenderGameKit import properties as props
+        cases = {"LINEAR": "Standard", "AGX": "AgX", "ACES": "AgX",
+                 "FILMIC": "Filmic", "REINHARD": "Filmic"}
+        for tonemap, expected in cases.items():
+            values = godot_look.env_display(
+                self._scene(self._settings(env_tonemap=tonemap)))
+            self.assertEqual(values["view_transform"], expected, tonemap)
+        self.assertEqual({item[0] for item in props.ENV_TONEMAPS},
+                         set(godot_look.TONEMAP_VIEW_TRANSFORMS),
+                         "设置卡上能选的,映射表里都得有")
+
+    def test_background_color_follows_settings(self):
+        from BlenderGameKit import godot_look
+        values = godot_look.env_display(self._scene(self._settings(
+            env_background="COLOR", env_bg_color=(0.1, 0.2, 0.3, 1.0))))
+        self.assertEqual(values["background"], "COLOR")
+        self.assertAlmostEqual(values["backdrop"][0], 0.1, places=5)
+        self.assertAlmostEqual(values["backdrop"][2], 0.3, places=5)
+
+    def test_sky_backdrop_uses_horizon(self):
+        """天空:预览用导出器算的那个**地平线色**(顶色往白里提 0.35)。"""
+        from BlenderGameKit import godot_look
+        values = godot_look.env_display(self._scene(self._settings(
+            env_background="SKY", env_bg_color=(0.0, 0.0, 0.0, 1.0))))
+        self.assertEqual(values["background"], "SKY")
+        self.assertAlmostEqual(values["backdrop"][0], 0.35, places=5)
+
+    def test_2d_scene_keeps_factory(self):
+        """2D 关卡不导环境(导出器同样跳过)-> 预览也别对齐它。"""
+        from BlenderGameKit import godot_look
+        values = godot_look.env_display(self._scene(
+            self._settings(dimension="2", env_tonemap="AGX")))
+        self.assertFalse(values["enabled"])
+        self.assertEqual(values["view_transform"], "Standard")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

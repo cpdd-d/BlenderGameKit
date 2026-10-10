@@ -58,16 +58,19 @@ func _report() -> void:
 	var day_bg := -1
 	var day_sky := false
 	var day_ambient := -1.0
+	var day_tone := -1
 	var day_fog := true
 	if day_env != null:
 		day_bg = day_env.background_mode
 		day_sky = day_env.sky != null
 		day_ambient = day_env.ambient_light_energy
+		day_tone = day_env.tonemap_mode
 		day_fog = day_env.fog_enabled
 	var day_ok := day_bg == 2 and day_sky and (not day_fog) \\
-		and absf(day_ambient - 0.8) <= 0.05
+		and absf(day_ambient - 0.8) <= 0.05 and day_tone == 4
 	print("ENV_DAY bg=", day_bg, " sky=", day_sky,
-		" ambient=", "%.3f" % day_ambient, " fog=", day_fog, " ok=", day_ok)
+		" ambient=", "%.3f" % day_ambient, " fog=", day_fog,
+		" tonemap=", day_tone, " ok=", day_ok)
 
 	# 幽暗:纯色背景 + 雾 + 泛光 + ACES
 	var night_bg := -1
@@ -198,7 +201,7 @@ def main():
                 ("background_mode = 2", "天空背景"),
                 ("ambient_light_energy = 0.800000", "环境光 0.8"),
                 ("fog_enabled = false", "雾关着"),
-                ("tonemap_mode = 2", "Filmic"),
+                ("tonemap_mode = 4", "AgX"),
         ):
             if needle not in day:
                 print(f"✗ 白天.tscn 里没有{why}: 找不到 {needle!r}")

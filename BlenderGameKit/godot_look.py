@@ -29,6 +29,28 @@ Blender 和 Godot 的"出厂画面"差得很远,在 Blender 里调好一看 Godo
 用户自己的世界可能有天空贴图、HDRI 之类。所以这里**新建**一个世界,
 并把原来的世界名、视图变换、EEVEE 开关都记在场景自定义属性里,
 点『还原』时原样放回去。
+
+── 第九十五轮:对齐**你选的设置**,而不是写死 Godot 的出厂值 ────────
+上面三条说的是"Godot **出厂画面**"的差异。可一旦你在『环境』设置卡上
+改了色调映射 / 背景,导出的 Godot 就按**你的设置**渲染,而预览还是
+出厂画面 —— 预览又开始骗人(用户:"预览和运行时画面差很大")。
+现在 apply() 读 `scene.gk_settings.env_*`(**和导出用的是同一份**),
+逐项对齐;设置卡没开时就退回出厂画面(= 老行为):
+
+| 设置卡上 | 预览里怎么对齐 | 精度 |
+|---|---|---|
+| 色调映射 Linear | 视图变换 Standard | 精确 |
+| 色调映射 AgX | 视图变换 AgX | 精确(同一条曲线) |
+| Filmic / ACES / Reinhard | 挑同族的 Filmic / AgX / Filmic | **近似** |
+| 背景 纯色 | 世界底色 = 那个颜色 | 精确 |
+| 背景 天空 | 用**地平线色**铺平(真实是三段渐变) | **近似** |
+| 环境光 | 两边都**不加**:卡通材质是 unshaded,运行时也不吃环境光 | 对卡通口径精确 |
+| 雾 / 泛光 / 色调调整 | 做不出来(Godot 的后处理)—— 保持关着 | —— |
+
+sRGB 换算的实测依据(第九十五轮标定):`Environment.background_color =
+Color(0.3, 0.3, 0.3)` 在 Godot 里渲出来的像素就是 **0.298** —— 写进
+`.tscn` 的颜色数字就是**屏幕上显示的值**。所以"设置卡上的颜色 -> Blender
+世界"必须过一遍 `srgb_to_linear`(和 0.30 平灰那条同一个换算)。
 """
 
 import bpy
@@ -42,6 +64,21 @@ GODOT_CLEAR_COLOR_SRGB = (0.3, 0.3, 0.3)
 
 # 我们建的世界叫这个名。带 GK 前缀,方便识别和清理。
 WORLD_NAME = "GK Godot 环境"
+
+# ── 色调映射 -> Blender 视图变换(第九十五轮)────────────────────
+# 键 = properties.ENV_TONEMAPS 的 value(即 Godot 的 tonemap_mode 枚举名)。
+#   * LINEAR -> Standard、AGX -> AgX:名字 / 曲线同族,对得上;
+#   * 其余三个 Blender 没有同名视图变换,挑最近的一族 —— 说明里会写
+#     "近似",不糊弄用户。
+TONEMAP_VIEW_TRANSFORMS = {
+    "LINEAR": "Standard",
+    "REINHARD": "Filmic",
+    "FILMIC": "Filmic",
+    "ACES": "AgX",
+    "AGX": "AgX",
+}
+# 哪些算"精确对应"(面板说明里用它决定措辞)
+TONEMAP_EXACT = ("LINEAR", "AGX")
 
 # 备份的键(存在 scene 的自定义属性上)
 _BACKUP = {
@@ -94,8 +131,69 @@ def _remember(scene):
     scene[_BACKUP["active"]] = True
 
 
-def build_world():
-    """建/刷新那个"只看得见、不照亮"的平灰世界。返回世界对象。"""
+def _rgba(value, fallback):
+    """设置卡里的 RGBA -> 四元组(读不动就用 fallback)。"""
+    try:
+        parts = [float(component) for component in value]
+    except (TypeError, ValueError):
+        return tuple(fallback)
+    while len(parts) < 4:
+        parts.append(1.0)
+    return tuple(parts[:4])
+
+
+def _mix_srgb(color, other, factor):
+    """两个 sRGB 颜色按比例混(天空的地平线色就是这么来的)。"""
+    return tuple(color[index] * (1.0 - factor) + other[index] * factor
+                 for index in range(3)) + (1.0,)
+
+
+def env_display(scene):
+    """预览要对齐的那几项 —— 读**导出用的同一份**场景设置。
+
+    没开『环境』(或 2D 关卡 —— 导出器同样不导环境)时返回 Godot 的
+    **出厂值**:0.30 平灰、Linear 色调映射 —— 也就是老行为。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    enabled = bool(getattr(settings, "env_enabled", False)) if settings else False
+    if enabled and str(getattr(settings, "dimension", "3")) == "2":
+        enabled = False                    # 见 asset_export.env_settings
+    if not enabled:
+        return {
+            "enabled": False,
+            "tonemap": "LINEAR",
+            "view_transform": TONEMAP_VIEW_TRANSFORMS["LINEAR"],
+            "background": "COLOR",
+            "backdrop": tuple(GODOT_CLEAR_COLOR_SRGB) + (1.0,),
+        }
+    tonemap = str(getattr(settings, "env_tonemap", "LINEAR") or "LINEAR")
+    if tonemap not in TONEMAP_VIEW_TRANSFORMS:
+        tonemap = "LINEAR"
+    background = str(getattr(settings, "env_background", "COLOR") or "COLOR")
+    bg_color = _rgba(getattr(settings, "env_bg_color", None),
+                     (0.05, 0.06, 0.10, 1.0))
+    # 天空:导出器把 sky_top 设成背景色、地平线往白里提 0.35
+    # (见 asset_export.SKY_MATERIAL_SUBRESOURCE)—— 预览拿那圈地平线色铺平。
+    backdrop = (_mix_srgb(bg_color, (1.0, 1.0, 1.0), 0.35)
+                if background == "SKY" else bg_color)
+    return {
+        "enabled": True,
+        "tonemap": tonemap,
+        "view_transform": TONEMAP_VIEW_TRANSFORMS[tonemap],
+        "background": background,
+        "backdrop": backdrop,
+    }
+
+
+def build_world(backdrop=None):
+    """建/刷新那个"看得见、不照亮"的世界。返回世界对象。
+
+    backdrop = **设置卡上的背景色(sRGB / 显示值)**,不给就用 Godot 出厂
+    的 0.30 平灰。函数内部统一过一遍 srgb_to_linear 再喂给 Blender。
+    """
+    backdrop = _rgba(backdrop if backdrop is not None
+                     else tuple(GODOT_CLEAR_COLOR_SRGB) + (1.0,),
+                     tuple(GODOT_CLEAR_COLOR_SRGB) + (1.0,))
     world = bpy.data.worlds.get(WORLD_NAME)
     if world is None:
         world = bpy.data.worlds.new(WORLD_NAME)
@@ -108,12 +206,12 @@ def build_world():
     output = tree.nodes.new("ShaderNodeOutputWorld")
     output.location = (420, 0)
 
-    # 看得见的灰底(相机射线走这条)
-    backdrop = tree.nodes.new("ShaderNodeBackground")
-    backdrop.location = (100, 90)
-    grey = srgb_to_linear(GODOT_CLEAR_COLOR_SRGB[0])
-    backdrop.inputs["Color"].default_value = (grey, grey, grey, 1.0)
-    backdrop.inputs["Strength"].default_value = 1.0
+    # 看得见的底色(相机射线走这条)
+    backdrop_node = tree.nodes.new("ShaderNodeBackground")
+    backdrop_node.location = (100, 90)
+    colour = tuple(srgb_to_linear(component) for component in backdrop[:3])
+    backdrop_node.inputs["Color"].default_value = colour + (1.0,)
+    backdrop_node.inputs["Strength"].default_value = 1.0
 
     # 照不亮的黑(GI / 漫反射射线走这条)——
     # Godot 默认没有环境光,所以非相机射线必须看到纯黑。
@@ -132,29 +230,33 @@ def build_world():
     # Is Camera Ray 为 1 时走灰底,否则走黑色(不参与照明)。
     tree.links.new(path.outputs["Is Camera Ray"], mix.inputs["Fac"])
     tree.links.new(shade.outputs["Background"], mix.inputs[1])
-    tree.links.new(backdrop.outputs["Background"], mix.inputs[2])
+    tree.links.new(backdrop_node.outputs["Background"], mix.inputs[2])
     tree.links.new(mix.outputs["Shader"], output.inputs["Surface"])
 
     # Solid 模式(实体着色)的背景用的是 world.color,是另一个值
-    world.color = (grey, grey, grey)
+    world.color = colour
     return world
 
 
 def apply(scene):
-    """让这个场景的预览贴近 Godot。返回 (成功, 说明)。"""
+    """让这个场景的预览贴近 Godot(按『环境』设置卡对齐)。返回 (成功, 说明)。"""
     if scene is None:
         return False, "没有场景"
 
     _remember(scene)
+    values = env_display(scene)
     notes = []
 
-    # ---- 1. 色调映射:对齐 Godot 的 Linear ----
+    # ---- 1. 色调映射:按设置卡上选的那个挑视图变换(第九十五轮)----
     view = scene.view_settings
+    exact = "" if values["tonemap"] in TONEMAP_EXACT else "(近似)"
     try:
-        view.view_transform = "Standard"
-        notes.append("视图变换 Standard(对应 Godot 的 Linear)")
+        view.view_transform = values["view_transform"]
+        notes.append(f"视图变换 {values['view_transform']}"
+                     f"(色调映射 {values['tonemap']}{exact})")
     except Exception:
-        notes.append("⚠ 没能改视图变换,请手动设成 Standard")
+        notes.append(f"⚠ 没能改视图变换,请手动设成 "
+                     f"{values['view_transform']}")
     try:
         view.look = "None"
     except Exception:
@@ -163,10 +265,17 @@ def apply(scene):
     view.gamma = 1.0
     view.use_curve_mapping = False
 
-    # ---- 2. 世界:平灰底 + 零环境光 ----
-    world = build_world()
+    # ---- 2. 世界:设置卡上的背景色 + 零环境光 ----
+    # 环境光**不加**:卡通材质是 unshaded,运行时也不吃环境光 —— 两边一致;
+    # (关掉卡通材质用 PBR 时,暗部会有点差别,说明里写着)
+    world = build_world(values["backdrop"])
     scene.world = world
-    notes.append(f"世界换成平灰底(不参与照明)")
+    if values["background"] == "SKY":
+        notes.append("世界用天空的地平线色铺平(真实是三段渐变,近似)")
+    elif values["enabled"]:
+        notes.append("世界换成设置卡上的背景色")
+    else:
+        notes.append("世界换成出厂平灰底(不参与照明)")
 
     # Solid 模式也跟着用世界背景,不然视口还是主题色
     shading = getattr(getattr(scene, "display", None), "shading", None)
@@ -188,6 +297,8 @@ def apply(scene):
                 except Exception:
                     pass
 
+    # ---- 4. 说清"对不上的那些"(第九十五轮)----
+    notes.append("雾 / 泛光 / 色调调整 / 描边 / 逐片元 SDF 预览里对不上")
     return True, "；".join(notes)
 
 
@@ -260,19 +371,27 @@ def is_active(scene):
 
 
 def summary(scene=None):
-    """给面板显示的一行摘要。"""
-    grey = GODOT_CLEAR_COLOR_SRGB[0]
-    return (f"背景 {grey:.2f} 平灰 · 无声环境光 · "
-            f"色调映射 Linear(与 Godot 默认一致)")
+    """给面板显示的一行摘要(按当前设置;第九十五轮起不是写死的)。"""
+    values = env_display(scene) if scene is not None else None
+    if values is None or not values["enabled"]:
+        grey = GODOT_CLEAR_COLOR_SRGB[0]
+        return (f"背景 {grey:.2f} 平灰 · 无声环境光 · "
+                f"色调映射 Linear(与 Godot 默认一致)")
+    exact = "" if values["tonemap"] in TONEMAP_EXACT else "(近似)"
+    where = "天空(地平线色近似)" if values["background"] == "SKY" else "纯色"
+    return (f"背景 {where} · 色调映射 {values['tonemap']}{exact} -> "
+            f"视图变换 {values['view_transform']}")
 
 
 def describe():
     """面板上显示的差异说明(每行一条)。"""
     return (
-        "Blender 和 Godot 的出厂画面差在三处:",
-        "· 色调映射:Godot 默认 Linear,Blender 默认 AgX(颜色会变淡)",
-        "· 背景:Godot 是 0.30 平灰",
-        "· 环境光:Godot 默认没有,Blender 的世界会当灯用",
+        "预览按『环境』设置卡对齐(没开设置卡 = Godot 出厂画面):",
+        "· 色调映射:Linear -> Standard、AgX -> AgX 是精确的;"
+        "Filmic / ACES / Reinhard 只能挑同族近似",
+        "· 背景:纯色精确;天空用地平线色铺平(真实是三段渐变)",
+        "· 环境光:卡通材质是 unshaded,运行时也不吃它(预览同样不加)",
+        "· 对不上的:雾 / 泛光 / 色调调整(后处理)、描边、逐片元面部 SDF",
     )
 
 

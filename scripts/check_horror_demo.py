@@ -376,14 +376,25 @@ def _run_probe(godot, stem, script_text, node_name, quit_after):
     with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
 
-    subprocess.run([godot, "--headless", "--path", OUT, "--import"],
-                   capture_output=True, text=True, encoding="utf-8",
-                   errors="replace")
-    run = subprocess.run([godot, "--headless", "--path", OUT,
-                          "--quit-after", str(quit_after)],
-                         capture_output=True, text=True, encoding="utf-8",
-                         errors="replace")
-    out = (run.stdout or "") + (run.stderr or "")
+    def _import_and_run():
+        subprocess.run([godot, "--headless", "--path", OUT, "--import"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
+        done = subprocess.run([godot, "--headless", "--path", OUT,
+                               "--quit-after", str(quit_after)],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace")
+        return (done.stdout or "") + (done.stderr or "")
+
+    out = _import_and_run()
+    # ── 偶发兜底:第一次 --import 偶尔会漏掉某个 .glb(第九十五轮门禁实测
+    # 撞过一次:楼梯间.glb 没进导入缓存 -> 载入 .tscn 报 "referenced
+    # non-existent resource",单独复跑就绿)。重跑一次;**真缺文件的话第二次
+    # 照样报**,不会被吞掉 —— 只是把"偶发的导入没齐"和"真的没有这个文件"
+    # 区分开。
+    if "non-existent resource" in out:
+        print("    ⚠ 导入没齐(non-existent resource),重跑一次…")
+        out = _import_and_run()
     for line in out.splitlines():
         if "HORROR" in line or "SCRIPT ERROR" in line or "Parse Error" in line:
             print("    " + line.strip())

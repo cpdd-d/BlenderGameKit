@@ -5349,6 +5349,46 @@ def main():
         check("第九十四轮(背面剔除)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第九十五轮:预览跟着『环境』设置卡对齐(不再写死出厂值)----------
+    # 真 Blender 才能验:视图变换 / 世界底色都是 Blender 侧的真属性。
+    try:
+        r95_look = import_module(f"{module_name}.godot_look")
+        r95_scene = bpy.context.scene
+        r95_settings = r95_scene.gk_settings
+        r95_keep = {name: getattr(r95_settings, name)
+                    for name in ("env_enabled", "dimension", "env_tonemap",
+                                 "env_background", "env_bg_color")}
+        r95_settings.dimension = "3"
+        r95_settings.env_enabled = True
+        r95_settings.env_tonemap = "AGX"
+        r95_settings.env_background = "COLOR"
+        r95_settings.env_bg_color = (0.1, 0.2, 0.3, 1.0)
+        r95_before = str(r95_scene.view_settings.view_transform)
+        r95_ok, r95_message = r95_look.apply(r95_scene)
+        check("第九十五轮:色调映射 AgX -> 视图变换真的切成 AgX",
+              r95_ok and str(r95_scene.view_settings.view_transform) == "AgX",
+              f"{r95_message} / {r95_scene.view_settings.view_transform}")
+        r95_backdrop = None
+        if r95_scene.world is not None:
+            for node in r95_scene.world.node_tree.nodes:
+                if node.bl_idname == "ShaderNodeBackground" \
+                        and node.inputs["Color"].default_value[0] > 1e-6:
+                    r95_backdrop = node.inputs["Color"].default_value[0]
+        r95_want = r95_look.srgb_to_linear(0.1)
+        check("第九十五轮:世界底色 = 设置卡上的背景色(过 sRGB 换算)",
+              r95_backdrop is not None
+              and abs(r95_backdrop - r95_want) < 1e-4,
+              f"{r95_backdrop} vs {r95_want}")
+        r95_look.restore(r95_scene)
+        check("第九十五轮:还原后视图变换回原来的",
+              str(r95_scene.view_settings.view_transform) == r95_before,
+              f"{r95_scene.view_settings.view_transform} != {r95_before}")
+        for name, value in r95_keep.items():
+            setattr(r95_settings, name, value)
+    except Exception as exc:
+        check("第九十五轮(预览对齐)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

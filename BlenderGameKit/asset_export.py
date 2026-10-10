@@ -2035,8 +2035,12 @@ def _esc_claimed_by_graph(scene):
 
 # 背景模式 / 色调映射的取值 = Godot 的枚举数值。离线测试会断言这里的
 # 顺序和 properties 里枚举项的**顺序一致**(防两处各写一套飘掉)。
+# AGX=4 是第九十五轮补的:真机反射核对过 Godot 4.7 的 hint
+# ("Linear,Reinhard,Filmic,ACES,AgX")—— 它和 Blender 默认的 AgX 视图
+# 变换同族,选它预览和运行时能精确对齐(godot_look 里那张映射表)。
 ENV_BACKGROUND_MODES = {"COLOR": 1, "SKY": 2}
-ENV_TONEMAP_MODES = {"LINEAR": 0, "REINHARD": 1, "FILMIC": 2, "ACES": 3}
+ENV_TONEMAP_MODES = {"LINEAR": 0, "REINHARD": 1, "FILMIC": 2, "ACES": 3,
+                     "AGX": 4}
 
 ENV_RESOURCE_ID = "gk_environment"
 ENV_SKY_MATERIAL_ID = "gk_sky_material"

@@ -11,7 +11,7 @@
 
 | 场景 | 背景 | 环境光 | 雾 | 泛光 | 色调 |
 |---|---|---|---|---|---|
-| **白天** | 程序化天空 | 亮(0.8) | 关 | 关 | Filmic |
+| **白天** | 程序化天空 | 亮(0.8) | 关 | 关 | AgX |
 | **幽暗** | 近黑的纯色 | 暗(0.15) | 开(0.08 冷蓝) | 开(1.2) | ACES |
 
 两关在 Blender 里是**两个场景**,导出时各出一张 .tscn
@@ -155,10 +155,11 @@ def build_day(scene):
         ("env_ambient_energy", 0.8),
         ("env_fog", False),
         ("env_glow", False),
-        ("env_tonemap", "FILMIC"),
+        ("env_tonemap", "AGX"),
         ("env_adjust", False),
     ))
-    log(f"{DAY}:天空背景 + 环境光 0.8 + Filmic(雾 / 泛光都关)")
+    log(f"{DAY}:天空背景 + 环境光 0.8 + AgX(第九十五轮:和 Blender 默认"
+        f"视图变换同名同族,预览↔运行时能精确对齐;雾 / 泛光都关)")
 
 
 def build_night(scene):

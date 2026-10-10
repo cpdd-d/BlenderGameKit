@@ -186,6 +186,51 @@ def main():
     ok3, _ = look.restore(scene)
     check("重复还原不会崩(只是提示)", ok3 is False)
 
+    # ---- 8. 跟着『环境』设置卡走(第九十五轮)----
+    print("=" * 72)
+    print("8. 预览跟着设置卡对齐(不再是写死的出厂值)")
+    print("=" * 72)
+    settings = scene.gk_settings
+    keep = {name: getattr(settings, name)
+            for name in ("env_enabled", "dimension", "env_tonemap",
+                         "env_background", "env_bg_color")}
+    try:
+        settings.dimension = "3"
+        settings.env_enabled = True
+        settings.env_tonemap = "AGX"
+        settings.env_background = "COLOR"
+        settings.env_bg_color = (0.2, 0.1, 0.05, 1.0)
+        values = look.env_display(scene)
+        print(f"    env_display: {values}")
+        check("色调映射 AgX 映射到 Blender 的 AgX",
+              values["view_transform"] == "AgX", str(values))
+        ok4, message4 = look.apply(scene)
+        print(f"    apply: {message4}")
+        check("apply 用的是设置里的色调映射",
+              ok4 and str(scene.view_settings.view_transform) == "AgX",
+              f"{message4} / {scene.view_settings.view_transform}")
+        wanted = look.srgb_to_linear(0.2)
+        colours = [node.inputs["Color"].default_value[0]
+                   for node in scene.world.node_tree.nodes
+                   if node.bl_idname == "ShaderNodeBackground"]
+        print(f"    世界背景色: {[round(c, 4) for c in colours]}")
+        check("世界底色 = 设置卡上的背景色(不是出厂灰)",
+              any(abs(colour - wanted) < 1e-4 for colour in colours),
+              str([round(c, 4) for c in colours]))
+        check("面板摘要跟着设置走", "AgX" in look.summary(scene),
+              look.summary(scene))
+
+        # 天空背景:用导出的地平线色(顶色往白里提 0.35)
+        settings.env_background = "SKY"
+        sky = look.env_display(scene)
+        horizon = 0.2 * 0.65 + 1.0 * 0.35
+        check("天空背景用地平线色(近似)",
+              abs(sky["backdrop"][0] - horizon) < 1e-4, str(sky["backdrop"]))
+        look.restore(scene)
+    finally:
+        for name, value in keep.items():
+            setattr(settings, name, value)
+
     addon_utils.disable(module_name, default_set=True)
     return 0
 
