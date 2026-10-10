@@ -27,6 +27,36 @@ def _audio_host(ctx, node):
     return "self"
 
 
+def _emit_stream_loop(ctx, indent, stream_var):
+    """给一条流打开"循环播放"—— **按流类型分别设**(第八十一轮抽出来)。
+
+    Godot 没有一个统一点:Ogg / MP3 是 `.loop`,`wav` 是 `loop_mode`。
+    只设一种的话换个格式就"播一遍就没了",而且不报错 —— 很难查。
+    (素材导入时的 loop 勾选也会被这里覆盖:节点上的『循环』才是准的)
+
+    ── wav 还要补 loop_end(第八十一轮真机抓到的)───────────────────
+    只设 `loop_mode = LOOP_FORWARD` 的话,导入器给的 `loop_end` 是 0 ——
+    循环长度 = 0,流**当场就结束**(实测:『音效_播放』勾循环后
+    1.9 秒探针读到 `playing = false`,声音早停了,一声都听不见)。
+    所以按『时长 × 采样率』算出**采样帧数**填进 `loop_end`
+    (和第七十七轮场景 BGM 的 wav 循环同一个坑、同一个算法)。
+
+    BGM(『音效_音乐』)和循环音效(『音效_播放』勾『循环』)共用这一份。
+    """
+    ctx.add_line(indent, f"if {stream_var} is AudioStreamOggVorbis:")
+    ctx.add_line(indent + 1,
+                 f"({stream_var} as AudioStreamOggVorbis).loop = true")
+    ctx.add_line(indent, f"elif {stream_var} is AudioStreamMP3:")
+    ctx.add_line(indent + 1, f"({stream_var} as AudioStreamMP3).loop = true")
+    ctx.add_line(indent, f"elif {stream_var} is AudioStreamWAV:")
+    ctx.add_line(indent + 1,
+                 f"({stream_var} as AudioStreamWAV).loop_mode = "
+                 f"AudioStreamWAV.LOOP_FORWARD")
+    ctx.add_line(indent + 1, f"({stream_var} as AudioStreamWAV).loop_end = "
+                 f"int(({stream_var} as AudioStreamWAV).get_length() * "
+                 f"float(({stream_var} as AudioStreamWAV).mix_rate))")
+
+
 @stmt_node("GKNodePlaySound")
 def _stmt_play_sound(ctx, node, indent):
     """一次性音效:运行时建播放器、播完自己删。
@@ -34,27 +64,51 @@ def _stmt_play_sound(ctx, node, indent):
     ── 为什么不要求用户先摆好 AudioStreamPlayer ─────────────────---─
     让用户为每个音效在场景里摆一个播放器节点，是"引擎在给用户添活"。
     这里按需建、播完销毁，节点图里写一条就够了。
+
+    ── 循环音效(第八十一轮)──────────────────────────────────────
+    勾了『循环』= 一直响(引擎 / 风声):流按格式打开循环,播放器**不**
+    挂 `finished` 自删(那个信号永远不会来),而是登记进 `_gk_loops`
+    (名字 -> 播放器),用『音效_停止』填同一个名字来停;
+    同名再播一次会先停掉旧的,不会越叠越多。
     """
     path = ctx.input_string(node, "音频路径", "")
     volume = _tunable_number(ctx, node, "音量", "0.0", "sfx_volume")
     pitch = _tunable_number(ctx, node, "音高", "1.0", "sfx_pitch")
     player_type = _audio_player_type(node)
     host = _audio_host(ctx, node)
+    loop = bool(getattr(node, "gk_loop", False))
+    name = str(getattr(node, "gk_name", "") or "").strip() or str(node.name)
 
     stream_var = ctx.new_temp("sfx_stream")
     player_var = ctx.new_temp("sfx")
+    if loop:
+        ctx.declare_var("_gk_loops", "Dictionary", initial="{}")
     # 音频文件缺失时给出可读的报错，而不是让 load() 静默返回 null 后再炸在别处
     ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
     ctx.add_line(indent, f"if {stream_var} != null:")
+    if loop:
+        _emit_stream_loop(ctx, indent + 1, stream_var)
+        key_var = ctx.new_temp("sfx_key")
+        old_var = ctx.new_temp("sfx_old")
+        ctx.add_line(indent + 1, f"var {key_var} := {gd_string(name)}")
+        ctx.add_line(indent + 1, f"if _gk_loops.has({key_var}):")
+        ctx.add_line(indent + 2, f"var {old_var}: Node = _gk_loops[{key_var}]")
+        ctx.add_line(indent + 2, f"if is_instance_valid({old_var}):")
+        ctx.add_line(indent + 3, f'{old_var}.call("stop")')
+        ctx.add_line(indent + 3, f"{old_var}.queue_free()")
     ctx.add_line(indent + 1, f"var {player_var} := {player_type}.new()")
     ctx.add_line(indent + 1, f"{player_var}.stream = {stream_var}")
     ctx.add_line(indent + 1, f"{player_var}.volume_db = {volume}")
     ctx.add_line(indent + 1, f"{player_var}.pitch_scale = {pitch}")
-    ctx.add_line(indent + 1, f"{player_var}.max_polyphony = 4")
+    ctx.add_line(indent + 1,
+                 f"{player_var}.max_polyphony = {1 if loop else 4}")
     ctx.add_line(indent + 1, f"{host}.add_child({player_var})")
     ctx.add_line(indent + 1, f"{player_var}.play()")
-    # 播完自己删:用 finished 信号，比"算时长"可靠(流长度不一定拿得到)
-    ctx.add_line(indent + 1, f"{player_var}.finished.connect({player_var}.queue_free)")
+    if loop:
+        ctx.add_line(indent + 1, f"_gk_loops[{key_var}] = {player_var}")
+    else:
+        # 播完自己删:用 finished 信号，比"算时长"可靠(流长度不一定拿得到)
+        ctx.add_line(indent + 1, f"{player_var}.finished.connect({player_var}.queue_free)")
     ctx.add_line(indent, "else:")
     ctx.add_line(indent + 1, f'push_warning("找不到音频文件: " + str({path}))')
 
@@ -74,18 +128,8 @@ def _stmt_play_music(ctx, node, indent):
     ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
     if loop:
         # ── 循环要**按流类型**分别设(第六十四轮)────────────────────
-        # Godot 没有一个统一点:Ogg / MP3 是 `.loop`,`wav` 是 `loop_mode`。
-        # 只设一种的话换个格式就"播一遍就没了",而且不报错 —— 很难查。
-        # (素材导入时的 loop 勾选也会被这里覆盖:节点上的『循环』才是准的)
-        ctx.add_line(indent, f"if {stream_var} is AudioStreamOggVorbis:")
-        ctx.add_line(indent + 1,
-                     f"({stream_var} as AudioStreamOggVorbis).loop = true")
-        ctx.add_line(indent, f"elif {stream_var} is AudioStreamMP3:")
-        ctx.add_line(indent + 1, f"({stream_var} as AudioStreamMP3).loop = true")
-        ctx.add_line(indent, f"elif {stream_var} is AudioStreamWAV:")
-        ctx.add_line(indent + 1,
-                     f"({stream_var} as AudioStreamWAV).loop_mode = "
-                     f"AudioStreamWAV.LOOP_FORWARD")
+        # (第八十一轮抽成 `_emit_stream_loop`:循环音效也用同一份)
+        _emit_stream_loop(ctx, indent, stream_var)
     ctx.add_line(indent, f"if {stream_var} != null:")
     # 重复播放同一首时不要打断(主菜单返回游戏很常见)
     ctx.add_line(indent + 1, f"if {music_var} != null and {music_var}.stream == {stream_var} and {music_var}.playing:")
@@ -112,6 +156,27 @@ def _stmt_play_music(ctx, node, indent):
 
 @stmt_node("GKNodeStopSound")
 def _stmt_stop_sound(ctx, node, indent):
+    """『音效_停止』:停 BGM(可淡出),或者停一个**同名的循环音效**。
+
+    ── 两种模式(第八十一轮加的第二种)────────────────────────────
+      * 『名字』留空 -> 老行为:停 `_gk_music`(可淡出),**一字不变**;
+      * 『名字』填了 -> 从 `_gk_loops` 里按名字取出循环音的播放器,
+        stop + 释放 + 抹掉登记。循环音一停就没了,不用淡出
+        (引擎声说停就停才自然)。
+    """
+    name = str(getattr(node, "gk_name", "") or "").strip()
+    if name:
+        ctx.declare_var("_gk_loops", "Dictionary", initial="{}")
+        key_var = ctx.new_temp("stop_key")
+        old_var = ctx.new_temp("stop_old")
+        ctx.add_line(indent, f"var {key_var} := {gd_string(name)}")
+        ctx.add_line(indent, f"if _gk_loops.has({key_var}):")
+        ctx.add_line(indent + 1, f"var {old_var}: Node = _gk_loops[{key_var}]")
+        ctx.add_line(indent + 1, f"if is_instance_valid({old_var}):")
+        ctx.add_line(indent + 2, f'{old_var}.call("stop")')
+        ctx.add_line(indent + 2, f"{old_var}.queue_free()")
+        ctx.add_line(indent + 1, f"_gk_loops.erase({key_var})")
+        return
     fade = gd_number(getattr(node, "gk_fade", 0.5))
     music_var = ctx.declare_var("_gk_music", "AudioStreamPlayer")
     ctx.add_line(indent, f"if {music_var} != null:")
@@ -782,6 +847,8 @@ def _stmt_ui_button(ctx, node, indent):
     text = ctx.input_string(node, "文字", "")
     width = gd_number(getattr(node, "gk_width", 160.0))
     height = gd_number(getattr(node, "gk_height", 48.0))
+    click_sound = str(getattr(node, "gk_click_sound", "") or "").strip()
+    click_db = gd_number(float(getattr(node, "gk_click_volume", -6.0) or 0.0))
 
     ctx.add_line(indent, f"if {widget} == null:")
     ctx.add_line(indent + 1, f"{widget} = Button.new()")
@@ -789,6 +856,25 @@ def _stmt_ui_button(ctx, node, indent):
     # 按钮必须吃鼠标事件，否则点不动
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
     ctx.add_line(indent + 1, f"{widget}.pressed.connect({handler})")
+    # 界面音效(第八十一轮):点了响一声。
+    # ⚠ 一次性播放器(不是成员变量):多按几次就是几个播放器,各播各的、
+    #   播完自己删 —— 和『音效_播放』一次性音效同一套做法。
+    if click_sound:
+        cb = ctx.new_temp("gk_ui_cb")
+        snd = ctx.new_temp("gk_ui_snd")
+        plr = ctx.new_temp("gk_ui_plr")
+        ctx.add_line(indent + 1, f"var {cb} := func() -> void:")
+        ctx.add_line(indent + 2,
+                     f"var {snd}: AudioStream = load({gd_string(_ui_image_res(click_sound))}) as AudioStream")
+        ctx.add_line(indent + 2, f"if {snd} == null:")
+        ctx.add_line(indent + 3, "return")
+        ctx.add_line(indent + 2, f"var {plr} := AudioStreamPlayer.new()")
+        ctx.add_line(indent + 2, f"{plr}.stream = {snd}")
+        ctx.add_line(indent + 2, f"{plr}.volume_db = {click_db}")
+        ctx.add_line(indent + 2, f"{root}.add_child({plr})")
+        ctx.add_line(indent + 2, f"{plr}.play()")
+        ctx.add_line(indent + 2, f"{plr}.finished.connect({plr}.queue_free)")
+        ctx.add_line(indent + 1, f"{widget}.pressed.connect({cb})")
     _ui_add_to(ctx, indent + 1, widget, node, root)
     _ui_size(ctx, indent, widget, node, width, height)
     _ui_place(ctx, indent, widget, node, "100.0", "200.0")
@@ -1081,6 +1167,14 @@ _DIALOG_RUNTIME_VARS = (
     ("_gk_history_scroll", "ScrollContainer", None),
     ("_gk_history_list", "VBoxContainer", None),
     ("_gk_history_clicked", "bool", "false"),
+    # 回顾面板的导出 / 点句重放(第八十一轮):
+    # `_gk_history_replay_on` 是**运行期开关**(点按处理里判它决定"点面板里关不关"),
+    # `_gk_history_export_btn` 让导出按钮只建一次(多次翻历史不会越堆越多)。
+    # ⚠ 开关名**不能**叫 `_gk_history_replay` —— 那是函数名,Godot 报
+    #   "Function has the same name as a previously declared variable"
+    #   (真 --check-only 抓出来的)
+    ("_gk_history_replay_on", "bool", "false"),
+    ("_gk_history_export_btn", "Button", None),
 )
 
 
@@ -1199,11 +1293,16 @@ def _stmt_ui_subtitle(ctx, node, indent):
     fade = gd_number(float(getattr(node, "gk_fade", 0.3) or 0.0))
     width = gd_number(getattr(node, "gk_width", 720.0))
     height = gd_number(getattr(node, "gk_height", 110.0))
-    margin = gd_number(getattr(node, "gk_margin", 48.0))
+    margin = gd_number(float(getattr(node, "gk_margin", 48.0) or 0.0))
+    # 说话人立绘(第八十一轮):**填了才多传一个实参** —— 没填的老调用点
+    # 还是 9 个实参,和第六十四轮逐字一致(helper 那边是带默认值的形参)
+    portrait = gd_string(_ui_image_res(getattr(node, "gk_image", "")))
+    args = (f"{speaker}, str({text}), {speed}, {seconds}, {fade}, "
+            f"{width}, {height}, {margin}")
+    if portrait != gd_string(""):
+        args += f", {portrait}"
 
-    ctx.add_line(indent, f"_gk_subtitle_show(self, {speaker}, str({text}), "
-                         f"{speed}, {seconds}, {fade}, {width}, {height}, "
-                         f"{margin})")
+    ctx.add_line(indent, f"_gk_subtitle_show(self, {args})")
 
 
 @stmt_node("GKNodeDialogHistory")
@@ -1218,6 +1317,20 @@ def _stmt_dialog_history(ctx, node, indent):
     # (历史的运行时变量另外由 _declare_dialog_runtime 补上)
     ctx.need_history_helpers = True
     _declare_dialog_runtime(ctx)
+    export_path = str(getattr(node, "gk_export_path", "") or "").strip()
+    replay = bool(getattr(node, "gk_replay", False))
+    if export_path:
+        ctx.need_history_export = True
+        if not export_path.startswith("user://"):
+            ctx.warn(f"『{node.bl_label}』的导出路径『{export_path}』不是 "
+                     f"user:// 开头 —— 打包成游戏后 res:// 是只读的,"
+                     f"建议改成 user://...")
+    if replay:
+        # 点句重放 = "那一句像字幕一样再飘一遍" -> 要字幕(和它背后的对话框)
+        # 那一套 helper 一起生成
+        ctx.need_history_replay = True
+        ctx.need_subtitle_helpers = True
+        ctx.need_dialog_helpers = True
     # 点按采集要在**节点遍历阶段**登记(见 _stmt_ui_dialog 的说明:
     # `_input` 的派发行比辅助函数先拼好)
     ctx.register_input_handler("gk_history_input_event", reset=False, body=[
@@ -1225,10 +1338,16 @@ def _stmt_dialog_history(ctx, node, indent):
         "        return",
         "    if event is InputEventMouseButton and event.pressed "
         "and event.button_index == MOUSE_BUTTON_LEFT:",
+        # 开了『点句重放』时,面板**里面**的点击是"点那一句",不许关面板;
+        # 点面板外面 / 按任意键才算看完(没开时老行为不变:点哪都关)
+        "        if _gk_history_replay_on and "
+        "_gk_history_panel.get_global_rect().has_point(event.position):",
+        "            return",
         "        _gk_history_clicked = true",
         "    elif event is InputEventKey and event.pressed and not event.echo:",
         "        _gk_history_clicked = true",
     ])
+    ctx.add_line(indent, f"_gk_history_replay_on = {'true' if replay else 'false'}")
 
     title = gd_string(str(getattr(node, "gk_title", "对话回顾") or ""))
     empty = gd_string(str(getattr(node, "gk_empty", "还没有说过话") or ""))
@@ -1236,8 +1355,12 @@ def _stmt_dialog_history(ctx, node, indent):
     width = gd_number(getattr(node, "gk_width", 720.0))
     height = gd_number(getattr(node, "gk_height", 380.0))
 
-    ctx.add_line(indent, f"_gk_history_show(self, {title}, {width}, {height}, "
-                         f"{max(8, min(48, font))}, {empty})")
+    args = f"{title}, {width}, {height}, {max(8, min(48, font))}, {empty}"
+    if export_path or replay:
+        # 两个开关的实参**一起给**(位置参数):只给一个的话没法只加尾巴
+        args += (f", {gd_string(export_path)}, "
+                 f"{'true' if replay else 'false'}")
+    ctx.add_line(indent, f"_gk_history_show(self, {args})")
     ctx.add_line(indent, "while not _gk_history_clicked:")
     ctx.add_line(indent + 1, "await get_tree().process_frame")
     ctx.add_line(indent, "_gk_history_hide()")
@@ -1556,6 +1679,7 @@ def _stmt_ui_input(ctx, node, indent):
     max_length = int(getattr(node, "gk_max_length", 24) or 0)
     secret = bool(getattr(node, "gk_password", False))
     focus = bool(getattr(node, "gk_focus", False))
+    ime = bool(getattr(node, "gk_ime", False))
     width = gd_number(getattr(node, "gk_width", 240.0))
     height = gd_number(getattr(node, "gk_height", 40.0))
 
@@ -1566,6 +1690,18 @@ def _stmt_ui_input(ctx, node, indent):
     ctx.add_line(indent + 1, f"{widget}.max_length = {max_length}")
     if secret:
         ctx.add_line(indent + 1, f"{widget}.secret = true")
+    # 输入法 / 软键盘(第八十一轮):手机上弹软键盘;桌面上输入法候选框
+    # 跟着光标走(中文打字的体验全靠这三根线)
+    if ime:
+        ctx.need_ime_helper = True
+        ctx.add_line(indent + 1, f"{widget}.virtual_keyboard_enabled = true")
+        ctx.add_line(indent + 1, f"{widget}.focus_entered.connect(func() -> void:")
+        ctx.add_line(indent + 2, "DisplayServer.window_set_ime_active(true)")
+        ctx.add_line(indent + 2, f"_gk_ime_update({widget}))")
+        ctx.add_line(indent + 1, f"{widget}.focus_exited.connect(func() -> void:")
+        ctx.add_line(indent + 2, "DisplayServer.window_set_ime_active(false))")
+        ctx.add_line(indent + 1, f"{widget}.text_changed.connect(func(_t: String) -> void:")
+        ctx.add_line(indent + 2, f"_gk_ime_update({widget}))")
     # 输入框必须吃鼠标 / 键盘,否则点不进去
     ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
     ctx.add_line(indent + 1, f"{widget}.text_submitted.connect({handler})")
@@ -1592,6 +1728,189 @@ def _stmt_ui_input(ctx, node, indent):
         "empty_body": "    pass",
         "separator": True,
     })
+
+
+@stmt_node("GKNodeUiTextEdit")
+def _stmt_ui_text_edit(ctx, node, indent):
+    """多行输入框(TextEdit):**Ctrl + 回车**沿『提交』出口继续。
+
+    ── 为什么是 Ctrl+回车,不是回车 ────────────────────────────────
+    TextEdit 里回车是"换行",聊天框最常用的键 —— 抢走它就没法打多行了。
+    Ctrl+回车是聊天软件的老规矩;`gui_input` 信号在控件自己的处理**之前**
+    发出来,所以这里接得到(真 Godot 探针锁着这条)。
+
+    ── 和『界面_输入框』的关系 ────────────────────────────────────
+    同一套路数:运行时按需建、出口不叫『完成』(叫『完成』会被自动续接,
+    刚建出来后面的逻辑就跑了),真正的续接放在 gui_input 回调里。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "TextEdit",
+                             key=node_lib.node_key(node))
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(node.name, 'edit')}_submit", key=node_lib.node_key(node))
+    text = ctx.input_string(node, "默认文字", "")
+    placeholder = gd_string(str(getattr(node, "gk_placeholder", "") or ""))
+    wrap = bool(getattr(node, "gk_wrap", True))
+    readonly = bool(getattr(node, "gk_readonly", False))
+    focus = bool(getattr(node, "gk_focus", False))
+    width = gd_number(getattr(node, "gk_width", 360.0))
+    height = gd_number(getattr(node, "gk_height", 120.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = TextEdit.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.placeholder_text = {placeholder}")
+    if wrap:
+        ctx.add_line(indent + 1,
+                     f"{widget}.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY")
+    if readonly:
+        ctx.add_line(indent + 1, f"{widget}.editable = false")
+    # 输入框必须吃鼠标 / 键盘,否则点不进去
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    ctx.add_line(indent + 1, f"{widget}.gui_input.connect({handler})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+    ctx.add_line(indent, f"{widget}.text = str({text})")
+    if focus:
+        ctx.add_line(indent, f"{widget}.grab_focus()")
+
+    saved_sink = ctx.sink
+    lines = ctx.new_section()
+    ctx._active.clear()
+    prev_event = ctx._current_event
+    ctx._current_event = node.name
+    _chain(ctx, node, 1, "提交")
+    body = list(lines.lines) or ["    pass"]
+    ctx._current_event = prev_event
+    ctx.sink = saved_sink
+    # 两条守卫在最前(不管有没有接『提交』都在):不是键盘 / 不是回车 /
+    # 没按 Ctrl 一律直接返回 —— 之后的链才算"提交了"
+    ctx.extra_sections.append({
+        "signature": f"func {handler}(event: InputEvent) -> void:",
+        "lines": [
+            "    if not (event is InputEventKey) or not event.pressed or event.echo:",
+            "        return",
+            "    if event.keycode != KEY_ENTER and event.keycode != KEY_KP_ENTER:",
+            "        return",
+            "    if not event.ctrl_pressed:",
+            "        return",
+        ] + body,
+        "empty_body": "    pass",
+        "separator": True,
+    })
+
+
+@stmt_node("GKNodeUiSkin")
+def _stmt_ui_skin(ctx, node, indent):
+    """『界面_皮肤』:建一套 Theme 挂到 UI 根上(第八十一轮)。
+
+    ── 为什么做成一个**语句节点**而不是全局设置 ────────────────────
+    皮肤是"这张图长什么样"的一部分,和别的界面节点住在同一张图里最好找;
+    挂到 `_gk_ui_root.theme` 之后,后面建的控件(包括『界面_套用设计』
+    展开出来的)**自动**继承 —— Godot 的主题是往下传的。
+
+    ── 覆盖哪些 ──────────────────────────────────────────────────
+      * Button 三态(normal / hover / pressed)+ **focus**(选中高亮);
+      * VScrollBar / HScrollBar 的 scroll(轨道)+ grabber 三态;
+      * Panel 的 panel、LineEdit / TextEdit 的 normal / focus;
+      * ProgressBar 的 background / fill;
+      * 常用类型的 font_color + `default_font_size`。
+    卡片自己设过 override 的控件(『界面_文本』的颜色、『界面_面板』的
+    底色)以卡片为准 —— 主题只兜底。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    font_size = int(getattr(node, "gk_font_size", 20) or 20)
+    font_color = getattr(node, "gk_font_color", (0.95, 0.97, 1.0, 1.0))
+    panel_color = getattr(node, "gk_panel_color", (0.06, 0.07, 0.10, 0.92))
+    button_color = getattr(node, "gk_button_color", (0.16, 0.20, 0.30, 0.95))
+    hover_color = getattr(node, "gk_button_hover", (0.22, 0.28, 0.42, 1.0))
+    press_color = getattr(node, "gk_button_press", (0.10, 0.13, 0.20, 1.0))
+    focus_color = getattr(node, "gk_focus_color", (1.0, 0.86, 0.45, 0.85))
+    scroll_color = getattr(node, "gk_scroll_color", (1.0, 1.0, 1.0, 0.30))
+    radius = int(getattr(node, "gk_radius", 8) or 0)
+
+    def color(entry):
+        return (f"Color({gd_number(entry[0])}, {gd_number(entry[1])}, "
+                f"{gd_number(entry[2])}, {gd_number(entry[3])})")
+
+    def stylebox(box_var, bg, corners=True, border=False):
+        """一个圆角方块的生成(底色 / 圆角 / 可选描边)。
+
+        ⚠ 属性行和 `var` 行**同一级**:GDScript 里没有开新块,
+          缩进再深一级就是语法错误(真 Godot 直接 Parse Error)。
+        """
+        ctx.add_line(indent, f"var {box_var} := StyleBoxFlat.new()")
+        ctx.add_line(indent, f"{box_var}.bg_color = {bg}")
+        if corners:
+            for corner in ("top_left", "top_right",
+                           "bottom_left", "bottom_right"):
+                ctx.add_line(indent,
+                             f"{box_var}.corner_radius_{corner} = {radius}")
+        if border:
+            for edge in ("top", "bottom", "left", "right"):
+                ctx.add_line(indent, f"{box_var}.border_width_{edge} = 2")
+            ctx.add_line(indent, f"{box_var}.border_color = {bg}")
+
+    theme = ctx.new_temp("gk_ui_theme")
+    ctx.add_line(indent, f"var {theme} := Theme.new()")
+    ctx.add_line(indent, f"{theme}.default_font_size = {max(8, min(72, font_size))}")
+    text_color = ctx.new_temp("gk_ui_color")
+    ctx.add_line(indent, f"var {text_color} := {color(font_color)}")
+    type_var = ctx.new_temp("gk_ui_t")
+    ctx.add_line(indent, f"for {type_var} in [\"Label\", \"Button\", "
+                         f"\"LineEdit\", \"TextEdit\"]:")
+    ctx.add_line(indent + 1,
+                 f"{theme}.set_color(\"font_color\", {type_var}, {text_color})")
+
+    # 按钮:三态 + 焦点(焦点就是"列表项选中高亮"的那个高亮)
+    for key, bg in (("normal", color(button_color)),
+                    ("hover", color(hover_color)),
+                    ("pressed", color(press_color))):
+        box = ctx.new_temp("gk_ui_btn")
+        stylebox(box, bg)
+        ctx.add_line(indent, f"{theme}.set_stylebox({gd_string(key)}, \"Button\", {box})")
+    focus_box = ctx.new_temp("gk_ui_focus")
+    stylebox(focus_box, color(focus_color), border=True)
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"focus\", \"Button\", {focus_box})")
+
+    # 面板 / 输入框
+    panel_box = ctx.new_temp("gk_ui_panel")
+    stylebox(panel_box, color(panel_color))
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"panel\", \"Panel\", {panel_box})")
+    edit_box = ctx.new_temp("gk_ui_edit")
+    stylebox(edit_box, color(panel_color))
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"normal\", \"LineEdit\", {edit_box})")
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"normal\", \"TextEdit\", {edit_box})")
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"focus\", \"LineEdit\", {focus_box})")
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"focus\", \"TextEdit\", {focus_box})")
+
+    # 滚动条(第八十一轮『滚动条美化』):轨道按滑块色淡化,不另配颜色
+    grabber = color(scroll_color)
+    track_var = ctx.new_temp("gk_ui_track")
+    stylebox(track_var, f"Color({gd_number(scroll_color[0])}, "
+                        f"{gd_number(scroll_color[1])}, "
+                        f"{gd_number(scroll_color[2])}, "
+                        f"{gd_number(float(scroll_color[3]) * 0.35)})")
+    grab_box = ctx.new_temp("gk_ui_grab")
+    stylebox(grab_box, grabber)
+    bar_var = ctx.new_temp("gk_ui_bar")
+    ctx.add_line(indent,
+                 f"for {bar_var} in [\"VScrollBar\", \"HScrollBar\"]:")
+    for key in ("scroll", "grabber", "grabber_highlight", "grabber_pressed"):
+        ctx.add_line(indent + 1,
+                     f"{theme}.set_stylebox({gd_string(key)}, {bar_var}, "
+                     f"{track_var if key == 'scroll' else grab_box})")
+
+    # 进度条
+    fill_box = ctx.new_temp("gk_ui_fill")
+    stylebox(fill_box, color(button_color))
+    bag_box = ctx.new_temp("gk_ui_barbg")
+    stylebox(bag_box, "Color(0.0, 0.0, 0.0, 0.35)")
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"background\", \"ProgressBar\", {bag_box})")
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"fill\", \"ProgressBar\", {fill_box})")
+
+    ctx.add_line(indent, f"{root}.theme = {theme}")
 
 
 @stmt_node("GKNodeUiFocus")

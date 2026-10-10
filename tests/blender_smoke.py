@@ -4333,6 +4333,127 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第八十一轮(F 组 15+16):界面收尾(皮肤 / 多行框 / 点击音效 /
+    #      字幕立绘 / 历史导出·跳回 / 音效循环)---------------------------------
+    # 15①滚动条美化 15②选中高亮 15⑥皮肤   -> 『界面_皮肤』一套主题
+    # 15③软键盘·IME  15④多行聊天框  15⑤界面音效
+    # 16①字幕说话人立绘  16②历史导出 / 跳回那一句  16③音效_播放循环
+    try:
+        ui_nodes = __import__(f"{module_name}.nodes.nodes",
+                             fromlist=["GKNodeUiSkin"])
+        r81_skin = getattr(ui_nodes, "GKNodeUiSkin", None)
+        r81_edit = getattr(ui_nodes, "GKNodeUiTextEdit", None)
+        check("界面:『界面_皮肤』『界面_多行输入框』都注册了",
+              r81_skin is not None and r81_edit is not None)
+        r81_skin_props = {e[0] for e in r81_skin.gk_prop_defs}
+        check("皮肤:九个属性齐(字号 / 五种色 / 圆角 / 滚动条)",
+              {"gk_font_size", "gk_font_color", "gk_panel_color",
+               "gk_button_color", "gk_button_hover", "gk_button_press",
+               "gk_focus_color", "gk_scroll_color", "gk_radius"}
+              <= r81_skin_props, str(sorted(r81_skin_props)))
+        check("老卡片新栏位:输入法 / 点击音效 / 字幕立绘 / 历史导出·跳回 / 循环",
+              "gk_ime" in {e[0] for e in ui_nodes.GKNodeUiInput.gk_prop_defs}
+              and "gk_click_sound" in {e[0] for e in
+                                       ui_nodes.GKNodeUiButton.gk_prop_defs}
+              and "gk_image" in {e[0] for e in
+                                 ui_nodes.GKNodeUiSubtitle.gk_prop_defs}
+              and {"gk_export_path", "gk_replay"} <=
+              {e[0] for e in ui_nodes.GKNodeDialogHistory.gk_prop_defs}
+              and {"gk_loop", "gk_name"} <=
+              {e[0] for e in ui_nodes.GKNodePlaySound.gk_prop_defs}
+              and "gk_name" in {e[0] for e in
+                                ui_nodes.GKNodeStopSound.gk_prop_defs})
+        check("多行输入框进了『设计图能摆』名单",
+              "GKNodeUiTextEdit" in ui_nodes.UI_DESIGN_BUILDER_NODES)
+
+        # ── 一张全开的图:生成物逐条对 ────────────────────────────────
+        r81_logic = bpy.data.node_groups.new("界面收尾81", "GKGameLogicTree")
+
+        def r81_add(kind, name, **props):
+            node = r81_logic.nodes.new(kind)
+            node.name = name
+            for key, value in props.items():
+                setattr(node, key, value)
+            return node
+
+        r81_event = r81_logic.nodes.new("GKNodeOnReady")
+        r81_skin_node = r81_add("GKNodeUiSkin", "皮肤", gk_font_size=22)
+        r81_button = r81_add("GKNodeUiButton", "开始", gk_text="开始",
+                             gk_click_sound="res://art/click.wav")
+        r81_input = r81_add("GKNodeUiInput", "昵称", gk_ime=True)
+        r81_chat = r81_add("GKNodeUiTextEdit", "聊天框")
+        r81_sub = r81_add("GKNodeUiSubtitle", "旁白", gk_text="旁白",
+                          gk_image="res://art/立绘.png")
+        r81_hist = r81_add("GKNodeDialogHistory", "回顾",
+                           gk_export_path="user://h.txt", gk_replay=True)
+        r81_sound = r81_add("GKNodePlaySound", "引擎",
+                            gk_path="res://art/engine.wav", gk_loop=True,
+                            gk_name="引擎")
+        r81_stop = r81_add("GKNodeStopSound", "停引擎", gk_name="引擎")
+        r81_logic.links.new(r81_event.outputs["执行"], r81_skin_node.inputs["执行"])
+        for r81_prev, r81_next in ((r81_skin_node, r81_button),
+                                   (r81_button, r81_input),
+                                   (r81_input, r81_chat),
+                                   (r81_chat, r81_sub),
+                                   (r81_sub, r81_hist),
+                                   (r81_hist, r81_sound),
+                                   (r81_sound, r81_stop)):
+            r81_logic.links.new(r81_prev.outputs["完成"], r81_next.inputs["执行"])
+
+        r81_code, r81_warn = codegen.generate(
+            r81_logic, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("皮肤:建 Theme + 焦点样式 + 两条滚动条 + 挂到 UI 根",
+              "Theme.new()" in r81_code
+              and 'set_stylebox("focus", "Button"' in r81_code
+              and '["VScrollBar", "HScrollBar"]' in r81_code
+              and 'set_stylebox("grabber"' in r81_code
+              and ".theme = _gk_ui_theme" in r81_code,
+              r81_code[-600:])
+        check("点击音效 / 多行框 / IME / 立绘 / 导出·跳回 / 循环 都在生成物里",
+              "AudioStreamPlayer.new()" in r81_code
+              and "TextEdit.new()" in r81_code
+              and "event.ctrl_pressed" in r81_code
+              and "DisplayServer.window_set_ime_active(true)" in r81_code
+              and "_gk_subtitle_show(self, \"\", str(\"旁白\")" in r81_code
+              and '"res://art/立绘.png")' in r81_code
+              and "func _gk_history_export(path: String) -> void:" in r81_code
+              and "func _gk_history_replay(host: Node, who: String, "
+                  "text: String) -> void:" in r81_code
+              and "var _gk_loops: Dictionary = {}" in r81_code
+              and "_gk_loops.has(_stop_key" in r81_code,
+              r81_code[-600:])
+        check("界面收尾:生成无告警", not r81_warn, str(r81_warn)[:300])
+
+        # 没填的老用法:皮肤 / 循环 / IME 一个字眼都不该出现
+        r81_plain = bpy.data.node_groups.new("老界面81", "GKGameLogicTree")
+        r81_pe = r81_plain.nodes.new("GKNodeOnReady")
+        r81_pb = r81_plain.nodes.new("GKNodeUiButton")
+        r81_pb.name = "按钮"
+        r81_plain.links.new(r81_pe.outputs["执行"], r81_pb.inputs["执行"])
+        r81_plain_code, _r81_pw = codegen.generate(
+            r81_plain, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("老图不变:没填的图里没有主题 / 循环 / 输入法",
+              "Theme.new()" not in r81_plain_code
+              and "_gk_loops" not in r81_plain_code
+              and "window_set_ime" not in r81_plain_code)
+
+        # ── 卡片画得完 ───────────────────────────────────────────────
+        r81_draw_error = ""
+        try:
+            for r81_card in (r81_skin_node, r81_button, r81_input, r81_chat,
+                             r81_sub, r81_hist, r81_sound, r81_stop):
+                r81_card.draw_buttons(bpy.context, _R79Layout())
+        except Exception as exc:                       # noqa: BLE001
+            r81_draw_error = f"{type(exc).__name__}: {exc}"
+        check("第八十一轮:皮肤 / 按钮 / 输入框 / 多行框 / 字幕 / 历史 / "
+              "音效卡都画得完", not r81_draw_error, r81_draw_error)
+
+        bpy.data.node_groups.remove(r81_plain)
+        bpy.data.node_groups.remove(r81_logic)
+    except Exception as exc:
+        check("第八十一轮(界面收尾:皮肤 / 多行框 / 立绘 / 历史 / 循环)",
+              False, f"{type(exc).__name__}: {exc}")
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

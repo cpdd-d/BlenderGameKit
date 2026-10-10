@@ -49,6 +49,22 @@
     三个选项按钮都在(选择1 / 选择2 / 选择3);
   * **选了走哪条链**:点第 2 个 -> 面板收起 + 得分变成"结局:独自逃出"
     + 『结局』变量 = 2(『选了第几个』这个整数输出真的写回去了)。
+
+第八十一轮(F 组 15 + 16:界面收尾)再看七样:
+  * **界面_皮肤**:UI 根挂上了 Theme(按钮焦点样式 / 滚动条样式都在),
+    存档列表那条滚动条**真的用上了**皮肤给的滑块色 —— 滚动条美化 / 列表项
+    选中高亮 / 皮肤三件事走同一套;
+  * **多行输入框**:『聊天框』是 TextEdit + 自动换行;打一行字 + Ctrl+回车
+    -> 沿『提交』走链,"得分"变成框里那行字;
+  * **输入法 / 软键盘**:『昵称』的 virtual_keyboard_enabled 是开的;
+  * **界面音效**:点『继续游戏』当帧就在 UI 根下建出一个 AudioStreamPlayer
+    (播完自己删的那套);
+  * **字幕说话人立绘**:旁白那行飘着的时候,对话框面板上的『立绘』是可见的、
+    贴图非空;
+  * **对话历史 导出**:面板右上『导出』按钮把整段历史写进
+    `user://对话历史.txt`,而且**点面板里不关**(开了点句重放);
+  * **对话历史 点句重放**:点列表里第一句 -> 面板收起 + 那一句像字幕一样
+    重飘一遍(对话框面板上的正文就是那一句)—— 执行流也随之往下走。
 """
 
 import argparse
@@ -80,6 +96,8 @@ var typing_after := 0          # 第一次点击之后(应该"补完")
 var dialog_hidden := false
 var score_after := ""
 var paused_before := false
+var replay_text := ""          # 点句重放点的哪一句(下一阶段比正文)
+var replay_who := ""           # 那一句的说话人(重放后说话人栏要比它)
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -143,6 +161,7 @@ func _physics_process(delta: float) -> void:
 		_send_key(KEY_ESCAPE, false)
 		_check_pause()
 		_check_menu_list()                     # 菜单开着,正好看列表 / 九宫格
+		_check_loop_playing()                  # 第八十一轮:引擎声还在响
 	elif phase == 5 and elapsed >= 2.15:
 		phase = 6
 		# 暂停中点击列表里的『存档一』(能点的行各接各的链)
@@ -156,9 +175,14 @@ func _physics_process(delta: float) -> void:
 		var button := _widget("继续按钮")
 		if button != null:
 			_click_at(button.get_global_rect().get_center())
+		# 同一个物理帧里数:点『继续游戏』当帧建出来的界面音效播放器
+		var click_players := _count_click_players()
+		print("UI_CLICK_SOUND ok=", click_players >= 1,
+			" players=", click_players)
 	elif phase == 7 and elapsed >= 2.9:
 		phase = 8
 		_check_resume()
+		_check_loop_stopped()                  # 第八十一轮:继续时把它停了
 		_check_log_list()                      # 『列表_填充』灌的三行
 		_submit_nickname()                     # 打字 + 回车,交给下一个阶段看
 	elif phase == 8 and elapsed >= 3.4:
@@ -176,14 +200,23 @@ func _physics_process(delta: float) -> void:
 	elif phase == 10 and elapsed >= 4.2:
 		phase = 11
 		_check_choice_picked()
-		# 第六十四轮:字幕(不阻塞)+ 对话历史回顾
+		# 第六十四轮:字幕(不阻塞)+ 对话历史回顾;第八十一轮:立绘
 		_check_narrative()
-		# 历史面板是"阻塞"的(等玩家点)—— 点一下关掉,下一阶段查它真关了。
-		# 面板本身不吃鼠标(`_input` 采点按),点哪儿都算。
-		_click_at(Vector2(400.0, 300.0))
+		# 第八十一轮:点『导出』(面板里面)—— 导出后**面板不许关**
+		var export := _widget("导出")
+		if export != null:
+			_click_at(export.get_global_rect().get_center())
 	elif phase == 11 and elapsed >= 4.6:
 		phase = 12
-		_check_history_closed()
+		_check_history_export()
+		_click_first_history_row()             # 点第一句 -> 重放它
+	elif phase == 12 and elapsed >= 5.0:
+		phase = 13
+		_check_history_replay()
+		_submit_chat()                         # 多行框:打字 + Ctrl+回车
+	elif phase == 13 and elapsed >= 5.4:
+		phase = 14
+		_check_chat_sent()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
@@ -212,32 +245,196 @@ func _check_narrative() -> void:
 		var list := panel.find_child("列表", true, false)
 		if list != null:
 			rows = list.get_child_count()
-			if rows > 0 and list.get_child(0) is Label:
-				first = (list.get_child(0) as Label).text
+			if rows > 0:
+				var row := list.get_child(0)
+				if row is Label:
+					first = (row as Label).text
+				elif row is Button:
+					first = (row as Button).text
 	var blip := world.find_child("GKBlip", true, false)
+	# 第八十一轮:说话人立绘(字幕那张卡上填了『立绘』)—— 面板上的
+	# 『立绘』应该可见且贴图非空(它就是字幕飘着的时候)
+	var portrait := _widget("立绘") as TextureRect
+	var portrait_ok: bool = portrait != null and portrait.visible \
+		and portrait.texture != null
 	var ok: bool = shown and rows == 2 and blip != null \
-		and score_text == "结局:独自逃出"
+		and score_text == "结局:独自逃出" and portrait_ok
 	print("UI_NARRATIVE ok=", ok, " panel=", shown, " rows=", rows,
-		" first=", first, " blip=", blip != null, " score=", score_text)
+		" first=", first, " blip=", blip != null, " score=", score_text,
+		" portrait=", portrait_ok)
 
 
-## 点一下之后历史面板要关掉(和对话框同一套:等一次点按)。
-func _check_history_closed() -> void:
+# ── 第八十一轮:皮肤 / 音效 / 历史导出·重放 ───────────────────────
+
+## 皮肤:UI 根挂上了 Theme;按钮焦点样式在;**存档列表的滚动条**
+## 真的用上了皮肤给的滑块色(滚动条美化 / 选中高亮 / 皮肤一件事)。
+func _check_skin() -> void:
+	var theme: Theme = ui_root.theme if ui_root != null else null
+	var ok := false
+	var note := "no theme"
+	if theme != null:
+		var focus := theme.get_stylebox("focus", "Button")
+		var grab := theme.get_stylebox("grabber", "VScrollBar")
+		var save_list := _widget("存档列表")
+		var bar_grab: StyleBox = null
+		if save_list is ScrollContainer:
+			bar_grab = (save_list as ScrollContainer).get_v_scroll_bar() \
+				.get_theme_stylebox("grabber")
+		var bar_alpha := -1.0
+		if bar_grab is StyleBoxFlat:
+			bar_alpha = (bar_grab as StyleBoxFlat).bg_color.a
+		ok = focus != null and grab != null and bar_grab != null \
+			and theme.default_font_size == 22 \
+			and absf(bar_alpha - 0.35) < 0.05
+		note = "size=" + str(theme.default_font_size) \
+			+ " focus=" + str(focus != null) + " grab=" + str(grab != null) \
+			+ " bar_a=" + str(bar_alpha)
+	print("UI_SKIN ok=", ok, " ", note)
+
+
+## 循环音效:宿主脚本上的 `_gk_loops` 里有『引擎』而且在响。
+func _loop_state() -> Dictionary:
+	if world == null:
+		return {}
+	for node in world.find_children("*", "Node", true, false):
+		var loops = node.get("_gk_loops")
+		if loops is Dictionary:
+			return loops
+	return {}
+
+
+func _check_loop_playing() -> void:
+	var loops := _loop_state()
+	var player = loops.get("引擎")
+	var playing: bool = player != null and bool(player.get("playing"))
+	print("UI_LOOP_SOUND ok=", playing, " has=", loops.has("引擎"),
+		" playing=", playing)
+
+
+func _check_loop_stopped() -> void:
+	var loops := _loop_state()
+	print("UI_LOOP_STOP ok=", not loops.has("引擎"), " keys=", loops.keys())
+
+
+## 界面音效:点按钮**当帧**在 UI 根下建出播放器(播完自己删)。
+## 同一个物理帧里数,不然短音效已经播完删掉了(实测会数到 0)。
+func _count_click_players() -> int:
+	var count := 0
+	if ui_root == null:
+		return 0
+	for child in ui_root.get_children():
+		if child is AudioStreamPlayer:
+			count += 1
+	return count
+
+
+## 导出按钮:文件写出来了,而且**面板还开着**(开了点句重放时,
+## 点面板里面不关 —— 里面是"点那一句")。
+func _check_history_export() -> void:
+	var panel := _widget("对话历史")
+	var still_open: bool = panel != null and panel.visible
+	var lines := -1
+	if FileAccess.file_exists("user://对话历史.txt"):
+		var file := FileAccess.open("user://对话历史.txt", FileAccess.READ)
+		if file != null:
+			lines = 0
+			while not file.eof_reached():
+				var line := file.get_line()
+				if line.strip_edges() != "":
+					lines += 1
+			file.close()
+	print("UI_HISTORY_EXPORT ok=", still_open and lines >= 2,
+		" open=", still_open, " lines=", lines)
+
+
+func _click_first_history_row() -> void:
+	var panel := _widget("对话历史")
+	if panel == null:
+		return
+	var list := panel.find_child("列表", true, false)
+	if list == null or list.get_child_count() == 0:
+		return
+	var row := list.get_child(0)
+	if row is Button:
+		var row_text := (row as Button).text
+		# 行文字是"说话人：正文";重放后**正文**进正文、说话人进说话人
+		var parts := row_text.split("：", true, 1)
+		if parts.size() == 2:
+			replay_who = parts[0]
+			replay_text = parts[1]
+		else:
+			replay_who = ""
+			replay_text = row_text
+		_click_at((row as Button).get_global_rect().get_center())
+
+
+## 点句重放:面板收起 + 那一句像字幕一样重飘(说话人 / 正文都对上)。
+func _check_history_replay() -> void:
 	var panel := _widget("对话历史")
 	var hidden: bool = panel == null or not panel.visible
-	print("UI_HISTORY_CLOSED ok=", hidden, " hidden=", hidden)
+	var dialog := _widget("对话框")
+	var text := dialog.find_child("正文", true, false) as Label \
+		if dialog != null else null
+	var name_label := dialog.find_child("说话人", true, false) as Label \
+		if dialog != null else null
+	var body := text.text if text != null else "<none>"
+	var who := name_label.text if name_label != null else "<none>"
+	print("UI_HISTORY_REPLAY ok=",
+		hidden and dialog != null and dialog.visible
+		and body == replay_text and who == replay_who and replay_text != "",
+		" hidden=", hidden, " text=", body, " want=", replay_text,
+		" who=", who, " want_who=", replay_who)
+
+
+## 多行聊天框:打一行字 + **Ctrl+回车** -> 提交链 -> 得分变成那行字。
+func _submit_chat() -> void:
+	var chat := _widget("聊天框") as TextEdit
+	if chat == null:
+		return
+	chat.grab_focus()
+	chat.text = "晚上好"
+	var event := InputEventKey.new()
+	event.keycode = KEY_ENTER
+	event.physical_keycode = KEY_ENTER
+	event.ctrl_pressed = true
+	event.pressed = true
+	event.echo = false
+	get_viewport().push_input(event)
+	event.pressed = false
+	get_viewport().push_input(event)
+
+
+func _check_chat_sent() -> void:
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	print("UI_CHAT_SEND ok=", text == "晚上好", " score=", text)
 
 
 func _check_widgets() -> void:
+	_check_skin()
 	var names := ["HUD底", "徽标", "分数", "血条", "底部提示",
 		"暂停菜单", "暂停标题", "继续按钮", "退出按钮",
 		"标题条", "存档列表", "存档槽一", "存档槽二", "日志列表", "昵称",
-		"设计底板", "设计标题", "设计按钮"]
+		"设计底板", "设计标题", "设计按钮", "聊天框"]
 	var missing: Array = []
 	for name in names:
 		if _widget(name) == null:
 			missing.append(name)
 	print("UI_WIDGETS ok=", missing.is_empty(), " missing=", missing)
+
+	# 第八十一轮:多行输入框(TextEdit + 自动换行 / Ctrl+回车提交)
+	var chat := _widget("聊天框")
+	var chat_wrap: int = (chat as TextEdit).wrap_mode if chat is TextEdit else -1
+	var chat_ok: bool = chat is TextEdit \
+		and chat_wrap == TextEdit.LINE_WRAPPING_BOUNDARY \
+		and (chat as TextEdit).placeholder_text != ""
+	print("UI_TEXTEDIT ok=", chat_ok, " type=", chat is TextEdit,
+		" wrap=", chat_wrap)
+
+	# 第八十一轮:输入法 / 软键盘(昵称框勾了『输入法』)
+	var nick := _widget("昵称") as LineEdit
+	print("UI_IME ok=", nick != null and nick.virtual_keyboard_enabled,
+		" vkb=", nick.virtual_keyboard_enabled if nick != null else "<none>")
 
 	# 图片:texture 非空 + 尺寸对(证明 art/ui_*.png 真的导出来了)
 	var logo := _widget("徽标") as TextureRect
@@ -612,8 +809,28 @@ def main():
         # ---- 第六十四轮:字幕 / 打字音 / 对话历史 ----
         (r"UI_NARRATIVE ok=true",
          "字幕或对话历史不对(字幕**卡住了执行流** / 历史里不是 2 行 / "
-         "打字音播放器没建出来)"),
-        (r"UI_HISTORY_CLOSED ok=true", "点一下没把『对话回顾』面板关掉"),
+         "打字音播放器没建出来 / 字幕立绘没显示)"),
+        # ---- 第八十一轮:皮肤 / 多行框 / 输入法 / 界面音效 / 历史导出·重放 ----
+        (r"UI_SKIN ok=true",
+         "『界面_皮肤』没生效(UI 根没有 Theme,或按钮焦点样式 / 滚动条"
+         "滑块样式没挂上 —— 滚动条美化 / 列表项选中高亮就靠它)"),
+        (r"UI_TEXTEDIT ok=true",
+         "『界面_多行输入框』不对(不是 TextEdit / 没开自动换行 / 没占位提示)"),
+        (r"UI_IME ok=true",
+         "『昵称』没开输入法 / 软键盘(virtual_keyboard_enabled 不是 true)"),
+        (r"UI_CLICK_SOUND ok=true",
+         "点『继续游戏』没响点击音效(UI 根下没建出 AudioStreamPlayer)"),
+        (r"UI_LOOP_SOUND ok=true",
+         "『音效_播放』循环没响(宿主的 _gk_loops 里没有『引擎』或在响=false)"),
+        (r"UI_LOOP_STOP ok=true",
+         "『音效_停止』填了名字没把循环音停掉(_gk_loops 里还留着)"),
+        (r"UI_HISTORY_EXPORT ok=true",
+         "『对话历史』的导出不对(文件没写出来 / 行数不足,"
+         "或者点面板里面把面板关掉了 —— 开了点句重放时里面是『点那一句』)"),
+        (r"UI_HISTORY_REPLAY ok=true",
+         "点句重放不对(面板没收起 / 那一句没重飘:对话框正文和点的行不一致)"),
+        (r"UI_CHAT_SEND ok=true",
+         "多行框 Ctrl+回车没走『提交』链(得分没变成框里那行字)"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -664,6 +881,21 @@ def main():
                 ('button.name = "选择%d" % (index + 1)', "选项按钮"),
                 ("gk_choice_input_event(event)", "数字键 1~6 也能选"),
                 ("_gk_choice_picked", "『选了第几个』输出"),
+                # ---- 第八十一轮:皮肤 / 多行框 / 输入法 / 点击音效 / 立绘 / 历史 ----
+                ("Theme.new()", "『界面_皮肤』的主题"),
+                ('set_stylebox("focus", "Button"', "按钮焦点样式(选中高亮)"),
+                ('["VScrollBar", "HScrollBar"]', "滚动条美化(竖横两条)"),
+                ("TextEdit.new()", "『界面_多行输入框』"),
+                ("event.ctrl_pressed", "多行框的 Ctrl+回车提交"),
+                ("DisplayServer.window_set_ime_active(true)", "输入法 / 软键盘"),
+                ('AudioStreamPlayer.new()', "界面音效(点按钮出声)"),
+                ('"res://art/ui_', "字幕立绘(界面图片落盘那条路)"),
+                ("func _gk_history_export(path: String) -> void:",
+                 "对话历史导出"),
+                ("func _gk_history_replay(host: Node, who: String, "
+                 "text: String) -> void:", "点句重放"),
+                ("_gk_loops[_sfx_key", "『音效_播放』循环登记"),
+                ("_gk_loops.has(_stop_key", "『音效_停止』按名字停循环"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")

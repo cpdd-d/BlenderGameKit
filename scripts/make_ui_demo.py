@@ -314,6 +314,14 @@ def _build_ui_chain(tree, ready, design):
     生成时按节点在画布上的上下位置依次出码(见 registry._next_nodes)。
     """
     # ── 设计图那条线:一个『界面_套用设计』+ 一个『界面_按钮点击』──────
+    # 第八十一轮:最前面先摆一个『界面_皮肤』—— 主题挂到 UI 根上之后,
+    # 后面建的控件(含套用设计展开出来的)自动继承(按钮三态 / 焦点高亮 /
+    # 滚动条 / 输入框底色一次全换)
+    skin = _add(tree, "GKNodeUiSkin", "皮肤", -260.0, -300.0,
+                gk_font_size=22, gk_radius=10,
+                gk_button_color=(0.18, 0.22, 0.34, 0.95),
+                gk_focus_color=(1.0, 0.78, 0.35, 0.85),
+                gk_scroll_color=(0.75, 0.85, 1.0, 0.35))
     apply_design = _add(tree, "GKNodeUiApplyDesign", "套用设计HUD", 0.0, -300.0,
                         gk_design=design.name)
     design_click = _add(tree, "GKNodeUiOnClick", "设计按钮点击", 260.0, -300.0,
@@ -336,6 +344,14 @@ def _build_ui_chain(tree, ready, design):
                gk_value=0.7, gk_max=1.0, gk_width=292.0, gk_height=16.0,
                gk_x=14.0, gk_y=96.0, gk_color=(0.35, 0.85, 0.45, 1.0),
                gk_parent_widget="HUD底")
+    # ── 第八十一轮『音效_播放』循环:开局开一条"引擎声"(一直响)────────
+    # 点『继续游戏』时用『音效_停止』(填同一个名字)把它停掉 ——
+    # 探针分别在"暂停前"(在响)和"继续后"(停了)各看一次
+    engine = _add(tree, "GKNodePlaySound", "引擎声", 780.0, -300.0,
+                  gk_path=TYPE_SOUND_RES, gk_loop=True, gk_name="引擎",
+                  gk_2d=False, gk_volume=-14.0)
+    stop_engine = _add(tree, "GKNodeStopSound", "停引擎声", 3380.0, -400.0,
+                       gk_name="引擎")
     # ── 暂停菜单:底板(正中、开局藏)+ 控件挂在它下面 ──────────
     # 菜单里从上往下:标题条(九宫格底图)→ 存档列表(两个槽)→ 两个按钮
     menu = _add(tree, "GKNodeUiPanel", "暂停菜单", 1040.0, 0.0,
@@ -364,6 +380,8 @@ def _build_ui_chain(tree, ready, design):
     resume = _add(tree, "GKNodeUiButton", "继续按钮", 2080.0, 0.0,
                   gk_text="继续游戏", gk_x=130.0, gk_y=206.0,
                   gk_width=180.0, gk_height=48.0,
+                  # 第八十一轮『界面音效』:点了响一声(复用打字音那个 wav)
+                  gk_click_sound=TYPE_SOUND_RES, gk_click_volume=-8.0,
                   gk_parent_widget="暂停菜单")
     quit_button = _add(tree, "GKNodeUiButton", "退出按钮", 2080.0, -260.0,
                        gk_text="退出游戏", gk_x=130.0, gk_y=262.0,
@@ -381,7 +399,19 @@ def _build_ui_chain(tree, ready, design):
     nickname = _add(tree, "GKNodeUiInput", "昵称", 2860.0, 0.0,
                     gk_placeholder="输入昵称,回车确认",
                     gk_x=12.0, gk_y=152.0, gk_width=260.0, gk_height=40.0,
-                    gk_max_length=12)
+                    gk_max_length=12,
+                    # 第八十一轮:吃中文输入法 / 手机软键盘,候选框跟光标走
+                    gk_ime=True)
+    # ── 第八十一轮:多行聊天框(Ctrl+回车提交)─────────────────────
+    # 挂在日志列表下面(左下角);提交后把框里的字**原样**写进"得分"
+    # (读聊天 -> 设置 的"文字"引脚这条线)
+    chat = _add(tree, "GKNodeUiTextEdit", "聊天框", 2860.0, 240.0,
+                gk_placeholder="打一行字,Ctrl+回车发送",
+                gk_x=12.0, gk_y=210.0, gk_width=260.0, gk_height=72.0)
+    read_chat = _add(tree, "GKNodeUiReadText", "读聊天", 3120.0, 400.0,
+                     gk_widget="聊天框")
+    send_chat = _add(tree, "GKNodeUiSet", "发出聊天", 3120.0, 240.0,
+                     gk_widget="分数", gk_set_text=True)
     read_name = _add(tree, "GKNodeUiReadText", "读昵称", 3120.0, -120.0,
                      gk_widget="昵称")
     write_name = _add(tree, "GKNodeUiSet", "把名字写进得分", 3120.0, 0.0,
@@ -428,12 +458,16 @@ def _build_ui_chain(tree, ready, design):
                    gk_pause=True, gk_show_mouse=True, gk_menu="",
                    gk_hotkey=False)
     # 一个出口接两条:先接按钮行为,再把整套界面建出来(两条互不依赖)
+    _link(tree, ready, "执行", skin, "执行")
+    _link(tree, skin, "完成", apply_design, "执行")
     _link(tree, apply_design, "完成", design_click, "执行")
     _link(tree, apply_design, "完成", hud, "执行")
     _link(tree, hud, "完成", logo, "执行")
     _link(tree, logo, "完成", score, "执行")
     _link(tree, score, "完成", bar, "执行")
-    _link(tree, bar, "完成", menu, "执行")
+    # 血条建好后开"引擎声"(循环音效,一直响到点『继续游戏』)
+    _link(tree, bar, "完成", engine, "执行")
+    _link(tree, engine, "完成", menu, "执行")
     _link(tree, menu, "完成", title, "执行")
     _link(tree, title, "完成", title_bar, "执行")
     _link(tree, title_bar, "完成", save_list, "执行")
@@ -443,7 +477,8 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, resume, "完成", quit_button, "执行")
     _link(tree, quit_button, "完成", logs, "执行")
     _link(tree, logs, "完成", fill, "执行")
-    _link(tree, fill, "完成", nickname, "执行")
+    _link(tree, fill, "完成", chat, "执行")
+    _link(tree, chat, "完成", nickname, "执行")
     # ⚠ 顺序:『暂停热键』在前(它在准备时会调一次"取消暂停"—— 它是开/关型),
     #   我的『开局选单态』在后,才不会被它覆盖(实测踩过:paused=false)。
     _link(tree, nickname, "完成", hotkey, "执行")
@@ -481,9 +516,13 @@ def _build_ui_chain(tree, ready, design):
     # 逃出』"其实就顺带证明了**字幕没把执行流卡住**(卡住的话分数永远不变)。
     subtitle = _add(tree, "GKNodeUiSubtitle", "旁白字幕", 5460.0, -560.0,
                     gk_text="你独自跑出了教学楼……", gk_seconds=2.5,
-                    gk_type_sound=TYPE_SOUND_RES)
+                    gk_type_sound=TYPE_SOUND_RES,
+                    # 第八十一轮:说话人立绘(复用徽标那张程序生成的图)
+                    gk_speaker="旁白", gk_image=LOGO_NAME)
     history = _add(tree, "GKNodeDialogHistory", "回顾", 5980.0, -300.0,
-                   gk_title="对话回顾")
+                   gk_title="对话回顾",
+                   # 第八十一轮:导出按钮 + 每句可点(点了像字幕一样重飘一遍)
+                   gk_export_path="user://对话历史.txt", gk_replay=True)
 
     _link(tree, focus_field, "完成", choice, "执行")
     _link(tree, choice, "选项1", pick_one, "执行")
@@ -499,11 +538,16 @@ def _build_ui_chain(tree, ready, design):
     # 输入框『提交』(回车):读框里的字 -> 写进"得分"
     _link(tree, read_name, "文字", write_name, "文字")
     _link(tree, nickname, "提交", write_name, "执行")
+    # 聊天框『提交』(Ctrl+回车):框里的字原样写进"得分"
+    _link(tree, read_chat, "文字", send_chat, "文字")
+    _link(tree, chat, "提交", send_chat, "执行")
 
     # 菜单里的按钮:先解除暂停,再回到游戏 / 退出
     back = _add(tree, "GKNodeUiPauseGame", "继续游戏", 3380.0, -260.0,
                 gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
-    _link(tree, resume, "点击", back, "执行")
+    # 继续之前先把"引擎声"停掉(『音效_停止』填同一个名字)
+    _link(tree, resume, "点击", stop_engine, "执行")
+    _link(tree, stop_engine, "完成", back, "执行")
     quit_pause = _add(tree, "GKNodeUiPauseGame", "退出前解除暂停", 3380.0, -520.0,
                       gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
     quit_game = _add(tree, "GKNodeQuitGame", "退出(菜单)", 3640.0, -520.0)
@@ -516,10 +560,11 @@ def _build_ui_chain(tree, ready, design):
                     gk_widget="分数", gk_set_text=True, gk_text="读取存档二")
     _link(tree, slot_one, "点击", load_one, "执行")
     _link(tree, slot_two, "点击", load_two, "执行")
-    log("界面链:套用设计图(右上角 HUD,3 个控件) -> 接设计按钮行为 -> "
-        "面板 -> 图片 -> 文本 -> 进度条 -> 暂停菜单(九宫格标题条 + "
-        "存档列表) -> 日志列表(填充) -> 昵称输入框 -> 提示 -> 对话框 -> "
-        "淡入 + 聚焦 -> 结局选择(3 个选项)")
+    log("界面链:皮肤 -> 套用设计图(右上角 HUD,3 个控件) -> 接设计按钮行为 -> "
+        "面板 -> 图片 -> 文本 -> 进度条 -> 引擎声(循环) -> 暂停菜单(九宫格标题条 + "
+        "存档列表) -> 日志列表(填充) -> 聊天框(多行) -> 昵称输入框(输入法) -> "
+        "提示 -> 对话框 -> 淡入 + 聚焦 -> 结局选择(3 个选项) -> 字幕(带立绘) -> "
+        "对话回顾(导出 + 点句重放)")
     return choice
 
 

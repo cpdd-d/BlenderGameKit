@@ -793,7 +793,12 @@ class GKNodePlaySound(B.GKStatementNode):
     bl_icon = "SOUND"
     gk_category = "音效"
     gk_doc = ("播放一次音效(跳跃 / 受击 / 拾取)。播放器是运行时自动建的，"
-              "播完自动销毁，不需要你在场景里摆节点")
+              "播完自动销毁，不需要你在场景里摆节点。\n"
+              "── 循环(第八十一轮)──\n"
+              "勾上『循环』= 一直响的**循环音效**(引擎声 / 风声 / 火堆)。\n"
+              "循环音不会自己销毁(它永远不\"播完\"),用『音效_停止』填同一个"
+              "『名字』来停它;同名再播一次会先停掉旧的(不会叠)。"
+              "『名字』留空 = 用卡片名。")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "音频路径", "res://art/jump.wav"),
@@ -811,6 +816,8 @@ class GKNodePlaySound(B.GKStatementNode):
         ("gk_pitch", "float", 1.0, "音高", "1.0 原速，>1 更尖更快"),
         ("gk_2d", "bool", True, "2D 音效", "勾上=按距离衰减(3D 项目取消勾选)"),
         ("gk_target", "node", "", "挂到", "留空则挂到当前脚本所在节点"),
+        ("gk_loop", "bool", False, "循环", "一直响;用『音效_停止』填名字来停"),
+        ("gk_name", "string", "", "名字", "循环音效的名字(停止时对名字);留空 = 卡片名"),
     )
 
     def draw_buttons(self, context, layout):
@@ -825,6 +832,9 @@ class GKNodePlaySound(B.GKStatementNode):
         row.prop(self, "gk_pitch", text="")
         row = layout.row(align=True)
         row.prop(self, "gk_2d", text="2D", toggle=True)
+        row.prop(self, "gk_loop", text="循环", toggle=True)
+        if getattr(self, "gk_loop", False):
+            row.prop(self, "gk_name", text="", icon="SORTALPHA")
         B.draw_target_picker(self, layout)
 
 
@@ -875,16 +885,26 @@ class GKNodePlayMusic(B.GKStatementNode):
 @N
 class GKNodeStopSound(B.GKStatementNode):
     bl_idname = "GKNodeStopSound"
-    bl_label = "音效_停止音乐"
+    bl_label = "音效_停止"
     bl_icon = "MUTE_IPO_OFF"
     gk_category = "音效"
-    gk_doc = "停止背景音乐(可做淡出)。音效是一次性的，播完自己就没了，不用手动停"
+    gk_doc = ("停背景音乐(可做淡出)。音效是一次性的，播完自己就没了，不用手动停 ——"
+              "**但循环音效要**(见『音效_播放』的『循环』)。\n"
+              "能停两样:\n"
+              "  ① 『名字』留空 -> 停 BGM(`_gk_music` 那条流);\n"
+              "  ② 『名字』填上 -> 停那个**同名**的循环音效"
+              "(名字 = 『音效_播放』卡片上填的 / 留空时的卡片名)。")
     gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "淡出秒数", 0.5),)
     gk_input_props = {"淡出秒数": "gk_fade"}
-    gk_prop_defs = (("gk_fade", "float", 0.5, "淡出秒数", "0 表示立刻停"),)
+    gk_prop_defs = (
+        ("gk_fade", "float", 0.5, "淡出秒数", "0 表示立刻停(只对 BGM 有效)"),
+        ("gk_name", "string", "", "名字",
+         "循环音效的名字(和『音效_播放』填的同一个);留空 = 停 BGM"),
+    )
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_fade", text="")
+        layout.prop(self, "gk_name", text="", icon="SORTALPHA")
 
 
 @N
@@ -1387,6 +1407,9 @@ class GKNodeUiButton(B.GKStatementNode):
         ("gk_parent_widget", "string", "", "父控件",
          "挂到哪个界面控件下面(填那个控件的名字)。留空 = 直接铺在屏幕上;"
          "挂到面板下面时,面板一藏它就跟着藏,对齐也变成相对面板"),
+        ("gk_click_sound", "string", "", "点击音效",
+         "点了响一声(『叮』那种)。从资产库挑或填 res:// 路径;留空 = 不响"),
+        ("gk_click_volume", "float", -6.0, "点击音效音量", "分贝;0 = 原始音量"),
     )
     # ── 两个出口,各管一段(第三十七轮补的 『完成』)─────────────────
     # 『完成』= **按钮建好了**,接着往下建 / 往下做(和别的语句节点一样);
@@ -1407,6 +1430,13 @@ class GKNodeUiButton(B.GKStatementNode):
         row.prop(self, "gk_height", text="")
         row.prop(self, "gk_parent_widget", text="", icon="NODE")
         B.draw_ui_align_row(self, layout)
+        # 界面音效(第八十一轮):点了响一声
+        row = layout.row(align=True)
+        row.prop(self, "gk_click_sound", text="", icon="SOUND")
+        pick = row.operator("gk.pick_sound", text="", icon="VIEWZOOM")
+        pick.node_name = self.name
+        pick.sound_prop = "gk_click_sound"
+        row.prop(self, "gk_click_volume", text="dB")
 
 
 @N
@@ -1866,6 +1896,8 @@ class GKNodeUiSubtitle(B.GKStatementNode):
         ("gk_seconds", "float", 3.0, "停留秒数", "飘多久后自动消失"),
         ("gk_fade", "float", 0.3, "淡出秒数", "消失时的淡出;0 = 直接消失"),
         ("gk_speed", "float", 30.0, "打字速度", "每秒显示几个字;0 = 直接全显示"),
+        ("gk_image", "string", "", "说话人立绘",
+         "可选的头像 / 半身像(Blender 图片名或 res:// 路径);留空 = 只有文字"),
         ("gk_type_sound", "string", "", "打字音",
          "逐字显示时每隔几个字响一下的音效;留空 = 不响"),
         ("gk_type_every", "int", 2, "每几个字",
@@ -1884,6 +1916,12 @@ class GKNodeUiSubtitle(B.GKStatementNode):
         row.prop(self, "gk_seconds", text="秒")
         row.prop(self, "gk_fade", text="淡出")
         layout.prop(self, "gk_text", text="")
+        # 说话人立绘(第八十一轮):可选的半身像
+        row = layout.row(align=True)
+        row.prop(self, "gk_image", text="", icon="IMAGE_DATA")
+        pick_image = row.operator("gk.pick_image", text="", icon="VIEWZOOM")
+        pick_image.node_name = self.name
+        pick_image.image_prop = "gk_image"
         row = layout.row(align=True)
         row.prop(self, "gk_speed", text="字/秒")
         row.prop(self, "gk_type_sound", text="", icon="SOUND")
@@ -1909,8 +1947,13 @@ class GKNodeDialogHistory(B.GKStatementNode):
               "那一句(说话人 + 正文)会**自动**进历史(最多留 200 句,"
               "超了丢最老的 —— 免得长流程把内存吃光)。\n"
               "── 怎么关 ──\n"
-              "点一下鼠标 / 按任意键关掉,沿『完成』继续后面的逻辑"
+              "点面板**外面** / 按任意键关掉,沿『完成』继续后面的逻辑"
               "(和对话框一样,执行流会停在这儿等玩家看完)。\n"
+              "── 导出 / 跳回那一句(第八十一轮)──\n"
+              "『导出路径』填了 = 面板右上多一个『导出』按钮,点了把整段历史"
+              "写成文本(建议 `user://` 开头 —— 打包后 `res://` 是只读的);\n"
+              "『点句重放』勾上 = 列表里每一句**都能点**,点哪句那一句就像"
+              "字幕后一样**再飘一遍**(相当于跳回去重看那一句)。\n"
               "── 典型接法 ──\n"
               "按某个键打开(比如 I / Tab),或者放在暂停菜单里。")
     gk_inputs = (S.pin(FLOW, "执行"),)
@@ -1922,6 +1965,10 @@ class GKNodeDialogHistory(B.GKStatementNode):
          None, {"min": 8, "max": 48}),
         ("gk_width", "float", 720.0, "宽", "面板宽(像素)"),
         ("gk_height", "float", 380.0, "高", "面板高(像素)"),
+        ("gk_export_path", "string", "", "导出路径",
+         "填了就有『导出』按钮:整段历史写成文本(建议 user:// 开头)"),
+        ("gk_replay", "bool", False, "点句重放",
+         "每句可点、点了那一句像字幕一样再飘一遍"),
     )
     gk_outputs = (S.pin(FLOW, "完成"),)
 
@@ -1932,6 +1979,9 @@ class GKNodeDialogHistory(B.GKStatementNode):
         row.prop(self, "gk_width", text="宽")
         row.prop(self, "gk_height", text="高")
         row.prop(self, "gk_font", text="号")
+        row = layout.row(align=True)
+        row.prop(self, "gk_export_path", text="", icon="FILE_TICK")
+        row.prop(self, "gk_replay", text="点句重放", toggle=True)
 
 
 # ==========================================================================
@@ -2162,6 +2212,8 @@ class GKNodeUiInput(B.GKStatementNode):
         ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
         ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
         ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+        ("gk_ime", "bool", False, "输入法 / 软键盘",
+         "让它吃中文输入法(手机上弹软键盘、桌面上输入法候选框跟着光标走)"),
     )
     # 出口叫『提交』(不叫『完成』):emit_statement 会自动续接『完成』,
     # 那样输入框刚建出来后面的逻辑就跑了。真正的续接在 text_submitted 回调里。
@@ -2177,8 +2229,122 @@ class GKNodeUiInput(B.GKStatementNode):
         row.prop(self, "gk_height", text="高")
         row.prop(self, "gk_password", text="密码", toggle=True)
         row.prop(self, "gk_focus", text="聚焦", toggle=True)
+        row.prop(self, "gk_ime", text="输入法", toggle=True)
         row.prop(self, "gk_parent_widget", text="", icon="NODE")
         B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiTextEdit(B.GKStatementNode):
+    bl_idname = "GKNodeUiTextEdit"
+    bl_label = "界面_多行输入框"
+    bl_icon = "GREASEPENCIL"
+    gk_category = "界面"
+    gk_doc = ("一个**多行**输入框(TextEdit):聊天框 / 留言板 / 备注。\n"
+              "── 怎么提交 ──\n"
+              "**Ctrl + 回车**算『提交』(沿『提交』出口继续)——"
+              "回车本身留给正常换行,聊天框就该这样。\n"
+              "── 和『界面_输入框』的区别 ──\n"
+              "单行框(LineEdit)回车提交,适合昵称 / 存档名;"
+              "多行的字多了会自己换行,框里能放好几段。\n"
+              "框里的字随时可以用『界面_取文字』读。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "默认文字", ""),
+    )
+    gk_input_props = {"默认文字": "gk_text"}
+    gk_prop_defs = (
+        ("gk_text", "string", "", "默认文字", "一建出来框里的字"),
+        ("gk_placeholder", "string", "说点什么…", "占位提示",
+         "空着的时候显示的灰字"),
+        ("gk_wrap", "bool", True, "自动换行", "长句子自己折行(取消 = 横向滚动)"),
+        ("gk_readonly", "bool", False, "只读",
+         "勾上 = 只能看不能改(做聊天记录窗用)"),
+        ("gk_focus", "bool", False, "自动聚焦", "建出来就选中(键盘直接能打字)"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 360.0, "宽", "像素"),
+        ("gk_height", "float", 120.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+    # 出口叫『提交』(不叫『完成』):和『界面_按钮』同一个道理 ——
+    # 『完成』会被自动续接(接上就立刻跑后面的逻辑),而这里的语义是
+    # "Ctrl+回车才算发出去了"。真正的续接在 gui_input 回调里。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "提交"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_placeholder", text="")
+        layout.prop(self, "gk_text", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_wrap", text="换行", toggle=True)
+        row.prop(self, "gk_readonly", text="只读", toggle=True)
+        row.prop(self, "gk_focus", text="聚焦", toggle=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiSkin(B.GKStatementNode):
+    bl_idname = "GKNodeUiSkin"
+    bl_label = "界面_皮肤"
+    bl_icon = "COLOR"
+    gk_category = "界面"
+    gk_doc = ("给整个界面换一套**皮肤**:主题色 + 字号 + 圆角,一次管全部控件。\n"
+              "── 它管什么(第八十一轮)──\n"
+              "  * **按钮三态**(普通 / 悬停 / 按下)+ **焦点高亮** ——"
+              "列表里用方向键选到哪一行、哪一行就亮(键鼠 / 手柄都能看见);\n"
+              "  * **滚动条**(轨道 + 滑块,竖横两条都换)——"
+              "`界面_列表` 超出一页时出的那条;\n"
+              "  * 面板 / 输入框 / 进度条的底色与圆角;文字色给 Label / 按钮 /\n"
+              "    输入框一起用。\n"
+              "── 怎么用 ──\n"
+              "在玩法图**最前面**摆一个(通常接在『每当_开始』第一条链上),"
+              "填好颜色就行;后面建的控件(含『界面_套用设计』展开出来的)"
+              "**自动**继承 —— 不用一个个改。\n"
+              "⚠ 卡片上自己设过颜色的控件(比如『界面_文本』的颜色)"
+              "以卡片为准 —— 皮肤兜底、卡片覆盖。\n"
+              "⚠ 对话框 / 历史 / 选择面板自带底色,不在皮肤范围内。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_font_size", "int", 20, "默认字号", "没单独设字号的控件用它",
+         None, {"min": 8, "max": 72}),
+        ("gk_font_color", "color", (0.95, 0.97, 1.0, 1.0), "文字色",
+         "Label / 按钮 / 输入框的默认文字色"),
+        ("gk_panel_color", "color", (0.06, 0.07, 0.10, 0.92), "面板色",
+         "面板 / 输入框的底色"),
+        ("gk_button_color", "color", (0.16, 0.20, 0.30, 0.95), "按钮色",
+         "按钮平时的底色"),
+        ("gk_button_hover", "color", (0.22, 0.28, 0.42, 1.0), "按钮悬停色",
+         "鼠标移上去的颜色"),
+        ("gk_button_press", "color", (0.10, 0.13, 0.20, 1.0), "按钮按下色",
+         "按下去的瞬间"),
+        ("gk_focus_color", "color", (1.0, 0.86, 0.45, 0.85), "焦点高亮色",
+         "方向键 / 手柄选中时的底色(列表项选中高亮)"),
+        ("gk_scroll_color", "color", (1.0, 1.0, 1.0, 0.30), "滚动条色",
+         "滚动条滑块的颜色(轨道自动按它淡化)"),
+        ("gk_radius", "int", 8, "圆角", "按钮 / 面板 / 输入框的圆角像素",
+         None, {"min": 0, "max": 32}),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_font_size", text="号")
+        row.prop(self, "gk_radius", text="圆角")
+        row = layout.row(align=True)
+        row.prop(self, "gk_font_color", text="")
+        row.prop(self, "gk_panel_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_button_color", text="")
+        row.prop(self, "gk_button_hover", text="")
+        row.prop(self, "gk_button_press", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_focus_color", text="")
+        row.prop(self, "gk_scroll_color", text="")
 
 
 @N
@@ -2338,6 +2504,7 @@ class GKNodeUiOnClick(B.GKStatementNode):
 UI_DESIGN_BUILDER_NODES = (
     "GKNodeUiText", "GKNodeUiBar", "GKNodeUiButton", "GKNodeUiImage",
     "GKNodeUiPanel", "GKNodeUiList", "GKNodeUiNinePatch", "GKNodeUiInput",
+    "GKNodeUiTextEdit",
 )
 
 for _cls in CLASSES:

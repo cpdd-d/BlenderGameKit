@@ -14218,8 +14218,9 @@ class TestRound64Narrative(Base):
         code, _ = gen(tree, V3)
         # 复用对话框那块面板(同一套观感)
         self.assertIn("func _gk_subtitle_show(", code)
-        self.assertIn("_gk_dialog_show(host, speaker, body, speed, \"\", width, "
-                      "height, margin)", code)
+        # 第八十一轮起立绘走 `portrait` 形参(默认空 = 老行为一字不变)
+        self.assertIn("_gk_dialog_show(host, speaker, body, speed, portrait, "
+                      "width, height, margin)", code)
         # 代数守卫:老定时器不许把新的一句关掉
         self.assertIn("_gk_sub_token += 1", code)
         self.assertIn("if token != _gk_sub_token:", code)
@@ -16648,6 +16649,367 @@ class TestRound80FleeNavAndHearing(Base):
             types.SimpleNamespace(surface_loudness=1.5)), 1.5)
         self.assertAlmostEqual(ae.surface_loudness_of(
             types.SimpleNamespace(surface_loudness=0.0)), 0.0)
+
+
+class TestRound81UiPolish(Base):
+    """第八十一轮(F 组 15 + 16):界面收尾 —— 皮肤 / 滚动条 / 选中高亮 /
+    软键盘·IME / 多行输入框 / 点击音效 / 字幕立绘 / 历史导出·跳回 /
+    音效循环。
+
+    老图契约:**每一个子项都是"填了才有"**。没填的卡片生成物互相不变 ——
+    唯一的两处必然变化(helper 签名加默认形参、历史点按处理里多一句
+    运行期开关判断)在这一轮的说明里写清楚了。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _chain(self, tree, *nodes):
+        """串一条执行链:准备 -> n1 -> n2 -> …(每个节点用『完成』接下一个)。"""
+        event = self._ready(tree)
+        previous = None
+        for node in nodes:
+            gk_stub.connect(tree, event if previous is None else previous,
+                            "执行" if previous is None else "完成",
+                            node, "执行")
+            previous = node
+        return event
+
+    # ---- 卡片 / 属性登记 ----
+
+    def test_new_nodes_and_props_registered(self):
+        skin = getattr(NN, "GKNodeUiSkin", None)
+        self.assertIsNotNone(skin, "界面_皮肤 没注册")
+        self.assertEqual(skin.bl_label, "界面_皮肤")
+        skin_props = {entry[0] for entry in skin.gk_prop_defs}
+        for key in ("gk_font_size", "gk_font_color", "gk_panel_color",
+                    "gk_button_color", "gk_button_hover", "gk_button_press",
+                    "gk_focus_color", "gk_scroll_color", "gk_radius"):
+            self.assertIn(key, skin_props, f"皮肤缺属性 {key}")
+
+        edit = getattr(NN, "GKNodeUiTextEdit", None)
+        self.assertIsNotNone(edit, "界面_多行输入框 没注册")
+        self.assertEqual(edit.bl_label, "界面_多行输入框")
+        edit_props = {entry[0] for entry in edit.gk_prop_defs}
+        for key in ("gk_text", "gk_placeholder", "gk_wrap", "gk_readonly",
+                    "gk_width", "gk_height"):
+            self.assertIn(key, edit_props, f"多行输入框缺属性 {key}")
+        outs = [pin["name"] for pin in edit.gk_outputs]
+        self.assertIn("提交", outs)
+
+        # 老卡片上的新栏位
+        input_props = {entry[0] for entry in NN.GKNodeUiInput.gk_prop_defs}
+        self.assertIn("gk_ime", input_props)
+        button_props = {entry[0] for entry in NN.GKNodeUiButton.gk_prop_defs}
+        self.assertIn("gk_click_sound", button_props)
+        self.assertIn("gk_click_volume", button_props)
+        sub_props = {entry[0] for entry in NN.GKNodeUiSubtitle.gk_prop_defs}
+        self.assertIn("gk_image", sub_props)
+        hist_props = {entry[0] for entry in NN.GKNodeDialogHistory.gk_prop_defs}
+        self.assertIn("gk_export_path", hist_props)
+        self.assertIn("gk_replay", hist_props)
+        sound_props = {entry[0] for entry in NN.GKNodePlaySound.gk_prop_defs}
+        self.assertIn("gk_loop", sound_props)
+        self.assertIn("gk_name", sound_props)
+        stop_props = {entry[0] for entry in NN.GKNodeStopSound.gk_prop_defs}
+        self.assertIn("gk_name", stop_props)
+
+    # ---- 15① 滚动条美化 + 15② 选中高亮 + 15⑥ 界面皮肤(一个节点全给)----
+
+    def test_skin_builds_and_applies_a_theme(self):
+        tree = make_tree()
+        skin = tree.new_node(NN.GKNodeUiSkin, "皮肤", gk_font_size=22)
+        self._chain(tree, skin)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 一套主题 + 默认字号
+        self.assertRegex(code, r"_gk_ui_theme\d+ := Theme\.new\(\)")
+        self.assertRegex(code, r"_gk_ui_theme\d+\.default_font_size = 22")
+        # 15② 选中高亮 = Button 的 focus 样式(键盘 / 手柄焦点看得见)
+        self.assertRegex(code, r'set_stylebox\("focus", "Button", ')
+        self.assertRegex(code, r'set_stylebox\("normal", "Button", ')
+        self.assertRegex(code, r'set_stylebox\("hover", "Button", ')
+        self.assertRegex(code, r'set_stylebox\("pressed", "Button", ')
+        # 15① 滚动条:V / H 两条都换轨道 + 滑块
+        self.assertIn('["VScrollBar", "HScrollBar"]', code)
+        self.assertRegex(code, r'set_stylebox\("scroll", ')
+        self.assertRegex(code, r'set_stylebox\("grabber", ')
+        self.assertRegex(code, r'set_stylebox\("grabber_highlight", ')
+        # 面板 / 输入框 / 进度条也一起收进来
+        self.assertRegex(code, r'set_stylebox\("panel", "Panel", ')
+        self.assertRegex(code, r'set_stylebox\("normal", "LineEdit", ')
+        self.assertRegex(code, r'set_stylebox\("normal", "TextEdit", ')
+        self.assertRegex(code, r'set_stylebox\("fill", "ProgressBar", ')
+        # 文字色给常用类型
+        self.assertRegex(code, r'set_color\("font_color", _gk_ui_t\d+')
+        # 建根 + 挂到根上(控件后建的也继承)
+        self.assertIn("_gk_ensure_ui(self)", code)
+        self.assertIn("_gk_ui_root.theme = ", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_without_skin_nothing_changes(self):
+        """没放皮肤 -> 一个主题字眼都不许有(老图不变)。"""
+        tree = make_tree()
+        button = tree.new_node(NN.GKNodeUiButton, "开始", gk_text="开始")
+        self._chain(tree, button)
+        code, _ = gen(tree, V3)
+        self.assertNotIn("Theme.new()", code)
+        self.assertNotIn("_gk_ui_root.theme", code)
+
+    # ---- 15③ 输入框软键盘 / IME ----
+
+    def test_input_ime_opt_in(self):
+        tree = make_tree()
+        field = tree.new_node(NN.GKNodeUiInput, "昵称", gk_ime=True)
+        self._chain(tree, field)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("virtual_keyboard_enabled = true", code)
+        self.assertIn("DisplayServer.window_set_ime_active(true)", code)
+        self.assertIn("DisplayServer.window_set_ime_active(false)", code)
+        self.assertIn("DisplayServer.window_set_ime_position(", code)
+        self.assertIn("focus_entered.connect(", code)
+        self.assertIn("text_changed.connect(", code)
+        self.assertIn("func _gk_ime_update(edit: Control) -> void:", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_input_ime_off_by_default(self):
+        tree = make_tree()
+        field = tree.new_node(NN.GKNodeUiInput, "昵称")
+        self._chain(tree, field)
+        code, _ = gen(tree, V3)
+        self.assertNotIn("window_set_ime_active", code)
+        self.assertNotIn("virtual_keyboard_enabled", code)
+        self.assertNotIn("_gk_ime_update", code)
+
+    # ---- 15④ 多行输入框 ----
+
+    def test_multiline_input_submits_on_ctrl_enter(self):
+        tree = make_tree()
+        field = tree.new_node(NN.GKNodeUiTextEdit, "聊天框", gk_text="默认",
+                              gk_placeholder="说点什么…", gk_width=360.0,
+                              gk_height=120.0)
+        later = tree.new_node(NN.GKNodePrint, "发出去了", gk_text="发送")
+        gk_stub.connect(tree, field, "提交", later, "执行")
+        self._chain(tree, field)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("TextEdit.new()", code)
+        self.assertIn("TextEdit.LINE_WRAPPING_BOUNDARY", code)
+        self.assertIn("gui_input.connect(", code)
+        self.assertIn("event.keycode != KEY_ENTER", code)
+        self.assertIn("event.keycode != KEY_KP_ENTER", code)
+        self.assertIn("if not event.ctrl_pressed:", code)
+        # 链死在提交回调里(不是建出来就跑)
+        funcs = self.functions(code)
+        handler = [name for name in funcs if "submit" in name]
+        self.assertTrue(handler, list(funcs))
+        self.assertIn('print("发送")', funcs[handler[0]])
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_multiline_input_wrap_and_readonly(self):
+        tree = make_tree()
+        field = tree.new_node(NN.GKNodeUiTextEdit, "输出窗", gk_wrap=False,
+                              gk_readonly=True)
+        self._chain(tree, field)
+        code, _ = gen(tree, V3)
+        self.assertNotIn("LINE_WRAPPING_BOUNDARY", code)
+        self.assertIn("editable = false", code)
+
+    # ---- 15⑤ 界面音效(点按钮出声)----
+
+    def test_button_click_sound_opt_in(self):
+        tree = make_tree()
+        button = tree.new_node(NN.GKNodeUiButton, "开始", gk_text="开始",
+                               gk_click_sound="res://art/click.wav",
+                               gk_click_volume=-8.0)
+        self._chain(tree, button)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('load("res://art/click.wav")', code)
+        self.assertIn("AudioStreamPlayer.new()", code)
+        self.assertIn("volume_db = -8.0", code)
+        self.assertRegex(code, r"\.pressed\.connect\(_gk_ui_cb\d+\)")
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_button_without_click_sound_is_old(self):
+        tree = make_tree()
+        button = tree.new_node(NN.GKNodeUiButton, "开始", gk_text="开始")
+        self._chain(tree, button)
+        code, _ = gen(tree, V3)
+        self.assertNotIn("AudioStreamPlayer", code)
+
+    # ---- 16① 字幕说话人立绘 ----
+
+    def test_subtitle_portrait_opt_in(self):
+        tree = make_tree()
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="早上好",
+                            gk_image="res://art/立绘.png")
+        self._chain(tree, sub)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 第 10 个实参就是立绘路径
+        self.assertIn('48.0, "res://art/立绘.png")', code)
+        # helper 加了带默认值的形参(老调用点 9 个实参照样合法)
+        self.assertIn('margin: float, portrait: String = "") -> void:', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_subtitle_without_portrait_call_unchanged(self):
+        tree = make_tree()
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="早上好")
+        self._chain(tree, sub)
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_subtitle_show(self, "", str("早上好"), 30.0, 3.0, '
+                      '0.3, 720.0, 110.0, 48.0)', code)
+
+    # ---- 16② 对话历史:导出 / 点句重放 ----
+
+    def test_history_export_and_replay_opt_in(self):
+        tree = make_tree()
+        hist = tree.new_node(NN.GKNodeDialogHistory, "回顾",
+                             gk_export_path="user://对话历史.txt",
+                             gk_replay=True)
+        self._chain(tree, hist)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 调用点把两个开关传进去
+        self.assertIn('"还没有说过话", "user://对话历史.txt", true)', code)
+        # 导出:按钮 + 写文件
+        self.assertIn("func _gk_history_export(path: String) -> void:", code)
+        self.assertIn("FileAccess.open(path, FileAccess.WRITE)", code)
+        self.assertIn("file.store_line(", code)
+        # 点句重放:行变成按钮,点了那一句像字幕一样再飘一遍
+        self.assertIn("func _gk_history_replay(host: Node, who: String, "
+                      "text: String) -> void:", code)
+        self.assertIn("_gk_subtitle_show(host, who, text,", code)
+        funcs = self.functions(code)
+        rows = funcs.get("_gk_history_show", "")
+        self.assertIn("Button.new()", rows)
+        self.assertIn("_gk_history_replay(host,", rows)
+        # 运行期开关 + 点面板里不关、点面板外才关
+        self.assertIn("var _gk_history_replay_on: bool = false", code)
+        self.assertIn("_gk_history_replay_on = true", code)
+        self.assertIn("get_global_rect().has_point(event.position)", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_history_defaults_are_old(self):
+        tree = make_tree()
+        hist = tree.new_node(NN.GKNodeDialogHistory, "回顾")
+        self._chain(tree, hist)
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_history_show(self, "对话回顾", 720.0, 380.0, 18, '
+                      '"还没有说过话")', code)
+        self.assertIn("_gk_history_replay_on = false", code)
+        self.assertNotIn("FileAccess.open(", code)
+        self.assertNotIn("func _gk_history_replay(", code)
+        self.assertNotIn("func _gk_history_export(", code)
+
+    # ---- 16③ 音效循环 ----
+
+    def test_loop_sound_registers_and_does_not_self_free(self):
+        tree = make_tree()
+        sound = tree.new_node(NN.GKNodePlaySound, "引擎声",
+                              gk_path="res://art/engine.wav", gk_loop=True,
+                              gk_name="引擎")
+        self._chain(tree, sound)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var _gk_loops: Dictionary = {}", code)
+        # 名字进了字典(键先存进一个变量,再 has / 取 / 覆盖)
+        self.assertRegex(code, r'var _sfx_key\d+ := "引擎"')
+        self.assertRegex(code, r"_gk_loops\[_sfx_key\d+\]")
+        self.assertRegex(code, r"_gk_loops\.has\(_sfx_key\d+\)")
+        # 三种流格式都要设循环(和 BGM 同一套)
+        self.assertIn("AudioStreamOggVorbis", code)
+        self.assertIn("AudioStreamMP3", code)
+        self.assertIn("AudioStreamWAV", code)
+        # wav 只设 loop_mode 的话循环长度是 0,流当场结束(真机抓到的)
+        self.assertIn("loop_end = int(", code)
+        # 循环音**不许**自己删(那个 finished 永远不会来)
+        self.assertNotIn("finished.connect(", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_loop_sound_without_name_uses_node_name(self):
+        tree = make_tree()
+        sound = tree.new_node(NN.GKNodePlaySound, "风声",
+                              gk_path="res://art/wind.wav", gk_loop=True)
+        self._chain(tree, sound)
+        code, _ = gen(tree, V3)
+        self.assertRegex(code, r'var _sfx_key\d+ := "风声"')
+
+    def test_named_stop_stops_loop_sound_only(self):
+        tree = make_tree()
+        stop = tree.new_node(NN.GKNodeStopSound, "停引擎", gk_name="引擎")
+        self._chain(tree, stop)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(code, r'var _stop_key\d+ := "引擎"')
+        self.assertRegex(code, r"_gk_loops\.has\(_stop_key\d+\)")
+        self.assertIn("erase(", code)
+        # 带名字 = 只停循环音,不许碰 BGM
+        self.assertNotIn("_gk_music", code)
+
+    def test_plain_stop_is_still_music(self):
+        tree = make_tree()
+        stop = tree.new_node(NN.GKNodeStopSound, "停BGM")
+        self._chain(tree, stop)
+        code, _ = gen(tree, V3)
+        self.assertIn("_gk_music", code)
+        self.assertNotIn("_gk_loops", code)
+
+    def test_plain_sound_self_frees_as_before(self):
+        tree = make_tree()
+        sound = tree.new_node(NN.GKNodePlaySound, "跳跃",
+                              gk_path="res://art/jump.wav")
+        self._chain(tree, sound)
+        code, _ = gen(tree, V3)
+        self.assertIn("finished.connect(", code)
+        self.assertNotIn("_gk_loops", code)
+
+    # ---- 一张全开的图:格式体检 ----
+
+    def test_all_round81_features_together(self):
+        tree = make_tree()
+        skin = tree.new_node(NN.GKNodeUiSkin, "皮肤")
+        button = tree.new_node(NN.GKNodeUiButton, "开始", gk_text="开始",
+                               gk_click_sound="res://art/click.wav")
+        field = tree.new_node(NN.GKNodeUiInput, "昵称", gk_ime=True)
+        chat = tree.new_node(NN.GKNodeUiTextEdit, "聊天框")
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="旁白",
+                            gk_image="res://art/立绘.png")
+        hist = tree.new_node(NN.GKNodeDialogHistory, "回顾",
+                             gk_export_path="user://h.txt", gk_replay=True)
+        sound = tree.new_node(NN.GKNodePlaySound, "引擎", gk_loop=True,
+                              gk_name="引擎")
+        stop = tree.new_node(NN.GKNodeStopSound, "停引擎", gk_name="引擎")
+        self._chain(tree, skin, button, field, chat, sub, hist, sound, stop)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_old_graph_still_clean(self):
+        """一张只用老功能的界面图:新功能一个字眼都不该出现。"""
+        tree = make_tree()
+        button = tree.new_node(NN.GKNodeUiButton, "开始", gk_text="开始")
+        field = tree.new_node(NN.GKNodeUiInput, "昵称")
+        sub = tree.new_node(NN.GKNodeUiSubtitle, "旁白", gk_text="……")
+        hist = tree.new_node(NN.GKNodeDialogHistory, "回顾")
+        sound = tree.new_node(NN.GKNodePlaySound, "跳",
+                              gk_path="res://art/jump.wav")
+        self._chain(tree, button, field, sub, hist, sound)
+        code, _ = gen(tree, V3)
+        for needle in ("Theme.new()", "window_set_ime_active",
+                       "_gk_loops", "FileAccess.open(", "TextEdit.new()",
+                       "func _gk_history_replay(", "func _gk_ime_update("):
+            self.assertNotIn(needle, code, needle)
 
 
 if __name__ == "__main__":

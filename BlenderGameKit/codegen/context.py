@@ -210,6 +210,13 @@ class GenContext:
         self.need_subtitle_helpers = False
         # 对话历史回顾(第六十四轮):生成 `_gk_history_show/_hide()`
         self.need_history_helpers = False
+        # 对话历史的导出 / 点句重放(第八十一轮):
+        # 各自生成 `_gk_history_export()` / `_gk_history_replay()`,
+        # 没填的图一个字都不多
+        self.need_history_export = False
+        self.need_history_replay = False
+        # 输入框的输入法跟随(第八十一轮):生成 `_gk_ime_update()`
+        self.need_ime_helper = False
         # 对话选择(第四十九轮:阶段③『对话_选择』分支):
         # 生成 _gk_choice_* 那组辅助函数(和对话框共用 UI 容器,不冲突)
         self.need_choice_helpers = False

@@ -995,6 +995,28 @@ class Generator:
                 "empty_body": "    pass",
                 "separator": True,
             })
+            if self.ctx.need_ime_helper:
+                sections.append({
+                    # 输入法候选框跟着光标走(第八十一轮):只有『输入法 /
+                    # 软键盘』勾了的输入框才生成 —— 没勾的图一个字都不多
+                    "signature": "func _gk_ime_update(edit: Control) -> void:",
+                    "lines": [
+                        "    if edit == null or not (edit is LineEdit):",
+                        "        return",
+                        "    var field := edit as LineEdit",
+                        "    var font := field.get_theme_font(\"font\")",
+                        "    var size := field.get_theme_font_size(\"font_size\")",
+                        "    var caret := 0",
+                        "    if font != null:",
+                        "        caret = int(font.get_string_size(",
+                        "            field.text.substr(0, field.caret_column),",
+                        "            HORIZONTAL_ALIGNMENT_LEFT, -1, size).x)",
+                        "    var spot := field.global_position + Vector2(float(caret), field.size.y)",
+                        "    DisplayServer.window_set_ime_position(Vector2i(int(spot.x), int(spot.y)))",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
             if self.ctx.need_list_helper:
                 sections.append({
                     # 列表是两层(滚动容器 + 里面排版的 VBox/HBox);
@@ -1299,13 +1321,15 @@ class Generator:
         # 新字幕/新对话框一来就 +1,老定时器看到代数变了就**不再关面板**
         # (不然老字幕的定时器会把后面新弹的对话框关掉)。
         if self.ctx.need_subtitle_helpers:
+            # 说话人立绘(第八十一轮):`portrait` 是**带默认值的形参** ——
+            # 老调用点(9 个实参)照样合法,填了立绘的调用点才多传一个
             sections.append({
                 "signature": ("func _gk_subtitle_show(host: Node, speaker: String, "
                               "body: String, speed: float, seconds: float, "
                               "fade: float, width: float, height: float, "
-                              "margin: float) -> void:"),
+                              "margin: float, portrait: String = \"\") -> void:"),
                 "lines": [
-                    "    _gk_dialog_show(host, speaker, body, speed, \"\", width, height, margin)",
+                    "    _gk_dialog_show(host, speaker, body, speed, portrait, width, height, margin)",
                     "    _gk_sub_token += 1",
                     "    var token := _gk_sub_token",
                     "    var timer := host.get_tree().create_timer(maxf(seconds, 0.05))",
@@ -1328,10 +1352,13 @@ class Generator:
         # 这里只负责"把记下来的列出来给人看"。滚动容器设成 STOP:
         # 鼠标滚轮滚得动(点一下仍然关 —— 那是 `_input` 管的,不受它影响)。
         if self.ctx.need_history_helpers:
+            # 导出路径 / 点句重放(第八十一轮):两个都是**带默认值的形参** ——
+            # 老调用点(6 个实参)一字不动,填了开关的调用点才多传尾巴
             sections.append({
                 "signature": ("func _gk_history_show(host: Node, title: String, "
                               "width: float, height: float, font_size: int, "
-                              "empty_hint: String) -> void:"),
+                              "empty_hint: String, export_path: String = \"\", "
+                              "replay: bool = false) -> void:"),
                 "lines": [
                     "    _gk_ensure_ui(host)",
                     "    if _gk_history_panel == null:",
@@ -1371,6 +1398,23 @@ class Generator:
                     "    _gk_history_title.text = title",
                     "    _gk_history_title.add_theme_font_size_override(\"font_size\", font_size + 4)",
                     "    _gk_history_title.position = Vector2(18.0, 12.0)",
+                    # ── 导出按钮(第八十一轮)───────────────────────────
+                    # 只建一次(成员变量记着),翻几次历史都不会越堆越多;
+                    # 这次没填导出路径就把它藏起来(同一张图里两张历史卡
+                    # 一个填一个没填时,行为跟最后走过的那张卡)
+                    "    if export_path != \"\":",
+                    "        if _gk_history_export_btn == null:",
+                    "            _gk_history_export_btn = Button.new()",
+                    "            _gk_history_export_btn.name = \"导出\"",
+                    "            _gk_history_export_btn.text = \"导出\"",
+                    "            _gk_history_export_btn.pressed.connect(",
+                    "                func() -> void: _gk_history_export(export_path))",
+                    "            _gk_history_panel.add_child(_gk_history_export_btn)",
+                    "        _gk_history_export_btn.size = Vector2(84.0, 30.0)",
+                    "        _gk_history_export_btn.position = Vector2(width - 102.0, 10.0)",
+                    "        _gk_history_export_btn.visible = true",
+                    "    elif _gk_history_export_btn != null:",
+                    "        _gk_history_export_btn.visible = false",
                     "    var top := 12.0 + float(font_size) + 22.0",
                     "    _gk_history_scroll.position = Vector2(18.0, top)",
                     "    _gk_history_scroll.size = Vector2(width - 36.0, height - top - 16.0)",
@@ -1388,12 +1432,30 @@ class Generator:
                     "    else:",
                     "        for entry in _gk_dialog_history:",
                     "            var who := str(entry.get(\"who\", \"\"))",
-                    "            var line := Label.new()",
-                    "            line.text = str(entry.get(\"text\", \"\")) if who == \"\" else who + \"：\" + str(entry.get(\"text\", \"\"))",
-                    "            line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART",
-                    "            line.custom_minimum_size = Vector2(width - 56.0, 0.0)",
-                    "            line.add_theme_font_size_override(\"font_size\", font_size)",
-                    "            _gk_history_list.add_child(line)",
+                    "            var body := str(entry.get(\"text\", \"\"))",
+                    "            var row_text := body if who == \"\" else who + \"：\" + body",
+                    # ── 点句重放(第八十一轮)───────────────────────────
+                    # 开了重放:每行是个**按钮**,点它 -> 面板收起 + 那一句
+                    # 像字幕一样再飘一遍(相当于跳回去重看那一句)。
+                    # 没开:还是 Label(老行为,一个像素都不变)
+                    "            if replay:",
+                    "                var row := Button.new()",
+                    "                row.flat = true",
+                    "                row.alignment = HORIZONTAL_ALIGNMENT_LEFT",
+                    "                row.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART",
+                    "                row.custom_minimum_size = Vector2(width - 56.0, 0.0)",
+                    "                row.add_theme_font_size_override(\"font_size\", font_size)",
+                    "                row.text = row_text",
+                    "                row.pressed.connect(",
+                    "                    func() -> void: _gk_history_replay(host, who, body))",
+                    "                _gk_history_list.add_child(row)",
+                    "            else:",
+                    "                var line := Label.new()",
+                    "                line.text = row_text",
+                    "                line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART",
+                    "                line.custom_minimum_size = Vector2(width - 56.0, 0.0)",
+                    "                line.add_theme_font_size_override(\"font_size\", font_size)",
+                    "                _gk_history_list.add_child(line)",
                     "    _gk_history_panel.visible = true",
                     "    _gk_history_clicked = false",
                 ],
@@ -1404,6 +1466,43 @@ class Generator:
                 "lines": [
                     "    if _gk_history_panel != null:",
                     "        _gk_history_panel.visible = false",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 对话历史:导出 / 点句重放(第八十一轮)----------------------
+        # 两个都是**填了才有**的死代码不给老图添:导出 = 把整段历史写成
+        # 文本(user:// 建议);重放 = 那一句像字幕一样再飘一遍(speed 0 =
+        # 直接全显示,3 秒后淡出 —— 和字幕同一套 helper,观感一致)。
+        if self.ctx.need_history_export:
+            sections.append({
+                "signature": "func _gk_history_export(path: String) -> void:",
+                "lines": [
+                    "    if path == \"\":",
+                    "        return",
+                    "    var file := FileAccess.open(path, FileAccess.WRITE)",
+                    "    if file == null:",
+                    "        push_warning(\"对话历史导出失败(打不开文件): \" + path)",
+                    "        return",
+                    "    for entry in _gk_dialog_history:",
+                    "        var who := str(entry.get(\"who\", \"\"))",
+                    "        var text := str(entry.get(\"text\", \"\"))",
+                    "        file.store_line(text if who == \"\" else who + \"：\" + text)",
+                    "    file.close()",
+                    "    print(\"[GK] 对话历史已导出: \", path)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+        if self.ctx.need_history_replay:
+            sections.append({
+                "signature": ("func _gk_history_replay(host: Node, who: String, "
+                              "text: String) -> void:"),
+                "lines": [
+                    "    _gk_history_hide()",
+                    "    _gk_subtitle_show(host, who, text, 0.0, 3.0, 0.3, "
+                    "720.0, 110.0, 48.0)",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
