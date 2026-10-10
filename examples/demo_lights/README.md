@@ -110,7 +110,11 @@ python scripts\check_lights_demo.py --godot "D:\godot\Godot_v4.7.2-stable_win64_
   0.95、内圈立刻变 0.45;按 6 回到 0.15 / 0.75;
 * **背面剔除**(第九十四轮):**地面**(Blender 里勾了『背面剔除』)的材质用
   **剔面版**着色器 `gk_toon_cull.gdshader`,**角色**(没勾)仍是双面板 ——
-  一对照就知道"勾了才换"(探针行 `LIGHTS_CULL`)。
+  一对照就知道"勾了才换"(探针行 `LIGHTS_CULL`);
+* **可见距离 / 阴影开销**(第九十八轮):**地面**的 `visibility_range_end == 60`
+  且 `cast_shadow == 0`(不投阴影)、**月光**是
+  `directional_shadow_max_distance == 50` —— 三样都在环境脚本的三张表里,
+  运行时应用(探针行 `LIGHTS_PERF`)。
 
 全绿会打印 `CHECK_LIGHTS_DEMO=OK`。
 
@@ -148,6 +152,11 @@ blender -b --gpu-backend vulkan --python scripts\make_lights_demo.py
    **『背面剔除』** —— 导出的那个材质会换用**剔面版**着色器(硬件剔背面),
    而 Blender 预览**立刻能看到同样的效果**(两边认同一个勾);
    ⚠ 单面片模型(MMD 头发 / 帽檐 / 裙摆)别勾 —— 剔了会整片消失。
+8. 想**少画一点**(第九十八轮):选中物体 ->『游戏物理』->
+   **『可见距离』**(相机离得超过它就整个不画,碰撞体还在 —— 远处装饰物
+   用它)、**『不投阴影』**(草 / 碎石 / 挂件);选中**太阳 / 月光** ->
+   **『阴影距离』**(阴影只算到这个距离)。三样都由环境脚本在运行时设
+   (网格在 glb 实例内部,写进 .tscn 会被 Godot 丢掉)。
 
 > ⚠ 这两样都是**全屏着色器**(Godot 的 `Environment` 没有内置暗角),
 > 所以改完请跑一次 `python scripts\verify_shaders.py` —— 它在真 Godot 里
