@@ -3010,6 +3010,16 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             col.prop(physics, "light_follow_camera", toggle=True)
             if physics.light_follow_camera:
                 box.label(text="运行时贴着当前相机走(手电筒)", icon="CHECKMARK")
+            # ── 阴影距离(第九十八轮:性能第二件)────────────────────
+            # 平行光的阴影只算到这个距离 —— 填小省阴影开销。只对太阳光
+            # 有效(Godot 的点光 / 聚光没有这个属性),所以在其它灯上不画。
+            if kind == "SUN":
+                shadow_row = box.row(align=True)
+                shadow_row.prop(physics, "light_shadow_distance",
+                                text="阴影距离", slider=True)
+                if float(physics.light_shadow_distance) > 0.0:
+                    box.label(text="这个距离外不投阴影(远处影子本来也看不见)",
+                              icon="CHECKMARK")
             box.label(text="颜色 / 亮度 / 阴影:用 Blender 灯光自己的设置",
                       icon="INFO")
             if float(getattr(obj.data, "energy", 1.0) or 0.0) <= 0.0:
@@ -3100,6 +3110,20 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             if abs(float(physics.nav_travel_cost) - 1.0) > 1e-6:
                 col.label(text="寻路会按这个代价绕开 / 吸引(泥地填 5 试试)",
                           icon="INFO")
+            # ── 可见距离 / 不投阴影(第九十八轮:性能第二件)──────────
+            # 两条都是"少画":可见距离 = 相机离得远就不画这个网格
+            # (Godot 的 visibility_range_end;碰撞体还在,照样撞得到);
+            # 不投阴影 = 小零件(草 / 碎石 / 挂件)不往阴影贴图里画。
+            # ⚠ 都得运行时设(网格在 glb 实例内部,外部覆盖会被丢掉),
+            #   所以导出写进环境脚本 —— 见 asset_export.render_tuning_tables。
+            perf_row = col.row(align=True)
+            perf_row.prop(physics, "render_visibility_distance",
+                          text="可见距离", slider=True)
+            if float(physics.render_visibility_distance) > 0.0:
+                col.label(text="超过这个距离(米)就不画,碰撞体还在",
+                          icon="CHECKMARK")
+            col.prop(physics, "render_no_shadow",
+                     text="不投阴影(小零件省阴影)")
             # ── 寻路层(第八十五轮:寻路第三版③)──────────────────────
             # 这个物体烤进第几层的导航网格 —— 不同层的角色走不同的网格
             # (地面层 1 / 空中层 2),互不干扰。只在勾了『寻路』的场景里

@@ -137,8 +137,18 @@ def build_scene():
 
     # ── 三盏灯(第四十八轮的主角)───────────────────────────────────
     # 月光:太阳光,偏蓝、斜着打(方向靠旋转)
-    make_light(MOON, "SUN", (0.0, 0.0, 6.0), 0.4, (0.6, 0.7, 1.0),
-               rotation=(math.radians(55.0), 0.0, math.radians(35.0)))
+    moon = make_light(MOON, "SUN", (0.0, 0.0, 6.0), 0.4, (0.6, 0.7, 1.0),
+                      rotation=(math.radians(55.0), 0.0, math.radians(35.0)))
+    # 第九十八轮:可见距离 / 阴影开销 的演示(三样都在这一屏)——
+    #   地面:相机离它超过 60 米就不画(碰撞体还在,角色照样站得住);
+    #         它也不投阴影(平的自阴影没意义,省阴影贴图)
+    #   月光:阴影只算到 50 米(远处的影子本来也看不见)
+    # 导出时写进环境脚本、运行时设(网格在 glb 实例内部,写 .tscn 会被丢掉)。
+    if ground.gk_physics is not None:
+        ground.gk_physics.render_visibility_distance = 60.0
+        ground.gk_physics.render_no_shadow = True
+    if moon.gk_physics is not None:
+        moon.gk_physics.light_shadow_distance = 50.0
     # 台灯:点光,暖黄,照到 8 米
     make_light(LAMP, "POINT", (4.0, 2.2, 0.0), 800.0, (1.0, 0.7, 0.4),
                cutoff=8.0)

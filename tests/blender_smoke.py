@@ -5457,6 +5457,62 @@ def main():
         check("第九十六轮(颜色色空间)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第九十八轮:可见距离 / 阴影开销(三张"少画"表)----------------
+    # 真 Blender 才能验:属性挂在真物体上(缺属性 / 类型写错 -> 面板画不出来),
+    # 而且导出读的是真 `gk_physics`。
+    try:
+        r98_scene = bpy.context.scene
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        r98_mesh = bpy.context.active_object
+        r98_mesh.name = "性能探针方块"
+        r98_light_data = bpy.data.lights.new("性能探针太阳数据", type="SUN")
+        r98_light = bpy.data.objects.new("性能探针太阳", r98_light_data)
+        r98_scene.collection.objects.link(r98_light)
+
+        check("第九十八轮:物体有『可见距离』『不投阴影』属性",
+              hasattr(r98_mesh.gk_physics, "render_visibility_distance")
+              and hasattr(r98_mesh.gk_physics, "render_no_shadow"))
+        check("第九十八轮:灯光有『阴影距离』属性",
+              hasattr(r98_light.gk_physics, "light_shadow_distance"))
+        check("第九十八轮:默认都不导出(0 / 不勾)",
+              abs(float(r98_mesh.gk_physics.render_visibility_distance)) < 1e-6
+              and not r98_mesh.gk_physics.render_no_shadow
+              and abs(float(r98_light.gk_physics.light_shadow_distance)) < 1e-6)
+
+        r98_mesh.gk_physics.render_visibility_distance = 60.0
+        r98_mesh.gk_physics.render_no_shadow = True
+        r98_light.gk_physics.light_shadow_distance = 50.0
+        r98_vis, r98_shadow, r98_light_txt = \
+            asset_export.render_tuning_tables(r98_scene)
+        check("第九十八轮:三张表写对了(可见距离 / 不投阴影 / 平行光阴影)",
+              "性能探针方块=60.0" in r98_vis
+              and "性能探针方块" in r98_shadow
+              and "性能探针太阳=50.0" in r98_light_txt,
+              f"{r98_vis} / {r98_shadow} / {r98_light_txt}")
+        r98_code = asset_export.render_env_script(
+            visibility_ranges=r98_vis, no_shadow_nodes=r98_shadow,
+            light_shadows=r98_light_txt)
+        check("第九十八轮:环境脚本带上三张表 + 运行时应用函数",
+              f"var visibility_ranges: String = {r98_vis}" in r98_code
+              and "func _apply_render_tuning() -> void:" in r98_code
+              and "visibility_range_end" in r98_code
+              and "directional_shadow_max_distance" in r98_code)
+
+        r98_mesh.gk_physics.render_visibility_distance = 0.0
+        r98_mesh.gk_physics.render_no_shadow = False
+        r98_light.gk_physics.light_shadow_distance = 0.0
+        check("第九十八轮:全清空 -> 三张表都是空串(老场景行为不变)",
+              asset_export.render_tuning_tables(r98_scene)
+              == ('""', '""', '""'))
+
+        bpy.data.objects.remove(r98_mesh, do_unlink=True)
+        bpy.data.objects.remove(r98_light, do_unlink=True)
+        bpy.data.lights.remove(r98_light_data)
+    except Exception as exc:
+        check("第九十八轮(可见距离 / 阴影开销)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

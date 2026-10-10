@@ -313,6 +313,23 @@ var _gk_esc_held: bool = false
 ## 2D 用 `rect`(XY 平面矩形),3D 用 `box`(世界 AABB)。
 var nav_costs: Array = {nav_costs}
 
+## ── 可见距离 / 阴影开销(第九十八轮:性能第二件)──────────────────────
+## 三张表都是"名字 -> 参数"的**竖线分隔**文本(和 materials 同一个约定:
+## 默认值里放真换行会让整个脚本解析失败)。全空 = 老场景行为一字不变。
+##   visibility_ranges  "树_本体=80|石头=50"  可见距离(米):超过就不画
+##   no_shadow_nodes    "碎石|草"             这些网格不投阴影
+##   light_shadows      "月光=60"             平行光的阴影最大距离(米)
+##
+## ⚠ 为什么运行时装:物体的网格在 **glb 实例内部**,而实例的内部子节点
+## **不能被外部节点覆盖**(见 _apply_materials 上面那段实测)—— 写进
+## .tscn 会被 Godot 丢掉。
+var visibility_ranges: String = {visibility_ranges}
+var no_shadow_nodes: String = {no_shadow_nodes}
+var light_shadows: String = {light_shadows}
+
+## GeometryInstance3D.SHADOW_CASTING_SETTING_OFF(不往阴影贴图里画)
+const _GK_SHADOW_OFF := 0
+
 const _GK_DBG_KEY := {debug_key}            # 弹出 / 收起面板
 const _GK_DBG_COPY_KEY := {debug_copy_key}  # 复制全部内容
 
@@ -357,6 +374,9 @@ func _ready() -> void:
 	# 角色就只剩 glb 自带的默认材质(用户看到的还是"材质没生效")。
 	# 用 call_deferred 推到本帧末,那时整棵树都建好了。
 	_apply_materials.call_deferred()
+	# 可见距离 / 阴影开销(第九十八轮)同理:网格在 glb 实例内部,
+	# 现在搜不到它 —— 一样推到帧末(表空时那个函数直接跳过,没有开销)。
+	_apply_render_tuning.call_deferred()
 	# 碰撞代理配对同理:glb 实例内部的网格节点现在还没进树,搜不到。
 	_gk_link_colliders.call_deferred()
 	# ── 运行时**新加**进场景的网格也要补材质(用户 2026-10-05)────────
@@ -602,6 +622,63 @@ func _apply_flat() -> void:
 		sm.set_shader_parameter("light_dir", Vector3.ZERO)
 		sm.set_shader_parameter("ambient", 1.0)
 		sm.set_shader_parameter("shadow_tint", Color(1, 1, 1, 1))
+
+
+## 可见距离 / 不投阴影 / 平行光阴影距离(第九十八轮)。
+##
+## 三个都只做"少画",不动游戏逻辑:可见距离只影响渲染(碰撞体照旧在),
+## 不投阴影只影响阴影贴图,阴影距离只影响平行光的阴影范围。
+## 表空就直接跳过 —— 老场景一个节点都不遍历(生成物也一字不多)。
+func _apply_render_tuning() -> void:
+	var root := _scene_root()
+	if root == null:
+		return
+	var tuned := 0
+	for line in visibility_ranges.split("|", false):
+		var text := line.strip_edges()
+		if text.is_empty() or not text.contains("="):
+			continue
+		var parts := text.split("=", true, 1)
+		var distance := float(parts[1].strip_edges())
+		if distance <= 0.0:
+			continue
+		for node in _gk_meshes_named(root, parts[0].strip_edges()):
+			node.visibility_range_end = distance
+			tuned += 1
+	for line in no_shadow_nodes.split("|", false):
+		var text := line.strip_edges()
+		if text.is_empty():
+			continue
+		for node in _gk_meshes_named(root, text):
+			node.cast_shadow = _GK_SHADOW_OFF
+			tuned += 1
+	for line in light_shadows.split("|", false):
+		var text := line.strip_edges()
+		if text.is_empty() or not text.contains("="):
+			continue
+		var parts := text.split("=", true, 1)
+		var distance := float(parts[1].strip_edges())
+		for node in root.find_children(parts[0].strip_edges(),
+				"DirectionalLight3D", true, false):
+			(node as DirectionalLight3D).directional_shadow_max_distance = distance
+			tuned += 1
+	if tuned > 0:
+		print("[GK] 渲染优化:设了 ", tuned, " 处(可见距离 / 不投阴影 / 阴影距离)")
+
+
+## 按名字找**所有**同名网格(静态资产在场景里可能摆了好几份)。
+## 先在所有 MeshInstance3D 里按名字找,找不到再退回 find_child ——
+## 和 _apply_material_table 同一套(同名节点里先被找到的往往是碰撞代理,
+## 那不是网格)。
+func _gk_meshes_named(root: Node, node_name: String) -> Array:
+	var out: Array = []
+	for candidate in root.find_children(node_name, "MeshInstance3D", true, false):
+		out.append(candidate as MeshInstance3D)
+	if out.is_empty():
+		var fallback := root.find_child(node_name, true, false)
+		if fallback is MeshInstance3D:
+			out.append(fallback as MeshInstance3D)
+	return out
 
 
 func _collect_materials() -> void:
@@ -1794,6 +1871,9 @@ ENV_SCRIPT_DEFAULTS = dict(
     nav_bake="false",
     # 代价区清单(第八十四轮):空数组 = 没有代价区
     nav_costs="[]",
+    # 可见距离 / 阴影开销(第九十八轮):三张表,空串 = 老场景行为
+    # (值是**带引号的 GDScript 字符串字面量**,见 render_tuning_tables)
+    visibility_ranges='""', no_shadow_nodes='""', light_shadows='""',
     follow_lights="",
     # 开局 BGM(第七十七轮)。这两个键和 `_env_fields` 里那两行**必须一一对应**:
     # 只加 `_env_fields` 忘了加这里 -> 模板渲染 KeyError,而且只在
@@ -2673,6 +2753,10 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
     bgm_path, bgm_volume = _bgm_fields(scene)
     dimension = "3" if is_3d else "2"
     music = _music_fields(scene)
+    # 可见距离 / 不投阴影 / 平行光阴影距离(第九十八轮)—— 都是"少画",
+    # 表空时环境脚本那两个循环直接跳过,生成物与老版本一字不差。
+    visibility_ranges, no_shadow_nodes, light_shadows = \
+        render_tuning_tables(scene)
     return dict(
         camera_name=camera_name,
         fov=_fmt(fov),
@@ -2707,6 +2791,11 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
         # 手电筒(第四十八轮):勾了『跟随相机』的灯名,运行时贴着相机走
         # (见环境脚本里的 _gk_follow_lights_tick)。
         follow_lights=_follow_light_names(_collect_lights(scene)),
+        # 可见距离 / 阴影开销(第九十八轮):物体『可见距离』『不投阴影』
+        # 与平行光『阴影距离』三张表,运行时由 _apply_render_tuning 应用
+        visibility_ranges=visibility_ranges,
+        no_shadow_nodes=no_shadow_nodes,
+        light_shadows=light_shadows,
     )
 
 
@@ -3176,6 +3265,107 @@ def nav_costs_literal(areas, dimension="3"):
                    f"{_gd_float(size[2])}))")
             parts.append(f'{{"name": {name}, "cost": {cost}, "box": {box}}}')
     return "[\n\t" + ",\n\t".join(parts) + ",\n]"
+
+
+# ==========================================================================
+# 可见距离 / 阴影开销(第九十八轮:性能第二件)
+# ==========================================================================
+# "少画"的三条低风险手段(都不动游戏逻辑,只是别把算力花在看不清的东西上):
+#
+#   1) 物体『可见距离』   -> GeometryInstance3D.visibility_range_end
+#                            相机离得超过它就不画这个网格(碰撞体还在)
+#   2) 物体『不投阴影』   -> GeometryInstance3D.cast_shadow = OFF
+#                            小零件(草 / 碎石 / 挂件)不往阴影贴图里画
+#   3) 平行光『阴影距离』 -> DirectionalLight3D.directional_shadow_max_distance
+#                            太阳 / 月光的阴影只算到这个距离
+#
+# ── 为什么全部走**运行时**,不写进 .tscn ────────────────────────────
+# 物体的网格在 **glb 实例内部**,而 glb 实例的内部子节点**不能被外部节点
+# 覆盖**(见 `_apply_materials` 上面那段实测:「Parent path ... has
+# vanished」,覆盖被丢弃)。所以和材质一样:导出时写进环境脚本的三个表,
+# 运行时按名字找节点设置。
+#
+# 三张表都是"节点名 -> 参数"的**竖线分隔**文本(和 materials 同一个约定:
+# 默认值里放真换行会让 GDScript 解析失败)。全空 = 老场景一字不变。
+def visibility_distance_of(physics):
+    """物体『可见距离』;没填 / <= 0 返回 None(不导出)。"""
+    if physics is None:
+        return None
+    raw = getattr(physics, "render_visibility_distance", None)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0.0:
+        return None
+    return value
+
+
+def shadow_off_of(physics):
+    """物体勾了『不投阴影』吗(缺属性按不勾 —— 老文件行为不变)。"""
+    if physics is None:
+        return False
+    return bool(getattr(physics, "render_no_shadow", False))
+
+
+def light_shadow_distance_of(obj):
+    """平行光『阴影距离』;没填 / <= 0 / 不是平行光 -> None(不导出)。
+
+    只认太阳光(导出成 `DirectionalLight3D`)—— 点光 / 聚光在 Godot 里
+    没有对应的"阴影最大距离"属性,填了也不生效,所以这里直接不导出
+    (面板上会提示只对平行光有效)。
+    """
+    if obj is None or getattr(obj, "type", "") != "LIGHT":
+        return None
+    data = getattr(obj, "data", None)
+    if data is None or str(getattr(data, "type", "")) != "SUN":
+        return None
+    raw = getattr(getattr(obj, "gk_physics", None), "light_shadow_distance", None)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0.0:
+        return None
+    return value
+
+
+def render_tuning_tables(scene):
+    """三张"少画"表 -> (可见距离, 不投阴影, 平行光阴影距离) 字面量。
+
+    都返回 GDScript 字符串字面量(空表 = `""`)。纯读 `scene.objects` 上的
+    属性 —— 离线测试喂一个假场景就能验(所以 objects 用 getattr 兜底:
+    测试里的假场景往往没这个属性)。
+    """
+    import json
+
+    vis_parts = []
+    shadow_off = []
+    light_parts = []
+    for obj in (getattr(scene, "objects", None) or ()):
+        kind = str(getattr(obj, "type", "") or "")
+        if kind == "MESH":
+            physics = getattr(obj, "gk_physics", None)
+            distance = visibility_distance_of(physics)
+            if distance is not None:
+                vis_parts.append(f"{str(obj.name)}={_gd_float(distance)}")
+            if shadow_off_of(physics):
+                shadow_off.append(str(obj.name))
+        elif kind == "LIGHT":
+            distance = light_shadow_distance_of(obj)
+            if distance is not None:
+                light_parts.append(f"{str(obj.name)}={_gd_float(distance)}")
+
+    def literal(parts):
+        # json.dumps 的输出正好是合法的 GDScript 字符串字面量(双引号 +
+        # 转义),中文名也照抄 —— 和 nav_costs_literal 同一个做法。
+        return json.dumps("|".join(parts), ensure_ascii=False)
+
+    return literal(vis_parts), literal(shadow_off), literal(light_parts)
 
 
 def write_world_scene(export_dir, scene_name="World", scene=None,

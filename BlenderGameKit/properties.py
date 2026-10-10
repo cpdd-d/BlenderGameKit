@@ -324,6 +324,34 @@ class GKObjectSettings(bpy.types.PropertyGroup):
         soft_min=0.05,
         soft_max=20.0,
     )
+    # ── 可见距离 / 阴影开销(第九十八轮:性能第二件)────────────────────
+    # "离得远就别画":Godot 的 GeometryInstance3D.visibility_range_end ——
+    # 相机离它超过这个距离,整个网格不进渲染。省的是**渲染**,不是物理
+    # (碰撞体还在,角色照样撞得到它)。
+    #
+    # ⚠ 为什么必须运行时设,而不是写进 .tscn(踩过的坑,见 asset_export
+    #   里 `_apply_materials` 上面那段):物体的网格在 **glb 实例内部**,
+    #   而 glb 实例的内部子节点**不能被外部节点覆盖** —— 在 .tscn 里写
+    #   `visibility_range_end = 80` 会被 Godot 丢掉。所以导出时改成
+    #   写进环境脚本,运行时设。
+    # ⚠ 默认 0 = 不导出(o 老场景一字不变)。硬切(到距离直接消失)——
+    #   想要淡出得在 Godot 里把 visibility_range_fade_mode 调成 Self。
+    render_visibility_distance: FloatProperty(
+        name="可见距离",
+        description=("相机离得超过这个距离(米)就不画这个网格 —— 省渲染,"
+                     "碰撞体还在(照样撞得到)。\n"
+                     "0 = 不限制(默认,不导出)。适合远处装饰物"),
+        default=0.0,
+        soft_min=0.0,
+        soft_max=200.0,
+    )
+    render_no_shadow: BoolProperty(
+        name="不投阴影",
+        description=("这个网格不往阴影贴图里画 —— 小零件(草 / 碎石 / 挂件)"
+                     "省阴影开销。\n"
+                     "⚠ 它自己**照样接收**阴影,只是不投"),
+        default=False,
+    )
     # ── 寻路层(第八十五轮:寻路第三版③ —— 多层导航)──────────────────
     # "不同的角色走**不同的导航网格**":这个物体属于第几层,导出时就烤进
     # 那一层的网格(按 Godot group 分组,各层只烤自己的几何,实测)。
@@ -391,6 +419,23 @@ class GKObjectSettings(bpy.types.PropertyGroup):
         description=("这盏灯跟着相机走(手电筒 / 头灯):位置和朝向每帧"
                      "对齐当前相机;颜色 / 亮度 / 阴影照旧用它自己的设置"),
         default=False,
+    )
+    # ── 阴影最大距离(第九十八轮:性能第二件)─────────────────────────
+    # Godot 的 DirectionalLight3D.directional_shadow_max_distance —— 平行光
+    # (太阳 / 月光)的阴影只在这个距离内算。**默认 100 米**已经很保守,
+    # 但开放场景里把 shadow map 铺满几百米会很贵;填小一点既省又往往
+    # 看不出区别(远处的影子本来就看不见)。
+    #
+    # ⚠ 只对**平行光**有意义(点光 / 聚光没有这个属性,Godot 侧不会设)——
+    #   在其它灯上填了不影响导出,但也不生效,面板上会提示。
+    # 0 = 不导出(老场景一字不变)。
+    light_shadow_distance: FloatProperty(
+        name="阴影距离",
+        description=("平行光(太阳 / 月光)的阴影只算到这个距离(米)。\n"
+                     "填小 = 省阴影开销;0 = 不导出(默认)。只对平行光有效"),
+        default=0.0,
+        soft_min=0.0,
+        soft_max=200.0,
     )
 
 

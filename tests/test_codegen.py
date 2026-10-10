@@ -18472,5 +18472,92 @@ class TestRound97AmbientSource(Base):
         self.assertEqual(set(ae.ENV_AMBIENT_SOURCES.values()), {2, 3})
 
 
+class TestRound98RenderTuning(Base):
+    """第九十八轮:可见距离 / 阴影开销(三张"少画"表)。
+
+    三项都走**环境脚本**(不是 .tscn):物体的网格在 glb 实例内部,而实例
+    的内部子节点不能被外部覆盖 —— 写进 .tscn 会被 Godot 丢掉(材质那条
+    踩过的坑,注释写在 asset_export 里)。全空 = 老场景一字不变。
+    """
+
+    class _Obj:
+        def __init__(self, name, kind="MESH", data_type="", **props):
+            self.name = name
+            self.type = kind
+            self.data = types.SimpleNamespace(type=data_type)
+            self.gk_physics = (types.SimpleNamespace(**props) if props else None)
+
+    def _scene(self, *objs):
+        return types.SimpleNamespace(objects=list(objs))
+
+    def test_empty_scene_writes_empty_tables(self):
+        """什么都没填 -> 三张表都是空串(老场景行为不变)。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.render_tuning_tables(self._scene()),
+                         ('""', '""', '""'))
+
+    def test_visibility_distance_only_when_positive(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(
+            self._Obj("树", render_visibility_distance=60.0),
+            self._Obj("石头", render_visibility_distance=0.0),
+            self._Obj("草", render_visibility_distance=-5.0),
+        )
+        vis, _shadow, _light = ae.render_tuning_tables(scene)
+        self.assertIn("树=60.0", vis)
+        self.assertNotIn("石头", vis)
+        self.assertNotIn("草", vis)
+
+    def test_no_shadow_lists_mesh_names(self):
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(
+            self._Obj("碎石", render_no_shadow=True),
+            self._Obj("墙", render_no_shadow=False),
+        )
+        _vis, shadow, _light = ae.render_tuning_tables(scene)
+        self.assertIn("碎石", shadow)
+        self.assertNotIn("墙", shadow)
+
+    def test_light_shadow_distance_only_for_sun(self):
+        """只认平行光(点光 / 聚光在 Godot 里没有这个属性,填了也不生效)。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(
+            self._Obj("月光", kind="LIGHT", data_type="SUN",
+                      light_shadow_distance=50.0),
+            self._Obj("台灯", kind="LIGHT", data_type="POINT",
+                      light_shadow_distance=50.0),
+            self._Obj("手电筒", kind="LIGHT", data_type="SPOT"),
+        )
+        _vis, _shadow, light = ae.render_tuning_tables(scene)
+        self.assertIn("月光=50.0", light)
+        self.assertNotIn("台灯", light)
+        self.assertNotIn("手电筒", light)
+
+    def test_tables_use_pipe_separator(self):
+        """分隔符必须是竖线 —— 默认值里放真换行会让 GDScript 解析失败。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(
+            self._Obj("树", render_visibility_distance=60.0),
+            self._Obj("石头", render_visibility_distance=30.0),
+        )
+        vis, _shadow, _light = ae.render_tuning_tables(scene)
+        self.assertIn("|", vis)
+        self.assertNotIn("\\n", vis)
+
+    def test_env_script_gets_the_tables(self):
+        """三张表要真的写进环境脚本文本(并且运行时函数在里面)。"""
+        from BlenderGameKit import asset_export as ae
+        text = ae.render_env_script(
+            visibility_ranges='"树=60.0"', no_shadow_nodes='"碎石"',
+            light_shadows='"月光=50.0"')
+        self.assertIn('var visibility_ranges: String = "树=60.0"', text)
+        self.assertIn('var no_shadow_nodes: String = "碎石"', text)
+        self.assertIn('var light_shadows: String = "月光=50.0"', text)
+        self.assertIn("func _apply_render_tuning() -> void:", text)
+        self.assertIn("visibility_range_end", text)
+        self.assertIn("cast_shadow = _GK_SHADOW_OFF", text)
+        self.assertIn("directional_shadow_max_distance", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

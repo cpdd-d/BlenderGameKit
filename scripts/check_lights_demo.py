@@ -116,6 +116,26 @@ func _report_cull() -> void:
 		" player=", player_path.get_file(), " ok=", ok)
 
 
+## 第九十八轮:可见距离 / 阴影开销 —— 三样都要真的设上。
+## 表写在环境脚本里,运行时由 _apply_render_tuning 应用(网格在 glb 实例
+## 内部,写 .tscn 会被 Godot 丢掉,所以只能运行时装)。
+func _report_perf() -> void:
+	var ground := _mesh_named("地面")
+	var vis := -1.0
+	var shadow := -1
+	if ground != null:
+		vis = ground.visibility_range_end
+		shadow = ground.cast_shadow
+	var sun_shadow := -1.0
+	if moon is DirectionalLight3D:
+		sun_shadow = (moon as DirectionalLight3D).directional_shadow_max_distance
+	# cast_shadow 0 = OFF(GeometryInstance3D.SHADOW_CASTING_SETTING_OFF)
+	var ok := ground != null and absf(vis - 60.0) <= 0.1 and shadow == 0 \\
+		and absf(sun_shadow - 50.0) <= 0.1
+	print("LIGHTS_PERF vis=", "%.2f" % vis, " cast_shadow=", shadow,
+		" sun_shadow=", "%.2f" % sun_shadow, " ok=", ok)
+
+
 func _send_key(code: int, pressed: bool) -> void:
 	var event := InputEventKey.new()
 	event.keycode = code
@@ -204,6 +224,7 @@ func _physics_process(delta: float) -> void:
 		_report_params()
 		_report_follow()
 		_report_cull()
+		_report_perf()
 		# 按 4 = 三盏全关
 		_send_key(KEY_4, true)
 	elif phase == 1 and elapsed >= 1.2:
@@ -479,6 +500,22 @@ def main():
     else:
         print(f"    背面剔除: 地面={cull.group(1)} 角色={cull.group(2)}")
 
+    # ── 第九十八轮:可见距离 / 阴影开销 ─────────────────────────────
+    # 三样都由环境脚本在运行时设(网格在 glb 实例内部,.tscn 覆盖会被丢掉)
+    perf = re.search(
+        r"LIGHTS_PERF vis=([\d.]+) cast_shadow=(-?\d+) "
+        r"sun_shadow=([\d.]+) ok=(\w+)", text)
+    if not perf:
+        print("✗ 没跑出可见距离 / 阴影开销的结论行(LIGHTS_PERF)")
+        ok = False
+    elif perf.group(4) != "true":
+        print("✗ 可见距离 / 阴影开销没生效:", perf.group(0))
+        ok = False
+    else:
+        print(f"    性能: 可见距离={perf.group(1)} 米"
+              f" 地面cast_shadow={perf.group(2)}(0=不投)"
+              f" 月光阴影={perf.group(3)} 米")
+
     # ── 生成物层面的证据 ────────────────────────────────────────────
     script_path = os.path.join(OUT, "scripts", "game_logic.gd")
     if os.path.isfile(script_path):
@@ -529,6 +566,11 @@ def main():
                  "手电筒写进了 follow_lights"),
                 ("@export var follow_scene_light: bool = true",
                  "卡通跟随场景光照开着"),
+                # 第九十八轮:三张"少画"表 + 运行时应用函数
+                ('var visibility_ranges: String = "地面=60.0"', "可见距离表"),
+                ('var no_shadow_nodes: String = "地面"', "不投阴影表"),
+                ('var light_shadows: String = "月光=50.0"', "阴影距离表"),
+                ("func _apply_render_tuning() -> void:", "运行时应用函数"),
         ):
             if needle not in env:
                 print(f"✗ gk_environment.gd 里没有{why}: 找不到 {needle!r}")
