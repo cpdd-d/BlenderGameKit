@@ -24,6 +24,7 @@ import math
 import os
 import re
 
+from . import curve_assets
 from . import generated_files
 from . import gk_log
 from . import godot_look
@@ -6166,6 +6167,22 @@ def _base_color_texture(material):
     return None
 
 
+def _find_image(name):
+    """按名字取 `bpy.data.images` 里的图像(拿不到返回 None)。
+
+    单独包一层是为了**离线测试**:那里没有 bpy,这个函数必须安静地返回
+    None,而不是让整条材质导出链炸掉(高光贴图第一百零一轮)。
+    """
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return None
+    images = getattr(getattr(bpy, "data", None), "images", None)
+    if images is None:
+        return None
+    return images.get(name)
+
+
 def _base_color_rgb(material):
     """取材质的基础色，用作卡通材质的主色。"""
     fallback = (0.85, 0.82, 0.88)
@@ -6254,11 +6271,17 @@ def derived_shader_names():
     return (CULL_SHADER_NAME,)
 
 
-def write_npr_material(export_dir, material, shader_res_dir="shaders"):
+def write_npr_material(export_dir, material, shader_res_dir="shaders",
+                       file_name=None):
     """把 Blender 里的 NPR 预览材质导出成 Godot 的 .tres。
 
     这是"在 Blender 里调参"能成立的关键一步:参数存在材质自定义属性上,
     这里读出来直接写成 Godot 的 shader_parameter,两边不会各调一遍。
+    高光形状贴图 / 遮罩图也会落盘成 `art/ui_xxx.png` 并写成 ExtResource
+    (第一百零一轮)。
+
+    file_name 给了就用它当文件名 —— 整场景导出时材质名要带**场景前缀**
+    (多场景防覆盖),那份名字由 write_materials 统一算,不能各算一套。
 
     返回 (文件路径, 参数个数);材质不是 NPR 材质时返回 (None, 0)。
     """
@@ -6270,7 +6293,7 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders"):
     if not params:
         return None, 0
 
-    name = safe_name(material.name, "material")
+    name = file_name or safe_name(material.name, "material")
     texture = _base_color_texture(material)
     # 背面剔除(第九十四轮):勾了的材质换剔面版着色器(顺手把变体写进项目)
     shader_name = _TOON_SHADER
@@ -6290,6 +6313,51 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders"):
         albedo_ref = 'ExtResource("2_albedo")'
         steps = 3
 
+    # ── 高光贴图(第一百零一轮):形状图 / 遮罩图 ──────────────────────
+    # 材质上存的是 **Blender 图片名**;这里落盘成 `art/ui_xxx.png` ——
+    # 用的命名函数和界面图片是**同一个**(curve_assets.image_file_name),
+    # 所以同一张图在界面和材质里都被引用时只会落一份,也不会两边算出
+    # 不同路径(曲线那次吃过"名字对不上"的亏)。
+    # `use_*` 开关**不走** read_params(那个函数的契约是"一条 PARAM_MAP
+    # 对应一个值"),这里按"有没有成功落盘"直接写,值永远自洽。
+    spec_exts = []            # 追加的 ext_resource 行
+    spec_lines = []           # 追加的 shader_parameter 行
+    for index, uniform in enumerate(sorted(npr_preview.TEXTURE_KEYS)):
+        image_name = npr_preview.get_texture(material, uniform)
+        image = _find_image(image_name) if image_name else None
+        if image_name and image is None:
+            gk_log.warn(f"材质『{material.name}』的高光贴图『{image_name}』"
+                        f"不在工程里(可能被删了),已跳过")
+        elif image is not None and tuple(image.size) == (0, 0):
+            gk_log.warn(f"材质『{material.name}』的高光贴图『{image_name}』"
+                        f"没有像素数据(没打包 / 没加载),已跳过")
+            image = None
+        res_id = ""
+        if image is not None:
+            file_name = curve_assets.image_file_name(image_name)
+            art_dir = os.path.join(export_dir, project.ART_DIR)
+            try:
+                os.makedirs(art_dir, exist_ok=True)
+                _save_image(image, os.path.join(art_dir, file_name))
+            except Exception as exc:                      # noqa: BLE001
+                gk_log.warn(f"材质『{material.name}』的高光贴图『{image_name}』"
+                            f"导出失败: {exc}")
+            else:
+                res_id = f"spec_{index}"
+                spec_exts.append(
+                    f'[ext_resource type="Texture2D" '
+                    f'path="res://{project.ART_DIR}/{file_name}" id="{res_id}"]')
+        # 开关**每次都写**(和 use_albedo_texture 同一个理由:着色器里
+        # hint_default_white 让"没贴图"和"白贴图"在 texture() 上一样,
+        # 只能靠这个开关区分)。有图 = 1,没有 = 0。
+        spec_lines.append(
+            f"shader_parameter/use_{uniform} = "
+            f"{1.0 if res_id else 0.0:.1f}")
+        if res_id:
+            spec_lines.append(
+                f'shader_parameter/{uniform} = ExtResource("{res_id}")')
+    steps += len(spec_exts)
+
     lines = [
         f'[gd_resource type="ShaderMaterial" load_steps={steps} format=3]',
         "",
@@ -6298,6 +6366,7 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders"):
     ]
     if textures_block:
         lines.append(textures_block.rstrip("\n"))
+    lines.extend(spec_exts)
     lines.append("")
     lines.append("[resource]")
     lines.append('shader = ExtResource("1_shader")')
@@ -6306,6 +6375,7 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders"):
     # 运行时区分不出"没贴图"和"贴图是白的"。
     lines.append(f"shader_parameter/use_albedo_texture = "
                  f"{1.0 if texture else 0.0:.1f}")
+    lines.extend(spec_lines)
 
     for uniform, value in params.items():
         if isinstance(value, (tuple, list)):
@@ -6396,6 +6466,18 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
             name = file_names[material.name]
             rgb = _base_color_rgb(material)
             texture = _base_color_texture(material)
+            # ── 有 NPR 参数的材质:走**完整**导出(第一百零一轮)────────
+            # 用户侧栏『卡通材质』调过高光(或点过『生成预览材质』)之后,
+            # 材质上就带着这一套自定义属性。老模板里 `specular_amount` 是
+            # 写死的 0.0 —— 那些材质在这儿会**永远没有高光**,更别说贴图。
+            # 所以这类材质改走 write_npr_material:按参数写全 + 带上两张
+            # 高光贴图。没有这些属性的老材质**一个字都不变**(还是老模板)。
+            if npr_preview.has_param(material, "specular_amount"):
+                npr_path, _count = write_npr_material(
+                    export_dir, material, shader_res_dir, file_name=name)
+                if npr_path:
+                    written.append((material.name, npr_path, bool(texture)))
+                    continue
             # 背面剔除(第九十四轮):Blender 材质勾了『背面剔除』-> 这个
             # .tres 引用剔面版着色器;没勾的照旧双面(老项目产物一字不变)。
             shader_name = _TOON_SHADER
@@ -6493,6 +6575,25 @@ def export_textures(export_dir, materials):
                     out.append((base_name, path))
                 except Exception as exc:
                     gk_log.warn(f"贴图 {base_name} 导出失败: {exc}")
+
+        # 高光形状图 / 遮罩图(第一百零一轮)。命名必须和 .tres 里写的
+        # **完全一致** —— 那边用的是 curve_assets.image_file_name,
+        # 这里少一步就变成两套名字,Godot 又找不到文件(基础色那次的坑)。
+        for uniform in npr_preview.TEXTURE_KEYS:
+            name = npr_preview.get_texture(material, uniform)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            image = bpy.data.images.get(name)
+            if image is None or image.size[0] == 0:
+                continue
+            file_name = curve_assets.image_file_name(name)
+            path = os.path.join(target_dir, file_name)
+            try:
+                _save_image(image, path)
+                out.append((name, path))
+            except Exception as exc:                      # noqa: BLE001
+                gk_log.warn(f"高光贴图 {name} 导出失败: {exc}")
 
         for name in _material_image_names(material):
             if name in seen:

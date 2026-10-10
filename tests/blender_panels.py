@@ -740,6 +740,80 @@ def main():
         check("联机节点卡片(第一百轮)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6h. 『卡通材质』盒(第一百零一轮:高光贴图)----
+    # 盒子里有图片选择器 / 清除按钮 / 参数输入 + 一个"生成预览材质"按钮,
+    # 而且**分两条路**画(材质有没有高光参数)。属性名或算子名写错在
+    # Blender 里是当场抛异常、整块消失 —— 冒烟那层看不见画的事。
+    print("=" * 72)
+    print("6h. 『卡通材质』盒(第一百零一轮)")
+    print("=" * 72)
+    try:
+        npr_mod = import_module(f"{module_name}.npr_preview")
+        plain = bpy.data.materials.new("面板探针普通材质")
+        plain.use_nodes = True
+        toon = bpy.data.materials.new("面板探针高光材质")
+        toon.use_nodes = True
+        npr_mod.build_toon_material(toon.name, {"specular_amount": 0.8})
+        cube.data.materials.clear()
+        cube.data.materials.append(plain)
+        cube.data.materials.append(toon)
+        cube.active_material_index = 0
+
+        panel = getattr(ui, "GK_PT_Main", None)
+        obj_panel = getattr(ui, "GK_PT_ObjectPhysics", None)
+        check("GK_PT_ObjectPhysics 存在", obj_panel is not None)
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        # ⚠ 用真面板:盒子挂在『游戏物理』面板上
+        obj_panel.draw(holder, FakeContext(cube, scene))
+        texts = " ".join(str(item) for item in layout.texts)
+        names = list(layout.operator_names)
+        check("『卡通材质』盒给两张贴图各画了一个图片选择器",
+              names.count("gk.pick_material_image") == 2, str(names))
+        check("还没填图时不画『清空』按钮(没东西可清)",
+              names.count("gk.clear_material_image") == 0, str(names))
+        check("『卡通材质』盒画出了『生成 / 刷新预览材质』",
+              "gk.rebuild_material_preview" in names)
+        check("『卡通材质』盒列出了两张贴图的槽位名和说明",
+              "高光形状贴图" in texts and "高光遮罩贴图" in texts
+              and "横向渐变" in texts and "白=留" in texts,
+              texts[:200])
+        check("当前材质是普通材质 -> 提示先建预览节点(不硬画读不到的属性)",
+              "还没建过预览节点" in texts, texts[-160:])
+
+        # 切到"有高光参数"的材质槽:参数输入行要画出来
+        cube.active_material_index = 1
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        obj_panel.draw(holder, FakeContext(cube, scene))
+        texts = " ".join(str(item) for item in layout.texts)
+        check("切到有参数的材质 -> 画出高光参数行 + 刷新提示",
+              "高光强度" in texts and "高光大小" in texts
+              and "刷新预览材质" in texts,
+              texts[-200:])
+
+        # 填了一张贴图 -> 那一行多出『清空』按钮(只有有图的那行才有)
+        npr_mod.set_texture(toon, "specular_mask_texture", "面板探针图")
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        obj_panel.draw(holder, FakeContext(cube, scene))
+        texts = " ".join(str(item) for item in layout.texts)
+        check("填了图的那一行画出『清空』按钮,另一行没有",
+              layout.operator_names.count("gk.clear_material_image") == 1,
+              str(layout.operator_names))
+        check("填了图之后画面上显示的是图片名",
+              "面板探针图" in texts, texts[-200:])
+        npr_mod.set_texture(toon, "specular_mask_texture", "")
+
+        check("『卡通材质』盒没把面板画崩(其它按钮还在)",
+              "gk.add_asset_instance" in layout.operator_names,
+              str(sorted(set(layout.operator_names)))[:200])
+        cube.data.materials.clear()
+    except Exception as exc:
+        check("『卡通材质』盒(第一百零一轮)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

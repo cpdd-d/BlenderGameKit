@@ -56,6 +56,11 @@ PARAM_MAP = (
     ("shadow_tint_2", "shadow_tint_2", "COLOR", (0.478, 0.420, 0.722), "深阴影颜色"),
     ("shadow_strength", "shadow_strength", "VALUE", 1.0, "阴影强度"),
     ("specular_amount", "specular_amount", "VALUE", 0.25, "高光强度"),
+    # 第一百零一轮:高光大小 / 边缘软硬 / 颜色本来只在着色器里有默认值,
+    # **从来没被导出过**(Blender 侧根本没有这三个参数)—— 这一轮补齐。
+    ("specular_size", "specular_size", "VALUE", 0.75, "高光大小"),
+    ("specular_smooth", "specular_smooth", "VALUE", 0.05, "高光边缘软硬"),
+    ("specular_color", "specular_color", "COLOR", (1.0, 1.0, 1.0), "高光颜色"),
     ("rim_amount", "rim_amount", "VALUE", 0.0, "边缘光强度"),
     ("rim_color", "rim_color", "COLOR", (0.75, 0.85, 1.0), "边缘光颜色"),
     ("rim_width", "rim_width", "VALUE", 0.55, "边缘光宽度"),
@@ -91,6 +96,8 @@ PARAM_LIMITS = {
     "shadow_smooth": (0.001, 0.6),
     "shadow_strength": (0.0, 4.0),
     "specular_amount": (0.0, 4.0),
+    "specular_size": (0.0, 1.0),
+    "specular_smooth": (0.005, 0.5),
     "rim_amount": (0.0, 4.0),
     "rim_width": (0.0, 1.0),
     "emission_amount": (0.0, 8.0),
@@ -108,6 +115,68 @@ PARAM_LIMITS = {
 LOCAL_ONLY_PARAMS = ("face_sdf_auto",)
 
 DEFAULT_TUNING = {name: default for name, _u, _k, default, _l in PARAM_MAP}
+
+
+# ==========================================================================
+# 高光贴图(第一百零一轮):『高光形状贴图』+『高光遮罩贴图』
+# ==========================================================================
+# uniform 名 -> (材质上的键名, 面板上的说明)
+#
+# 值存的是 **Blender 图片名**(不是路径、不是 res://)——
+# 导出时由 asset_export 落盘成 art/ui_xxx.png 再写进 .tres,
+# 用的命名函数和界面图片是同一个(curve_assets.image_file_name),
+# 同一张图在界面和材质里都被引用时只会落一份。
+#
+# `use_<uniform>` 开关**不存**在材质上 —— 它由"有没有填图"算出来,
+# 免得出现"开关是 1 但图被删了"这种自相矛盾的状态。
+TEXTURE_KEYS = {
+    "specular_shape_texture": (
+        "高光形状贴图",
+        "横向渐变:0(左)=高光外缘,1(右)=正中心。"
+        "右半边压黑 => 高光变空心环;整条压暗 => 高光变柔和。"
+        "⚠ 一旦用了它,『高光边缘软硬』就不起作用了(软硬由渐变决定)"),
+    "specular_mask_texture": (
+        "高光遮罩贴图",
+        "按 UV 决定高光长在哪儿:白=留,黑=去掉(数据图,不是颜色图)"),
+}
+
+
+def texture_key(uniform):
+    """uniform 名 -> 材质上那个自定义属性的键名(中文,面板里一眼看得懂)。"""
+    return TEXTURE_KEYS[uniform][0]
+
+
+def texture_hint(uniform):
+    return TEXTURE_KEYS[uniform][1]
+
+
+def get_texture(material, uniform):
+    """读材质上填的那张图片名(没填返回 "")。"""
+    if material is None:
+        return ""
+    raw = material.get(texture_key(uniform))
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
+def set_texture(material, uniform, image_name):
+    """填/清掉一张高光贴图。image_name 为空 = 清掉。"""
+    if material is None:
+        return
+    name = str(image_name or "").strip()
+    if name:
+        material[texture_key(uniform)] = name
+    elif material.get(texture_key(uniform)) is not None:
+        del material[texture_key(uniform)]
+
+
+def texture_image(material, uniform):
+    """读材质上那张图对应的 `bpy.data.images` 数据块(拿不到返回 None)。"""
+    name = get_texture(material, uniform)
+    if not name:
+        return None
+    return bpy.data.images.get(name)
 
 
 class NodeBuilder:
@@ -495,7 +564,8 @@ def compute_face_sdf_angle(scene=None):
     return max(-1.0, min(1.0, angle_rad / (math.pi * 0.5)))
 
 
-def build_toon_material(name, params=None, base_texture=None, uv_layer="UVMap"):
+def build_toon_material(name, params=None, base_texture=None, uv_layer="UVMap",
+                        textures=None):
     """把 NPR 卡通节点**直接内联**建进一个材质里。
 
     每个材质都为自己的模型生成,所以不会出现"空贴图节点"——
@@ -504,6 +574,11 @@ def build_toon_material(name, params=None, base_texture=None, uv_layer="UVMap"):
     数据流(两边表示不同,别混):
         材质自定义属性  <- 存 **sRGB** 值,导出时直接透传给 Godot
         节点(RGB/色标) <- 用 **线性** 值,否则 EEVEE 渲染会偏亮
+
+    textures: {uniform: 图片名} —— 高光形状图 / 遮罩图(第一百零一轮)。
+    不传就从材质自定义属性上读(所以"改完参数重建预览"不会把贴图弄丢)。
+    图片名在 `bpy.data.images` 里找不到时**不建节点**(空 TexImage 会输出
+    透明黑,把整条链乘成 0 —— 这个坑见模块开头)。
     """
     values = dict(DEFAULT_TUNING)
     values.update(params or {})
@@ -515,6 +590,22 @@ def build_toon_material(name, params=None, base_texture=None, uv_layer="UVMap"):
     tree = material.node_tree
     for node in list(tree.nodes):
         tree.nodes.remove(node)
+
+    # 高光贴图:从参数里拿(或从材质属性读),顺便把属性同步回名字
+    spec_images = {}
+    for uniform in TEXTURE_KEYS:
+        raw = (textures or {}).get(uniform)
+        if raw is None:
+            raw = get_texture(material, uniform)
+        image = raw
+        if isinstance(raw, str):
+            # ⚠ 这里**不能**写 `import bpy` —— 那会让 bpy 变成这个函数的
+            # 局部变量,于是上面那句 `bpy.data.materials.get(name)` 直接
+            # UnboundLocalError(实测踩到)。模块级已经 import 过 bpy 了。
+            image = bpy.data.images.get(raw)
+        if image is not None:
+            spec_images[uniform] = image
+            set_texture(material, uniform, getattr(image, "name", ""))
 
     b = NodeBuilder(tree)
 
@@ -633,21 +724,75 @@ def build_toon_material(name, params=None, base_texture=None, uv_layer="UVMap"):
                 # Non-Color,那是安全的(有文件缓冲)。
 
     # ---- 高光(硬边色带)----
+    #
+    # ── 预览里这个高光是**近似**,别当成 1:1(第一百零一轮写清)────────
+    # Godot 那边用的是"视线与光线的半程向量" N·H;Blender 节点里拿不到
+    # 那个量(和面部 SDF 同一个限制),所以这里用菲涅尔 Facing 代替。
+    # 因此:
+    #   * 『高光大小』按**相对默认值的偏移**挪一下色带位置(方向对得上:
+    #     越大 -> 高光越大),精确位置两边不可能一致;
+    #   * 『高光边缘软硬』**不参与预览**(色带是 CONSTANT 硬边)——
+    #     那个只能在 Godot 里看;
+    #   * 『高光颜色』与两张**高光贴图**是 1:1 的(同一套采样与乘法),
+    #     所以"贴图把高光改成空心环 / 抹掉"在预览里也看得见。
+    # 默认参数下这条链的输出和以前**逐字节一致**(颜色白 = 乘 1)。
     spec_amount = float(values.get("specular_amount", 0.25))
     if spec_amount > 0.001:
+        spec_size = float(values.get("specular_size", 0.75))
         layer = b.node("ShaderNodeLayerWeight", "菲涅尔", (100, -420))
         layer.inputs["Blend"].default_value = 0.35
         spec_ramp = b.node("ShaderNodeValToRGB", "高光色带", (330, -420))
         spec_ramp.color_ramp.interpolation = "CONSTANT"
-        spec_ramp.color_ramp.elements[0].position = 0.60
+        spec_step = max(0.05, min(0.95, 0.72 - (spec_size - 0.75) * 0.6))
+        spec_ramp.color_ramp.elements[0].position = max(0.0, spec_step - 0.05)
         spec_ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
-        spec_ramp.color_ramp.elements[1].position = 0.72
+        spec_ramp.color_ramp.elements[1].position = spec_step
         spec_ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
         tree.links.new(b.out(layer, "Facing"), b.inp(spec_ramp, "Fac"))
-        spec_scale = b.mix_rgb("高光强度", (560, -420), "MULTIPLY", spec_amount)
-        tree.links.new(b.out(spec_ramp, "Color"), b.inp(spec_scale, "A", 6))
-        tree.links.new(b.out(spec_ramp, "Color"), b.inp(spec_scale, "B", 7))
-        add_spec = b.mix_rgb("加高光", (790, -200), "ADD")
+        spec_shape = b.out(spec_ramp, "Color")
+
+        # 高光颜色(默认纯白 —— 乘法恒等,老材质的预览不变)
+        spec_rgb = b.node("ShaderNodeRGB", "高光颜色", (330, -620))
+        sr, sg, sb = to_linear_rgb(values.get("specular_color", (1.0, 1.0, 1.0)))
+        spec_rgb.outputs["Color"].default_value = (sr, sg, sb, 1.0)
+        spec_tint = b.mix_rgb("高光上色", (560, -620), "MULTIPLY")
+        tree.links.new(spec_shape, b.inp(spec_tint, "A", 6))
+        tree.links.new(b.out(spec_rgb, "Color"), b.inp(spec_tint, "B", 7))
+        spec_shape = b.out(spec_tint, "Result")
+
+        # 高光形状贴图:用"当前高光强度"当横坐标去采样那条渐变
+        # (和着色器里的 vec2(spot, 0.5) 是同一个意思)
+        shape_image = spec_images.get("specular_shape_texture")
+        if shape_image is not None:
+            coords = b.node("ShaderNodeCombineXYZ", "形状采样坐标", (790, -620))
+            tree.links.new(spec_shape, b.inp(coords, "X"))
+            coords.inputs["Y"].default_value = 0.5
+            coords.inputs["Z"].default_value = 0.0
+            shape_tex = b.node("ShaderNodeTexImage", "高光形状贴图", (1010, -620))
+            shape_tex.image = shape_image
+            shape_tex.interpolation = "Linear"
+            tree.links.new(b.out(coords, "Vector"), b.inp(shape_tex, "Vector"))
+            shape_mul = b.mix_rgb("形状×高光", (1250, -620), "MULTIPLY")
+            tree.links.new(spec_shape, b.inp(shape_mul, "A", 6))
+            tree.links.new(b.out(shape_tex, "Color"), b.inp(shape_mul, "B", 7))
+            spec_shape = b.out(shape_mul, "Result")
+
+        # 高光遮罩贴图:按 UV 决定"这块面片上到底出不出高光"
+        mask_image = spec_images.get("specular_mask_texture")
+        if mask_image is not None:
+            mask_tex = b.node("ShaderNodeTexImage", "高光遮罩贴图", (790, -880))
+            mask_tex.image = mask_image
+            mask_tex.interpolation = "Linear"
+            tree.links.new(uv_out, b.inp(mask_tex, "Vector"))
+            mask_mul = b.mix_rgb("遮罩×高光", (1010, -880), "MULTIPLY")
+            tree.links.new(spec_shape, b.inp(mask_mul, "A", 6))
+            tree.links.new(b.out(mask_tex, "Color"), b.inp(mask_mul, "B", 7))
+            spec_shape = b.out(mask_mul, "Result")
+
+        spec_scale = b.mix_rgb("高光强度", (1250, -420), "MULTIPLY", spec_amount)
+        tree.links.new(spec_shape, b.inp(spec_scale, "A", 6))
+        tree.links.new(spec_shape, b.inp(spec_scale, "B", 7))
+        add_spec = b.mix_rgb("加高光", (1480, -200), "ADD")
         tree.links.new(shaded, b.inp(add_spec, "A", 6))
         tree.links.new(b.out(spec_scale, "Result"), b.inp(add_spec, "B", 7))
         shaded = b.out(add_spec, "Result")
@@ -947,6 +1092,11 @@ def read_params(material):
                 out[uniform] = float(stored)
             except (TypeError, ValueError):
                 out[uniform] = float(default)
+    # ⚠ 高光贴图的 `use_*` 开关**不在这里**加(第一百零一轮)。
+    # 这个函数的契约是"一个 PARAM_MAP 条目 -> 一个返回值",加了别的键
+    # 就破坏了它(实测:`blender_material_params.py` 那条"能读出所有参数"
+    # 当场判红)。开关由导出侧按"有没有填图"直接写(shader_parameter/use_*),
+    # 值也永远是自洽的。
     return out
 
 
@@ -993,15 +1143,55 @@ def current_base_color(material):
     return None
 
 
+def base_color_from_principled(material):
+    """从材质的 Principled BSDF 读基础色,返回 **sRGB** 值(拿不到给默认色)。
+
+    第一百零一轮:"生成 / 刷新预览材质"按钮要能在**用户自己的材质**上工作 ——
+    他那个材质很可能只是一个带颜色的 Principled BSDF,自定义属性里
+    根本没有 albedo_color。这时应该把他的颜色带过来,而不是把材质
+    洗成默认的那点粉。
+    """
+    tree = getattr(material, "node_tree", None)
+    if tree is not None:
+        for node in tree.nodes:
+            if node.type != "BSDF_PRINCIPLED":
+                continue
+            socket = node.inputs.get("Base Color")
+            if socket is None or socket.is_linked:
+                continue
+            try:
+                value = socket.default_value
+                return list(from_linear_rgb((float(value[0]), float(value[1]),
+                                             float(value[2]))))
+            except (IndexError, TypeError, ValueError):
+                break
+    return list(DEFAULT_TUNING.get("albedo_color", (1.0, 0.932, 0.912)))
+
+
 def current_base_image(material):
-    """读材质节点里当前用的基础色贴图(可能没有)。"""
+    """读材质节点里当前用的基础色贴图(可能没有)。
+
+    ⚠ 第一百零一轮起材质里**不止一个**图片节点(高光形状图 / 遮罩图),
+    所以不能"拿第一个 TexImage"了 —— 那会把高光贴图当成基础色贴图。
+    先按**节点名**找"基础色贴图";找不到才退回第一个(兼容老材质)。
+    """
     tree = getattr(material, "node_tree", None)
     if tree is None:
         return None
+    named = tree.nodes.get("基础色贴图")
+    if named is not None and getattr(named, "image", None) is not None:
+        return named.image
     for node in tree.nodes:
-        if node.bl_idname == "ShaderNodeTexImage" and node.image is not None:
-            return node.image
+        if node.bl_idname != "ShaderNodeTexImage" or node.image is None:
+            continue
+        if node.name in SPECULAR_NODE_NAMES:
+            continue
+        return node.image
     return None
+
+
+# 高光贴图那两个节点在预览里的名字(重建时要按名字把它们和别的图片节点分开)
+SPECULAR_NODE_NAMES = ("高光形状贴图", "高光遮罩贴图")
 
 
 def update_material(material, params):

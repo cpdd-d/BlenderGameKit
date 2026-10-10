@@ -1,0 +1,23 @@
+[gd_resource type="ShaderMaterial" load_steps=2 format=3]
+
+[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="1_toon"]
+
+[resource]
+shader = ExtResource("1_toon")
+shader_parameter/albedo_color = Color(0.100, 0.100, 0.120, 1)
+shader_parameter/albedo_strength = 1.0
+shader_parameter/light_map_mix = 0.0
+shader_parameter/lit_tint = Color(1, 0.976, 0.914, 1)
+shader_parameter/shadow_tint = Color(0.706, 0.627, 0.902, 1)
+shader_parameter/shadow_tint_2 = Color(0.478, 0.42, 0.722, 1)
+shader_parameter/shadow_strength = 1.0
+shader_parameter/rim_color = Color(0.75, 0.85, 1, 1)
+shader_parameter/rim_front = 0.15
+shader_parameter/backlight_color = Color(1, 0.75, 0.55, 1)
+shader_parameter/emission_amount = 0.0
+shader_parameter/alpha_cut = 0.5
+shader_parameter/eye_highlight_boost = 0.0
+shader_parameter/specular_amount = 1.6
+shader_parameter/specular_size = 0.85
+shader_parameter/specular_smooth = 0.02
+shader_parameter/specular_color = Color(1, 1, 1, 1)

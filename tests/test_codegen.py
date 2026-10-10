@@ -18844,5 +18844,155 @@ class TestRound100Net(Base):
         self.assert_indent_sane(code)
 
 
+class TestRound101SpecTexture(Base):
+    """第一百零一轮:高光贴图(形状剖面图 + UV 遮罩图)。
+
+    ── 这一层锁住的三条硬事实(改代码前先看)────────────────────────
+    1. **形状图必须用连续坐标采样**。第一版把二值的 `spot`(硬色带 0/1)
+       直接当横坐标去采样 —— 那样只会读到渐变的两个端点像素,
+       "形状贴图"等于没用(设计时就发现并改掉了);
+    2. `read_params` 的契约是"一条 PARAM_MAP 一个值",高光贴图的
+       `use_*` 开关**不能**加进去(加了会当场弄红 material_params 那条);
+    3. 开关由导出侧按"有没有落盘"写,值永远自洽(不会出现"开着的图没了")。
+    """
+
+    @staticmethod
+    def _shader_text():
+        from BlenderGameKit import npr_preview
+        path = os.path.join(os.path.dirname(os.path.abspath(npr_preview.__file__)),
+                            "shaders", "gk_toon.gdshader")
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    class FakeMat(dict):
+        """最小材质替身:只有导出链真正读的那几个属性。"""
+
+        name = "假材质"
+        use_nodes = False
+        use_backface_culling = False
+
+    # ---- 着色器 ----
+    def test_shader_declares_two_texture_uniforms(self):
+        text = self._shader_text()
+        for uniform in ("specular_shape_texture", "specular_mask_texture"):
+            self.assertIn(f"uniform sampler2D {uniform}", text)
+            self.assertIn(f"uniform float use_{uniform}", text)
+            self.assertIn(f"if (use_{uniform} > 0.5) {{", text)
+
+    def test_shape_texture_uses_continuous_coordinate(self):
+        text = self._shader_text()
+        self.assertIn("texture(specular_shape_texture, vec2(u, 0.5))", text)
+        self.assertIn("float half_spot = dot(n_view, half_vec);", text)
+        # 二值坐标那条老写法必须已经不在了(否则贴图等于摆设)
+        self.assertNotIn("texture(specular_shape_texture, vec2(spot, 0.5))", text)
+
+    def test_mask_texture_uses_uv(self):
+        self.assertIn("texture(specular_mask_texture, UV).r", self._shader_text())
+
+    def test_highlight_knobs_are_real_uniforms_and_params(self):
+        from BlenderGameKit import npr_preview as npr
+        names = {entry[0] for entry in npr.PARAM_MAP}
+        self.assertLessEqual(
+            {"specular_amount", "specular_size", "specular_smooth",
+             "specular_color"}, names)
+        text = self._shader_text()
+        self.assertIn("uniform float specular_size", text)
+        self.assertIn("uniform float specular_smooth", text)
+        self.assertIn("uniform vec4 specular_color", text)
+
+    # ---- 材质上的读写 ----
+    def test_texture_keys_are_chinese_and_distinct(self):
+        from BlenderGameKit import npr_preview as npr
+        keys = [npr.texture_key(u) for u in npr.TEXTURE_KEYS]
+        self.assertEqual(len(keys), len(set(keys)))
+        for key in keys:
+            self.assertTrue(any("\u4e00" <= ch <= "\u9fff" for ch in key), key)
+            self.assertIn(key, [npr.texture_key(u) for u in npr.TEXTURE_KEYS])
+            self.assertTrue(npr.texture_hint(
+                [u for u in npr.TEXTURE_KEYS if npr.texture_key(u) == key][0]))
+
+    def test_get_set_texture_round_trip(self):
+        from BlenderGameKit import npr_preview as npr
+        mat = self.FakeMat()
+        self.assertEqual(npr.get_texture(mat, "specular_shape_texture"), "")
+        npr.set_texture(mat, "specular_shape_texture", "形状图")
+        self.assertEqual(npr.get_texture(mat, "specular_shape_texture"), "形状图")
+        self.assertEqual(mat[npr.texture_key("specular_shape_texture")], "形状图")
+        # 另一槽位不受影响
+        self.assertEqual(npr.get_texture(mat, "specular_mask_texture"), "")
+        npr.set_texture(mat, "specular_shape_texture", "")
+        self.assertEqual(npr.get_texture(mat, "specular_shape_texture"), "")
+        self.assertNotIn(npr.texture_key("specular_shape_texture"), mat)
+
+    def test_read_params_keeps_one_entry_per_param(self):
+        from BlenderGameKit import npr_preview as npr
+        params = npr.read_params(self.FakeMat())
+        self.assertEqual(len(params), len(npr.PARAM_MAP))
+        self.assertFalse([key for key in params if key.startswith("use_")])
+
+    # ---- 导出 ----
+    def test_export_without_textures_writes_switches_off(self):
+        from BlenderGameKit import asset_export as ae
+        mat = self.FakeMat()
+        with tempfile.TemporaryDirectory() as folder:
+            path, _count = ae.write_npr_material(folder, mat)
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        self.assertIn("shader_parameter/use_specular_shape_texture = 0.0", text)
+        self.assertIn("shader_parameter/use_specular_mask_texture = 0.0", text)
+        self.assertNotIn("specular_shape_texture = ExtResource", text)
+
+    def test_export_with_texture_writes_resource_and_switch(self):
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import curve_assets, npr_preview as npr
+
+        class _Image:
+            name = "形状图"
+            size = (4, 4)
+
+        mat = self.FakeMat()
+        npr.set_texture(mat, "specular_shape_texture", "形状图")
+        with mock.patch.object(ae, "_find_image", return_value=_Image()), \
+                mock.patch.object(ae, "_save_image"):
+            with tempfile.TemporaryDirectory() as folder:
+                path, _count = ae.write_npr_material(folder, mat)
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+        file_name = curve_assets.image_file_name("形状图")
+        self.assertIn("shader_parameter/use_specular_shape_texture = 1.0", text)
+        # sorted(TEXTURE_KEYS):mask 先(0)、shape 后(1)—— id 跟着这个顺序
+        self.assertIn(f'path="res://art/{file_name}" id="spec_1"', text)
+        self.assertIn('shader_parameter/specular_shape_texture = '
+                      'ExtResource("spec_1")', text)
+        self.assertIn("shader_parameter/use_specular_mask_texture = 0.0", text)
+        # load_steps 必须跟着多出来的 ext_resource 涨(少了 Godot 不认)
+        self.assertIn("load_steps=3", text)
+
+    def test_missing_image_warns_and_keeps_switch_off(self):
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import npr_preview as npr
+        mat = self.FakeMat()
+        npr.set_texture(mat, "specular_shape_texture", "被删掉的图")
+        with mock.patch.object(ae, "_find_image", return_value=None):
+            with tempfile.TemporaryDirectory() as folder:
+                path, _count = ae.write_npr_material(folder, mat)
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+        self.assertIn("shader_parameter/use_specular_shape_texture = 0.0", text)
+        self.assertNotIn("ExtResource(\"spec_1\")", text)
+
+    def test_scene_export_uses_npr_path_only_when_params_exist(self):
+        """整场景导出:有 NPR 参数的材质走完整导出,老材质还是老模板。
+
+        ⚠ 这一条是**必须的**:场景导出原来写死用 TOON_MATERIAL_TEMPLATE
+        (`specular_amount = 0.0`)—— 高光参数根本到不了游戏里。
+        """
+        import inspect
+        from BlenderGameKit import asset_export as ae
+        source = inspect.getsource(ae.write_materials)
+        self.assertIn('has_param(material, "specular_amount")', source)
+        self.assertIn("write_npr_material(", source)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

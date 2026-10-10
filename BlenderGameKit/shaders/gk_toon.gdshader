@@ -141,6 +141,27 @@ uniform float specular_amount : hint_range(0.0, 4.0) = 0.0;
 uniform float specular_size : hint_range(0.0, 1.0) = 0.75;
 uniform float specular_smooth : hint_range(0.005, 0.5) = 0.05;
 uniform vec4 specular_color : source_color = vec4(1.0, 1.0, 1.0, 1.0);
+// Shape texture (round 101): takes over the *profile* of the highlight, so
+// the artist draws it instead of accepting a plain filled disc -- hard core
+// + soft edge, a hollow ring (dark middle -> the highlight becomes a rim),
+// a crescent... whatever the ramp says.
+// Layout: a HORIZONTAL gradient sampled at v = 0.5 (a 1 pixel tall strip is
+// enough); x = 0 at the outer edge of the highlight, x = 1 at its centre.
+// NOTE the sampled coordinate is CONTINUOUS (raw N.H remapped over the
+// highlight's radius), not the binary band value -- sampling a ramp with a
+// hard 0/1 term would only ever read the two end pixels and the "shape"
+// texture could not draw anything in between. Consequence: once a shape
+// texture is used, `specular_smooth` no longer applies -- softness is
+// whatever the gradient says.
+// `hint_default_white` keeps an unset texture a no-op.
+uniform sampler2D specular_shape_texture : hint_default_white, filter_linear, repeat_disable;
+uniform float use_specular_shape_texture : hint_range(0.0, 1.0) = 0.0;
+// Mask texture (round 101): sampled by UV, decides *where* the highlight is
+// allowed to show up (only on the forehead, only on the shoulder plate...).
+// White = keep the highlight, black = remove it. This one is a data mask,
+// deliberately NOT `source_color` so no sRGB decode happens.
+uniform sampler2D specular_mask_texture : hint_default_white, filter_linear, repeat_disable;
+uniform float use_specular_mask_texture : hint_range(0.0, 1.0) = 0.0;
 
 group_uniforms rim_light;
 uniform vec4 rim_color : source_color = vec4(0.75, 0.85, 1.0, 1.0);
@@ -272,13 +293,36 @@ void fragment() {
 	// --- cel highlight: a hard-edged spot instead of a soft falloff ---------
 	// 高光**故意**留在视图空间:高光本来就该跟着相机走(物理上就是
 	// 视线与光线的半程向量),这跟阴影"必须固定在世界里"不矛盾。
+	//
+	// ⚠⚠ 这里以及下面几段必须写 **ALBEDO**,不能写 EMISSION(第 101 轮实测)。
+	//
+	// 本 shader 是 `unshaded` —— 真机标定(一颗深色球 + specular_amount 1.6,
+	// 真窗口出图数亮点):
+	//     写 EMISSION:峰值 0.114(就是底色本身,高光**一点都没有**)
+	//     写 ALBEDO  :峰值 1.000,实心高光 20880 个亮点
+	// 也就是说 **unshaded 下 Godot 根本不看 EMISSION**(unshaded = 跳过整个
+	// 光照/自发光阶段,直接拿 ALBEDO 当最终颜色)。这意味着在这之前,
+	// 高光 / 边缘光 / 自发光 / 眼睛高光**四个参数全是死的** ——
+	// 面板上调半天画面纹丝不动。改成 ALBEDO 之后它们才真的生效。
 	if (specular_amount > 0.001) {
 		vec3 n_view = normalize(NORMAL);
 		vec3 view_dir = normalize(VIEW);
 		vec3 light_view = normalize(mat3(VIEW_MATRIX) * l_world);
 		vec3 half_vec = normalize(view_dir + light_view);
-		float spot = gk_band(dot(n_view, half_vec), 1.0 - specular_size, specular_smooth);
-		EMISSION += specular_color.rgb * spot * specular_amount;
+		float half_spot = dot(n_view, half_vec);
+		float spot = gk_band(half_spot, 1.0 - specular_size, specular_smooth);
+		// Round 101: let a texture reshape the highlight. Shape first (it
+		// rewrites the whole profile), then the UV mask (it decides where
+		// the highlight is allowed to appear at all).
+		if (use_specular_shape_texture > 0.5) {
+			float u = clamp((half_spot - (1.0 - specular_size))
+				/ max(specular_size, 0.0001), 0.0, 1.0);
+			spot = texture(specular_shape_texture, vec2(u, 0.5)).r;
+		}
+		if (use_specular_mask_texture > 0.5) {
+			spot *= texture(specular_mask_texture, UV).r;
+		}
+		ALBEDO += specular_color.rgb * spot * specular_amount;
 	}
 
 	// --- rim light ---------------------------------------------------------
@@ -287,16 +331,16 @@ void fragment() {
 		float nv = dot(normalize(NORMAL), normalize(VIEW));
 		float rim = 1.0 - smoothstep(rim_width, 1.0, nv);
 		rim = clamp(rim + rim_front * (1.0 - nv), 0.0, 1.0);
-		EMISSION += rim_color.rgb * rim * rim_amount;
+		ALBEDO += rim_color.rgb * rim * rim_amount;
 	}
 
 	if (emission_amount > 0.001) {
-		EMISSION += base.rgb * emission_amount;
+		ALBEDO += base.rgb * emission_amount;
 	}
 	if (eye_highlight_boost > 0.001) {
 		// Bright pixels (eye highlights painted into the texture) glow
 		// slightly, which makes the eyes read at small sizes.
 		float bright = smoothstep(0.75, 1.0, dot(base.rgb, vec3(0.333)));
-		EMISSION += base.rgb * bright * eye_highlight_boost;
+		ALBEDO += base.rgb * bright * eye_highlight_boost;
 	}
 }

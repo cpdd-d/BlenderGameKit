@@ -5659,6 +5659,118 @@ def main():
         check("第一百轮(网络联机)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零一轮:高光贴图(形状剖面图 + UV 遮罩图)----
+    # 真 Blender 才能验的:材质上真的记住/重建得住两张贴图、导出的 .tres
+    # 真的带 ExtResource、PNG 真的落盘、**整场景导出那条路**也走对了
+    # (那条路原来写死 specular_amount = 0.0,高光根本到不了游戏里)。
+    try:
+        import shutil
+        from importlib import import_module as _r101_import
+
+        r101_npr = _r101_import(f"{module_name}.npr_preview")
+        r101_curve = _r101_import(f"{module_name}.curve_assets")
+
+        r101_shape = bpy.data.images.new("高光探针形状图", width=8, height=1,
+                                         alpha=True)
+        # 左半白、右半黑 = "空心环"(外缘亮、中心暗)
+        r101_shape.pixels = ([1.0, 1.0, 1.0, 1.0] * 4
+                             + [0.0, 0.0, 0.0, 1.0] * 4)
+        r101_mask = bpy.data.images.new("高光探针遮罩图", width=4, height=4,
+                                        alpha=True)
+        r101_mask.pixels = [0.0, 0.0, 0.0, 1.0] * 16
+
+        r101_mat = bpy.data.materials.new("高光探针材质")
+        r101_mat.use_nodes = True
+        r101_npr.build_toon_material(
+            r101_mat.name,
+            {"specular_amount": 0.9, "specular_size": 0.5},
+            textures={"specular_shape_texture": r101_shape.name,
+                      "specular_mask_texture": r101_mask.name})
+        check("第一百零一轮:材质记住了两张高光贴图",
+              r101_npr.get_texture(r101_mat, "specular_shape_texture")
+              == "高光探针形状图"
+              and r101_npr.get_texture(r101_mat, "specular_mask_texture")
+              == "高光探针遮罩图")
+        check("第一百零一轮:预览里真建出了那两个图片节点",
+              r101_mat.node_tree.nodes.get("高光形状贴图") is not None
+              and r101_mat.node_tree.nodes.get("高光遮罩贴图") is not None)
+        check("第一百零一轮:高光大小 / 颜色也真的进了参数表",
+              r101_npr.has_param(r101_mat, "specular_size")
+              and r101_npr.has_param(r101_mat, "specular_color")
+              and abs(r101_npr.get_param(r101_mat, "specular_size") - 0.5) < 1e-4)
+
+        # 重建预览:贴图不能丢(update_material 会删掉所有节点重建)
+        r101_npr.update_material(r101_mat, r101_npr.read_params(r101_mat))
+        check("第一百零一轮:重建预览后贴图还在",
+              r101_npr.get_texture(r101_mat, "specular_shape_texture")
+              == "高光探针形状图"
+              and r101_npr.get_texture(r101_mat, "specular_mask_texture")
+              == "高光探针遮罩图")
+        check("第一百零一轮:基础色贴图没被高光贴图顶掉",
+              r101_npr.current_base_image(r101_mat) is None)
+
+        r101_dir = tempfile.mkdtemp(prefix="gk_spec_")
+        r101_path, _r101_count = asset_export.write_npr_material(
+            r101_dir, r101_mat)
+        with open(r101_path, encoding="utf-8") as handle:
+            r101_text = handle.read()
+        r101_shape_file = r101_curve.image_file_name("高光探针形状图")
+        r101_mask_file = r101_curve.image_file_name("高光探针遮罩图")
+        check("第一百零一轮:.tres 里两张贴图都写成了 ExtResource",
+              f'path="res://art/{r101_shape_file}"' in r101_text
+              and f'path="res://art/{r101_mask_file}"' in r101_text
+              and 'shader_parameter/specular_shape_texture = ExtResource('
+              in r101_text
+              and 'shader_parameter/specular_mask_texture = ExtResource('
+              in r101_text)
+        check("第一百零一轮:两个 use_ 开关都是 1.0",
+              "shader_parameter/use_specular_shape_texture = 1.0" in r101_text
+              and "shader_parameter/use_specular_mask_texture = 1.0"
+              in r101_text)
+        r101_art = os.path.join(r101_dir, asset_export.project.ART_DIR)
+        check("第一百零一轮:PNG 真落盘了,而且名字和 .tres 里一致",
+              os.path.isfile(os.path.join(r101_art, r101_shape_file))
+              and os.path.isfile(os.path.join(r101_art, r101_mask_file)),
+              str(os.listdir(r101_art) if os.path.isdir(r101_art) else "(无)"))
+
+        # ── 整场景导出那条路(原来写死 specular_amount = 0.0)──────────
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+        r101_obj = bpy.context.active_object
+        r101_obj.name = "高光探针方块"
+        r101_obj.data.materials.append(r101_mat)
+        r101_plain_mat = bpy.data.materials.new("普通探针材质")
+        r101_plain_mat.use_nodes = True
+        r101_obj.data.materials.append(r101_plain_mat)
+        r101_scene_dir = tempfile.mkdtemp(prefix="gk_spec_scene_")
+        r101_written = asset_export.write_materials(r101_scene_dir, [r101_obj])
+        r101_by_name = {item[0]: open(item[1], encoding="utf-8").read()
+                        for item in r101_written}
+        check("第一百零一轮:有 NPR 参数的材质走完整导出(高光真的写进去了)",
+              "shader_parameter/specular_amount = 0.9" in
+              r101_by_name.get("高光探针材质", "")
+              and "shader_parameter/specular_size = 0.5" in
+              r101_by_name.get("高光探针材质", "")
+              and 'shader_parameter/specular_shape_texture = ExtResource(' in
+              r101_by_name.get("高光探针材质", ""))
+        check("第一百零一轮:没有参数的材质还是老模板(产物一字不变)",
+              "shader_parameter/specular_amount = 0.0"
+              in r101_by_name.get("普通探针材质", "")
+              and "specular_shape_texture" not in
+              r101_by_name.get("普通探针材质", ""))
+        r101_tex = asset_export.export_textures(
+            r101_scene_dir, [r101_mat, r101_plain_mat])
+        check("第一百零一轮:整场景导出会带上高光贴图(清单里也有)",
+              any(name == "高光探针形状图" for name, _p in r101_tex)
+              and any(name == "高光探针遮罩图" for name, _p in r101_tex),
+              str([name for name, _p in r101_tex]))
+
+        bpy.data.objects.remove(r101_obj, do_unlink=True)
+        for folder in (r101_dir, r101_scene_dir):
+            shutil.rmtree(folder, ignore_errors=True)
+    except Exception as exc:
+        check("第一百零一轮(高光贴图)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

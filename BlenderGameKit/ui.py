@@ -3271,10 +3271,86 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
                     col.label(text="空物体也能当发射器:只标位置和朝向",
                               icon="INFO")
 
+        # ---- 卡通材质(第一百零一轮:高光参数 + 两张高光贴图)----------
+        _draw_toon_material_box(layout, context, obj)
+
         # ---- 『视口预览』盒第四十二轮搬走了 ----
         # 碰撞线框的"显示这一个 / 显示全部 / 隐藏"原来在这里,和侧栏导出盒里的
         # 『预览碰撞体』是两处入口 —— 用户嫌"不好找"。现在统一收进
         # 『游戏显示』设置图的『显示_碰撞线框』卡上(第四十二轮)。
+
+
+def _draw_toon_material_box(layout, context, obj):
+    """『卡通材质』盒:高光参数 + 两张高光贴图(第一百零一轮)。
+
+    ── 为什么加这一盒 ────────────────────────────────────────────────
+    高光参数(强度 / 大小 / 边缘软硬 / 颜色)一直存在,但**没有任何界面**:
+    它们只是材质上的自定义属性,用户得去『材质属性 -> 自定义属性』里
+    对着中文键一个个改。这一盒把它们搬到看得见的地方,顺手把这一轮新增的
+    『高光形状贴图』『高光遮罩贴图』也做进去。
+
+    ⚠ 这里改的是**当前材质槽**(绿色三角那个);物体有多个材质槽时,
+    先用 Blender 原生的材质槽列表选,免得"改了另一个材质的参数"。
+    """
+    from . import npr_preview
+
+    data = getattr(obj, "data", None)
+    slots = [slot for slot in (getattr(data, "materials", None) or ())
+             if slot is not None]
+    if not slots:
+        return
+
+    box = layout.box()
+    box.label(text="卡通材质 · 高光", icon="MATERIAL")
+    if len(slots) > 1:
+        try:
+            box.template_list("MATERIAL_UL_matslots", "", obj, "material_slots",
+                              obj, "active_material_index", rows=2)
+        except Exception:                                 # noqa: BLE001
+            box.label(text=f"本物体有 {len(slots)} 个材质槽:先用材质槽列表"
+                           f"选中要改的那个", icon="INFO")
+    try:
+        index = int(getattr(obj, "active_material_index", 0))
+    except (TypeError, ValueError):
+        index = 0
+    material = slots[min(max(index, 0), len(slots) - 1)]
+    box.label(text=f"当前材质:{material.name}", icon="DOT")
+
+    # ---- 两张高光贴图 ----
+    for uniform in npr_preview.TEXTURE_KEYS:
+        row = box.row(align=True)
+        current = npr_preview.get_texture(material, uniform)
+        row.label(text=npr_preview.texture_key(uniform),
+                  icon="IMAGE_DATA" if current else "NONE")
+        row.label(text=current or "(没填,高光不受贴图影响)")
+        pick = row.operator("gk.pick_material_image", text="", icon="VIEWZOOM")
+        pick.material_name = material.name
+        pick.uniform = uniform
+        if current:
+            clear = row.operator("gk.clear_material_image", text="", icon="X")
+            clear.material_name = material.name
+            clear.uniform = uniform
+    for uniform in npr_preview.TEXTURE_KEYS:
+        box.label(text=npr_preview.texture_hint(uniform), icon="INFO")
+
+    # ---- 高光参数 + 预览 ----
+    # 参数属性只有"生成过预览材质"之后才存在(用户自己的 Principled 材质
+    # 上什么都没有),所以分两条路走 —— 不硬画一个读不到的属性。
+    if npr_preview.has_param(material, "specular_amount"):
+        col = box.column(align=True)
+        for name, _uniform, _kind, _default, label in npr_preview.PARAM_MAP:
+            if not name.startswith("specular"):
+                continue
+            col.prop(material, f'["{npr_preview.material_key(name)}"]', text=label)
+        box.label(text="改完点下面『刷新预览材质』才看得到(导出一直按新值)",
+                  icon="INFO")
+    else:
+        box.label(text="这个材质还没建过预览节点 —— 点下面生成,"
+                       "就能在 Blender 里看到卡通高光", icon="INFO")
+    row = box.row(align=True)
+    row.operator("gk.rebuild_material_preview",
+                 text="生成 / 刷新预览材质", icon="SHADERFX").material_name = \
+        material.name
 
 
 def _draw_body_type(layout, physics, is_3d):

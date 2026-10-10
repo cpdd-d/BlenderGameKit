@@ -1,0 +1,35 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="sh_toon"]
+[ext_resource type="Script" path="res://spec_probe.gd" id="sh_spec"]
+[ext_resource type="ShaderMaterial" path="res://materials/Spec_plain.tres" id="m_spec"]
+
+[sub_resource type="SphereMesh" id="spec_sphere"]
+radius = 0.9
+height = 1.8
+radial_segments = 48
+rings = 24
+[sub_resource type="Environment" id="spec_env"]
+background_mode = 1
+background_color = Color(0.02, 0.02, 0.03, 1)
+ambient_light_source = 3
+ambient_light_energy = 0.0
+tonemap_mode = 2
+
+[node name="SpecRoot" type="Node3D"]
+script = ExtResource("sh_spec")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("spec_env")
+
+[node name="KeyLight" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.86, -0.35, 0.37, 0, 0.73, 0.68, -0.51, -0.59, 0.63, 2, 3, 2)
+light_energy = 0.5
+
+[node name="Camera" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3.2)
+fov = 45.0
+
+[node name="SpecBall" type="MeshInstance3D" parent="."]
+mesh = SubResource("spec_sphere")
+material_override = ExtResource("m_spec")

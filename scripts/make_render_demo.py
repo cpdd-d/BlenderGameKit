@@ -52,12 +52,20 @@ MATERIAL_VARIANTS = [
 ]
 
 
-def make_material(name, albedo, params, with_outline):
+def make_material(name, albedo, params, with_outline, textures=None,
+                  extra_steps=0):
+    """写一份材质。
+
+    textures: [(uniform 名, res:// 路径, id 后缀)] —— 高光贴图那条链(第一百零一轮)。
+    """
     lines = [
-        '[gd_resource type="ShaderMaterial" load_steps=2 format=3]',
+        f'[gd_resource type="ShaderMaterial" load_steps={2 + extra_steps} format=3]',
         "",
         '[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="1_toon"]',
     ]
+    for uniform, res_path, res_id in (textures or ()):
+        lines.append(f'[ext_resource type="Texture2D" path="{res_path}" '
+                     f'id="{res_id}"]')
     if with_outline:
         lines.append(
             '[ext_resource type="Shader" path="res://shaders/gk_outline.gdshader" id="2_outline"]'
@@ -88,6 +96,9 @@ def make_material(name, albedo, params, with_outline):
     lines.append("shader_parameter/eye_highlight_boost = 0.0")
     for key, value in params.items():
         lines.append(f"shader_parameter/{key} = {value}")
+    for uniform, _res_path, res_id in (textures or ()):
+        lines.append(f'shader_parameter/use_{uniform} = 1.0')
+        lines.append(f'shader_parameter/{uniform} = ExtResource("{res_id}")')
     if with_outline:
         lines.append('next_pass = SubResource("outline_pass")')
     return write(os.path.join(OUT, "materials", f"{name}.tres"), "\n".join(lines) + "\n")
@@ -249,6 +260,83 @@ def make_scene():
     return write(os.path.join(OUT, "Main.tscn"), "\n".join(parts) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# 高光贴图(第一百零一轮)—— 一张"空心环"形状图 + 一张全黑遮罩
+# ---------------------------------------------------------------------------
+# 三份材质**其它参数完全一样**,只差贴图:
+#   Spec_plain    没有贴图      -> 实心高光斑
+#   Spec_ring     形状图左白右黑 -> 高光只剩外圈(空心环)
+#   Spec_blocked  全黑遮罩      -> 高光被抹掉
+# 探针(spec_probe.gd)真 GPU 各出一张图数亮点,断言 plain > ring > blocked。
+# ⚠ 颜色参数必须写成 `Color(...)`,不能写 `(1, 1, 1, 1)` ——
+# 后者是**解析错误**,整个 .tres 都 load 不出来(实测:材质"接上了"却
+# 三份全部 loaded=false,查半天才发现是这一行)。
+SPEC_PARAMS = {"specular_amount": 1.6, "specular_size": 0.85,
+               "specular_smooth": 0.02, "specular_color": "Color(1, 1, 1, 1)"}
+
+
+def make_spec_textures():
+    """两张高光贴图(纯标准库写 PNG,不依赖 Pillow —— 和面部 SDF 同一套)。"""
+    import make_face_sdf
+
+    # 形状图:横着一条渐变。x 小 = 高光外缘(白),x 大 = 正中心(黑)
+    # -> 高光的中心被压黑,只剩一圈。
+    shape = make_face_sdf.write_png(
+        os.path.join(OUT, "art", "spec_shape.png"), 32, 2,
+        lambda x, _y: (255, 255, 255, 255) if x < 16 else (0, 0, 0, 255))
+    # 遮罩图:全黑 -> 高光完全消失。
+    mask = make_face_sdf.write_png(
+        os.path.join(OUT, "art", "spec_mask.png"), 4, 4,
+        lambda _x, _y: (0, 0, 0, 255))
+    return shape, mask
+
+
+def make_spec_scene():
+    """只放一颗球 + 相机 + 光的小场景,专给高光探针用(不和扫光抢)。"""
+    ext = [
+        '[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="sh_toon"]',
+        '[ext_resource type="Script" path="res://spec_probe.gd" id="sh_spec"]',
+        '[ext_resource type="ShaderMaterial" path="res://materials/Spec_plain.tres" id="m_spec"]',
+    ]
+    subs = [
+        '[sub_resource type="SphereMesh" id="spec_sphere"]\n'
+        "radius = 0.9\n"
+        "height = 1.8\n"
+        "radial_segments = 48\n"
+        "rings = 24",
+        '[sub_resource type="Environment" id="spec_env"]\n'
+        "background_mode = 1\n"
+        "background_color = Color(0.02, 0.02, 0.03, 1)\n"
+        "ambient_light_source = 3\n"
+        "ambient_light_energy = 0.0\n"
+        "tonemap_mode = 2",
+    ]
+    parts = [f"[gd_scene load_steps={len(ext) + len(subs) + 1} format=3]", ""]
+    parts += ext
+    parts.append("")
+    parts += subs
+    parts.append("")
+    parts.append('[node name="SpecRoot" type="Node3D"]')
+    parts.append('script = ExtResource("sh_spec")')
+    parts.append("")
+    parts.append('[node name="WorldEnvironment" type="WorldEnvironment" parent="."]')
+    parts.append('environment = SubResource("spec_env")')
+    parts.append("")
+    parts.append('[node name="KeyLight" type="DirectionalLight3D" parent="."]')
+    parts.append("transform = Transform3D(0.86, -0.35, 0.37, 0, 0.73, 0.68, "
+                 "-0.51, -0.59, 0.63, 2, 3, 2)")
+    parts.append("light_energy = 0.5")
+    parts.append("")
+    parts.append('[node name="Camera" type="Camera3D" parent="."]')
+    parts.append("transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3.2)")
+    parts.append("fov = 45.0")
+    parts.append("")
+    parts.append('[node name="SpecBall" type="MeshInstance3D" parent="."]')
+    parts.append('mesh = SubResource("spec_sphere")')
+    parts.append('material_override = ExtResource("m_spec")')
+    return write(os.path.join(OUT, "spec.tscn"), "\n".join(parts) + "\n")
+
+
 def main():
     if not os.path.isdir(SHADER_SRC):
         print(f"找不到着色器目录: {SHADER_SRC}")
@@ -279,12 +367,34 @@ def main():
 
     for index, (name, albedo, params) in enumerate(MATERIAL_VARIANTS):
         make_material(name, albedo, params, with_outline=(index == 3))
+
+    # 高光贴图那三份材质(第一百零一轮)
+    make_spec_textures()
+    # 基础色**故意压得很暗**:这三颗球是拿来数"亮点"的 ——
+    # 底色一亮,整个球体都算亮点,高光有没有贴图就分不出来了(实测踩到:
+    # 三份材质的 bright 一模一样都是 18763)。压暗之后,**只有高光**是亮的。
+    spec_color = (0.10, 0.10, 0.12)
+    make_material("Spec_plain", spec_color, dict(SPEC_PARAMS),
+                  with_outline=False)
+    make_material("Spec_ring", spec_color, dict(SPEC_PARAMS),
+                  with_outline=False,
+                  textures=[("specular_shape_texture",
+                             "res://art/spec_shape.png", "spec_shape")],
+                  extra_steps=1)
+    make_material("Spec_blocked", spec_color, dict(SPEC_PARAMS),
+                  with_outline=False,
+                  textures=[("specular_mask_texture",
+                             "res://art/spec_mask.png", "spec_mask")],
+                  extra_steps=1)
+
     make_scene()
+    make_spec_scene()
 
     print(f"已生成 NPR demo: {OUT}")
     print(f"  着色器: {', '.join(copied)}")
-    print(f"  材质变体: {len(MATERIAL_VARIANTS)} 个")
+    print(f"  材质变体: {len(MATERIAL_VARIANTS)} 个 + 高光贴图 3 份")
     print("  场景: Main.tscn (4 个球对比 + 带描边的胶囊 + 面部 SDF 头像)")
+    print("        spec.tscn (高光贴图探针:实心 / 空心环 / 被遮罩抹掉)")
     return 0
 
 

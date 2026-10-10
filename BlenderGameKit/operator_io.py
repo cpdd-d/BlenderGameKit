@@ -2155,6 +2155,106 @@ class GK_OT_PickImage(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ── 高光贴图 / 预览材质(第一百零一轮:侧栏『卡通材质』盒)──────────────
+class GK_OT_PickMaterialImage(bpy.types.Operator):
+    """给某个材质的『高光形状贴图』/『高光遮罩贴图』挑一张图。
+
+    ── 为什么不是像界面图片那样挂在节点上 ──────────────────────────
+    界面图片是**节点**上的一个栏位(`node.gk_image`),而高光贴图属于
+    **材质**(一个材质一张,所有用到它的物体共用)。所以这里写进材质的
+    自定义属性(`npr_preview.set_texture`),导出时由 asset_export 落盘成
+    `art/ui_xxx.png` 再写进 .tres。
+    """
+
+    bl_idname = "gk.pick_material_image"
+    bl_label = "选高光贴图"
+    bl_description = "把这张图设为该材质的高光贴图(导出时带进 Godot)"
+    bl_property = "image_name"
+
+    material_name: StringProperty(name="材质", default="")
+    uniform: StringProperty(name="槽位", default="specular_shape_texture")
+    image_name: EnumProperty(name="图片", items=image_items)
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        from . import npr_preview
+
+        material = bpy.data.materials.get(self.material_name)
+        if material is None:
+            _report(self, "WARNING", "找不到那个材质(可能刚被删了)")
+            return {"CANCELLED"}
+        if self.uniform not in npr_preview.TEXTURE_KEYS:
+            _report(self, "WARNING", "不认识这个高光贴图槽位")
+            return {"CANCELLED"}
+        if not self.image_name:
+            _report(self, "WARNING", "工程里还没有可选的图片(先导入一张图)")
+            return {"CANCELLED"}
+        npr_preview.set_texture(material, self.uniform, self.image_name)
+        _report(self, "INFO",
+                f"{npr_preview.texture_key(self.uniform)} -> {self.image_name}")
+        return {"FINISHED"}
+
+
+class GK_OT_ClearMaterialImage(bpy.types.Operator):
+    """清掉某个材质的高光贴图(退回"只用高光参数"的老行为)。"""
+
+    bl_idname = "gk.clear_material_image"
+    bl_label = "清掉高光贴图"
+    bl_description = "不再用这张贴图(导出时也不带它进 Godot)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    material_name: StringProperty(name="材质", default="")
+    uniform: StringProperty(name="槽位", default="specular_shape_texture")
+
+    def execute(self, context):
+        from . import npr_preview
+
+        material = bpy.data.materials.get(self.material_name)
+        if material is None or self.uniform not in npr_preview.TEXTURE_KEYS:
+            return {"CANCELLED"}
+        npr_preview.set_texture(material, self.uniform, "")
+        _report(self, "INFO", f"已清掉『{npr_preview.texture_key(self.uniform)}』")
+        return {"FINISHED"}
+
+
+class GK_OT_RebuildMaterialPreview(bpy.types.Operator):
+    """按当前参数(重新)生成 NPR 预览材质:补参数属性 + 重建节点树。
+
+    ── 为什么需要它(第一百零一轮)──────────────────────────────────
+    高光参数存在材质**自定义属性**上(导出读的就是那里),但 Blender 视口
+    里看到的其实是另一套 EEVEE 节点。两边的桥就是这个算子:
+      * 材质上还没有这些属性(用户自己的 Principled 材质)-> 建出来,
+        基础色从他原本的颜色带过来(不洗成默认粉);
+      * 已经有属性 -> 按现在的值重建节点,改完参数点一下就能看到效果。
+    """
+
+    bl_idname = "gk.rebuild_material_preview"
+    bl_label = "生成 / 刷新预览材质"
+    bl_description = ("按当前参数生成 NPR 预览材质(在 Blender 里就能看到"
+                      "卡通着色 / 高光贴图效果)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    material_name: StringProperty(name="材质", default="")
+
+    def execute(self, context):
+        from . import npr_preview
+
+        material = bpy.data.materials.get(self.material_name)
+        if material is None:
+            _report(self, "WARNING", "找不到那个材质(可能刚被删了)")
+            return {"CANCELLED"}
+        params = npr_preview.read_params(material)
+        if not npr_preview.has_param(material, "albedo_color"):
+            params["albedo_color"] = tuple(
+                npr_preview.base_color_from_principled(material))
+        npr_preview.update_material(material, params)
+        _report(self, "INFO", f"已按当前参数重建『{material.name}』的预览材质")
+        return {"FINISHED"}
+
+
 # ── 音频资产(第四十三轮:『游戏资产』图的『资产_声音卡』)──────────────
 def sound_asset_items(_self=None, _context=None):
     """资产库里所有声音卡,给音效节点卡上的『从资产库挑』用。
@@ -4006,6 +4106,10 @@ GK_CLASSES = (
     GK_OT_PickAsset,
     # 挑一张图片当界面图片 / 对话框立绘(第三十七轮 UI 设计)
     GK_OT_PickImage,
+    # 高光贴图 + NPR 预览材质(第一百零一轮:侧栏『卡通材质』盒)
+    GK_OT_PickMaterialImage,
+    GK_OT_ClearMaterialImage,
+    GK_OT_RebuildMaterialPreview,
     # 真预览:把相机沿曲线跑一遍(所见即所得,不产生游戏代码)
     GK_OT_PreviewCameraPath,
     # 动作分类标签(给动作打"静止/移动/攻击…",导出时按分类成表)

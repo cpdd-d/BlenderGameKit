@@ -79,6 +79,33 @@ def rebuild_demo():
     return ok
 
 
+def run_spec_headless(godot):
+    """高光贴图的**无头**那一半:只验"接线"(第一百零一轮)。
+
+    无头能加载 .tres / 贴图资源(渲染器是 dummy,但资源系统是真的),
+    所以"材质能不能加载 / 着色器在不在 / 贴图有没有绑上 / 开关对不对"
+    这一层无头就能验 —— 而且**不用 GPU**,任何机器都跑得到。
+    """
+    env = dict(os.environ)
+    env["GK_SPEC_CHECK"] = "1"
+    run = subprocess.run(
+        [godot, "--headless", "--path", DEMO, "res://spec.tscn"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env, timeout=120)
+    return (run.stdout or "") + (run.stderr or "")
+
+
+def run_spec_render(godot):
+    """高光贴图的**真 GPU**那一半:同一颗球换三份材质各出一张图。"""
+    env = dict(os.environ)
+    env["GK_SPEC"] = "1"
+    run = subprocess.run(
+        [godot, "--path", DEMO, "res://spec.tscn", "--resolution", "480x480"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env, timeout=180)
+    return (run.stdout or "") + (run.stderr or "")
+
+
 def run_sweep(godot):
     """真窗口跑扫光。返回 (stdout+stderr, 是否开得起来)。"""
     if os.path.isdir(OUT):
@@ -213,6 +240,107 @@ def main():
             log("✗ " + problem)
         print("CHECK_RENDER_DEMO=FAILED")
         return 1
+
+    # ---- 第一百零一轮:高光形状 / 遮罩贴图 ----
+    #
+    # ── 为什么分两半 ──────────────────────────────────────────────────
+    # 「接线」无头就能验(材质 / 着色器 / 贴图 / 开关),任何机器都跑得到;
+    # 「像素」必须真 GPU 出图 —— 无头是 dummy 渲染器。所以接线那半**判红**,
+    # 像素那半跟着扫光那一层走(开不出窗口就跳过)。
+    spec_problems = []
+    # 先导入一次:新写出来的两张高光贴图(PNG)要有 .import 才 load 得到。
+    # 不导入的话 .tres 里的 ext_resource 全部找不到,load() 直接返回 null
+    # —— 看起来像"材质坏了",其实只是没导入(实测踩到)。
+    subprocess.run([godot, "--headless", "--path", DEMO, "--import"],
+                   capture_output=True, text=True, encoding="utf-8",
+                   errors="replace")
+    try:
+        headless = run_spec_headless(godot)
+    except subprocess.TimeoutExpired:
+        headless = ""
+        spec_problems.append("高光贴图的无头检查超时")
+    for line in headless.splitlines():
+        if "GK_SPEC_CHECK" in line:
+            log(line.strip())
+    if "GK_SPEC_CHECK=DONE" not in headless or "loaded=false" in headless:
+        # 材质加载失败时把 Godot 自己的报错也带出来(不然只剩"没接上"三个字)
+        for line in headless.splitlines():
+            if re.search(r"ERROR|error|Failed|Can't|Cannot", line):
+                log("   " + line.strip())
+    for name in ("plain", "ring", "blocked"):
+        # 没设过的开关读回来是 `<null>`(手写的那三份材质只在有贴图时才写
+        # 开关)—— 当作 0 处理。
+        found = re.search(rf"GK_SPEC_CHECK name={name} loaded=true has_shader=true"
+                          rf".*use_shape=([-\d.]+|<null>)"
+                          rf" use_mask=([-\d.]+|<null>)"
+                          rf" shape_w=(-?\d+) mask_w=(-?\d+)", headless)
+        if not found:
+            spec_problems.append(f"高光材质『{name}』没加载成功 / 拿不到参数"
+                                 f"(着色器或贴图没接上?)")
+            continue
+        use_shape = 0.0 if found.group(1) == "<null>" else float(found.group(1))
+        use_mask = 0.0 if found.group(2) == "<null>" else float(found.group(2))
+        shape_w = int(found.group(3))
+        mask_w = int(found.group(4))
+        want = {"plain": (0.0, 0.0), "ring": (1.0, 0.0), "blocked": (0.0, 1.0)}
+        if (use_shape, use_mask) != want[name]:
+            spec_problems.append(
+                f"高光材质『{name}』的开关不对(shape={use_shape} "
+                f"mask={use_mask},期望 {want[name]})")
+        if name == "ring" and shape_w <= 0:
+            spec_problems.append("ring 的形状贴图没绑上(width<=0)")
+        if name == "blocked" and mask_w <= 0:
+            spec_problems.append("blocked 的遮罩贴图没绑上(width<=0)")
+        if name == "plain" and (shape_w > 0 or mask_w > 0):
+            spec_problems.append("plain 不该有贴图,却绑上了")
+    if "GK_SPEC_CHECK=DONE" not in headless:
+        spec_problems.append("高光贴图的无头检查没跑完(材质加载失败?)")
+
+    # 像素那一半:开得出窗口才跑。
+    # ⚠ 判据用"扫光真的出了图"(files 非空)—— 不能用 _no_display():
+    # 那个是给"一张都没出"那条路用的宽泛关键词表(Godot 正常启动也会打
+    # "vulkan" 之类的字样),拿它当"有没有窗口"会误判成没 GPU(实测)。
+    spec_bright = {}
+    if len(files) >= 1:
+        try:
+            spec_text = run_spec_render(godot)
+        except subprocess.TimeoutExpired:
+            spec_text = ""
+        for line in spec_text.splitlines():
+            if "GK_SPEC" in line and "GK_SPEC_CHECK" not in line:
+                log(line.strip())
+        for name in ("plain", "ring", "blocked"):
+            found = re.search(rf"GK_SPEC name={name} bright=(\d+)", spec_text)
+            if found:
+                spec_bright[name] = int(found.group(1))
+        if "GK_SPEC=DONE" not in spec_text:
+            spec_problems.append("高光贴图的出图检查没跑完(开得出窗口却挂了?)")
+        elif len(spec_bright) < 3:
+            spec_problems.append(f"三份材质的亮点统计不全:{spec_bright}")
+        else:
+            plain = spec_bright["plain"]
+            ring = spec_bright["ring"]
+            blocked = spec_bright["blocked"]
+            if plain < 50:
+                spec_problems.append(
+                    f"没有贴图的实心高光本身就没画出来(bright={plain})")
+            if not ring < plain:
+                spec_problems.append(
+                    f"形状贴图没起作用(空心环 bright={ring} 不小于实心 "
+                    f"{plain})")
+            if blocked > max(2, plain // 20):
+                spec_problems.append(
+                    f"遮罩贴图没起作用(全黑遮罩下还有 {blocked} 个亮点)")
+            log(f"高光亮点数:实心={plain} 空心环={ring} 被遮罩={blocked}")
+    else:
+        log("跳过高光贴图的出图检查:开不出窗口 / 没有 GPU(接线那半已验)")
+
+    if spec_problems:
+        for problem in spec_problems:
+            log("✗ " + problem)
+        print("CHECK_RENDER_DEMO=FAILED")
+        return 1
+
     print("CHECK_RENDER_DEMO=OK")
     return 0
 
