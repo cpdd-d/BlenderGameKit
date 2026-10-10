@@ -2847,6 +2847,16 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
                 col.label(
                     text="脚下响度会乘进脚步声(配『声音_脚下响度』节点)",
                     icon="INFO")
+            # ── 动态障碍(第八十三轮:寻路第三版)──────────────────────
+            # 勾了 = 导出时给这个物体挂 NavigationObstacle2D/3D ——
+            # 勾『避障』的角色实时绕开它,不用重烤导航网格。
+            # ⚠ 触发器(Area)**也能**勾:没有物理碰撞、只有避障理它 ——
+            #   这就是"幽灵障碍"(示例 demo_nav2d 的对照就是这么做的),
+            #   所以这一行**不**跟着 is_trigger 置灰。
+            nav_row = col.row(align=True)
+            nav_row.prop(physics, "nav_obstacle", toggle=True)
+            if physics.nav_obstacle:
+                nav_row.prop(physics, "nav_obstacle_radius", text="半径", slider=True)
 
         # ── 子物体碰撞块(本轮:"人形头/身/腿各摆一个")────────────────
         # 勾上 = 这个物体不出现在画面里,形状并入父物体的碰撞体。

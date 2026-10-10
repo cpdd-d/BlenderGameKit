@@ -4454,6 +4454,73 @@ def main():
         check("第八十一轮(界面收尾:皮肤 / 多行框 / 立绘 / 历史 / 循环)",
               False, f"{type(exc).__name__}: {exc}")
 
+    # ---- 第八十三轮(寻路第三版第一小件):动态障碍 NavigationObstacle ----
+    # 物体『游戏物理』勾『动态障碍』+『障碍半径』-> 导出时给它挂一个
+    # NavigationObstacle2D / 3D 子节点(勾了『避障』的角色实时绕开它,
+    # 不用重烤导航网格)。没勾的物体一个字都不多。
+    try:
+        import shutil
+        r83_ui = import_module(f"{module_name}.ui")
+        asset_export = import_module(f"{module_name}.asset_export")
+        r83_work = os.path.join(tempfile.gettempdir(), "gk_navobstacle83")
+        shutil.rmtree(r83_work, ignore_errors=True)
+        os.makedirs(r83_work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 1.0))
+        r83_pillar = bpy.context.active_object
+        r83_pillar.name = "会动的柱子"
+        r83_pillar.gk_physics.nav_obstacle = True
+        r83_pillar.gk_physics.nav_obstacle_radius = 2.0
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(6.0, 0.0, 1.0))
+        r83_plain = bpy.context.active_object
+        r83_plain.name = "普通箱子"
+        bpy.context.view_layer.update()
+        check("动态障碍:属性在物理面板上(默认关 / 半径默认 1.0)",
+              hasattr(r83_plain.gk_physics, "nav_obstacle")
+              and r83_plain.gk_physics.nav_obstacle is False
+              and abs(r83_plain.gk_physics.nav_obstacle_radius - 1.0) < 1e-6
+              and r83_pillar.gk_physics.nav_obstacle is True,
+              f"{getattr(r83_plain.gk_physics, 'nav_obstacle', '<no prop>')}")
+        check("动态障碍:纯函数(半径透出 + 0 钳到 0.05)",
+              abs(asset_export.nav_obstacle_radius_of(
+                  r83_pillar.gk_physics) - 2.0) < 1e-6
+              and asset_export.nav_obstacle_radius_of(
+                  r83_plain.gk_physics) is None)
+
+        # ── 面板 draw:勾着 / 没勾两条路都要画得完 ──────────────────
+        r83_draw_error = ""
+        try:
+            r83_panel = r83_ui.GK_PT_ObjectPhysics
+            for r83_target in (r83_pillar, r83_plain):
+                r83_layout = _R79Layout()
+                r83_holder = type("P", (), {"layout": r83_layout})()
+                r83_ctx = type("C", (), {"object": r83_target,
+                                         "scene": bpy.context.scene})()
+                r83_panel.draw(r83_holder, r83_ctx)
+        except Exception as exc:                       # noqa: BLE001
+            r83_draw_error = f"{type(exc).__name__}: {exc}"
+        check("第八十三轮:『游戏物理』面板(动态障碍 勾/不勾)画得完",
+              not r83_draw_error, r83_draw_error)
+
+        # ── 真导出:tscn 里挂上 NavigationObstacle3D ────────────────
+        asset_export.export_scene_glb(r83_work, "World")
+        r83_world_path, _r83_n = asset_export.write_world_scene(
+            r83_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r83_world_path, encoding="utf-8") as r83_handle:
+            r83_world_text = r83_handle.read()
+        check("动态障碍:勾了的物体挂 NavigationObstacle3D + 半径,"
+              "没勾的没有",
+              '[node name="NavObstacle" type="NavigationObstacle3D" '
+              'parent="Colliders/会动的柱子"]' in r83_world_text
+              and "radius = 2.000000" in r83_world_text
+              and r83_world_text.count("NavigationObstacle3D") == 1,
+              r83_world_text[-400:])
+    except Exception as exc:
+        check("第八十三轮(动态障碍 NavigationObstacle)", False,
+              f"{type(exc).__name__}: {exc}")
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

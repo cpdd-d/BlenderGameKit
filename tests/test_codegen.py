@@ -16651,6 +16651,63 @@ class TestRound80FleeNavAndHearing(Base):
             types.SimpleNamespace(surface_loudness=0.0)), 0.0)
 
 
+class TestRound83NavObstacle(Base):
+    """第八十三轮(寻路第三版第一小件):动态障碍 `NavigationObstacle`。
+
+    物体『游戏物理』勾『动态障碍』-> 导出时给它挂一个
+    `NavigationObstacle2D / 3D` 子节点(半径 = 『障碍半径』)——
+    勾了『避障』的角色会**实时绕开它,不用重烤导航网格**。
+    没勾的老图一个字都不多(纯函数返回空)。
+    """
+
+    def _physics(self, **props):
+        return types.SimpleNamespace(**props)
+
+    def test_radius_of_default_and_clamp(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertIsNone(ae.nav_obstacle_radius_of(None))
+        self.assertIsNone(ae.nav_obstacle_radius_of(self._physics()))
+        self.assertIsNone(ae.nav_obstacle_radius_of(
+            self._physics(nav_obstacle=False, nav_obstacle_radius=2.0)))
+        # 勾了:默认半径 1.0;值原样透出来
+        self.assertAlmostEqual(ae.nav_obstacle_radius_of(
+            self._physics(nav_obstacle=True)), 1.0)
+        self.assertAlmostEqual(ae.nav_obstacle_radius_of(
+            self._physics(nav_obstacle=True, nav_obstacle_radius=2.5)), 2.5)
+        # 0 / 负数钳到 0.05:填 0 时 Godot 会当成"没有障碍"静默不生效
+        self.assertAlmostEqual(ae.nav_obstacle_radius_of(
+            self._physics(nav_obstacle=True, nav_obstacle_radius=0.0)), 0.05)
+        self.assertAlmostEqual(ae.nav_obstacle_radius_of(
+            self._physics(nav_obstacle=True, nav_obstacle_radius=-3.0)), 0.05)
+
+    def test_node_lines_3d_and_2d(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.nav_obstacle_node_lines(
+            self._physics(), True, "箱子"), [])
+        lines3 = ae.nav_obstacle_node_lines(
+            self._physics(nav_obstacle=True, nav_obstacle_radius=1.5),
+            True, "箱子")
+        self.assertIn('[node name="NavObstacle" type="NavigationObstacle3D" '
+                      'parent="Colliders/箱子"]', lines3)
+        self.assertIn("radius = 1.500000", lines3)
+        lines2 = ae.nav_obstacle_node_lines(
+            self._physics(nav_obstacle=True), False, "幽灵")
+        self.assertIn('[node name="NavObstacle" type="NavigationObstacle2D" '
+                      'parent="Colliders/幽灵"]', lines2)
+
+    def test_property_registered_on_physics(self):
+        """真实属性组上有这两个字段(冒烟那层再验真机 + 真导出)。
+
+        ⚠ 这些属性是**类注解**(`nav_obstacle: BoolProperty(...)`),
+        Blender 在注册时才把它们变成真属性 —— 所以这里查 `__annotations__`,
+        查 `dir()` 是空的(第一版就是这么写错的)。
+        """
+        from BlenderGameKit import properties
+        names = set(getattr(properties.GKObjectSettings, "__annotations__", {}))
+        self.assertIn("nav_obstacle", names)
+        self.assertIn("nav_obstacle_radius", names)
+
+
 class TestRound81UiPolish(Base):
     """第八十一轮(F 组 15 + 16):界面收尾 —— 皮肤 / 滚动条 / 选中高亮 /
     软键盘·IME / 多行输入框 / 点击音效 / 字幕立绘 / 历史导出·跳回 /

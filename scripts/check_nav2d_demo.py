@@ -66,10 +66,16 @@ var goal_d: Node2D = null
 var sep_avoid := 1.0e9    # 避障对的最小间距
 var sep_plain := 1.0e9    # 对照对的最小间距
 var dev_avoid := 0.0      # 避障对最大横向偏离(诊断用)
+# ── 第八十三轮:动态障碍(幽灵)────────────────────────────────
+var ghost_a: Node2D = null    # 避障车道正中那个(Area2D + 动态障碍)
+var ghost_b: Node2D = null    # 对照车道正中那个
+var ghost_dist_a := 1.0e9     # 避障对离幽灵最近到过多少
+var ghost_dist_b := 1.0e9     # 对照对离幽灵最近到过多少
 const LANE_X := 5.0
 const AVOID_Y := 3.0
 const PLAIN_Y := -3.0
 const LANE_WINDOW := 5.5  # 车道实验窗口(秒)
+const GHOST_SWING := 1.0  # 幽灵沿 x 来回挪的幅度(模拟会动的柱子)
 
 
 func _ready() -> void:
@@ -90,6 +96,8 @@ func _ready() -> void:
 	goal_b = _node2d("终点乙")
 	goal_c = _node2d("终点丙")
 	goal_d = _node2d("终点丁")
+	ghost_a = _node2d("幽灵甲")
+	ghost_b = _node2d("幽灵乙")
 	var regions := world.find_children("Navigation", "NavigationRegion2D", true, false)
 	if not regions.is_empty():
 		var poly := (regions[0] as NavigationRegion2D).navigation_polygon
@@ -214,6 +222,8 @@ func _lane_setup() -> void:
 	sep_avoid = 1.0e9
 	sep_plain = 1.0e9
 	dev_avoid = 0.0
+	ghost_dist_a = 1.0e9
+	ghost_dist_b = 1.0e9
 	lane_mode = true
 	lane_at = elapsed
 	var avoid_text := "avoid=<none>"
@@ -236,12 +246,30 @@ func _lane_reset(body: CharacterBody2D, at: Vector2) -> void:
 
 
 func _lane_sample() -> void:
+	# ── 幽灵障碍(第八十三轮):每帧沿 x 来回挪(模拟会动的柱子)────
+	# 导航网格是**启动时烤好的**,这里挪它不会重烤 —— 正好证明
+	# "NavigationObstacle 不用重烤就能绕"。
+	var swing := sin((elapsed - lane_at) * 1.6) * GHOST_SWING
+	if ghost_a != null:
+		ghost_a.global_position.x = swing
+	if ghost_b != null:
+		ghost_b.global_position.x = -swing
 	if avoid_a != null and avoid_b != null:
 		sep_avoid = minf(sep_avoid, avoid_a.global_position.distance_to(
 			avoid_b.global_position))
 		dev_avoid = maxf(dev_avoid, maxf(
 			absf(avoid_a.global_position.y - AVOID_Y),
 			absf(avoid_b.global_position.y - AVOID_Y)))
+	if ghost_a != null:
+		for body in [avoid_a, avoid_b]:
+			if body != null:
+				ghost_dist_a = minf(ghost_dist_a, body.global_position.distance_to(
+					ghost_a.global_position))
+	if ghost_b != null:
+		for body in [plain_c, plain_d]:
+			if body != null:
+				ghost_dist_b = minf(ghost_dist_b, body.global_position.distance_to(
+					ghost_b.global_position))
 	if plain_c != null and plain_d != null:
 		sep_plain = minf(sep_plain, plain_c.global_position.distance_to(
 			plain_d.global_position))
@@ -276,6 +304,15 @@ func _lane_finish() -> void:
 		" min_sep=", "%.2f" % sep_avoid, " dev=", "%.2f" % dev_avoid)
 	print("NAV2D_AVOID_CTRL ok=", ok_plain, " c=", got_c, " d=", got_d,
 		" min_sep=", "%.2f" % sep_plain)
+	# ── 第八十三轮:动态障碍(幽灵)两问 ─────────────────────────
+	# ① 避障对**没有穿过**幽灵障碍(最近距离 ≥ 0.9,幽灵半径 0.8):
+	#    幽灵没有物理碰撞,能保距只可能是避障在起作用;
+	# ② 对照对**直接穿过去了**(最近距离 ≤ 0.4):证明幽灵确实没有物理碰撞,
+	#    ① 的保距不是"被撞住的"。
+	var ok_ghost: bool = ghost_dist_a >= 0.9 and ghost_dist_b <= 0.4
+	print("NAV2D_OBSTACLE ok=", ok_ghost,
+		" avoid_min=", "%.2f" % ghost_dist_a,
+		" ctrl_min=", "%.2f" % ghost_dist_b)
 	print("NAV2D_DONE")
 	done = true
 	# ── 内置 ESC 退出(第三十九轮)────────────────────────────────
@@ -384,6 +421,12 @@ def main():
         print("✗ 避障对照组不对(不勾避障那对应该**顶死在中点**——"
               "它们要是也到了,说明这个对照没验出东西):",
               [line for line in text.splitlines() if "NAV2D_AVOID_CTRL" in line])
+        ok = False
+    # ── 第八十三轮:动态障碍(幽灵,NavigationObstacle)──────────────
+    if not re.search(r"NAV2D_OBSTACLE ok=true", text):
+        print("✗ 动态障碍没生效(勾『动态障碍』的幽灵没被避障绕开 / "
+              "对方没穿过去 —— 幽灵是 Area,不该有物理碰撞):",
+              [line for line in text.splitlines() if "NAV2D_OBSTACLE" in line])
         ok = False
     if not re.search(r"NAV2D_CAM current=true covers=true", text):
         print("✗ 2D 兜底相机没生效(运行后看不到内容 / 视角错乱):",

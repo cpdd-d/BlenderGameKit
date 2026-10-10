@@ -71,6 +71,15 @@ LANE_STOP = 0.5            # 到点多近算到了
 AVOID_RADIUS = 0.6         # 避障半径(RVO 里"我占多大地方")
 AVOID_LANE_Y = 3.0         # 勾避障那对的车道
 PLAIN_LANE_Y = -3.0        # 不勾避障(对照)那对的车道
+# ── 第八十三轮:动态障碍(NavigationObstacle)─────────────────────────
+# 两条车道正中各摆一个"幽灵障碍":物体是 **Area2D**(没有物理碰撞,
+# 谁也撞不到它),但在『游戏物理』里勾了『动态障碍』-> 导出时挂一个
+# NavigationObstacle2D —— **勾了避障的人会绕开它,不勾的直接穿过去**。
+# 探针还会每帧把它沿 x 来回挪(模拟会动的柱子),证明不用重烤导航网格。
+GHOST_RADIUS = 0.8         # 幽灵障碍半径(避障系统按它保距)
+GHOST_SWING = 1.0          # 探针来回挪的幅度(米)
+GHOST_NAME_A = "幽灵甲"
+GHOST_NAME_B = "幽灵乙"
 
 
 def log(message):
@@ -159,6 +168,14 @@ def build_scene():
                                     (LANE_X, y, 0.0), marker_color)
         lanes[goal_right] = make_box(goal_right, (0.6, 0.6, 1.0),
                                      (-LANE_X, y, 0.0), marker_color)
+    # 幽灵障碍(第八十三轮):两条车道正中各一个(Area2D + 动态障碍)
+    ghost_color = (0.95, 0.45, 0.95, 1.0)
+    lanes[GHOST_NAME_A] = make_box(
+        GHOST_NAME_A, (1.2, 1.2, 1.0), (0.0, AVOID_LANE_Y, 0.0), ghost_color)
+    lanes[GHOST_NAME_B] = make_box(
+        GHOST_NAME_B, (1.2, 1.2, 1.0), (0.0, PLAIN_LANE_Y, 0.0), ghost_color)
+    log(f"幽灵障碍:{GHOST_NAME_A} / {GHOST_NAME_B}(半径 {GHOST_RADIUS:g},"
+        f"无物理碰撞;探针会沿 x 来回挪 ±{GHOST_SWING:g})")
     log(f"对撞车道:避障对 y={AVOID_LANE_Y:g}(甲/乙) / "
         f"对照对 y={PLAIN_LANE_Y:g}(丙/丁);两端 x=±{LANE_X:g}")
     log(f"场景:场地 {ARENA_HALF_X * 2:.0f}x{ARENA_HALF_Y * 2:.0f} / "
@@ -191,6 +208,12 @@ def write_physics(scene, chaser, player, lanes):
         elif obj.name in lanes:
             if obj.name.startswith("终点"):
                 physics.body_type = "Area2D"
+            elif obj.name.startswith("幽灵"):
+                # 幽灵障碍(第八十三轮):Area2D(没有物理碰撞)+ 动态障碍 ——
+                # 只有"避障"会理它,所以对照对会直接穿过去(探针拿这个当证据)
+                physics.body_type = "Area2D"
+                physics.nav_obstacle = True
+                physics.nav_obstacle_radius = GHOST_RADIUS
             else:
                 physics.body_type = "CharacterBody2D"
         elif getattr(obj, "type", "") == "MESH":

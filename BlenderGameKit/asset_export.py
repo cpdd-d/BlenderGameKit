@@ -2526,6 +2526,45 @@ def surface_loudness_of(physics):
     return value
 
 
+# ── 动态障碍(第八十三轮:寻路第三版)──────────────────────────────
+# 勾了『动态障碍』的物体,导出时多挂一个 NavigationObstacle2D / 3D 子节点。
+# 它的半径交给**避障系统**(RVO):勾了『避障』的角色会实时绕开它,
+# **不用重烤导航网格** —— 这就是"会动的挡路物"的正确做法
+# (重烤是整张网重算,每帧挪一点的柱子扛不住)。
+NAV_OBSTACLE_NODE = "NavObstacle"
+
+
+def nav_obstacle_radius_of(physics):
+    """物体『动态障碍』的半径;没勾返回 None(不挂节点)。
+
+    半径钳到 ≥ 0.05:填 0 / 负数时 Godot 那边会把它当成"没有障碍",
+    静默不生效 —— 这种"看起来勾了却没用"最难查,所以这里兜住。
+    """
+    if physics is None:
+        return None
+    if not getattr(physics, "nav_obstacle", False):
+        return None
+    try:
+        radius = float(getattr(physics, "nav_obstacle_radius", 1.0))
+    except (TypeError, ValueError):
+        radius = 1.0
+    return max(0.05, radius)
+
+
+def nav_obstacle_node_lines(physics, is_3d, parent_name):
+    """动态障碍在 .tscn 里的那几行(没勾 = 空列表,老图一字不变)。"""
+    radius = nav_obstacle_radius_of(physics)
+    if radius is None:
+        return []
+    node_type = "NavigationObstacle3D" if is_3d else "NavigationObstacle2D"
+    return [
+        f'[node name="{NAV_OBSTACLE_NODE}" type="{node_type}" '
+        f'parent="Colliders/{parent_name}"]',
+        f"radius = {_fmt(radius)}",
+        "",
+    ]
+
+
 def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
                       materials_map=None, character_model=None, file_names=None,
@@ -2941,6 +2980,10 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 # 子物体碰撞块:和主 Collision 同级各来一个(头/身/腿…)
                 lines.extend(_collision_piece_node_lines(
                     piece_entries, is_3d, obj.name))
+                # 动态障碍(第八十三轮):勾了『动态障碍』就多挂一个
+                # NavigationObstacle 子节点 —— 勾了『避障』的角色实时绕开它
+                lines.extend(nav_obstacle_node_lines(
+                    physics, is_3d, _sanitize_node_name(obj.name)))
                 # ── 网格的重复偏移在这里抵消 ──────────────────────────────
                 # Model 拿到 glb 根节点变换的**逆**,于是
                 #     角色节点变换 × 逆 × glb 根节点变换 = 角色节点变换
@@ -3004,6 +3047,10 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             # 子物体碰撞块:和主 Collision 同级各来一个
             lines.extend(_collision_piece_node_lines(piece_entries, is_3d,
                                                      obj.name))
+            # 动态障碍(第八十三轮):勾了『动态障碍』就多挂一个
+            # NavigationObstacle 子节点 —— 勾了『避障』的角色实时绕开它
+            lines.extend(nav_obstacle_node_lines(
+                physics, is_3d, _sanitize_node_name(obj.name)))
 
     # ---- 粒子节点落位(容器要先声明,子节点才挂得上)----
     if fx_blocks:
