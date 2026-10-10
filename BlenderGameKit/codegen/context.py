@@ -188,6 +188,9 @@ class GenContext:
         self.need_collision_helper = False
         # 只有真的用了『资产_创建实例』才生成 _gk_spawn_asset()
         self.need_asset_spawn_helper = False
+        # 网络联机(第一百轮):用过联机节点才生成那组 ENet 辅助函数 +
+        # `@rpc` 收消息方法(见 codegen/network.py)
+        self.need_net = False
         # 『资产_创建实例』节点 -> 它生成的那个**临时变量名**。
         # 节点的『实例』输出就是它(见 statements._expr_asset_spawn_outputs):
         # 运行时的节点引用只能靠变量传,而创建和用它通常在一条执行流上,
@@ -797,6 +800,15 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             if owner is not None:
                 return EVENT_PARAM_NAMES.get(owner.bl_idname, "delta")
             return "delta"
+        # ── 事件节点的"数据输出"(第一百轮:联机)─────────────────────
+        # 事件节点(有人进来 / 收到消息)的输出不是一个表达式,而是"回调
+        # 先写进成员变量、用户那条链再读它"。节点类用
+        # `gk_event_output_vars` 声明"哪个输出对应哪个成员变量"。
+        owner = self._socket_source_event(socket)
+        if owner is not None:
+            mapping = getattr(owner, "gk_event_output_vars", None)
+            if mapping and name in mapping:
+                return mapping[name]
         if S.is_any(socket) or getattr(socket, "bl_idname", "") == "NodeSocketObject":
             return "null"
         gd_type = S.gdscript_type(getattr(socket, "bl_idname", ""))

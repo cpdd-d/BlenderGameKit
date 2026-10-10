@@ -5570,6 +5570,95 @@ def main():
         check("第九十九轮(遮挡体)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百轮:网络联机(ENet 房间 + 自定义消息)----
+    # 真 Blender 才能验的:7 个节点真的注册上了、属性真的声明出来了、
+    # 真图上连线后生成的代码里有那几行(尤其是『谁』/『谁发的』这种
+    # "事件节点的数据输出"能不能解析成成员变量)。
+    try:
+        r100_ids = ("GKNodeNetHost", "GKNodeNetJoin", "GKNodeNetDisconnect",
+                    "GKNodeNetSend", "GKNodeNetPeerJoined",
+                    "GKNodeNetPeerLeft", "GKNodeNetMessage")
+        r100_missing = [name for name in r100_ids
+                        if getattr(node_lib, name, None) is None]
+        check("第一百轮:7 个联机节点都注册上了", not r100_missing,
+              str(r100_missing))
+        check("第一百轮:分类是『网络』",
+              all(getattr(getattr(node_lib, name), "gk_category", "") == "网络"
+                  for name in r100_ids))
+
+        r100_tree = bpy.data.node_groups.new("联机冒烟100", "GKGameLogicTree")
+        r100_tree.use_fake_user = True
+        r100_ready = r100_tree.nodes.new("GKNodeOnReady")
+        r100_host = r100_tree.nodes.new("GKNodeNetHost")
+        check("第一百轮:『联机_开房』属性声明出来了",
+              hasattr(r100_host, "gk_port") and hasattr(r100_host, "gk_max"))
+        check("第一百轮:默认端口 8910 / 上限 8",
+              int(r100_host.gk_port) == 8910 and int(r100_host.gk_max) == 8)
+        r100_joined = r100_tree.nodes.new("GKNodeNetPeerJoined")
+        r100_send = r100_tree.nodes.new("GKNodeNetSend")
+        r100_send.gk_mode = "ONE"
+        r100_send.gk_text = "欢迎"
+        r100_recv = r100_tree.nodes.new("GKNodeNetMessage")
+        r100_send.gk_channel = "默认"
+        r100_print = r100_tree.nodes.new("GKNodePrint")
+        r100_print.gk_text = "NET_RECV"
+        check("第一百轮:事件节点有『谁』输出引脚",
+              r100_joined.outputs.get("谁") is not None
+              and r100_recv.outputs.get("谁发的") is not None
+              and r100_recv.outputs.get("内容") is not None)
+        check("第一百轮:『开房』只有执行流(没有莫名其妙的数据口)",
+              [s.name for s in r100_host.outputs] == ["完成"],
+              str([s.name for s in r100_host.outputs]))
+
+        r100_tree.links.new(r100_ready.outputs["执行"],
+                            r100_host.inputs["执行"])
+        r100_tree.links.new(r100_joined.outputs["执行"],
+                            r100_send.inputs["执行"])
+        r100_tree.links.new(r100_joined.outputs["谁"],
+                            r100_send.inputs["发给谁"])
+        r100_tree.links.new(r100_recv.outputs["执行"],
+                            r100_print.inputs["执行"])
+        r100_tree.links.new(r100_recv.outputs["内容"],
+                            r100_print.inputs["内容"])
+        r100_code, r100_warnings = codegen.generate(r100_tree, {
+            "dimension": "3", "base_class": "StaticBody3D"})
+        check("第一百轮:生成无告警", not r100_warnings,
+              str(r100_warnings)[:300])
+        check("第一百轮:开房那行真的生成了",
+              '_gk_net_start(true, "127.0.0.1", 8910, 8)' in r100_code,
+              r100_code[:400])
+        check("第一百轮:『谁』解析成成员变量(不是字面量 0)",
+              'int(_gk_net_peer)' in r100_code)
+        check("第一百轮:收到消息用固定 @rpc 通道",
+              '@rpc("any_peer", "call_remote", "reliable")\n'
+              "func _gk_net_msg(channel: String, sender: int, "
+              "text: String) -> void:" in r100_code)
+        check("第一百轮:内容接出去 -> print 读的是成员变量",
+              "print(_gk_net_msg_text)" in r100_code)
+        check("第一百轮:信号连接在 _ready 最前面(开房之前)",
+              r100_code.index("peer_connected.connect")
+              < r100_code.index("_gk_net_start(true"))
+
+        # 不用联机节点的图一个字都不多(老图行为不变)
+        r100_plain = bpy.data.node_groups.new("无联机冒烟100", "GKGameLogicTree")
+        r100_plain.use_fake_user = True
+        r100_p_ready = r100_plain.nodes.new("GKNodeOnReady")
+        r100_p_print = r100_plain.nodes.new("GKNodePrint")
+        r100_p_print.gk_text = "你好"
+        r100_plain.links.new(r100_p_ready.outputs["执行"],
+                             r100_p_print.inputs["执行"])
+        r100_plain_code, _ = codegen.generate(r100_plain, {
+            "dimension": "3", "base_class": "StaticBody3D"})
+        check("第一百轮:没用联机节点 -> 生成物里没有 _gk_net / @rpc",
+              "_gk_net" not in r100_plain_code
+              and "@rpc" not in r100_plain_code)
+
+        bpy.data.node_groups.remove(r100_tree)
+        bpy.data.node_groups.remove(r100_plain)
+    except Exception as exc:
+        check("第一百轮(网络联机)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

@@ -28,6 +28,8 @@ from . import _displayset
 from . import _assets
 # 音乐设置卡(第八十六轮:『游戏音乐』树)—— 和 _displayset 同一类设置卡
 from . import _musicset
+# 网络联机(第一百轮:房间 + 自定义消息)—— ENet + @rpc
+from . import _network
 
 
 def _merge_namespaces(*modules):
@@ -41,7 +43,7 @@ def _merge_namespaces(*modules):
 _merge_namespaces(_common, _events, _flow, _movement, _animation,
                   _instances, _fx, _variables, _input, _expressions,
                   _display, _containers, _functions, _ai, _displayset,
-                  _assets, _musicset)
+                  _assets, _musicset, _network)
 del _merge_namespaces
 
 
@@ -136,7 +138,7 @@ for _cls in CLASSES:
 ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
-CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "资产", "实例", "特效", "变量", "函数", "信号", "输入",
+CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "资产", "实例", "特效", "变量", "函数", "信号", "网络", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "灯光", "音效", "存档", "界面",
                   "屏幕效果", "氛围", "显示设置", "音乐设置", "射线", "定时", "列表", "字典", "时间",
                   "实用", "动画(旧)")

@@ -684,6 +684,62 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6g. 七个联机节点的卡片(第一百轮)----
+    # 卡片上有输入框 / 下拉 / 勾选框 + 一行"发给谁"的联动 —— 属性名写错
+    # 或参数配错在 Blender 里是**当场抛异常、整块卡片画不出来**,
+    # 冒烟那层只验"节点在、代码对",看不见画的事(第五十五轮就是这么漏的)。
+    print("=" * 72)
+    print("6g. 联机节点卡片(第一百轮)")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟联机100", "GKGameLogicTree")
+        cards = {
+            "开房": tree.nodes.new("GKNodeNetHost"),
+            "加入": tree.nodes.new("GKNodeNetJoin"),
+            "断开": tree.nodes.new("GKNodeNetDisconnect"),
+            "发消息": tree.nodes.new("GKNodeNetSend"),
+            "有人进来": tree.nodes.new("GKNodeNetPeerJoined"),
+            "有人走了": tree.nodes.new("GKNodeNetPeerLeft"),
+            "收到消息": tree.nodes.new("GKNodeNetMessage"),
+        }
+        card_error = ""
+        for label, card in cards.items():
+            try:
+                card.draw_buttons(bpy.context, RecordingLayout())
+            except Exception as exc:                      # noqa: BLE001
+                card_error = f"{label}: {type(exc).__name__}: {exc}"
+                break
+        check("七个联机节点的 draw_buttons 都能画完", not card_error,
+              card_error)
+
+        host_layout = RecordingLayout()
+        cards["开房"].draw_buttons(bpy.context, host_layout)
+        check("『联机_开房』卡片画出端口 / 上限",
+              "端口" in host_layout.texts and "上限" in host_layout.texts,
+              str(host_layout.texts)[:200])
+
+        # 『发给谁』只在选了"某个玩家"时才画出来(联动)
+        send_card = cards["发消息"]
+        all_layout = RecordingLayout()
+        send_card.draw_buttons(bpy.context, all_layout)
+        check("『联机_发消息』选『所有人』时不画『谁』",
+              "谁" not in all_layout.texts, str(all_layout.texts)[:200])
+        send_card.gk_mode = "ONE"
+        one_layout = RecordingLayout()
+        send_card.draw_buttons(bpy.context, one_layout)
+        check("『联机_发消息』选了『某个玩家』才画出『谁』",
+              "谁" in one_layout.texts, str(one_layout.texts)[:200])
+
+        recv_card = cards["收到消息"]
+        recv_layout = RecordingLayout()
+        recv_card.draw_buttons(bpy.context, recv_layout)
+        check("『联机_收到消息』画出『任何频道』勾选框",
+              "任何频道" in recv_layout.texts, str(recv_layout.texts)[:200])
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("联机节点卡片(第一百轮)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

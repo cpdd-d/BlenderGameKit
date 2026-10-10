@@ -16,6 +16,7 @@ from .camera import _path_name
 from .services import (_FILTER_SHADER_CONST, _GD_FILTER_SHADER,
                        _GD_VIGNETTE_SHADER, _SAVE_SALT, _SAVE_SALT_CONST,
                        _VIGNETTE_SHADER_CONST)
+from .network import emit_network
 from .context import GenContext
 
 
@@ -250,6 +251,12 @@ class Generator:
             #   触发区完全不响应(第七十轮踩到)。
             self._append_block(sections, "_ready", "func _ready() -> void:",
                                trigger_ready, at_front=True)
+
+        # ---- 网络联机(第一百轮)──────────────────────────────────────
+        # 和触发器同一套路:每个事件节点(有人进来 / 有人走了 / 收到消息)
+        # 是一条独立执行流,信号 / RPC 连接补进 `_ready`;另外生成一组
+        # ENet 辅助函数 + 一个 `@rpc` 收消息方法(见 codegen/network.py)。
+        emit_network(self, sections)
 
         # ---- 自由飞行相机(兜底观察机)──────────────────────────────
         # **必须**放在 process_hooks / physics_hooks 落盘**之前**:

@@ -37,7 +37,8 @@
 """
 
 from . import (ai, animation, api, camera, context, easing, expressions,
-               generator, literals, registry, services, statements, validation)
+               generator, literals, network, registry, services, statements,
+               validation)
 
 
 def _merge_namespaces(*modules):
@@ -50,7 +51,8 @@ def _merge_namespaces(*modules):
 
 # 按依赖顺序合并(被依赖者在前);`api` 放最后,保证 generate 等对外名字不被覆盖
 _merge_namespaces(literals, registry, easing, statements, camera, expressions,
-                  animation, ai, services, context, generator, validation, api)
+                  animation, ai, services, network, context, generator,
+                  validation, api)
 
 # 清掉合并用的临时名,避免污染 `codegen.` 表面
 del _merge_namespaces

@@ -85,6 +85,8 @@ _SUBMODULES = (
     "nodes._assets",
     # 音乐设置卡(第八十六轮:『游戏音乐』树)—— 同样必须在重载表里
     "nodes._musicset",
+    # 网络联机(第一百轮)—— 同样必须在重载表里,否则重载后这 7 个节点整批消失
+    "nodes._network",
     "nodes.nodes",
     "nodes",
     # codegen 主体按领域拆成 10 个模块(纯搬运)。顺序 = 依赖顺序:
@@ -104,6 +106,9 @@ _SUBMODULES = (
     "codegen.animation",
     "codegen.ai",
     "codegen.services",
+    # 网络联机发射器(第一百轮)—— 必须在 generator 之前:
+    # generator 会 `from .network import emit_network`
+    "codegen.network",
     "codegen.context",
     "codegen.generator",
     "codegen.validation",

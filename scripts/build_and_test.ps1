@@ -745,6 +745,44 @@ if ($SkipGodot) {
         }
     }
 
+    # 5t. 网络联机示例(第一百轮:房间 + 自定义消息)—— **同机起两个 Godot
+    #     进程真连一次**:一个开房、一个加入,互相收发消息再断开。
+    #     ── 为什么必须两个进程 ────────────────────────────────────────
+    #     Godot 一个 SceneTree 只有一个 multiplayer_peer —— "开房"和"加入"
+    #     只能在两个进程里。探针把示例场景**复制一份、只换脚本**当"对端"
+    #     (RPC 按节点路径找对端,节点结构必须逐字节一致,不然收不到消息)。
+    Write-Output ""
+    $netDir = Join-Path $Root "examples\demo_net"
+    $netMaker = Join-Path $Root "scripts\make_net_demo.py"
+    if ($godotSkipped) {
+        Write-Output "跳过联机示例:本机找不到 Godot(要两个进程真连)"
+    } elseif (-not (Test-Path $Blender)) {
+        Write-Output "跳过联机示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $netDir)) {
+        Write-Output "跳过联机示例:还没有 examples\demo_net"
+    } else {
+        $netLog = & $Blender -b --python $netMaker 2>&1 | Out-String
+        if ($netLog -notmatch "已保存") {
+            Write-Host "---- 重建联机示例失败,尾部 20 行 ----"
+            ($netLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $netChecker = Join-Path $Root "scripts\check_net_demo.py"
+            $netOut = & python $netChecker --godot $Godot 2>&1 | Out-String
+            $netOut -split "`n" | Where-Object {
+                $_ -match "^(----|\[PASS\]|\[FAIL\]|CHECK_NET_DEMO|跳过|✗)"
+            } | ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($netOut -match "CHECK_NET_DEMO=OK") {
+                $godotRan += "联机示例"
+            } elseif ($netOut -match "跳过") {
+                Write-Output "（联机示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

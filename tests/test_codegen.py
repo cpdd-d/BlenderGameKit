@@ -18666,5 +18666,183 @@ class TestRound99Occluder(Base):
             self.assertIn("occlusion_culling/use_occlusion_culling = true", text)
 
 
+class TestRound100Net(Base):
+    """第一百轮:网络联机(ENet 房间 + 自定义消息)。
+
+    ── 这些断言锁的是"真机标定过的形状"(改代码前先看注释)────────
+    * 开房 / 加入都走同一个 `_gk_net_start(server, ip, port, max)`;
+    * 信号(peer_connected / peer_disconnected)接在 `_ready` **最前面**,
+      而且**先连接后开房**(实测:先 connect 再赋 multiplayer_peer 一样收得到);
+    * 收到的消息走一个固定的 `@rpc` 通道 `_gk_net_msg(频道, 发送者, 文本)`,
+      发送者**当参数传**(不靠 get_remote_sender_id),这样"谁发的"可控;
+    * `rpc(...)` = 发给除自己以外的所有人(实测),发的人自己收不到。
+    """
+
+    def _host_tree(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        host = tree.new_node(NN.GKNodeNetHost, "开房",
+                             gk_port=9001, gk_max=4)
+        printer = tree.new_node(NN.GKNodePrint, "日志", gk_text="NET_HOST_READY")
+        gk_stub.connect(tree, ready, "执行", host, "执行")
+        gk_stub.connect(tree, host, "完成", printer, "执行")
+        return tree
+
+    # ---- 四个动作节点 ----
+    def test_host_opens_room(self):
+        code, warnings = gen(self._host_tree(), V3)
+        self.assertIn('_gk_net_start(true, "127.0.0.1", 9001, 4)', code)
+        self.assertIn("ENetMultiplayerPeer.new()", code)
+        self.assertIn("peer.create_server(port, max_clients)", code)
+        self.assertIn('print("NET_HOST_READY")', code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+        self.assertFalse([w for w in warnings if "端口" in w], warnings)
+
+    def test_join_connects_to_address(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        join = tree.new_node(NN.GKNodeNetJoin, "加入",
+                             gk_ip="192.168.1.7", gk_port=9001)
+        gk_stub.connect(tree, ready, "执行", join, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_net_start(false, "192.168.1.7", 9001, 1)', code)
+        self.assertIn("peer.create_client(ip, port)", code)
+
+    def test_bad_port_falls_back_with_warning(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        host = tree.new_node(NN.GKNodeNetHost, "开房", gk_port=70000)
+        gk_stub.connect(tree, ready, "执行", host, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertIn('_gk_net_start(true, "127.0.0.1", 8910, 8)', code)
+        self.assertTrue(any("端口" in w and "70000" in w for w in warnings), warnings)
+
+    def test_disconnect(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        off = tree.new_node(NN.GKNodeNetDisconnect, "断开")
+        gk_stub.connect(tree, ready, "执行", off, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("_gk_net_stop()", code)
+        self.assertIn("multiplayer.multiplayer_peer = null", code)
+
+    def test_send_to_all(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        send = tree.new_node(NN.GKNodeNetSend, "发消息",
+                             gk_channel="聊天", gk_text="大家好啊")
+        gk_stub.connect(tree, ready, "执行", send, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_net_send("聊天", 0, "大家好啊")', code)
+        self.assertIn('rpc("_gk_net_msg", channel, _me, text)', code)
+
+    def test_send_to_one_uses_peer_pin(self):
+        """『发给谁』接『有人进来』的『谁』-> 直接读那个成员变量。"""
+        tree = make_tree()
+        joined = tree.new_node(NN.GKNodeNetPeerJoined, "有人进来")
+        send = tree.new_node(NN.GKNodeNetSend, "欢迎",
+                             gk_mode="ONE", gk_text="欢迎")
+        gk_stub.connect(tree, joined, "执行", send, "执行")
+        gk_stub.connect(tree, joined, "谁", send, "发给谁")
+        code, _ = gen(tree, V3)
+        self.assertIn('_gk_net_send("默认", int(_gk_net_peer), "欢迎")', code)
+        self.assertIn('rpc_id(to_peer, "_gk_net_msg", channel, _me, text)', code)
+
+    # ---- 事件节点 ----
+    def test_peer_joined_is_driven_by_signal(self):
+        tree = make_tree()
+        joined = tree.new_node(NN.GKNodeNetPeerJoined, "有人进来")
+        printer = tree.new_node(NN.GKNodePrint, "日志", gk_text="NET_PEER_JOINED")
+        gk_stub.connect(tree, joined, "执行", printer, "执行")
+        code, _ = gen(tree, V3)
+        # 每个事件节点一条独立执行流
+        self.assertIn("func _gk_net_evt_joined() -> void:", code)
+        self.assertIn('print("NET_PEER_JOINED")', code)
+        # 分发函数把 id 写进变量、再跑那条链
+        self.assertIn("func _gk_net_on_peer_connected(id: int) -> void:", code)
+        self.assertIn("    _gk_net_peer = id", code)
+        self.assertIn("    _gk_net_evt_joined()", code)
+        # 信号在 _ready 里接上
+        self.assertIn("multiplayer.peer_connected.connect", code)
+
+    def test_peer_left_is_driven_by_signal(self):
+        tree = make_tree()
+        left = tree.new_node(NN.GKNodeNetPeerLeft, "有人走了")
+        printer = tree.new_node(NN.GKNodePrint, "日志", gk_text="NET_PEER_LEFT")
+        gk_stub.connect(tree, left, "执行", printer, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("func _gk_net_evt_left() -> void:", code)
+        self.assertIn("func _gk_net_on_peer_disconnected(id: int) -> void:", code)
+        self.assertIn("multiplayer.peer_disconnected.connect", code)
+
+    def test_message_rpc_channel_filter(self):
+        tree = make_tree()
+        recv = tree.new_node(NN.GKNodeNetMessage, "收消息", gk_channel="聊天")
+        printer = tree.new_node(NN.GKNodePrint, "日志")
+        gk_stub.connect(tree, recv, "执行", printer, "执行")
+        gk_stub.connect(tree, recv, "内容", printer, "内容")
+        code, _ = gen(tree, V3)
+        self.assertIn('@rpc("any_peer", "call_remote", "reliable")\n'
+                      "func _gk_net_msg(channel: String, sender: int, "
+                      "text: String) -> void:", code)
+        self.assertIn("    _gk_net_msg_sender = sender", code)
+        self.assertIn("    _gk_net_msg_text = text", code)
+        self.assertIn('if channel == "聊天":', code)
+        self.assertIn("        _gk_net_evt_msg()", code)
+        self.assertIn("print(_gk_net_msg_text)", code)
+
+    def test_message_any_channel_skips_filter(self):
+        tree = make_tree()
+        recv = tree.new_node(NN.GKNodeNetMessage, "收消息", gk_any=True)
+        printer = tree.new_node(NN.GKNodePrint, "日志", gk_text="ANY")
+        gk_stub.connect(tree, recv, "执行", printer, "执行")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("if channel ==", code)
+        self.assertIn("    _gk_net_evt_msg()", code)
+
+    def test_sender_output_resolves_to_variable(self):
+        """『谁发的』接到『发给谁』-> 转回发送者(回声 / 回礼)。"""
+        tree = make_tree()
+        recv = tree.new_node(NN.GKNodeNetMessage, "收消息")
+        send = tree.new_node(NN.GKNodeNetSend, "回礼",
+                             gk_mode="ONE", gk_text="收到")
+        gk_stub.connect(tree, recv, "执行", send, "执行")
+        gk_stub.connect(tree, recv, "谁发的", send, "发给谁")
+        code, _ = gen(tree, V3)
+        self.assertIn('int(_gk_net_msg_sender)', code)
+
+    def test_two_message_nodes_get_distinct_funcs(self):
+        tree = make_tree()
+        first = tree.new_node(NN.GKNodeNetMessage, "收A", gk_channel="A")
+        second = tree.new_node(NN.GKNodeNetMessage, "收B", gk_channel="B")
+        for node in (first, second):
+            printer = tree.new_node(NN.GKNodePrint, "日志", gk_text="X")
+            gk_stub.connect(tree, node, "执行", printer, "执行")
+        code, _ = gen(tree, V3)
+        self.assertIn("func _gk_net_evt_msg() -> void:", code)
+        self.assertIn("func _gk_net_evt_msg_2() -> void:", code)
+        self.assertIn('if channel == "A":', code)
+        self.assertIn('if channel == "B":', code)
+
+    # ---- 不影响老图 ----
+    def test_no_net_nodes_writes_nothing(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        printer = tree.new_node(NN.GKNodePrint, "日志", gk_text="你好")
+        gk_stub.connect(tree, ready, "执行", printer, "执行")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("_gk_net", code)
+        self.assertNotIn("@rpc", code)
+
+    def test_helpers_only_once_with_many_nodes(self):
+        """一堆联机节点也只生成一份辅助函数(同名函数会拒绝整个脚本)。"""
+        code, _ = gen(self._host_tree(), V3)
+        self.assertEqual(code.count("func _gk_net_start("), 1)
+        self.assertEqual(code.count("func _gk_net_send("), 1)
+        self.assertEqual(code.count("func _gk_net_msg("), 1)
+        self.assert_indent_sane(code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
