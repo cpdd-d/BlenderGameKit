@@ -20,7 +20,15 @@
     - 勾了『避障』那对(RVO)**互相绕开、两个都到达**,而且最小间距
       ≥ 0.9(没互相顶住);
     - **不勾避障**的对照对**顶死在中点**(两个都到不了、间距≈1.0 贴在一起)
-      —— 这条是"绕开"真的由避障干的证据,不是碰巧走过去。
+      —— 这条是"绕开"真的由避障干的证据,不是碰巧走过去;
+  * **动态障碍(第八十三轮)**:两条车道正中的幽灵障碍(Area + 动态障碍,
+    探针每帧沿 x 来回挪)—— 勾避障的那对离它最近 ≥0.9(绕开),
+    不勾的那对 0.00(直接穿过去);
+  * **区域代价(第八十四轮)**:场地左侧的泥地补丁(『通行代价』5):
+    - 泥地车道的路**绕开泥地**(横向偏离 ≥1、一脚没踩进泥地)且到达;
+    - 对照车道(没有泥地)**一路直走**完(偏离 ≤0.3)—— 证明"绕开"
+      是泥地干的;
+    - 从车道起点到**泥地中心**的路径可达(代价区该是"贵",不是"墙")。
 """
 
 import argparse
@@ -71,11 +79,28 @@ var ghost_a: Node2D = null    # 避障车道正中那个(Area2D + 动态障碍)
 var ghost_b: Node2D = null    # 对照车道正中那个
 var ghost_dist_a := 1.0e9     # 避障对离幽灵最近到过多少
 var ghost_dist_b := 1.0e9     # 对照对离幽灵最近到过多少
+# ── 第八十四轮:区域代价(泥地)两条车道 ────────────────────────────
+var mud_mode := false         # 车道实验结束后切到"代价车道"
+var mud_at := 0.0
+var mud_tick := -1
+var mud_walker: CharacterBody2D = null   # 泥地甲(该绕开泥地)
+var ctrl_walker: CharacterBody2D = null  # 对照戊(没有泥地,该直走)
+var mud_goal: Node2D = null
+var ctrl_goal: Node2D = null
+var dev_mud := 0.0            # 泥地车道最大横向偏离(绕行证据)
+var dev_ctrl := 0.0           # 对照车道最大横向偏离(该≈0)
+var mud_entered := false      # 泥地甲有没有一脚踩进泥地
 const LANE_X := 5.0
 const AVOID_Y := 3.0
 const PLAIN_Y := -3.0
 const LANE_WINDOW := 5.5  # 车道实验窗口(秒)
 const GHOST_SWING := 1.0  # 幽灵沿 x 来回挪的幅度(模拟会动的柱子)
+const MUD_LANE_Y := 5.5   # 泥地车道(直线穿过泥地)
+const MUD_CTRL_Y := -7.5  # 对照车道(没有泥地)
+const MUD_START := Vector2(-6.0, 5.5)
+const MUD_CTRL_START := Vector2(-6.0, -7.5)
+const MUD_WINDOW := 6.0   # 代价车道实验窗口(秒)
+const MUD_RECT := Rect2(-4.5, 4.5, 3.0, 2.0)  # 泥地补丁(中心 -3,5.5)
 
 
 func _ready() -> void:
@@ -98,6 +123,10 @@ func _ready() -> void:
 	goal_d = _node2d("终点丁")
 	ghost_a = _node2d("幽灵甲")
 	ghost_b = _node2d("幽灵乙")
+	mud_walker = _body("泥地甲")
+	ctrl_walker = _body("对照戊")
+	mud_goal = _node2d("终点戊")
+	ctrl_goal = _node2d("终点己")
 	var regions := world.find_children("Navigation", "NavigationRegion2D", true, false)
 	if not regions.is_empty():
 		var poly := (regions[0] as NavigationRegion2D).navigation_polygon
@@ -106,7 +135,9 @@ func _ready() -> void:
 	print("NAV2D_GAME chaser=", chaser != null, " player=", player != null,
 		" polys=", polys, " lanes=",
 		avoid_a != null and avoid_b != null and plain_c != null
-		and plain_d != null)
+		and plain_d != null, " mud=",
+		mud_walker != null and ctrl_walker != null
+		and mud_goal != null and ctrl_goal != null)
 	# 诊断:等地图同步后直接查一条"从追踪者到玩家"的路径 ——
 	# 追踪者走直线(= 拿不到路径)时,这行能分清"网格没同步"还是"别的"。
 	_path_probe.call_deferred()
@@ -171,6 +202,11 @@ func _physics_process(delta: float) -> void:
 		_lane_sample()
 		if elapsed - lane_at >= LANE_WINDOW:
 			_lane_finish()
+		return
+	if mud_mode:
+		_mud_sample()
+		if elapsed - mud_at >= MUD_WINDOW:
+			_mud_finish()
 		return
 	_lane_chase(delta)
 
@@ -292,6 +328,7 @@ func _lane_reached(body: CharacterBody2D, goal: Node2D) -> bool:
 
 
 func _lane_finish() -> void:
+	lane_mode = false       # ⚠ 先关掉:不然窗口到了之后每帧都会重进这里
 	var got_a := _lane_reached(avoid_a, goal_a)
 	var got_b := _lane_reached(avoid_b, goal_b)
 	var got_c := _lane_reached(plain_c, goal_c)
@@ -313,6 +350,82 @@ func _lane_finish() -> void:
 	print("NAV2D_OBSTACLE ok=", ok_ghost,
 		" avoid_min=", "%.2f" % ghost_dist_a,
 		" ctrl_min=", "%.2f" % ghost_dist_b)
+	# ── 第八十四轮:切到"代价车道"实验(泥地 / 对照)──────────────
+	_mud_setup()
+
+
+## ── 第三段:代价车道实验(第八十四轮)────────────────────────────
+## 泥地甲从 (-6, 5.5) 走到 (6, 5.5),直线会穿过泥地补丁(中心 -3,5.5,
+## 3x2,『通行代价』5)—— 该**绕开**;对照戊在没有泥地的车道上直走。
+## 追人那对已经被 _lane_setup 挪到远角,正好给这两条车道腾地方
+## (对照车道 y=-7.5 就从"小玩家原站位"(0,-6)旁边过 —— 玩家挪走了才干净)。
+func _mud_setup() -> void:
+	_lane_reset(mud_walker, MUD_START)
+	_lane_reset(ctrl_walker, MUD_CTRL_START)
+	dev_mud = 0.0
+	dev_ctrl = 0.0
+	mud_entered = false
+	mud_mode = true
+	mud_at = elapsed
+	print("NAV2D_MUD_START t=", "%.2f" % elapsed)
+	# "泥地不是墙"的诊断:从车道起点查一条**走进泥地中心**的路径 ——
+	# 代价区该是"贵",不是"不可达"(洞没填上的话这条会到不了)。
+	_path_into_mud.call_deferred()
+
+
+func _path_into_mud() -> void:
+	for i in 10:
+		await get_tree().physics_frame
+	if mud_walker == null:
+		print("NAV2D_MUD_WALK ok=false n=0(NO_WALKER)")
+		return
+	var map := mud_walker.get_world_2d().navigation_map
+	var to := Vector2(MUD_RECT.position.x + MUD_RECT.size.x * 0.5,
+		MUD_RECT.position.y + MUD_RECT.size.y * 0.5)
+	var p := NavigationServer2D.map_get_path(map, MUD_START, to, true)
+	var end := Vector2.ZERO
+	if p.size() > 0:
+		end = p[p.size() - 1]
+	var reach := p.size() > 0 and end.distance_to(to) <= 0.6
+	print("NAV2D_MUD_WALK ok=", reach, " n=", p.size(),
+		" target=", to, " end=", end, " pts=", p)
+
+
+func _mud_sample() -> void:
+	if mud_walker != null:
+		var here := mud_walker.global_position
+		dev_mud = maxf(dev_mud, absf(here.y - MUD_LANE_Y))
+		if MUD_RECT.has_point(here):
+			mud_entered = true
+	if ctrl_walker != null:
+		dev_ctrl = maxf(dev_ctrl,
+			absf(ctrl_walker.global_position.y - MUD_CTRL_Y))
+	var tick := int((elapsed - mud_at) / 1.0)
+	if tick != mud_tick:
+		mud_tick = tick
+		var mud_text := "mud=<none>"
+		if mud_walker != null:
+			mud_text = "mud=(%.2f,%.2f)" % [
+				mud_walker.global_position.x, mud_walker.global_position.y]
+		var ctrl_text := "ctrl=<none>"
+		if ctrl_walker != null:
+			ctrl_text = "ctrl=(%.2f,%.2f)" % [
+				ctrl_walker.global_position.x, ctrl_walker.global_position.y]
+		print("NAV2D_MUD_T t=%.1f " % (elapsed - mud_at), mud_text, " ",
+			ctrl_text)
+
+
+func _mud_finish() -> void:
+	var got_mud := _lane_reached(mud_walker, mud_goal)
+	var got_ctrl := _lane_reached(ctrl_walker, ctrl_goal)
+	# 泥地车道:到达 + 绕开(横向偏离 ≥1)+ 一脚没踩进泥地
+	var ok_mud: bool = got_mud and dev_mud >= 1.0 and not mud_entered
+	# 对照车道:到达 + 一路直走(偏离 ≤0.3)
+	var ok_ctrl: bool = got_ctrl and dev_ctrl <= 0.3
+	print("NAV2D_MUD ok=", ok_mud, " arrived=", got_mud,
+		" dev=", "%.2f" % dev_mud, " entered=", mud_entered)
+	print("NAV2D_MUD_CTRL ok=", ok_ctrl, " arrived=", got_ctrl,
+		" dev=", "%.2f" % dev_ctrl)
 	print("NAV2D_DONE")
 	done = true
 	# ── 内置 ESC 退出(第三十九轮)────────────────────────────────
@@ -369,9 +482,9 @@ def run_godot(godot):
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     run = subprocess.run([godot, "--headless", "--path", OUT,
-                          # 12 秒追人 + 5.5 秒避障车道 + Esc 收尾;
+                          # 12 秒追人 + 5.5 秒避障车道 + 6 秒代价车道 + Esc 收尾;
                           # 无头下主循环比物理快,给足余量
-                          "--quit-after", "26000"],
+                          "--quit-after", "31000"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -405,6 +518,10 @@ def main():
         print("✗ 避障车道那四个人 / 终点标记没找齐(第八十二轮的示例没重建?):",
               [line for line in text.splitlines() if "NAV2D_GAME" in line])
         ok = False
+    if "mud=true" not in text:
+        print("✗ 代价车道那两个人 / 终点标记没找齐(第八十四轮的示例没重建?):",
+              [line for line in text.splitlines() if "NAV2D_GAME" in line])
+        ok = False
     if not re.search(r"NAV2D ok=true", text):
         print("✗ 追踪者没绕开中间障碍追到人(2D 烘焙没生效 / 绕不过去 / 穿障了):",
               [line for line in text.splitlines() if "NAV2D " in line])
@@ -427,6 +544,22 @@ def main():
         print("✗ 动态障碍没生效(勾『动态障碍』的幽灵没被避障绕开 / "
               "对方没穿过去 —— 幽灵是 Area,不该有物理碰撞):",
               [line for line in text.splitlines() if "NAV2D_OBSTACLE" in line])
+        ok = False
+    # ── 第八十四轮:区域代价(泥地)—— 该绕开 / 对照该直走 / 泥地可达 ──
+    if not re.search(r"NAV2D_MUD ok=true", text):
+        print("✗ 区域代价没生效(泥地车道没绕开 / 没到达 / 一脚踩进了泥地 —— "
+              "挖洞+补洞 / travel_cost 哪一段没接上):",
+              [line for line in text.splitlines() if "NAV2D_MUD" in line])
+        ok = False
+    if not re.search(r"NAV2D_MUD_CTRL ok=true", text):
+        print("✗ 代价对照车道不对(没有泥地的那条该一路直走完 —— "
+              "它要是也绕了,说明绕行不是泥地干的):",
+              [line for line in text.splitlines() if "NAV2D_MUD" in line])
+        ok = False
+    if not re.search(r"NAV2D_MUD_WALK ok=true", text):
+        print("✗ 泥地不可达(代价区该是'贵',不是'墙' —— "
+              "补块没进地图 / 洞没填上):",
+              [line for line in text.splitlines() if "NAV2D_MUD" in line])
         ok = False
     if not re.search(r"NAV2D_CAM current=true covers=true", text):
         print("✗ 2D 兜底相机没生效(运行后看不到内容 / 视角错乱):",

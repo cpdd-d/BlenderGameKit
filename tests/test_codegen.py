@@ -16708,6 +16708,91 @@ class TestRound83NavObstacle(Base):
         self.assertIn("nav_obstacle_radius", names)
 
 
+class TestRound84NavCost(Base):
+    """第八十四轮(H 组 22 第二小件):区域代价 —— 泥地 / 危险区。
+
+    物体『游戏物理』新增『通行代价』(默认 1.0 = 普通地面)。填 != 1 时
+    导出侧把它的世界包围盒写进环境脚本的 `nav_costs`;环境脚本烘焙时
+    把它当障碍**挖洞**、再单独补一块带 `travel_cost` 的代价区域 ——
+    A* 会在"绕路"和"穿泥地"之间按代价选。没配代价区的场景 `nav_costs`
+    为空,运行时行为不变(环境脚本里那些函数直接 return)。
+
+    真机机制是 spike 定下来的(真 Godot 实测:**两块 region 重叠时代价
+    会被无视**,必须"挖洞 + 补洞";拼边/共享边的两块 region 代价才生效)。
+    探针在 demo_nav2d 里带对照(有泥地绕开 / 没泥地直穿 / 泥地可达)。
+    """
+
+    def _physics(self, **props):
+        return types.SimpleNamespace(**props)
+
+    def test_travel_cost_of(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertIsNone(ae.nav_travel_cost_of(None))
+        self.assertIsNone(ae.nav_travel_cost_of(self._physics()))
+        # 1.0 = 普通地面 -> 不导出(老图一个字都不多)
+        self.assertIsNone(ae.nav_travel_cost_of(
+            self._physics(nav_travel_cost=1.0)))
+        self.assertAlmostEqual(ae.nav_travel_cost_of(
+            self._physics(nav_travel_cost=5.0)), 5.0)
+        # 小于 1 = "近路"(会吸引路径)也透出来
+        self.assertAlmostEqual(ae.nav_travel_cost_of(
+            self._physics(nav_travel_cost=0.5)), 0.5)
+        # 0 / 负数钳到 0.05:0 会让 A* 的代价计算失去意义
+        self.assertAlmostEqual(ae.nav_travel_cost_of(
+            self._physics(nav_travel_cost=0.0)), 0.05)
+        self.assertAlmostEqual(ae.nav_travel_cost_of(
+            self._physics(nav_travel_cost=-2.0)), 0.05)
+
+    def test_literal_3d_uses_world_box(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.nav_costs_literal([], "3"), "[]")
+        text = ae.nav_costs_literal([{
+            "name": "泥地", "cost": 5.0,
+            "min": (-1.5, 0.0, 4.5), "size": (3.0, 0.0, 2.0)}], "3")
+        self.assertIn('"name": "泥地"', text)
+        self.assertIn('"cost": 5.0', text)
+        self.assertIn(
+            "AABB(Vector3(-1.5, 0.0, 4.5), Vector3(3.0, 0.0, 2.0))", text)
+        self.assertNotIn("Rect2", text)
+
+    def test_literal_2d_uses_xy_rect(self):
+        """2D(俯视)里 Z 没有意义 —— 只把 XY 平面的矩形写进去。"""
+        from BlenderGameKit import asset_export as ae
+        text = ae.nav_costs_literal([{
+            "name": "泥地", "cost": 5.0,
+            "min": (-1.5, 4.5, 0.0), "size": (3.0, 2.0, 0.0)}], "2")
+        self.assertIn("Rect2(-1.5, 4.5, 3.0, 2.0)", text)
+        self.assertNotIn("AABB", text)
+        self.assertNotIn("Vector3", text)
+
+    def test_literal_escapes_name(self):
+        """物体名里带引号也不能把环境脚本写坏。"""
+        from BlenderGameKit import asset_export as ae
+        text = ae.nav_costs_literal([{
+            "name": '泥"地', "cost": 2.0,
+            "min": (0.0, 0.0, 0.0), "size": (1.0, 1.0, 1.0)}], "3")
+        self.assertIn('\\"', text)
+
+    def test_env_script_has_cost_pipeline(self):
+        """环境脚本里有整条管线:空清单 + 挖洞 + 补洞 + 设代价。"""
+        from BlenderGameKit import asset_export as ae
+        text = ae.render_env_script()
+        self.assertIn("var nav_costs: Array = []", text)
+        for marker in ("add_obstruction_outline",
+                       "add_projected_obstruction",
+                       "region_set_travel_cost",
+                       "_gk_apply_nav_costs_2d",
+                       "_gk_apply_nav_costs_3d",
+                       "_gk_nav_cost_surface_y"):
+            self.assertIn(marker, text)
+
+    def test_property_registered_on_physics(self):
+        """真实属性组上有这个字段(冒烟那层再验真机 + 真导出)。"""
+        from BlenderGameKit import properties
+        names = set(getattr(properties.GKObjectSettings, "__annotations__", {}))
+        self.assertIn("nav_travel_cost", names)
+
+
 class TestRound81UiPolish(Base):
     """第八十一轮(F 组 15 + 16):界面收尾 —— 皮肤 / 滚动条 / 选中高亮 /
     软键盘·IME / 多行输入框 / 点击音效 / 字幕立绘 / 历史导出·跳回 /

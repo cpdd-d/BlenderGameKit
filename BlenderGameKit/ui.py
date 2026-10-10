@@ -2857,6 +2857,17 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             nav_row.prop(physics, "nav_obstacle", toggle=True)
             if physics.nav_obstacle:
                 nav_row.prop(physics, "nav_obstacle_radius", text="半径", slider=True)
+            # ── 通行代价(第八十四轮:寻路第三版②)────────────────────
+            # 填 != 1 = 这个物体盖住的那片地是"代价区"(泥地 / 危险区
+            # 填 > 1 寻路会绕开;< 1 是近路会吸引路径)。只在勾了『寻路』
+            # 的场景里生效 —— 导出时主网格会在它下面挖个洞、单独补一块
+            # 带价格的区域(真机实测:叠着放没用,必须拼边)。
+            cost_row = col.row(align=True)
+            cost_row.prop(physics, "nav_travel_cost", text="通行代价",
+                          slider=True)
+            if abs(float(physics.nav_travel_cost) - 1.0) > 1e-6:
+                col.label(text="寻路会按这个代价绕开 / 吸引(泥地填 5 试试)",
+                          icon="INFO")
 
         # ── 子物体碰撞块(本轮:"人形头/身/腿各摆一个")────────────────
         # 勾上 = 这个物体不出现在画面里,形状并入父物体的碰撞体。

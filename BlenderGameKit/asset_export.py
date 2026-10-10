@@ -292,6 +292,12 @@ var _gk_esc_held: bool = false
 ## 少一块网格不该让游戏坏掉。
 @export var nav_bake: bool = {nav_bake}
 
+## ── 代价区(第八十四轮:寻路第三版②)──────────────────────────────────
+## [{{name, cost, rect|box}}] —— 物体『通行代价』填 != 1 时由导出写进来。
+## 空数组 = 没有代价区(那些函数直接 return,老场景行为一字不变)。
+## 2D 用 `rect`(XY 平面矩形),3D 用 `box`(世界 AABB)。
+var nav_costs: Array = {nav_costs}
+
 const _GK_DBG_KEY := {debug_key}            # 弹出 / 收起面板
 const _GK_DBG_COPY_KEY := {debug_copy_key}  # 复制全部内容
 
@@ -1441,12 +1447,17 @@ func _gk_bake_navigation_3d(root: Node, region: NavigationRegion3D) -> void:
 	var baked: NavigationMesh = navmesh.duplicate()
 	var source := NavigationMeshSourceGeometryData3D.new()
 	NavigationServer3D.parse_source_geometry_data(baked, source, root)
+	# 代价区(第八十四轮):当成"柱形障碍"挖洞 —— 主网格不覆盖它,
+	# 价格才有意义(重叠着放的价格会被路径无视,实测)
+	for area in nav_costs:
+		_gk_add_cost_obstruction(source, area["box"])
 	NavigationServer3D.bake_from_source_geometry_data(baked, source)
 	region.navigation_mesh = baked
 	# ⚠ 防"第一个地图吞第一次赋值"(实测):再赋一份同内容
 	region.navigation_mesh = baked.duplicate()
 	print("[GK] 导航网格已烤:", baked.get_polygon_count(),
 		  " 个多边形(代理半径 ", baked.agent_radius, ")")
+	_gk_apply_nav_costs_3d(root, region)
 
 
 ## 2D:碰撞体按**障碍**解析 —— 必须先给一个 outline 当"外框"
@@ -1499,12 +1510,180 @@ func _gk_bake_navigation_2d(root: Node, region: NavigationRegion2D) -> void:
 	poly.parsed_geometry_type = NavigationPolygon.PARSED_GEOMETRY_STATIC_COLLIDERS
 	var source := NavigationMeshSourceGeometryData2D.new()
 	NavigationServer2D.parse_source_geometry_data(poly, source, root)
+	# 代价区(第八十四轮):当**障碍轮廓**加进去 —— 主多边形在这里挖洞
+	# (洞 = 代价矩形外扩 1×代理半径,膨胀是烘焙器自己做的)
+	for area in nav_costs:
+		source.add_obstruction_outline(_gk_cost_points_2d(area))
 	NavigationServer2D.bake_from_source_geometry_data(poly, source)
 	region.navigation_polygon = poly
 	# ⚠ 同上:再赋一份(防"第一个地图吞第一次赋值"的同类问题)
 	region.navigation_polygon = poly.duplicate()
 	print("[GK] 2D 导航多边形已烤:", poly.get_polygon_count(),
 		  " 个多边形(代理半径 ", poly.agent_radius, ")")
+	_gk_apply_nav_costs_2d(root, region)
+
+
+## ── 代价区(第八十四轮:寻路第三版②)—— 泥地 / 危险区 ────────────────
+## 物体『游戏物理』的『通行代价』填 != 1 = 这片地"过路费":> 1 是泥地 /
+## 危险区(寻路尽量绕开),< 1 是近路(会吸引路径)。
+##
+## ── 为什么是"挖洞 + 补洞",而不是把代价块叠在主网格上 ─────────────
+## 真 Godot spike 实测:**两块 region 重叠时,路径无视上面那块的价格
+## 照直穿**;必须让主网格在代价区**没有覆盖**(烘焙时当障碍挖掉,见
+## 上面两个烘焙函数),再单独烤一小块**填回洞里**并设 `travel_cost` ——
+## A* 这才会在"绕路"和"穿泥地"之间按价格选(实测:代价 2 就绕开,
+## 代价 1 直穿;2D / 3D 行为一致)。
+##
+## 尺寸关系(烘焙器语义:外框内缩 agent_radius、障碍外扩同样多):
+##   * 洞 = 代价矩形外扩 1×半径(主网格那边的障碍膨胀出来的);
+##   * 补块 = 单独烤,外框取"代价矩形外扩 2×半径" —— 被内缩半径后
+##     正好等于那个洞;两边顶点精确重合,跨区域连接实测稳。
+var _gk_nav_cost_regions: Dictionary = {{}}
+
+
+## 补块 region 要进的地图:用**世界自己的**导航地图(root 视口里那张)。
+## ⚠ 不能用 `region_get_map(主区域)`:烘焙发生在 _ready 里,那时主区域
+##   节点**还没同步进地图**,读出来是空 RID —— 补块会进不了任何地图
+##   (真机实测:地图上只有 1 个 region,路径死活进不了代价区)。
+func _gk_nav_cost_map(root: Node, is_3d: bool) -> RID:
+	var viewport := root.get_viewport()
+	if viewport != null:
+		if is_3d:
+			var world3 := viewport.find_world_3d()
+			if world3 != null:
+				return world3.navigation_map
+		else:
+			var world2 := viewport.find_world_2d()
+			if world2 != null:
+				return world2.navigation_map
+	return RID()
+
+
+## 2D 代价区:逐块烤 + 建/更新服务器 region(用 RID 记住,重烤不堆积)。
+func _gk_apply_nav_costs_2d(root: Node, region: NavigationRegion2D) -> void:
+	if nav_costs.is_empty() or region.navigation_polygon == null:
+		return
+	var radius: float = maxf(region.navigation_polygon.agent_radius, 0.01)
+	var map := _gk_nav_cost_map(root, false)
+	if not map.is_valid():
+		map = NavigationServer2D.region_get_map(region.get_rid())
+	if not map.is_valid():
+		print("[GK] 代价区进不了 2D 导航地图 —— 重新导出一次")
+		return
+	for i in nav_costs.size():
+		var area: Dictionary = nav_costs[i]
+		var rid: RID = _gk_nav_cost_regions.get(i, RID())
+		if not rid.is_valid():
+			rid = NavigationServer2D.region_create()
+			NavigationServer2D.region_set_map(rid, map)
+			_gk_nav_cost_regions[i] = rid
+		var poly := _gk_bake_nav_cost_2d(root, area["rect"], radius)
+		NavigationServer2D.region_set_navigation_polygon(rid, poly)
+		# ⚠ 同主区域:烤出来的第一份可能被服务器吞掉(真机实测:
+		#   路径死活进不了代价区),再赋一份同内容就好
+		NavigationServer2D.region_set_navigation_polygon(rid, poly.duplicate())
+		NavigationServer2D.region_set_travel_cost(rid, area["cost"])
+		print("[GK] 代价区『", area["name"], "』:补块 ",
+			  poly.get_polygon_count(), " 块,代价 ", area["cost"])
+
+
+## 2D 补块:外框 = 代价矩形外扩 2×半径(内缩半径后 == 主网格的洞)。
+## 障碍照常参与(代价区里摆着墙的话,补块也把它挖掉,和主网格一致)。
+func _gk_bake_nav_cost_2d(root: Node, rect: Rect2,
+		radius: float) -> NavigationPolygon:
+	var poly := NavigationPolygon.new()
+	poly.agent_radius = maxf(radius, 0.01)
+	poly.cell_size = clampf(poly.agent_radius * 0.5, 0.25, 8.0)
+	poly.parsed_geometry_type = NavigationPolygon.PARSED_GEOMETRY_STATIC_COLLIDERS
+	var grown := rect.grow(poly.agent_radius * 2.0)
+	poly.add_outline(PackedVector2Array([grown.position,
+			Vector2(grown.end.x, grown.position.y),
+			grown.end,
+			Vector2(grown.position.x, grown.end.y)]))
+	var source := NavigationMeshSourceGeometryData2D.new()
+	NavigationServer2D.parse_source_geometry_data(poly, source, root)
+	NavigationServer2D.bake_from_source_geometry_data(poly, source)
+	return poly
+
+
+func _gk_cost_points_2d(area: Dictionary) -> PackedVector2Array:
+	var rect: Rect2 = area["rect"]
+	return PackedVector2Array([rect.position,
+			Vector2(rect.end.x, rect.position.y), rect.end,
+			Vector2(rect.position.x, rect.end.y)])
+
+
+## 3D 代价区:手工矩形补块(顶点和洞的边重合)+ 建/更新服务器 region。
+func _gk_apply_nav_costs_3d(root: Node, region: NavigationRegion3D) -> void:
+	if nav_costs.is_empty() or region.navigation_mesh == null:
+		return
+	var map := _gk_nav_cost_map(root, true)
+	if not map.is_valid():
+		map = NavigationServer3D.region_get_map(region.get_rid())
+	if not map.is_valid():
+		print("[GK] 代价区进不了 3D 导航地图 —— 重新导出一次")
+		return
+	for i in nav_costs.size():
+		var area: Dictionary = nav_costs[i]
+		var rid: RID = _gk_nav_cost_regions.get(i, RID())
+		if not rid.is_valid():
+			rid = NavigationServer3D.region_create()
+			NavigationServer3D.region_set_map(rid, map)
+			_gk_nav_cost_regions[i] = rid
+		var mesh := _gk_nav_cost_mesh_3d(region.navigation_mesh, area["box"])
+		NavigationServer3D.region_set_navigation_mesh(rid, mesh)
+		# ⚠ 同主区域:第一份可能被服务器吞掉,再赋一份同内容
+		NavigationServer3D.region_set_navigation_mesh(rid, mesh.duplicate())
+		NavigationServer3D.region_set_travel_cost(rid, area["cost"])
+		print("[GK] 代价区『", area["name"], "』:补块 1 块(面高 ",
+			  mesh.get_vertices()[0].y, "),代价 ", area["cost"])
+
+
+## 3D 补块:代价矩形(XZ)的四个角 + 面高度。高度**必须**取主网格在
+## 那一带的面高 —— 实测 recast 的面不在 y=0(高度量化),高度差一点点
+## 跨区域就连接不上。
+func _gk_nav_cost_mesh_3d(navmesh: NavigationMesh, box: AABB) -> NavigationMesh:
+	var y := _gk_nav_cost_surface_y(navmesh, box)
+	var mesh := NavigationMesh.new()
+	mesh.agent_radius = navmesh.agent_radius
+	mesh.set_vertices(PackedVector3Array([
+			Vector3(box.position.x, y, box.position.z),
+			Vector3(box.position.x, y, box.end.z),
+			Vector3(box.end.x, y, box.end.z),
+			Vector3(box.end.x, y, box.position.z)]))
+	mesh.add_polygon(PackedInt32Array([0, 1, 2, 3]))
+	return mesh
+
+
+## 面高:矩形里没有顶点(被挖成洞了)就往外扩 1 米找那一圈;再没有
+## 就退回物体自己的底面高度(空场景的兜底)。
+func _gk_nav_cost_surface_y(navmesh: NavigationMesh, box: AABB) -> float:
+	var verts := navmesh.get_vertices()
+	for band in [0.0, 1.0]:
+		var best := -1.0e9
+		for v in verts:
+			if v.x < box.position.x - band or v.x > box.end.x + band:
+				continue
+			if v.z < box.position.z - band or v.z > box.end.z + band:
+				continue
+			best = maxf(best, v.y)
+		if best > -1.0e8:
+			return best
+	return box.position.y
+
+
+## 3D 挖洞:投影障碍(柱体)= 矩形的 XZ 四个角 + 从"底面往下 0.5 米"
+## 到"顶面往上 0.5 米" —— 贴地的薄泥地也要能碰到脚下的导航面
+## (只按物体自己的高度范围会擦着地面切不到)。
+func _gk_add_cost_obstruction(source: NavigationMeshSourceGeometryData3D,
+		box: AABB) -> void:
+	var corners := PackedVector3Array([
+			Vector3(box.position.x, box.position.y, box.position.z),
+			Vector3(box.end.x, box.position.y, box.position.z),
+			Vector3(box.end.x, box.position.y, box.end.z),
+			Vector3(box.position.x, box.position.y, box.end.z)])
+	source.add_projected_obstruction(corners, box.position.y - 0.5,
+			box.size.y + 1.0, true)
 
 
 func _find_camera() -> Camera3D:
@@ -1533,6 +1712,8 @@ ENV_SCRIPT_DEFAULTS = dict(
     possess_key="KEY_F",
     esc_quit="true",
     nav_bake="false",
+    # 代价区清单(第八十四轮):空数组 = 没有代价区
+    nav_costs="[]",
     follow_lights="",
     # 开局 BGM(第七十七轮)。这两个键和 `_env_fields` 里那两行**必须一一对应**:
     # 只加 `_env_fields` 忘了加这里 -> 模板渲染 KeyError,而且只在
@@ -2158,7 +2339,8 @@ def _debug_watch_text(scene):
     return "|".join(cleaned)
 
 
-def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
+def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
+                is_3d=True):
     """环境脚本模板的填充值(两处分支共用一份)。
 
     ── 为什么要抽出来(踩过的坑)──────────────────────────────────
@@ -2167,6 +2349,7 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
     第一版就是这么撞的)。现在两边都调这个函数,加字段只改一处。
     """
     bgm_path, bgm_volume = _bgm_fields(scene)
+    dimension = "3" if is_3d else "2"
     return dict(
         camera_name=camera_name,
         fov=_fmt(fov),
@@ -2188,6 +2371,9 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None):
         # 暂停菜单 / 用户自己接的 Esc 都算"有人管了"(见 _esc_claimed_by_graph)。
         esc_quit="false" if _esc_claimed_by_graph(scene) else "true",
         nav_bake="true" if _nav_on(scene) else "false",
+        # 代价区(第八十四轮):物体『通行代价』!= 1 的清单 —— 环境脚本
+        # 烘焙时把它们挖成洞、各自补一块设 travel_cost(挖洞+补洞见模板)
+        nav_costs=nav_costs_literal(nav_cost_areas(scene), dimension),
         # 手电筒(第四十八轮):勾了『跟随相机』的灯名,运行时贴着相机走
         # (见环境脚本里的 _gk_follow_lights_tick)。
         follow_lights=_follow_light_names(_collect_lights(scene)),
@@ -2563,6 +2749,92 @@ def nav_obstacle_node_lines(physics, is_3d, parent_name):
         f"radius = {_fmt(radius)}",
         "",
     ]
+
+
+# ── 区域代价(第八十四轮:寻路第三版②)────────────────────────────────
+# 物体『通行代价』填 != 1 = 它盖住的那片地是"代价区"(泥地 / 危险区
+# 填 > 1 会绕开;< 1 是近路)。导出侧只做两件事:
+#   1. 把代价区的**世界包围盒**写进环境脚本的 `nav_costs`;
+#   2. 其余交给环境脚本 —— 烘焙时把代价区当障碍**挖洞**、再单独补一块
+#      设 `travel_cost`。
+# 为什么不能直接叠一块 region 在主网格上(真 Godot spike 实测):
+# **重叠区域的代价会被无视**,路径照直穿;必须拼边(挖洞 + 补洞)。
+def nav_travel_cost_of(physics):
+    """物体『通行代价』;没填 / 1.0(普通地面)返回 None(不导出)。
+
+    0 / 负数钳到 0.05:代价 0 会让 A* 的代价计算失去意义(路径能
+    "免费"在泥地里绕),Godot 那边也不保证处理 —— 导出侧就兜住。
+    """
+    if physics is None:
+        return None
+    raw = getattr(physics, "nav_travel_cost", None)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if abs(value - 1.0) < 1e-6:
+        return None
+    return max(0.05, value)
+
+
+def nav_cost_areas(scene):
+    """场景里所有『代价区』-> [{name, cost, min, size}](世界 AABB)。
+
+    * 只在场景勾了『寻路』时才有意义(没网格可挖,代价区无从谈起);
+    * 只认**网格物体**(空物体 / 相机没有面积可挖);
+    * `min` / `size` 是 3 轴元组 —— 2D 场景只用 XY,3D 用 XYZ
+      (由 `nav_costs_literal` 按维度挑)。
+    """
+    if scene is None or not _nav_on(scene):
+        return []
+    out = []
+    for obj in scene.objects:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        cost = nav_travel_cost_of(getattr(obj, "gk_physics", None))
+        if cost is None:
+            continue
+        bounds = object_bounds([obj])
+        if bounds is None:
+            continue
+        out.append({
+            "name": obj.name,
+            "cost": cost,
+            "min": bounds["min"],
+            "size": bounds["size"],
+        })
+    return out
+
+
+def nav_costs_literal(areas, dimension="3"):
+    """代价区清单 -> 环境脚本里的 GDScript 数组字面量(空 -> `[]`)。
+
+    2D(俯视):`rect` 用 XY 平面的矩形(Z 不参与 —— 俯视 2D 没有高度);
+    3D:`box` 用世界 AABB(XYZ 都参与,环境脚本再按它挖柱形洞)。
+    """
+    if not areas:
+        return "[]"
+    import json
+
+    parts = []
+    for area in areas:
+        name = json.dumps(str(area.get("name", "")), ensure_ascii=False)
+        cost = _gd_float(area.get("cost", 1.0))
+        mins = tuple(area.get("min", (0.0, 0.0, 0.0)))
+        size = tuple(area.get("size", (0.0, 0.0, 0.0)))
+        if str(dimension) == "2":
+            rect = (f"Rect2({_gd_float(mins[0])}, {_gd_float(mins[1])}, "
+                    f"{_gd_float(size[0])}, {_gd_float(size[1])})")
+            parts.append(f'{{"name": {name}, "cost": {cost}, "rect": {rect}}}')
+        else:
+            box = (f"AABB(Vector3({_gd_float(mins[0])}, {_gd_float(mins[1])}, "
+                   f"{_gd_float(mins[2])}), "
+                   f"Vector3({_gd_float(size[0])}, {_gd_float(size[1])}, "
+                   f"{_gd_float(size[2])}))")
+            parts.append(f'{{"name": {name}, "cost": {cost}, "box": {box}}}')
+    return "[\n\t" + ",\n\t".join(parts) + ",\n]"
 
 
 def write_world_scene(export_dir, scene_name="World", scene=None,
@@ -3229,7 +3501,7 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         if (_nav_on(scene) or _god_camera_on(scene)
                 or _debug_panel_on(scene) or scene_bgm_path(scene)):
             fields = _env_fields(scene, camera_name="", fov=_fmt(0.0),
-                                 material_files=material_files)
+                                 material_files=material_files, is_3d=False)
             files[env_script_rel(scene_name)] = \
                 ENVIRONMENT_SCRIPT.format(**fields)
             return ENVIRONMENT_NODE.format(**fields), files, ""

@@ -4521,6 +4521,96 @@ def main():
         check("第八十三轮(动态障碍 NavigationObstacle)", False,
               f"{type(exc).__name__}: {exc}")
 
+    # ---- 第八十四轮(H 组 22 第二小件):区域代价(泥地 / 危险区)--------
+    # 物体『游戏物理』填『通行代价』!= 1 -> 导出写进环境脚本 nav_costs
+    # (世界 AABB);环境脚本烘焙时把它当障碍挖洞、再补一块设 travel_cost
+    # 的代价区域。填 1.0(默认)的物体不进清单 —— 老场景行为不变。
+    try:
+        import shutil
+        asset_export = import_module(f"{module_name}.asset_export")
+        r84_work = os.path.join(tempfile.gettempdir(), "gk_navcost84")
+        shutil.rmtree(r84_work, ignore_errors=True)
+        os.makedirs(r84_work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        r84_mud = bpy.context.active_object
+        r84_mud.name = "泥地"
+        r84_mud.scale = (3.0, 2.0, 0.2)
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(6.0, 0.0, 0.0))
+        r84_plain = bpy.context.active_object
+        r84_plain.name = "普通地"
+        r84_settings = getattr(bpy.context.scene, "gk_settings", None)
+        if r84_settings is not None:
+            r84_settings.nav_enabled = True
+        bpy.context.view_layer.update()
+        check("区域代价:属性在物理面板上(默认 1.0 = 普通地面)",
+              hasattr(r84_plain.gk_physics, "nav_travel_cost")
+              and abs(r84_plain.gk_physics.nav_travel_cost - 1.0) < 1e-6,
+              f"{getattr(r84_plain.gk_physics, 'nav_travel_cost', '<no prop>')}")
+        r84_mud.gk_physics.nav_travel_cost = 5.0
+        check("区域代价:纯函数(1.0 不导出 / 5.0 透出)",
+              abs(asset_export.nav_travel_cost_of(
+                  r84_mud.gk_physics) - 5.0) < 1e-6
+              and asset_export.nav_travel_cost_of(
+                  r84_plain.gk_physics) is None)
+        r84_areas = asset_export.nav_cost_areas(bpy.context.scene)
+        check("区域代价:清单只收代价区(世界 AABB 3×2)",
+              len(r84_areas) == 1 and r84_areas[0]["name"] == "泥地"
+              and abs(r84_areas[0]["size"][0] - 3.0) < 1e-4
+              and abs(r84_areas[0]["size"][1] - 2.0) < 1e-4,
+              f"{r84_areas}")
+
+        # ── 面板 draw:填了 / 没填两条路都要画得完 ──────────────────
+        r84_draw_error = ""
+        try:
+            r84_panel = import_module(f"{module_name}.ui").GK_PT_ObjectPhysics
+            for r84_target in (r84_mud, r84_plain):
+                r84_layout = _R79Layout()
+                r84_holder = type("P", (), {"layout": r84_layout})()
+                r84_ctx = type("C", (), {"object": r84_target,
+                                         "scene": bpy.context.scene})()
+                r84_panel.draw(r84_holder, r84_ctx)
+        except Exception as exc:                       # noqa: BLE001
+            r84_draw_error = f"{type(exc).__name__}: {exc}"
+        check("第八十四轮:『游戏物理』面板(通行代价 填/不填)画得完",
+              not r84_draw_error, r84_draw_error)
+
+        # ── 真导出:环境脚本里 nav_costs 写的是泥地的世界 AABB ────────
+        r84_env = ""
+        _nodes, r84_files, _cam = asset_export.build_environment_nodes(
+            bpy.context.scene, is_3d=True, scene_name="World")
+        for value in (r84_files or {}).values():
+            r84_env = value
+        check("区域代价:环境脚本 nav_costs 写世界 AABB + 整条代价管线",
+              '"name": "泥地"' in r84_env and '"cost": 5.0' in r84_env
+              and "AABB(Vector3(" in r84_env and "普通地" not in r84_env
+              and "add_projected_obstruction" in r84_env
+              and "add_obstruction_outline" in r84_env
+              and "region_set_travel_cost" in r84_env,
+              r84_env[-300:])
+        r84_text_2d = asset_export.nav_costs_literal(r84_areas, "2")
+        check("区域代价:2D 场景用 XY 矩形(Z 不参与)",
+              "Rect2(" in r84_text_2d and "AABB" not in r84_text_2d,
+              r84_text_2d)
+
+        # ── 填回 1.0:清单空、环境脚本 nav_costs = [] (老场景行为不变) ──
+        r84_mud.gk_physics.nav_travel_cost = 1.0
+        r84_env2 = ""
+        _nodes2, r84_files2, _cam2 = asset_export.build_environment_nodes(
+            bpy.context.scene, is_3d=True, scene_name="World")
+        for value in (r84_files2 or {}).values():
+            r84_env2 = value
+        check("区域代价:代价填回 1.0 后 nav_costs 空(老场景行为不变)",
+              asset_export.nav_cost_areas(bpy.context.scene) == []
+              and "var nav_costs: Array = []" in r84_env2,
+              r84_env2[-200:])
+    except Exception as exc:
+        check("第八十四轮(区域代价 泥地/危险区)", False,
+              f"{type(exc).__name__}: {exc}")
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

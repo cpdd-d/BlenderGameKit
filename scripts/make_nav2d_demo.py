@@ -27,6 +27,19 @@
 ⚠ 终点标记用 **Area2D**:2D 烘焙只认 StaticBody2D,标记要是 StaticBody2D
   就会被挖成障碍(终点变成不可达)。
 
+── 第八十四轮:区域代价(泥地)真机探针用的两条"代价车道"─────────────
+场地左侧铺一块**泥地补丁**(『通行代价』5.0)。导出时主网格会在它下面
+**挖一个洞**、再单独补一块带价格的区域 —— 寻路会在"绕路"和"穿泥地"
+之间按价格选:
+
+  * **泥地车道**(泥地甲,y=+5.5):直线穿泥地 ≈12 米、绕开 ≈13 米;
+    代价 5 时该**绕开**(探针量横向偏离 ≥1);
+  * **对照车道**(对照戊,y=-7.5):同一套设置、**没有泥地** ——
+    直着走完(证明"绕开"是泥地干的,不是这套设置自己爱拐弯)。
+
+⚠ 泥地补丁是 **Area2D**(没有物理碰撞):路径愿意走就能走过去,只是贵。
+  它**不是墙** —— 探针另外查一条"走进泥地中心"的路径,证明那里可达。
+
 ── 2D 寻路的注意事项(和 3D 的唯一区别)──────────────────────────
 **2D 里碰撞体 = 障碍物**。所以给"墙 / 箱子 / 障碍"加碰撞体,给"地面 /
 地板"**不要**加(整块地板会被当成一个巨大的障碍挖掉) —— 俯视 2D 游戏
@@ -80,6 +93,26 @@ GHOST_RADIUS = 0.8         # 幽灵障碍半径(避障系统按它保距)
 GHOST_SWING = 1.0          # 探针来回挪的幅度(米)
 GHOST_NAME_A = "幽灵甲"
 GHOST_NAME_B = "幽灵乙"
+# ── 第八十四轮:区域代价(泥地)—— 一条"绕泥地"车道 + 一条对照车道 ────
+# 泥地补丁是 **Area2D**(没有物理碰撞 —— 路径愿意走就能走过去,只是"贵"),
+# 『通行代价』填 5.0。导出时主网格在它下面**挖个洞**、单独补一块带价格的
+# 区域(真机实测:把代价块叠在主网格上没用,必须拼边):
+#   * 泥地车道(y=+5.5):直线穿泥地 ≈12 米,绕开 ≈13 米 —— 代价 5 时
+#     寻路选**绕开**(探针量横向偏离);
+#   * 对照车道(y=-7.5):同一套设置、**没有泥地** —— 直线走完
+#     (证明"绕开"是泥地干的,不是这套设置自己爱拐弯)。
+# ⚠ 对照车道摆在 y=-7.5(贴着下墙)是有意的:y=-5.5 会撞上站在
+#   (0,-6) 的小玩家,绕不开就顶死在那儿(实测规划时算出来的)。
+MUD_NAME = "泥地"
+MUD_COST = 5.0
+MUD_CENTER_X = -3.0        # 泥地补丁中心(躲开追踪者的出发点 (0,6))
+MUD_HALF_X = 1.5
+MUD_HALF_Y = 1.0
+MUD_LANE_Y = 5.5           # 泥地车道
+MUD_CTRL_Y = -7.5          # 对照车道(没有泥地)
+MUD_START_X = -6.0
+MUD_GOAL_X = 6.0
+MUD_SPEED = LANE_SPEED     # 和避障车道同速
 
 
 def log(message):
@@ -176,6 +209,26 @@ def build_scene():
         GHOST_NAME_B, (1.2, 1.2, 1.0), (0.0, PLAIN_LANE_Y, 0.0), ghost_color)
     log(f"幽灵障碍:{GHOST_NAME_A} / {GHOST_NAME_B}(半径 {GHOST_RADIUS:g},"
         f"无物理碰撞;探针会沿 x 来回挪 ±{GHOST_SWING:g})")
+    # ── 第八十四轮:泥地补丁 + 两条代价车道(泥地 / 对照)────────────
+    mud_color = (0.42, 0.32, 0.2, 1.0)
+    lanes[MUD_NAME] = make_box(
+        MUD_NAME, (MUD_HALF_X * 2.0, MUD_HALF_Y * 2.0, 1.0),
+        (MUD_CENTER_X, MUD_LANE_Y, 0.0), mud_color)
+    lanes["泥地甲"] = make_box("泥地甲", (1.0, 1.0, 1.0),
+                               (MUD_START_X, MUD_LANE_Y, 0.0),
+                               (0.85, 0.7, 0.45, 1.0))
+    lanes["对照戊"] = make_box("对照戊", (1.0, 1.0, 1.0),
+                               (MUD_START_X, MUD_CTRL_Y, 0.0),
+                               (0.6, 0.75, 0.55, 1.0))
+    lanes["终点戊"] = make_box("终点戊", (0.6, 0.6, 1.0),
+                               (MUD_GOAL_X, MUD_LANE_Y, 0.0), marker_color)
+    lanes["终点己"] = make_box("终点己", (0.6, 0.6, 1.0),
+                               (MUD_GOAL_X, MUD_CTRL_Y, 0.0), marker_color)
+    log(f"泥地:{MUD_NAME} 在 ({MUD_CENTER_X:g}, {MUD_LANE_Y:g})"
+        f" 尺寸 {MUD_HALF_X * 2:g}x{MUD_HALF_Y * 2:g},通行代价 {MUD_COST:g}"
+        f"(Area2D —— 没物理碰撞,只有路径价格)")
+    log(f"代价车道:泥地车道 y={MUD_LANE_Y:g} / 对照车道 y={MUD_CTRL_Y:g}"
+        f"(没有泥地);两端 x={MUD_START_X:g} -> {MUD_GOAL_X:g}")
     log(f"对撞车道:避障对 y={AVOID_LANE_Y:g}(甲/乙) / "
         f"对照对 y={PLAIN_LANE_Y:g}(丙/丁);两端 x=±{LANE_X:g}")
     log(f"场景:场地 {ARENA_HALF_X * 2:.0f}x{ARENA_HALF_Y * 2:.0f} / "
@@ -214,6 +267,11 @@ def write_physics(scene, chaser, player, lanes):
                 physics.body_type = "Area2D"
                 physics.nav_obstacle = True
                 physics.nav_obstacle_radius = GHOST_RADIUS
+            elif obj.name == MUD_NAME:
+                # 泥地(第八十四轮):Area2D(没有物理碰撞 —— 路径愿意走
+                # 就能走过去,只是"贵")+『通行代价』,导出时挖洞 + 补价格块
+                physics.body_type = "Area2D"
+                physics.nav_travel_cost = MUD_COST
             else:
                 physics.body_type = "CharacterBody2D"
         elif getattr(obj, "type", "") == "MESH":
@@ -250,8 +308,23 @@ def build_graph(scene):
     for node in lane_nodes:
         _link(tree, previous, "完成", node, "执行")
         previous = node
+    # ── 第八十四轮:两条代价车道(泥地 / 对照)────────────────────────
+    # 和上面同一套『移动_寻路』;只有"目标"不同 —— 泥地车道的路会绕开
+    # 泥地(代价 5),对照车道没有泥地、直着走完。
+    mud_nodes = []
+    y2 = -840.0
+    for name, goal in (("泥地甲", "终点戊"), ("对照戊", "终点己")):
+        node = _add(tree, "GKNodeNavigate", f"{name}走", 520.0, y2,
+                    gk_target=name, gk_goal=goal, gk_speed=MUD_SPEED,
+                    gk_stop_distance=LANE_STOP, gk_turn=True)
+        mud_nodes.append(node)
+        y2 -= 140.0
+    for node in mud_nodes:
+        _link(tree, previous, "完成", node, "执行")
+        previous = node
     log("图:『每当_物理帧』->『移动_寻路』(追踪者追玩家) -> "
-        "对撞车道(避障甲 / 避障乙 / 对照丙 / 对照丁)已接好")
+        "对撞车道(避障甲 / 避障乙 / 对照丙 / 对照丁) -> "
+        "代价车道(泥地甲 / 对照戊)已接好")
     return tree
 
 
