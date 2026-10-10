@@ -54,6 +54,8 @@ _SUBMODULES = (
     "properties",
     # 预设(一键生成第三人称角色):纯节点/连线逻辑,离线也能 import
     "presets",
+    # 关卡预设(2D 闯关 / 3D 关卡 / 2.5D,第八十七轮):同上,operator_io 用
+    "levels",
     "nodes.node_base",
     # 节点按领域拆成 _*.py,门面 nodes/nodes.py 合并命名空间。
     # _common 必须排最前 —— 它里面 `CLASSES = []` 负责把登记表清空,

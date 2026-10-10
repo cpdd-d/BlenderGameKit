@@ -69,6 +69,91 @@ class GKNodeDisplaySwitch(B.GKStatementNode):
         layout.label(text="每张玩法图只放一个", icon="INFO")
 
 
+# ── 画质档位(第八十八轮 I 组 25)────────────────────────────────────
+# 低 / 中 / 高 三档 + 自定义。每档是 (视口缩放, 抗锯齿, 阴影) 三个数,
+# 落成 Godot 的**真渲染设置**(不是插件自己的开关):
+#   * 视口缩放 -> 3D: Viewport.scaling_3d_scale;2D: Window.content_scale_factor
+#   * 抗锯齿   -> Viewport.msaa_3d / msaa_2d(0 / 2x / 4x / 8x)
+#   * 阴影     -> 每盏灯的 shadow_enabled + RenderingServer 的阴影图大小 /
+#                 软阴影过滤质量
+QUALITY_LEVELS = (
+    ("LOW", "低", "省电:视口 0.6 倍 + 不抗锯齿 + 关阴影"),
+    ("MID", "中", "均衡:视口 0.85 倍 + 2x 抗锯齿 + 中阴影"),
+    ("HIGH", "高", "画质优先:视口 1.0 + 4x 抗锯齿 + 高阴影"),
+    ("CUSTOM", "自定义", "用下面三个手填值"),
+)
+
+# 档位 -> (视口缩放, 抗锯齿档, 阴影档);抗锯齿 0=关 1=2x 2=4x 3=8x。
+QUALITY_PRESETS = {
+    "LOW": (0.6, 0, 0),
+    "MID": (0.85, 1, 2),
+    "HIGH": (1.0, 2, 3),
+}
+_MSAA_CODES = {"OFF": 0, "2X": 1, "4X": 2, "8X": 3}
+_SHADOW_CODES = {"OFF": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+
+
+def resolved_quality(node):
+    """这个节点最后要设的三个数(**纯函数**,离线可测)。
+
+    档位不是自定义时用预设值;自定义时用卡片上那三个手填项(缩放的
+    合法范围是 0.1~1.0,越界就夹回来)。返回 (视口缩放, 抗锯齿, 阴影)。
+    """
+    level = str(getattr(node, "gk_level", "HIGH") or "HIGH")
+    if level in QUALITY_PRESETS:
+        return QUALITY_PRESETS[level]
+    try:
+        scale = float(getattr(node, "gk_scale", 1.0))
+    except (TypeError, ValueError):
+        scale = 1.0
+    return (max(0.1, min(1.0, scale)),
+            _MSAA_CODES.get(str(getattr(node, "gk_msaa", "OFF")), 0),
+            _SHADOW_CODES.get(str(getattr(node, "gk_shadow", "OFF")), 0))
+
+
+@N
+class GKNodeQualitySet(B.GKStatementNode):
+    bl_idname = "GKNodeQualitySet"
+    bl_label = "画质_设置"
+    bl_icon = "PREFERENCES"
+    gk_category = "显示"
+    gk_doc = ("运行时切**画质档位** —— 设置菜单里的\"低 / 中 / 高\"接这里。\n"
+              "三档各自会真的改 Godot 的渲染设置:\n"
+              "  * 视口缩放(3D 用 `scaling_3d_scale`;2D 用窗口 "
+              "`content_scale_factor`)\n"
+              "  * 抗锯齿(`msaa_3d` / `msaa_2d`:关 / 2x / 4x / 8x)\n"
+              "  * 阴影(每盏灯的 `shadow_enabled` + 阴影图大小 + 软阴影质量)\n"
+              "『自定义』= 用卡片下面那三个手填值(想只微调某一项就用它)。\n"
+              "『执行』走到它时才生效:接在『每当_准备』后面就是开局默认画质;"
+              "挂在按钮 / 按键上就是设置菜单里的\"低/中/高\"。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_level", "enum", "HIGH", "档位", "", QUALITY_LEVELS),
+        ("gk_scale", "float", 1.0, "视口缩放",
+         "自定义档用:0.1~1.0(0.6 = 按六成分辨率渲染再放大)"),
+        ("gk_msaa", "enum", "OFF", "抗锯齿", "自定义档用",
+         (("OFF", "关", ""), ("2X", "2x", ""), ("4X", "4x", ""),
+          ("8X", "8x", ""))),
+        ("gk_shadow", "enum", "OFF", "阴影", "自定义档用",
+         (("OFF", "关", ""), ("LOW", "低", ""), ("MEDIUM", "中", ""),
+          ("HIGH", "高", ""))),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_level", text="")
+        level = str(getattr(self, "gk_level", "HIGH") or "HIGH")
+        if level == "CUSTOM":
+            row = layout.row(align=True)
+            row.prop(self, "gk_scale", text="缩放")
+            row.prop(self, "gk_msaa", text="")
+            row.prop(self, "gk_shadow", text="")
+        scale, msaa, shadow = resolved_quality(self)
+        layout.label(text=f"视口 ×{scale:g} · "
+                          f"抗锯齿 {('关', '2x', '4x', '8x')[msaa]} · "
+                          f"阴影 {('关', '低', '中', '高')[shadow]}",
+                     icon="INFO")
+
+
 @N
 class GKNodeSetPaused(B.GKStatementNode):
     bl_idname = "GKNodeSetPaused"

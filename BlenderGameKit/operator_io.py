@@ -11,8 +11,8 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        FloatProperty, IntProperty, StringProperty)
 
 from . import (advisor, advisor_tools, asset_export, codegen, curve_assets,
-               export_report, exporter, gk_log, node_groups, npr_preview,
-               packaging, project)
+               export_report, exporter, gk_log, levels, node_groups,
+               npr_preview, packaging, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -801,6 +801,89 @@ class GK_OT_CharacterPreset(bpy.types.Operator):
         # 顺手切到新那张图,让用户立刻看到成果(没有节点编辑器就算了)
         try:
             bpy.ops.gk.focus_tree(tree_name=logic_tree.name)
+        except Exception:                                 # noqa: BLE001
+            pass
+        return {"FINISHED"}
+
+
+class GK_OT_LevelPreset(bpy.types.Operator):
+    """一键建一关(关卡预设:2D 闯关 / 3D 关卡 / 2.5D)。
+
+    ── 为什么要有它(待办 I 组 24)──────────────────────────────────
+    用户从待办里点的"三种关卡预设模板"。『角色预设』解决的是"角色怎么动",
+    这个解决的是"**这一关从哪开始**":新建场景 + 地面 / 角色 / 相机 +
+    起步逻辑链 + 场景与物体设置一起配好 —— 导出后 Godot 里直接能玩。
+
+    ── 和『角色预设』的关系 ─────────────────────────────────────────
+    3D 模板**直接复用**角色预设那张跑通的图(输入 / 移动 / 跳跃 / 鼠标
+    转视角 / C·V 换机位);2D 和 2.5D 各有自己的起步链(见 levels.py)。
+    建出来的都是普通节点图,想怎么改都行。
+    """
+
+    bl_idname = "gk.level_preset"
+    bl_label = "新建关卡(预设)"
+    bl_description = ("一键建一关:新建场景 + 地面 / 角色 / 相机 + 连好的"
+                      "起步逻辑图 + 场景与物体设置 —— 导出后能直接玩")
+    bl_options = {"REGISTER", "UNDO"}
+
+    template: EnumProperty(
+        name="模板", items=levels.template_items(), default="3d",
+        description="要建哪种玩法的一关")
+    scene_name: StringProperty(
+        name="场景名", default="",
+        description="留空 = 用模板的默认名(2D关卡 / 3D关卡 / 2.5D关卡)")
+    character_name: StringProperty(
+        name="角色名", default="",
+        description="新角色的名字(留空 = 『角色』)")
+    move_speed: FloatProperty(name="移动速度", default=6.0,
+                              min=0.1, max=60.0)
+    jump_force: FloatProperty(name="跳跃强度", default=7.0,
+                              min=0.1, max=60.0)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column()
+        col.prop(self, "template", expand=True)
+        layout.label(text=levels.TEMPLATE_HINTS.get(self.template, ""),
+                     icon="INFO")
+        box = layout.box()
+        box.label(text="名字", icon="SORTALPHA")
+        box.prop(self, "scene_name")
+        box.prop(self, "character_name")
+        box = layout.box()
+        box.label(text="手感", icon="DRIVER")
+        box.prop(self, "move_speed")
+        box.prop(self, "jump_force")
+        layout.label(text="建的是新场景,老场景一个字都不动", icon="SCENE_DATA")
+
+    def execute(self, context):
+        # 2D 的默认速度单位是像素/秒,和 3D 的米/秒差很多 —— 模板不同,
+        # 默认值跟着走(用户在对话框里改过的值优先)。
+        speed = float(self.move_speed)
+        jump = float(self.jump_force)
+        if self.template == "2d" and speed == 6.0:
+            speed = 240.0
+        if self.template == "2d" and jump == 7.0:
+            jump = 520.0
+        try:
+            outcome = levels.create_level(
+                template=self.template,
+                scene_name=self.scene_name,
+                character_name=self.character_name,
+                params={"move_speed": speed, "jump_force": jump})
+        except Exception as exc:                          # noqa: BLE001
+            _report(self, "ERROR", f"建关卡失败:{type(exc).__name__}: {exc}")
+            return {"CANCELLED"}
+        for note in outcome["notes"]:
+            print(f"[BlenderGameKit] {note}")
+        _report(self, "INFO",
+                f"已建好『{outcome['scene'].name}』(逻辑图 "
+                f"『{outcome['tree'].name}』)—— 导出后就能玩")
+        try:
+            bpy.ops.gk.focus_tree(tree_name=outcome["tree"].name)
         except Exception:                                 # noqa: BLE001
             pass
         return {"FINISHED"}
@@ -2689,7 +2772,8 @@ class GK_OT_ExportAssets(bpy.types.Operator):
         try:
             outcome = asset_export.export_all_scenes(
                 directory,
-                dimension=settings.get("dimension", "3"),
+                # dimension=None = 逐场景用各自的设置(第八十七轮,同下)
+                dimension=None,
                 script_name=LAST_EXPORT.get("script_name") or None,
             )
         except Exception as exc:
@@ -3188,7 +3272,10 @@ def _auto_prepare(operator, context, directory):
     try:
         outcome = asset_export.export_all_scenes(
             directory,
-            dimension=exporter.build_settings(context.scene).get("dimension", "3"),
+            # dimension=None = **逐场景**用各自的设置(第八十七轮)——
+            # 『关卡预设』可以建出 2D / 3D 混在一个 .blend 里的工程,
+            # 各导各的维度;单一维度的工程行为和以前完全一样。
+            dimension=None,
             script_name=script_name,
         )
         if outcome.get("error"):
@@ -3795,6 +3882,8 @@ GK_CLASSES = (
     # 现在面板测试里加了一条通用断言:**画出来的每个按钮 idname 都必须
     # 是真算子** —— 这类"逻辑测了、接线忘了"的错以后当场就红。
     GK_OT_CharacterPreset,
+    # 一键建一关(关卡预设:2D 闯关 / 3D 关卡 / 2.5D,第八十七轮 I 组 24)
+    GK_OT_LevelPreset,
     # 变量集中面板:查找引用 + 放取/设节点
     GK_OT_VarFindRefs,
     GK_OT_VarMakeNode,

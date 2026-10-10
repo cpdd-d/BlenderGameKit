@@ -2887,6 +2887,17 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         "export_lights": False,
         "export_extras": True,
     }
+    # ── 只导出**当前这个场景**(第八十七轮:多场景时串场景)────────────
+    # 不传这个开关时,导出器会把 **.blend 里所有场景**都算进来,
+    # 而 `use_selection` 只筛"选中的物体" —— 别的场景里选中的东西会
+    # **混进这个 glb**(实测:『关卡预设』建了三关,3D 关的 glb 里
+    # 混进了 2.5D 关的地面和角色)。传 True 就把范围收在活动场景里;
+    # 老版本 Blender 没有这个参数时 `_run_gltf_export` 会自动降级重试。
+    try:
+        if bpy.context.scene == scene:
+            kwargs["use_active_scene"] = True
+    except Exception:                                     # noqa: BLE001
+        pass
     result = _run_gltf_export(kwargs, path)
 
     # 隐藏骨架 -> 明确告警(同 export_subtree_glb)
@@ -7075,7 +7086,7 @@ def _activate_scene(scene):
         return False
 
 
-def export_all_scenes(directory, dimension="3", script_name=None):
+def export_all_scenes(directory, dimension=None, script_name=None):
     """把一个 .blend 里的**每个 Blender 场景**各导出一张 .tscn(用户 2026-10-04)。
 
     ── 为什么需要它 ────────────────────────────────────────────────
@@ -7087,6 +7098,13 @@ def export_all_scenes(directory, dimension="3", script_name=None):
     现在:遍历 .blend 里所有 Blender 场景,每个场景用它在场景设置里选的
     逻辑图,各导一份 .tscn。**单场景项目 scene_name 仍是 "World",与以前
     完全一致** —— 只有 .blend 里存在多于一个场景时才走多场景命名。
+
+    ── dimension 参数(第八十七轮起可为 None)────────────────────────
+    None = **逐场景**用各自的场景设置(『关卡预设』建的 2D / 3D 关
+    可以在同一个 .blend 里各导各的维度);给了值 = 全部按这个值导
+    (老调用方 / 修过的角例,行为一字不变)。
+    以前只认一个值:一个 .blend 里同时有 2D 和 3D 关卡时,后者的场景
+    会被前者的维度导出(2D 关卡里出现 Camera3D 那种错)。
 
     ── 主场景 ──────────────────────────────────────────────────────
     多场景时主场景指向**第一个**场景(通常就是关卡1),但用户手动在 Godot
@@ -7123,6 +7141,15 @@ def export_all_scenes(directory, dimension="3", script_name=None):
         # 会去导"当前这一关"的东西。
         _activate_scene(scene)
         scene_name = _safe_scene_name(scene.name) if multi else "World"
+        # ── 这一关的维度(第八十七轮)────────────────────────────────
+        # 调用方给了值就用它(老调用方一字不变);没给(None)= 逐场景
+        # 读各自的场景设置 —— 一个 .blend 里 2D 关卡和 3D 关卡混着放时
+        # 各导各的,不会把 3D 关当 2D 导。
+        if dimension is None:
+            scene_dimension = str(
+                exporter.build_settings(scene).get("dimension", "3") or "3")
+        else:
+            scene_dimension = str(dimension)
         entry = {"scene": scene.name, "scene_name": scene_name,
                  "tscn": "", "ok": False, "warnings": [],
                  "script_name": "", "tree_reason": ""}
@@ -7144,7 +7171,7 @@ def export_all_scenes(directory, dimension="3", script_name=None):
         if tree is not None and (multi or not tree_script or script_missing):
             scene_settings = exporter.build_settings(scene)
             scene_settings["output_dir"] = directory
-            scene_settings["dimension"] = dimension
+            scene_settings["dimension"] = scene_dimension
             if multi:
                 # ── 每个场景的逻辑脚本必须**分开命名**(用户 2026-10-04)────
                 # 脚本名默认取节点树名,而中文名会被压成空 -> 回退 game_logic.gd。
@@ -7177,7 +7204,7 @@ def export_all_scenes(directory, dimension="3", script_name=None):
                 f"『{scene.name}』没有可用的游戏逻辑图:{why}")
 
         outcome = export_assets_pipeline(
-            scene, directory, dimension=dimension, script_name=tree_script,
+            scene, directory, dimension=scene_dimension, script_name=tree_script,
             scene_name=scene_name)
         entry["warnings"].extend(outcome.get("warnings", []))
         # 累加,不能覆盖:上面『逻辑图导出』那一步可能已经记了脚本 / 曲线
@@ -7398,6 +7425,17 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
         "export_lights": False,
         "export_extras": True,
     }
+    # ── 只导出**当前这个场景**(第八十七轮:多场景时串场景)────────────
+    # 不传这个开关时,导出器会把 **.blend 里所有场景**都算进来,
+    # 而 `use_selection` 只筛"选中的物体" —— 别的场景里选中的东西会
+    # **混进这个 glb**(实测:『关卡预设』建了三关,3D 关的 glb 里
+    # 混进了 2.5D 关的地面和角色)。传 True 就把范围收在活动场景里;
+    # 老版本 Blender 没有这个参数时 `_run_gltf_export` 会自动降级重试。
+    try:
+        if bpy.context.scene == scene:
+            kwargs["use_active_scene"] = True
+    except Exception:                                     # noqa: BLE001
+        pass
     result = _run_gltf_export(kwargs, path)
 
     # 隐藏骨架 -> 明确告警(见上面那段说明)。

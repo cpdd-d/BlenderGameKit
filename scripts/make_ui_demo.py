@@ -475,7 +475,29 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, slot_one, "完成", slot_two, "执行")
     _link(tree, slot_two, "完成", resume, "执行")
     _link(tree, resume, "完成", quit_button, "执行")
-    _link(tree, quit_button, "完成", logs, "执行")
+    # ── 第八十八轮:画质三档(点了**真的改渲染设置**)────────────────
+    # 三个按钮放**左上角**(不进暂停菜单):菜单是居中弹的,而『对话_选择』
+    # 面板也居中 —— 探针点它的时候正好两个都可能开着,放菜单里会被面板盖住。
+    # 它们仍然接在**同一条建控件的链上**(界面控件是按名字找父级的),
+    # 各自的『点击』接一个『画质_设置』。探针点『画质中』,断言视口缩放 /
+    # 抗锯齿真的变了(不是插件自己的开关)。
+    quality_buttons = []
+    for _index, (_label, _level) in enumerate(
+            (("画质低", "LOW"), ("画质中", "MID"), ("画质高", "HIGH"))):
+        quality_button = _add(tree, "GKNodeUiButton", _label,
+                              2860.0, -1300.0 - _index * 60.0,
+                              gk_text=_label, gk_x=1022.0,
+                              gk_y=452.0 + _index * 48.0,
+                              gk_width=110.0, gk_height=40.0)
+        quality_apply = _add(tree, "GKNodeQualitySet", f"{_label}生效",
+                             3120.0, -1300.0 - _index * 60.0,
+                             gk_level=_level)
+        _link(tree, quality_button, "点击", quality_apply, "执行")
+        quality_buttons.append(quality_button)
+    _link(tree, quit_button, "完成", quality_buttons[0], "执行")
+    _link(tree, quality_buttons[0], "完成", quality_buttons[1], "执行")
+    _link(tree, quality_buttons[1], "完成", quality_buttons[2], "执行")
+    _link(tree, quality_buttons[2], "完成", logs, "执行")
     _link(tree, logs, "完成", fill, "执行")
     _link(tree, fill, "完成", chat, "执行")
     _link(tree, chat, "完成", nickname, "执行")
@@ -562,9 +584,9 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, slot_two, "点击", load_two, "执行")
     log("界面链:皮肤 -> 套用设计图(右上角 HUD,3 个控件) -> 接设计按钮行为 -> "
         "面板 -> 图片 -> 文本 -> 进度条 -> 引擎声(循环) -> 暂停菜单(九宫格标题条 + "
-        "存档列表) -> 日志列表(填充) -> 聊天框(多行) -> 昵称输入框(输入法) -> "
-        "提示 -> 对话框 -> 淡入 + 聚焦 -> 结局选择(3 个选项) -> 字幕(带立绘) -> "
-        "对话回顾(导出 + 点句重放)")
+        "存档列表 + 画质三档) -> 日志列表(填充) -> 聊天框(多行) -> "
+        "昵称输入框(输入法) -> 提示 -> 对话框 -> 淡入 + 聚焦 -> "
+        "结局选择(3 个选项) -> 字幕(带立绘) -> 对话回顾(导出 + 点句重放)")
     return choice
 
 

@@ -217,6 +217,15 @@ func _physics_process(delta: float) -> void:
 	elif phase == 13 and elapsed >= 5.4:
 		phase = 14
 		_check_chat_sent()
+		# 第八十八轮:点右下角『画质中』—— 下一个阶段看渲染设置变了没
+		# (放在最尾:这时『对话_选择』面板已经收起,不会挡着点击;
+		#  按钮本身也**不在**暂停菜单里,任何时候都点得动)
+		var quality := _widget("画质中")
+		if quality != null:
+			_click_at(quality.get_global_rect().get_center())
+	elif phase == 14 and elapsed >= 5.8:
+		phase = 15
+		_check_quality()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
@@ -602,6 +611,17 @@ func _check_slot_click() -> void:
 	print("UI_LIST_CLICK ok=", text == "读取存档一", " score=", text)
 
 
+## 第八十八轮:『画质_设置』—— 点了『画质中』,视口缩放 / 抗锯齿
+## 真的变了(中档 = 0.85 倍 + 2x 抗锯齿)。看的是 Godot 自己的视口属性,
+## 所以"真改渲染设置"这句话有真机证据。
+func _check_quality() -> void:
+	var vp := get_viewport()
+	var scale_now: float = vp.scaling_3d_scale
+	var msaa_now: int = vp.msaa_3d
+	print("UI_QUALITY ok=", is_equal_approx(scale_now, 0.85) and msaa_now == 1,
+		" scale=", snappedf(scale_now, 0.001), " msaa=", msaa_now)
+
+
 func _check_log_list() -> void:
 	var list := _widget("日志列表")
 	var body: Node = null
@@ -787,6 +807,10 @@ def main():
         (r"UI_RESUME ok=true", "点『继续游戏』没有解冻 / 菜单没收回去"),
         (r"UI_LIST ok=true", "列表没建两层 / 存档槽没挂在里层容器里排队"),
         (r"UI_LIST_CLICK ok=true", "点『存档一』没走进它自己的点击链"),
+        # ---- 第八十八轮:画质三档(真改渲染设置)----
+        (r"UI_QUALITY ok=true",
+         "『画质_设置』没真的改渲染设置(点了『画质中』之后 "
+         "scaling_3d_scale 应该是 0.85 / msaa_3d 应该是 2x)"),
         (r"UI_LIST_FILL ok=true", "『列表_填充』没灌出三行日志"),
         (r"UI_NINEPATCH ok=true", "九宫格切片 / 贴图 / 垫底 不对"),
         (r"UI_FOCUS_TWEEN ok=true", "输入框没淡入到不透明 / 焦点没落到它身上"),

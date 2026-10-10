@@ -4847,6 +4847,142 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第八十七轮(I 组 24):三种关卡预设模板(2D 闯关 / 3D 关卡 / 2.5D)----
+    # ① 三种模板各建一关:新场景 + 地面 / 角色 / 相机 + 逻辑图 + 设置;
+    # ② 图在真 Blender 里也能生成干净代码;
+    # ③ 真导出:三个场景各导一张 .tscn(dimension=None = 逐场景维度):
+    #    2D 关没有 Camera3D、3D / 2.5D 关有;脚本 / 输入映射都在。
+    try:
+        import shutil
+        r87_levels = import_module(f"{module_name}.levels")
+        r87_asset = import_module(f"{module_name}.asset_export")
+        r87_project = import_module(f"{module_name}.project")
+
+        created = {}
+        for r87_key in ("2d", "3d", "25d"):
+            r87_out = r87_levels.create_level(template=r87_key,
+                                              scene_name=f"冒烟{r87_key}")
+            created[r87_key] = r87_out
+            r87_scene = r87_out["scene"]
+            r87_tree = r87_out["tree"]
+            r87_char = r87_out["character"]
+            r87_names = [obj.name for obj in r87_scene.objects]
+
+            def _r87_has(prefix, names=None):
+                # 场景里已有同名物体时 Blender 会加 .001 后缀 —— 按前缀认
+                return any(str(name).startswith(prefix)
+                           for name in (names or r87_names))
+
+            r87_settings = r87_scene.gk_settings
+            r87_physics = r87_char.gk_physics
+            check(f"关卡模板[{r87_key}]:场景 / 地面 / 角色 / 相机 都建出来了",
+                  _r87_has("地面") and _r87_has("角色")
+                  and (_r87_has("侧视机位") and _r87_has("俯瞰机位")
+                       if r87_key != "2d" else True)
+                  and len(r87_tree.nodes) >= 8
+                  and bool(getattr(r87_tree, "use_fake_user", False)),
+                  str(r87_names))
+            check(f"关卡模板[{r87_key}]:场景设置 / 角色物理设置都配好了",
+                  str(r87_settings.dimension)
+                  == ("2" if r87_key == "2d" else "3")
+                  and r87_settings.logic_tree == r87_tree.name
+                  and str(getattr(r87_physics, "body_type", ""))
+                  == ("CharacterBody2D" if r87_key == "2d"
+                      else "CharacterBody3D")
+                  and bool(getattr(r87_physics, "script_target", False)),
+                  f"dim={r87_settings.dimension} "
+                  f"tree={r87_settings.logic_tree} "
+                  f"body={getattr(r87_physics, 'body_type', '?')}")
+
+            r87_code, r87_warnings = codegen.generate(r87_tree, {
+                "dimension": "2" if r87_key == "2d" else "3",
+                "base_class": ("CharacterBody2D" if r87_key == "2d"
+                               else "CharacterBody3D"),
+            })
+            check(f"关卡模板[{r87_key}]:生成代码无告警 + 能动",
+                  not r87_warnings and "move_and_slide()" in r87_code,
+                  str(r87_warnings)[:200])
+
+        # ③ 真导出(逐场景维度):项目骨架 + 三个场景各一张 .tscn
+        r87_work = os.path.join(tempfile.gettempdir(), "gk_levels87")
+        shutil.rmtree(r87_work, ignore_errors=True)
+        os.makedirs(r87_work, exist_ok=True)
+        r87_project.create_project(r87_work, title="关卡模板冒烟")
+        r87_result = r87_asset.export_all_scenes(r87_work)  # dimension=None
+        r87_ok = {entry["scene"]: entry["ok"]
+                  for entry in r87_result.get("scenes", [])}
+        r87_mine = {name: r87_ok.get(name) for name in ("冒烟2d", "冒烟3d",
+                                                        "冒烟25d")}
+        check("关卡模板:三个场景各导出一张 .tscn(全成功)",
+              all(r87_mine.values()), str(r87_ok))
+
+        def _r87_read(name):
+            path = os.path.join(r87_work, "scenes", f"{name}.tscn")
+            with open(path, encoding="utf-8") as handle:
+                return handle.read()
+
+        def _r87_glb_bytes(name):
+            path = os.path.join(r87_work, "art", f"{name}.glb")
+            with open(path, "rb") as handle:
+                return handle.read()
+
+        r87_2d = _r87_read("冒烟2d")
+        r87_3d = _r87_read("冒烟3d")
+        r87_25d = _r87_read("冒烟25d")
+        check("关卡模板:2D 关按 2D 导(身体是 CharacterBody2D / 没有相机)",
+              "CharacterBody2D" in r87_2d and "Camera3D" not in r87_2d,
+              r87_2d[:200])
+        check("关卡模板:3D / 2.5D 关挂上了脚本",
+              "script = ExtResource" in r87_3d
+              and "script = ExtResource" in r87_25d)
+        # 相机在**世界 glb** 里(glTF 带过去的),环境脚本负责把它设成主相机
+        # ⚠ glTF 导出的 JSON 把非 ASCII 转义成了 \uXXXX,所以按字节搜名字
+        #   搜不到 —— 老老实实解析 JSON(实测踩过)。
+        def _r87_glb_json(name):
+            import json
+            import struct
+
+            data = _r87_glb_bytes(name)
+            length = struct.unpack("<I", data[12:16])[0]
+            return json.loads(data[20:20 + length].decode("utf-8"))
+
+        r87_doc_3d = _r87_glb_json("冒烟3d")
+        r87_glb_names = [node.get("name")
+                         for node in r87_doc_3d.get("nodes", [])]
+        r87_cam_names = [cam.get("name")
+                         for cam in r87_doc_3d.get("cameras", [])]
+        with open(os.path.join(r87_work, "scripts",
+                               "gk_environment_冒烟3d.gd"),
+                  encoding="utf-8") as r87_env_handle:
+            r87_env_3d = r87_env_handle.read()
+        check("关卡模板:相机进 glb + 环境脚本认它当主相机",
+              "侧视机位" in r87_cam_names and "俯瞰机位" in r87_cam_names
+              and "camera_name" in r87_env_3d,
+              f"cameras={r87_cam_names}")
+        # ── 每关的 glb 不许混进别的关卡的物体(第八十七轮修的串场景)──
+        check("关卡模板:各关 glb 互相不串(3D 关里没有 2D / 2.5D 的东西)",
+              "方块A" in r87_glb_names
+              and not any(str(name).startswith(("跳台", "地面.003"))
+                          for name in r87_glb_names),
+              str(r87_glb_names))
+        with open(os.path.join(r87_work, "project.godot"),
+                  encoding="utf-8") as r87_handle:
+            r87_godot = r87_handle.read()
+        check("关卡模板:输入映射(populate 了 move_* / jump)",
+              "move_left" in r87_godot and "jump" in r87_godot,
+              r87_godot[:200])
+
+        # 清理:建的场景 / 物体 / 图都删掉(别影响后面的卸载)
+        for r87_out in created.values():
+            for r87_obj in list(r87_out["scene"].objects):
+                bpy.data.objects.remove(r87_obj, do_unlink=True)
+            bpy.data.scenes.remove(r87_out["scene"])
+            bpy.data.node_groups.remove(r87_out["tree"])
+    except Exception as exc:
+        check("第八十七轮(关卡预设模板)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

@@ -1409,6 +1409,93 @@ def _stmt_display_switch(ctx, node, indent):
     ctx.add_line(indent, f"{helper}({', '.join(flags)})")
 
 
+# ==========================================================================
+# 『画质_设置』(第八十八轮 I 组 25:UI 交互"真做"的画质那一半)
+# ==========================================================================
+# 档位 -> (阴影图大小, 软阴影过滤质量)。0 = 关阴影(逐灯关 shadow_enabled)。
+# 过滤质量的枚举值(真 Godot 4.7 实测):HARD=0 / SOFT_VERY_LOW=1 /
+# SOFT_LOW=2 / SOFT_MEDIUM=3 / SOFT_HIGH=4 —— 和"低/中/高"对应成 2/3/4。
+_SHADOW_ATLAS = {0: 0, 1: 1024, 2: 2048, 3: 4096}
+_SHADOW_QUALITY = {0: 0, 1: 2, 2: 3, 3: 4}
+
+
+def _quality_helper(ctx):
+    """生成(或复用)套用画质的 helper,返回函数名。
+
+    ── 为什么 helper 收四个数字,自己不再算 ──────────────────────────
+    档位 -> 数字的映射放在 Python 侧(`node_lib.resolved_quality` +
+    上面两张表),生成出来的调用点是一行字面量:
+        _gk_quality_apply(0.85, 1, 2048, 3)
+    好处是"卡片上选了中档 -> 生成的就是这些数"可以在单测里直接断言,
+    而 GDScript 那边只是老老实实设值。
+
+    ── 只有一处"整关级"的副作用 ────────────────────────────────────
+    阴影要找**场景里所有的灯**(逐盏设 shadow_enabled)。遍历用"从当前
+    场景往下走"的方式 —— 和『显示_效果开关』找网格是同一套写法。
+    """
+    name = getattr(ctx, "_gk_quality_fn", "")
+    if name:
+        return name
+    name = ctx.declare_func_name("_gk_quality_apply")
+    ctx._gk_quality_fn = name
+    is_2d = ctx.dim == 2
+    scale_lines = (
+        "    var _gk_win := get_window()",
+        "    if _gk_win != null:",
+        "        _gk_win.content_scale_factor = scale",
+    ) if is_2d else (
+        "    var _gk_vp := get_viewport()",
+        "    if _gk_vp != null:",
+        "        _gk_vp.scaling_3d_scale = scale",
+    )
+    msaa_lines = (
+        "    var _gk_vp := get_viewport()",
+        "    if _gk_vp != null:",
+        "        _gk_vp.msaa_2d = msaa",
+    ) if is_2d else (
+        "    var _gk_vp2 := get_viewport()",
+        "    if _gk_vp2 != null:",
+        "        _gk_vp2.msaa_3d = msaa",
+    )
+    lines = [
+        "    # 走到这里时按档位设值(数字在 Blender 那边就算好了)。",
+        "    # ① 视口缩放:3D 走 scaling_3d_scale;2D 走窗口 content_scale_factor",
+    ]
+    lines.extend(scale_lines)
+    lines.extend(["    # ② 抗锯齿(0 = 关)", *msaa_lines])
+    lines.extend([
+        "    # ③ 阴影:每盏灯 + 阴影图大小 / 软阴影质量(0 = 全关)",
+        "    var _gk_shadow_on := atlas > 0",
+        "    var _gk_q_stack: Array = [get_tree().current_scene]",
+        "    while not _gk_q_stack.is_empty():",
+        "        var _gk_q_cur: Node = _gk_q_stack.pop_back()",
+        "        if _gk_q_cur is Light3D:",
+        "            (_gk_q_cur as Light3D).shadow_enabled = _gk_shadow_on",
+        "        for _gk_q_child in _gk_q_cur.get_children():",
+        "            _gk_q_stack.append(_gk_q_child)",
+        "    if _gk_shadow_on:",
+        "        RenderingServer.directional_shadow_atlas_set_size(atlas, true)",
+        "        RenderingServer.directional_soft_shadow_filter_set_quality(quality)",
+        "        RenderingServer.positional_soft_shadow_filter_set_quality(quality)",
+    ])
+    ctx.extra_sections.append({
+        "signature": (f"func {name}(scale: float, msaa: int, atlas: int, "
+                      f"quality: int) -> void:"),
+        "lines": lines,
+        "empty_body": "    pass",
+    })
+    return name
+
+
+@stmt_node("GKNodeQualitySet")
+def _stmt_quality_set(ctx, node, indent):
+    """『画质_设置』:走到这里把这一档画质的数字设下去。"""
+    helper = _quality_helper(ctx)
+    scale, msaa, shadow = node_lib.resolved_quality(node)
+    ctx.add_line(indent, f"{helper}({gd_number(scale)}, {int(msaa)}, "
+                         f"{_SHADOW_ATLAS[shadow]}, {_SHADOW_QUALITY[shadow]})")
+
+
 @stmt_node("GKNodeSetTimeScale")
 def _stmt_set_time_scale(ctx, node, indent):
     scale = _tunable_number(ctx, node, "倍速", "1.0", "time_scale")

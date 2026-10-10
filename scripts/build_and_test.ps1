@@ -689,6 +689,33 @@ if ($SkipGodot) {
         }
     }
 
+    # 5r. 关卡预设模板(第八十七轮:I 组 24)——『一键建能跑的一关』。
+    #     Blender 里建 2D / 3D / 2.5D 三关 + 真导出(逐场景维度、各关 glb
+    #     互不串),再用真 Godot 无头跑 3D 关:角色落地 / 按 D 走 /
+    #     按 C 切相机 —— "跑得起来"这句话要有真机证据。
+    Write-Output ""
+    $lvTplChecker = Join-Path $Root "scripts\check_level_templates.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过关卡模板自查:找不到 Blender(它要在 Blender 里建关)"
+    } elseif (-not (Test-Path $lvTplChecker)) {
+        Write-Output "跳过关卡模板自查:没有 scripts\check_level_templates.py"
+    } else {
+        # 探针自己按 GK_GODOT / 默认路径找 Godot —— 把门禁用的那台传进去
+        $env:GK_GODOT = $Godot
+        $lvTplOut = & $Blender -b --python $lvTplChecker 2>&1 | Out-String
+        $lvTplOut -split "`n" | Where-Object {
+            $_ -match "^(\[PASS\]|\[FAIL\]|结果:|失败项:|CHECK_LEVEL_TEMPLATES|LEVELS_|跳过)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($lvTplOut -match "CHECK_LEVEL_TEMPLATES=OK") {
+            $godotRan += "关卡模板"
+        } elseif ($lvTplOut -match "找不到 Godot") {
+            Write-Output "（关卡模板自查:运行时探针跳过 —— 只算了导出那段）"
+            $godotRan += "关卡模板(导出段)"
+        } else {
+            $godotOk = $false
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

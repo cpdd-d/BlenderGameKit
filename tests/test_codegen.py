@@ -7560,6 +7560,49 @@ class TestOldFileCleanup(Base):
         self.assertEqual(gf.read_manifest(directory),
                          ["materials/关卡1_旧.tres"])
 
+    def test_per_scene_dimension(self):
+        """第八十七轮:dimension=None 时**逐场景**用各自的维度。
+
+        一个 .blend 里 2D 关卡和 3D 关卡混着放(『关卡预设』能建出来)——
+        各导各的;给了值的老调用方行为一字不变。
+        """
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import exporter as ex
+        scenes = [types.SimpleNamespace(name="2D关", dim="2"),
+                  types.SimpleNamespace(name="3D关", dim="3")]
+        seen = {}
+
+        def fake_pipeline(scene, directory, dimension="3", script_name=None,
+                          scene_name="World"):
+            seen[scene.name] = dimension
+            return {"written": [], "warnings": [], "materials": 0,
+                    "bodies": 0, "cameras": 0, "lights": 0, "error": None}
+
+        patches = [
+            mock.patch.object(ex, "exportable_scenes", lambda: scenes),
+            mock.patch.object(ex, "resolve_scene_tree",
+                              lambda scene: (None, "没有逻辑图")),
+            mock.patch.object(ex, "build_settings",
+                              lambda scene: {"dimension": scene.dim}),
+            mock.patch.object(ae, "_activate_scene", lambda scene: None),
+            mock.patch.object(ae, "_active_scene", lambda: None),
+            mock.patch.object(ae, "_safe_scene_name", lambda name: name),
+            mock.patch.object(ae, "export_assets_pipeline", fake_pipeline),
+            mock.patch.object(ae.gk_log, "info"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+        directory = self._project()
+        out = ae.export_all_scenes(directory, dimension=None)
+        self.assertIsNone(out["error"], out)
+        self.assertEqual(seen, {"2D关": "2", "3D关": "3"})
+
+        seen.clear()
+        ae.export_all_scenes(directory, dimension="3")
+        self.assertEqual(seen, {"2D关": "3", "3D关": "3"})
+
 
 class TestColliderSyncAndGodGuard(Base):
     """第十四轮:碰撞代理跟随 + 上帝视角期间相机过渡暂停(用户实测反馈)。"""
@@ -17589,6 +17632,175 @@ class TestRound86MusicSet(Base):
         _node, files, _cam = ae.build_environment_nodes(
             self._scene(dimension="2"), is_3d=False, scene_name="World")
         self.assertFalse(files, "什么都没开的 2D 场景:还是老行为(不写)")
+
+
+class TestRound87LevelPresets(Base):
+    """第八十七轮(I 组 24):三种关卡预设模板(2D 闯关 / 3D 关卡 / 2.5D)。
+
+    "一键建一关":新场景 + 地面 / 角色 / 相机 + 连好的起步逻辑图
+    (见 levels.py)。这里测**图那一半**(离线可跑):三条起步链的
+    节点 / 连线 / 生成物;建场景 / 摆物体那一半归真 Blender 的冒烟。
+    """
+
+    def _tree(self, template, **params):
+        from BlenderGameKit import levels
+        tree = _PresetTree(f"{template}逻辑")
+        levels._CHAIN_BUILDERS[template](tree, params)
+        return tree
+
+    def test_template_items_shape(self):
+        from BlenderGameKit import levels
+        items = levels.template_items()
+        self.assertEqual([entry[0] for entry in items], ["2d", "3d", "25d"])
+        for key, label, hint in items:
+            self.assertTrue(label and hint, key)
+            self.assertIn(key, levels.TEMPLATE_HINTS)
+        self.assertEqual([entry[1] for entry in items],
+                         [label for _key, label in levels.TEMPLATES])
+
+    def test_2d_chain_runs(self):
+        """2D 链:方向键走 + 空格跳 + 相机跟随,生成的脚本要真的能跑。"""
+        tree = self._tree("2d")
+        kinds = [node.bl_idname for node in tree.tree.nodes]
+        for want in ("GKNodeOnReady", "GKNodeOnPhysicsProcess",
+                     "GKNodeInputDirection", "GKNodeMoveDirection",
+                     "GKNodeCameraFollow", "GKNodeJump", "GKNodeBranch",
+                     "GKNodeIsOnFloor", "GKNodeKey"):
+            self.assertIn(want, kinds, want)
+        code, warnings = codegen.generate(tree.tree, dict(V2))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("move_and_slide()", code)
+        self.assertIn("ACTION_JUMP", code)
+        self.assertIn("_gk_follow_cam", code)          # 相机跟随
+        # 2D 场景没相机时脚本自己造一台 Camera2D(模板不摆相机,靠这条兜底)
+        self.assertIn("_gk_ensure_camera2d", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_2d_params_reach_the_graph(self):
+        tree = self._tree("2d", move_speed=320.0, jump_force=600.0)
+        by_name = {node.name: node for node in tree.tree.nodes}
+        self.assertEqual(by_name["移动_按方向"].gk_speed, 320.0)
+        self.assertTrue(by_name["移动_按方向"].gk_keep_y)   # 平台跳跃必须有重力
+        self.assertEqual(by_name["起跳"].gk_jump_force, 600.0)
+
+    def test_3d_chain_is_the_character_preset(self):
+        """3D 链直接复用『角色预设』那张跑通的图(不重抄一份)。"""
+        tree = self._tree("3d")
+        kinds = [node.bl_idname for node in tree.tree.nodes]
+        for want in ("GKNodeMouseMode", "GKNodeMouseMotion",
+                     "GKNodeCameraSpringArm", "GKNodeJump"):
+            self.assertIn(want, kinds, want)
+        code, warnings = codegen.generate(tree.tree, dict(V3))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.mouse_mode = Input.MOUSE_MODE_CAPTURED", code)
+        # 两台相机的名字是约定值(关卡模板会摆在场景里)
+        self.assertIn("侧视机位", code)
+        self.assertIn("俯瞰机位", code)
+
+    def test_25d_chain_switches_cameras(self):
+        """2.5D:固定机位 + C/V 切换,不转视角(和 3D 链的关键差别)。"""
+        tree = self._tree("25d")
+        by_name = {node.name: node for node in tree.tree.nodes}
+        kinds = [node.bl_idname for node in tree.tree.nodes]
+        self.assertIn("GKNodeCameraActive", kinds)
+        self.assertEqual(by_name["启用侧视机位"].gk_target, "侧视机位")
+        switches = [node for node in tree.tree.nodes
+                    if node.bl_idname == "GKNodeCameraSetCurrent"]
+        self.assertEqual([node.gk_target for node in switches],
+                         ["俯瞰机位", "侧视机位"])
+        code, warnings = codegen.generate(tree.tree, dict(V3))
+        self.assertEqual(warnings, [], warnings)
+        # 不转视角(没有鼠标锁定 / 鼠标位移那套)
+        self.assertNotIn("Input.mouse_mode", code)
+        self.assertIn("make_current()", code)
+        self.assertIn("move_and_slide()", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_every_template_generates_clean_code(self):
+        """三种模板一张图:生成物不许告警 / 缩进必须整齐。"""
+        for template in ("2d", "3d", "25d"):
+            tree = self._tree(template)
+            options = dict(V2 if template == "2d" else V3)
+            code, warnings = codegen.generate(tree.tree, options)
+            self.assertEqual(warnings, [], f"{template}: {warnings}")
+            self.assertIn("move_and_slide()", code, template)
+
+
+class TestRound88QualitySet(Base):
+    """第八十八轮(I 组 25):『画质_设置』—— 切画质真的改渲染设置。
+
+    档位 -> 数字的映射是纯函数(`nodes.resolved_quality` + 两张表),
+    生成物是"一行字面量 + 一个老老实实设值的 helper"。这里两边都断言:
+    卡片上选低档、生成的就是 0.6 / 0 抗锯齿 / 关阴影 这套数字。
+    """
+
+    def test_presets_and_custom(self):
+        from BlenderGameKit.nodes import nodes as NN
+        low = types.SimpleNamespace(gk_level="LOW")
+        mid = types.SimpleNamespace(gk_level="MID")
+        high = types.SimpleNamespace(gk_level="HIGH")
+        self.assertEqual(NN.resolved_quality(low), (0.6, 0, 0))
+        self.assertEqual(NN.resolved_quality(mid), (0.85, 1, 2))
+        self.assertEqual(NN.resolved_quality(high), (1.0, 2, 3))
+        custom = types.SimpleNamespace(gk_level="CUSTOM", gk_scale=0.42,
+                                       gk_msaa="4X", gk_shadow="LOW")
+        self.assertEqual(NN.resolved_quality(custom), (0.42, 2, 1))
+        # 缩放越界会夹回来(0.05 -> 0.1;2.0 -> 1.0)
+        self.assertEqual(NN.resolved_quality(types.SimpleNamespace(
+            gk_level="CUSTOM", gk_scale=0.05, gk_msaa="OFF",
+            gk_shadow="OFF")), (0.1, 0, 0))
+        self.assertEqual(NN.resolved_quality(types.SimpleNamespace(
+            gk_level="CUSTOM", gk_scale=2.0, gk_msaa="OFF",
+            gk_shadow="OFF")), (1.0, 0, 0))
+
+    def test_3d_code_sets_render_settings(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        quality = tree.new_node(NN.GKNodeQualitySet, "画质=中",
+                                gk_level="MID")
+        gk_stub.connect(tree, ready, "执行", quality, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_quality_apply(0.85, 1, 2048, 3)", code)
+        self.assertIn("_gk_vp.scaling_3d_scale = scale", code)
+        self.assertIn("_gk_vp2.msaa_3d = msaa", code)
+        self.assertIn("shadow_enabled = _gk_shadow_on", code)
+        self.assertIn("directional_shadow_atlas_set_size(atlas, true)", code)
+        self.assertIn("directional_soft_shadow_filter_set_quality(quality)",
+                      code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_2d_uses_window_scale(self):
+        """2D 项目改窗口 content_scale_factor + msaa_2d(实测 4.7 没有
+        Viewport.scaling_2d_scale)。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        quality = tree.new_node(NN.GKNodeQualitySet, "画质=低",
+                                gk_level="LOW")
+        gk_stub.connect(tree, ready, "执行", quality, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_quality_apply(0.6, 0, 0, 0)", code)
+        self.assertIn("_gk_win.content_scale_factor = scale", code)
+        self.assertIn("_gk_vp.msaa_2d = msaa", code)
+        # 2D 不许去碰 3D 的那条属性(注释里提到它不算)
+        self.assertNotIn("_gk_vp.scaling_3d_scale", code)
+
+    def test_helper_generated_once(self):
+        """两个画质节点共用一个 helper(生成物只多一行调用,不重抄)。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        low = tree.new_node(NN.GKNodeQualitySet, "画质=低", gk_level="LOW")
+        high = tree.new_node(NN.GKNodeQualitySet, "画质=高", gk_level="HIGH")
+        gk_stub.connect(tree, ready, "执行", low, "执行")
+        gk_stub.connect(tree, low, "完成", high, "执行")
+        code, _w = gen(tree, V3)
+        self.assertEqual(code.count("func _gk_quality_apply("), 1)
+        self.assertIn("_gk_quality_apply(0.6, 0, 0, 0)", code)
+        self.assertIn("_gk_quality_apply(1.0, 2, 4096, 4)", code)
 
 
 if __name__ == "__main__":

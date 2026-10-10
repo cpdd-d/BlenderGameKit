@@ -4848,6 +4848,13 @@ def _draw_preset_box(layout, context):
     box.operator("gk.character_preset", text="生成第三人称角色(预设)",
                  icon="PLAY")
     box.label(text="相机物体自己摆,名字对上就行", icon="CAMERA_DATA")
+    # ── 一键建一关(第八十七轮 I 组 24)────────────────────────────
+    # 和角色预设的分工:那个解决"角色怎么动",这个解决"这一关从哪开始"
+    # (新场景 + 地面 / 相机 / 角色 + 起步链一起建好)。
+    box.separator()
+    box.label(text="一关从哪开始:", icon="SCENE_DATA")
+    box.operator("gk.level_preset", text="新建关卡(2D / 3D / 2.5D)",
+                 icon="SCENE_DATA")
 
 
 def _draw_asset_box(layout, context):
