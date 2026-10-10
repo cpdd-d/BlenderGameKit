@@ -69,6 +69,35 @@ $Model.material_override = mat
 | `backlight_amount` | 背光轮廓 | 光从背后来时的一圈暖色,`0~0.8` |
 | `light_map` + `light_map_mix` | **用贴图控制阴影形状** | 见下 |
 
+### 背面剔除:封闭模型省一半面片(第九十四轮)
+
+`gk_toon.gdshader` 的 render_mode 里写的是 `cull_disabled`(**双面**)——
+这是为了 MMD 那种单面片头发 / 裙摆:剔了会整片消失。代价是封闭模型
+(方块 / 房子 / 地形)的背面也照画,白费一半面片。
+
+想剔**不用改着色器**:在 Blender 里选中那个材质 -> 材质属性 -> 设置 ->
+勾**『背面剔除』**(Backface Culling)。导出时:
+
+| Blender 里 | 导出的 .tres 引用 | 效果 |
+|---|---|---|
+| 不勾(默认) | `shaders/gk_toon.gdshader` | 双面(和以前**一字不差**) |
+| 勾了 | `shaders/gk_toon_cull.gdshader` | 硬件剔背面(`cull_back`) |
+
+`gk_toon_cull.gdshader` **不是仓库里的第二份源码**,是导出时从
+`gk_toon.gdshader` **当场生成**的(只把 render_mode 那一行换成 `cull_back`,
+其余逐字相同)—— 不存在"两份文件改漂"的问题,改着色器只改一份;
+没勾的项目里根本不会生成它。
+
+⚠ 两件事记住:
+
+* **单面片模型别勾**(头发 / 帽檐 / 裙摆):那些面片只有一面,剔了整片消失;
+* Blender 预览**也认这个勾**(EEVEE 的『背面剔除』就是它)—— 预览里什么样,
+  Godot 里就什么样,两边不会再对不上。
+
+参考实现:`asset_export.material_culls_backfaces` / `cull_shader_source` /
+`write_cull_shader`;真机对照见 `scripts/check_lights_demo.py`(地面勾了、
+角色没勾,探针断言两块材质的着色器不一样)。
+
 ### `light_map`:让美术控制阴影,而不是让光角度控制
 
 这是二次元角色最关键的开关之一。做法:
