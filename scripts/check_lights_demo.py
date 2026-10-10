@@ -75,6 +75,47 @@ func _find_toon() -> ShaderMaterial:
 	return null
 
 
+## 第九十四轮:背面剔除的对照报告 —— 地面(Blender 里勾了『背面剔除』)
+## 该换成**剔面版**着色器,角色(没勾)仍是双面板。材质是环境脚本在
+## call_deferred 里挂的,所以和别的报告一样放在 phase 0。
+func _mesh_named(node_name: String) -> MeshInstance3D:
+	# ⚠ 不能直接 find_child:同名节点先撞上的是 Colliders 里的碰撞代理
+	#   (StaticBody3D),那不是网格。
+	for node in world.find_children(node_name, "", true, false):
+		if node is MeshInstance3D:
+			return node as MeshInstance3D
+	return null
+
+
+func _toon_path_in(root_node: Node) -> String:
+	# 一个物体身上第一条卡通材质的着色器路径(整网格覆盖 / 按表面覆盖都认)
+	if root_node == null:
+		return "<no-node>"
+	var meshes: Array = []
+	if root_node is MeshInstance3D:
+		meshes.append(root_node)
+	meshes += root_node.find_children("*", "MeshInstance3D", true, false)
+	for item in meshes:
+		var node := item as MeshInstance3D
+		var whole := node.material_override
+		if whole is ShaderMaterial and (whole as ShaderMaterial).shader != null:
+			return (whole as ShaderMaterial).shader.resource_path
+		for index in range(node.get_surface_override_material_count()):
+			var surface := node.get_surface_override_material(index)
+			if surface is ShaderMaterial and (surface as ShaderMaterial).shader != null:
+				return (surface as ShaderMaterial).shader.resource_path
+	return "<no-material>"
+
+
+func _report_cull() -> void:
+	var ground_path := _toon_path_in(_mesh_named("地面"))
+	var player_path := _toon_path_in(character)
+	var ok := ground_path.ends_with("gk_toon_cull.gdshader") \\
+		and player_path.ends_with("gk_toon.gdshader")
+	print("LIGHTS_CULL ground=", ground_path.get_file(),
+		" player=", player_path.get_file(), " ok=", ok)
+
+
 func _send_key(code: int, pressed: bool) -> void:
 	var event := InputEventKey.new()
 	event.keycode = code
@@ -162,6 +203,7 @@ func _physics_process(delta: float) -> void:
 		_report_types()
 		_report_params()
 		_report_follow()
+		_report_cull()
 		# 按 4 = 三盏全关
 		_send_key(KEY_4, true)
 	elif phase == 1 and elapsed >= 1.2:
@@ -423,6 +465,19 @@ def main():
     if "LIGHTS_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")
         ok = False
+
+    # ── 第九十四轮:背面剔除 ────────────────────────────────────────
+    # 运行时:地面(勾了)用剔面版着色器,角色(没勾)保持双面 —— 对照断言
+    cull = re.search(r"LIGHTS_CULL ground=(\S+) player=(\S+) ok=(\w+)", text)
+    if not cull:
+        print("✗ 没跑出背面剔除的结论行(LIGHTS_CULL)")
+        ok = False
+    elif cull.group(3) != "true":
+        print("✗ 背面剔除没走到导出(地面该用剔面版 / 角色保持双面):",
+              cull.group(0))
+        ok = False
+    else:
+        print(f"    背面剔除: 地面={cull.group(1)} 角色={cull.group(2)}")
 
     # ── 生成物层面的证据 ────────────────────────────────────────────
     script_path = os.path.join(OUT, "scripts", "game_logic.gd")

@@ -18227,5 +18227,71 @@ class TestRound90AdviceBatch(Base):
             advisor.clear_proposals()
 
 
+class TestRound94BackfaceCulling(Base):
+    """第九十四轮:背面剔除 —— Blender 材质勾了『背面剔除』导出要跟着剔。
+
+    以前导出链路**根本没读那个勾**(所有卡通材质都写死双面的
+    `gk_toon.gdshader`):Blender 预览剔了、Godot 里照旧双面 —— 预览在骗人,
+    背面那些面片也白画。修法是"按需生成剔面变体"(不是仓库里第二份源码)。
+    """
+
+    def test_flag_defaults_to_no_culling(self):
+        """缺属性(老文件 / 假对象)按**不剔除** —— 面板片消失最难受。"""
+        from BlenderGameKit import asset_export
+
+        class Fake:
+            pass
+
+        self.assertFalse(asset_export.material_culls_backfaces(Fake()))
+        self.assertFalse(asset_export.material_culls_backfaces(None))
+        fake = Fake()
+        fake.use_backface_culling = True
+        self.assertTrue(asset_export.material_culls_backfaces(fake))
+
+    def test_variant_differs_by_one_line_only(self):
+        """变体 = 原文件 + 一行 render_mode 换词(逐行比对,别的都不许动)。"""
+        from BlenderGameKit import asset_export
+        shader = os.path.join(ROOT, "BlenderGameKit", "shaders",
+                             "gk_toon.gdshader")
+        with open(shader, "r", encoding="utf-8") as handle:
+            base = handle.read()
+        variant = asset_export.cull_shader_source(base)
+        self.assertIn("cull_back;", variant)
+        self.assertNotIn("cull_disabled;", variant)
+        base_lines = base.splitlines()
+        variant_lines = variant.splitlines()
+        self.assertEqual(len(base_lines), len(variant_lines))
+        diff = [pair for pair in zip(base_lines, variant_lines)
+                if pair[0] != pair[1]]
+        self.assertEqual(len(diff), 1, diff)
+        self.assertIn("render_mode", diff[0][0])
+        self.assertIn("render_mode", diff[0][1])
+
+    def test_variant_generation_fails_loudly(self):
+        """源文件那行被改坏时必须**报错** —— 不能静默生成"没剔面"的变体。"""
+        from BlenderGameKit import asset_export
+        with self.assertRaises(ValueError):
+            asset_export.cull_shader_source("shader_type spatial;\n")
+
+    def test_variant_name_is_claimed_by_cleanup(self):
+        """派生文件名要在"插件认识的着色器"名单里(否则存量文件永远删不掉)。"""
+        from BlenderGameKit import asset_export, generated_files
+        self.assertIn(asset_export.CULL_SHADER_NAME,
+                      generated_files._plugin_shader_names())
+        with tempfile.TemporaryDirectory() as folder:
+            shaders = os.path.join(folder, "shaders")
+            os.makedirs(shaders)
+            mine = os.path.join(shaders, asset_export.CULL_SHADER_NAME)
+            with open(mine, "w", encoding="utf-8") as handle:
+                handle.write("shader_type spatial;\n")
+            self.assertTrue(generated_files.is_generated_file(mine),
+                            "派生着色器要被认领,不然后面永远清不掉")
+            theirs = os.path.join(shaders, "my_own.gdshader")
+            with open(theirs, "w", encoding="utf-8") as handle:
+                handle.write("shader_type spatial;\n")
+            self.assertFalse(generated_files.is_generated_file(theirs),
+                             "用户自己放的着色器不该被认领")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

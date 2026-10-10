@@ -17,6 +17,7 @@
 | **手电筒(跟随相机)** | 灯光物体勾了『跟随相机(手电筒)』—— 运行时每物理帧把它的位置朝向贴到当前相机上 |
 | **灯光_设置** | 数字键 1/2/3 开关对应的灯;4 = 三盏全关 |
 | **卡通跟随场景光照** | 场景设置里打开:卡通材质按"影响最大的那盏亮灯"画明暗,灯全关就变平涂 |
+| **背面剔除**(第九十四轮) | 地面是**封闭方块**,勾了 Blender 材质的『背面剔除』—— 导出的那个材质换用**剔面版**着色器(`gk_toon_cull.gdshader`,导出时从 `gk_toon.gdshader` 生成,只差 render_mode 一行);角色没勾、保持双面,**正好当对照** |
 
 按键:WASD 移动 / 空格 跳 / 鼠标转视角 / C·V 切机位 /
 数字键 1 = 手电筒、2 = 台灯、3 = 月光、4 = 三盏全关。
@@ -119,8 +120,14 @@ def build_scene():
     scene = clear_scene()
     # ⚠ 必须有不止一个网格:整场景只有"角色"一个网格时插件不会生成主场景
     # .tscn(它以为这关没东西可看)—— 探针就没有 World.tscn 可加载了。
-    make_box(GROUND, (20.0, 20.0, 0.4), (0.0, 0.0, -0.2),
-             (0.22, 0.24, 0.30, 1.0))
+    ground = make_box(GROUND, (20.0, 20.0, 0.4), (0.0, 0.0, -0.2),
+                      (0.22, 0.24, 0.30, 1.0))
+    # 第九十四轮:地面是个**封闭方块**,勾上『背面剔除』当演示 —— 导出的
+    # 材质会换用剔面版着色器(`gk_toon_cull.gdshader`);角色保持默认(双面)
+    # 正好当对照。探针两件事都断言(LIGHTS_CULL)。
+    # ⚠ 单面片模型(MMD 头发 / 帽檐 / 裙摆)别勾 —— 勾了会整片消失。
+    if ground.data.materials:
+        ground.data.materials[0].use_backface_culling = True
     player = make_box(PLAYER, (1.0, 1.0, 1.6), (0.0, 0.0, 1.0),
                       (0.90, 0.60, 0.30, 1.0))
     side = make_camera("侧视机位", (0.0, -15.0, 5.0),
@@ -141,7 +148,8 @@ def build_scene():
                        cutoff=14.0, spot_size=math.radians(40.0),
                        use_shadow=False)
     log(f"场景:{GROUND} + {PLAYER} + 两台相机 + 三盏灯"
-        f"({MOON} 太阳 / {LAMP} 点光 / {TORCH} 聚光)")
+        f"({MOON} 太阳 / {LAMP} 点光 / {TORCH} 聚光)"
+        f" —— {GROUND} 勾了背面剔除(第九十四轮)")
     return scene, player, torch
 
 

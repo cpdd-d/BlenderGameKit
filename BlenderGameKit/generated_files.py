@@ -68,17 +68,28 @@ def _head(path, size=2048):
 
 
 def _plugin_shader_names():
-    """插件自带着色器的文件名集合(shaders/ 里同名的就是插件写的)。"""
+    """插件"认识"的着色器文件名集合(shaders/ 里同名的就是插件写的)。
+
+    除了 `shaders/` 目录里那份清单,还要并上**导出时当场生成**的派生文件
+    (第九十四轮的 `gk_toon_cull.gdshader`)—— 它不在插件目录里,但确实
+    是插件的产物;不并进来的话,项目里那个文件会在清理时被当成"用户
+    自己放的东西",勾选取消后也永远删不掉。
+    """
     try:
         from . import asset_export
         folder = asset_export.shader_source_dir()
     except Exception:                                     # noqa: BLE001
         return set()
     try:
-        return {name for name in os.listdir(folder)
-                if name.endswith((".gdshader", ".gdshaderinc"))}
+        names = {name for name in os.listdir(folder)
+                 if name.endswith((".gdshader", ".gdshaderinc"))}
     except OSError:
         return set()
+    try:
+        names.update(asset_export.derived_shader_names())
+    except Exception:                                     # noqa: BLE001
+        pass
+    return names
 
 
 def is_generated_file(path):

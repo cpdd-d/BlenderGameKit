@@ -5792,6 +5792,76 @@ def _base_color_rgb(material):
     return fallback
 
 
+# ==========================================================================
+# 背面剔除(第九十四轮)
+# ==========================================================================
+# ── 为什么说"没做背面剔除"其实是个 bug,不是缺功能 ────────────────────
+# Blender 的材质设置里一直有『背面剔除』(use_backface_culling),勾了预览
+# 就真的剔 —— 但导出链路**根本没读它**:所有卡通材质都写死引用
+# `gk_toon.gdshader`,而那份着色器是 `cull_disabled`(双面 —— 为了 MMD
+# 的单面片头发/裙摆)。于是"Blender 里勾了剔除,Godot 里照旧双面":
+# 预览在骗人,而且白白多画了背面那些面片。
+#
+# ── 怎么修 ──────────────────────────────────────────────────────────
+# 勾了的材质 -> .tres 引用**剔面版**着色器 `gk_toon_cull.gdshader`。
+# 变体不是仓库里的第二份源码,而是导出时从 `gk_toon.gdshader`
+# **当场生成**的(只换 render_mode 那一行)。这样:
+#   * 单一真相:改着色器只改那一份,不存在"两份改漂"的问题;
+#   * 没勾(默认)的项目产物**一字不变**,也不会多出没用的文件;
+#   * 变体只差一个词(`cull_disabled` -> `cull_back`),语义完全确定。
+#
+# ⚠ 单面片模型(MMD 头发 / 帽檐 / 裙摆)别勾:那些面片只有一面,
+#   剔了会整片消失 —— 这也是当年默认双面的原因。
+_TOON_SHADER = "gk_toon.gdshader"
+CULL_SHADER_NAME = "gk_toon_cull.gdshader"
+_BASE_RENDER_MODE = "render_mode unshaded, depth_draw_opaque, cull_disabled;"
+_CULL_RENDER_MODE = "render_mode unshaded, depth_draw_opaque, cull_back;"
+
+
+def material_culls_backfaces(material):
+    """这个 Blender 材质勾了『背面剔除』吗。
+
+    缺属性(老文件 / 假对象)时按**不剔除**处理 —— 和 Blender 的默认一致,
+    宁可多画,也不让面片凭空消失。
+    """
+    return bool(getattr(material, "use_backface_culling", False))
+
+
+def cull_shader_source(base_text):
+    """从 gk_toon.gdshader 的源码生成剔面变体(只换 render_mode 一行)。
+
+    ⚠ 找不到那一行就**报错**,不生成"看起来是变体、其实没剔面"的文件 ——
+    那种失败是静默的:画面照旧、性能也没省,谁都不会发现。
+    """
+    if _BASE_RENDER_MODE not in base_text:
+        raise ValueError(
+            f"{_TOON_SHADER} 里找不到预期的那行:\n    {_BASE_RENDER_MODE}\n"
+            "(改 render_mode 时请同步 asset_export 里的常量)")
+    return base_text.replace(_BASE_RENDER_MODE, _CULL_RENDER_MODE, 1)
+
+
+def write_cull_shader(export_dir, shader_res_dir="shaders"):
+    """把剔面变体写进项目(有材质勾了剔除时才调)。返回写出的路径。"""
+    source = os.path.join(shader_source_dir(), _TOON_SHADER)
+    with open(source, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    target = os.path.join(export_dir, shader_res_dir, CULL_SHADER_NAME)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(cull_shader_source(text))
+    return target
+
+
+def derived_shader_names():
+    """导出时**当场生成**的着色器文件名(不在 shaders/ 目录里)。
+
+    清理 / 清单那条链靠名字认亲(见 generated_files._plugin_shader_names):
+    不把派生名并进去的话,项目里这个文件会被当成"用户自己放的东西",
+    勾选取消之后也永远删不掉(实测过同类的残留问题)。
+    """
+    return (CULL_SHADER_NAME,)
+
+
 def write_npr_material(export_dir, material, shader_res_dir="shaders"):
     """把 Blender 里的 NPR 预览材质导出成 Godot 的 .tres。
 
@@ -5810,6 +5880,11 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders"):
 
     name = safe_name(material.name, "material")
     texture = _base_color_texture(material)
+    # 背面剔除(第九十四轮):勾了的材质换剔面版着色器(顺手把变体写进项目)
+    shader_name = _TOON_SHADER
+    if material_culls_backfaces(material):
+        shader_name = CULL_SHADER_NAME
+        write_cull_shader(export_dir, shader_res_dir)
 
     textures_block = ""
     albedo_ref = "null"
@@ -5826,7 +5901,7 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders"):
     lines = [
         f'[gd_resource type="ShaderMaterial" load_steps={steps} format=3]',
         "",
-        f'[ext_resource type="Shader" path="res://{shader_res_dir}/gk_toon.gdshader" '
+        f'[ext_resource type="Shader" path="res://{shader_res_dir}/{shader_name}" '
         f'id="1_shader"]',
     ]
     if textures_block:
@@ -5917,6 +5992,8 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
     file_names = _unique_file_names(wanted, prefix=prefix)
 
     written = []
+    # 剔面变体**整个导出只写一次**(第一个勾了剔除的材质触发,见上)
+    cull_written = False
     for obj in objects:
         for slot in getattr(obj, "material_slots", ()):
             material = slot.material
@@ -5927,6 +6004,14 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
             name = file_names[material.name]
             rgb = _base_color_rgb(material)
             texture = _base_color_texture(material)
+            # 背面剔除(第九十四轮):Blender 材质勾了『背面剔除』-> 这个
+            # .tres 引用剔面版着色器;没勾的照旧双面(老项目产物一字不变)。
+            shader_name = _TOON_SHADER
+            if material_culls_backfaces(material):
+                shader_name = CULL_SHADER_NAME
+                if not cull_written:
+                    write_cull_shader(export_dir, shader_res_dir)
+                    cull_written = True
 
             textures_block = ""
             albedo_ref = "null"
@@ -5942,7 +6027,7 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
 
             text = TOON_MATERIAL_TEMPLATE.format(
                 steps=steps,
-                shader_path=f"res://{shader_res_dir}/gk_toon.gdshader",
+                shader_path=f"res://{shader_res_dir}/{shader_name}",
                 textures=textures_block,
                 r=rgb[0], g=rgb[1], b=rgb[2],
                 albedo_ref=albedo_ref,

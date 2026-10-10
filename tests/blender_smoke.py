@@ -5286,6 +5286,69 @@ def main():
         check("第九十三轮(存档防改档)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第九十四轮:背面剔除(材质勾了 -> 导出换剔面版着色器)------------
+    # 只有真 Blender 能验:开关在**真材质**上(use_backface_culling),而导出
+    # 要读它、按需生成变体文件、并给 .tres 选对着色器路径。
+    try:
+        import shutil
+
+        r94_dir = tempfile.mkdtemp(prefix="gk_cull_")
+        r94_toon_prev = bool(bpy.context.scene.gk_settings.toon_materials)
+        bpy.context.scene.gk_settings.toon_materials = True
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        r94_obj = bpy.context.active_object
+        r94_obj.name = "剔除探针方块"
+        r94_mat = bpy.data.materials.new("剔除探针材质")
+        r94_mat.use_nodes = True
+        r94_obj.data.materials.append(r94_mat)
+        r94_variant = os.path.join(r94_dir, "shaders",
+                                   asset_export.CULL_SHADER_NAME)
+
+        def r94_material_text():
+            written = asset_export.write_materials(r94_dir, [r94_obj])
+            if not written:
+                return ""
+            with open(written[0][1], "r", encoding="utf-8") as handle:
+                return handle.read()
+
+        check("第九十四轮:Blender 材质有『背面剔除』属性",
+              hasattr(r94_mat, "use_backface_culling"))
+        check("第九十四轮:默认不勾(导出仍是双面)",
+              not r94_mat.use_backface_culling)
+        r94_plain = r94_material_text()
+        check("第九十四轮:不勾 -> .tres 引用双面着色器,且不生成变体",
+              "gk_toon.gdshader" in r94_plain
+              and asset_export.CULL_SHADER_NAME not in r94_plain
+              and not os.path.isfile(r94_variant),
+              r94_plain[:160])
+        r94_mat.use_backface_culling = True
+        r94_guarded = r94_material_text()
+        r94_variant_text = ""
+        if os.path.isfile(r94_variant):
+            with open(r94_variant, "r", encoding="utf-8") as handle:
+                r94_variant_text = handle.read()
+        with open(os.path.join(asset_export.shader_source_dir(),
+                               "gk_toon.gdshader"), "r",
+                  encoding="utf-8") as handle:
+            r94_base = handle.read()
+        check("第九十四轮:勾了 -> .tres 引用剔面版 + 变体文件落地",
+              asset_export.CULL_SHADER_NAME in r94_guarded
+              and "gk_toon.gdshader" not in r94_guarded
+              and os.path.isfile(r94_variant),
+              r94_guarded[:160])
+        check("第九十四轮:变体只差 render_mode 一行(其余逐字相同)",
+              bool(r94_variant_text)
+              and r94_variant_text.replace("cull_back;", "cull_disabled;")
+              == r94_base)
+
+        bpy.context.scene.gk_settings.toon_materials = r94_toon_prev
+        bpy.data.objects.remove(r94_obj, do_unlink=True)
+        bpy.data.materials.remove(r94_mat)
+        shutil.rmtree(r94_dir, ignore_errors=True)
+    except Exception as exc:
+        check("第九十四轮(背面剔除)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)
