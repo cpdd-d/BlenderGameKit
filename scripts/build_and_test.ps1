@@ -716,6 +716,35 @@ if ($SkipGodot) {
         }
     }
 
+    # 5s. NPR 渲染验证(第九十一轮:I 组 32)—— `demo_render` 的**渲染结果**
+    #     进守则。这一层要真 GPU 出图(`--headless` 是 dummy 渲染器,
+    #     什么都画不出来),所以会**开一个真窗口**跑 4 个角度的扫光。
+    #     断言的是结果而不是"文件存在":每张不黑、明暗随光角度变
+    #     (面部阴影 SDF 在滑动)、四张两两字节不同(灯真的转了)。
+    #     机器没有 GPU / 开不出窗口时探针自己打印"跳过",**不判红**
+    #     —— 这一层是加分项,不能因为环境没显卡把守则整片弄红。
+    Write-Output ""
+    $renderChecker = Join-Path $Root "scripts\check_render_demo.py"
+    if ($godotSkipped) {
+        Write-Output "跳过渲染验证:本机找不到 Godot"
+    } elseif (-not (Test-Path $renderChecker)) {
+        Write-Output "跳过渲染验证:没有 scripts\check_render_demo.py"
+    } else {
+        # 探针自己按 GK_GODOT / 默认路径找 Godot —— 把门禁用的那台传进去
+        $env:GK_GODOT = $Godot
+        $renderOut = & python $renderChecker 2>&1 | Out-String
+        $renderOut -split "`n" | Where-Object {
+            $_ -match "^(\[渲染验证\]|CHECK_RENDER_DEMO|跳过)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($renderOut -match "CHECK_RENDER_DEMO=OK") {
+            $godotRan += "NPR 渲染"
+        } elseif ($renderOut -match "跳过") {
+            Write-Output "（渲染验证跳过:这台机器没有可用 GPU / 开不出窗口）"
+        } else {
+            $godotOk = $false
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

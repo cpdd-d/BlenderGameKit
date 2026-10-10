@@ -37,7 +37,9 @@ GATE = os.path.join(SCRIPTS, "build_and_test.ps1")
 GODOT_ONLY = {
     "demo_2d": "Godot 侧 2D 示例(无 .blend),门禁 5a 用 godot_verify.ps1 验",
     "demo_platformer": "Godot 侧平台跳跃示例,门禁 5b 用 platformer_verify.ps1 验",
-    "demo_render": "渲染出图工程(要真 GPU,出的是图不是断言)—— 手动跑 render_shots.ps1",
+    "demo_render": ("渲染出图工程(无 .blend;要真 GPU 出图,无头是 dummy "
+                    "渲染器)—— 门禁 5s 用 check_render_demo.py 真开窗口扫光验,"
+                    "没 GPU 的环境自动跳过;手动出参考图跑 render_shots.ps1"),
 }
 # 旧示例(仅存档):有重建脚本 + 自查,但只在 `-Deep` 那一层跑
 DEEP_ONLY = {
