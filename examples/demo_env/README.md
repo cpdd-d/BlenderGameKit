@@ -20,7 +20,7 @@
 | 环境光 | 亮 **0.8**(暖白) | 暗 **0.15**(冷蓝) |
 | 雾 | 关 | **开**,冷蓝,浓度 **0.08** |
 | 泛光 | 关 | **开**,强度 **1.2**,溢出 0.2 |
-| 色调映射 | Filmic | ACES |
+| 色调映射 | AgX | ACES |
 | 灯 | 一盏太阳(3.0) | 弱月光(0.25)+ 暖台灯 + 手电筒(聚光,跟随相机) |
 
 跑法:Godot 打开 `环境示例_godot` 按 **F5** 跑`白天`;想看`幽暗`,在 Godot 里
@@ -66,7 +66,7 @@ fog_density = 0.080000
 glow_enabled = true
 glow_intensity = 1.200000
 glow_bloom = 0.200000
-tonemap_mode = 3                        # 0 线性 / 1 Reinhard / 2 Filmic / 3 ACES
+tonemap_mode = 3                        # 0 线性 / 1 Reinhard / 2 Filmic / 3 ACES / 4 AgX
 adjustment_enabled = false
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="."]
@@ -95,7 +95,8 @@ python scripts\check_env_demo.py --godot "D:\godot\Godot_v4.7.2-stable_win64_con
 Godot,加载两张 `.tscn`,断言:
 
 * **白天**:`background_mode == 2` 且 `sky != null`、`ambient_light_energy ≈ 0.8`、
-  `fog_enabled == false`;
+  `fog_enabled == false`、`tonemap_mode == 4`(AgX,第九十五轮补的 ——
+  和 Blender 默认的 AgX 视图变换同名同族);
 * **幽暗**:`background_mode == 1`、`fog_enabled == true` 且浓度 ≈ 0.08、
   `glow_enabled == true`、`tonemap_mode == 3`(ACES)、`ambient_light_energy ≈ 0.15`;
 * **两关确实不一样**(对照才说明环境真的在起作用)。
@@ -116,5 +117,5 @@ blender -b --python scripts\make_env_demo.py
    雾开(浓度 0.05~0.1);泛光开(点光 / 手电筒会毛起来);色调 ACES
    (暗部更沉);
 3. **白天**:背景选天空、背景色给天空蓝;环境光拉亮(0.6~1.0);雾 / 泛光关;
-   色调 Filmic;
+   色调 AgX(和 Blender 默认视图变换一致 —— 预览里什么样,游戏里就什么样);
 4. 想再暗一点就开**色调调整**(亮度 / 对比度 / 饱和度)。
