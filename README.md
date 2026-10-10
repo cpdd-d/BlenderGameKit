@@ -229,8 +229,9 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 307 项冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端十七层(-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端十九层(NPR 渲染那层要真 GPU,没显卡自动跳过;-Deep 再加动画六层)
 ├── check_release.py            ★ 打包自检:真 Godot 逐个平台跑 `--export-release`(Windows/Linux/Web;没装那个平台的导出模板则跳过)
+├── check_render_demo.py        ★ NPR 渲染自检:**真开窗口**扫光出图,断言"不黑 / 明暗随光角度滑动 / 四张两两不同"(门禁 5s;没 GPU 自动跳过)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
 ├── make_horror_demo.py         ★ 生成恐怖示例(氛围套件 + 听觉怪物 + 结局分支;现生成音频)
@@ -680,10 +681,11 @@ pip install pytest && python -m pytest
 #    (后者是最容易漏的:无头探针用 dummy 渲染器,着色器编译错误不进断言)
 python scripts\verify_shaders.py
 
-# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 307 项冒烟 + 示例完整性体检 + 节点手册新鲜度 + Godot 端到端十八层
+# 3. 一键门禁:着色器编译 + 构建 + 装进 Blender + 冒烟 + 示例完整性体检 + 节点手册新鲜度 + Godot 端到端十九层
 #    —— 改节点/UI/生成代码后必跑
-#    端到端十八层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
-#                界面 / AI / AI寻路绕墙 / 资产 / 关卡 / 灯光 / 环境 / 恐怖示例 / 混合树示例 / 打包发布 / 关卡模板;产物写在 _dist(不动 examples);
+#    端到端十九层:2D 示例 / 平台跳跃 / 曲线 / 小游戏 / 物理测试场 / 2D寻路 /
+#                界面 / AI / AI寻路绕墙 / 资产 / 关卡 / 灯光 / 环境 / 恐怖示例 / 混合树示例 / 打包发布 / 关卡模板 / NPR 渲染;产物写在 _dist(不动 examples);
+#    NPR 渲染那一层要真 GPU(会开一个真窗口扫光,断言"明暗随光角度滑动"),没 GPU 的环境自动跳过;
 #    加 -Deep 再跑动画系统六层验证(要真 Blender、会重建 examples\demo_anim_tree,较慢)
 #    本机没装 Godot 时自动跳过;加 -SkipGodot 可显式跳过
 powershell -File scripts\build_and_test.ps1

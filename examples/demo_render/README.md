@@ -29,5 +29,10 @@ godot --path examples/demo_render --resolution 640x640
 着色器参数含义、光照强度甜点区、面部阴影怎么调 —— 见
 `docs\渲染-NPR卡通着色.md`;这个工程是那篇文档里的**验证现场**。
 
-> 它不进 `build_and_test.ps1`(要真 GPU 渲染,且出的是图片不是断言),
-> 属于"要用时手动跑"的工程。素材(`*.png` / `.godot/`)是 Godot 自己导入的产物。
+> **守则里的 5s 层**(第九十一轮起):`scripts\check_render_demo.py` 会
+> 真开窗口跑 4 个角度的扫光,断言**渲染结果** —— 每张不黑、明暗随光角度
+> **滑动**(dark 至少有 3 种取值)、四张两两字节不同(灯真的转了)。
+> 它要真 GPU(`--headless` 是 dummy 渲染器,画不出东西),所以**没显卡的
+> 机器上自动跳过、不判红**;手动出参考图(写进本目录 `shots/`)还是用
+> 上面那条 `render_shots.ps1`。
+> 素材(`*.png` / `.godot/`)是 Godot 自己导入的产物。
