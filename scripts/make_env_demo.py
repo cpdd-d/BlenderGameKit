@@ -176,7 +176,10 @@ def build_night(scene):
     apply_settings(scene, (
         ("env_enabled", True),
         ("env_background", "COLOR"),
-        ("env_bg_color", (0.03, 0.04, 0.07, 1.0)),
+        # ⚠ 这些颜色是**线性**值(Blender 属性);第九十六轮起导出会换算成
+        #   显示值再写进 .tscn —— 想让它"屏幕上看着接近全黑",填的线性值
+        #   要小一个数量级(0.004 的线性 ≈ 屏幕上 0.05 的显示值)。
+        ("env_bg_color", (0.004, 0.006, 0.011, 1.0)),
         ("env_ambient_color", (0.45, 0.52, 0.72, 1.0)),
         ("env_ambient_energy", 0.15),
         ("env_fog", True),

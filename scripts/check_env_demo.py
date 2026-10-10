@@ -97,6 +97,18 @@ func _report() -> void:
 	# 两关确实不一样(对照)
 	var differ := day_env != null and night_env != null and day_bg != night_bg
 	print("ENV_DIFF day_bg=", day_bg, " night_bg=", night_bg, " ok=", differ)
+	# 第九十六轮:颜色数字的色空间 —— .tscn 里的 Color 是"显示值"语义,
+	# 导出会把 Blender 的线性颜色换算成显示值(取色器上的色块 = 游戏里的颜色)
+	var night_bg_r := -1.0
+	var day_top_r := -1.0
+	if night_env != null:
+		night_bg_r = night_env.background_color.r
+	if day_env != null and day_env.sky != null:
+		var sky_mat := day_env.sky.sky_material as ProceduralSkyMaterial
+		if sky_mat != null:
+			day_top_r = sky_mat.sky_top_color.r
+	print("ENV_COLOR night_bg_r=", "%.4f" % night_bg_r,
+		" day_top_r=", "%.4f" % day_top_r)
 	print("ENV_DONE")
 '''
 
@@ -148,6 +160,17 @@ def run_godot(godot):
     return (run.stdout or "") + (run.stderr or "")
 
 
+def _linear_to_srgb(value):
+    """线性 -> sRGB(第九十六轮:导出写 .tscn 时用的那条换算)。
+
+    和 asset_export 里走的是同一个公式(那边借的是 godot_look 的实现)——
+    这里抄一份是为了**独立算期望值**,免得"用被测代码验被测代码"。
+    """
+    if value <= 0.0031308:
+        return value * 12.92
+    return 1.055 * (value ** (1.0 / 2.4)) - 0.055
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--godot", default=(
@@ -182,6 +205,29 @@ def main():
         print("✗ 两关环境没拉开差距:",
               [line for line in text.splitlines() if "ENV_DIFF" in line])
         ok = False
+
+    # ── 第九十六轮:颜色数字过没过 linear->sRGB ──────────────────────
+    # 幽暗的背景色设置是线性 (0.004,...) -> 写进 .tscn 应该是显示值 ≈0.05;
+    # 白天的天空顶色是线性 0.35 -> 显示值 ≈0.62。差一个数量级,很好认。
+    colour = re.search(r"ENV_COLOR night_bg_r=([\d.]+) day_top_r=([\d.]+)", text)
+    if not colour:
+        print("✗ 没跑出颜色色空间的结论行(ENV_COLOR)")
+        ok = False
+    else:
+        night_r = float(colour.group(1))
+        day_r = float(colour.group(2))
+        expect_night = _linear_to_srgb(0.004)
+        expect_day = _linear_to_srgb(0.35)
+        print(f"    颜色: 幽暗背景 r={night_r:.4f}(期望 {expect_night:.4f}) "
+              f"白天天空顶 r={day_r:.4f}(期望 {expect_day:.4f})")
+        if abs(night_r - expect_night) > 0.02:
+            print("✗ 幽暗背景没换算成显示值(还是线性的?):",
+                  night_r, "!=", round(expect_night, 4))
+            ok = False
+        if abs(day_r - expect_day) > 0.02:
+            print("✗ 天空顶色没换算成显示值(还是线性的?):",
+                  day_r, "!=", round(expect_day, 4))
+            ok = False
     if "ENV_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")
         ok = False

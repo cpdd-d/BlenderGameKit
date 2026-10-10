@@ -18321,15 +18321,21 @@ class TestRound95PreviewAlign(Base):
         return scene
 
     def test_disabled_falls_back_to_factory(self):
-        """没开设置卡 -> Godot 出厂画面(老行为,不是空值)。"""
+        """没开设置卡 -> Godot 出厂画面(老行为,不是空值)。
+
+        ⚠ 出厂灰是 Godot 给的**显示值**,预览世界要的是线性值 ——
+        所以要换算(第九十六轮把这条口径写死在这里)。
+        """
         from BlenderGameKit import godot_look
         for settings in (None, self._settings(env_enabled=False)):
             values = godot_look.env_display(self._scene(settings))
             self.assertFalse(values["enabled"])
             self.assertEqual(values["view_transform"], "Standard")
             self.assertEqual(values["tonemap"], "LINEAR")
-            self.assertEqual(values["backdrop"][0],
-                             godot_look.GODOT_CLEAR_COLOR_SRGB[0])
+            self.assertAlmostEqual(
+                values["backdrop"][0],
+                godot_look.srgb_to_linear(godot_look.GODOT_CLEAR_COLOR_SRGB[0]),
+                places=5)
 
     def test_tonemap_picks_view_transform(self):
         """五种色调映射都要有映射,且和 properties 的选项一一对上。"""
@@ -18368,6 +18374,49 @@ class TestRound95PreviewAlign(Base):
             self._settings(dimension="2", env_tonemap="AGX")))
         self.assertFalse(values["enabled"])
         self.assertEqual(values["view_transform"], "Standard")
+
+
+class TestRound96ColorSpace(Base):
+    """第九十六轮:写进 .tscn 的颜色按"显示值"语义换算(线性 -> sRGB)。
+
+    实测标定(第九十五轮):`Environment.background_color = Color(0.3,)`
+    渲出来就是 0.298 的像素 —— 那些 Color 是**显示值**;而 Blender 的颜色
+    属性存的是**线性**值。以前 1:1 直写 -> 取色器上的色块 ≠ 游戏里的颜色
+    (游戏偏暗)。换算之后:取色器看到什么,游戏里就是什么。
+    """
+
+    def test_env_colors_are_converted(self):
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import godot_look
+        want = godot_look.linear_to_srgb(0.3)
+        text = ae._env_color_text((0.3, 0.3, 0.3, 1.0))
+        self.assertIn("Color(%.6f" % want, text)
+        self.assertNotIn("0.300000", text, "直写那套已经不对了")
+
+    def test_conversion_endpoints_are_fixed(self):
+        """0 和 1 是换算的不动点(黑还是黑、白还是白)。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertIn("Color(0.000000, 0.000000, 0.000000, 1.000000)",
+                      ae._env_color_text((0.0, 0.0, 0.0, 1.0)))
+        self.assertIn("Color(1.000000, 1.000000, 1.000000, 1.000000)",
+                      ae._env_color_text((1.0, 1.0, 1.0, 1.0)))
+
+    def test_preview_world_color_is_the_setting(self):
+        """导出换算之后,预览**直接**用设置值当线性世界色(不再自己换算)。"""
+        from BlenderGameKit import godot_look
+
+        class Fake:
+            pass
+
+        settings = Fake()
+        settings.env_enabled = True
+        settings.dimension = "3"
+        settings.env_background = "COLOR"
+        settings.env_bg_color = (0.2, 0.2, 0.2, 1.0)
+        scene = Fake()
+        scene.gk_settings = settings
+        values = godot_look.env_display(scene)
+        self.assertAlmostEqual(values["backdrop"][0], 0.2, places=5)
 
 
 if __name__ == "__main__":

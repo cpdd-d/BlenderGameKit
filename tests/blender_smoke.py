@@ -5374,8 +5374,8 @@ def main():
                 if node.bl_idname == "ShaderNodeBackground" \
                         and node.inputs["Color"].default_value[0] > 1e-6:
                     r95_backdrop = node.inputs["Color"].default_value[0]
-        r95_want = r95_look.srgb_to_linear(0.1)
-        check("第九十五轮:世界底色 = 设置卡上的背景色(过 sRGB 换算)",
+        r95_want = 0.1     # 第九十六轮起:预览直接用设置值当线性世界色
+        check("第九十五轮:世界底色 = 设置卡上的背景色",
               r95_backdrop is not None
               and abs(r95_backdrop - r95_want) < 1e-4,
               f"{r95_backdrop} vs {r95_want}")
@@ -5387,6 +5387,63 @@ def main():
             setattr(r95_settings, name, value)
     except Exception as exc:
         check("第九十五轮(预览对齐)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 第九十六轮:颜色数字的色空间(.tscn 是"显示值"语义)------------
+    # 实测标定过:Environment.background_color = Color(0.3,) 渲出来就是
+    # 0.298 的像素 —— 而 Blender 的颜色属性存的是线性值,所以要换算。
+    # ⚠ 材质的 albedo_color **不**换算(shader 里标了 source_color),
+    # 这一条也在这里钉住,免得以后"顺手统一"。
+    try:
+        r96_text = asset_export._env_color_text((0.3, 0.3, 0.3, 1.0))
+        r96_want = "%.6f" % r95_look.linear_to_srgb(0.3)
+        check("第九十六轮:环境色导出过 linear->sRGB(不再是 0.300000)",
+              r96_want in r96_text and "0.300000" not in r96_text,
+              f"{r96_text}(期望含 {r96_want})")
+        r96_settings = bpy.context.scene.gk_settings
+        r96_keep = {name: getattr(r96_settings, name)
+                    for name in ("env_enabled", "dimension", "env_background",
+                                 "env_bg_color", "env_tonemap")}
+        r96_settings.dimension = "3"
+        r96_settings.env_enabled = True
+        r96_settings.env_background = "COLOR"
+        r96_settings.env_bg_color = (0.3, 0.3, 0.3, 1.0)
+        r96_blocks, _r96_node = asset_export.environment_scene_blocks(
+            bpy.context.scene)
+        r96_sub = "".join(r96_blocks)
+        r96_value = re.search(r"background_color = Color\(([\d.]+)", r96_sub)
+        # ⚠ 用容差比,别比字符串:Blender 的颜色属性是 float32(0.3 实际是
+        # 0.30000001192),第 6 位小数会和"字面量 0.3"算出来的差 1。
+        check("第九十六轮:Environment 子资源写的是换算后的颜色",
+              r96_value is not None
+              and abs(float(r96_value.group(1))
+                      - r95_look.linear_to_srgb(0.3)) < 0.001,
+              r96_value.group(0) if r96_value else r96_sub[:200])
+        for name, value in r96_keep.items():
+            setattr(r96_settings, name, value)
+
+        import shutil
+
+        r96_dir = tempfile.mkdtemp(prefix="gk_color_")
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        r96_obj = bpy.context.active_object
+        r96_obj.name = "色空间探针方块"
+        r96_mat = bpy.data.materials.new("色空间探针材质")
+        r96_mat.use_nodes = True
+        r96_obj.data.materials.append(r96_mat)
+        r96_written = asset_export.write_materials(r96_dir, [r96_obj])
+        r96_mat_text = ""
+        if r96_written:
+            with open(r96_written[0][1], "r", encoding="utf-8") as handle:
+                r96_mat_text = handle.read()
+        check("第九十六轮:材质 albedo 保持线性(1:1,不换算)",
+              "albedo_color = Color(0.8000, 0.8000, 0.8000, 1)"
+              in r96_mat_text, r96_mat_text[:200])
+        bpy.data.objects.remove(r96_obj, do_unlink=True)
+        bpy.data.materials.remove(r96_mat)
+        shutil.rmtree(r96_dir, ignore_errors=True)
+    except Exception as exc:
+        check("第九十六轮(颜色色空间)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 卸载不报错 ----

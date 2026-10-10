@@ -26,6 +26,7 @@ import re
 
 from . import generated_files
 from . import gk_log
+from . import godot_look
 from . import npr_preview
 from . import project
 from . import sound_assets
@@ -1875,6 +1876,12 @@ shader_parameter/emission_amount = 0.0
 # 见到 `#` 就当语法错误,整个材质文件加载失败。后果就是模型又变回白模。
 # 所以:注释写在这里(Python 里),不要写进模板字符串。
 #
+# ── 颜色数字的色空间(第九十六轮,别"顺手统一"成 env 那套)─────────────
+# 这里的 albedo_color 是**线性**值、1:1 直写 —— shader 里它标了
+# `source_color`,Godot 上传 uniform 时会自己把值当 sRGB 转成线性。
+# 而 `_env_color_text`(Environment / 天空)那边**要**换算,
+# 因为那些 Color 是"显示值"语义(实测标定见那个函数的说明)。
+#
 # ── rim_amount / specular_amount 为什么默认 0 ──────────────────────────
 # 这两个是 **EMISSION 加法项**:
 #     EMISSION += rim_color.rgb * rim * rim_amount
@@ -2093,14 +2100,31 @@ def _env_number(settings, attr, fallback):
 
 
 def _env_color_text(value, fallback=(0.0, 0.0, 0.0, 1.0)):
-    """把场景设置里的 RGBA 读成 Godot 的 Color(...) 文本(线性,1:1)。"""
+    """把场景设置里的 RGBA 读成 Godot 的 Color(...) 文本。
+
+    ── 为什么要过一遍 linear -> sRGB(第九十六轮)───────────────────
+    Blender 的颜色属性存的是**线性**值(取色器把 sRGB 显示值换算成线性存
+    下来),而写进 `.tscn` 的 `Color(...)` 数字在 Godot 里是**显示值** ——
+    第九十五轮真机标定:`Environment.background_color = Color(0.3,0.3,0.3)`
+    渲出来的像素就是 **0.298**。以前 1:1 直写 -> **Blender 取色器上的色块
+    ≠ 游戏里的颜色**(游戏偏暗)。换算之后:取色器看到什么,游戏里就是什么。
+
+    ⚠ **材质**那边的 `albedo_color` **不换算**(见 TOON_MATERIAL_TEMPLATE):
+    它是 shader 里标了 `source_color` 的 uniform,Godot 会自己把值当 sRGB
+    转成线性 —— 1:1 直写才是对的。两处的规矩不一样,别顺手统一。
+    """
     try:
         parts = [float(component) for component in value]
     except (TypeError, ValueError):
         parts = list(fallback)
     while len(parts) < 4:
         parts.append(1.0)
-    return "Color({:.6f}, {:.6f}, {:.6f}, {:.6f})".format(*parts[:4])
+    red, green, blue, alpha = parts[:4]
+    return "Color({:.6f}, {:.6f}, {:.6f}, {:.6f})".format(
+        godot_look.linear_to_srgb(red),
+        godot_look.linear_to_srgb(green),
+        godot_look.linear_to_srgb(blue),
+        alpha)
 
 
 def _env_mix(color, other, amount):

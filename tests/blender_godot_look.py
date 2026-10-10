@@ -209,12 +209,12 @@ def main():
         check("apply 用的是设置里的色调映射",
               ok4 and str(scene.view_settings.view_transform) == "AgX",
               f"{message4} / {scene.view_settings.view_transform}")
-        wanted = look.srgb_to_linear(0.2)
+        wanted = 0.2          # 导出换算后,预览直接用设置值当线性世界色
         colours = [node.inputs["Color"].default_value[0]
                    for node in scene.world.node_tree.nodes
                    if node.bl_idname == "ShaderNodeBackground"]
         print(f"    世界背景色: {[round(c, 4) for c in colours]}")
-        check("世界底色 = 设置卡上的背景色(不是出厂灰)",
+        check("世界底色 = 设置卡上的颜色(不是出厂灰)",
               any(abs(colour - wanted) < 1e-4 for colour in colours),
               str([round(c, 4) for c in colours]))
         check("面板摘要跟着设置走", "AgX" in look.summary(scene),

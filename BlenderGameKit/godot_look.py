@@ -47,10 +47,16 @@ Blender 和 Godot 的"出厂画面"差得很远,在 Blender 里调好一看 Godo
 | 环境光 | 两边都**不加**:卡通材质是 unshaded,运行时也不吃环境光 | 对卡通口径精确 |
 | 雾 / 泛光 / 色调调整 | 做不出来(Godot 的后处理)—— 保持关着 | —— |
 
-sRGB 换算的实测依据(第九十五轮标定):`Environment.background_color =
-Color(0.3, 0.3, 0.3)` 在 Godot 里渲出来的像素就是 **0.298** —— 写进
-`.tscn` 的颜色数字就是**屏幕上显示的值**。所以"设置卡上的颜色 -> Blender
-世界"必须过一遍 `srgb_to_linear`(和 0.30 平灰那条同一个换算)。
+sRGB 换算(第九十五轮标定 + 第九十六轮修导出):
+  * **写进 `.tscn` 的 Color 数字 = 屏幕上显示的值**(标定:
+    `Environment.background_color = Color(0.3,0.3,0.3)` 渲出来就是 0.298
+    的像素);
+  * 第九十六轮起**导出**会把设置卡上的线性颜色换算成显示值再写
+    (`asset_export._env_color_text`)—— 取色器上的色块 = 游戏里的颜色。
+    所以**预览直接用设置值**:那是线性世界色,Blender 显示出来正好就是
+    那个显示值,两边对上;
+  * 只有"设置卡没开"的**出厂灰**要换算 `srgb_to_linear(0.30)` —— 那个
+    0.30 是 Godot 给的**显示值**,不换的话背景会比 Godot 亮一大截。
 """
 
 import bpy
@@ -159,12 +165,15 @@ def env_display(scene):
     if enabled and str(getattr(settings, "dimension", "3")) == "2":
         enabled = False                    # 见 asset_export.env_settings
     if not enabled:
+        # 出厂灰 0.30 是 Godot 的**显示值**(不是设置卡上的线性值)——
+        # 要换算成线性才是 Blender 世界的颜色。
+        grey_linear = srgb_to_linear(GODOT_CLEAR_COLOR_SRGB[0])
         return {
             "enabled": False,
             "tonemap": "LINEAR",
             "view_transform": TONEMAP_VIEW_TRANSFORMS["LINEAR"],
             "background": "COLOR",
-            "backdrop": tuple(GODOT_CLEAR_COLOR_SRGB) + (1.0,),
+            "backdrop": (grey_linear, grey_linear, grey_linear, 1.0),
         }
     tonemap = str(getattr(settings, "env_tonemap", "LINEAR") or "LINEAR")
     if tonemap not in TONEMAP_VIEW_TRANSFORMS:
@@ -172,6 +181,9 @@ def env_display(scene):
     background = str(getattr(settings, "env_background", "COLOR") or "COLOR")
     bg_color = _rgba(getattr(settings, "env_bg_color", None),
                      (0.05, 0.06, 0.10, 1.0))
+    # 设置卡上的值是**线性**的(Blender 颜色属性),而导出会把它换算成显示值
+    # 写进 .tscn(见 asset_export._env_color_text)—— 所以这里**直接用**:
+    # Blender 显示 srgb(它) = Godot 显示那个换算后的值,两边对上。
     # 天空:导出器把 sky_top 设成背景色、地平线往白里提 0.35
     # (见 asset_export.SKY_MATERIAL_SUBRESOURCE)—— 预览拿那圈地平线色铺平。
     backdrop = (_mix_srgb(bg_color, (1.0, 1.0, 1.0), 0.35)
@@ -188,12 +200,13 @@ def env_display(scene):
 def build_world(backdrop=None):
     """建/刷新那个"看得见、不照亮"的世界。返回世界对象。
 
-    backdrop = **设置卡上的背景色(sRGB / 显示值)**,不给就用 Godot 出厂
-    的 0.30 平灰。函数内部统一过一遍 srgb_to_linear 再喂给 Blender。
+    backdrop = **线性的世界底色**(env_display 已经算好换算;不给就用
+    Godot 出厂灰 0.30 换算出来的线性值)。
     """
-    backdrop = _rgba(backdrop if backdrop is not None
-                     else tuple(GODOT_CLEAR_COLOR_SRGB) + (1.0,),
-                     tuple(GODOT_CLEAR_COLOR_SRGB) + (1.0,))
+    if backdrop is None:
+        grey = srgb_to_linear(GODOT_CLEAR_COLOR_SRGB[0])
+        backdrop = (grey, grey, grey, 1.0)
+    backdrop = _rgba(backdrop, (0.0, 0.0, 0.0, 1.0))
     world = bpy.data.worlds.get(WORLD_NAME)
     if world is None:
         world = bpy.data.worlds.new(WORLD_NAME)
@@ -209,7 +222,7 @@ def build_world(backdrop=None):
     # 看得见的底色(相机射线走这条)
     backdrop_node = tree.nodes.new("ShaderNodeBackground")
     backdrop_node.location = (100, 90)
-    colour = tuple(srgb_to_linear(component) for component in backdrop[:3])
+    colour = tuple(backdrop[:3])
     backdrop_node.inputs["Color"].default_value = colour + (1.0,)
     backdrop_node.inputs["Strength"].default_value = 1.0
 
