@@ -12004,7 +12004,9 @@ class TestRound49Environment(Base):
         text = blocks[0]
         self.assertIn('[sub_resource type="Environment"', text)
         self.assertIn("background_mode = 1", text)          # 纯色
-        self.assertIn("ambient_light_source = 3", text)     # 用颜色当环境光
+        # 第九十七轮:纯色背景必须写 **2(Color)** —— 写 3(Sky) 时没有天空,
+        # Godot 会当"没有环境光"(真机标定过:和 Disabled 不可区分)
+        self.assertIn("ambient_light_source = 2", text)
         self.assertIn("ambient_light_energy = 0.420000", text)
         self.assertIn("fog_enabled = true", text)
         self.assertIn("fog_density = 0.070000", text)
@@ -18417,6 +18419,57 @@ class TestRound96ColorSpace(Base):
         scene.gk_settings = settings
         values = godot_look.env_display(scene)
         self.assertAlmostEqual(values["backdrop"][0], 0.2, places=5)
+
+
+class TestRound97AmbientSource(Base):
+    """第九十七轮:环境光来源跟着背景模式选(纯色 -> Color,天空 -> Sky)。
+
+    —— 原来写死 3(**Sky**),而注释还写着"用颜色当环境光":枚举搞错了。
+    纯色背景下没有天空,`ambient_light_source = 3` 等于**把环境光静默关掉**
+    (真机标定:和 Disabled 渲出来一模一样),用户在设置卡上填的
+    『环境光颜色 / 强度』一直被忽略。
+    """
+
+    def _scene(self, **values):
+        class Fake:
+            pass
+
+        settings = Fake()
+        settings.env_enabled = True
+        settings.dimension = "3"
+        for name, value in values.items():
+            setattr(settings, name, value)
+        scene = Fake()
+        scene.gk_settings = settings
+        return scene
+
+    def test_solid_background_uses_color_source(self):
+        from BlenderGameKit import asset_export as ae
+        blocks, _node = ae.environment_scene_blocks(
+            self._scene(env_background="COLOR"))
+        text = blocks[-1]
+        self.assertIn("background_mode = 1", text)
+        self.assertIn("ambient_light_source = 2", text,
+                      "纯色背景必须用 Color(2),不然用户填的环境光不生效")
+        self.assertNotIn("ambient_light_source = 3", text)
+        self.assertNotIn("sky =", text)
+
+    def test_sky_background_uses_sky_source(self):
+        from BlenderGameKit import asset_export as ae
+        blocks, _node = ae.environment_scene_blocks(
+            self._scene(env_background="SKY"))
+        text = "".join(blocks)
+        self.assertIn("background_mode = 2", text)
+        self.assertIn("ambient_light_source = 3", text,
+                      "有天空时才该拿天空当环境光")
+        self.assertIn("sky = SubResource(", text)
+
+    def test_ambient_source_covers_every_background(self):
+        """背景模式每多一种,环境光来源都必须有对应项(不然会 KeyError)。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(set(ae.ENV_AMBIENT_SOURCES),
+                         set(ae.ENV_BACKGROUND_MODES))
+        self.assertEqual(set(ae.ENV_AMBIENT_SOURCES.values()), {2, 3})
 
 
 if __name__ == "__main__":

@@ -1443,6 +1443,17 @@ def main():
               and "background_mode = 2" in r49_sky
               and 'sky = SubResource("gk_sky")' in r49_sky)
 
+        # ---- 第九十七轮:环境光来源跟着背景模式 ----
+        # Godot 枚举:Color=2 / Sky=3。写死 Sky 时纯色背景没有天空 ——
+        # 真机标定过:那等于把环境光**静默关掉**(和 Disabled 渲出来一样),
+        # 用户填的『环境光颜色 / 强度』白填。这里两种背景都过一遍。
+        check("第九十七轮:纯色背景用 Color 环境光(不是被静默关掉的 Sky)",
+              "ambient_light_source = 2" in r49_on
+              and "ambient_light_source = 3" not in r49_on,
+              r49_on[:400])
+        check("第九十七轮:天空背景才用 Sky 环境光",
+              "ambient_light_source = 3" in r49_sky, r49_sky[:400])
+
         # 第五张卡的 draw_buttons 也要能画完
         class _R49Layout:
             def __getattr__(self, name):

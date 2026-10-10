@@ -97,6 +97,17 @@ func _report() -> void:
 	# 两关确实不一样(对照)
 	var differ := day_env != null and night_env != null and day_bg != night_bg
 	print("ENV_DIFF day_bg=", day_bg, " night_bg=", night_bg, " ok=", differ)
+	# 第九十七轮:环境光来源 —— 纯色背景必须是 Color(2),写 Sky(3) 的话
+	# 没有天空可用,Godot 会当"没有环境光"(真机标定:和 Disabled 一模一样),
+	# 用户填的『环境光颜色 / 强度』等于白填。天空背景才该用 Sky(3)。
+	var day_source := -1
+	var night_source := -1
+	if day_env != null:
+		day_source = day_env.ambient_light_source
+	if night_env != null:
+		night_source = night_env.ambient_light_source
+	print("ENV_SOURCE day=", day_source, " night=", night_source)
+
 	# 第九十六轮:颜色数字的色空间 —— .tscn 里的 Color 是"显示值"语义,
 	# 导出会把 Blender 的线性颜色换算成显示值(取色器上的色块 = 游戏里的颜色)
 	var night_bg_r := -1.0
@@ -205,6 +216,24 @@ def main():
         print("✗ 两关环境没拉开差距:",
               [line for line in text.splitlines() if "ENV_DIFF" in line])
         ok = False
+
+    # ── 第九十七轮:环境光来源 ──────────────────────────────────────
+    source = re.search(r"ENV_SOURCE day=(-?\d+) night=(-?\d+)", text)
+    if not source:
+        print("✗ 没跑出环境光来源的结论行(ENV_SOURCE)")
+        ok = False
+    else:
+        day_source = int(source.group(1))
+        night_source = int(source.group(2))
+        print(f"    环境光来源: 白天={day_source}(期望 3=Sky)"
+              f" 幽暗={night_source}(期望 2=Color)")
+        if day_source != 3:
+            print("✗ 天空背景的环境光来源该是 3(Sky):", day_source)
+            ok = False
+        if night_source != 2:
+            print("✗ 纯色背景的环境光来源该是 2(Color)—— 写 Sky 等于关掉:",
+                  night_source)
+            ok = False
 
     # ── 第九十六轮:颜色数字过没过 linear->sRGB ──────────────────────
     # 幽暗的背景色设置是线性 (0.004,...) -> 写进 .tscn 应该是显示值 ≈0.05;

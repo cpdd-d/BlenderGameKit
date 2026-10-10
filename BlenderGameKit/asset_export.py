@@ -2049,6 +2049,26 @@ ENV_BACKGROUND_MODES = {"COLOR": 1, "SKY": 2}
 ENV_TONEMAP_MODES = {"LINEAR": 0, "REINHARD": 1, "FILMIC": 2, "ACES": 3,
                      "AGX": 4}
 
+# ── 环境光来源(第九十七轮修)────────────────────────────────────────
+# Godot 的 Environment.ambient_light_source 枚举(真机反射核对的顺序):
+#     Background=0, Disabled=1, **Color=2**, **Sky=3**
+#
+# ⚠ 这里曾经写死 **3(Sky)** —— 而那时候注释还写着"用颜色当环境光",
+#    说明是枚举搞错了。第九十七轮真机标定(纯色深灰背景 + 一盏灯都没有 +
+#    一个 StandardMaterial3D 白球,环境光设成纯红 1.0):
+#        source=3(Sky)      -> 球心像素 0.0000,0.0000,0.0000(**全黑**)
+#        source=1(Disabled) -> 球心像素 0.0000,0.0000,0.0000(一模一样)
+#        source=2(Color)    -> 球心像素 1.0000,0.0000,0.0000(**被红光照亮**)
+#    结论:**纯色背景下写 Sky 等于把环境光静默关掉** —— 用户在设置卡上
+#    填的『环境光颜色 / 强度』一直被 Godot 忽略。
+#
+# 现在按背景模式选:纯色 -> Color(用用户填的),天空 -> Sky(拿天空当环境光)。
+# ⚠ 天空模式下 Godot 会忽略 `ambient_light_color` / `ambient_light_energy`
+#    (光源就是天空)—— 这是引擎语义,不是我们丢参数。
+# ⚠ 影响面:卡通材质是 `unshaded`,本来就不吃环境光 —— 所以只有
+#    **关掉卡通材质(用 PBR 材质)** 的项目观感会变亮,这是修回本意。
+ENV_AMBIENT_SOURCES = {"COLOR": 2, "SKY": 3}
+
 ENV_RESOURCE_ID = "gk_environment"
 ENV_SKY_MATERIAL_ID = "gk_sky_material"
 ENV_SKY_ID = "gk_sky"
@@ -2056,7 +2076,7 @@ ENV_SKY_ID = "gk_sky"
 ENVIRONMENT_SUBRESOURCE = """[sub_resource type="Environment" id="{res_id}"]
 background_mode = {background_mode}
 background_color = {bg_color}
-ambient_light_source = 3
+ambient_light_source = {ambient_source}
 ambient_light_color = {ambient_color}
 ambient_light_energy = {ambient_energy}
 fog_enabled = {fog}
@@ -2204,6 +2224,9 @@ def environment_scene_blocks(scene):
     sub_resources.append(ENVIRONMENT_SUBRESOURCE.format(
         res_id=ENV_RESOURCE_ID,
         background_mode=ENV_BACKGROUND_MODES[values["background"]],
+        # 纯色 -> Color(用户填的颜色才真的生效)、天空 -> Sky(拿天空当环境光);
+        # 见 ENV_AMBIENT_SOURCES 上面那段真机标定
+        ambient_source=ENV_AMBIENT_SOURCES[values["background"]],
         bg_color=values["bg_color"],
         ambient_color=values["ambient_color"],
         ambient_energy="%.6f" % values["ambient_energy"],
