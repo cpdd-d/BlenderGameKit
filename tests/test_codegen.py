@@ -552,7 +552,8 @@ class TestNodeLibrary(unittest.TestCase):
         `GKNodeAnimEntry`)—— 它们**动画树**里的节点,不是执行流的一环。
         例外二:『游戏显示』设置图的四张**设置卡**(第四十二轮)——
         它们不是逻辑,是场景显示设置的控制台(卡上的开关直接改场景设置),
-        所以一个引脚都没有。
+        所以一个引脚都没有。『游戏音乐』设置图的两张卡(第八十六轮)
+        同理。
         """
         from BlenderGameKit import gk_sockets as S
         from BlenderGameKit.nodes import node_base as NB
@@ -562,6 +563,7 @@ class TestNodeLibrary(unittest.TestCase):
         no_flow = {"GKNodeAnimState", "GKNodeAnimTransition",
                    "GKNodeAnimEntry"}
         no_flow |= set(NN.DISPLAY_CARD_IDS)
+        no_flow |= set(NN.MUSIC_CARD_IDS)
         no_flow |= set(NN.ASSET_CARD_IDS) | set(NN.LEGACY_ASSET_CARD_IDS)
         # 例外三:AI 图那两件(第六十九轮)——
         #   * 『AI_开始』是**源头**(只有『开始』出口,和动画的『开始口』一个道理);
@@ -17349,6 +17351,244 @@ class TestRound81UiPolish(Base):
                        "_gk_loops", "FileAccess.open(", "TextEdit.new()",
                        "func _gk_history_replay(", "func _gk_ime_update("):
             self.assertNotIn(needle, code, needle)
+
+
+class TestRound86LogicInfo(Base):
+    """第八十六轮(E 组 13):『游戏逻辑信息』—— 侧栏信息块的判据(纯函数)。
+
+    这块的价值全在**体检**:error / warn / info 三档,把"导出来才发现"
+    的问题提前说出来(没事件节点 / 没挂脚本 / 两个物体互相覆盖 /
+    用了寻路但导航关着 / 端口声明了没人写)。判据是纯函数,
+    这里喂假事实直接断言;侧栏那边只负责收集事实。
+    """
+
+    @staticmethod
+    def _facts(**overrides):
+        values = dict(
+            tree_name="玩家逻辑",
+            tree_reason="只有一棵游戏逻辑图,自动使用",
+            event_count=1,
+            carrier_count=1,
+            carrier_names=["角色"],
+            uses_pathfinding=False,
+            nav_enabled=False,
+            declared_ports=(),
+            written_ports=(),
+            disabled_trees=0,
+        )
+        values.update(overrides)
+        return values
+
+    def test_inventory_counts_kinds_and_nodes(self):
+        from BlenderGameKit import logic_info
+        groups = [
+            types.SimpleNamespace(bl_idname="GKGameLogicTree", nodes=[1, 2, 3]),
+            types.SimpleNamespace(bl_idname="GKGameLogicTree", nodes=[1]),
+            types.SimpleNamespace(bl_idname="GKAnimationTree", nodes=[1, 2]),
+            types.SimpleNamespace(bl_idname="GKMusicTree", nodes=[]),
+            # 认不出的类型:计进总数,但不进分类统计(不许抛异常)
+            types.SimpleNamespace(bl_idname="SomeOtherTree", nodes=[1]),
+        ]
+        data = logic_info.inventory(groups)
+        self.assertEqual(data["total"], 5)
+        self.assertEqual(data["nodes"], 7)
+        self.assertEqual(data["kinds"], {"逻辑": 2, "动画": 1, "音乐": 1})
+        self.assertIn("逻辑 2", logic_info.inventory_text(groups))
+        self.assertEqual(logic_info.inventory_text([]), "还没有节点图")
+
+    def test_clean_scene_has_no_rows(self):
+        from BlenderGameKit import logic_info
+        self.assertEqual(logic_info.checkup(self._facts()), [])
+        self.assertEqual(logic_info.checkup_summary([]), "一切正常")
+
+    def test_missing_tree_says_why(self):
+        """没解析到图 = 直接把 `resolve_scene_tree` 的说明摆出来。"""
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(
+            tree_name="",
+            tree_reason="有 2 棵游戏逻辑图,但这个场景没选 —— 请在『导出』面板给场景指定一棵"))
+        self.assertEqual(rows[0][0], "error")
+        self.assertIn("这个场景没选", rows[0][1])
+        # 拿不到理由时的兜底
+        rows = logic_info.checkup(self._facts(tree_name="", tree_reason=""))
+        self.assertTrue(rows[0][1])
+
+    def test_no_event_node_is_error(self):
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(event_count=0))
+        self.assertEqual([level for level, _ in rows], ["error"])
+        self.assertIn("事件节点", rows[0][1])
+
+    def test_no_carrier_is_warn_with_hint(self):
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(carrier_count=0,
+                                              carrier_names=[]))
+        self.assertEqual(rows[0][0], "warn")
+        self.assertIn("脚本挂载目标", rows[0][1])
+
+    def test_two_carriers_is_error_with_names(self):
+        """多于一个挂脚本 = 会互相覆盖(后写的赢)—— 点名是哪几个。"""
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(carrier_count=2,
+                                              carrier_names=["角色", "敌人"]))
+        self.assertEqual(rows[0][0], "error")
+        self.assertIn("角色", rows[0][1])
+        self.assertIn("敌人", rows[0][1])
+
+    def test_pathfinding_hint_only_when_nav_off(self):
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(uses_pathfinding=True))
+        self.assertEqual(rows[0][0], "info")
+        self.assertIn("寻路", rows[0][1])
+        # 导航开着就不再提这一条
+        self.assertEqual(
+            logic_info.checkup(self._facts(uses_pathfinding=True,
+                                           nav_enabled=True)), [])
+
+    def test_unwritten_port_is_reported(self):
+        """端口声明了、但图里没有『逻辑_输出结果』写它 —— 别的图读到空值。"""
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(
+            declared_ports=["完成", "胜利"], written_ports=["完成"]))
+        self.assertEqual(len(rows), 1)
+        self.assertIn("胜利", rows[0][1])
+
+    def test_disabled_trees_noted(self):
+        from BlenderGameKit import logic_info
+        rows = logic_info.checkup(self._facts(disabled_trees=2))
+        self.assertEqual(rows[0][0], "info")
+        self.assertIn("2 张图停用", rows[0][1])
+
+    def test_summary_counts_levels(self):
+        from BlenderGameKit import logic_info
+        # 错误 + 提示(没绑图 + 有图停用)
+        rows = logic_info.checkup(self._facts(
+            tree_name="", tree_reason="没有逻辑图", disabled_trees=1))
+        self.assertEqual(logic_info.checkup_summary(rows),
+                         "1 个错误 / 1 条提示")
+        # 警告 + 提示(有图,但没人挂脚本)
+        rows = logic_info.checkup(self._facts(
+            carrier_count=0, carrier_names=[], disabled_trees=1))
+        self.assertEqual(logic_info.checkup_summary(rows),
+                         "1 条警告 / 1 条提示")
+
+
+class TestRound86MusicSet(Base):
+    """第八十六轮(E 组 14):『游戏音乐』设置图 —— 音量 / 循环 / 场景规则。
+
+    形态照『游戏显示』先例(用户点的新节点树):两张设置卡直接读写
+    **当前场景**的设置,产物落进环境脚本。
+
+    判据:**默认值 = 老行为** —— 循环开、BGM 走 Master、总线音量不应用,
+    这几件事不勾时运行时和以前一模一样(产物里只多几行默认值字段)。
+    """
+
+    @staticmethod
+    def _scene(**overrides):
+        values = dict(dimension="3", scene_bgm="", scene_bgm_volume=-6.0,
+                      scene_bgm_loop=True, scene_bgm_bus="",
+                      music_bus="Music", music_bus_db=-6.0,
+                      music_bus_apply=False)
+        values.update(overrides)
+        return types.SimpleNamespace(gk_settings=types.SimpleNamespace(**values))
+
+    def test_cards_list_and_missing(self):
+        from BlenderGameKit.nodes import nodes as NN
+        self.assertEqual(NN.MUSIC_CARD_IDS,
+                         ("GKNodeMusicSceneBgm", "GKNodeMusicBus"))
+        for blob in NN.MUSIC_CARD_IDS:
+            self.assertTrue(any(cls.bl_idname == blob for cls in NN.ALL_CLASSES),
+                            blob)
+        tree = types.SimpleNamespace(nodes=[
+            types.SimpleNamespace(bl_idname="GKNodeMusicSceneBgm")])
+        self.assertEqual(NN.missing_music_cards(tree), ["GKNodeMusicBus"])
+        self.assertEqual(NN.missing_music_cards(types.SimpleNamespace(nodes=[])),
+                         list(NN.MUSIC_CARD_IDS))
+
+    def test_cards_belong_to_music_tree_only(self):
+        """两张卡只出现在『游戏音乐』树里(和显示卡一个道理)。"""
+        from BlenderGameKit import properties as props
+        from BlenderGameKit.nodes import nodes as NN
+        for blob in NN.MUSIC_CARD_IDS:
+            cls = next(c for c in NN.ALL_CLASSES if c.bl_idname == blob)
+            self.assertTrue(props.node_fits_tree(cls, "GKMusicTree"), blob)
+            self.assertFalse(props.node_fits_tree(cls, "GKGameLogicTree"), blob)
+
+    def test_rows_summarize_settings(self):
+        from BlenderGameKit.nodes import nodes as NN
+        # 函数吃的是**场景设置对象**(scene.gk_settings),不是场景
+        rows = NN.music_settings_rows(self._scene().gk_settings)
+        self.assertEqual(rows[0], ("开局 BGM", "留空(不播)", False))
+        self.assertEqual(rows[1][0], "总线音量")
+        self.assertFalse(rows[1][2])
+
+        rows = NN.music_settings_rows(self._scene(
+            scene_bgm=r"D:\snd\主题曲.ogg", scene_bgm_volume=-12.0,
+            scene_bgm_loop=False, scene_bgm_bus="Music",
+            music_bus_apply=True, music_bus_db=-3.0).gk_settings)
+        self.assertTrue(rows[0][2])
+        self.assertIn("-12", rows[0][1])
+        self.assertIn("播一遍", rows[0][1])
+        self.assertIn("Music", rows[0][1])
+        self.assertEqual(rows[1][2], True)
+        self.assertIn("-3", rows[1][1])
+        # 没有设置对象也不许炸
+        self.assertEqual(NN.music_settings_rows(None), [])
+
+    def test_defaults_are_old_behavior(self):
+        """不碰音乐设置图的 .blend:三个字段都是老行为。"""
+        from BlenderGameKit import asset_export as ae
+        text = ae.render_env_script()
+        self.assertIn("bgm_loop: bool = true", text)
+        self.assertIn('bgm_bus: String = ""', text)
+        self.assertIn("music_bus_apply: bool = false", text)
+
+    def test_loop_off_is_written(self):
+        from BlenderGameKit import asset_export as ae
+        fields = ae._env_fields(self._scene(scene_bgm=r"D:\a.ogg",
+                                            scene_bgm_loop=False))
+        rendered = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        self.assertIn("bgm_loop: bool = false", rendered)
+        # wav 那条分支:不循环要写 LOOP_DISABLED(以前写死 LOOP_FORWARD)
+        self.assertIn("LOOP_DISABLED", rendered)
+        # 老场景(默认)那条分支仍然是 LOOP_FORWARD
+        default = ae.ENVIRONMENT_SCRIPT.format(**ae._env_fields(self._scene()))
+        self.assertIn("LOOP_FORWARD", default)
+
+    def test_bus_names_are_escaped(self):
+        """总线名里的引号不许把生成的脚本弄坏。"""
+        from BlenderGameKit import asset_export as ae
+        fields = ae._env_fields(self._scene(
+            scene_bgm_bus='Mu"sic\\x', music_bus='A"B'))
+        rendered = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        self.assertIn('bgm_bus: String = "Mu\\"sic\\\\x"', rendered)
+        self.assertIn('music_bus: String = "A\\"B"', rendered)
+
+    def test_bus_apply_writes_runtime_call(self):
+        from BlenderGameKit import asset_export as ae
+        fields = ae._env_fields(self._scene(music_bus="Music",
+                                            music_bus_db=-9.5,
+                                            music_bus_apply=True))
+        rendered = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        self.assertIn("music_bus_apply: bool = true", rendered)
+        self.assertIn("music_bus_db: float = -9.5", rendered)
+        self.assertIn("_gk_apply_music_bus()", rendered)
+        self.assertIn("AudioServer.get_bus_index(music_bus)", rendered)
+        # 不勾 = 一行都不多(判定函数是同一处真相)
+        self.assertFalse(ae._music_bus_apply_on(self._scene()))
+        self.assertTrue(ae._music_bus_apply_on(
+            self._scene(music_bus_apply=True)))
+
+    def test_bus_apply_counts_as_2d_work(self):
+        """2D 场景本来"没活干"就不写环境脚本 —— 勾了总线音量也算一件活。"""
+        from BlenderGameKit import asset_export as ae
+        _node, files, _cam = ae.build_environment_nodes(
+            self._scene(dimension="2", music_bus_apply=True),
+            is_3d=False, scene_name="World")
+        self.assertTrue(files, "只勾了总线音量的 2D 场景也该有环境脚本")
+        _node, files, _cam = ae.build_environment_nodes(
+            self._scene(dimension="2"), is_3d=False, scene_name="World")
+        self.assertFalse(files, "什么都没开的 2D 场景:还是老行为(不写)")
 
 
 if __name__ == "__main__":

@@ -425,7 +425,8 @@ def _read_trees(context, params=None):
 
     kinds = {"GKGameLogicTree": "游戏逻辑", "GKAnimationTree": "动画",
              "GKUiDesignTree": "界面设计", "GKGameAiTree": "游戏AI",
-             "GKDisplayTree": "显示设置", "GKAssetTree": "资产库"}
+             "GKDisplayTree": "显示设置", "GKAssetTree": "资产库",
+             "GKMusicTree": "游戏音乐"}
     groups = [g for g in bpy.data.node_groups
               if getattr(g, "bl_idname", "") in kinds]
     if not groups:

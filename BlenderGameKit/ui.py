@@ -7,7 +7,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        IntProperty, StringProperty)
 
 from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
-               exporter, gk_log, project)
+               exporter, gk_log, logic_info, project)
 from . import asset_export
 from . import node_groups
 from . import operator_io as ops
@@ -144,7 +144,8 @@ class GK_OT_SwitchTree(bpy.types.Operator):
                                                     "GKUiDesignTree",
                                                     "GKGameAiTree",
                                                     "GKDisplayTree",
-                                                    "GKAssetTree"):
+                                                    "GKAssetTree",
+                                                    "GKMusicTree"):
             _LAST_TREE[current_kind] = current
 
         wanted = self.target
@@ -171,6 +172,9 @@ class GK_OT_SwitchTree(bpy.types.Operator):
                 # 顺便把 .blend 里已有的资产收录成卡(见 _fill_asset_cards)
                 tree = _asset_tree_or_new()
                 _fill_asset_cards(tree)
+            elif wanted == "GKMusicTree":
+                # 顺手把两张音乐设置卡摆好(见 _new_music_tree)
+                tree = _new_music_tree()
             elif wanted == "GKAnimationTree":
                 # 顺手放个起始状态,免得面对空图不知道从哪下手
                 tree = bpy.data.node_groups.new("动画", "GKAnimationTree")
@@ -1197,6 +1201,158 @@ class GK_PT_DisplayTree(bpy.types.Panel):
                   icon="NODETREE" if not missing else "ERROR")
         if missing:
             box.operator("gk.display_fill_cards",
+                         text=f"补齐 {len(missing)} 张", icon="ADD")
+        box.label(text="卡上改 = 导出立刻按新值走,不用点应用", icon="INFO")
+        back = box.operator("gk.switch_tree", text="← 回到游戏逻辑",
+                            icon="LOOP_BACK")
+        back.target = "GKGameLogicTree"
+
+
+# ==========================================================================
+# 第七种节点树:『游戏音乐』设置图(第八十六轮 E 组 14)
+# ==========================================================================
+# 用户从六个"编辑器"里点的最后一个:『游戏音乐设置』(音量 / 循环 / 场景规则)。
+# 形态照着『游戏显示』的先例(那一轮用户在新节点树 vs 属性标签页里选了
+# 新节点树:设置卡能分类摆、能补能删)—— 注册 NodeTree 就自动出现在
+# 编辑器类型菜单里。
+#
+# 这张图是**音乐控制台**:两张卡(『音乐_场景 BGM』『音乐_总线音量』)
+# 直接读写**当前场景**的 GKSceneSettings —— 和显示设置卡一样"写透":
+# 卡上改 = 导出立刻按新值走;多关卡时每关一套,切场景跟着切。
+class GKMusicTree(bpy.types.NodeTree):
+    """游戏音乐设置图:开局 BGM / 循环 / 总线音量 的音乐控制台。"""
+
+    bl_idname = "GKMusicTree"
+    bl_label = "游戏音乐"
+    bl_icon = "SOUND"
+    bl_description = ("BlenderGameKit 的音乐设置图 —— 每关放哪首 BGM / "
+                      "多大声 / 循环吗 / 走哪条音频总线,卡上改的就是"
+                      "**当前场景**的设置,导出立刻生效")
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        layout.label(text="卡上改的直接写进当前场景,导出立刻生效",
+                     icon="INFO")
+
+
+def _fill_music_cards(tree):
+    """把缺的音乐设置卡补上(已有的不动)。返回补了几张。"""
+    added = 0
+    for blob in node_lib.missing_music_cards(tree):
+        node = tree.nodes.new(blob)
+        node.location = (0.0, -node_lib.MUSIC_CARD_GAP
+                         * (len(tree.nodes) - 1))
+        added += 1
+    return added
+
+
+def _new_music_tree():
+    """新建一张音乐设置图,顺手把两张卡摆成一列。"""
+    tree = bpy.data.node_groups.new("游戏音乐", "GKMusicTree")
+    # 没有人"引用"它的数据块存盘时会被丢掉(和 AI 图同一个坑),必须 fake user
+    tree.use_fake_user = True
+    _fill_music_cards(tree)
+    return tree
+
+
+class GK_OT_OpenMusicTree(bpy.types.Operator):
+    """打开音乐设置图;没有就新建一张(带两张设置卡)。"""
+
+    bl_idname = "gk.open_music_tree"
+    bl_label = "打开/新建音乐设置图"
+    bl_description = ("切到『游戏音乐』图(没有就新建一张,"
+                      "带『音乐_场景 BGM』『音乐_总线音量』两张设置卡)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        trees = [g for g in bpy.data.node_groups
+                 if getattr(g, "bl_idname", "") == "GKMusicTree"]
+        tree = trees[0] if trees else None
+        if tree is None:
+            tree = _new_music_tree()
+            self.report({"INFO"}, f"已新建音乐设置图『{tree.name}』")
+
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"},
+                        "没找到节点编辑器 —— 请打开一个『节点编辑器』区域")
+            return {"CANCELLED"}
+        space.tree_type = "GKMusicTree"
+        space.node_tree = tree
+        return {"FINISHED"}
+
+
+class GK_OT_MusicFillCards(bpy.types.Operator):
+    """把这张音乐设置图里缺的设置卡补回来(已有的不动)。"""
+
+    bl_idname = "gk.music_fill_cards"
+    bl_label = "补齐缺失的设置卡"
+    bl_description = "把这张图里还没有的设置卡补上(已有的卡片和位置都不动)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        if tree is None or str(getattr(tree, "bl_idname", "")) != "GKMusicTree":
+            self.report({"WARNING"}, "请先打开一张『游戏音乐』设置图")
+            return {"CANCELLED"}
+        added = _fill_music_cards(tree)
+        if not added:
+            self.report({"INFO"}, "设置卡都在,没有缺的")
+        else:
+            self.report({"INFO"}, f"补了 {added} 张设置卡")
+        return {"FINISHED"}
+
+
+class GK_PT_MusicTree(bpy.types.Panel):
+    """『游戏音乐』图的侧栏面板:当前场景摘要 + 补卡 + 回游戏逻辑。"""
+
+    bl_idname = "GK_PT_MusicTree"
+    bl_label = "游戏音乐 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "游戏音乐"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return (space is not None
+                and getattr(space, "tree_type", "") == "GKMusicTree")
+
+    def draw(self, context):
+        layout = self.layout
+        tree = props.current_tree(context)
+        settings = getattr(context.scene, "gk_settings", None)
+        scene_name = getattr(getattr(context, "scene", None), "name", "?")
+
+        box = layout.box()
+        box.label(text=f"当前场景:{scene_name}", icon="SCENE_DATA")
+        if tree is None:
+            box.label(text="没有音乐设置图", icon="INFO")
+            return
+
+        # ---- 当前设置摘要(卡上和这里显示的是同一批值)----
+        rows = node_lib.music_settings_rows(settings)
+        box = layout.box()
+        if rows:
+            box.label(text="本场景当前设置", icon="CHECKMARK")
+            for title, text, on in rows:
+                box.label(text=f"{title}: {text}",
+                          icon="CHECKMARK" if on else "X")
+        else:
+            box.label(text="拿不到场景设置", icon="ERROR")
+
+        # ---- 设置卡补齐 ----
+        total = len(node_lib.MUSIC_CARD_IDS)
+        missing = node_lib.missing_music_cards(tree)
+        box = layout.box()
+        box.label(text=f"设置卡 {total - len(missing)}/{total} 张在图上",
+                  icon="NODETREE" if not missing else "ERROR")
+        if missing:
+            box.operator("gk.music_fill_cards",
                          text=f"补齐 {len(missing)} 张", icon="ADD")
         box.label(text="卡上改 = 导出立刻按新值走,不用点应用", icon="INFO")
         back = box.operator("gk.switch_tree", text="← 回到游戏逻辑",
@@ -4444,7 +4600,8 @@ def _draw_tree_list_box(layout, context):
                                                  "GKUiDesignTree",
                                                  "GKGameAiTree",
                                                  "GKDisplayTree",
-                                                 "GKAssetTree")]
+                                                 "GKAssetTree",
+                                                 "GKMusicTree")]
     if not groups:
         box.label(text="还没有节点图", icon="INFO")
         return
@@ -4459,15 +4616,17 @@ def _draw_tree_list_box(layout, context):
                 else "ARMATURE_DATA" if blob == "GKAnimationTree"
                 else "TRACKER" if blob == "GKGameAiTree"
                 else "HIDE_OFF" if blob == "GKDisplayTree"
+                else "SOUND" if blob == "GKMusicTree"
                 else "ASSET_MANAGER" if blob == "GKAssetTree"
                 else "WINDOW")
         # 勾选框:关掉 = 这张图不参与导出
         if blob in ("GKUiDesignTree", "GKGameAiTree", "GKDisplayTree",
-                    "GKAssetTree"):
-            # ── 设计图 / AI 图 / 显示设置图 / 资产库没有"参与导出"这一说
-            # (第四十 / 四十一 / 四十二 / 四十三轮)──────────────────────
+                    "GKMusicTree", "GKAssetTree"):
+            # ── 设计图 / AI 图 / 显示设置图 / 音乐设置图 / 资产库
+            # 没有"参与导出"这一说(第四十 / 四十一 / 四十二 / 四十三 /
+            # 八十六轮)──────────────────────────────────────────────
             # 前两张由玩法图按需引用(『界面_套用设计』『AI_启用』),
-            # 后两张更是"索引 / 控制台" —— 摆一个勾选框不仅含义含糊,
+            # 后三张更是"索引 / 控制台" —— 摆一个勾选框不仅含义含糊,
             # `prop()` 还会去读它们**没有**的属性(画面板时炸)。
             row.label(text=" ")
         else:
@@ -4476,7 +4635,8 @@ def _draw_tree_list_box(layout, context):
         op.tree_name = group.name
         kind = {"GKGameLogicTree": "逻辑", "GKAnimationTree": "动画",
                 "GKUiDesignTree": "界面", "GKGameAiTree": "AI",
-                "GKDisplayTree": "显示", "GKAssetTree": "资产"}.get(blob, "图")
+                "GKDisplayTree": "显示", "GKAssetTree": "资产",
+                "GKMusicTree": "音乐"}.get(blob, "图")
         row.label(text=f"{kind} · {len(group.nodes)} 节点")
     if disabled:
         box.label(text=f"有 {disabled} 张图已停用(不会导出)", icon="INFO")
@@ -4490,6 +4650,137 @@ def _draw_tree_list_box(layout, context):
                        f"事件 {events} · 动作 {statements}", icon="DOT")
         if events == 0:
             box.label(text="还没有事件节点,脚本不会执行任何逻辑", icon="ERROR")
+
+
+def _logic_info_facts(scene, tree, reason):
+    """把 bpy 里的事实收成 `logic_info.checkup` 要的那份字典。
+
+    ── 为什么单独一个函数 ────────────────────────────────────────────
+    判据全在 `logic_info`(纯函数,离线可测),这里只负责**读**:
+    读不出来的键按"拿不到"兜底 —— 侧栏画不出错,最多少说一句。
+    """
+    settings = getattr(scene, "gk_settings", None)
+
+    def safe(getter, fallback):
+        try:
+            return getter()
+        except Exception:                                 # noqa: BLE001
+            return fallback
+
+    carriers = safe(lambda: exporter.script_targets(scene), [])
+    names = [getattr(obj, "name", "?") for obj in carriers]
+
+    # 图里用了寻路吗:『移动_寻路』或任何『AI_状态』(AI 的走路行为
+    # 勾了场景寻路就会自动走导航网格)。逻辑图 + AI 图一起扫 ——
+    # AI 状态在 AI 图里,但"这一关会不会绕墙"是同一件事。
+    uses_pathfinding = False
+    for group in safe(lambda: list(bpy.data.node_groups), []):
+        kind = str(getattr(group, "bl_idname", "") or "")
+        if kind not in ("GKGameLogicTree", "GKGameAiTree"):
+            continue
+        for node in getattr(group, "nodes", ()) or ():
+            if str(getattr(node, "bl_idname", "")) in ("GKNodeNavigate",
+                                                       "GKNodeAiState"):
+                uses_pathfinding = True
+                break
+        if uses_pathfinding:
+            break
+
+    declared, written = [], []
+    if tree is not None:
+        declared = [str(getattr(port, "port_name", "") or "")
+                    for port in (getattr(tree, "gk_ports", ()) or ())]
+        for node in getattr(tree, "nodes", ()) or ():
+            if str(getattr(node, "bl_idname", "")) == "GKNodeLogicOutput":
+                written.append(str(getattr(node, "gk_output_name", "") or ""))
+
+    events = 0
+    if tree is not None:
+        events = safe(lambda: props.event_summary(tree)[0], 0)
+
+    disabled = sum(
+        1 for group in safe(lambda: list(bpy.data.node_groups), [])
+        if str(getattr(group, "bl_idname", "") or "")
+        in ("GKGameLogicTree", "GKAnimationTree")
+        and not bool(getattr(group, "gk_enabled", True)))
+
+    return {
+        "tree_name": str(getattr(tree, "name", "") or ""),
+        "tree_reason": reason,
+        "event_count": events,
+        "carrier_count": len(names),
+        "carrier_names": names,
+        "uses_pathfinding": uses_pathfinding,
+        "nav_enabled": bool(getattr(settings, "nav_enabled", False)),
+        "declared_ports": [name for name in declared if name],
+        "written_ports": [name for name in written if name],
+        "disabled_trees": disabled,
+    }
+
+
+def _draw_logic_info_box(layout, context):
+    """『逻辑信息』:本场景绑的图 / 规模 / 上次导出 / 体检(第八十六轮 E 组 13)。
+
+    ── 为什么要有这块(六个"编辑器"的最后一个)──────────────────────
+    事实本来散在各处:绑没绑图在『导出设置』里、几张图在『节点图』里、
+    谁挂脚本在『谁挂了脚本』里 —— 而"没有事件节点 / 两个物体互相覆盖"
+    这类**导出来才发现**的问题,没有任何地方提前说。这块把它们收在一处:
+    上面是事实(点图名能跳过去),下面是**体检**。
+    默认收起 —— 不挤侧栏,要看才点开(第五十五轮"信息太多"的教训)。
+    """
+    box, opened = collapsible_box(layout, "logic_info", "逻辑信息", "INFO",
+                                 default_open=False)
+    if not opened:
+        return
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        box.label(text="没有场景", icon="ERROR")
+        return
+
+    # ── 本场景:绑的哪棵逻辑图(解析和导出**同一套**)────────────────
+    tree, reason = exporter.resolve_scene_tree(scene)
+    row = box.row(align=True)
+    row.label(text=f"本场景:{scene.name}", icon="SCENE_DATA")
+    if tree is not None:
+        jump = row.operator("gk.focus_tree", text=tree.name, icon="NODETREE")
+        jump.tree_name = tree.name
+    else:
+        row.label(text="没绑逻辑图", icon="ERROR")
+    if reason:
+        box.label(text=reason, icon="CHECKMARK" if tree is not None else "ERROR")
+
+    # ── 规模 / 挂脚本 / 上次导出(各一行,不再展开)──────────────────
+    groups = [g for g in bpy.data.node_groups
+              if getattr(g, "bl_idname", "") in logic_info.TREE_KINDS]
+    box.label(text=logic_info.inventory_text(groups), icon="NODETREE")
+
+    facts = _logic_info_facts(scene, tree, reason)
+
+    if facts["carrier_names"]:
+        shown = "、".join(facts["carrier_names"][:4])
+        more = f" 等 {len(facts['carrier_names'])} 个" \
+            if len(facts["carrier_names"]) > 4 else ""
+        box.label(text=f"挂脚本:{shown}{more}", icon="OBJECT_DATA")
+    else:
+        box.label(text="挂脚本:还没有物体挂上", icon="ERROR")
+
+    report = export_report.load(scene)
+    if report:
+        state = "成功" if report.get("ok") else "失败"
+        box.label(text=f"上次导出:{state} · {report.get('script_name') or '?'}"
+                       f"({report.get('lines', 0)} 行 · "
+                       f"{report.get('written', 0)} 个文件)· {report.get('at', '')}",
+                  icon="FILE_TICK" if report.get("ok") else "ERROR")
+    else:
+        box.label(text="还没导出过 —— 点『导出为 Godot 脚本』", icon="INFO")
+
+    # ── 体检(判据在 logic_info.checkup,纯函数)────────────────────
+    rows = logic_info.checkup(facts)
+    box.separator()
+    box.label(text=f"体检:{logic_info.checkup_summary(rows)}",
+              icon="CHECKMARK" if not rows else "ERROR")
+    for level, text in rows:
+        box.label(text=text, icon=logic_info.LEVEL_ICONS.get(level, "INFO"))
 
 
 def _draw_other_trees_box(layout):
@@ -4528,6 +4819,8 @@ def _draw_other_trees_box(layout):
          "个状态", lambda g: len([n for n in g.nodes
                                   if getattr(n, "bl_idname", "") == "GKNodeAiState"])),
         ("gk.open_display_tree", "游戏显示", "HIDE_OFF", "GKDisplayTree",
+         "张卡", lambda g: len(g.nodes)),
+        ("gk.open_music_tree", "游戏音乐", "SOUND", "GKMusicTree",
          "张卡", lambda g: len(g.nodes)),
         ("gk.open_asset_tree", "游戏资产", "ASSET_MANAGER", "GKAssetTree",
          "份资产", lambda g: sum(node_lib.card_counts(g).values())),
@@ -4695,7 +4988,8 @@ class GK_OT_FocusTree(bpy.types.Operator):
             # 时直接塞一张界面设计图进去会被拒(打不开 / 悄悄弹回)。
             kind = str(getattr(group, "bl_idname", ""))
             if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
-                        "GKGameAiTree", "GKDisplayTree", "GKAssetTree"):
+                        "GKGameAiTree", "GKDisplayTree", "GKAssetTree",
+                        "GKMusicTree"):
                 space.tree_type = kind
             space.pin = True
             space.node_tree = group
@@ -5101,6 +5395,11 @@ class GK_PT_Main(bpy.types.Panel):
 
         # ---- 分组框(第六十二轮:"节点图一大就没法整理")----
         _draw_group_box(layout, context)
+
+        # ---- 逻辑信息(第八十六轮:E 组 13)----
+        # 六个"编辑器"的最后一个:本场景绑的图 / 规模 / 上次导出 / 体检。
+        # 默认收起 —— 它是"要看才点开"的东西,不常驻占地方。
+        _draw_logic_info_box(layout, context)
 
         # ---- 导出脚本 ----
         settings = getattr(context.scene, "gk_settings", None)
@@ -5804,6 +6103,7 @@ GK_CLASSES = (
     GKUiDesignTree,
     GKGameAiTree,
     GKDisplayTree,
+    GKMusicTree,
     GKAssetTree,
     # 侧栏里"点一下就跳过去"的两个小算子(节点图总览 / 脚本载体)
     GK_OT_FocusTree,
@@ -5837,6 +6137,9 @@ GK_CLASSES = (
     GK_OT_OpenAiTree,
     GK_OT_OpenDisplayTree,
     GK_OT_DisplayFillCards,
+    # 音乐设置图(第八十六轮 E 组 14):打开 / 补卡
+    GK_OT_OpenMusicTree,
+    GK_OT_MusicFillCards,
     # 资产库(第四十三/六十六轮):打开 / 收录 / 加卡 / 刷缩略图 / 登记 /
     # 收集合 / 摆一份 / 定位
     GK_OT_OpenAssetTree,
@@ -5873,6 +6176,7 @@ GK_CLASSES = (
     GK_PT_UiDesign,
     GK_PT_AiDesign,
     GK_PT_DisplayTree,
+    GK_PT_MusicTree,
     GK_PT_AssetTree,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,

@@ -208,6 +208,20 @@ extends Node
 ## 开局 BGM 的音量(dB)。0 = 原始,负数是调小。
 @export var bgm_volume_db: float = {bgm_volume}
 
+## 开局 BGM 是否循环(第八十六轮『游戏音乐』图 —— 默认开 = 老行为)。
+@export var bgm_loop: bool = {bgm_loop}
+
+## 开局 BGM 走哪条音频总线(留空 = Master)。
+## 想单独压背景音乐:先在 Godot 的『音频』面板建一条 Music 总线再填名字。
+@export var bgm_bus: String = "{bgm_bus}"
+
+## ── 音乐总线音量(第八十六轮:『游戏音乐』图的『音乐_总线音量』卡)────
+## 勾了『开局应用』才生效(_gk_apply_music_bus);不勾时下面三行不起作用,
+## 运行时行为与以前完全一致(老工程导出产物只多这几行字)。
+@export var music_bus: String = "{music_bus}"
+@export var music_bus_db: float = {music_bus_db}
+@export var music_bus_apply: bool = {music_bus_apply}
+
 ## ── 手电筒:跟着相机走的灯(第四十八轮:阶段①灯光扩展)──────────────
 ## 在 Blender 里给灯勾上『跟随相机(手电筒)』(『游戏物理』面板 -> 灯光),
 ## 导出会把这盏灯的名字写进来(多盏用竖线分隔)。运行时**每物理帧**把
@@ -376,9 +390,29 @@ func _ready() -> void:
 	# 也会走 _ready,编辑器里放音乐会很烦。
 	if not bgm_path.is_empty() and not Engine.is_editor_hint():
 		_gk_start_bgm()
+	# 音乐总线音量(第八十六轮):勾了『开局应用』才动总线 ——
+	# 不勾时这行什么都不做,和以前完全一样。
+	if music_bus_apply and not Engine.is_editor_hint():
+		_gk_apply_music_bus()
 
 
-## 开局 BGM:造一个常驻播放器,循环播。
+## 音乐总线音量(第八十六轮):把一条总线设到指定 dB。
+##
+## ── 为什么找不到总线只警告不报错 ────────────────────────────────
+## 总线是**工程级**的东西(Godot 的『音频』面板里建的),插件没法替你建。
+## 用户还没建时最常见的写法是先填上名字 —— 那时给一条能看懂的警告,
+## 而不是让场景加载失败。
+func _gk_apply_music_bus() -> void:
+	var index := AudioServer.get_bus_index(music_bus)
+	if index < 0:
+		push_warning("[GK] 找不到音频总线: %s(在 Godot 的『音频』面板里建一条)"
+				% music_bus)
+		return
+	AudioServer.set_bus_volume_db(index, music_bus_db)
+
+
+## 开局 BGM:造一个常驻播放器,循环播(第八十六轮起循环可在『游戏音乐』
+## 图的卡上关掉)。
 ##
 ## ── 为什么要自己开循环 ──────────────────────────────────────────
 ## Godot 的 AudioStreamPlayer 播完就停,而 BGM 是要一直有的。
@@ -392,18 +426,24 @@ func _gk_start_bgm() -> void:
 		push_warning("[GK] 找不到开局 BGM 文件: %s" % bgm_path)
 		return
 	if stream is AudioStreamOggVorbis:
-		(stream as AudioStreamOggVorbis).loop = true
+		(stream as AudioStreamOggVorbis).loop = bgm_loop
 	elif stream is AudioStreamMP3:
-		(stream as AudioStreamMP3).loop = true
+		(stream as AudioStreamMP3).loop = bgm_loop
 	elif stream is AudioStreamWAV:
 		var wav := stream as AudioStreamWAV
-		wav.loop_mode = AudioStreamWAV.LOOP_FORWARD
-		wav.loop_begin = 0
-		wav.loop_end = _gk_wav_frames(wav)
+		if bgm_loop:
+			wav.loop_mode = AudioStreamWAV.LOOP_FORWARD
+			wav.loop_begin = 0
+			wav.loop_end = _gk_wav_frames(wav)
+		else:
+			wav.loop_mode = AudioStreamWAV.LOOP_DISABLED
 	var player := AudioStreamPlayer.new()
 	player.name = "GKBgm"
 	player.stream = stream
 	player.volume_db = bgm_volume_db
+	# 走哪条总线(第八十六轮):留空 = Master(老行为)
+	if not bgm_bus.is_empty():
+		player.bus = bgm_bus
 	# 暂停(ESC 菜单 / 上帝机时停)时 BGM 不该跟着停 —— 它是"这一关的
 	# 背景",不是某个角色的动作。
 	player.process_mode = Node.PROCESS_MODE_ALWAYS
@@ -1759,6 +1799,10 @@ ENV_SCRIPT_DEFAULTS = dict(
     # `render_env_script()` 那条路(测试 / 工具)上炸 —— 导出反而好好的。
     # 有 `TestRound77SceneBgm.test_defaults_cover_every_placeholder` 锁着。
     bgm_path="", bgm_volume="-6.0",
+    # 音乐设置(第八十六轮 E 组 14):循环 / 总线 / 总线音量。
+    # 默认值 = 老行为(循环开、总线空、不应用)。
+    bgm_loop="true", bgm_bus="",
+    music_bus="Music", music_bus_db="-6.0", music_bus_apply="false",
 )
 
 
@@ -2185,6 +2229,16 @@ def _nav_on(scene):
     return bool(getattr(settings, "nav_enabled", False))
 
 
+def _music_bus_apply_on(scene):
+    """『音乐_总线音量』卡勾了『开局应用』没有(第八十六轮)。
+
+    也算"环境脚本有活要干"的一件事 —— 没勾时返回 False,
+    老场景的导出产物里连环境脚本都不多一份(和上帝机 / 调试面板同款)。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    return bool(getattr(settings, "music_bus_apply", False))
+
+
 def _gd_float(value):
     """GDScript 里的浮点写法(不是 .tscn 那套 6 位小数)。
 
@@ -2236,6 +2290,47 @@ def _bgm_fields(scene):
         volume = -6.0
     path = scene_bgm_path(scene)
     return (sound_assets.sound_res_path(path) if path else "", volume)
+
+
+def _gd_quoted(value):
+    """把用户填的字符串安全地塞进 GDScript 双引号字面量。
+
+    总线名这种东西走 `@export var x: String = "{...}"` 的模板替换 ——
+    名字里带个引号 / 反斜杠就会把生成的脚本弄坏。转义 + 去掉换行,
+    最坏情况只是名字看起来怪一点(总比导出的脚本编译不过强)。
+    """
+    text = str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return text.replace("\r", " ").replace("\n", " ")
+
+
+def _music_fields(scene):
+    """环境脚本里的音乐设置字段(第八十六轮『游戏音乐』图)。
+
+    ── 默认值就是老行为 ──────────────────────────────────────────────
+    循环开(true)、BGM 总线空(走 Master)、总线音量**不应用**(false)。
+    所以没动过音乐设置图的 .blend,运行时行为和以前完全一致
+    (产物里只多几行默认值字段,见测试 `test_defaults_are_old_behavior`)。
+    """
+    settings = getattr(scene, "gk_settings", None)
+
+    def text(attr, fallback=""):
+        return _gd_quoted(getattr(settings, attr, fallback))
+
+    def number(attr, fallback):
+        try:
+            return float(getattr(settings, attr, fallback))
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "loop": "true" if bool(getattr(settings, "scene_bgm_loop", True))
+                else "false",
+        "bgm_bus": text("scene_bgm_bus"),
+        "bus": text("music_bus", "Music"),
+        "bus_db": _gd_float(number("music_bus_db", -6.0)),
+        "apply": "true" if bool(getattr(settings, "music_bus_apply", False))
+                 else "false",
+    }
 
 
 def _nav_settings(scene):
@@ -2526,11 +2621,19 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
     """
     bgm_path, bgm_volume = _bgm_fields(scene)
     dimension = "3" if is_3d else "2"
+    music = _music_fields(scene)
     return dict(
         camera_name=camera_name,
         fov=_fmt(fov),
         bgm_path=bgm_path,
         bgm_volume=_gd_float(bgm_volume),
+        # 音乐设置(第八十六轮『游戏音乐』图):默认值 = 老行为 ——
+        # 循环开、总线空(走 Master)、总线音量不应用。
+        bgm_loop=music["loop"],
+        bgm_bus=music["bgm_bus"],
+        music_bus=music["bus"],
+        music_bus_db=music["bus_db"],
+        music_bus_apply=music["apply"],
         materials=_material_table(material_files),
         follow_scene_light="true" if _toon_follow_light(scene) else "false",
         god_camera="true" if _god_camera_on(scene) else "false",
@@ -3682,10 +3785,12 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         # 事都只能在运行时做)。相机 / 灯 / 材质那些 3D 内容在 2D 场景里
         # 没有作用对象;环境脚本里这些分支本来就有"找不到就跳过"的兜底,
         # 不会报错(探针实测)。
-        # 只有**有活要干**时(寻路 / 上帝机 / 调试面板)才写这个节点。
+        # 只有**有活要干**时(寻路 / 上帝机 / 调试面板 / 开局 BGM /
+        # 音乐总线音量)才写这个节点。
         files = {}
         if (_nav_on(scene) or _god_camera_on(scene)
-                or _debug_panel_on(scene) or scene_bgm_path(scene)):
+                or _debug_panel_on(scene) or scene_bgm_path(scene)
+                or _music_bus_apply_on(scene)):
             fields = _env_fields(scene, camera_name="", fov=_fmt(0.0),
                                  material_files=material_files, is_3d=False)
             files[env_script_rel(scene_name)] = \
@@ -3798,7 +3903,8 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     # 否则"场景里只有网格"时面板会跟着不存在,而排查恰恰常在这种场景里做。
     # 寻路(第三十四轮)同理:烤导航网格那件事本身就在环境脚本里。
     if (parts or material_table or _god_camera_on(scene)
-            or _debug_panel_on(scene) or _nav_on(scene)):
+            or _debug_panel_on(scene) or _nav_on(scene)
+            or _music_bus_apply_on(scene)):
         fields = _env_fields(scene, camera_name=camera_name, fov=fov_for_env,
                              material_files=material_files)
         if not parts:

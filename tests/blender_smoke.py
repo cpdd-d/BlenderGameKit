@@ -4707,6 +4707,146 @@ def main():
         check("第八十五轮(多层导航)", False,
               f"{type(exc).__name__}: {exc}")
 
+    # ---- 第八十六轮(E 组 13+14):『逻辑信息』+『游戏音乐』设置图 ----------
+    # ① 『游戏音乐』是第七种节点树:新建带两张卡、补卡不重复、poll 双向把关;
+    # ② 写透:卡上读写的就是场景设置(改场景 -> 摘要跟着变);
+    # ③ 两张卡的 draw_buttons 画得完;侧栏面板注册上了;
+    # ④ 环境脚本:循环关 / BGM 总线 / 总线音量(勾『开局应用』)真的写进去,
+    #    恢复默认 = 老行为(循环开 / 不应用 / 走 Master);
+    # ⑤ 『逻辑信息』的真机侧事实收集(事件数 / 挂脚本数 / 体检判据)。
+    try:
+        import shutil
+        r86_ui = import_module(f"{module_name}.ui")
+        r86_info = import_module(f"{module_name}.logic_info")
+        r86_asset = import_module(f"{module_name}.asset_export")
+
+        # ① 音乐设置图:类型注册 + 新建带两张卡 + fake user + 补卡不重复
+        r86_music = r86_ui._new_music_tree()
+        r86_names = [getattr(node, "bl_idname", "") for node in r86_music.nodes]
+        check("音乐:第七种图类型注册成功,新建带齐两张设置卡",
+              getattr(r86_music, "bl_idname", "") == "GKMusicTree"
+              and r86_names == list(node_lib.MUSIC_CARD_IDS)
+              and bool(getattr(r86_music, "use_fake_user", False)),
+              str(r86_names))
+        check("音乐:两张卡补不重复(都在时不加)",
+              node_lib.missing_music_cards(r86_music) == []
+              and r86_ui._fill_music_cards(r86_music) == 0)
+
+        # ② poll 把关:玩法节点进不了音乐图;音乐卡进不了玩法图
+        r86_before = len(r86_music.nodes)
+        try:
+            r86_music.nodes.new("GKNodeMoveDirection")
+            r86_move_blocked = False
+        except RuntimeError:
+            r86_move_blocked = True
+        check("音乐:玩法节点进不了音乐图(Blender 侧把关)",
+              r86_move_blocked and len(r86_music.nodes) == r86_before)
+
+        r86_logic = bpy.data.node_groups.new("音乐冒烟86", "GKGameLogicTree")
+        try:
+            r86_logic.nodes.new("GKNodeMusicSceneBgm")
+            r86_card_blocked = False
+        except RuntimeError:
+            r86_card_blocked = True
+        check("音乐:设置卡进不了玩法图(不会污染代码生成)",
+              r86_card_blocked and len(r86_logic.nodes) == 0)
+
+        # ③ 写透:改场景设置 -> 摘要立刻反映(没有第二份值)
+        r86_settings = bpy.context.scene.gk_settings
+        r86_saved = {name: getattr(r86_settings, name) for name in (
+            "scene_bgm", "scene_bgm_loop", "scene_bgm_bus",
+            "music_bus", "music_bus_db", "music_bus_apply")}
+        r86_settings.scene_bgm = r"D:/snd/主题曲.ogg"
+        r86_settings.scene_bgm_loop = False
+        r86_settings.scene_bgm_bus = "Music"
+        r86_settings.music_bus_apply = True
+        r86_settings.music_bus_db = -9.5
+        r86_rows = node_lib.music_settings_rows(r86_settings)
+        check("音乐:摘要读的是场景设置(写透,不用点应用)",
+              bool(r86_rows[0][2]) and "播一遍" in r86_rows[0][1]
+              and "总线 Music" in r86_rows[0][1]
+              and bool(r86_rows[1][2]) and "-9.5" in r86_rows[1][1],
+              str(r86_rows))
+
+        # ④ 两张卡的 draw_buttons 都要能画完
+        r86_draw_error = ""
+        try:
+            class _R86Layout:   # 最小替身:随便怎么调都返回自己
+                def __getattr__(self, name):
+                    if name.startswith("_"):
+                        raise AttributeError(name)
+
+                    def recorder(*_args, **_kwargs):
+                        return self
+                    return recorder
+
+            for r86_card in r86_music.nodes:
+                r86_card.draw_buttons(bpy.context, _R86Layout())
+        except Exception as exc:                       # noqa: BLE001
+            r86_draw_error = f"{type(exc).__name__}: {exc}"
+        check("音乐:两张卡的 draw_buttons 都能画完", not r86_draw_error,
+              r86_draw_error)
+
+        r86_panels = [cls.__name__ for cls in bpy.types.Panel.__subclasses__()]
+        check("音乐:侧栏面板已注册", "GK_PT_MusicTree" in r86_panels,
+              str(r86_panels)[:200])
+
+        # ⑤ 真导出:环境脚本里循环关 / 总线 / 总线音量都在
+        r86_work = os.path.join(tempfile.gettempdir(), "gk_music86")
+        shutil.rmtree(r86_work, ignore_errors=True)
+        os.makedirs(r86_work, exist_ok=True)
+        # 主场景要先有 World glb(没有网格时 write_world_scene 会早退)
+        check("音乐:世界 glb 导出成功",
+              r86_asset.export_scene_glb(r86_work, "World")[1])
+        r86_path, _r86_n = r86_asset.write_world_scene(
+            r86_work, "World", scene=bpy.context.scene, dimension="3")
+        # 音乐设置落在**环境脚本**里(每场景一份),不在 .tscn 正文里
+        r86_env = os.path.join(r86_work, "scripts", "gk_environment.gd")
+        with open(r86_env, encoding="utf-8") as r86_handle:
+            r86_text = r86_handle.read()
+        check("音乐:环境脚本写入循环关 / 总线 / 总线音量",
+              "bgm_loop: bool = false" in r86_text
+              and 'bgm_bus: String = "Music"' in r86_text
+              and "music_bus_apply: bool = true" in r86_text
+              and "music_bus_db: float = -9.5" in r86_text
+              and "_gk_apply_music_bus()" in r86_text
+              and "LOOP_DISABLED" in r86_text,
+              r86_text[-260:])
+
+        # 恢复默认 = 老行为(循环开 / 不应用)
+        for r86_key, r86_value in r86_saved.items():
+            setattr(r86_settings, r86_key, r86_value)
+        r86_path2, _r86_n2 = r86_asset.write_world_scene(
+            r86_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r86_env, encoding="utf-8") as r86_handle2:
+            r86_text2 = r86_handle2.read()
+        check("音乐:恢复默认 = 老行为(循环开 / 不应用 / 走 Master)",
+              "bgm_loop: bool = true" in r86_text2
+              and "music_bus_apply: bool = false" in r86_text2
+              and 'bgm_bus: String = ""' in r86_text2,
+              r86_text2[-260:])
+
+        # ⑥ 『逻辑信息』:真机侧的事实收集 + 体检判据
+        r86_event = r86_logic.nodes.new("GKNodeOnReady")
+        r86_event.name = "开始"
+        r86_facts = r86_ui._logic_info_facts(
+            bpy.context.scene, r86_logic, "冒烟用")
+        r86_rows2 = r86_info.checkup(r86_facts)
+        check("逻辑信息:事实收集(事件数 / 挂脚本数 / 名字)",
+              r86_facts["tree_name"] == r86_logic.name
+              and int(r86_facts["event_count"]) >= 1
+              and int(r86_facts["carrier_count"]) == 0, str(r86_facts))
+        check("逻辑信息:体检抓出『没有物体挂脚本』",
+              any(level == "warn" and "脚本" in text
+                  for level, text in r86_rows2), str(r86_rows2))
+
+        bpy.data.node_groups.remove(r86_logic)
+        bpy.data.node_groups.remove(r86_music)
+    except Exception as exc:
+        check("第八十六轮(逻辑信息 + 游戏音乐)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

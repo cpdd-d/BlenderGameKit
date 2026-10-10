@@ -785,6 +785,32 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         soft_min=-40.0, soft_max=6.0,
         description="开局 BGM 的音量(dB)。0 = 原始,负数是调小")
 
+    # ── 游戏音乐设置(第八十六轮:E 组 14)──────────────────────────────
+    # 『游戏音乐』设置图的『音乐_场景 BGM』卡上那几项 —— 和显示设置卡
+    # 同一套"写透":卡上改 = 导出立刻按新值走,不存在"忘了点应用"。
+    # 值还是挂在**场景**上(每关一套),切场景跟着切。
+    scene_bgm_loop: BoolProperty(
+        name="BGM 循环", default=True,
+        description="开局 BGM 是否循环播放(关掉 = 播一遍就停)")
+    scene_bgm_bus: StringProperty(
+        name="BGM 总线", default="",
+        description="开局 BGM 走哪条音频总线(留空 = Master)。\n"
+                    "想在游戏里单独压背景音乐,先在 Godot 的『音频』面板"
+                    "建一条 Music 总线,再把名字填这里")
+
+    # 『音乐_总线音量』卡:开局把一条音频总线设到指定 dB。
+    # 默认**不应用**(music_bus_apply = False)—— 老工程导出产物一字不变。
+    music_bus: StringProperty(
+        name="音乐总线", default="Music",
+        description="要调音量的音频总线名(Godot『音频』面板里建过的名字)")
+    music_bus_db: FloatProperty(
+        name="总线音量", default=-6.0,
+        soft_min=-60.0, soft_max=6.0,
+        description="开局把上面那条总线设成这个音量(dB)")
+    music_bus_apply: BoolProperty(
+        name="开局应用", default=False,
+        description="勾上 = 场景一开始就把总线音量设下去(不勾 = 什么都不做)")
+
     show_export_settings: BoolProperty(
         name="展开导出设置", default=False,
         description="侧栏『导出设置』默认收起 —— 那几项开一次就不用再动")
@@ -1258,7 +1284,7 @@ def make_node_picker(prop_name):
 
 
 def current_tree_type(context):
-    """当前节点编辑器在编辑哪一类树 —— 六种之一:
+    """当前节点编辑器在编辑哪一类树 —— 七种之一:
 
         "GKGameLogicTree"  玩法图
         "GKAnimationTree"  动画树(『游戏动画』)
@@ -1266,13 +1292,15 @@ def current_tree_type(context):
         "GKGameAiTree"     AI 图(『游戏AI』,第四十一轮)
         "GKDisplayTree"    显示设置图(『游戏显示』,第四十二轮)
         "GKAssetTree"      资产库(『游戏资产』,第四十三轮)
+        "GKMusicTree"      音乐设置图(『游戏音乐』,第八十六轮)
 
     取不到就返回 None。菜单按这个过滤(见 node_menu_entries)。
     """
     space = getattr(context, "space_data", None)
     kind = getattr(space, "tree_type", "") if space is not None else ""
     if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
-                "GKGameAiTree", "GKDisplayTree", "GKAssetTree"):
+                "GKGameAiTree", "GKDisplayTree", "GKAssetTree",
+                "GKMusicTree"):
         return kind
     return None
 

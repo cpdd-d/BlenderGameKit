@@ -81,6 +81,8 @@ _SUBMODULES = (
     "nodes._displayset",
     # 资产卡(第四十三轮:『游戏资产』树)—— 同样必须在重载表里(见上面那条)
     "nodes._assets",
+    # 音乐设置卡(第八十六轮:『游戏音乐』树)—— 同样必须在重载表里
+    "nodes._musicset",
     "nodes.nodes",
     "nodes",
     # codegen 主体按领域拆成 10 个模块(纯搬运)。顺序 = 依赖顺序:
@@ -107,6 +109,9 @@ _SUBMODULES = (
     "codegen",
     # 导出物清单 / 旧文件清理(纯标准库,离线可测)
     "generated_files",
+    # 游戏逻辑信息(第八十六轮:E 组 13)—— 侧栏『逻辑信息』的判据层,
+    # 纯函数、不依赖 bpy;ui 会 import 它,所以排在 ui 之前
+    "logic_info",
     # 打包发布(生成导出预设 + 调 Godot --export-release,纯标准库、离线可测)
     # 必须排在 operator_io 之前 —— 它 import 这个模块
     "packaging",

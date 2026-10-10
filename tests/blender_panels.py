@@ -164,6 +164,8 @@ def main():
         ("GK_PT_DisplayTree", cube),
         # 『游戏资产』资产库的侧栏面板(第四十三轮)同理。
         ("GK_PT_AssetTree", cube),
+        # 『游戏音乐』设置图的侧栏面板(第八十六轮)同理。
+        ("GK_PT_MusicTree", cube),
     ]
     for class_name, target in cases:
         panel = getattr(ui, class_name, None)
@@ -309,6 +311,81 @@ def main():
         bpy.data.node_groups.remove(tree)
     except Exception as exc:
         check("『游戏显示』面板", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 4b. 『游戏音乐』设置图的面板 + 两张卡(第八十六轮)----
+    # 和显示设置图同一套:缺卡 -> 『补齐』;补齐后 -> 『回到游戏逻辑』。
+    print("=" * 72)
+    print("4b. 『游戏音乐』面板 + 两张设置卡")
+    print("=" * 72)
+    try:
+        music = bpy.data.node_groups.new("面板冒烟音乐86", "GKMusicTree")
+        music.nodes.new("GKNodeMusicSceneBgm")
+        panel = getattr(ui, "GK_PT_MusicTree", None)
+        if panel is None:
+            check("GK_PT_MusicTree 存在", False, "类找不到")
+        else:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, music))
+            names = list(layout.operator_names)
+            check("『游戏音乐』面板缺卡时画出『补齐』按钮",
+                  "gk.music_fill_cards" in names, str(sorted(set(names))))
+
+            ui._fill_music_cards(music)
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, music))
+            names = list(layout.operator_names)
+            check("『游戏音乐』面板补齐后回到游戏逻辑一直在",
+                  "gk.music_fill_cards" not in names
+                  and "gk.switch_tree" in names, str(sorted(set(names))))
+            # 摘要行真的画出来了(两行:开局 BGM / 总线音量)
+            texts = " ".join(layout.texts)
+            check("『游戏音乐』面板画出设置摘要",
+                  "开局 BGM" in texts and "总线音量" in texts, texts[:200])
+
+        # 两张卡的 draw_buttons 都要能画完
+        card_error = ""
+        for card in music.nodes:
+            try:
+                card.draw_buttons(bpy.context, RecordingLayout())
+            except Exception as exc:                      # noqa: BLE001
+                card_error = (f"{getattr(card, 'bl_label', '?')}: "
+                              f"{type(exc).__name__}: {exc}")
+                break
+        check("两张音乐设置卡的 draw_buttons 都能画完", not card_error,
+              card_error)
+        bpy.data.node_groups.remove(music)
+    except Exception as exc:
+        check("『游戏音乐』面板", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 4c. 『逻辑信息』盒子(第八十六轮:E 组 13)----
+    # 默认收起 —— 强制展开,把"有事实 + 有体检"那条路真画一遍:
+    # 它读 resolve_scene_tree / 挂脚本 / 上次导出报告 / logic_info 判据,
+    # 任何一环拿不到都不许把侧栏整块画没。
+    print("=" * 72)
+    print("4c. 『逻辑信息』盒子(展开)")
+    print("=" * 72)
+    try:
+        ui._OPEN_SECTIONS["logic_info"] = True
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        panel = getattr(ui, "GK_PT_Main", None)
+        panel.draw(holder, FakeContext(cube, scene))
+        texts = " ".join(layout.texts)
+        check("『逻辑信息』展开后画出 体检 / 规模 / 挂脚本",
+              "体检" in texts and "挂脚本" in texts
+              and ("张图" in texts or "还没有节点图" in texts),
+              texts[:300])
+        check("『逻辑信息』盒子没把侧栏画崩(其它按钮还在)",
+              "gk.export_script" in layout.operator_names,
+              str(sorted(set(layout.operator_names)))[:200])
+        ui._OPEN_SECTIONS.pop("logic_info", None)
+    except Exception as exc:
+        ui._OPEN_SECTIONS.pop("logic_info", None)
+        check("『逻辑信息』盒子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 5. 『游戏资产』资产库的面板 + 统一『资产卡』(第四十三/六十六轮)----
