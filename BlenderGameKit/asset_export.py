@@ -3368,6 +3368,143 @@ def render_tuning_tables(scene):
     return literal(vis_parts), literal(shadow_off), literal(light_parts)
 
 
+def render_occluder_of(physics):
+    """物体勾了『遮挡体』吗(缺属性按不勾 —— 老文件行为不变)。"""
+    if physics is None:
+        return False
+    return bool(getattr(physics, "render_occluder", False))
+
+
+# ==========================================================================
+# 遮挡剔除(第九十九轮:性能第三件)
+# ==========================================================================
+# 勾了『遮挡体』的物体 -> 场景里多一个 `OccluderInstance3D` 节点,形状是
+# 按物体**世界包围盒**做的 `BoxOccluder3D`。Godot 会用它把"挡在后面"的
+# 东西整批剔掉(不提交渲染)。
+#
+# ── 真机标定(2026-10-10,Godot 4.7.2,真窗口)─────────────────────
+# 场景:相机 (0,0,10) 看着一面 20x20 的墙(z=0),墙**后面**放 20 个方块。
+# 量的是 `Performance.RENDER_TOTAL_OBJECTS_IN_FRAME`:
+#
+#     挂遮挡体:第 10 帧 = 21(还在建 BVH) -> **第 20 帧起 = 1**
+#     拿掉遮挡体(occluder = null):**始终 21**
+#
+# 即:**20 个被挡住的对象全被剔除**,而且 BVH 是**分摊到几帧**建起来的。
+#
+# ── 为什么这个能写进 .tscn(上一轮的 visibility_range 不能)──────────
+# `OccluderInstance3D` 是**场景里的独立节点**(挂 `parent="."`),
+# 不是 glb 实例的内部子节点 —— 不存在"外部覆盖被 Godot 丢掉"的问题。
+# 那条限制只管"给实例内部的网格改属性"。
+OCCLUDER_SUBRESOURCE = """[sub_resource type="BoxOccluder3D" id="{res_id}"]
+size = Vector3({sx:.4f}, {sy:.4f}, {sz:.4f})"""
+
+OCCLUDER_NODE_TEXT = """[node name="{node_name}" type="OccluderInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, {px:.4f}, {py:.4f}, {pz:.4f})
+occluder = SubResource("{res_id}")"""
+
+# Godot 项目的遮挡剔除总开关(`rendering/occlusion_culling/use_occlusion_culling`)。
+# ⚠ **默认 false** —— 光有 OccluderInstance3D 一点都不会省(真机实测:
+#   挂着 21 个渲染对象、拿掉也是 21 个)。所以勾了『遮挡体』就必须顺手
+#   把这个设置打开,否则是"白导"。
+OCCLUSION_CULLING_KEY = "occlusion_culling/use_occlusion_culling"
+
+
+def occluder_entries(scene):
+    """勾了『遮挡体』的网格 -> [{name, position, size}](都换算成 Godot 轴序)。
+
+    尺寸用**世界包围盒**(和碰撞体 / 导航代价同一套 `object_bounds`);
+    位置用包围盒中心(不是物体原点 —— 网格常常偏在原点一侧)。
+
+    ⚠ 2D 场景直接返回 []:遮挡剔除是 3D 的(`OccluderInstance3D`),
+    2D 里那个 `LightOccluder2D` 是给**光影**用的,不是遮挡剔除。
+    """
+    settings = getattr(scene, "gk_settings", None)
+    if settings is not None and str(getattr(settings, "dimension", "3")) == "2":
+        return []
+    out = []
+    for obj in (getattr(scene, "objects", None) or ()):
+        if str(getattr(obj, "type", "") or "") != "MESH":
+            continue
+        if not render_occluder_of(getattr(obj, "gk_physics", None)):
+            continue
+        bounds = object_bounds([obj])
+        if bounds is None:
+            continue
+        size = tuple(float(v) for v in bounds["size"])
+        mins = tuple(float(v) for v in bounds["min"])
+        center = tuple(mins[i] + size[i] / 2.0 for i in range(3))
+        out.append({
+            "name": str(obj.name),
+            # Blender(x, y, z) -> Godot(x, z, -y),尺寸同理换轴序
+            "position": (center[0], center[2], -center[1]),
+            "size": (size[0], size[2], size[1]),
+        })
+    return out
+
+
+def occluder_texts(entries):
+    """`occluder_entries` 的结果 -> (子资源文本列表, 节点文本列表)。
+
+    空表 -> ([], [])(老场景产物一字不变)。
+    """
+    blocks = []
+    nodes = []
+    for index, entry in enumerate(entries):
+        res_id = f"gk_occluder_{index}"
+        px, py, pz = entry["position"]
+        sx, sy, sz = entry["size"]
+        blocks.append(OCCLUDER_SUBRESOURCE.format(
+            res_id=res_id, sx=sx, sy=sy, sz=sz))
+        # 节点名用 `Occluder_` + 序号(不加物体名:中文名做节点名没问题,
+        # 但导出后用户想按名字找它时,带序号的英文名更好认)
+        nodes.append(OCCLUDER_NODE_TEXT.format(
+            node_name=f"Occluder_{index}", res_id=res_id,
+            px=px, py=py, pz=pz))
+    return blocks, nodes
+
+
+def ensure_occlusion_culling(directory, enabled=True):
+    """把遮挡剔除的总开关写进 project.godot。返回是否改动了。
+
+    ── 为什么必须有这一步(第九十九轮真机实测)──────────────────────
+    Godot 4 的 `rendering/occlusion_culling/use_occlusion_culling`
+    **默认是 false**:场景里挂着 OccluderInstance3D 也**一点都不会省**
+    (实测:挂着 21 个渲染对象、拿掉同样 21 个;打开之后降到 1)。
+    所以勾了『遮挡体』就要顺手打开它 —— 否则用户以为勾了有用,其实白导。
+
+    ── 为什么只开不关 ──────────────────────────────────────────────
+    项目设置是**整个项目**的,而多关卡里可能"这关有遮挡体、那关没有"。
+    只在需要时打开、从不去关(关掉会把别的关卡一起废掉)。真不想要了,
+    用户在 Godot 的项目设置里关一下就行 —— 我们不去猜。
+    """
+    if not directory or not enabled:
+        return False
+    project_file = os.path.join(directory, "project.godot")
+    if not os.path.isfile(project_file):
+        return False
+
+    with open(project_file, "r", encoding="utf-8") as handle:
+        text = handle.read()
+
+    line = f"{OCCLUSION_CULLING_KEY} = true"
+    existing = re.search(
+        rf"^{re.escape(OCCLUSION_CULLING_KEY)}\s*=\s*(\w+)", text, re.MULTILINE)
+    if existing:
+        if existing.group(1) == "true":
+            return False
+        text = text[:existing.start()] + line + text[existing.end():]
+    elif "[rendering]" in text:
+        # 插到 [rendering] 段里(紧跟在段头后面,和 create_project 的模板一致)
+        index = text.index("[rendering]") + len("[rendering]")
+        text = text[:index] + f"\n\n{line}" + text[index:]
+    else:
+        text = text.rstrip() + f"\n\n[rendering]\n\n{line}\n"
+
+    with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    return True
+
+
 def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
                       materials_map=None, character_model=None, file_names=None,
@@ -3577,6 +3714,18 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # 加进来,节点文本拼到场景末尾。
     env_blocks, env_node = environment_scene_blocks(scene)
     sub_resources.extend(env_blocks)
+
+    # ---- 遮挡体(第九十九轮:性能第三件)----
+    # 勾了『遮挡体』的物体各生成一个 `OccluderInstance3D`(形状 = 世界包围盒)。
+    # 这次**可以**写进 .tscn:它是场景里的**独立节点**,不是 glb 实例内部的
+    # 网格 —— 上一条"外部覆盖会被 Godot 丢掉"的限制管不着它。
+    occ_entries = occluder_entries(scene)
+    occ_blocks, occ_nodes = occluder_texts(occ_entries)
+    sub_resources.extend(occ_blocks)
+    if occ_entries:
+        # ⚠ 总开关默认 false:不打开的话这些节点**一点都不会省**(真机实测
+        # 21 vs 21)。见 ensure_occlusion_culling 的说明。
+        ensure_occlusion_culling(export_dir)
 
     load_steps = 1 + len(ext_lines) + len(sub_resources)
 
@@ -3894,6 +4043,8 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # 环境与后处理(第四十九轮):WorldEnvironment + Environment 子资源
     if env_node:
         lines.append(env_node.strip("\n"))
+    for occ_node in occ_nodes:
+        lines.append(occ_node)
         lines.append("")
 
     with open(path, "w", encoding="utf-8", newline="\n") as handle:

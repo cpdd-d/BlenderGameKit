@@ -157,6 +157,7 @@ func _ready() -> void:
 		" chaser=", _chaser() != null,
 		" spark=", spark != null,
 		" fx=", fx_names)
+	_report_occluders()
 	# ── 第四十四轮新内容:守卫(『游戏AI』图驱动)+ 状态变量在跑 ──────
 	# ⚠ `ai_state` 在**玩家脚本**上(AI_启用 的『作用在谁』= 敌3守卫,
 	#   但代码生成在"挂脚本的那个物体" = 玩家,和 AI 示例同一个做法)。
@@ -315,6 +316,22 @@ func _far_corner(from: Vector3) -> Vector3:
 				best_dist = dist
 				best = spot
 	return best
+
+
+func _report_occluders() -> void:
+	# 第九十九轮:遮挡体 —— 南北两面临街的墙勾了『遮挡体』,导出该给它们
+	# 各生成一个 OccluderInstance3D(形状 = 墙的包围盒)。
+	# ⚠ 遮挡剔除只是"不提交渲染",节点和属性照旧在,所以这里读得到;
+	#   "真的少画了"由标定实验证明(21 个渲染对象 -> 1 个),不在这里量
+	#   (无头探针的渲染统计是 0)。
+	var found := 0
+	var total := Vector3.ZERO
+	for node in world.find_children("Occluder_*", "OccluderInstance3D", true, false):
+		found += 1
+		var occ := (node as OccluderInstance3D).occluder
+		if occ is BoxOccluder3D:
+			total += (occ as BoxOccluder3D).size
+	print("DEMO_OCCLUDERS count=", found, " total_size=", total)
 
 
 func _physics_process(delta: float) -> void:
@@ -711,6 +728,39 @@ def main():
     if not re.search(r"DEMO_MOVE ok=true", text):
         print("✗ 按 W 之后角色没动(角色预设链路):",
               [line for line in text.splitlines() if "DEMO_MOVE" in line])
+        ok = False
+    # ── 第九十九轮:遮挡体 ──────────────────────────────────────────
+    # 南北两面墙勾了『遮挡体』-> 各一个 OccluderInstance3D,形状 = 墙的包围盒。
+    # 墙在 Blender 里是 24x0.6x3.0 -> Godot 轴序 24x3.0x0.6,两面加起来
+    # (48, 6, 1.2) —— 这个数字对得上就说明"包围盒 + 换轴序"整条链没错。
+    occluders = re.search(
+        r"DEMO_OCCLUDERS count=(\d+) total_size=\(([\d.]+), ([\d.]+), ([\d.]+)\)",
+        text)
+    if not occluders:
+        print("✗ 没跑出遮挡体的结论行(DEMO_OCCLUDERS):",
+              [line for line in text.splitlines() if "DEMO_OCCLUDERS" in line])
+        ok = False
+    else:
+        count = int(occluders.group(1))
+        size = tuple(float(occluders.group(i)) for i in (2, 3, 4))
+        want = (48.0, 6.0, 1.2)
+        print(f"    遮挡体: {count} 个,总尺寸 {size}(期望 {want})")
+        if count != 2:
+            print("✗ 遮挡体数量不对(南北两面墙该各一个):", count)
+            ok = False
+        elif any(abs(size[i] - want[i]) > 0.05 for i in range(3)):
+            print("✗ 遮挡体尺寸不对(包围盒 / 换轴序错了):", size, "!=", want)
+            ok = False
+    project_file = os.path.join(OUT, "project.godot")
+    if os.path.isfile(project_file):
+        with open(project_file, "r", encoding="utf-8") as handle:
+            project_text = handle.read()
+        # ⚠ 总开关默认 false —— 没打开的话遮挡体**一点都不会省**(实测)
+        if "occlusion_culling/use_occlusion_culling = true" not in project_text:
+            print("✗ project.godot 里没打开遮挡剔除总开关(那个默认是关的)")
+            ok = False
+    else:
+        print("✗ 没找到 project.godot")
         ok = False
     if not re.search(r"DEMO_PATROL ok=true", text):
         print("✗ 敌1 没有在巡逻(时间轴往返链路):",

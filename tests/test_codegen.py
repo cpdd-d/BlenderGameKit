@@ -18559,5 +18559,112 @@ class TestRound98RenderTuning(Base):
         self.assertIn("directional_shadow_max_distance", text)
 
 
+class TestRound99Occluder(Base):
+    """第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)。
+
+    ── 两个真机标定出来的硬事实(都在这一层锁住)──────────────────
+    1. Godot 的 `rendering/occlusion_culling/use_occlusion_culling`
+       **默认 false** —— 光有节点一点都不会省(实测挂着 21 个渲染对象、
+       拿掉也是 21 个;打开后 1 个)。所以勾了就必须顺手打开;
+    2. 这次**可以**写进 .tscn(不像上一轮的 visibility_range):
+       OccluderInstance3D 是场景里的独立节点,不是 glb 实例内部的网格。
+    """
+
+    class _Obj:
+        def __init__(self, name, kind="MESH", occluder=False, bounds=None):
+            self.name = name
+            self.type = kind
+            self.gk_physics = types.SimpleNamespace(render_occluder=occluder)
+            self._bounds = bounds
+
+    def _scene(self, *objs, dimension="3"):
+        return types.SimpleNamespace(
+            objects=list(objs),
+            gk_settings=types.SimpleNamespace(dimension=dimension))
+
+    def test_no_occluder_writes_nothing(self):
+        from BlenderGameKit import asset_export as ae
+        entries = ae.occluder_entries(self._scene(self._Obj("墙")))
+        self.assertEqual(entries, [])
+        self.assertEqual(ae.occluder_texts(entries), ([], []))
+
+    def test_entries_use_bounds_and_godot_axis(self):
+        """尺寸取包围盒、位置取包围盒中心,并按 Blender -> Godot 换轴序。"""
+        from BlenderGameKit import asset_export as ae
+        with mock.patch.object(ae, "object_bounds", return_value={
+                "min": (0.0, 0.0, 0.0), "size": (4.0, 2.0, 6.0)}):
+            entries = ae.occluder_entries(
+                self._scene(self._Obj("墙", occluder=True)))
+        self.assertEqual(len(entries), 1)
+        # Blender 中心 (2, 1, 3) -> Godot (2, 3, -1)
+        self.assertEqual(entries[0]["position"], (2.0, 3.0, -1.0))
+        # Blender 尺寸 (4, 2, 6) -> Godot (4, 6, 2)
+        self.assertEqual(entries[0]["size"], (4.0, 6.0, 2.0))
+
+    def test_texts_are_occluder_node_and_box(self):
+        from BlenderGameKit import asset_export as ae
+        blocks, nodes = ae.occluder_texts([
+            {"name": "墙", "position": (1.0, 2.0, 3.0), "size": (4.0, 5.0, 6.0)},
+        ])
+        self.assertEqual(len(blocks), 1)
+        self.assertIn('[sub_resource type="BoxOccluder3D" id="gk_occluder_0"]',
+                      blocks[0])
+        self.assertIn("size = Vector3(4.0000, 5.0000, 6.0000)", blocks[0])
+        self.assertEqual(len(nodes), 1)
+        self.assertIn('type="OccluderInstance3D" parent="."', nodes[0])
+        self.assertIn("1.0000, 2.0000, 3.0000", nodes[0])
+        self.assertIn('occluder = SubResource("gk_occluder_0")', nodes[0])
+
+    def test_two_occluders_get_distinct_ids(self):
+        from BlenderGameKit import asset_export as ae
+        blocks, nodes = ae.occluder_texts([
+            {"name": "A", "position": (0.0, 0.0, 0.0), "size": (1.0, 1.0, 1.0)},
+            {"name": "B", "position": (0.0, 0.0, 0.0), "size": (1.0, 1.0, 1.0)},
+        ])
+        self.assertIn("gk_occluder_0", blocks[0])
+        self.assertIn("gk_occluder_1", blocks[1])
+        self.assertIn('type="OccluderInstance3D"', nodes[1])
+        # ⚠ 节点名不能重复(Godot 会改名,用户按名字找就找不着了)
+        self.assertNotEqual(nodes[0].split('"')[1], nodes[1].split('"')[1])
+
+    def test_2d_scene_skips_occluders(self):
+        """遮挡剔除是 3D 的(LightOccluder2D 是给光影的,不是它)。"""
+        from BlenderGameKit import asset_export as ae
+        entries = ae.occluder_entries(
+            self._scene(self._Obj("墙", occluder=True), dimension="2"))
+        self.assertEqual(entries, [])
+
+    def test_project_setting_is_enabled(self):
+        """勾了遮挡体 -> project.godot 里的总开关被打开(默认是 false)。"""
+        from BlenderGameKit import asset_export as ae
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "project.godot")
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("config_version=5\n\n[application]\n\n"
+                             'config/name="x"\n\n[rendering]\n\n'
+                             'renderer/rendering_method="forward_plus"\n')
+            self.assertTrue(ae.ensure_occlusion_culling(folder))
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("occlusion_culling/use_occlusion_culling = true", text)
+            self.assertIn('renderer/rendering_method="forward_plus"', text)
+            # 已经开着了 -> 不再改(幂等,别每次导出都重写文件)
+            self.assertFalse(ae.ensure_occlusion_culling(folder))
+
+    def test_project_setting_without_rendering_section(self):
+        """project.godot 里没有 [rendering] 段时也要能写进去。"""
+        from BlenderGameKit import asset_export as ae
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "project.godot")
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("config_version=5\n\n[application]\n\n"
+                             'config/name="x"\n')
+            self.assertTrue(ae.ensure_occlusion_culling(folder))
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("[rendering]", text)
+            self.assertIn("occlusion_culling/use_occlusion_culling = true", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -5513,6 +5513,63 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)----
+    # 真 Blender 才能验:属性在真物体上,而且导出要落成 .tscn 节点 + 改
+    # project.godot。两条硬事实(都在真机标定过):
+    #   * 这次**可以**写进 .tscn(独立节点,不是 glb 实例内部的网格);
+    #   * 项目总开关默认 false —— 不打开的话节点一点都不会省。
+    try:
+        import shutil
+
+        r99_scene = bpy.context.scene
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        r99_obj = bpy.context.active_object
+        r99_obj.name = "遮挡体探针墙"
+        check("第九十九轮:物体有『遮挡体』属性",
+              hasattr(r99_obj.gk_physics, "render_occluder"))
+        check("第九十九轮:默认不勾(老场景行为不变)",
+              not r99_obj.gk_physics.render_occluder
+              and not asset_export.occluder_entries(r99_scene))
+
+        r99_obj.gk_physics.render_occluder = True
+        r99_entries = asset_export.occluder_entries(r99_scene)
+        check("第九十九轮:勾了 -> 出一条(尺寸取包围盒)", len(r99_entries) == 1,
+              str(r99_entries))
+        # 真几何的包围盒:1x1x1 的方块 -> Godot 轴序仍是 1x1x1(换轴不影响立方体)
+        if r99_entries:
+            r99_size = r99_entries[0]["size"]
+            check("第九十九轮:尺寸来自真几何的包围盒",
+                  all(abs(v - 1.0) < 0.01 for v in r99_size), str(r99_size))
+        r99_blocks, r99_nodes = asset_export.occluder_texts(r99_entries)
+        check("第九十九轮:生成 BoxOccluder3D + OccluderInstance3D 文本",
+              len(r99_blocks) == 1 and len(r99_nodes) == 1
+              and 'type="BoxOccluder3D"' in r99_blocks[0]
+              and 'type="OccluderInstance3D" parent="."' in r99_nodes[0])
+
+        # 真文件读写:总开关写进 project.godot(⚠ 默认是关的,不打开白导)
+        r99_dir = tempfile.mkdtemp(prefix="gk_occ_")
+        r99_project_path = os.path.join(r99_dir, "project.godot")
+        with open(r99_project_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("config_version=5\n\n[application]\n\n"
+                         'config/name="occ_probe"\n\n[rendering]\n\n'
+                         'renderer/rendering_method="forward_plus"\n')
+        check("第九十九轮:打开遮挡剔除总开关(改动过)",
+              asset_export.ensure_occlusion_culling(r99_dir) is True)
+        with open(r99_project_path, "r", encoding="utf-8") as handle:
+            r99_project = handle.read()
+        check("第九十九轮:总开关真的落到了 project.godot 里",
+              "occlusion_culling/use_occlusion_culling = true" in r99_project
+              and 'renderer/rendering_method="forward_plus"' in r99_project,
+              r99_project[:300])
+        check("第九十九轮:重复调用不再改文件(幂等)",
+              asset_export.ensure_occlusion_culling(r99_dir) is False)
+
+        bpy.data.objects.remove(r99_obj, do_unlink=True)
+        shutil.rmtree(r99_dir, ignore_errors=True)
+    except Exception as exc:
+        check("第九十九轮(遮挡体)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

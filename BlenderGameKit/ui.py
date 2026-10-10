@@ -3124,6 +3124,17 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
                           icon="CHECKMARK")
             col.prop(physics, "render_no_shadow",
                      text="不投阴影(小零件省阴影)")
+            # ── 遮挡体(第九十九轮:性能第三件)──────────────────────
+            # 勾上 = 这个物体挡住的东西不画(Godot 的 OccluderInstance3D)。
+            # ⚠ 每个遮挡体都有 CPU 开销 —— 小块物体勾了反而更慢,所以
+            #   面板上把"只给大块用"写在旁边,不让人瞎勾。
+            col.prop(physics, "render_occluder",
+                     text="遮挡体(挡住的东西不画)")
+            if physics.render_occluder:
+                col.label(text="只给大块的墙 / 建筑 / 地形用:每个遮挡体都有开销",
+                          icon="INFO")
+                col.label(text="尺寸按包围盒算,导出时会自动打开遮挡剔除开关",
+                          icon="INFO")
             # ── 寻路层(第八十五轮:寻路第三版③)──────────────────────
             # 这个物体烤进第几层的导航网格 —— 不同层的角色走不同的网格
             # (地面层 1 / 空中层 2),互不干扰。只在勾了『寻路』的场景里
