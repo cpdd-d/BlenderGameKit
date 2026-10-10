@@ -16,6 +16,17 @@
   * 追踪者每帧查 NavigationServer2D 的绕行路径 -> **从障碍两端绕过去**
     追到玩家(直线追只会一头顶在障碍上)。
 
+── 第八十二轮:2D 避障真机探针用的两对对撞车道 ────────────────────
+场地里还有四个人分成两对,从 x=±5 对走(终点是对方那头的小标记):
+
+  * **避障对**(避障甲 / 避障乙,y=+3):勾了『避障』—— NavigationAgent2D
+    的 RVO 让两人**互相绕开**,都走到终点;
+  * **对照对**(对照丙 / 对照丁,y=-3):同一套设置**不勾避障** ——
+    两人正对撞上就顶死在中点(证明"绕开"是避障干的,不是碰巧)。
+
+⚠ 终点标记用 **Area2D**:2D 烘焙只认 StaticBody2D,标记要是 StaticBody2D
+  就会被挖成障碍(终点变成不可达)。
+
 ── 2D 寻路的注意事项(和 3D 的唯一区别)──────────────────────────
 **2D 里碰撞体 = 障碍物**。所以给"墙 / 箱子 / 障碍"加碰撞体,给"地面 /
 地板"**不要**加(整块地板会被当成一个巨大的障碍挖掉) —— 俯视 2D 游戏
@@ -50,6 +61,16 @@ CHASE_SPEED = 3.0          # 追踪者速度(2D 单位/秒)
 NAV_RADIUS = 0.5           # 寻路代理半径(和角色半宽一致)
 CHASER_START = (0.0, 6.0)
 PLAYER_START = (0.0, -6.0)
+# ── 第八十二轮:2D 避障(AVOID)真机探针用的两对"对撞"车道 ────────────
+# 每对两个人从 x=±LANE_X 对走(终点是对方那头的小标记)。上面一对勾
+# 『避障』(NavigationAgent2D 的 RVO),下面一对**不勾** —— 探针拿两对
+# 做对照:勾了的那对要**互相绕开、都到达**;不勾的那对会**顶死在中点**。
+LANE_X = 5.0               # 车道两端(离中心 5 米)
+LANE_SPEED = 3.5           # 车道速度(比追踪者快一点,把探针窗口压短)
+LANE_STOP = 0.5            # 到点多近算到了
+AVOID_RADIUS = 0.6         # 避障半径(RVO 里"我占多大地方")
+AVOID_LANE_Y = 3.0         # 勾避障那对的车道
+PLAIN_LANE_Y = -3.0        # 不勾避障(对照)那对的车道
 
 
 def log(message):
@@ -119,15 +140,38 @@ def build_scene():
     player = make_box(PLAYER, (1.0, 1.0, 1.0),
                       (PLAYER_START[0], PLAYER_START[1], 0.0),
                       (0.4, 0.65, 0.9, 1.0))
+    # ── 第八十二轮:两对对撞的人 + 四个小终点标记 ──────────────────
+    # 标记给 **Area2D** 是有意的:2D 烘焙只认 StaticBody2D(见环境脚本),
+    # 但标记要是 StaticBody2D 就会被挖成障碍 —— 改用 Area2D 就既不挡路、
+    # 也不进烘焙,只提供"终点坐标"。
+    avoid_color = (0.9, 0.75, 0.3, 1.0)
+    plain_color = (0.55, 0.6, 0.7, 1.0)
+    marker_color = (0.45, 0.9, 0.5, 1.0)
+    lanes = {}
+    for left, right, goal_left, goal_right, y, color in (
+            ("避障甲", "避障乙", "终点甲", "终点乙",
+             AVOID_LANE_Y, avoid_color),
+            ("对照丙", "对照丁", "终点丙", "终点丁",
+             PLAIN_LANE_Y, plain_color)):
+        lanes[left] = make_box(left, (1.0, 1.0, 1.0), (-LANE_X, y, 0.0), color)
+        lanes[right] = make_box(right, (1.0, 1.0, 1.0), (LANE_X, y, 0.0), color)
+        lanes[goal_left] = make_box(goal_left, (0.6, 0.6, 1.0),
+                                    (LANE_X, y, 0.0), marker_color)
+        lanes[goal_right] = make_box(goal_right, (0.6, 0.6, 1.0),
+                                     (-LANE_X, y, 0.0), marker_color)
+    log(f"对撞车道:避障对 y={AVOID_LANE_Y:g}(甲/乙) / "
+        f"对照对 y={PLAIN_LANE_Y:g}(丙/丁);两端 x=±{LANE_X:g}")
     log(f"场景:场地 {ARENA_HALF_X * 2:.0f}x{ARENA_HALF_Y * 2:.0f} / "
         f"中间障碍 {OBSTACLE_HALF * 2:.0f} 米宽 / "
         f"追踪者 {CHASER_START} 追玩家 {PLAYER_START}")
-    return scene, chaser, player
+    return scene, chaser, player, lanes
 
 
-def write_physics(scene, chaser, player):
+def write_physics(scene, chaser, player, lanes):
     """2D 物理:墙/障碍 = StaticBody2D(会被烤成导航障碍);
-    追踪者 = CharacterBody2D(挂脚本);玩家 = CharacterBody2D(不参与烘焙)。"""
+    追踪者 = CharacterBody2D(挂脚本);玩家 = CharacterBody2D(不参与烘焙);
+    对撞的人 = CharacterBody2D(不挂脚本,由同一张图按名字驱动);
+    终点标记 = Area2D(只提供坐标,不挡路也不进烘焙)。"""
     for obj in scene.objects:
         physics = getattr(obj, "gk_physics", None)
         if physics is None:
@@ -144,6 +188,11 @@ def write_physics(scene, chaser, player):
         elif obj is player:
             physics.body_type = "CharacterBody2D"
             log("玩家:CharacterBody2D(静止目标;不参与导航烘焙)")
+        elif obj.name in lanes:
+            if obj.name.startswith("终点"):
+                physics.body_type = "Area2D"
+            else:
+                physics.body_type = "CharacterBody2D"
         elif getattr(obj, "type", "") == "MESH":
             physics.body_type = "StaticBody2D"
 
@@ -160,7 +209,26 @@ def build_graph(scene):
                  gk_target=CHASER, gk_goal=PLAYER, gk_speed=CHASE_SPEED,
                  gk_stop_distance=1.0, gk_turn=True)
     _link(tree, physics, "执行", chase, "执行")
-    log("图:『每当_物理帧』->『移动_寻路』(追踪者追玩家)已接好")
+    # ── 第八十二轮:两对对撞的车道 ──────────────────────────────────
+    # 同一张图、同一个脚本驱动四个人:『目标』按名字选到谁就动谁。
+    # 上面一对勾『避障』(RVO 互相绕开),下面一对不勾(对照:会顶死)。
+    lane_nodes = []
+    y = -260.0
+    for name, goal, avoid in (
+            ("避障甲", "终点甲", True), ("避障乙", "终点乙", True),
+            ("对照丙", "终点丙", False), ("对照丁", "终点丁", False)):
+        node = _add(tree, "GKNodeNavigate", f"{name}走", 520.0, y,
+                    gk_target=name, gk_goal=goal, gk_speed=LANE_SPEED,
+                    gk_stop_distance=LANE_STOP, gk_turn=True,
+                    gk_avoid=avoid, gk_avoid_radius=AVOID_RADIUS)
+        lane_nodes.append(node)
+        y -= 140.0
+    previous = chase
+    for node in lane_nodes:
+        _link(tree, previous, "完成", node, "执行")
+        previous = node
+    log("图:『每当_物理帧』->『移动_寻路』(追踪者追玩家) -> "
+        "对撞车道(避障甲 / 避障乙 / 对照丙 / 对照丁)已接好")
     return tree
 
 
@@ -193,8 +261,8 @@ def main():
     from BlenderGameKit import asset_export, project
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    scene, chaser, player = build_scene()
-    write_physics(scene, chaser, player)
+    scene, chaser, player, lanes = build_scene()
+    write_physics(scene, chaser, player, lanes)
     build_graph(scene)
     # ── 2D + 寻路(第三十六轮)──────────────────────────────────────
     # dimension=2:导出成 NavigationRegion2D + NavigationPolygon;

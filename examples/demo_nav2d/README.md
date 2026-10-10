@@ -11,6 +11,21 @@
 * 追踪者每帧查 NavigationServer2D 的绕行路径 → **从障碍两端绕过去**追到玩家
   (直线追只会一头顶在障碍上)。
 
+## 避障(第八十二轮:两对对撞的人)
+
+场地里还有四个人分成**两对**,从 x=±5 对走(终点是对方那头的小绿标记):
+
+| 车道 | 谁 | 勾了『避障』吗 | 现象 |
+|---|---|---|---|
+| y=+3 | 避障甲 / 避障乙 | **勾了** | 快撞上时各自侧移让开(最小间距 1.2 米 = 2×避障半径),**两个都到达** |
+| y=-3 | 对照丙 / 对照丁 | **没勾** | 正对撞上就**顶死在中点**(间距 1.0 = 两个方块贴住),谁也没到 |
+
+> 两对是同一张图、同一个脚本驱动的(『移动_寻路』的『目标』按名字选到谁就动谁);
+> 『避障』= NavigationAgent2D 的 RVO —— 勾上后每帧把"期望速度"交给引擎,
+> 由它算一个**不会撞上邻居**的安全速度再移动。
+> ⚠ 终点标记故意用 **Area2D**:2D 烘焙只认 StaticBody2D,标记要是 StaticBody2D
+> 就会被挖成障碍(终点变不可达)。
+
 ## ⚠ 2D 寻路的唯一注意事项
 
 **2D 里碰撞体 = 障碍物**。所以:
@@ -22,7 +37,7 @@
 ## 自动检查 / 重建
 
 ```powershell
-python scripts\check_nav2d_demo.py      # 探针(要 Godot):追踪者真的绕过障碍追到人
+python scripts\check_nav2d_demo.py      # 探针(要 Godot):追踪者真的绕过障碍追到人 + 避障两对对照
 blender -b --gpu-backend vulkan --python scripts\make_nav2d_demo.py   # 重建 .blend + 工程
 ```
 
@@ -34,4 +49,4 @@ blender -b --gpu-backend vulkan --python scripts\make_nav2d_demo.py   # 重建 .
 > 想自己控镜头:在 Blender 里放一台相机并设为视口当前相机(小键盘 0)。
 >
 > 3D 寻路的现场在 `examples\demo_physics`(『绕墙追击』『群追避障』『门升起重烤』工位);
-> 多层 / 避障 / 区域代价还是待办(见 docs\待办清单.md)。
+> 多层导航 / `NavigationObstacle` / 区域代价还是待办(见 docs\待办清单.md)。
