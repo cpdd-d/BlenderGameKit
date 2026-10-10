@@ -4611,6 +4611,102 @@ def main():
         check("第八十四轮(区域代价 泥地/危险区)", False,
               f"{type(exc).__name__}: {exc}")
 
+    # ---- 第八十五轮(H 组 22③):多层导航(不同层走不同网格)------------
+    # 物体『游戏物理』的『寻路层』把静态几何分成几层:导出时每层一块
+    # NavigationRegion,各自按 Godot group"只烤本组几何"(group 写在
+    # **节点头**里 —— 写成属性行 Godot 会丢掉整个节点,实测)。
+    # 『移动_寻路』/『AI_状态』的『走哪层』决定查哪一层。
+    # 没用多层的老场景一个字都不多。
+    try:
+        import shutil
+        asset_export = import_module(f"{module_name}.asset_export")
+        r85_work = os.path.join(tempfile.gettempdir(), "gk_navlayers85")
+        shutil.rmtree(r85_work, ignore_errors=True)
+        os.makedirs(r85_work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 1.0))
+        r85_l2 = bpy.context.active_object
+        r85_l2.name = "空中平台"
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(8.0, 0.0, 1.0))
+        r85_l1 = bpy.context.active_object
+        r85_l1.name = "地面"
+        r85_settings = getattr(bpy.context.scene, "gk_settings", None)
+        if r85_settings is not None:
+            r85_settings.nav_enabled = True
+        bpy.context.view_layer.update()
+        check("寻路层:属性在物理面板上(默认第 1 层)",
+              hasattr(r85_l1.gk_physics, "nav_layer")
+              and str(r85_l1.gk_physics.nav_layer) == "1",
+              f"{getattr(r85_l1.gk_physics, 'nav_layer', '<no prop>')}")
+        r85_l2.gk_physics.nav_layer = "2"
+        check("寻路层:纯函数(层号 / 掩码 / 分组头)",
+              asset_export.nav_layer_of(r85_l1.gk_physics) == 1
+              and asset_export.nav_layer_of(r85_l2.gk_physics) == 2
+              and asset_export.nav_layer_mask(2) == 2
+              and asset_export.nav_group_header(
+                  r85_l2.gk_physics, True) == ' groups=["gk_nav_layer_2"]'
+              and asset_export.nav_region_names(bpy.context.scene)
+              == [(1, "Navigation"), (2, "Navigation_2")],
+              f"extra={asset_export.nav_extra_layers(bpy.context.scene)}")
+        check("寻路层:清单只算用了多层的场景 / 层 2 才算多层",
+              asset_export.nav_layers_active(bpy.context.scene)
+              and asset_export.nav_extra_layers(bpy.context.scene) == [2])
+
+        # ── 面板 draw:选了层 2 的物体也要画得完 ──────────────────────
+        r85_draw_error = ""
+        try:
+            r85_panel = import_module(f"{module_name}.ui").GK_PT_ObjectPhysics
+            r85_layout = _R79Layout()
+            r85_holder = type("P", (), {"layout": r85_layout})()
+            r85_ctx = type("C", (), {"object": r85_l2,
+                                     "scene": bpy.context.scene})()
+            r85_panel.draw(r85_holder, r85_ctx)
+        except Exception as exc:                       # noqa: BLE001
+            r85_draw_error = f"{type(exc).__name__}: {exc}"
+        check("第八十五轮:『游戏物理』面板(寻路层)画得完",
+              not r85_draw_error, r85_draw_error)
+
+        # ── 真导出:两块导航区 + groups 写在节点头 + 子资源按组烤 ──────
+        asset_export.export_scene_glb(r85_work, "World")
+        r85_path, _r85_n = asset_export.write_world_scene(
+            r85_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r85_path, encoding="utf-8") as r85_handle:
+            r85_text = r85_handle.read()
+        check("多层导航:导出两块网格(层 1 + 层 2)+ 层 2 带 navigation_layers",
+              '[node name="Navigation" type="NavigationRegion3D"' in r85_text
+              and '[node name="Navigation_2" type="NavigationRegion3D"' in r85_text
+              and r85_text.count("navigation_layers = 2") == 1
+              and 'id="gk_navmesh_2"' in r85_text
+              and "geometry_source_geometry_mode = 1" in r85_text
+              and 'geometry_source_group_name = "gk_nav_layer_2"' in r85_text,
+              r85_text[-260:])
+        check("多层导航:groups 写在**节点头**里(属性行会丢节点)",
+              'type="StaticBody3D" parent="Colliders" '
+              'groups=["gk_nav_layer_2"]' in r85_text
+              and 'type="StaticBody3D" parent="Colliders" '
+              'groups=["gk_nav_layer_1"]' in r85_text
+              and "\ngroups = " not in r85_text,
+              r85_text[-260:])
+
+        # ── 老场景回归锁:把层 2 改回第 1 层 -> 只剩一块、一个字不多 ────
+        r85_l2.gk_physics.nav_layer = "1"
+        r85_path2, _r85_n2 = asset_export.write_world_scene(
+            r85_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r85_path2, encoding="utf-8") as r85_handle2:
+            r85_text2 = r85_handle2.read()
+        check("多层导航:全是第 1 层时退回老样子(一块网格 / 没有 groups)",
+              not asset_export.nav_layers_active(bpy.context.scene)
+              and r85_text2.count("NavigationRegion3D") == 1
+              and "navigation_layers" not in r85_text2
+              and "groups" not in r85_text2
+              and "geometry_source_geometry_mode" not in r85_text2,
+              r85_text2[-260:])
+    except Exception as exc:
+        check("第八十五轮(多层导航)", False,
+              f"{type(exc).__name__}: {exc}")
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

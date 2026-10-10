@@ -92,7 +92,7 @@ def _ai_enter_on_entry(state):
 
 
 def _emit_patrol_waypoints(ctx, indent, self_expr, reader, stop, speed, facing,
-                           points, index_var, dir_var):
+                           points, index_var, dir_var, nav_layers=None):
     """三点以上的巡逻:按**填了的点**往返走(第七十八轮)。
 
     A→B→C→D 然后 D→C→B→A。当前第几个点 + 往前往后各占一个成员变量 ——
@@ -114,7 +114,7 @@ def _emit_patrol_waypoints(ctx, indent, self_expr, reader, stop, speed, facing,
         ctx.add_line(indent + 1, f"{goal_at} = {reader}({point})")
     ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
     # 巡逻同样绕障碍(和两点那条一样)
-    walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
+    walk = _walk_direction(ctx, indent, self_expr, goal_at, diff, nav_layers)
     ctx.add_line(indent, f"if {diff}.length() <= {stop}:")
     # 到两头的边界就掉头,其余沿当前方向继续 —— 于是 A→B→C→D→C→B→A
     ctx.add_line(indent + 1, f"if {index_var} >= {last}:")
@@ -191,7 +191,7 @@ def _nav_dir_helper(ctx):
         f"        return {vector}.ZERO",
         f"    var here := {reader}(body)",
         f"    var path := {server}.map_get_path(body.{world}().navigation_map, "
-        f"here, goal, true)",
+        f"here, goal, true, layers)",
         f"    var step: {vector} = {vector}.ZERO",
         "    # ── 从第 1 个点往后找**第一个真的在别处的点**────────────────",
         "    # 不能只看 path[1]:第 0 个点是『离自己最近的网格点』,当自己正好",
@@ -214,7 +214,8 @@ def _nav_dir_helper(ctx):
         "    return direct.normalized()",
     ]
     ctx.extra_sections.append({
-        "signature": f"func {name}(host: Node, goal: {vector}) -> {vector}:",
+        "signature": f"func {name}(host: Node, goal: {vector}, "
+                     f"layers: int = 1) -> {vector}:",
         "lines": lines,
         "empty_body": f"    return {vector}.ZERO",
         "separator": True,
@@ -223,17 +224,33 @@ def _nav_dir_helper(ctx):
     return name
 
 
-def _walk_direction(ctx, indent, self_expr, goal_at, diff):
+def _ai_nav_layers(state):
+    """这个 AI 状态『走哪层』-> 层掩码(默认 1)。
+
+    多层导航(第八十五轮):和物体『寻路层』/『移动_寻路』的『走哪层』
+    同一套口径 —— 生成的掩码就交给 `_gk_ai_nav_dir` 的第 3 个参数。
+    """
+    from .statements import nav_layer_mask_of
+    return nav_layer_mask_of(state)
+
+
+def _walk_direction(ctx, indent, self_expr, goal_at, diff, layers=None):
     """这个行为**这一帧朝哪走** —— 返回一个 GDScript 表达式字符串。
 
     场景勾了『寻路』-> 走导航网格算出来的方向(AI 绕开障碍);
     没勾 -> 直线方向,生成的代码和以前**逐字一样**。
+
+    `layers`(第八十五轮:多层导航)= 这个状态的『走哪层』掩码。
+    第 1 层(默认)不带参数 —— 老图的调用点一个字都不变,只有那个公共
+    helper 的签名多了个默认形参(行为完全一样)。
     """
     if not bool(getattr(ctx, "nav_enabled", False)):
         return f"{diff}.normalized()"
     helper = _nav_dir_helper(ctx)
     direction = ctx.new_temp("ai_dir")
-    ctx.add_line(indent, f"var {direction} := {helper}({self_expr}, {goal_at})")
+    extra = f", {layers}" if layers and int(layers) != 1 else ""
+    ctx.add_line(indent,
+                 f"var {direction} := {helper}({self_expr}, {goal_at}{extra})")
     return direction
 
 
@@ -360,6 +377,8 @@ def _emit_ai_behavior(ctx, indent, machine, state):
     facing = str(getattr(state, "gk_facing", "GOAL") or "GOAL")
     speed = gd_number(float(getattr(state, "gk_speed", 3.0) or 0.0))
     stop = gd_number(float(getattr(state, "gk_stop_distance", 0.6) or 0.0))
+    # 多层导航(第八十五轮):这个状态走哪一层的网格(默认第 1 层)
+    nav_layers = _ai_nav_layers(state)
 
     if behavior == "STAND":
         _stop_and_slide(ctx, indent, self_expr)
@@ -381,7 +400,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
         ctx.add_line(indent, f"var {dist} := {diff}.length()")
         # 走法:勾了『寻路』就绕开障碍,没勾就是直线(见 _walk_direction)
-        walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
+        walk = _walk_direction(ctx, indent, self_expr, goal_at, diff, nav_layers)
         ctx.add_line(indent, f"if {dist} > {stop}:")
         ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
         ctx.add_line(indent, "else:")
@@ -465,7 +484,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
                 f"var {flee_goal} := {here} + {away}.normalized() "
                 f"* {gd_number(flee_distance)}")
             walk = _walk_direction(ctx, indent, self_expr, flee_goal,
-                                   f"({flee_goal} - {here})")
+                                   f"({flee_goal} - {here})", nav_layers)
             ctx.add_line(indent, f"if {dist} <= {stop}:")
             # 威胁和自己几乎重合时"反方向"不存在,别让 NaN / 零向量抖
             ctx.add_line(indent + 1, f"if {dist} < 0.001:")
@@ -504,7 +523,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         # 新噪音先关门(done=false):赶路这几秒里『安静下来』不许成立
         _emit_investigate_reset(ctx, inner, machine, at_var, now_var)
         # 噪音点是个**坐标**(不是一个物体),同样能走导航网格
-        walk = _walk_direction(ctx, inner, self_expr, pos_var, diff)
+        walk = _walk_direction(ctx, inner, self_expr, pos_var, diff, nav_layers)
         ctx.add_line(inner, f"if {dist} > {stop}:")
         ctx.add_line(inner + 1, f"{self_expr}.velocity = {walk} * {speed}")
         # 赶路时看着噪音点;到点后**环顾的朝向由环顾代码自己管**,
@@ -536,7 +555,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
             ctx, indent, self_expr, reader, stop, speed, facing,
             [point for point in (point_a, point_b) if point is not None]
             + extra_points,
-            wp_index, machine.get("wp_dir"))
+            wp_index, machine.get("wp_dir"), nav_layers)
         return
     flip = machine.get("flip")
     here = ctx.new_temp("ai_here")
@@ -552,7 +571,7 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(indent, f"var {goal_at} := {reader}({point_a})")
     ctx.add_line(indent, f"var {diff} := {goal_at} - {here}")
     # 巡逻同样绕障碍 —— 巡逻路线穿过一堵墙是最常见的"看起来像卡住了"
-    walk = _walk_direction(ctx, indent, self_expr, goal_at, diff)
+    walk = _walk_direction(ctx, indent, self_expr, goal_at, diff, nav_layers)
     ctx.add_line(indent, f"if {diff}.length() <= {stop}:")
     if point_b is not None and flip:
         ctx.add_line(indent + 1, f"{flip} = not {flip}")

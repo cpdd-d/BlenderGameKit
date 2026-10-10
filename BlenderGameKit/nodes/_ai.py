@@ -125,6 +125,15 @@ class GKNodeAiState(B.GKStatementNode):
         ("gk_look_time", "float", 2.0, "环顾秒数",
          "『去查看』环顾多久;期间『安静下来』不成立,看完才回岗(默认 2 秒)"),
         ("gk_facing", "enum", "GOAL", "朝向", "走路时头朝哪", AI_FACINGS),
+        # 走哪层(第八十五轮:多层导航)—— 和『移动_寻路』的『走哪层』
+        # 同一个意思:用第几层的导航网格找路(物体『寻路层』分出来的)。
+        ("gk_nav_layer", "enum", "1", "走哪层",
+         "用第几层的导航网格(和物体『寻路层』对应)", (
+             ("1", "第1层", "默认"),
+             ("2", "第2层", ""),
+             ("3", "第3层", ""),
+             ("4", "第4层", ""),
+         )),
         # 入口数量:Blender 一个输入引脚只允许一条连线 ——
         # "巡逻"被好几条转场指着时要多开几个入口(和『动画_状态』同一个做法)
         ("gk_in_count", "int", 2, "入口数量",
@@ -176,6 +185,9 @@ class GKNodeAiState(B.GKStatementNode):
             row.prop(self, "gk_speed", text="速度")
             row.prop(self, "gk_stop_distance", text="停距")
             layout.prop(self, "gk_facing", text="")
+            # 走哪层(第八十五轮:多层导航)—— 场景把静态几何分成几层网格
+            # 时才需要改;默认第 1 层(老图一个字都不变)。
+            layout.prop(self, "gk_nav_layer", text="走哪层")
         if behavior == "ATTACK":
             row = layout.row(align=True)
             row.prop(self, "gk_attack_range", text="攻击距离")

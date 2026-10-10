@@ -29,6 +29,11 @@
     - 对照车道(没有泥地)**一路直走**完(偏离 ≤0.3)—— 证明"绕开"
       是泥地干的;
     - 从车道起点到**泥地中心**的路径可达(代价区该是"贵",不是"墙")。
+  * **多层导航(第八十五轮)**:场景里有**两块**导航网格(层 1 = 场地,
+    层 2 = 场地外那条走廊);两个人走同一段路去同一个终点:
+    - 走**第 2 层**的那个人到得了(它的网格就是这条走廊);
+    - 走**第 1 层**的那个人到不了(层 1 的网格是里面那块场地,
+      根本不含这条走廊)—— 这一条就是"分层"在起作用的证据。
 """
 
 import argparse
@@ -90,6 +95,20 @@ var ctrl_goal: Node2D = null
 var dev_mud := 0.0            # 泥地车道最大横向偏离(绕行证据)
 var dev_ctrl := 0.0           # 对照车道最大横向偏离(该≈0)
 var mud_entered := false      # 泥地甲有没有一脚踩进泥地
+# ── 第八十五轮:多层导航(层 2 走廊)────────────────────────────────
+var layer_mode := false        # 代价车道跑完切到"多层车道"
+var layer_at := 0.0
+var layer_tick := -1
+var l2_walker: CharacterBody2D = null   # 层2甲(走第 2 层)
+var l1_walker: CharacterBody2D = null   # 层1乙(走第 1 层,该到不了)
+var l2_goal: Node2D = null
+var l2_arrived := false
+var l1_arrived := false
+var regions_found := 0         # 场景里几块导航网格(该是 2)
+const L2_START := Vector2(18.0, 0.0)
+const L2_START_B := Vector2(18.0, 3.0)
+const LAYER_WINDOW := 6.0      # 多层车道实验窗口(秒)
+const LAYER_PARK := Vector2(0.0, 60.0)   # 前几段先"按住"这两个人的地方
 const LANE_X := 5.0
 const AVOID_Y := 3.0
 const PLAIN_Y := -3.0
@@ -127,17 +146,28 @@ func _ready() -> void:
 	ctrl_walker = _body("对照戊")
 	mud_goal = _node2d("终点戊")
 	ctrl_goal = _node2d("终点己")
+	l2_walker = _body("层2甲")
+	l1_walker = _body("层1乙")
+	l2_goal = _node2d("终点层2")
 	var regions := world.find_children("Navigation", "NavigationRegion2D", true, false)
 	if not regions.is_empty():
 		var poly := (regions[0] as NavigationRegion2D).navigation_polygon
 		if poly != null:
 			polys = poly.get_polygon_count()
+	# 多层导航(第八十五轮):场景里该有**两块**导航网格(层 1 / 层 2)
+	for node in world.find_children("Navigation*", "NavigationRegion2D", true, false):
+		regions_found += 1
 	print("NAV2D_GAME chaser=", chaser != null, " player=", player != null,
 		" polys=", polys, " lanes=",
 		avoid_a != null and avoid_b != null and plain_c != null
 		and plain_d != null, " mud=",
 		mud_walker != null and ctrl_walker != null
-		and mud_goal != null and ctrl_goal != null)
+		and mud_goal != null and ctrl_goal != null, " layers=",
+		regions_found, " layer_walkers=",
+		l2_walker != null and l1_walker != null and l2_goal != null)
+	# 多层那两个人:前几段先按在远处 —— 走层 1 的那个会把路径吸附回
+	# 场地里,可能撞到实验里的人(这俩人只服务最后一段)。
+	_park_layer_walkers()
 	# 诊断:等地图同步后直接查一条"从追踪者到玩家"的路径 ——
 	# 追踪者走直线(= 拿不到路径)时,这行能分清"网格没同步"还是"别的"。
 	_path_probe.call_deferred()
@@ -208,6 +238,13 @@ func _physics_process(delta: float) -> void:
 		if elapsed - mud_at >= MUD_WINDOW:
 			_mud_finish()
 		return
+	if layer_mode:
+		_layer_sample()
+		if elapsed - layer_at >= LAYER_WINDOW:
+			_layer_finish()
+		return
+	# 还没轮到多层那段:把两个人按在远处,别让走层 1 的那个溜进场地
+	_park_layer_walkers()
 	_lane_chase(delta)
 
 
@@ -246,6 +283,7 @@ func _lane_chase(_delta: float) -> void:
 ## ── 第二段:避障车道实验(第八十二轮)─────────────────────────────
 ## 把追踪者/玩家挪到远角(别再横穿车道),四个人回出发点重新对走。
 func _lane_setup() -> void:
+	_park_layer_walkers()      # 多层那两个人这一路都先按在远处
 	if chaser != null:
 		chaser.global_position = Vector2(-10.5, 6.5)
 		chaser.velocity = Vector2.ZERO
@@ -360,6 +398,7 @@ func _lane_finish() -> void:
 ## 追人那对已经被 _lane_setup 挪到远角,正好给这两条车道腾地方
 ## (对照车道 y=-7.5 就从"小玩家原站位"(0,-6)旁边过 —— 玩家挪走了才干净)。
 func _mud_setup() -> void:
+	_park_layer_walkers()
 	_lane_reset(mud_walker, MUD_START)
 	_lane_reset(ctrl_walker, MUD_CTRL_START)
 	dev_mud = 0.0
@@ -416,6 +455,7 @@ func _mud_sample() -> void:
 
 
 func _mud_finish() -> void:
+	mud_mode = false       # ⚠ 先关掉:不然窗口到了之后每帧都会重进这里
 	var got_mud := _lane_reached(mud_walker, mud_goal)
 	var got_ctrl := _lane_reached(ctrl_walker, ctrl_goal)
 	# 泥地车道:到达 + 绕开(横向偏离 ≥1)+ 一脚没踩进泥地
@@ -426,6 +466,66 @@ func _mud_finish() -> void:
 		" dev=", "%.2f" % dev_mud, " entered=", mud_entered)
 	print("NAV2D_MUD_CTRL ok=", ok_ctrl, " arrived=", got_ctrl,
 		" dev=", "%.2f" % dev_ctrl)
+	# ── 第八十五轮:切到"多层车道"实验(层 2 走廊)─────────────────
+	_layer_setup()
+
+
+## ── 第四段:多层导航实验(第八十五轮)────────────────────────────
+## 同一条走廊、同一个终点,两个人只差『走哪层』:
+##   层2甲 走第 2 层 -> 该到得了(层 2 的网格就是这条走廊);
+##   层1乙 走第 1 层 -> 该**到不了**(层 1 的网格是里面那块场地。
+##   注意它不会"钻进去" —— Godot 会把查询点吸附到层 1 最近的网格上,
+##   于是它往场地那头走,永远走不到这条走廊的终点)。
+func _park_layer_walkers() -> void:
+	if l2_walker != null:
+		l2_walker.global_position = LAYER_PARK
+		l2_walker.velocity = Vector2.ZERO
+	if l1_walker != null:
+		l1_walker.global_position = LAYER_PARK + Vector2(2.0, 0.0)
+		l1_walker.velocity = Vector2.ZERO
+
+
+func _layer_setup() -> void:
+	_park_layer_walkers()
+	if l2_walker != null:
+		l2_walker.global_position = L2_START
+	if l1_walker != null:
+		l1_walker.global_position = L2_START_B
+	l2_arrived = false
+	l1_arrived = false
+	layer_mode = true
+	layer_at = elapsed
+	print("NAV2D_LAYER_START t=", "%.2f" % elapsed,
+		" regions=", regions_found)
+
+
+func _layer_sample() -> void:
+	if l2_walker != null and l2_goal != null:
+		if l2_walker.global_position.distance_to(l2_goal.global_position) <= 0.9:
+			l2_arrived = true
+	if l1_walker != null and l2_goal != null:
+		if l1_walker.global_position.distance_to(l2_goal.global_position) <= 0.9:
+			l1_arrived = true
+	var tick := int((elapsed - layer_at) / 1.0)
+	if tick != layer_tick:
+		layer_tick = tick
+		var text2 := "l2=<none>"
+		if l2_walker != null:
+			text2 = "l2=(%.1f,%.1f)" % [
+				l2_walker.global_position.x, l2_walker.global_position.y]
+		var text1 := "l1=<none>"
+		if l1_walker != null:
+			text1 = "l1=(%.1f,%.1f)" % [
+				l1_walker.global_position.x, l1_walker.global_position.y]
+		print("NAV2D_LAYER_T t=%.1f " % (elapsed - layer_at), text2, " ", text1)
+
+
+func _layer_finish() -> void:
+	layer_mode = false
+	# 走层 2 的到得了;走层 1 的到不了(层 1 的网格不含这条走廊)
+	var ok_layer: bool = l2_arrived and not l1_arrived and regions_found >= 2
+	print("NAV2D_LAYER ok=", ok_layer, " layer2_arrived=", l2_arrived,
+		" layer1_arrived=", l1_arrived, " regions=", regions_found)
 	print("NAV2D_DONE")
 	done = true
 	# ── 内置 ESC 退出(第三十九轮)────────────────────────────────
@@ -482,9 +582,10 @@ def run_godot(godot):
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     run = subprocess.run([godot, "--headless", "--path", OUT,
-                          # 12 秒追人 + 5.5 秒避障车道 + 6 秒代价车道 + Esc 收尾;
+                          # 12 秒追人 + 5.5 秒避障车道 + 6 秒代价车道
+                          # + 6 秒多层车道 + Esc 收尾;
                           # 无头下主循环比物理快,给足余量
-                          "--quit-after", "31000"],
+                          "--quit-after", "37000"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -520,6 +621,14 @@ def main():
         ok = False
     if "mud=true" not in text:
         print("✗ 代价车道那两个人 / 终点标记没找齐(第八十四轮的示例没重建?):",
+              [line for line in text.splitlines() if "NAV2D_GAME" in line])
+        ok = False
+    if "layers=2" not in text:
+        print("✗ 导航网格不是两块(第八十五轮多层导航:场景里该有层1/层2 两块):",
+              [line for line in text.splitlines() if "NAV2D_GAME" in line])
+        ok = False
+    if "layer_walkers=true" not in text:
+        print("✗ 多层车道那两个人 / 终点没找齐(第八十五轮的示例没重建?):",
               [line for line in text.splitlines() if "NAV2D_GAME" in line])
         ok = False
     if not re.search(r"NAV2D ok=true", text):

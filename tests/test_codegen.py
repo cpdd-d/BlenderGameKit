@@ -14044,8 +14044,10 @@ class TestRound63AiPathfinding(Base):
         code, warnings = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
         self.assertEqual(warnings, [], warnings)
         # 顶层 helper 只生成一份
-        self.assertIn("func _gk_ai_nav_dir(host: Node, goal: Vector3) -> Vector3:",
-                      code)
+        # ⚠ 第八十五轮(多层导航)给签名加了个**默认形参** `layers: int = 1`
+        #   (调用点不填就是老行为;见 TestRound85NavLayers)。
+        self.assertIn("func _gk_ai_nav_dir(host: Node, goal: Vector3, "
+                      "layers: int = 1) -> Vector3:", code)
         self.assertEqual(code.count("func _gk_ai_nav_dir("), 1)
         # 真去问导航服务器要路径,并**跳过退化点**找下一个路点
         # (只看 path[1] 会在"自己正站在拐角上"时退回直线 -> 卡墙角)
@@ -14063,8 +14065,8 @@ class TestRound63AiPathfinding(Base):
         ai = self._ai_tree()
         tree, _state = self._with_chase(ai)
         code, _ = self._gen_with_ai(ai, tree, dict(V2, nav_enabled=True))
-        self.assertIn("func _gk_ai_nav_dir(host: Node, goal: Vector2) -> Vector2:",
-                      code)
+        self.assertIn("func _gk_ai_nav_dir(host: Node, goal: Vector2, "
+                      "layers: int = 1) -> Vector2:", code)
         self.assertIn("NavigationServer2D.map_get_path(", code)
         self.assertIn("body.get_world_2d().navigation_map", code)
         # 2D 没有"高度"这回事,不压平
@@ -16791,6 +16793,201 @@ class TestRound84NavCost(Base):
         from BlenderGameKit import properties
         names = set(getattr(properties.GKObjectSettings, "__annotations__", {}))
         self.assertIn("nav_travel_cost", names)
+
+
+class TestRound85NavLayers(Base):
+    """第八十五轮(H 组 22③):多层导航 —— 不同层的角色走**不同的导航网格**。
+
+    ── 机制(真 Godot spike 定下)────────────────────────────────────
+    Godot 的 `NavigationMesh` / `NavigationPolygon` 有
+    `source_geometry_mode = GROUPS_WITH_CHILDREN`:烘焙时**只解析"在某个
+    Godot group 里的节点及其子节点"**。于是导出侧只要:
+      * 每个碰撞体按『寻路层』写进 `gk_nav_layer_N` 组;
+      * 每层一块 NavigationRegion(层 1 = `Navigation`,层 2 = `Navigation_2`),
+        各自网格子资源指向自己的组、`navigation_layers = 1 << (N-1)`;
+      * agent 查询带层掩码 `map_get_path(..., true, mask)`。
+    **不用挪碰撞体节点** —— 挪了会牵连材质挂载 / 动态障碍父路径 /
+    碰撞块合并一大片(所以选 group 模式)。
+
+    ── 老图契约 ────────────────────────────────────────────────────
+    没用到多层的老场景:`groups` / `navigation_layers` / `map_get_path`
+    的第 5 个参数**一个字都不写**(逐字不变)—— 唯一必然变化的是 AI 那个
+    公共 helper 的签名加了默认形参 `layers: int = 1`(行为和以前完全一样)。
+    """
+
+    def _physics(self, **props):
+        return types.SimpleNamespace(**props)
+
+    def _scene(self, layers, nav=True):
+        objs = []
+        for index, layer in enumerate(layers):
+            objs.append(types.SimpleNamespace(
+                type="MESH", name=f"物{index}",
+                gk_physics=types.SimpleNamespace(nav_layer=layer)))
+        return types.SimpleNamespace(
+            objects=objs,
+            gk_settings=types.SimpleNamespace(nav_enabled=nav))
+
+    def test_layer_of_default_and_clamp(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.nav_layer_of(None), 1)
+        self.assertEqual(ae.nav_layer_of(self._physics()), 1)
+        self.assertEqual(ae.nav_layer_of(self._physics(nav_layer=2)), 2)
+        self.assertEqual(ae.nav_layer_of(self._physics(nav_layer=4)), 4)
+        # 越界钳住:0 / 负数 -> 第 1 层;太大 -> 第 4 层
+        self.assertEqual(ae.nav_layer_of(self._physics(nav_layer=0)), 1)
+        self.assertEqual(ae.nav_layer_of(self._physics(nav_layer=-3)), 1)
+        self.assertEqual(ae.nav_layer_of(self._physics(nav_layer=9)), 4)
+
+    def test_layer_mask(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.nav_layer_mask(1), 1)
+        self.assertEqual(ae.nav_layer_mask(2), 2)
+        self.assertEqual(ae.nav_layer_mask(3), 4)
+        self.assertEqual(ae.nav_layer_mask(4), 8)
+        # 越界的层也钳到 1~4(和 nav_layer_of 同一套口径)
+        self.assertEqual(ae.nav_layer_mask(0), 1)
+        self.assertEqual(ae.nav_layer_mask(99), 8)
+
+    def test_group_name_and_header(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.nav_group_name(2), "gk_nav_layer_2")
+        # 单层模式:一个字都不写(老场景逐字不变)
+        self.assertEqual(
+            ae.nav_group_header(self._physics(nav_layer=2), False), "")
+        # 多层模式:层 2 的物体写自己的组;层 1 的**也要写** ——
+        # 不写的话层 1 的网格会按"根下所有静态碰撞体"烤,把层 2 的几何
+        # 也烤进去(实测:层 1 的人能走到层 2 的平台上)
+        # ⚠ 必须写在**节点头**里:写成单独一行属性 Godot 会丢掉整个节点
+        self.assertEqual(ae.nav_group_header(self._physics(nav_layer=2), True),
+                         ' groups=["gk_nav_layer_2"]')
+        self.assertEqual(ae.nav_group_header(self._physics(), True),
+                         ' groups=["gk_nav_layer_1"]')
+
+    def test_extra_layers_and_region_names(self):
+        from BlenderGameKit import asset_export as ae
+        single = self._scene([1, 1])
+        self.assertEqual(ae.nav_extra_layers(single), [])
+        self.assertFalse(ae.nav_layers_active(single))
+        self.assertEqual(ae.nav_region_names(single), [(1, "Navigation")])
+        multi = self._scene([1, 3, 2, 3])
+        self.assertEqual(ae.nav_extra_layers(multi), [2, 3])
+        self.assertTrue(ae.nav_layers_active(multi))
+        self.assertEqual(ae.nav_region_names(multi),
+                         [(1, "Navigation"), (2, "Navigation_2"),
+                          (3, "Navigation_3")])
+        # 场景没勾『寻路』-> 没有层可言(也不会导出任何导航东西)
+        self.assertEqual(ae.nav_extra_layers(self._scene([1, 2], nav=False)), [])
+        # 空场景 / 没有物理设置的物体都不算
+        self.assertEqual(ae.nav_extra_layers(types.SimpleNamespace(
+            objects=[types.SimpleNamespace(type="CAMERA", name="相机")],
+            gk_settings=types.SimpleNamespace(nav_enabled=True))), [])
+
+    def test_subresource_carries_group(self):
+        from BlenderGameKit import asset_export as ae
+        params = {"radius": "0.5", "height": "1.8", "slope": "45.0"}
+        text3 = ae.nav_subresource_text(2, True, params)
+        self.assertIn('id="gk_navmesh_2"', text3)
+        self.assertIn("geometry_source_geometry_mode = 1", text3)
+        self.assertIn('geometry_source_group_name = "gk_nav_layer_2"', text3)
+        # 层 1 的老写法:不带组(老场景逐字不变)
+        self.assertNotIn("group_name", ae.nav_subresource_text(1, True, params))
+        text2 = ae.nav_subresource_text(2, False, params)
+        self.assertIn('id="gk_navpoly_2"', text2)
+        self.assertIn("source_geometry_mode = 1", text2)
+        self.assertIn('source_geometry_group_name = "gk_nav_layer_2"', text2)
+
+    def test_region_node_text(self):
+        from BlenderGameKit import asset_export as ae
+        text = ae.nav_region_node_text(2, True, "Navigation_2")
+        self.assertIn('[node name="Navigation_2" type="NavigationRegion3D"',
+                      text)
+        self.assertIn("navigation_layers = 2", text)
+        # 层 1 照旧:不写 navigation_layers(默认就是 1,老场景逐字不变)
+        self.assertNotIn("navigation_layers",
+                         ae.nav_region_node_text(1, True, "Navigation"))
+        text2 = ae.nav_region_node_text(3, False, "Navigation_3")
+        self.assertIn('type="NavigationRegion2D"', text2)
+        self.assertIn("navigation_layers = 4", text2)
+
+    def test_env_script_bakes_every_layer(self):
+        """环境脚本:一层一块 region 都要烤;2D 的外框按**本层的组**算。"""
+        from BlenderGameKit import asset_export as ae
+        text = ae.render_env_script()
+        for marker in ("_gk_nav_regions", "source_geometry_group_name",
+                       "navigation_layers"):
+            self.assertIn(marker, text)
+
+    def test_property_registered_on_physics(self):
+        from BlenderGameKit import properties
+        names = set(getattr(properties.GKObjectSettings, "__annotations__", {}))
+        self.assertIn("nav_layer", names)
+
+    def test_navigate_node_layer_argument(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        chaser = tree.new_node(NN.GKNodeNavigate, "追玩家", gk_goal="玩家",
+                               gk_nav_layer=2)
+        gk_stub.connect(tree, physics, "执行", chaser, "执行")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertIn("map_get_path(", code)
+        self.assertIn("true, 2)", code)
+
+    def test_navigate_default_layer_has_no_extra_argument(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        chaser = tree.new_node(NN.GKNodeNavigate, "追玩家", gk_goal="玩家")
+        gk_stub.connect(tree, physics, "执行", chaser, "执行")
+        code, _ = gen(tree, dict(V3, nav_enabled=True))
+        self.assertIn(", true)", code)
+        self.assertNotIn("true, 1)", code)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _chase_tree(self, ai, **props):
+        state = ai.new_node(NN.GKNodeAiState, "追", gk_state_name="追",
+                            gk_behavior="CHASE", gk_goal="玩家",
+                            gk_speed=4.0, gk_stop_distance=1.2,
+                            gk_facing="GOAL", **props)
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", gk_target="玩家")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return tree, state
+
+    def test_ai_state_layer_argument(self):
+        """『AI_状态』填了『走哪层』-> 公共 helper 带上层掩码。"""
+        ai = self._ai_tree()
+        tree, _state = self._chase_tree(ai, gk_nav_layer=2)
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertIn("_gk_ai_nav_dir(", code)
+        self.assertIn("layers: int = 1", code)
+        self.assertIn(", 2)", code)
+
+    def test_ai_state_default_layer_unchanged_behavior(self):
+        """没填的 AI 图:helper 多了个默认形参,行为一字不变。"""
+        ai = self._ai_tree()
+        tree, _state = self._chase_tree(ai)
+        code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertIn("layers: int = 1", code)
+        self.assertNotIn(", 2)", code)
 
 
 class TestRound81UiPolish(Base):

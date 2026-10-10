@@ -721,6 +721,23 @@ def _expr_move_toward_outputs(ctx, node):
 # ==========================================================================
 # 寻路(第三十四轮:用户选的"敌人会绕墙追你")
 # ==========================================================================
+def nav_layer_mask_of(node):
+    """节点『走哪层』-> Godot 的层掩码(默认 1 = 第 1 层)。
+
+    ── 多层导航(第八十五轮:寻路第三版③)──────────────────────────
+    物体的『寻路层』把静态几何分成几层网格(层 1 = 走路的、层 2 = 飞的…);
+    这里对应"这个节点**用哪一层**找路"。掩码口径和导出侧
+    `asset_export.nav_layer_mask` 一样(`1 << (n-1)`)。
+    这里**不 import asset_export** —— codegen 要能脱开 Blender 单独跑。
+    """
+    try:
+        layer = int(getattr(node, "gk_nav_layer", 1))
+    except (TypeError, ValueError):
+        layer = 1
+    layer = max(1, min(4, layer))
+    return 1 << (layer - 1)
+
+
 @stmt_node("GKNodeNavigate")
 def _stmt_navigate(ctx, node, indent):
     """『移动_寻路』:朝目标走,方向由**导航网格**算(不是直线)。
@@ -800,9 +817,14 @@ def _stmt_navigate(ctx, node, indent):
     if nav_ok:
         path = ctx.new_temp("nav_path")
         step = ctx.new_temp("nav_step")
+        # 多层导航(第八十五轮):『走哪层』不是第 1 层时带上层掩码
+        # (map_get_path 的第 5 个参数)。默认那层**不写** ——
+        # 老图里这句 map_get_path 逐字不变。
+        layer_mask = nav_layer_mask_of(node)
+        layers_arg = f", {layer_mask}" if layer_mask != 1 else ""
         ctx.add_line(indent, f"var {path} := {server}.map_get_path("
                              f"{map_expr}, "
-                             f"{here}, {goal_at}, true)")
+                             f"{here}, {goal_at}, true{layers_arg})")
         ctx.add_line(indent, f"var {step} := {diff}")
         # ── 盯住路径的**第 1 个点**(第 0 个点就是自己站的那个)──────────
         # 只有 0/1 个点 = 网格还没烤完 / 目标不可达 -> 保持直线。

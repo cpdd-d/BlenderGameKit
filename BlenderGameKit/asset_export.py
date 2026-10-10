@@ -1410,15 +1410,29 @@ func _gk_bake_navigation() -> void:
 	var root := _scene_root()
 	if root == null:
 		return
-	var region := root.find_child("Navigation", true, false) as NavigationRegion3D
-	if region != null:
-		_gk_bake_navigation_3d(root, region)
+	# ── 多层导航(第八十五轮):一层一块导航区,都要烤 ────────────────────
+	# 层 1 = `Navigation`、层 n = `Navigation_n`;每块的网格子资源里写了
+	# source group(见 NAVMESH_SUBRESOURCE),所以 parse 时**只挑本层的
+	# 几何** —— 这里不用自己过滤。
+	var regions := _gk_nav_regions(root)
+	if regions.is_empty():
+		print("[GK] 『寻路』开着,但场景里没有 Navigation 节点 —— 重新导出一次")
 		return
-	var region2 := root.find_child("Navigation", true, false) as NavigationRegion2D
-	if region2 != null:
-		_gk_bake_navigation_2d(root, region2)
-		return
-	print("[GK] 『寻路』开着,但场景里没有 Navigation 节点 —— 重新导出一次")
+	for region in regions:
+		if region is NavigationRegion3D:
+			_gk_bake_navigation_3d(root, region)
+		elif region is NavigationRegion2D:
+			_gk_bake_navigation_2d(root, region)
+
+
+## 场景里的所有导航区(层 1 = `Navigation`,层 n = `Navigation_n`)。
+## 按树里的顺序 —— 导出就是按层号写的,所以层 1 在前。
+func _gk_nav_regions(root: Node) -> Array:
+	var out: Array = []
+	for node in root.find_children("Navigation*", "", true, false):
+		if node is NavigationRegion3D or node is NavigationRegion2D:
+			out.append(node)
+	return out
 
 
 ## 重烤(第三十六轮:门 / 平台挪了之后)。
@@ -1469,15 +1483,30 @@ func _gk_bake_navigation_2d(root: Node, region: NavigationRegion2D) -> void:
 		print("[GK] Navigation 节点上没有导航多边形 —— 重新导出一次")
 		return
 	var old: NavigationPolygon = region.navigation_polygon
+	# ── 多层导航(第八十五轮):外框只按**本层**的碰撞体算 ──────────────
+	# ⚠ `source_geometry_group_name` 的**默认值不是空串**(是个占位名
+	#   `navigation_polygon_source_geometry_group`)—— 光看"名字非空"会把
+	#   单层场景也当成"按组烤",然后一个碰撞体都挑不到(实测:层 1 烤出
+	#   0 个多边形,整个寻路全哑)。所以必须**同时**看 `source_geometry_mode`
+	#   是不是 1(按组)。
+	var layer_group := ""
+	if int(old.source_geometry_mode) == 1:
+		layer_group = str(old.source_geometry_group_name)
 	# ── 每次新建一份,不用 duplicate ────────────────────────────────
 	# 外框是加进 outline 列表的,duplicate 会把上一轮的旧外框带过来
 	# (场景挪过之后旧外框和新外框叠在一起,烤出怪多边形)。
 	var poly := NavigationPolygon.new()
 	poly.agent_radius = maxf(old.agent_radius, 0.01)
 	poly.cell_size = clampf(poly.agent_radius * 0.5, 0.25, 8.0)
+	# 把"按组烤"这件事**带过去** —— 不带的话新多边形还是"根下所有几何",
+	# 分层就白做了(实测:层 2 的网格会把层 1 的墙也当障碍)
+	poly.source_geometry_mode = old.source_geometry_mode
+	poly.source_geometry_group_name = old.source_geometry_group_name
 	var bounds := Rect2()
 	var found := false
 	for body in root.find_children("*", "StaticBody2D", true, false):
+		if not layer_group.is_empty() and not body.is_in_group(layer_group):
+			continue
 		for shape_node in body.find_children("*", "CollisionShape2D", true, false):
 			var shape: Shape2D = (shape_node as CollisionShape2D).shape
 			if shape == null:
@@ -1570,18 +1599,24 @@ func _gk_apply_nav_costs_2d(root: Node, region: NavigationRegion2D) -> void:
 	if not map.is_valid():
 		print("[GK] 代价区进不了 2D 导航地图 —— 重新导出一次")
 		return
+	# 多层导航(第八十五轮):补块**跟着本块的层走** —— 层掩码当 key 前缀,
+	# 各层的补块互不覆盖;补块自己也要挂上同样的层,不然层 2 的角色
+	# 看不见这滩泥地(它只在层 1)。
+	var layers := region.navigation_layers
+	var key_base := layers * 100
 	for i in nav_costs.size():
 		var area: Dictionary = nav_costs[i]
-		var rid: RID = _gk_nav_cost_regions.get(i, RID())
+		var rid: RID = _gk_nav_cost_regions.get(key_base + i, RID())
 		if not rid.is_valid():
 			rid = NavigationServer2D.region_create()
 			NavigationServer2D.region_set_map(rid, map)
-			_gk_nav_cost_regions[i] = rid
+			_gk_nav_cost_regions[key_base + i] = rid
 		var poly := _gk_bake_nav_cost_2d(root, area["rect"], radius)
 		NavigationServer2D.region_set_navigation_polygon(rid, poly)
 		# ⚠ 同主区域:烤出来的第一份可能被服务器吞掉(真机实测:
 		#   路径死活进不了代价区),再赋一份同内容就好
 		NavigationServer2D.region_set_navigation_polygon(rid, poly.duplicate())
+		NavigationServer2D.region_set_navigation_layers(rid, layers)
 		NavigationServer2D.region_set_travel_cost(rid, area["cost"])
 		print("[GK] 代价区『", area["name"], "』:补块 ",
 			  poly.get_polygon_count(), " 块,代价 ", area["cost"])
@@ -1623,17 +1658,21 @@ func _gk_apply_nav_costs_3d(root: Node, region: NavigationRegion3D) -> void:
 	if not map.is_valid():
 		print("[GK] 代价区进不了 3D 导航地图 —— 重新导出一次")
 		return
+	# 多层导航(第八十五轮):同 2D —— 补块跟着本块的层走
+	var layers := region.navigation_layers
+	var key_base := layers * 100
 	for i in nav_costs.size():
 		var area: Dictionary = nav_costs[i]
-		var rid: RID = _gk_nav_cost_regions.get(i, RID())
+		var rid: RID = _gk_nav_cost_regions.get(key_base + i, RID())
 		if not rid.is_valid():
 			rid = NavigationServer3D.region_create()
 			NavigationServer3D.region_set_map(rid, map)
-			_gk_nav_cost_regions[i] = rid
+			_gk_nav_cost_regions[key_base + i] = rid
 		var mesh := _gk_nav_cost_mesh_3d(region.navigation_mesh, area["box"])
 		NavigationServer3D.region_set_navigation_mesh(rid, mesh)
 		# ⚠ 同主区域:第一份可能被服务器吞掉,再赋一份同内容
 		NavigationServer3D.region_set_navigation_mesh(rid, mesh.duplicate())
+		NavigationServer3D.region_set_navigation_layers(rid, layers)
 		NavigationServer3D.region_set_travel_cost(rid, area["cost"])
 		print("[GK] 代价区『", area["name"], "』:补块 1 块(面高 ",
 			  mesh.get_vertices()[0].y, "),代价 ", area["cost"])
@@ -2218,6 +2257,143 @@ def _nav_settings(scene):
         "height": max(0.1, number("nav_agent_height", 1.8)),
         "slope": max(0.0, min(89.0, number("nav_max_slope", 45.0))),
     }
+
+
+# ── 多层导航(第八十五轮:寻路第三版③)──────────────────────────────
+# 物体『寻路层』(1~4):不同层的角色走**不同的导航网格** —— 比如"走路的人"
+# 走地面(层 1)、"飞行的人"走空中平台(层 2),互相看不见对方的路。
+#
+# ── 怎么做到"每层只烤自己的几何"(真 Godot spike 定的)──────────────
+# Godot 的 NavigationMesh / NavigationPolygon 有
+# `source_geometry_mode = GROUPS_WITH_CHILDREN`:烘焙时**只解析"在这些
+# Godot group 里的节点及其子节点"**。于是每层只要:
+#   * 该层的静态碰撞体节点多一行 `groups = ["gk_nav_layer_N"]`;
+#   * 该层的网格子资源写 `source_geometry_mode = 1` + 组名。
+# **不用挪碰撞体节点** —— 挪了会牵连材质挂载 / 动态障碍父路径 /
+# 碰撞块合并一大片(所以选 group 模式)。
+#
+# ⚠ 一旦场景用到层 2,层 1 的物体**也要**写自己的组:不写的话层 1 的
+#   网格会按"根下所有静态碰撞体"烤,把层 2 的几何一起烤进去
+#   (实测:层 1 的人能走到层 2 的平台上 —— 分层就白做了)。
+# ⚠ 没用到多层的老场景:一个字都不写(逐字不变)。
+NAV_LAYER_MAX = 4
+NAV_LAYER_GROUP_PREFIX = "gk_nav_layer_"
+
+
+def _clamp_nav_layer(value):
+    """层号钳到 1~4(填 0 / 负数 / 超大值都不至于把导出写坏)。
+
+    也容忍界面上那种 `L2` / `layer2` 写法(取里面的数字)。
+    """
+    try:
+        return max(1, min(NAV_LAYER_MAX, int(value)))
+    except (TypeError, ValueError):
+        pass
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    try:
+        return max(1, min(NAV_LAYER_MAX, int(digits)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def nav_layer_of(physics):
+    """物体『寻路层』(1~4);没设置就当作第 1 层。"""
+    if physics is None:
+        return 1
+    return _clamp_nav_layer(getattr(physics, "nav_layer", 1))
+
+
+def nav_layer_mask(layer):
+    """第 n 层 -> Godot 的层掩码位(1 层 = 1、2 层 = 2、3 层 = 4、4 层 = 8)。
+
+    就是 `1 << (n-1)`。`map_get_path` 的第 5 个参数和导航区的
+    `navigation_layers` 都用这个位掩码。
+    """
+    return 1 << (_clamp_nav_layer(layer) - 1)
+
+
+def nav_group_name(layer):
+    """第 n 层的 Godot group 名(烘焙时按它挑几何)。"""
+    return f"{NAV_LAYER_GROUP_PREFIX}{_clamp_nav_layer(layer)}"
+
+
+def nav_group_header(physics, multi):
+    """碰撞体节点**头里**要加的那段 `groups=[...]`;单层场景空串(一字不变)。
+
+    ⚠ group 必须写在**节点头**里(`[node name=... type=... groups=["x"]]`)。
+      第一版写成单独一行 `groups = [...]` —— Godot 的场景解析器会**丢掉
+      整个节点**(实测:碰撞体全没了,导航烤出 0 个多边形,而且不报错)。
+    """
+    if not multi:
+        return ""
+    return f' groups=["{nav_group_name(nav_layer_of(physics))}"]'
+
+
+def nav_extra_layers(scene):
+    """场景里用到的**第 2 层及以后**的层号(升序)。空 = 没用多层。
+
+    只看**网格物体**(空物体 / 相机没有碰撞体可烤);场景没勾『寻路』时
+    也不存在"层"这回事(没有网格可分层)。
+    """
+    if scene is None or not _nav_on(scene):
+        return []
+    found = set()
+    for obj in getattr(scene, "objects", None) or []:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        layer = nav_layer_of(getattr(obj, "gk_physics", None))
+        if layer > 1:
+            found.add(layer)
+    return sorted(found)
+
+
+def nav_layers_active(scene):
+    """这个场景用没用多层(用了才导出多块网格 / groups)。"""
+    return bool(nav_extra_layers(scene))
+
+
+def nav_region_names(scene):
+    """[(层号, 节点名)] —— 层 1 叫 `Navigation`,层 n 叫 `Navigation_n`。
+
+    单层场景返回 `[(1, "Navigation")]`(和以前一模一样)。
+    """
+    layers = nav_extra_layers(scene)
+    top = max(layers) if layers else 1
+    return [(layer,
+             NAV_REGION_NAME if layer == 1 else f"{NAV_REGION_NAME}_{layer}")
+            for layer in range(1, top + 1)]
+
+
+def nav_subresource_text(layer, is_3d, params):
+    """导航网格子资源文本(层 != 1 时多两行"只烤本组几何")。"""
+    layer = _clamp_nav_layer(layer)
+    if is_3d:
+        text = NAVMESH_SUBRESOURCE.format(**params)
+    else:
+        text = NAVPOLY_SUBRESOURCE.format(radius=params["radius"])
+    if layer == 1:
+        return text
+    group = nav_group_name(layer)
+    if is_3d:
+        text = text.replace('id="gk_navmesh"', f'id="gk_navmesh_{layer}"')
+        return (text + "\ngeometry_source_geometry_mode = 1"
+                f'\ngeometry_source_group_name = "{group}"')
+    text = text.replace('id="gk_navpoly"', f'id="gk_navpoly_{layer}"')
+    return (text + "\nsource_geometry_mode = 1"
+            f'\nsource_geometry_group_name = "{group}"')
+
+
+def nav_region_node_text(layer, is_3d, name):
+    """导航区节点文本。层 1 不写 `navigation_layers`(默认就是 1)。"""
+    layer = _clamp_nav_layer(layer)
+    text = (NAVIGATION_NODE.format(name=name) if is_3d
+            else NAVIGATION_NODE_2D.format(name=name))
+    if layer == 1:
+        return text
+    old_id = "gk_navmesh" if is_3d else "gk_navpoly"
+    text = text.replace(f'SubResource("{old_id}")',
+                        f'SubResource("{old_id}_{layer}")')
+    return text + f"\nnavigation_layers = {nav_layer_mask(layer)}"
 
 
 # NavigationMesh 子资源 + 导航区节点。
@@ -3033,13 +3209,11 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # (网格要按**导出的碰撞体**烤,导出侧烤不了 —— 见 _nav_on 的说明)。
     nav = _nav_settings(scene) if _nav_on(scene) else None
     if nav is not None:
-        if is_3d:
-            sub_resources.append(NAVMESH_SUBRESOURCE.format(**nav))
-        else:
-            # 2D 的 NavigationPolygon 只要参数;外框由环境脚本按
-            # 导出的静态碰撞体包围盒算(见 NAVPOLY_SUBRESOURCE 的说明)。
-            sub_resources.append(
-                NAVPOLY_SUBRESOURCE.format(radius=nav["radius"]))
+        # 多层导航(第八十五轮):一层一份网格子资源(层 1 = `gk_navmesh`,
+        # 层 n = `gk_navmesh_n`)—— 层 != 1 的那份多两行"只烤本组几何"。
+        # 单层场景就只有层 1 那份,文本和以前**逐字一样**。
+        for layer, _name in nav_region_names(scene):
+            sub_resources.append(nav_subresource_text(layer, is_3d, nav))
 
     # ---- 环境与后处理(第四十九轮:阶段②)----
     # WorldEnvironment 只挂在**这张要走的主场景**上:角色子场景是被
@@ -3150,6 +3324,9 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     if bodies:
         lines.append('[node name="Colliders" type="Node3D" parent="."]')
         lines.append("")
+        # 多层导航(第八十五轮):用到层 2+ 时每个静态碰撞体都要写自己的组
+        # (层 1 也写 —— 否则层 1 的网格会把层 2 的几何一起烤进去)。
+        multi_nav = nav_layers_active(scene)
         for obj, physics, built, shape_id, position, piece_entries in bodies:
             # 节点类型和脚本基类必须由**同一个函数**决定 ——
             # 各算各的就会出现"节点是 CharacterBody3D、脚本却 extends X"
@@ -3179,9 +3356,17 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                     model_glb = asset_models[key]
                     model_id = asset_ids[key]
             attach_model = model_glb is not None
+            # 多层导航(第八十五轮):静态碰撞体按『寻路层』写进自己的组(写在
+            # **节点头**里)—— 每层的网格"只烤本组几何"就靠它(group 模式,
+            # 见 nav_group_header / nav_subresource_text 的说明)。
+            # 单层场景 / 非静态体不写(老场景逐字不变)。
+            nav_group = ""
+            if body_type.startswith("StaticBody"):
+                nav_group = nav_group_header(physics, multi_nav)
 
             lines.append(f'[node name="{_sanitize_node_name(obj.name)}" '
-                         f'type="{body_type}" parent="Colliders"]')
+                         f'type="{body_type}" parent="Colliders"'
+                         f'{nav_group}]')
             if attach_model:
                 # ── 位置由**角色节点**说了算,glb 里那份重复的偏移用逆变换抵消 ──
                 # glTF 导出会把物体的**世界变换**写进 glb 的根节点。所以角色
@@ -3340,11 +3525,12 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # 它的网格在启动时由环境脚本烤出来(见 _gk_bake_navigation)。
     # 放在根下面 = 解析根是场景根。
     if nav is not None:
-        if is_3d:
-            lines.append(NAVIGATION_NODE.format(name=NAV_REGION_NAME))
-        else:
-            lines.append(NAVIGATION_NODE_2D.format(name=NAV_REGION_NAME))
-        lines.append("")
+        # 一层一块导航区(层 1 = `Navigation`,层 n = `Navigation_n`)——
+        # 每块的网格在启动时由环境脚本**按自己的组**烤出来
+        # (见 _gk_bake_navigation)。单层场景就只有 `Navigation`,和以前一样。
+        for layer, region_name in nav_region_names(scene):
+            lines.append(nav_region_node_text(layer, is_3d, region_name))
+            lines.append("")
 
     if environment:
         lines.append(environment.strip("\n"))

@@ -260,6 +260,16 @@ class GKNodeNavigate(B.GKStatementNode):
          "多个追人的敌人互相绕开、不挤成一团(单敌人开着也没副作用)"),
         ("gk_avoid_radius", "float", 0.5, "避障半径",
          "敌人之间保持的间距(米 / 2D 单位):越大离得越开"),
+        # ── 走哪层(第八十五轮:寻路第三版③ —— 多层导航)──────────────
+        # 场景里物体的『寻路层』可以把静态几何分成好几层网格(地面 / 空中);
+        # 这里挑"用哪一层找路"。默认第 1 层 —— 老图一个字都不变。
+        ("gk_nav_layer", "enum", "1", "走哪层",
+         "用第几层的导航网格(和物体『寻路层』对应)", (
+             ("1", "第1层", "默认"),
+             ("2", "第2层", ""),
+             ("3", "第3层", ""),
+             ("4", "第4层", ""),
+         )),
     )
     gk_outputs = (S.pin(FLOW, "完成"), S.pin(BOOL, "到达", False),)
 
@@ -278,6 +288,10 @@ class GKNodeNavigate(B.GKStatementNode):
         row.prop(self, "gk_avoid", text="避障(互相绕开)", toggle=True)
         if getattr(self, "gk_avoid", False):
             row.prop(self, "gk_avoid_radius", text="半径")
+        # 多层导航(第八十五轮):只在"场景真的分了层"时才画 ——
+        # 单层场景画出来只是噪音(而且默认值就是第 1 层,什么都不用改)。
+        row = layout.row(align=True)
+        row.prop(self, "gk_nav_layer", text="走哪层")
 
 
 @N

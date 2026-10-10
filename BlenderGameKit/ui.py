@@ -2868,6 +2868,13 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             if abs(float(physics.nav_travel_cost) - 1.0) > 1e-6:
                 col.label(text="寻路会按这个代价绕开 / 吸引(泥地填 5 试试)",
                           icon="INFO")
+            # ── 寻路层(第八十五轮:寻路第三版③)──────────────────────
+            # 这个物体烤进第几层的导航网格 —— 不同层的角色走不同的网格
+            # (地面层 1 / 空中层 2),互不干扰。只在勾了『寻路』的场景里
+            # 有意义;用了层 2 之后『移动_寻路』/『AI_状态』也要挑走哪层。
+            layer_row = col.row(align=True)
+            layer_row.label(text="寻路层")
+            layer_row.prop(physics, "nav_layer", text="")
 
         # ── 子物体碰撞块(本轮:"人形头/身/腿各摆一个")────────────────
         # 勾上 = 这个物体不出现在画面里,形状并入父物体的碰撞体。

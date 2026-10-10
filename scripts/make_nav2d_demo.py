@@ -40,6 +40,17 @@
 ⚠ 泥地补丁是 **Area2D**(没有物理碰撞):路径愿意走就能走过去,只是贵。
   它**不是墙** —— 探针另外查一条"走进泥地中心"的路径,证明那里可达。
 
+── 第八十五轮:多层导航真机探针用的"层 2 走廊"──────────────────────
+场地**外面**再围一条走廊,它的四堵墙在『游戏物理』里设**『寻路层 = 第2层』**
+—— 导出时会有**两块**导航网格(层 1 = 里面那块场地、层 2 = 这条走廊),
+各自只烤自己那层的静态碰撞体:
+
+  * **层2甲**(『移动_寻路』里『走哪层』= 第2层):到得了终点;
+  * **层1乙**(同一段路、同一个终点,只差『走哪层』= 第1层):
+    **到不了** —— 层 1 的网格里根本没有这个位置。
+
+两个人一对比,"到得了 / 到不了"就是分层在起作用的证据。
+
 ── 2D 寻路的注意事项(和 3D 的唯一区别)──────────────────────────
 **2D 里碰撞体 = 障碍物**。所以给"墙 / 箱子 / 障碍"加碰撞体,给"地面 /
 地板"**不要**加(整块地板会被当成一个巨大的障碍挖掉) —— 俯视 2D 游戏
@@ -113,6 +124,20 @@ MUD_CTRL_Y = -7.5          # 对照车道(没有泥地)
 MUD_START_X = -6.0
 MUD_GOAL_X = 6.0
 MUD_SPEED = LANE_SPEED     # 和避障车道同速
+# ── 第八十五轮:多层导航 —— 层 2 的走廊(和层 1 的场地完全分开)──────
+# 场地**外面**再围一条走廊,它的墙在『游戏物理』里设『寻路层 = 第2层』——
+# 于是导出时会有**两块**导航网格:层 1 = 里面那块场地,层 2 = 这条走廊。
+# 两个人从同一段路出发去同一个点:
+#   * 走层 2 的人 -> 到得了(它的网格就是这条走廊);
+#   * 走层 1 的人 -> **到不了**(层 1 的网格是里面那块场地,
+#     根本不包含这个位置 —— 这就是"分层"在起作用)。
+L2_X0 = 16.0
+L2_X1 = 30.0
+L2_HALF_Y = 6.0
+L2_WALL = 1.0
+L2_START = (18.0, 0.0)
+L2_START_B = (18.0, 3.0)
+L2_GOAL = (28.0, 0.0)
 
 
 def log(message):
@@ -229,6 +254,33 @@ def build_scene():
         f"(Area2D —— 没物理碰撞,只有路径价格)")
     log(f"代价车道:泥地车道 y={MUD_LANE_Y:g} / 对照车道 y={MUD_CTRL_Y:g}"
         f"(没有泥地);两端 x={MUD_START_X:g} -> {MUD_GOAL_X:g}")
+    # ── 第八十五轮:层 2 的走廊(四堵墙,和里面那块场地分开)──────────
+    l2_color = (0.35, 0.55, 0.75, 1.0)
+    l2_walls = {}
+    l2_walls["层2_上"] = make_box(
+        "层2_上", (L2_X1 - L2_X0 + L2_WALL * 2, L2_WALL, 1.0),
+        ((L2_X0 + L2_X1) * 0.5, L2_HALF_Y + L2_WALL * 0.5, 0.0), l2_color)
+    l2_walls["层2_下"] = make_box(
+        "层2_下", (L2_X1 - L2_X0 + L2_WALL * 2, L2_WALL, 1.0),
+        ((L2_X0 + L2_X1) * 0.5, -L2_HALF_Y - L2_WALL * 0.5, 0.0), l2_color)
+    l2_walls["层2_左"] = make_box(
+        "层2_左", (L2_WALL, L2_HALF_Y * 2, 1.0),
+        (L2_X0 - L2_WALL * 0.5, 0.0, 0.0), l2_color)
+    l2_walls["层2_右"] = make_box(
+        "层2_右", (L2_WALL, L2_HALF_Y * 2, 1.0),
+        (L2_X1 + L2_WALL * 0.5, 0.0, 0.0), l2_color)
+    lanes.update(l2_walls)
+    lanes["层2甲"] = make_box("层2甲", (1.0, 1.0, 1.0),
+                              (L2_START[0], L2_START[1], 0.0),
+                              (0.3, 0.8, 0.9, 1.0))
+    lanes["层1乙"] = make_box("层1乙", (1.0, 1.0, 1.0),
+                              (L2_START_B[0], L2_START_B[1], 0.0),
+                              (0.75, 0.45, 0.3, 1.0))
+    lanes["终点层2"] = make_box("终点层2", (0.6, 0.6, 1.0),
+                                (L2_GOAL[0], L2_GOAL[1], 0.0), marker_color)
+    log(f"层2 走廊:场地外 x∈[{L2_X0:g},{L2_X1:g}] y=±{L2_HALF_Y:g}"
+        f"(四堵墙设『寻路层 = 第2层』);层2甲走层2、层1乙走层1,"
+        f"都去 ({L2_GOAL[0]:g}, {L2_GOAL[1]:g})")
     log(f"对撞车道:避障对 y={AVOID_LANE_Y:g}(甲/乙) / "
         f"对照对 y={PLAIN_LANE_Y:g}(丙/丁);两端 x=±{LANE_X:g}")
     log(f"场景:场地 {ARENA_HALF_X * 2:.0f}x{ARENA_HALF_Y * 2:.0f} / "
@@ -272,6 +324,11 @@ def write_physics(scene, chaser, player, lanes):
                 # 就能走过去,只是"贵")+『通行代价』,导出时挖洞 + 补价格块
                 physics.body_type = "Area2D"
                 physics.nav_travel_cost = MUD_COST
+            elif obj.name.startswith("层2_"):
+                # 层 2 走廊的墙(第八十五轮:多层导航)—— 『寻路层』设第 2 层,
+                # 导出时它们烤进**第 2 块**导航网格,和层 1 的场地互不干扰
+                physics.body_type = "StaticBody2D"
+                physics.nav_layer = "2"
             else:
                 physics.body_type = "CharacterBody2D"
         elif getattr(obj, "type", "") == "MESH":
@@ -322,9 +379,27 @@ def build_graph(scene):
     for node in mud_nodes:
         _link(tree, previous, "完成", node, "执行")
         previous = node
+    # ── 第八十五轮:多层导航(层 2 走廊)────────────────────────────
+    # 同一条路、同一个终点,两个人只差『走哪层』:
+    #   层2甲 走第 2 层 -> 到得了(它的网格就是这条走廊);
+    #   层1乙 走第 1 层 -> 到不了(层 1 的网格是里面那块场地,不含这儿)。
+    layer_nodes = []
+    y3 = -1120.0
+    for name, goal, layer in (("层2甲", "终点层2", "2"),
+                              ("层1乙", "终点层2", "1")):
+        node = _add(tree, "GKNodeNavigate", f"{name}走", 520.0, y3,
+                    gk_target=name, gk_goal=goal, gk_speed=LANE_SPEED,
+                    gk_stop_distance=LANE_STOP, gk_turn=True,
+                    gk_nav_layer=layer)
+        layer_nodes.append(node)
+        y3 -= 140.0
+    for node in layer_nodes:
+        _link(tree, previous, "完成", node, "执行")
+        previous = node
     log("图:『每当_物理帧』->『移动_寻路』(追踪者追玩家) -> "
         "对撞车道(避障甲 / 避障乙 / 对照丙 / 对照丁) -> "
-        "代价车道(泥地甲 / 对照戊)已接好")
+        "代价车道(泥地甲 / 对照戊) -> "
+        "多层车道(层2甲 走层2 / 层1乙 走层1)已接好")
     return tree
 
 
