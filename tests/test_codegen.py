@@ -14114,11 +14114,21 @@ class TestRound63AiPathfinding(Base):
         self.assertGreaterEqual(code.count(":= _gk_ai_nav_dir("), 2)
 
     def test_nav_on_leaves_flee_alone(self):
-        """『逃跑』不接导航 —— 它是"背对威胁跑",没有固定目标点。"""
+        """『逃跑』在第八十轮(D-11)接上了导航。
+
+        第六十三轮它是唯一不接导航的移动行为("没有固定目标点");
+        第八十轮的做法:朝**威胁反方向投影一个『逃跑距离』外的点**,
+        把这个点交给导航网格 —— 有墙时绕着墙逃,不可达时 helper 自己
+        退回直线(见 TestRound80FleeNavAndHearing)。
+        """
         ai = self._ai_tree()
         tree, _state = self._with_chase(ai, behavior="FLEE")
         code, _ = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
-        self.assertNotIn("_gk_ai_nav_dir", code)
+        self.assertRegex(
+            code,
+            r"var _ai_flee_goal\d+ := _ai_here\d+ \+ "
+            r"_ai_away\d+\.normalized\(\) \* 8\.0")
+        self.assertIn("_gk_ai_nav_dir(", code)
 
     # ---- 顺手抓到的另一个真 bug:晚登记的引用漏 helper ----
 
@@ -16353,6 +16363,291 @@ class TestRound71SingleChain(Base):
         code, _warnings = gen(tree, V3)
         self.assertEqual(code.count("唯一标记"), 1,
                          "『声音_发出噪音』下游只该走一遍:\n" + code[-600:])
+
+
+class TestRound80FleeNavAndHearing(Base):
+    """第八十轮(D 组 11 + 12):逃跑接导航 / 噪音类型 / 去查看环顾 / 脚下响度。
+
+    D-11:场景勾了『寻路』时,『逃跑』把"威胁反方向投影一个点"交给导航网格
+         (`_gk_ai_nav_dir`);没勾时生成物和老图**逐字一致**(直线后退)。
+    D-12①:『声音_发出噪音』带『类型』;『AI_听见』和转场的听见/安静条件
+          能按类型过滤(留空 = 什么都听)。
+    D-12③:『去查看』走到噪音点后原地左右环顾(角度 + 秒数两张卡上配),
+          环顾期间『安静下来』不成立,环顾结束才允许回岗。
+    D-12②:新节点『声音_脚下响度』向下射线查脚下碰撞体的
+          `gk_surface_loudness` 元数据(Blender 物体『游戏物理』里配,
+          导出写进 .tscn 的 `metadata/`),拿它乘跑步噪音的响度。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _enable(self, tree, **props):
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI", **props)
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        return enable
+
+    def _flee_tree(self, **props):
+        ai = self._ai_tree()
+        props.setdefault("gk_goal", "玩家")
+        ai.new_node(NN.GKNodeAiState, "逃跑", gk_state_name="逃跑",
+                    gk_behavior="FLEE", gk_speed=5.0,
+                    gk_stop_distance=3.0, gk_flee_distance=8.0, **props)
+        tree = make_tree()
+        self._enable(tree)
+        return ai, tree
+
+    # ---- 卡片 / 属性都登记好了 ----
+    def test_new_props_declared(self):
+        state_props = {entry[0] for entry in NN.GKNodeAiState.gk_prop_defs}
+        self.assertIn("gk_flee_distance", state_props)
+        self.assertIn("gk_look_angle", state_props)
+        self.assertIn("gk_look_time", state_props)
+        trans_props = {entry[0] for entry in NN.GKNodeAiTransition.gk_prop_defs}
+        self.assertIn("gk_hear_type", trans_props)
+        hear_props = {entry[0] for entry in NN.GKNodeAiHear.gk_prop_defs}
+        self.assertIn("gk_hear_type", hear_props)
+        noise_props = {entry[0] for entry in NN.GKNodeNoise.gk_prop_defs}
+        self.assertIn("gk_noise_type", noise_props)
+
+    def test_surface_loudness_node_registered(self):
+        cls = getattr(NN, "GKNodeSurfaceLoudness", None)
+        self.assertIsNotNone(cls, "声音_脚下响度 没注册")
+        self.assertEqual(cls.bl_label, "声音_脚下响度")
+        self.assertEqual(str(cls.gk_tree_type), "GKGameLogicTree")
+        self.assertTrue(getattr(cls, "gk_no_cache", False),
+                        "脚下响度是射线,每次求值都要重新射,必须 gk_no_cache")
+        outs = [pin["name"] for pin in cls.gk_outputs]
+        self.assertIn("响度倍率", outs)
+
+    # ---- D-11:逃跑接导航 ----
+    def test_flee_without_nav_is_byte_compatible(self):
+        ai, tree = self._flee_tree()
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        # 没勾寻路:一个导航字眼都不许有(老图逐字不变)
+        self.assertNotIn("_gk_ai_nav_dir", code)
+        self.assertNotIn("flee_goal", code)
+        self.assertRegex(code, r"if _ai_dist\d+ <= 3\.0:")
+        self.assertRegex(code,
+                         r"\.velocity = _ai_away\d+\.normalized\(\) \* 5\.0")
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_flee_with_nav_projects_a_point_behind(self):
+        ai, tree = self._flee_tree()
+        code, warnings = self._gen_with_ai(ai, tree, dict(V3, nav_enabled=True))
+        self.assertEqual(warnings, [], warnings)
+        # 投影点 = 自己 + (背对威胁方向) × 逃跑距离
+        self.assertRegex(
+            code,
+            r"var _ai_flee_goal\d+ := _ai_here\d+ \+ "
+            r"_ai_away\d+\.normalized\(\) \* 8\.0")
+        # 这个点交给导航网格,而不是直接 normalized()
+        self.assertRegex(
+            code,
+            r"var _ai_dir\d+ := _gk_ai_nav_dir\(self, _ai_flee_goal\d+\)")
+        self.assertRegex(code, r"if _ai_dist\d+ < 0\.001:")
+        self.assertRegex(code, r"\.velocity = _ai_dir\d+ \* 5\.0")
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    # ---- D-12①:噪音类型 ----
+    def _hearing_graph(self, want_type=""):
+        """巡逻 --听见『类型』--> 去查看 --安静(同类型)--> 巡逻 + 一个发声卡。"""
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B", gk_speed=3.0,
+                             gk_stop_distance=0.6)
+        look = ai.new_node(NN.GKNodeAiState, "去查看", gk_state_name="去查看",
+                           gk_behavior="INVESTIGATE", gk_speed=4.0,
+                           gk_stop_distance=1.0, gk_look_angle=70.0,
+                           gk_look_time=2.0)
+        heard = ai.new_node(NN.GKNodeAiTransition, "听见玻璃",
+                            gk_cond_source="HEARD", gk_ear=0.0, gk_memory=1.2,
+                            gk_hear_type=want_type)
+        calm = ai.new_node(NN.GKNodeAiTransition, "安静了",
+                           gk_cond_source="CALM", gk_ear=0.0, gk_memory=1.2,
+                           gk_hear_type=want_type)
+        gk_stub.connect(ai, patrol, "转到", heard, "上游")
+        gk_stub.connect(ai, heard, "转到", look, "进入")
+        gk_stub.connect(ai, look, "转到", calm, "上游")
+        gk_stub.connect(ai, calm, "转到", patrol, "进入 2")
+
+        tree = make_tree()
+        enable = self._enable(tree)
+        noise = tree.new_node(NN.GKNodeNoise, "打碎玻璃",
+                              gk_loudness=16.0, gk_interval=0.2,
+                              gk_target="玩家", gk_noise_type="玻璃")
+        gk_stub.connect(tree, enable, "完成", noise, "执行")
+        return ai, tree
+
+    def test_dispatcher_carries_noise_type(self):
+        ai, tree = self._hearing_graph(want_type="玻璃")
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(
+            "func _gk_hear_noise(at: Vector3, loudness: float, "
+            "noise_type: String) -> void:", code)
+        self.assertIn("ai_state_hear_type = noise_type", code)
+        # 广播方把类型一起送过去
+        self.assertRegex(code, r'\._gk_hear_noise\([^;]*?, 16\.0, "玻璃"\)')
+        # 听方函数多了 want_type 参数,并在不是的时候拒绝
+        self.assertIn(
+            "func _gk_heard_ai_state_hear(host: Node, ear: float, "
+            "memory: float, want_type: String) -> bool:", code)
+        self.assertIn('if want_type != "":', code)
+        self.assertIn("ai_state_hear_type != want_type", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_transition_passes_want_type(self):
+        ai, tree = self._hearing_graph(want_type="玻璃")
+        code, _ = self._gen_with_ai(ai, tree)
+        # 听见 / 安静两条边都把类型带进判据
+        self.assertEqual(len(re.findall(r'_gk_heard_ai_state_hear\([^\n]*?"玻璃"\)',
+                                        code)), 2)
+
+    def test_ai_hear_expression_filters_by_type(self):
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B")
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="CHASE", gk_goal="玩家")
+        hear = ai.new_node(NN.GKNodeAiHear, "听见脚步", gk_ear=20.0,
+                           gk_memory=3.0, gk_hear_type="脚步")
+        trans = ai.new_node(NN.GKNodeAiTransition, "听见就追")
+        gk_stub.connect(ai, patrol, "转到", trans, "上游")
+        gk_stub.connect(ai, hear, "听见", trans, "条件")
+        gk_stub.connect(ai, trans, "转到", chase, "进入")
+        tree = make_tree()
+        self._enable(tree, gk_target="敌人")
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(code, r'_gk_heard_ai_state_hear\([^\n]*?"脚步"\)')
+
+    # ---- D-12③:去查看到位后环顾 ----
+    def test_investigate_look_around_runtime(self):
+        ai, tree = self._hearing_graph(want_type="玻璃")
+        code, _ = self._gen_with_ai(ai, tree)
+        # 跨帧记的环顾状态(默认"看完了"—— 没听到声音时安静条件该成立)
+        self.assertIn("var _gk_inv_on_1: bool = false", code)
+        self.assertIn("var _gk_inv_done_1: bool = true", code)
+        self.assertIn("var _gk_inv_start_1: float = -1.0", code)
+        self.assertIn("var _gk_inv_base_1: float = 0.0", code)
+        self.assertIn("var _gk_inv_noise_1: float = -1000000000.0", code)
+        # 新噪音 -> 重新开始(赶路途中就要关门,start 置 -1 = 还没到点);
+        # 到点后:70°、2 秒、正弦摆头
+        self.assertIn("if _gk_inv_noise_1 != ai_state_hear_at:", code)
+        self.assertIn("_gk_inv_start_1 = -1.0", code)
+        self.assertIn("if _gk_inv_on_1 and _gk_inv_start_1 < 0.0:", code)
+        self.assertIn("(self as Node3D).rotation.y = _gk_inv_base_1", code)
+        self.assertRegex(
+            code,
+            r"deg_to_rad\(70\.0\) \* sin\(TAU \* _ai_look_el\d+ / 2\.0\)")
+        self.assertRegex(code, r"if _ai_look_el\d+ >= 2\.0:")
+        self.assertIn("_gk_inv_done_1 = true", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_calm_blocked_until_look_done(self):
+        ai, tree = self._hearing_graph(want_type="玻璃")
+        code, _ = self._gen_with_ai(ai, tree)
+        # 『安静下来』= 听不见**且**环顾完了
+        self.assertRegex(
+            code,
+            r"not _gk_heard_ai_state_hear\([^\n]*?"
+            r'"玻璃"\) and _gk_inv_done_1')
+
+    def test_calm_without_investigate_is_unchanged(self):
+        # 没有『去查看』状态的图:一个环顾变量都不多,CALM 也不被门控
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B")
+        idle = ai.new_node(NN.GKNodeAiState, "待机", gk_state_name="待机",
+                           gk_behavior="STAND")
+        calm = ai.new_node(NN.GKNodeAiTransition, "安静了",
+                           gk_cond_source="CALM", gk_memory=3.0)
+        gk_stub.connect(ai, patrol, "转到", calm, "上游")
+        gk_stub.connect(ai, calm, "转到", idle, "进入")
+        tree = make_tree()
+        self._enable(tree)
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_inv_", code)
+        self.assertRegex(code, r"if not _gk_heard_ai_state_hear\([^\n]*?\):")
+
+    # ---- D-12②:脚下响度 ----
+    def _surface_tree(self, target="玩家"):
+        tree = make_tree()
+        event = self._ready(tree)
+        surf = tree.new_node(NN.GKNodeSurfaceLoudness, "脚下响度",
+                             gk_target=target, gk_distance=3.0)
+        noise = tree.new_node(NN.GKNodeNoise, "跑步声", gk_loudness=16.0,
+                              gk_interval=0.2, gk_target=target,
+                              gk_noise_type="脚步")
+        gk_stub.connect(tree, surf, "响度倍率", noise, "响度")
+        gk_stub.connect(tree, event, "执行", noise, "执行")
+        return tree
+
+    def test_surface_loudness_helper_3d(self):
+        code, warnings = gen(self._surface_tree(), V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(
+            "func _gk_surface_loudness_3d(host: Node, dist: float) -> float:",
+            code)
+        self.assertIn("get_world_3d().direct_space_state", code)
+        self.assertIn("intersect_ray", code)
+        self.assertIn('get_meta("gk_surface_loudness", 1.0)', code)
+        # 探测不到地面时退回 1.0(别把脚步声弄没了)
+        self.assertRegex(code,
+                         r"if _gk_hit\d+.is_empty\(\):\s*\n\s*return 1\.0")
+        # 发声卡的响度引脚真的接了脚下倍率
+        self.assertRegex(code, r"_gk_surface_loudness_3d\([^\n]*?, 3\.0\)")
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_surface_loudness_helper_2d(self):
+        code, _ = gen(self._surface_tree(), V2)
+        self.assertIn(
+            "func _gk_surface_loudness_2d(host: Node, dist: float) -> float:",
+            code)
+        self.assertIn("get_world_2d().direct_space_state", code)
+        self.assertIn('get_meta("gk_surface_loudness", 1.0)', code)
+
+    def test_surface_loudness_export_value_helper(self):
+        """导出侧:1.0 = 普通地面(不写元数据);其它值(含 0)才写。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertIsNone(ae.surface_loudness_of(
+            types.SimpleNamespace(surface_loudness=1.0)))
+        self.assertIsNone(ae.surface_loudness_of(types.SimpleNamespace()))
+        self.assertAlmostEqual(ae.surface_loudness_of(
+            types.SimpleNamespace(surface_loudness=1.5)), 1.5)
+        self.assertAlmostEqual(ae.surface_loudness_of(
+            types.SimpleNamespace(surface_loudness=0.0)), 0.0)
 
 
 if __name__ == "__main__":

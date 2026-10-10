@@ -23,7 +23,9 @@ AI 的规则**不在玩法图里**,画在一张独立的『游戏AI』节点图�
 | **AI_转场(看见 / 丢失目标)** | 条件就填在卡片上(视野距离),不用拼"距离 + 比较"两个节点 |
 | **AI_状态(去查看)** | **听见动静**但看不见你时,走到那个位置看看(第五十七轮) |
 | **AI_转场(听见动静 / 安静下来)** | 也是填在卡片上:记住多久、耳朵多远 |
-| **声音_发出噪音** | 玩家脚本里:按住 **K** = 弄出动静(响度 16 米,最快 0.2 秒一次) |
+| **声音_发出噪音** | 玩家脚本里:按住 **K** = 弄出『脚步』声(基础响度 16 米,最快 0.2 秒一次),敌人只听这个类型 |
+| **声音_脚下响度** | 实际响度 = 16 × **脚下地面倍率**:玩家出生在**铁皮**上(×2),对角铺了**地毯**(×0.3) |
+| **AI_状态(去查看)的环顾** | 到噪音点后原地**左右摆头 ±70°(2 秒)**,看完了才安静回岗 —— 不是一到就走 |
 | **AI_启用** | 玩法图里唯一的 AI 入口 —— 作用在『敌人』身上(AI 代码在玩家脚本里,和追击怪同一个做法) |
 | **打印状态变化** | 勾上了 —— Godot 输出面板里能看到 "切到状态: 追击" |
 | **上帝机(Tab)** | 飞起来看一眼它的巡逻路线 |
@@ -74,17 +76,29 @@ ATTACK_RANGE = 2.5     # 进到 2.5 米内就开打
 ATTACK_COOLDOWN = 0.8  # 每 0.8 秒打一下
 HIT_VAR = "被打次数"    # 每打一下 +1(探针读它证明"真的打到了")
 
-# ── 听觉(第五十七轮)─────────────────────────────────────────────
+# ── 听觉(第五十七轮;类型过滤第八十轮)────────────────────────────
 NOISE_KEY = "K"        # 按 K = 弄出动静(跑步 / 踢到东西)
 NOISE_ACTION = "key_k"
 # ⚠ 响度(16)必须**大于**『看见』的距离(9)—— 否则"听得见"的那个距离上
 #   敌人早就**看得见**你了,会直接切『追击』,听觉那条路根本轮不到。
 #   16 > 9 才有"看不见但听得见"的窗口(13 米处:看不见、听得见)。
-NOISE_LOUD = 16.0      # 这声音能传 16 米
+NOISE_LOUD = 16.0      # 基础响度 16 米,实际响度 = 基础 × 脚下地面倍率
 NOISE_INTERVAL = 0.2   # 最快 0.2 秒发一次(按住 K 就是连续动静)
+NOISE_TYPE = "脚步"    # 第八十轮:噪音类型 —— 敌人的『只听类型』也填它
 EAR_MEMORY = 1.2       # 听到之后记 1.2 秒 —— 也就是"去查看"会持续这么久
 LOOK_SPEED = 4.0
 LOOK_STOP = 1.0
+# ── 到点环顾(第八十轮 D-12③)────────────────────────────────────
+# 走到噪音点后原地左右摆头 ±70°,一个来回 2 秒;这期间『安静下来』不成立,
+# 看完了才许回岗 —— 而不是一抬脚往回走。
+LOOK_ANGLE = 70.0
+LOOK_TIME = 2.0
+# ── 地面响度倍率(第八十轮 D-12②)────────────────────────────────
+# 铁皮上跑步传得更远(×2),地毯上几乎听不到(×0.3);普通地面 1.0 不写数据。
+TIN_PLATE = "铁皮地面"
+TIN_MULT = 2.0
+CARPET = "地毯地面"
+CARPET_MULT = 0.3
 
 
 def log(message):
@@ -133,6 +147,13 @@ def build_scene():
     # .tscn(它以为这关没东西可看)—— 探针就没有 World.tscn 可加载了。
     make_box("地面", (24.0, 24.0, 0.4), (0.0, 0.0, -0.2),
              (0.26, 0.34, 0.28, 1.0))
+    # ── 两种"会响的地面"(第八十轮):玩家出生点就踩在铁皮上 ──────────
+    # 0.2 米薄板铺在普通地面之上(顶面 z=0.1),物理面板给倍率、
+    # 导出写进碰撞体 metadata;另一角铺块地毯当对照。
+    make_box(TIN_PLATE, (6.0, 6.0, 0.2), (-8.0, -8.0, 0.0),
+             (0.62, 0.66, 0.70, 1.0))
+    make_box(CARPET, (4.0, 4.0, 0.2), (8.0, 8.0, 0.0),
+             (0.45, 0.20, 0.22, 1.0))
     player = make_box(PLAYER, (1.0, 1.0, 1.6), (-8.0, 0.0, -8.0),
                       (0.95, 0.55, 0.25, 1.0))
     enemy = make_box(ENEMY, (1.4, 1.4, 1.4), (0.0, 0.0, 0.7),
@@ -180,6 +201,11 @@ def write_physics(scene, player, enemy):
         elif getattr(obj, "type", "") == "MESH":
             physics.body_type = "StaticBody3D"
             physics.dimension = "3"
+            # 第八十轮:地面响度倍率(普通地面保持默认 1.0,不写 metadata)
+            if obj.name == TIN_PLATE:
+                physics.surface_loudness = TIN_MULT
+            elif obj.name == CARPET:
+                physics.surface_loudness = CARPET_MULT
 
 
 def _add(tree, kind, name, x, y, **props):
@@ -209,12 +235,16 @@ def build_ai_tree():
     tree = bpy.data.node_groups.new(AI_TREE_NAME, "GKGameAiTree")
     tree.use_fake_user = True
 
+    # 这是张循环图(每个状态都有转场指回来),显式摆『AI_开始』指定巡逻为起点。
+    start = _add(tree, "GKNodeAiStart", "开始", -420.0, 0.0)
+
     patrol = _add(tree, "GKNodeAiState", "巡逻", -60.0, 0.0,
                   gk_state_name="巡逻", gk_behavior="PATROL",
                   gk_patrol_a=PATROL_A, gk_patrol_b=PATROL_B,
                   gk_patrol_c=PATROL_C,
                   gk_speed=PATROL_SPEED, gk_stop_distance=0.7,
-                  gk_facing="MOVE")
+                  gk_facing="MOVE", gk_in_count=3)
+    patrol.build_sockets()     # 开始 / 丢失玩家 / 安静下来 各占一个入口
     chase = _add(tree, "GKNodeAiState", "追击", 700.0, 0.0,
                  gk_state_name="追击", gk_behavior="CHASE",
                  gk_goal=PLAYER, gk_speed=CHASE_SPEED,
@@ -225,15 +255,20 @@ def build_ai_tree():
     look = _add(tree, "GKNodeAiState", "去查看", 700.0, 340.0,
                 gk_state_name="去查看", gk_behavior="INVESTIGATE",
                 gk_speed=LOOK_SPEED, gk_stop_distance=LOOK_STOP,
-                gk_facing="MOVE")
+                gk_facing="MOVE",
+                # 第八十轮 D-12③:到点后原地环顾 ±70° / 2 秒,看完才许安静回岗
+                gk_look_angle=LOOK_ANGLE, gk_look_time=LOOK_TIME)
     see = _add(tree, "GKNodeAiTransition", "看见玩家", 320.0, 180.0,
                gk_cond_source="SEE", gk_goal=PLAYER, gk_sight=SIGHT)
     back = _add(tree, "GKNodeAiTransition", "丢失玩家", 320.0, -210.0,
                 gk_cond_source="LOST", gk_goal=PLAYER, gk_sight=LOST_RANGE)
     heard = _add(tree, "GKNodeAiTransition", "听见动静", 320.0, 340.0,
-                 gk_cond_source="HEARD", gk_ear=0.0, gk_memory=EAR_MEMORY)
+                 gk_cond_source="HEARD", gk_ear=0.0, gk_memory=EAR_MEMORY,
+                 # 第八十轮 D-12①:只被『脚步』声惊动(枪声 / 玻璃不管)
+                 gk_hear_type=NOISE_TYPE)
     calm = _add(tree, "GKNodeAiTransition", "安静下来", 700.0, 480.0,
-                gk_cond_source="CALM", gk_ear=0.0, gk_memory=EAR_MEMORY)
+                gk_cond_source="CALM", gk_ear=0.0, gk_memory=EAR_MEMORY,
+                gk_hear_type=NOISE_TYPE)
 
     # ── 攻击(第七十九轮,D 组 9 + 10)─────────────────────────────────
     # 追上之后贴近到 2.5 米 = 开打:站住、看着玩家,每 0.8 秒"打一下"。
@@ -254,19 +289,17 @@ def build_ai_tree():
                 gk_sight=ATTACK_RANGE + 1.5)
 
     # 环用连线搭(实测 Blender 4.5.5 允许,保存 / 读回都正常)
+    _link(tree, start, "开始", patrol, "进入")
     _link(tree, patrol, "转到", see, "上游")
     _link(tree, see, "转到", chase, "进入")
     _link(tree, chase, "转到", back, "上游")
-    _link(tree, back, "转到", patrol, "进入")
+    # 巡逻的三个入口:『进入』= AI_开始(见上面)、进入2 = 丢失玩家、进入3 = 安静
+    _link(tree, back, "转到", patrol, "进入 2")
     # 听觉那条支路:巡逻 --听见动静--> 去查看 --安静下来--> 巡逻
     _link(tree, patrol, "转到", heard, "上游")
     _link(tree, heard, "转到", look, "进入")
     _link(tree, look, "转到", calm, "上游")
-    # ⚠ 巡逻现在有**两条**转场指进来(『丢失玩家』和『安静下来』)——
-    #   Blender 的 links.new 接一个**已经接过线的输入**是**替换**旧线,
-    #   所以第二条必须用『进入 2』(『入口数量』默认 2,正好够)。
-    #   不这么做的话『丢失玩家』那条会**无声消失**。
-    _link(tree, calm, "转到", patrol, "进入 2")
+    _link(tree, calm, "转到", patrol, "进入 3")
     # 攻击那条环:追击 --贴近(2.5 米)--> 攻击 --又跑远(4 米)--> 追击。
     # ⚠ 『转到』是**输出**引脚,可以 fan-out 两条(输入才只许一条),
     #   所以『追击』的『转到』同时接着『丢失玩家』和『贴近了』。
@@ -280,7 +313,8 @@ def build_ai_tree():
     log(f"AI 图『{tree.name}』:巡逻 --看见({SIGHT:g} 米)--> 追击 "
         f"--贴近({ATTACK_RANGE:g} 米)--> 攻击(每 {ATTACK_COOLDOWN:g} 秒"
         f"『{HIT_VAR}』+1) --又跑远--> 追击;"
-        f"巡逻 --听见动静({NOISE_LOUD:g} 米内)--> 去查看 "
+        f"巡逻 --听见『{NOISE_TYPE}』({NOISE_LOUD:g} 米内)--> 去查看 "
+        f"(到点环顾 ±{LOOK_ANGLE:g}°/{LOOK_TIME:g} 秒) "
         f"--安静({EAR_MEMORY:g} 秒)--> 巡逻({len(tree.nodes)} 个节点,"
         f"起始状态 = 巡逻)")
     return tree
@@ -328,18 +362,28 @@ def build_graph(scene, player, enemy, ai_tree):
     physics = _add(logic, "GKNodeOnPhysicsProcess", "每当物理帧", 0.0, -980.0)
     # ⚠ 『输入_按键』是**表达式**节点(输出真假),没有执行引脚 —— 要经过
     #   『流程_分支』才能驱动执行流(和 chase 示例里"R 键重开"同一套接法)。
-    noise_key = _add(logic, "GKNodeKey", "按K弄出动静", -340.0, -980.0,
+    noise_key = _add(logic, "GKNodeKey", "按K弄出动静", -560.0, -980.0,
                      gk_key=NOISE_KEY, gk_action=NOISE_ACTION,
                      gk_trigger="PRESSED")
-    noise_branch = _add(logic, "GKNodeBranch", "按住K?", -140.0, -980.0)
+    noise_branch = _add(logic, "GKNodeBranch", "按住K?", -360.0, -980.0)
+    # ── 脚下响度(第八十轮 D-12②):基础响度 × 脚下地面倍率 ───────────
+    # 玩家出生在铁皮(×2)上,按 K 的第一声能传 32 米;走到普通地面回到 16。
+    surface = _add(logic, "GKNodeSurfaceLoudness", "脚下响度", -560.0, -1180.0,
+                   gk_target=player.name, gk_distance=3.0)
+    loud_mul = _add(logic, "GKNodeMath", "响度乘倍率", -360.0, -1180.0,
+                    gk_op="MUL", gk_a=NOISE_LOUD, gk_b=1.0, gk_c=0.0)
+    _link(logic, surface, "响度倍率", loud_mul, "B")
     noise = _add(logic, "GKNodeNoise", "弄出动静", 60.0, -980.0,
                  gk_loudness=NOISE_LOUD, gk_interval=NOISE_INTERVAL,
-                 gk_target=player.name, gk_debug_print=True)
+                 gk_target=player.name, gk_noise_type=NOISE_TYPE,
+                 gk_debug_print=True)
     _link(logic, noise_key, "结果", noise_branch, "条件")
     _link(logic, physics, "执行", noise_branch, "执行")
     _link(logic, noise_branch, "是", noise, "执行")
+    _link(logic, loud_mul, "结果", noise, "响度")
     log(f"玩家逻辑:『每当_物理帧』->『按键 {NOISE_KEY}』->『弄出动静』"
-        f"(响度 {NOISE_LOUD:g} 米,间隔 {NOISE_INTERVAL:g} 秒)")
+        f"(类型『{NOISE_TYPE}』,基础响度 {NOISE_LOUD:g} 米 × 脚下倍率,"
+        f"间隔 {NOISE_INTERVAL:g} 秒)")
     return logic
 
 

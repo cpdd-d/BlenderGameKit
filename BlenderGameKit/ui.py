@@ -2837,6 +2837,16 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             row.prop(physics, "collision_layer", text="")
             row.prop(physics, "collision_mask", text="")
             col.prop(physics, "is_trigger")
+            # ── 地面响度倍率(第八十轮 D-12②)──────────────────────────
+            # 触发器是 Area、脚下射线不打 Area,给它设倍率没有意义 -> 置灰。
+            loud_row = col.row(align=True)
+            loud_row.prop(physics, "surface_loudness", slider=True)
+            if physics.is_trigger:
+                loud_row.enabled = False
+            elif abs(float(physics.surface_loudness) - 1.0) > 1e-6:
+                col.label(
+                    text="脚下响度会乘进脚步声(配『声音_脚下响度』节点)",
+                    icon="INFO")
 
         # ── 子物体碰撞块(本轮:"人形头/身/腿各摆一个")────────────────
         # 勾上 = 这个物体不出现在画面里,形状并入父物体的碰撞体。

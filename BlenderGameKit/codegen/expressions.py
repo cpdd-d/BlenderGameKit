@@ -1124,6 +1124,75 @@ def _expr_raycast_check(ctx, node):
 
 
 # ==========================================================================
+# 第八十轮 D-12②:脚下地面的响度倍率(潜行:地毯小声 / 铁皮大声)
+# ==========================================================================
+def _ensure_surface_loudness_helper(ctx):
+    """生成 `_gk_surface_loudness_{2d|3d}(host, dist) -> float`。
+
+    从 host 位置往下射一根短射线,读命中碰撞体上的
+    `gk_surface_loudness` metadata(Blender『游戏物理』面板的『地面响度
+    倍率』,导出时写在 .tscn 的 `metadata/` 上)。射不到地面 / 倍率没配
+    都退回 **1.0** —— 绝不能因为查询失败让脚步声消失。
+
+    射线要**排除自己**(角色自己也是物理体,从体内起射会先命中自己)。
+    """
+    made = getattr(ctx, "_surface_loudness_helper", None)
+    if made is not None:
+        return made
+    if ctx.dim == 2:
+        name = "_gk_surface_loudness_2d"
+        lines = [
+            "    var body := host as Node2D",
+            "    if body == null:",
+            "        return 1.0",
+            "    var from := body.global_position + Vector2(0.0, 2.0)",
+            "    var space := body.get_world_2d().direct_space_state",
+            "    var query := PhysicsRayQueryParameters2D.create("
+            "from, from + Vector2.DOWN * dist)",
+            "    query.exclude = [body.get_rid()]",
+            "    var _gk_hit1 := space.intersect_ray(query)",
+            "    if _gk_hit1.is_empty():",
+            "        return 1.0",
+            '    return float(_gk_hit1["collider"].get_meta('
+            '"gk_surface_loudness", 1.0))',
+        ]
+    else:
+        name = "_gk_surface_loudness_3d"
+        lines = [
+            "    var body := host as Node3D",
+            "    if body == null:",
+            "        return 1.0",
+            "    var from := body.global_position + Vector3(0.0, 0.2, 0.0)",
+            "    var space := body.get_world_3d().direct_space_state",
+            "    var query := PhysicsRayQueryParameters3D.create("
+            "from, from + Vector3.DOWN * dist)",
+            "    query.exclude = [body.get_rid()]",
+            "    var _gk_hit1 := space.intersect_ray(query)",
+            "    if _gk_hit1.is_empty():",
+            "        return 1.0",
+            '    return float(_gk_hit1["collider"].get_meta('
+            '"gk_surface_loudness", 1.0))',
+        ]
+    ctx.extra_sections.append({
+        "signature": f"func {name}(host: Node, dist: float) -> float:",
+        "lines": lines,
+        "empty_body": "    return 1.0",
+        "separator": True,
+    })
+    ctx._surface_loudness_helper = name
+    return name
+
+
+@expr_node("GKNodeSurfaceLoudness")
+def _expr_surface_loudness(ctx, node):
+    """『声音_脚下响度』:向下短射线查脚下碰撞体的响度倍率(1.0 = 普通)。"""
+    helper = _ensure_surface_loudness_helper(ctx)
+    target = ctx.target_expr(node, "gk_target", hint="物体")
+    distance = ctx.input_number(node, "检测距离", "3.0")
+    return f"{helper}({target}, {distance})"
+
+
+# ==========================================================================
 # 手柄
 # ==========================================================================
 _JOY_DEADZONE_FN = "_gk_joy_axis"

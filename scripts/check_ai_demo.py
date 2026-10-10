@@ -21,8 +21,12 @@
   * **听觉(第五十七轮)**:把玩家放到噪音能传到的地方,**按住 K 弄出动静**
     -> `ai_state` 变成**去查看**,而且敌人**真的朝噪音点走过去**
     (距离缩了近、量出"朝噪音方向走"的位移);
-  * **松开 K 之后**:等超过『记忆秒数』-> `ai_state` 回到**巡逻**
-    (安静下来了,不查了);
+  * **松开 K 之后**:敌人走到噪音点**原地环顾 ±70°(2 秒,朝向真的左右摆)**,
+    环顾中 `ai_state` 必须仍是**去查看**;看完 + 安静才回**巡逻**;
+  * **噪音类型(第八十轮)**:广播『枪声』(敌人只听脚步)状态不变,
+    再广播『脚步』立刻切**去查看**;
+  * **脚下响度(第八十轮)**:玩家出生踩铁皮 -> 射线读回 **2.0**,
+    普通地面读回默认 **1.0**;`.tscn` 里写了 metadata;
   * 生成脚本里:状态变量 / 起始赋值 / 看见-丢失的距离条件 / 巡逻折返 /
     听觉三件套(广播 / 登记进组 / 去查看朝噪音点);
   * .tscn 里:'敌人' 是 CharacterBody3D、两个巡逻点都在(静态体)。
@@ -48,6 +52,12 @@ PROBE_GD = '''extends Node
 # ⚠ `ai_state` 在**玩家脚本**上(『AI_启用』的『作用在谁』= 敌人,
 #   但代码生成在"挂脚本的那个物体" = 玩家)。所以状态从 player 读,
 #   位置从 enemy 读。
+#
+# 第八十轮新增四段:
+#   AI_SURFACE_TIN / AI_SURFACE_GROUND —— 脚下响度射线(铁皮 2.0 / 普通 1.0)
+#   AI_LOOK_SWING / AI_LOOK_MID       —— 到点环顾:摆头 + 环顾中不许回岗
+#   AI_CALM                           —— 看完(2 秒)+ 安静才回巡逻
+#   AI_TYPE_WRONG / AI_TYPE_RIGHT     —— 只听『脚步』:枪声不理、脚步惊动
 
 var world: Node = null
 var player: Node = null
@@ -64,6 +74,19 @@ var wp_after := -2
 # 攻击(第七十九轮):进追击前记一下"被打次数",开打后再记一次,要变大
 var hits_before := -1.0
 var hits_after := -2.0
+# 脚下响度(第八十轮)
+var surface_tin_done := false
+var surface_ground_done := false
+var surface_final_done := false
+# 到点环顾(第八十轮)
+var look_arrived := false
+var look_t := 0.0
+var rot_a := 0.0
+var rot_b := 0.0
+var swing_done := false
+var mid_done := false
+# 类型过滤(第八十轮)
+var type_t := 0.0
 
 
 func _wp() -> int:
@@ -97,6 +120,27 @@ func _state() -> String:
 
 func _physics_process(delta: float) -> void:
 	elapsed += delta
+	# ── 脚下响度(第八十轮)──────────────────────────────────────────
+	# ⚠ 必须赶在 1.05 秒的巡逻阶段之前、并且在**同一帧**内测完:
+	#   敌人视野 9 米,把玩家低空放到铁皮 (距巡逻点甲 8.25 米) 或原点
+	#   (6 米)只要停留超过一帧就会被看见、提前切追击(实测踩过)。
+	#   所以在 10 米高空两处各测一次(射线长度放到 12),同帧再停到
+	#   11 米外的死角 —— 高空 3D 距离 > 视野,敌人当帧无论如何看不见。
+	if not surface_tin_done and elapsed >= 0.30:
+		surface_tin_done = true
+		surface_ground_done = true
+		surface_final_done = true
+		if player != null:
+			# 铁皮地面 Godot 坐标 (-8, +8),顶面 y=0.1,倍率 2.0
+			player.global_position = Vector3(-8.0, 10.0, 8.0)
+			var tin: float = player._gk_surface_loudness_3d(player, 12.0)
+			print("AI_SURFACE_TIN value=", snappedf(tin, 0.01))
+			# 原点正上方是普通『地面』,无 metadata,读回默认 1.0
+			player.global_position = Vector3(0.0, 10.0, 0.0)
+			var ground: float = player._gk_surface_loudness_3d(player, 12.0)
+			print("AI_SURFACE_GROUND value=", snappedf(ground, 0.01))
+			# 测完停远:11 米外死角,等 1.05 秒阶段重新摆局
+			player.global_position = Vector3(-11.0, 1.0, -11.0)
 	if phase == 0 and elapsed >= 0.15:
 		phase = 1
 		# ── 三点巡逻(第七十八轮)────────────────────────────────────
@@ -164,9 +208,9 @@ func _physics_process(delta: float) -> void:
 			noise_start = enemy.global_position
 			noise_at = player.global_position
 		Input.action_press("key_k")
-	elif phase == 5 and elapsed >= 5.15:
+	elif phase == 5 and elapsed >= 4.35:
 		phase = 6
-		# 这一秒里敌人应该"听见动静 -> 去查看",并且朝噪音点走过去
+		# 0.6 秒的脚步声足够它切『去查看』并朝噪音点走出一段
 		Input.action_release("key_k")
 		var came := -1.0
 		if enemy != null and noise_at != Vector3.ZERO:
@@ -180,10 +224,53 @@ func _physics_process(delta: float) -> void:
 		#   走一边就走进 9 米视野了,会切『追击』,测不到『安靜回巡逻』。
 		if player != null:
 			player.global_position = Vector3(-40.0, 1.0, -40.0)
-	elif phase == 6 and elapsed >= 6.75:
-		phase = 7
-		# 松手 + 超过记忆秒数(1.2 秒)-> 应该"安静下来"回巡逻
-		print("AI_CALM state=", _state())
+	elif phase == 6:
+		# ── 等它走到噪音点(停距 1 米;1.6 米内就算到达),再看环顾 ─────
+		if not look_arrived and enemy != null and noise_at != Vector3.ZERO \\
+				and enemy.global_position.distance_to(noise_at) <= 1.6:
+			look_arrived = true
+			look_t = elapsed
+			rot_a = enemy.rotation.y
+		if look_arrived:
+			if not swing_done and elapsed - look_t >= 0.55:
+				# 环顾是 ±70° 正弦:0.55 秒时该明显偏离到达时的朝向
+				swing_done = true
+				rot_b = enemy.rotation.y
+				print("AI_LOOK_SWING state=", _state(),
+					" rot_a=", snappedf(rot_a, 0.001),
+					" rot_b=", snappedf(rot_b, 0.001))
+			if not mid_done and elapsed - look_t >= 1.0:
+				# 环顾要 2 秒:1 秒时『安静下来』必须不成立(还在去查看)
+				mid_done = true
+				print("AI_LOOK_MID state=", _state())
+			if swing_done and mid_done and elapsed - look_t >= 3.6:
+				# 环顾 2 秒 + 记忆 1.2 秒 + 余量 -> 该回巡逻了
+				print("AI_CALM state=", _state())
+				phase = 7
+				type_t = elapsed
+				# 类型过滤:先广播一声**枪声**(敌人只听脚步,不该动)
+				if player != null and enemy != null:
+					player._gk_hear_noise(
+						enemy.global_position + Vector3(10.0, 0.0, 0.0),
+						16.0, "枪声")
+		if not look_arrived and elapsed >= 12.5:
+			# 超时也把后面的阶段走完,让失败行打全(别静默卡住)
+			print("AI_LOOK_SWING state=TIMEOUT rot_a=0 rot_b=0")
+			print("AI_LOOK_MID state=TIMEOUT")
+			print("AI_CALM state=TIMEOUT")
+			phase = 7
+			type_t = elapsed
+	elif phase == 7 and elapsed - type_t >= 0.5:
+		phase = 8
+		print("AI_TYPE_WRONG state=", _state())
+		# 再广播一声**脚步** —— 这次必须切去查看
+		if player != null and enemy != null:
+			player._gk_hear_noise(
+				enemy.global_position + Vector3(10.0, 0.0, 0.0),
+				16.0, "脚步")
+		type_t = elapsed
+	elif phase == 8 and elapsed - type_t >= 0.4:
+		print("AI_TYPE_RIGHT state=", _state())
 		print("AI_DONE")
 		set_physics_process(false)
 		get_tree().quit()
@@ -323,8 +410,79 @@ def main():
                   f"{heard.group(3)} 米):", heard.group(0))
             ok = False
     if not re.search(r"AI_CALM state=巡逻", text):
-        print("✗ 松手 + 过了『记忆秒数』后没回到巡逻:",
+        print("✗ 环顾看完 + 安静后没回到巡逻:",
               [line for line in text.splitlines() if line.startswith("AI_CALM")])
+        ok = False
+
+    # ── 脚下响度(第八十轮):铁皮 2.0,普通地面默认 1.0 ───────────────
+    tin = re.search(r"AI_SURFACE_TIN value=([-\d.]+)", text)
+    if not tin:
+        print("✗ 脚下响度(铁皮)那段没跑出来:",
+              [line for line in text.splitlines()
+               if line.startswith("AI_SURFACE_TIN")])
+        ok = False
+    elif abs(float(tin.group(1)) - 2.0) > 0.05:
+        print(f"✗ 铁皮地面的响度倍率应为 2.0,读到 {tin.group(1)}:", tin.group(0))
+        ok = False
+    ground = re.search(r"AI_SURFACE_GROUND value=([-\d.]+)", text)
+    if not ground:
+        print("✗ 脚下响度(普通地面)那段没跑出来:",
+              [line for line in text.splitlines()
+               if line.startswith("AI_SURFACE_GROUND")])
+        ok = False
+    elif abs(float(ground.group(1)) - 1.0) > 0.05:
+        print(f"✗ 普通地面的响度倍率应退回默认 1.0,读到 {ground.group(1)}:",
+              ground.group(0))
+        ok = False
+
+    # ── 到点环顾(第八十轮):摆头 + 环顾期间不许回岗 ─────────────────
+    swing = re.search(
+        r"AI_LOOK_SWING state=(\S+) rot_a=([-\d.]+) rot_b=([-\d.]+)", text)
+    if not swing:
+        print("✗ 环顾那段没跑出来:",
+              [line for line in text.splitlines()
+               if line.startswith("AI_LOOK_SWING")])
+        ok = False
+    else:
+        if swing.group(1) != "去查看":
+            print(f"✗ 到点环顾时状态应仍是『去查看』(实际 {swing.group(1)}):",
+                  swing.group(0))
+            ok = False
+        if abs(float(swing.group(3)) - float(swing.group(2))) < 0.1:
+            print("✗ 环顾时没有真的摆头(两个朝向差 < 0.1 弧度):",
+                  swing.group(0))
+            ok = False
+    mid = re.search(r"AI_LOOK_MID state=(\S+)", text)
+    if not mid:
+        print("✗ 环顾中段那行没跑出来:",
+              [line for line in text.splitlines()
+               if line.startswith("AI_LOOK_MID")])
+        ok = False
+    elif mid.group(1) != "去查看":
+        print(f"✗ 环顾才过 1 秒就离开了『去查看』(环顾秒数=2,状态 {mid.group(1)}):"
+              "『安静下来』被环顾门控放早了", mid.group(0))
+        ok = False
+
+    # ── 噪音类型过滤(第八十轮):枪声不理、脚步惊动 ──────────────────
+    wrong = re.search(r"AI_TYPE_WRONG state=(\S+)", text)
+    if not wrong:
+        print("✗ 类型不匹配那段没跑出来:",
+              [line for line in text.splitlines()
+               if line.startswith("AI_TYPE_WRONG")])
+        ok = False
+    elif wrong.group(1) != "巡逻":
+        print(f"✗ 敌人只听『脚步』,却被一声『枪声』惊动了(状态 {wrong.group(1)}):",
+              wrong.group(0))
+        ok = False
+    right = re.search(r"AI_TYPE_RIGHT state=(\S+)", text)
+    if not right:
+        print("✗ 类型匹配那段没跑出来:",
+              [line for line in text.splitlines()
+               if line.startswith("AI_TYPE_RIGHT")])
+        ok = False
+    elif right.group(1) != "去查看":
+        print(f"✗ 广播了『脚步』声却没切去查看(状态 {right.group(1)}):",
+              right.group(0))
         ok = False
 
     if "AI_DONE" not in text:
@@ -368,6 +526,18 @@ def main():
                 ("ai_state_hear_pos", "『去查看』朝记住的噪音点走"),
                 ("not _gk_heard_", "『安静下来』= 听不见"),
                 ("[GK 噪音]", "噪音的调试打印"),
+                # ── 噪音类型(第八十轮 D-12①)────────────────────────
+                ('noise_type: String', "派发器带类型参数"),
+                ('want_type: String', "听方带『只听类型』参数"),
+                ('if want_type != "":', "类型过滤分支"),
+                ('"脚步"', "噪音和转场都用『脚步』这个类型"),
+                # ── 到点环顾(第八十轮 D-12③)────────────────────────
+                ("_gk_inv_done_", "环顾完成门控变量"),
+                ("deg_to_rad(70.0)", "环顾角度 70°"),
+                ("sin(TAU * ", "正弦摆头"),
+                # ── 脚下响度(第八十轮 D-12②)────────────────────────
+                ("func _gk_surface_loudness_3d(", "脚下响度 helper"),
+                ('get_meta("gk_surface_loudness", 1.0)', "读地面 metadata"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")
@@ -384,6 +554,13 @@ def main():
                 ('[node name="敌人" type="CharacterBody3D"', "敌人在场景里"),
                 ('name="巡逻点甲"', "巡逻点甲在场景里"),
                 ('name="巡逻点乙"', "巡逻点乙在场景里"),
+                # ── 地面响度 metadata(第八十轮 D-12②)────────────────
+                ('name="铁皮地面"', "铁皮地面在场景里"),
+                ('name="地毯地面"', "地毯地面在场景里"),
+                ("metadata/gk_surface_loudness = 2.000000",
+                 "铁皮倍率 2.0 写进了碰撞体 metadata"),
+                ("metadata/gk_surface_loudness = 0.300000",
+                 "地毯倍率 0.3 写进了碰撞体 metadata"),
         ):
             if needle not in scene:
                 print(f"✗ World.tscn 里没有{why}: 找不到 {needle!r}")

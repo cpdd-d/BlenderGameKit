@@ -143,12 +143,13 @@ def _emit_patrol_waypoints(ctx, indent, self_expr, reader, stop, speed, facing,
 #
 # 所以这里让 AI 的移动行为**默认就走导航网格**,开关只有一个:**场景设置
 # 里那个『寻路』**(它决定有没有导航网格可走)。没勾 -> 一行代码都不变
-# (老图产物逐字不变);勾了 -> 追击 / 跟随 / 去查看 / 巡逻 / 返回 自动
-# 绕开墙和石头。不再加节点上的开关:场景那个开关已经是"要不要寻路"的
-# 总闸,再加一层只会让人猜"到底哪个生效"。
+# (老图产物逐字不变);勾了 -> 追击 / 跟随 / 攻击 / 去查看 / 巡逻 / 返回 /
+# 逃跑 自动绕开墙和石头。不再加节点上的开关:场景那个开关已经是"要不要
+# 寻路"的总闸,再加一层只会让人猜"到底哪个生效"。
 #
-# ⚠ 『逃跑』**没有**接:它的目标是"背对威胁跑",没有一个固定的目标点,
-#   用导航网格反而会绕到威胁那边去。这条留在文档 / 待办里。
+# 『逃跑』第八十轮也接上了:投影点取在"背对威胁『逃跑距离』外",
+#   导航只会带着它绕障碍远离威胁,不会绕到威胁脸上;投影点不可达时
+#   helper 自带退回直线。
 def _nav_dir_helper(ctx):
     """生成 `_gk_ai_nav_dir(host, goal)` —— "下一步朝哪走"(绕开障碍)。
 
@@ -283,6 +284,68 @@ def _stop_and_slide(ctx, indent, self_expr):
     ctx.add_line(indent, f"{self_expr}.move_and_slide()")
 
 
+def _emit_investigate_reset(ctx, indent, machine, at_var, now_var):
+    """听到**新噪音**的这一刻先把环顾的门关好(第八十轮 D-12③)。
+
+    ⚠ 真机探针抓到:这段最早只写在"到点"分支里 —— 可敌人赶路要 3 秒,
+      噪音记忆只有 1.2 秒,记忆一过 `not heard and inv_done`(默认 true)
+      立刻成立,敌人半路就被『安静下来』拉回巡逻,根本走不到噪音点。
+      现在赶路途中每帧也检查:听到时刻一变就 done=false、start=-1
+      (-1 = 还没到点;到点那一帧才记起点朝向和环顾起点)。
+    """
+    inv = machine.get("inv")
+    if not inv:
+        return
+    ctx.add_line(indent, f"if {inv['noise']} != {at_var}:")
+    ctx.add_line(indent + 1, f"{inv['noise']} = {at_var}")
+    ctx.add_line(indent + 1, f"{inv['on']} = true")
+    ctx.add_line(indent + 1, f"{inv['done']} = false")
+    ctx.add_line(indent + 1, f"{inv['start']} = -1.0")
+
+
+def _emit_investigate_look(ctx, indent, machine, state, self_expr, now_var):
+    """『去查看』走到噪音点后的**原地环顾**(第八十轮 D-12③)。
+
+    到点的这一帧(`start == -1` 的那一帧)记住现在的朝向 + 起点时间,
+    然后在『环顾秒数』内用正弦波左右摆头(±『环顾角度』);摆完把朝向
+    还原,并置位 done —— CALM 边拿着这个 done 当"看完了吗"的门(见
+    `_ai_edge_condition`)。赶路途中来了新噪音会把 start 重置成 -1
+    (见 `_emit_investigate_reset`),到点自动从头再看一遍。
+    """
+    ctx.add_line(indent, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+    inv = machine.get("inv")
+    if not inv:
+        return  # 理论上不会:图里有 INVESTIGATE 状态就会声明(见启用节点)
+    if ctx.dim == 2:
+        rot = f"({self_expr} as Node2D).rotation"
+    else:
+        rot = f"({self_expr} as Node3D).rotation.y"
+    angle = gd_number(float(getattr(state, "gk_look_angle", 70.0) or 0.0))
+    secs = max(0.0, float(getattr(state, "gk_look_time", 2.0) or 0.0))
+    secs_str = gd_number(secs)
+    el_var = ctx.new_temp("ai_look_el")
+    # 到点第一帧:记起点朝向 + 环顾起点(start 被 reset 置成 -1)
+    ctx.add_line(indent, f"if {inv['on']} and {inv['start']} < 0.0:")
+    ctx.add_line(indent + 1, f"{inv['start']} = {now_var}")
+    ctx.add_line(indent + 1, f"{inv['base']} = {rot}")
+    ctx.add_line(indent, f"if {inv['on']}:")
+    ctx.add_line(indent + 1, f"var {el_var} := {now_var} - {inv['start']}")
+    if secs <= 0.0:
+        # 秒数填 0 = 不环顾(首帧立即收工)
+        ctx.add_line(indent + 1, f"if {el_var} >= 0.0:")
+    else:
+        ctx.add_line(indent + 1, f"if {el_var} >= {secs_str}:")
+    ctx.add_line(indent + 2, f"{inv['on']} = false")
+    ctx.add_line(indent + 2, f"{inv['done']} = true")
+    ctx.add_line(indent + 2, f"{rot} = {inv['base']}")
+    if secs > 0.0:
+        ctx.add_line(indent + 1, "else:")
+        # 正弦摆头:TAU * t / 秒数 -> 一个周期正好左右各一次再回到正中
+        ctx.add_line(indent + 2,
+                     f"{rot} = {inv['base']} + deg_to_rad({angle}) * "
+                     f"sin(TAU * {el_var} / {secs_str})")
+
+
 # ==========================================================================
 # 行为:每个『AI_状态』生成一段
 # ==========================================================================
@@ -385,10 +448,32 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(indent, f"var {here} := {reader}({self_expr})")
         ctx.add_line(indent, f"var {away} := {here} - {reader}({goal})")
         ctx.add_line(indent, f"var {dist} := {away}.length()")
-        ctx.add_line(indent, f"if {dist} <= {stop}:")
-        ctx.add_line(indent + 1, f"{self_expr}.velocity = {away}.normalized() * {speed}")
-        ctx.add_line(indent, "else:")
-        ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+        if not bool(getattr(ctx, "nav_enabled", False)):
+            # 没勾『寻路』:老图逐字不变 —— 直接背对威胁直线后退
+            ctx.add_line(indent, f"if {dist} <= {stop}:")
+            ctx.add_line(indent + 1, f"{self_expr}.velocity = {away}.normalized() * {speed}")
+            ctx.add_line(indent, "else:")
+            ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+        else:
+            # 勾了『寻路』(第八十轮):朝威胁反方向投影一个点交给导航网格 ——
+            # 没墙时这个方向和直线后退一模一样;有墙时导航会绕开。
+            flee_distance = max(
+                0.0, float(getattr(state, "gk_flee_distance", 8.0) or 0.0))
+            flee_goal = ctx.new_temp("ai_flee_goal")
+            ctx.add_line(
+                indent,
+                f"var {flee_goal} := {here} + {away}.normalized() "
+                f"* {gd_number(flee_distance)}")
+            walk = _walk_direction(ctx, indent, self_expr, flee_goal,
+                                   f"({flee_goal} - {here})")
+            ctx.add_line(indent, f"if {dist} <= {stop}:")
+            # 威胁和自己几乎重合时"反方向"不存在,别让 NaN / 零向量抖
+            ctx.add_line(indent + 1, f"if {dist} < 0.001:")
+            ctx.add_line(indent + 2, f"{self_expr}.velocity = {_vector_zero(ctx)}")
+            ctx.add_line(indent + 1, "else:")
+            ctx.add_line(indent + 2, f"{self_expr}.velocity = {walk} * {speed}")
+            ctx.add_line(indent, "else:")
+            ctx.add_line(indent + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
         # 『朝目标』= 看着威胁(追兵):face_vec 用「目标 - 自己」= -away
         face = ctx.new_temp("ai_face")
         ctx.add_line(indent, f"var {face} := -{away}")
@@ -399,7 +484,8 @@ def _emit_ai_behavior(ctx, indent, machine, state):
     # ---- 去查看:朝**最近听到的噪音点**走(第四十一轮:听觉)----------
     if behavior == "INVESTIGATE":
         prefix = _hear_prefix(machine["var"])
-        _heard_fn, pos_var, at_var = _ensure_ai_hear_helper(ctx, prefix)
+        _heard_fn, pos_var, at_var, _type_var = _ensure_ai_hear_helper(
+            ctx, prefix)
         # 从没听到过声音就别乱跑 —— 不判的话它会一路走向世界原点
         # (Vector 零值),看起来像"AI 发疯了"。
         ctx.add_line(indent, f"if {at_var} < {_NEVER_HEARD} * 0.5:")
@@ -412,13 +498,21 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(inner, f"var {here} := {reader}({self_expr})")
         ctx.add_line(inner, f"var {diff} := {pos_var} - {here}")
         ctx.add_line(inner, f"var {dist} := {diff}.length()")
+        now_var = ctx.new_temp("ai_now")
+        ctx.add_line(
+            inner, f"var {now_var} := float(Time.get_ticks_msec()) * 0.001")
+        # 新噪音先关门(done=false):赶路这几秒里『安静下来』不许成立
+        _emit_investigate_reset(ctx, inner, machine, at_var, now_var)
         # 噪音点是个**坐标**(不是一个物体),同样能走导航网格
         walk = _walk_direction(ctx, inner, self_expr, pos_var, diff)
         ctx.add_line(inner, f"if {dist} > {stop}:")
         ctx.add_line(inner + 1, f"{self_expr}.velocity = {walk} * {speed}")
+        # 赶路时看着噪音点;到点后**环顾的朝向由环顾代码自己管**,
+        # 这里再 look_at 会和摆头互相打架(第八十轮)。
+        _emit_ai_facing(ctx, inner + 1, self_expr, diff, facing)
         ctx.add_line(inner, "else:")
-        ctx.add_line(inner + 1, f"{self_expr}.velocity = {_vector_zero(ctx)}")
-        _emit_ai_facing(ctx, inner, self_expr, diff, facing)
+        _emit_investigate_look(ctx, inner + 1, machine, state, self_expr,
+                               now_var)
         ctx.add_line(inner, f"{self_expr}.move_and_slide()")
         return
 
@@ -496,14 +590,26 @@ def _ai_edge_condition(ctx, edge, machine):
     # "最近有没有听到噪音"(『声音_发出噪音』广播过来的)。
     if kind in node_lib.AI_HEAR_COND_SOURCES:
         prefix = _hear_prefix(machine["var"])
-        heard_fn, _pos, _at = _ensure_ai_hear_helper(ctx, prefix)
+        heard_fn, _pos, _at, _type = _ensure_ai_hear_helper(ctx, prefix)
         ear = gd_number(float(getattr(trans, "gk_ear", 0.0) or 0.0))
         memory = gd_number(float(getattr(trans, "gk_memory", 3.0) or 0.0))
-        heard = f"{heard_fn}({machine['self']}, {ear}, {memory})"
+        want_type = gd_string(
+            str(getattr(trans, "gk_hear_type", "") or "").strip())
+        heard = (f"{heard_fn}({machine['self']}, {ear}, {memory}, "
+                 f"{want_type})")
         # 『安静下来』就是"听不见" —— 两个条件互为反面,和 SEE/LOST 一样。
         # 但必须**先听过才能"安静下来"**吗?不用:从没听到过声音时,
         # 『听见动静』为假、『安静下来』为真,正好是"没什么事、该干嘛干嘛"。
-        return heard if kind == "HEARD" else f"not {heard}"
+        if kind == "HEARD":
+            return heard
+        # 第八十轮:图里有『去查看』时,到点后的**环顾**没看完不许安静 —
+        # 否则它刚在噪音点站定就立刻"安静了 -> 回岗",环顾卡纯属摆设。
+        # 环顾变量默认 done=true:从没去查看过的初始帧仍然算安静(见上)。
+        inv = machine.get("inv") or {}
+        done_var = inv.get("done")
+        if done_var:
+            return f"not {heard} and {done_var}"
+        return f"not {heard}"
 
     # kind == "pin":接在『条件』引脚上的表达式。
     socket = ctx._socket(trans, "条件")
@@ -769,6 +875,30 @@ def _stmt_ai_enable(ctx, node, indent):
         attack_timer = ctx.declare_var(f"_gk_ai_atk_{index}", "float",
                                        initial="0.0")
 
+    # ── 『去查看』到点后环顾的跨帧状态(第八十轮)────────────────────
+    # on   = 正在环顾;done = 看完了(CALM 边拿它当门,见 _ai_edge_condition);
+    # start/base = 本轮开始时刻 / 开始时的朝向;noise = 触发本轮的噪音时刻。
+    # 没有『去查看』状态的图**一个都不声明** —— 老图产物一字不变。
+    # done 默认 true:从没去查看过声音时"安静下来"仍然成立(初始语义不变)。
+    inv_vars = None
+    if any(str(getattr(s, "gk_behavior", "") or "") == "INVESTIGATE"
+           for s in graph["states"]):
+        index = len(getattr(ctx, "ai_machines", ()) or ()) + 1
+        inv_vars = {
+            "on": ctx.declare_var(f"_gk_inv_on_{index}", "bool",
+                                  initial="false"),
+            "done": ctx.declare_var(f"_gk_inv_done_{index}", "bool",
+                                    initial="true"),
+            # -1 = 还没到点(到点那一帧才记环顾起点);默认值不能是 0,
+            # 否则首帧 now>=0 会让"秒数填 0 立即收工"在赶路时误触发
+            "start": ctx.declare_var(f"_gk_inv_start_{index}", "float",
+                                     initial="-1.0"),
+            "base": ctx.declare_var(f"_gk_inv_base_{index}", "float",
+                                    initial="0.0"),
+            "noise": ctx.declare_var(f"_gk_inv_noise_{index}", "float",
+                                     initial=_NEVER_HEARD),
+        }
+
     # ── 听觉运行时(第四十一轮)────────────────────────────────────
     # 图里用到听觉就先把它生成出来 —— 广播方(machine['self'])得是
     # `gk_ai_hearer` 组的成员、并且有 `_gk_hear_noise` 可以被调到;
@@ -802,6 +932,8 @@ def _stmt_ai_enable(ctx, node, indent):
         "attack_timer": attack_timer,
         "enter_hooks": enter_hooks,
         "exit_hooks": exit_hooks,
+        # 第八十轮:去查看到点后的环顾状态(没有该状态时为 None)
+        "inv": inv_vars,
     })
     ctx.need_ai_process = True
 
@@ -938,12 +1070,14 @@ def _ensure_ai_hear_helper(ctx, prefix):
     """确保听觉运行时已生成,返回 (查询函数名, 位置变量名, 时间变量名)。
 
     生成的东西(都挂在**脚本所在节点**上):
-      * `{prefix}_pos` / `{prefix}_loud` / `{prefix}_at` —— 记住了什么声音;
-      * `_gk_hear_noise(at, loudness)` —— 『声音_发出噪音』广播时调它;
-        名字**固定**,因为广播方不知道听方的前缀是什么 —— 它只按
+      * `{prefix}_pos` / `{prefix}_loud` / `{prefix}_at` / `{prefix}_type`
+        —— 记住了什么声音(位置 / 响度 / 时刻 / 类型,第八十轮);
+      * `_gk_hear_noise(at, loudness, noise_type)` —— 『声音_发出噪音』广播时
+        调它;名字**固定**,因为广播方不知道听方的前缀是什么 —— 它只按
         `gk_ai_hearer` 组挨个调,所以这个函数的签名必须统一(见下面"派发器");
-      * `_gk_heard_{prefix}(host, ear, memory)` —— "听得见吗",顺带把自己
-        登记进 `gk_ai_hearer` 组(**懒登记**:不依赖 _ready 的执行顺序)。
+      * `_gk_heard_{prefix}(host, ear, memory, want_type)` —— "听得见吗",
+        顺带把自己登记进 `gk_ai_hearer` 组(**懒登记**:不依赖 _ready 的执行
+        顺序);`want_type` 非空时只认真同类型的噪音(第八十轮)。
     """
     from .expressions import ensure_position_helper
     reader = ensure_position_helper(ctx)
@@ -959,11 +1093,12 @@ def _ensure_ai_hear_helper(ctx, prefix):
     pos_var = ctx.declare_var(f"{prefix}_pos", vector, initial=zero)
     loud_var = ctx.declare_var(f"{prefix}_loud", "float", initial="0.0")
     at_var = ctx.declare_var(f"{prefix}_at", "float", initial=_NEVER_HEARD)
+    type_var = ctx.declare_var(f"{prefix}_type", "String", initial='""')
     heard_fn = f"_gk_heard_{prefix}"
 
     ctx.extra_sections.append({
         "signature": f"func {heard_fn}(host: Node, ear: float, "
-                     f"memory: float) -> bool:",
+                     f"memory: float, want_type: String) -> bool:",
         "lines": [
             # ── 懒登记(而不是写在 _ready 里)─────────────────────────
             # 谁用听觉谁自己加进组。写在 _ready 里的话得知道"哪些脚本要听",
@@ -973,6 +1108,12 @@ def _ensure_ai_hear_helper(ctx, prefix):
             f'        add_to_group("{HEAR_GROUP}")',
             f"    if {at_var} < {_NEVER_HEARD} * 0.5:",
             "        return false      # 从来没听到过任何声音",
+            # ── 按类型挑声音(第八十轮)──────────────────────────────
+            # 听方留空 = 什么都听(老图语义);填了就只认真同类型的噪音 —
+            # "玻璃碎了去查窗、脚步声不惊动"靠这一行。
+            '    if want_type != "":',
+            f"        if {type_var} != want_type:",
+            "            return false      # 最后那个声音不是我要听的类型",
             "    if memory > 0.0:",
             f"        var age := float(Time.get_ticks_msec()) * 0.001 - {at_var}",
             "        if age > memory:",
@@ -987,7 +1128,7 @@ def _ensure_ai_hear_helper(ctx, prefix):
         "empty_body": "    return false",
         "separator": True,
     })
-    made[prefix] = (heard_fn, pos_var, at_var)
+    made[prefix] = (heard_fn, pos_var, at_var, type_var)
     _rebuild_hear_dispatcher(ctx)
     return made[prefix]
 
@@ -1011,16 +1152,18 @@ def _rebuild_hear_dispatcher(ctx):
     vector, _zero = _dim_vector(ctx)
     lines = [f"    var now := float(Time.get_ticks_msec()) * 0.001"]
     for prefix in names:
-        _heard_fn, pos_var, at_var = made[prefix]
+        _heard_fn, pos_var, at_var, type_var = made[prefix]
         loud_var = ctx.declare_var(f"{prefix}_loud", "float", initial="0.0")
         lines.append(f"    {pos_var} = at")
         lines.append(f"    {loud_var} = loudness")
         lines.append(f"    {at_var} = now")
+        # 噪音类型(第八十轮):发声卡贴的标签,听方按它挑声音
+        lines.append(f"    {type_var} = noise_type")
     section = getattr(ctx, "_ai_hear_dispatcher", None)
     if section is None:
         section = {
             "signature": f"func _gk_hear_noise(at: {vector}, "
-                         f"loudness: float) -> void:",
+                         f"loudness: float, noise_type: String) -> void:",
             "lines": lines,
             "empty_body": "    pass",
             "separator": True,
@@ -1063,6 +1206,9 @@ def _stmt_noise(ctx, node, indent):
     loudness = ctx.input_number(node, "响度", "8.0")
     interval = gd_number(float(getattr(node, "gk_interval", 0.5) or 0.0))
     target = ctx.target_expr(node, "gk_target", hint="物体")
+    # 噪音类型(第八十轮):留空 = 普通噪音,听方什么都听
+    noise_type = gd_string(
+        str(getattr(node, "gk_noise_type", "") or "").strip())
     debug = bool(getattr(node, "gk_debug_print", False))
 
     # 时间戳要**跨帧**记 -> 成员变量。每个『声音_发出噪音』各占一个
@@ -1082,22 +1228,26 @@ def _stmt_noise(ctx, node, indent):
     if debug:
         ctx.add_line(indent + 1,
                      f'print("[GK 噪音] 位置=", {at}, " 响度=", {loudness},'
+                     f' " 类型=", {noise_type},'
                      f' " 听觉体=", {hearer}s.size())')
     ctx.add_line(indent + 1, f"for {hearer} in {hearer}s:")
-    # 听不听得到由**听方**自己判断(它有自己的耳朵距离和记忆时长)——
-    # 广播方只管把"哪、多大声"送到。
+    # 听不听得到由**听方**自己判断(它有自己的耳朵距离、记忆时长和类型
+    # 过滤)—— 广播方只管把"哪、多大声、什么类型"送到。
     ctx.add_line(indent + 2,
                  f'if {hearer}.has_method("_gk_hear_noise"):')
-    ctx.add_line(indent + 3, f"{hearer}._gk_hear_noise({at}, {loudness})")
+    ctx.add_line(indent + 3,
+                 f"{hearer}._gk_hear_noise({at}, {loudness}, {noise_type})")
     # ⚠ 同上:不许自己再走一遍下游(见 _stmt_ai_enable 的说明)。
 
 
 @expr_node("GKNodeAiHear")
 def _expr_ai_hear(ctx, node):
-    """『AI_听见』:距离 + 记忆 -> 布尔。"""
+    """『AI_听见』:距离 + 记忆 + 类型过滤 -> 布尔。"""
     prefix = _hear_prefix(getattr(ctx, "_ai_hear_var", "ai_state"))
-    heard_fn, _pos, _at = _ensure_ai_hear_helper(ctx, prefix)
+    heard_fn, _pos, _at, _type = _ensure_ai_hear_helper(ctx, prefix)
     self_expr = getattr(ctx, "_ai_self_expr", None) or "self"
     ear = ctx.input_number(node, "听觉距离", "0.0")
     memory = ctx.input_number(node, "记忆秒数", "3.0")
-    return f"{heard_fn}({self_expr}, {ear}, {memory})"
+    want_type = gd_string(
+        str(getattr(node, "gk_hear_type", "") or "").strip())
+    return f"{heard_fn}({self_expr}, {ear}, {memory}, {want_type})"

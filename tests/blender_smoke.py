@@ -4145,6 +4145,194 @@ def main():
         check("第七十九轮(攻击 + 进入时)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第八十轮(D 组 11+12):逃跑导航 / 噪音类型 / 去查看环顾 / 脚下响度 ----
+    # D-11   FLEE 勾寻路:背对威胁投影『逃跑距离』点交导航;没勾逐字不变。
+    # D-12①  发声卡带『类型』,听见 / 转场带『只听类型』过滤。
+    # D-12③  去查看到点后原地环顾(角度 / 秒数),环顾期 CALM 不成立。
+    # D-12②  物体物理面板的『地面响度倍率』导出成 tscn metadata,
+    #        玩法图『声音_脚下响度』射线读它,乘进跑步噪音响度。
+    try:
+        # ── 卡片 / 属性 ──────────────────────────────────────────────
+        r80_state_props = [e[0] for e in ai_nodes.GKNodeAiState.gk_prop_defs]
+        check("逃跑:状态卡有『逃跑距离』",
+              "gk_flee_distance" in r80_state_props, str(r80_state_props))
+        check("环顾:状态卡有『环顾角度』『环顾秒数』",
+              "gk_look_angle" in r80_state_props
+              and "gk_look_time" in r80_state_props)
+        r80_trans_props = [e[0] for e in ai_nodes.GKNodeAiTransition.gk_prop_defs]
+        r80_hear_props = [e[0] for e in ai_nodes.GKNodeAiHear.gk_prop_defs]
+        r80_noise_props = [e[0] for e in ai_nodes.GKNodeNoise.gk_prop_defs]
+        check("类型过滤:转场 / 听见卡有『只听类型』,发声卡有『类型』",
+              "gk_hear_type" in r80_trans_props
+              and "gk_hear_type" in r80_hear_props
+              and "gk_noise_type" in r80_noise_props)
+
+        # ── AI 图:逃跑 + 去查看 + 带类型的听见 / 安静转场 ─────────────
+        r80_ai = bpy.data.node_groups.new("听觉冒烟80", "GKGameAiTree")
+        r80_patrol = r80_ai.nodes.new("GKNodeAiState")
+        r80_patrol.name = "巡逻"
+        r80_patrol.gk_state_name = "巡逻"
+        r80_patrol.gk_behavior = "PATROL"
+        r80_patrol.gk_patrol_a = "点A"
+        r80_patrol.gk_patrol_b = "点B"
+        # 三个入口:听见玻璃回巡逻 / 环顾完回巡逻 / 逃跑安全了回巡逻
+        r80_patrol.gk_in_count = 3
+        r80_patrol.build_sockets()
+        r80_flee = r80_ai.nodes.new("GKNodeAiState")
+        r80_flee.name = "逃跑"
+        r80_flee.gk_state_name = "逃跑"
+        r80_flee.gk_behavior = "FLEE"
+        r80_flee.gk_goal = "玩家"
+        r80_flee.gk_flee_distance = 8.0
+        r80_look = r80_ai.nodes.new("GKNodeAiState")
+        r80_look.name = "去查看"
+        r80_look.gk_state_name = "去查看"
+        r80_look.gk_behavior = "INVESTIGATE"
+        r80_look.gk_look_angle = 70.0
+        r80_look.gk_look_time = 2.0
+        r80_heard = r80_ai.nodes.new("GKNodeAiTransition")
+        r80_heard.name = "听见玻璃"
+        r80_heard.gk_cond_source = "HEARD"
+        r80_heard.gk_memory = 1.2
+        r80_heard.gk_hear_type = "玻璃"
+        r80_calm = r80_ai.nodes.new("GKNodeAiTransition")
+        r80_calm.name = "安静了"
+        r80_calm.gk_cond_source = "CALM"
+        r80_calm.gk_memory = 1.2
+        r80_calm.gk_hear_type = "玻璃"
+        # 逃跑是入口状态(没人指它),补一条『安全了 -> 回岗』把三台机器串起来,
+        # 否则图解析会判巡逻 / 去查看为"孤立状态"。
+        r80_safe = r80_ai.nodes.new("GKNodeAiTransition")
+        r80_safe.name = "安全了"
+        r80_safe.gk_cond_source = "CALM"
+        r80_safe.gk_memory = 1.0
+        r80_ai.links.new(r80_patrol.outputs["转到"], r80_heard.inputs["上游"])
+        r80_ai.links.new(r80_heard.outputs["转到"], r80_look.inputs["进入"])
+        r80_ai.links.new(r80_look.outputs["转到"], r80_calm.inputs["上游"])
+        r80_ai.links.new(r80_calm.outputs["转到"], r80_patrol.inputs["进入 2"])
+        r80_ai.links.new(r80_flee.outputs["转到"], r80_safe.inputs["上游"])
+        r80_ai.links.new(r80_safe.outputs["转到"], r80_patrol.inputs["进入 3"])
+        check("听觉:图解析无问题",
+              not node_lib.ai_tree_graph(r80_ai)["problems"],
+              str(node_lib.ai_tree_graph(r80_ai)["problems"])[:300])
+
+        r80_logic = bpy.data.node_groups.new("听觉逻辑80", "GKGameLogicTree")
+        r80_event = r80_logic.nodes.new("GKNodeOnReady")
+        r80_enable = r80_logic.nodes.new("GKNodeAiEnable")
+        r80_logic.links.new(r80_event.outputs["执行"], r80_enable.inputs["执行"])
+        r80_noise = r80_logic.nodes.new("GKNodeNoise")
+        r80_noise.name = "打碎玻璃"
+        r80_noise.gk_loudness = 16.0
+        r80_noise.gk_interval = 0.2
+        r80_noise.gk_noise_type = "玻璃"
+        r80_logic.links.new(r80_enable.outputs["完成"], r80_noise.inputs["执行"])
+
+        r80_code, r80_warn = codegen.generate(
+            r80_logic, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("类型:派发器 / 听方函数都带类型,广播带上玻璃",
+              "func _gk_hear_noise(at: Vector3, loudness: float, "
+              "noise_type: String) -> void:" in r80_code
+              and 'want_type: String) -> bool:' in r80_code
+              and '._gk_hear_noise(' in r80_code
+              and ', 16.0, "玻璃")' in r80_code,
+              r80_code[-600:])
+        check("环顾:五个跨帧变量 + 70°/2 秒摆头 + CALM 门控",
+              "var _gk_inv_on_1: bool = false" in r80_code
+              and "var _gk_inv_done_1: bool = true" in r80_code
+              and "deg_to_rad(70.0) * sin(TAU *" in r80_code
+              and "and _gk_inv_done_1" in r80_code,
+              r80_code[-600:])
+        check("逃跑:没勾寻路时生成物不含导航",
+              "_gk_ai_nav_dir" not in r80_code and "flee_goal" not in r80_code)
+        check("听觉冒烟:无告警", not r80_warn, str(r80_warn)[:300])
+
+        # 勾了寻路:逃跑投影点交导航(同一棵图,只改选项)
+        r80_code_nav, r80_warn_nav = codegen.generate(
+            r80_logic, {"dimension": "3", "base_class": "CharacterBody3D",
+                        "nav_enabled": True})
+        check("逃跑:勾寻路后投影 8 米外交导航网格",
+              "_ai_flee_goal" in r80_code_nav
+              and "_gk_ai_nav_dir(" in r80_code_nav
+              and "* 8.0" in r80_code_nav,
+              r80_code_nav[-500:])
+        check("逃跑:勾寻路生成无告警", not r80_warn_nav, str(r80_warn_nav)[:300])
+
+        # ── 玩法图:脚下响度 × 噪音响度 ──────────────────────────────
+        r80_surf_logic = bpy.data.node_groups.new("脚下响度80", "GKGameLogicTree")
+        r80_se = r80_surf_logic.nodes.new("GKNodeOnReady")
+        r80_surf = r80_surf_logic.nodes.new("GKNodeSurfaceLoudness")
+        r80_surf.name = "脚下响度"
+        r80_surf.gk_distance = 3.0
+        r80_step = r80_surf_logic.nodes.new("GKNodeNoise")
+        r80_step.name = "跑步声"
+        r80_step.gk_interval = 0.2
+        r80_step.gk_noise_type = "脚步"
+        r80_surf_logic.links.new(r80_se.outputs["执行"], r80_step.inputs["执行"])
+        r80_surf_logic.links.new(r80_surf.outputs["响度倍率"],
+                                r80_step.inputs["响度"])
+        check("脚下响度:节点是射线类,每次求值都重射(gk_no_cache)",
+              bool(getattr(ai_nodes.GKNodeSurfaceLoudness, "gk_no_cache", False)))
+        r80_surf_code, r80_surf_warn = codegen.generate(
+            r80_surf_logic, {"dimension": "3", "base_class": "CharacterBody3D"})
+        check("脚下响度:3D 射线 + 读 metadata + 没地面退 1.0",
+              "func _gk_surface_loudness_3d(host: Node, dist: float) -> float:"
+              in r80_surf_code
+              and "get_world_3d().direct_space_state" in r80_surf_code
+              and 'get_meta("gk_surface_loudness", 1.0)' in r80_surf_code
+              and "_gk_surface_loudness_3d(" in r80_surf_code,
+              r80_surf_code[-600:])
+        check("脚下响度:无告警", not r80_surf_warn, str(r80_surf_warn)[:300])
+
+        # ── 各种卡片画得完 ─────────────────────────────────────────
+        r80_draw_error = ""
+        try:
+            for r80_card in (r80_flee, r80_look, r80_heard, r80_calm,
+                             r80_noise, r80_surf):
+                r80_card.draw_buttons(bpy.context, _R79Layout())
+            r80_hear_card = r80_ai.nodes.new("GKNodeAiHear")
+            r80_hear_card.draw_buttons(bpy.context, _R79Layout())
+        except Exception as exc:                       # noqa: BLE001
+            r80_draw_error = f"{type(exc).__name__}: {exc}"
+        check("第八十轮:逃跑 / 环顾 / 听见 / 发声 / 脚下响度卡片画得完",
+              not r80_draw_error, r80_draw_error)
+
+        # ── 真实物体属性 + 导出成 tscn metadata ─────────────────────
+        import shutil
+        r80_work = os.path.join(tempfile.gettempdir(), "gk_surface80")
+        shutil.rmtree(r80_work, ignore_errors=True)
+        os.makedirs(r80_work, exist_ok=True)
+        for leftover in list(bpy.context.scene.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, -1.0))
+        r80_carpet = bpy.context.active_object
+        r80_carpet.name = "地毯"
+        r80_carpet.gk_physics.surface_loudness = 0.3
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(6.0, 0.0, -1.0))
+        r80_plain = bpy.context.active_object
+        r80_plain.name = "普通地"
+        bpy.context.view_layer.update()
+        check("地面响度:默认 1.0 不导出,0.3 才导出",
+              asset_export.surface_loudness_of(r80_plain.gk_physics) is None
+              and abs(asset_export.surface_loudness_of(r80_carpet.gk_physics)
+                      - 0.3) < 1e-6)
+        asset_export.export_scene_glb(r80_work, "World")
+        r80_world_path, _r80_n = asset_export.write_world_scene(
+            r80_work, "World", scene=bpy.context.scene, dimension="3")
+        with open(r80_world_path, encoding="utf-8") as r80_handle:
+            r80_world_text = r80_handle.read()
+        check("地面响度:tscn 碰撞体上写了 metadata,普通地没写",
+              'metadata/gk_surface_loudness = 0.300000' in r80_world_text
+              and r80_world_text.count("gk_surface_loudness") == 1,
+              r80_world_text[-600:])
+
+        bpy.data.node_groups.remove(r80_surf_logic)
+        bpy.data.node_groups.remove(r80_logic)
+        bpy.data.node_groups.remove(r80_ai)
+    except Exception as exc:
+        check("第八十轮(逃跑导航 / 噪音类型 / 环顾 / 脚下响度)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

@@ -2504,6 +2504,28 @@ def _run_gltf_export(kwargs, path):
     return path, False, "重试次数用尽"
 
 
+# 脚下响度 metadata 的 key —— codegen 里 get_meta 用的必须和这里**逐字一致**。
+SURFACE_LOUDNESS_META = "gk_surface_loudness"
+
+
+def surface_loudness_of(physics):
+    """物体『地面响度倍率』该写成多少;**1.0(默认)返回 None = 不写元数据**。
+
+    绝大多数地面都是普通地面 —— 每个碰撞体都写一行 metadata 纯属噪声,
+    所以只在倍率 != 1.0 时导出。0.0(地毯 = 完全静音)是有效值,必须保留,
+    不能用 falsy 判断。
+    """
+    if physics is None:
+        return None
+    raw = getattr(physics, "surface_loudness", None)
+    if raw is None:
+        return None
+    value = float(raw)
+    if abs(value - 1.0) < 1e-6:
+        return None
+    return value
+
+
 def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
                       materials_map=None, character_model=None, file_names=None,
@@ -2896,6 +2918,13 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 if layer != "1" or mask != "1":
                     lines.append(f"collision_layer = {int(layer)}")
                     lines.append(f"collision_mask = {int(mask)}")
+                # ── 脚下响度倍率(第八十轮):触发器(Area)不写,射线不打 Area ──
+                if not getattr(physics, "is_trigger", False):
+                    loudness = surface_loudness_of(physics)
+                    if loudness is not None:
+                        lines.append(
+                            f"metadata/{SURFACE_LOUDNESS_META} = "
+                            f"{_fmt(loudness)}")
                 lines.append("")
                 shape_type_name = "CollisionShape3D" if is_3d else "CollisionShape2D"
                 lines.append(f'[node name="Collision" type="{shape_type_name}" '
@@ -2953,6 +2982,14 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             if layer != "1" or mask != "1":
                 lines.append(f"collision_layer = {int(layer)}")
                 lines.append(f"collision_mask = {int(mask)}")
+            # ── 脚下响度倍率(第八十轮);触发器(Area)不写 ──────────────
+            # 玩法图的『声音_脚下响度』往脚下射短射线,读的就是这个 metadata。
+            if not getattr(physics, "is_trigger", False):
+                loudness = surface_loudness_of(physics)
+                if loudness is not None:
+                    lines.append(
+                        f"metadata/{SURFACE_LOUDNESS_META} = "
+                        f"{_fmt(loudness)}")
             lines.append("")
             shape_type = "CollisionShape3D" if is_3d else "CollisionShape2D"
             lines.append(f'[node name="Collision" type="{shape_type}" '

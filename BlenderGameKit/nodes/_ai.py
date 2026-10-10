@@ -49,11 +49,19 @@ class GKNodeAiState(B.GKStatementNode):
               "所以这个物体必须是角色体(3D 角色 / 2D 角色),"
               "行为都是 velocity + move_and_slide 那一套。\n"
               "── 会绕墙吗 ──\n"
-              "**会**。追击 / 跟随 / 去查看 / 巡逻 / 返回 / 攻击这几个『走路』的"
-              "行为,只要**场景设置里勾了『寻路』**,就会自动走导航网格算出来"
-              "的方向(绕开墙 / 石头 / 台子)—— 不需要你再拼一个『移动_寻路』。"
-              "没勾『寻路』时它们退回**直线走**(和以前一样)。\n"
-              "⚠ 『逃跑』不走导航(它是“背对威胁跑”,没有固定目标点)。")
+              "**会**。追击 / 跟随 / 去查看 / 巡逻 / 返回 / 攻击 / 逃跑这几个"
+              "『走路』的行为,只要**场景设置里勾了『寻路』**,就会自动走导航"
+              "网格算出来的方向(绕开墙 / 石头 / 台子)—— 不需要你再拼一个"
+              "『移动_寻路』。没勾『寻路』时它们退回**直线走**(和以前一样)。\n"
+              "── 逃跑往哪逃(第八十轮)──\n"
+              "勾了『寻路』时,逃跑不是瞎跑:从自己位置朝**威胁的反方向**投影"
+              "一个『逃跑距离』外的点,沿导航网格绕着障碍逃过去"
+              "(投影点不可达时退回直线,不会站着不动)。\n"
+              "── 去查看 + 环顾(第八十轮)──\n"
+              "『去查看』走到噪音点后会**原地左右环顾**(『环顾角度』= 左右"
+              "各转多少、『环顾秒数』= 转多久);环顾期间『安静下来』不成立 ——"
+              "看完了才允许回岗。\n"
+              "⚠ 没勾『寻路』时,『逃跑』仍然是直线后退(和以前一样)。")
     gk_inputs = (
         S.pin(FLOW, "进入"),
     )
@@ -106,6 +114,16 @@ class GKNodeAiState(B.GKStatementNode):
          "『攻击』行为:离目标多近算进了攻击范围;0 = 用『停在多远』"),
         ("gk_cooldown", "float", 1.5, "冷却(秒)",
          "『攻击』行为:两次“打一下”之间至少隔多久"),
+        # ── 逃跑(第八十轮)────────────────────────────────────────
+        # 勾『寻路』时:背对威胁投影一个这么远的点,沿导航网格逃过去;
+        # 没勾寻路时这个值不用(逃跑仍然是直线后退)。
+        ("gk_flee_distance", "float", 8.0, "逃跑距离",
+         "『逃跑』+ 勾了『寻路』:朝威胁反方向投影多远的点去导航(米,默认 8)"),
+        # ── 去查看到点后环顾(第八十轮)──────────────────────────────
+        ("gk_look_angle", "float", 70.0, "环顾角度",
+         "『去查看』走到点后原地左右环顾,左右各转多少度(默认 70)"),
+        ("gk_look_time", "float", 2.0, "环顾秒数",
+         "『去查看』环顾多久;期间『安静下来』不成立,看完才回岗(默认 2 秒)"),
         ("gk_facing", "enum", "GOAL", "朝向", "走路时头朝哪", AI_FACINGS),
         # 入口数量:Blender 一个输入引脚只允许一条连线 ——
         # "巡逻"被好几条转场指着时要多开几个入口(和『动画_状态』同一个做法)
@@ -162,6 +180,12 @@ class GKNodeAiState(B.GKStatementNode):
             row = layout.row(align=True)
             row.prop(self, "gk_attack_range", text="攻击距离")
             row.prop(self, "gk_cooldown", text="冷却")
+        if behavior == "FLEE":
+            layout.prop(self, "gk_flee_distance", text="逃跑距离")
+        if behavior == "INVESTIGATE":
+            row = layout.row(align=True)
+            row.prop(self, "gk_look_angle", text="环顾角度")
+            row.prop(self, "gk_look_time", text="秒数")
 
         row = layout.row(align=True)
         row.prop(self, "gk_in_count", text="入口")
@@ -222,6 +246,13 @@ class GKNodeAiTransition(B.GKStatementNode):
          "耳朵最远能听多远;0 = 不限制(只看噪音自己的『响度』)"),
         ("gk_memory", "float", 3.0, "记忆秒数",
          "听到之后记多久 —— 也就是『去查看』能持续多久"),
+        # ── 只听哪一种噪音(第八十轮)──────────────────────────────
+        # 发声卡可以给自己贴个『类型』(脚步 / 玻璃 / 说话 …)。
+        # 这里留空 = 什么类型都听;填了就只被同类型的噪音惊动 ——
+        # 这样"玻璃碎了去查窗户、脚步声不影响"这种分工才画得出来。
+        ("gk_hear_type", "string", "", "只听类型",
+         "只被这个类型的噪音惊动(和『声音_发出噪音』的『类型』一致);"
+         "留空 = 什么都听"),
         # ── 备用下拉:连线忘了也能用(照『动画_转场』)────────────────
         ("gk_from_state", "string", "", "从状态",
          "备用:『上游』没接线时用这个(下拉里是这张图的状态)"),
@@ -252,7 +283,8 @@ class GKNodeAiTransition(B.GKStatementNode):
             row = layout.row(align=True)
             row.prop(self, "gk_ear", text="听觉距离")
             row.prop(self, "gk_memory", text="记忆秒")
-            layout.label(text="配『声音_发出噪音』用;0 = 不限距离", icon="INFO")
+            layout.prop(self, "gk_hear_type", text="只听类型")
+            layout.label(text="类型留空 = 什么都听;0 = 不限距离", icon="INFO")
         else:
             row = layout.row(align=True)
             row.label(text="目标")
@@ -354,12 +386,16 @@ class GKNodeAiHear(B.GKExpressionNode):
          "耳朵最远能听多远;0 = 不限制(只看噪音自己的『响度』)"),
         ("gk_memory", "float", 3.0, "记忆秒数",
          "听到之后记多久(秒)—— 用来做'过去看看'的持续时间"),
+        ("gk_hear_type", "string", "", "只听类型",
+         "只对这个类型的噪音算'听见'(和『声音_发出噪音』的『类型』配对);"
+         "留空 = 什么类型都听"),
     )
 
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         row.prop(self, "gk_ear", text="听觉距离")
         row.prop(self, "gk_memory", text="记忆秒")
+        layout.prop(self, "gk_hear_type", text="只听类型")
         if float(getattr(self, "gk_ear", 0.0) or 0.0) <= 0.0:
             layout.label(text="0 = 不限距离(看噪音响度)", icon="INFO")
 
@@ -406,6 +442,10 @@ class GKNodeNoise(B.GKStatementNode):
          "(0 = 每帧都发)"),
         ("gk_target", "node", TARGET_SELF, "从哪发出",
          "噪音的位置(默认脚本所在物体)"),
+        ("gk_noise_type", "string", "", "类型",
+         "给噪音贴的标签(脚步 / 玻璃 / 说话 …)。听方在『AI_听见』或"
+         "『AI_转场』的『只听类型』里填一样的词才会被惊动;留空 = 普通噪音,"
+         "谁都能听见"),
         ("gk_debug_print", "bool", False, "打印",
          "每次发声往输出面板打一行(含位置和通知了几个听觉体),调试听觉时用"),
     )
@@ -414,12 +454,61 @@ class GKNodeNoise(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_loudness", text="响度")
         row.prop(self, "gk_interval", text="间隔秒")
+        layout.prop(self, "gk_noise_type", text="类型")
         row = layout.row(align=True)
         row.label(text="从哪发出")
         B.draw_target_picker(self, row, "gk_target")
         row.prop(self, "gk_debug_print", text="", icon="CONSOLE")
         if float(getattr(self, "gk_interval", 0.5) or 0.0) <= 0.0:
             layout.label(text="间隔 0 = 每帧都发(接物理帧会刷爆)", icon="ERROR")
+
+
+@N
+class GKNodeSurfaceLoudness(B.GKExpressionNode):
+    """『声音_脚下响度』(第八十轮 D-12②):脚下地面的**响度倍率**。
+
+    潜行游戏的老规矩:地毯上跑步和铁皮上跑步,传出去的声音不该一样响。
+    艺术家在 Blender 里给地面物体的『游戏物理』面板填『地面响度倍率』,
+    导出时写进碰撞体的 metadata;这个节点运行时从角色脚下往下射一根短射线,
+    读命中碰撞体上那个倍率,拿它去乘『声音_发出噪音』的『响度』引脚
+    (中间接一个『数学_运算』MUL)。射不到地面时退回 1.0(原样响)。
+    """
+
+    bl_idname = "GKNodeSurfaceLoudness"
+    bl_label = "声音_脚下响度"
+    bl_icon = "NORMALS_FACE"
+    gk_category = "AI"
+    gk_tree_type = "GKGameLogicTree"
+    gk_doc = ("脚下踩的地面有多“响” —— 输出**响度倍率**(float)。\n"
+              "── 怎么用 ──\n"
+              "把它接到一个『数学_运算』(乘)上:**噪音基础响度 × 脚下响度**,"
+              "结果再接到『声音_发出噪音』的『响度』引脚。"
+              "这样在地毯上(0.3)跑步几乎听不到,踩铁皮(2.0)半条街都惊动。\n"
+              "── 倍率在哪配 ──\n"
+              "选中地面物体,右侧『游戏物理』面板里填『地面响度倍率』"
+              "(默认 1.0 = 普通地面,不写任何额外数据)。\n"
+              "节点从『从谁脚下』物体的位置往下射一根短射线"
+              "(『检测距离』默认 3 米),读命中碰撞体上的倍率;"
+              "脚下没地面时返回 1.0,不会把脚步声弄没。")
+    gk_inputs = (
+        S.pin(FLOAT, "检测距离", 3.0),
+    )
+    gk_input_props = {"检测距离": "gk_distance"}
+    gk_outputs = (S.pin(FLOAT, "响度倍率", 1.0),)
+    gk_prop_defs = (
+        ("gk_target", "node", TARGET_SELF, "从谁脚下",
+         "从谁的脚下往下查(默认脚本所在物体,一般就是玩家)"),
+        ("gk_distance", "float", 3.0, "检测距离",
+         "往下射多远(米)。有台阶 / 跳跃离地时调大一点"),
+    )
+    # 射线每次求值都要重新射,不能缓存表达式(同『射线_有东西吗』)。
+    gk_no_cache = True
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.label(text="从谁脚下")
+        B.draw_target_picker(self, row, "gk_target")
+        layout.prop(self, "gk_distance", text="检测距离")
 
 
 # ==========================================================================

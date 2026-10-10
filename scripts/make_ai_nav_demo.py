@@ -21,8 +21,9 @@
 | 用到的 | 在游戏里怎么看 |
 |---|---|
 | **『AI_状态』(追击)** | 敌人每帧朝玩家走;勾了寻路就绕开墙 |
+| **『AI_状态』(逃跑,第八十轮)** | 贴脸 0.9 米就转身逃:朝你反方向投影 8 米,被**第二堵墙**挡住时同样绕墙 |
 | **『AI_启用』** | 玩法图里把那张 AI 图挂到『敌人』身上 |
-| **场景设置的『寻路』** | 总开关:它决定"有没有导航网格可走" |
+| **场景设置的『寻路』** | 总开关:它决定"有没有导航网格可走"(追击 / 逃跑共用) |
 | **『编辑器侧栏』→『导出脚本』→『寻路』** | 勾上它会多烤一块导航网格 |
 
 跑法(Godot):打开 `AI寻路示例_godot` 直接 F5(想飞着看按 Tab)。
@@ -46,8 +47,17 @@ BLEND_PATH = os.path.join(OUT_DIR, "AI寻路示例.blend")
 ENEMY = "敌人"
 PLAYER = "玩家"
 WALL = "导航墙"
+FLEE_WALL = "逃跑墙"
 AI_TREE = "敌人AI"
 LOGIC_TREE = "AI寻路逻辑"
+
+# ── 逃跑(第八十轮 D-11)──────────────────────────────────────────
+# 追得太贴(0.9 米)就切『逃跑』:朝玩家反方向投影 8 米外的一个点交给导航。
+# 这堵墙横在逃跑路线上 —— 直线逃会贴墙站住,勾了寻路就该从墙端绕过去。
+FLEE_TRIGGER = 0.9     # 贴到 0.9 米内触发逃跑(小于追击停距 1.2,不会误触)
+FLEE_DISTANCE = 8.0    # 逃到 8 米外
+FLEE_STOP = 10.0       # 威胁在 10 米内就一直跑(保证能跑到投影点)
+FLEE_BACK_SIGHT = 20.0 # 拉开 20 米才算"又安全了"(探针里不会发生)
 
 # 几何(Blender:Y 轴换到 Godot 的 -Z)────────────────────────────────
 # 墙沿 Blender X 铺 5 米,厚 0.5;敌人在 Blender y=+2(Godot z=-2),
@@ -109,6 +119,11 @@ def build_scene():
     make_box("地面", (20.0, 20.0, 0.4), (0.0, 0.0, -0.2), (0.16, 0.18, 0.22, 1.0))
     make_box(WALL, (WALL_SPAN, WALL_THICK, WALL_HEIGHT),
              (0.0, 0.0, WALL_HEIGHT / 2.0), (0.55, 0.55, 0.60, 1.0))
+    # ── 逃跑墙(第八十轮):横在敌人"背对玩家"的逃跑路线上 ─────────────
+    # Blender y=+4(Godot z=-4):敌人被贴脸后朝 -z 逃 8 米,这堵墙挡路,
+    # 勾了寻路就该横着绕出 ±2.5 米墙端再折回。
+    make_box(FLEE_WALL, (WALL_SPAN, WALL_THICK, WALL_HEIGHT),
+             (0.0, 4.0, WALL_HEIGHT / 2.0), (0.60, 0.45, 0.35, 1.0))
     enemy = make_box(ENEMY, (ENEMY_SIZE, ENEMY_SIZE, 1.6), (0.0, 2.0, 0.8),
                      (0.85, 0.35, 0.35, 1.0))
     make_box(PLAYER, (0.8, 0.8, 1.6), (0.0, -2.0, 0.8),
@@ -166,22 +181,47 @@ def _link(tree, source, source_pin, target, target_pin):
 
 
 def build_ai_tree():
-    """AI 图:只有一个『追击』状态 —— 起始状态(没被任何转场指到)。
+    """AI 图:追击(显式入口)+ 逃跑。
 
     ⚠ 这里**故意不放『移动_寻路』**:整个示例要证明的是"AI 自己的移动行为
       就走导航网格"。放了寻路节点就说不清了。
+
+    第八十轮:追得太贴(0.9 米)就切『逃跑』 —— FLEE 勾了寻路后,朝威胁
+    反方向投影一个 8 米外的点交给同一条 `_gk_ai_nav_dir`,逃跑墙挡路时
+    一样绕墙。
     """
     ai = bpy.data.node_groups.new(AI_TREE, "GKGameAiTree")
     ai.use_fake_user = True
-    _add(ai, "GKNodeAiState", "追击", 0.0, 0.0,
-         gk_state_name="追击",
-         gk_behavior="CHASE",
-         gk_goal=PLAYER,
-         gk_speed=ENEMY_SPEED,
-         gk_stop_distance=STOP_DISTANCE,
-         gk_facing="GOAL")
-    log(f"AI 图『{AI_TREE}』:一个『追击』状态(目标 = {PLAYER},"
-        f" 速度 {ENEMY_SPEED} 米/秒)")
+    start = _add(ai, "GKNodeAiStart", "开始", -420.0, 0.0)
+    chase = _add(ai, "GKNodeAiState", "追击", 0.0, 0.0,
+                 gk_state_name="追击",
+                 gk_behavior="CHASE",
+                 gk_goal=PLAYER,
+                 gk_speed=ENEMY_SPEED,
+                 gk_stop_distance=STOP_DISTANCE,
+                 gk_facing="GOAL")
+    flee = _add(ai, "GKNodeAiState", "逃跑", 420.0, 0.0,
+                gk_state_name="逃跑",
+                gk_behavior="FLEE",
+                gk_goal=PLAYER,
+                gk_speed=ENEMY_SPEED,
+                gk_stop_distance=FLEE_STOP,
+                gk_flee_distance=FLEE_DISTANCE,
+                gk_facing="GOAL")
+    too_close = _add(ai, "GKNodeAiTransition", "贴脸了", 210.0, 200.0,
+                     gk_cond_source="SEE", gk_goal=PLAYER,
+                     gk_sight=FLEE_TRIGGER)
+    safe_again = _add(ai, "GKNodeAiTransition", "又安全了", 630.0, -220.0,
+                      gk_cond_source="LOST", gk_goal=PLAYER,
+                      gk_sight=FLEE_BACK_SIGHT)
+    _link(ai, start, "开始", chase, "进入")
+    _link(ai, chase, "转到", too_close, "上游")
+    _link(ai, too_close, "转到", flee, "进入")
+    _link(ai, flee, "转到", safe_again, "上游")
+    _link(ai, safe_again, "转到", chase, "进入 2")
+    log(f"AI 图『{AI_TREE}』:追击 --贴脸({FLEE_TRIGGER:g} 米)--> 逃跑"
+        f"(投影 {FLEE_DISTANCE:g} 米,走导航绕开『{FLEE_WALL}』)"
+        f" --拉开 {FLEE_BACK_SIGHT:g} 米--> 追击")
     return ai
 
 
