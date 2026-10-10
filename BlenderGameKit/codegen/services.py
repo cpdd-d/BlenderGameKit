@@ -403,6 +403,18 @@ def _stmt_scare(ctx, node, indent):
 #   "存档_写入"是廉价的，"存档_保存"才是真正写文件的那一次。
 _SAVE_DATA_VAR = "_gk_save_data"
 
+# ── 防改档(第九十三轮)───────────────────────────────────────────
+# 『存档_保存』勾了『防改档』之后,落盘的是一层"信封":
+#     {"gk_check": "<sha256>", "gk_data": "<原来的 JSON 文本>"}
+# 这里存的是生成脚本里那个常量名 + 它的值。
+#
+# ⚠ 盐是**公开常量**,不承担保密职责 —— 它挡的是"玩家顺手打开记事本
+# 把 100 改成 9999"这一类改档:改完数值还得知道格式、自己重算一遍
+# sha256,才写得回去。**不是防破解**:客户端存档就在玩家机器上,
+# 这是它的本质限制(节点手册 / README 里也这么写明)。
+_SAVE_SALT_CONST = "_GK_SAVE_SALT"
+_SAVE_SALT = "blendergamekit-save-v1"
+
 
 def _save_dict(ctx):
     """声明(不初始化)存档字典成员变量。"""
@@ -480,12 +492,23 @@ def _stmt_save_get(ctx, node, indent):
 
 @stmt_node("GKNodeSaveWrite")
 def _stmt_save_write(ctx, node, indent):
+    """『存档_保存』:把内存里的字典写进磁盘。
+
+    ── 防改档(第九十三轮)────────────────────────────────────────
+    卡片上勾『防改档』-> 这次写盘带校验和(信封格式,见 `_SAVE_SALT_CONST`
+    那段的说明)。开关**逐节点**生效:同一个图里"这个槽防、那个槽不防"
+    是允许的 —— 读侧自描述,两种格式都能读回。没勾的节点生成物一字不变。
+    """
     data = _save_dict(ctx)
     path = ctx.declare_var("_gk_save_path", "String")
     slot = getattr(node, "gk_slot", "save1")
+    verify = bool(getattr(node, "gk_save_verify", False))
     _ensure_save_block(ctx, data, path, slot, indent)
+    if verify:
+        # 只有真的勾了才置位:没勾的老图照旧生成"不带校验"的那一套辅助函数
+        ctx.need_save_verify = True
     ctx.add_line(indent, f"{path} = _gk_save_file({gd_string(slot)})")
-    ctx.add_line(indent, f"_gk_write_save({path}, {data})")
+    ctx.add_line(indent, f"_gk_write_save({path}, {data}{', true' if verify else ''})")
 
 
 @stmt_node("GKNodeSaveLoad")

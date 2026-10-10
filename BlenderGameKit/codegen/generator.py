@@ -14,7 +14,8 @@ from .animation import (_anim_category_table, _emit_blend_update,
 from .ai import _emit_ai_graph
 from .camera import _path_name
 from .services import (_FILTER_SHADER_CONST, _GD_FILTER_SHADER,
-                       _GD_VIGNETTE_SHADER, _VIGNETTE_SHADER_CONST)
+                       _GD_VIGNETTE_SHADER, _SAVE_SALT, _SAVE_SALT_CONST,
+                       _VIGNETTE_SHADER_CONST)
 from .context import GenContext
 
 
@@ -927,37 +928,96 @@ class Generator:
                 ],
                 "empty_body": "    pass",
             })
-            sections.append({
-                "signature": "func _gk_read_save(path: String) -> Dictionary:",
-                "lines": [
-                    "    if not FileAccess.file_exists(path):",
-                    "        return {}",
-                    "    var file := FileAccess.open(path, FileAccess.READ)",
-                    "    if file == null:",
-                    '        push_warning("存档打不开: " + path)',
-                    "        return {}",
-                    "    var text := file.get_as_text()",
-                    "    file.close()",
-                    "    var parsed: Variant = JSON.parse_string(text)",
-                    "    if parsed is Dictionary:",
-                    "        return parsed",
-                    '    push_warning("存档内容不是合法 JSON: " + path)',
-                    "    return {}",
-                ],
-                "empty_body": "    pass",
-            })
-            sections.append({
-                "signature": "func _gk_write_save(path: String, data: Dictionary) -> void:",
-                "lines": [
-                    "    var file := FileAccess.open(path, FileAccess.WRITE)",
-                    "    if file == null:",
-                    '        push_warning("存档写不进去: " + path)',
-                    "        return",
-                    "    file.store_string(JSON.stringify(data))",
-                    "    file.close()",
-                ],
-                "empty_body": "    pass",
-            })
+            if self.ctx.need_save_verify:
+                # ── 防改档(第九十三轮)────────────────────────────────
+                # 勾了『防改档』的存档落盘时多一层"信封":
+                #     {"gk_check": "<sha256>", "gk_data": "<原来的 JSON 文本>"}
+                # ⚠ 哈希算在 **gk_data 的原文本**上(不是把它当嵌套对象再
+                # stringify 一遍):JSON 往返会把 int 变成 float、还可能动
+                # 键序,重新序列化后哈希对不上,好档会被误判成"被改过"。
+                # 读侧**自描述**:认得信封就校验,没勾的裸 JSON(老存档)
+                # 原样读 —— 这行"老档继续能读"就是靠它。
+                check_expr = (f'(payload + "|" + {_SAVE_SALT_CONST})'
+                              f'.sha256_text()')
+                sections.append({
+                    "signature": "func _gk_read_save(path: String) -> Dictionary:",
+                    "lines": [
+                        "    if not FileAccess.file_exists(path):",
+                        "        return {}",
+                        "    var file := FileAccess.open(path, FileAccess.READ)",
+                        "    if file == null:",
+                        '        push_warning("存档打不开: " + path)',
+                        "        return {}",
+                        "    var text := file.get_as_text()",
+                        "    file.close()",
+                        "    var parsed: Variant = JSON.parse_string(text)",
+                        "    if parsed is Dictionary:",
+                        "        var box: Dictionary = parsed",
+                        '        if box.has("gk_check"):',
+                        '            var payload := str(box.get("gk_data"))',
+                        f'            if {check_expr} != str(box.get("gk_check")):',
+                        '                push_warning("存档校验不过(文件被改过?): " + path)',
+                        "                return {}",
+                        "            var inner: Variant = JSON.parse_string(payload)",
+                        "            if inner is Dictionary:",
+                        "                return inner",
+                        '            push_warning("存档内容不是合法 JSON: " + path)',
+                        "            return {}",
+                        "        return box",
+                        '    push_warning("存档内容不是合法 JSON: " + path)',
+                        "    return {}",
+                    ],
+                    "empty_body": "    pass",
+                })
+                sections.append({
+                    "signature": "func _gk_write_save(path: String, data: Dictionary, verify: bool = false) -> void:",
+                    "lines": [
+                        "    var file := FileAccess.open(path, FileAccess.WRITE)",
+                        "    if file == null:",
+                        '        push_warning("存档写不进去: " + path)',
+                        "        return",
+                        "    if verify:",
+                        "        var payload := JSON.stringify(data)",
+                        f'        var box := {{"gk_check": {check_expr}, "gk_data": payload}}',
+                        "        file.store_string(JSON.stringify(box))",
+                        "    else:",
+                        "        file.store_string(JSON.stringify(data))",
+                        "    file.close()",
+                    ],
+                    "empty_body": "    pass",
+                })
+            else:
+                sections.append({
+                    "signature": "func _gk_read_save(path: String) -> Dictionary:",
+                    "lines": [
+                        "    if not FileAccess.file_exists(path):",
+                        "        return {}",
+                        "    var file := FileAccess.open(path, FileAccess.READ)",
+                        "    if file == null:",
+                        '        push_warning("存档打不开: " + path)',
+                        "        return {}",
+                        "    var text := file.get_as_text()",
+                        "    file.close()",
+                        "    var parsed: Variant = JSON.parse_string(text)",
+                        "    if parsed is Dictionary:",
+                        "        return parsed",
+                        '    push_warning("存档内容不是合法 JSON: " + path)',
+                        "    return {}",
+                    ],
+                    "empty_body": "    pass",
+                })
+                sections.append({
+                    "signature": "func _gk_write_save(path: String, data: Dictionary) -> void:",
+                    "lines": [
+                        "    var file := FileAccess.open(path, FileAccess.WRITE)",
+                        "    if file == null:",
+                        '        push_warning("存档写不进去: " + path)',
+                        "        return",
+                        "    file.store_string(JSON.stringify(data))",
+                        "    file.close()",
+                    ],
+                    "empty_body": "    pass",
+                })
             sections.append({
                 "signature": "func _gk_delete_save(slot: String) -> void:",
                 "lines": [
@@ -2501,6 +2561,14 @@ class Generator:
         if ctx.need_screen_vignette and _GD_VIGNETTE_SHADER not in out:
             out.append("# ---- 暗角着色器(由『屏幕_暗角』节点使用)----")
             out.append(f'const {_VIGNETTE_SHADER_CONST} := """{_GD_VIGNETTE_SHADER}"""')
+            out.append("")
+
+        # 存档校验用的盐(第九十三轮):只有勾了『防改档』才生成 ——
+        # 没勾的老图一个字都不多。⚠ 它是公开常量,挡的是"顺手改记事本",
+        # 不是防破解(客户端存档的本质限制,README / 节点手册里写明)。
+        if ctx.need_save_verify:
+            out.append("# ---- 存档校验用的盐(『存档_保存』勾了『防改档』时使用)----")
+            out.append(f"const {_SAVE_SALT_CONST} := {gd_string(_SAVE_SALT)}")
             out.append("")
 
         if ctx.input_actions:

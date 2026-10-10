@@ -19,6 +19,9 @@
 
 **跨关的数据**(纸条数)走**存档**:教室拾满时 `存档_保存` 落盘,
 楼梯间开局 `存档_载入` + `存档_读取到变量` 读回来,门口按时判"够不够 3 张"。
+两处『存档_保存』都勾了**『防改档』**(第九十三轮):落盘是带校验和的信封,
+玩家手改文件就当没存档;探针里专门有两趟 —— 读回生成代码自己写的信封、
+塞一份改过的档验证被拒(`check_horror_demo.py` 的 HORROR_ENVELOPE / HORROR_TAMPER)。
 
 按键:标题页点『开始游戏』/ 游戏里 WASD 移动 / 空格 跳 / 鼠标转视角 /
 C·V 切机位 / Tab 上帝机 / **按住 K 弄出动静** / 门口按 **1 或 2** 选结局。
@@ -580,7 +583,7 @@ def build_room_logic(scene, player):
     write = _add(logic, "GKNodeSaveSet", "存纸条数", 160.0, -420.0,
                  gk_key="纸条数")
     save = _add(logic, "GKNodeSaveWrite", "保存纸条数", 380.0, -420.0,
-                gk_slot="save1")
+                gk_slot="save1", gk_save_verify=True)
     change = _add(logic, "GKNodeChangeScene", "去走廊", 600.0, -420.0,
                   gk_scene_path=CORRIDOR_RES)
     _link(logic, read, "值", write, "值")
@@ -749,7 +752,7 @@ def build_stairs_logic(scene, player):
         write = _add(logic, "GKNodeSaveSet", f"写结局{number}", 1340.0, y,
                      gk_key="结局")
         save = _add(logic, "GKNodeSaveWrite", f"保存{number}", 1580.0, y,
-                    gk_slot="save1")
+                    gk_slot="save1", gk_save_verify=True)
         text = _add(logic, "GKNodeUiText", f"结局文字{number}", 1820.0, y,
                     gk_text=f"结局:{label}", gk_x=18.0, gk_y=60.0, gk_size=26)
         # 演完停 3 秒让玩家看清,再回标题页(一段可循环的短篇)

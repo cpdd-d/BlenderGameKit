@@ -5242,6 +5242,50 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第九十三轮:存档『防改档』(校验和 + 自描述读档)----------------
+    # 属性只能在真 Blender 里验:名字 / 类型写错 -> 卡片画不出来,
+    # 而且默认值必须是 False(老 .blend 里没存过这个属性时也回落到关,
+    # 这样老图重新导出一个字都不变)。
+    try:
+        r93_tree = bpy.data.node_groups.new("存档防改档冒烟", "GKGameLogicTree")
+        r93_ready = r93_tree.nodes.new("GKNodeOnReady")
+        r93_set = r93_tree.nodes.new("GKNodeSaveSet")
+        r93_set.gk_key = "hp"
+        r93_save = r93_tree.nodes.new("GKNodeSaveWrite")
+        r93_save.gk_slot = "save1"
+        check("第九十三轮:『存档_保存』默认不勾『防改档』",
+              r93_save.gk_save_verify is False)
+        for source, pin, target, target_pin in (
+                (r93_ready, "执行", r93_set, "执行"),
+                (r93_set, "完成", r93_save, "执行")):
+            r93_tree.links.new(source.outputs[pin], target.inputs[target_pin])
+        r93_plain, r93_plain_warnings = codegen.generate(r93_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D"})
+        check("第九十三轮:没勾时生成物与老版本一致(无盐 / 无校验)",
+              "sha256_text" not in r93_plain
+              and "_GK_SAVE_SALT" not in r93_plain
+              and "gk_check" not in r93_plain
+              and "_gk_write_save(_gk_save_path, _gk_save_data)" in r93_plain,
+              str(r93_plain_warnings))
+        r93_save.gk_save_verify = True
+        r93_guarded, r93_guard_warnings = codegen.generate(r93_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D"})
+        check("第九十三轮:勾了『防改档』-> 信封 + 校验读档",
+              'const _GK_SAVE_SALT := "blendergamekit-save-v1"' in r93_guarded
+              and "sha256_text()" in r93_guarded
+              and '"gk_check"' in r93_guarded
+              and "_gk_write_save(_gk_save_path, _gk_save_data, true)"
+              in r93_guarded
+              and 'if box.has("gk_check"):' in r93_guarded,
+              str(r93_guard_warnings))
+        check("第九十三轮:雷同的调用点只差一个 true(别的字都没动)",
+              r93_guarded.replace(", true)", ")").count("_gk_write_save(_gk_save_path, _gk_save_data)")
+              == r93_plain.count("_gk_write_save(_gk_save_path, _gk_save_data)"))
+        bpy.data.node_groups.remove(r93_tree)
+    except Exception as exc:
+        check("第九十三轮(存档防改档)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

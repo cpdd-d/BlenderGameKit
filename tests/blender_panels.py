@@ -657,6 +657,33 @@ def main():
         check("AI 建议卡片的批量按钮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6f. 『存档_保存』的卡片(第九十三轮:多了一个『防改档』勾选框)----
+    # 存档卡片上原来只有『存档槽』一个输入框,现在多一行勾选框 ——
+    # 属性名写错 / 参数配错在 Blender 里是**当场抛异常、卡片整块消失**,
+    # 冒烟那层看到的是"节点在、代码也对",唯独看不见画的事。
+    print("=" * 72)
+    print("6f. 『存档_保存』卡片(防改档勾选框)")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟存档93", "GKGameLogicTree")
+        save = tree.nodes.new("GKNodeSaveWrite")
+        card_error = ""
+        try:
+            layout = RecordingLayout()
+            save.draw_buttons(bpy.context, layout)
+        except Exception as exc:                          # noqa: BLE001
+            card_error = f"{type(exc).__name__}: {exc}"
+        check("『存档_保存』卡片的 draw_buttons 能画完", not card_error,
+              card_error)
+        check("『存档_保存』卡片画出了『防改档』勾选框",
+              not card_error and "防改档(存校验和)" in layout.texts,
+              str(layout.texts)[:200])
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『存档_保存』卡片(防改档勾选框)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

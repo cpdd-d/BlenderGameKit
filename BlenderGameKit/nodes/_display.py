@@ -1079,15 +1079,21 @@ class GKNodeSaveWrite(B.GKStatementNode):
     bl_label = "存档_保存"
     bl_icon = "FILE_TICK"
     gk_category = "存档"
-    gk_doc = "把内存里的存档数据写进磁盘文件(user:// 目录下)"
+    gk_doc = ("把内存里的存档数据写进磁盘文件(user:// 目录下)。"
+              "勾『防改档』后存档带校验和:玩家改过文件就当没存档,"
+              "老存档(不带校验的)仍能照常读")
     gk_inputs = (S.pin(FLOW, "执行"),)
 
     gk_prop_defs = (
         ("gk_slot", "string", "save1", "存档槽", "不同槽位互不影响，做多存档用"),
+        ("gk_save_verify", "bool", False, "防改档",
+         "存档带校验和：文件被手改过就当没有存档（防改数值，不防破解；"
+         "老存档不受影响）"),
     )
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_slot", text="")
+        layout.prop(self, "gk_save_verify", text="防改档(存校验和)")
 
 
 @N

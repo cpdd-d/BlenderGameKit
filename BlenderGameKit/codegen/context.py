@@ -178,6 +178,11 @@ class GenContext:
         self.need_layer_player = False
         # 只有真的用了存档节点才生成那几个读写文件的辅助函数
         self.need_save_helpers = False
+        # 存档防改档(第九十三轮):任一『存档_保存』勾了『防改档』才置位。
+        # 置位后多生成两样东西:脚本头的盐常量 + 带校验的读写辅助函数
+        # (读侧自描述 —— 没有 gk_check 的裸 JSON 老存档照旧读)。
+        # 一个都没勾时逐字保持老样子,老图生成物一行都不变。
+        self.need_save_verify = False
         # 只有真的用了『物理_启用碰撞』才生成 _gk_set_collision()
         # (用户 2026-10-05)—— 见 generator 里那段说明。
         self.need_collision_helper = False

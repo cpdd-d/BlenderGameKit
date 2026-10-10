@@ -1085,6 +1085,95 @@ class TestSaveNodes(Base):
         self.assertIn("remove_absolute", code)
 
 
+class TestRound93SaveVerify(Base):
+    """第九十三轮:『存档_保存』的『防改档』(存档校验和)。
+
+    勾上之后落盘是一层"信封"(gk_check + gk_data 文本),读档**自描述** ——
+    认得信封就校验,裸 JSON(老存档)原样读;一个都没勾的图生成物逐字不变。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_verify_off_keeps_old_output(self):
+        """没勾『防改档』-> 一个字都不多(老图生成物不变)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveWrite, "保存", gk_slot="save1",
+                             gk_save_verify=False)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("sha256_text", code)
+        self.assertNotIn("gk_check", code)
+        self.assertNotIn("_GK_SAVE_SALT", code)
+        self.assertIn("func _gk_write_save(path: String, data: Dictionary) -> void:",
+                      code)
+        self.assertIn("_gk_write_save(_gk_save_path, _gk_save_data)", code)
+        self.assert_indent_sane(code)
+
+    def test_verify_on_writes_envelope(self):
+        """勾上 -> 盐常量 + 校验读写 + 调用点带 true。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveWrite, "保存", gk_slot="save1",
+                             gk_save_verify=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('const _GK_SAVE_SALT := "blendergamekit-save-v1"', code)
+        self.assertIn('(payload + "|" + _GK_SAVE_SALT).sha256_text()', code)
+        self.assertIn('"gk_check"', code)
+        self.assertIn('"gk_data"', code)
+        self.assertIn("_gk_write_save(_gk_save_path, _gk_save_data, true)", code)
+        self.assertIn("func _gk_write_save(path: String, data: Dictionary, "
+                      "verify: bool = false) -> void:", code)
+        # 校验不过 -> 当没有存档(空字典),并给一条可读的告警
+        self.assertIn("存档校验不过", code)
+        self.assertIn("return {}", code)
+        self.assert_indent_sane(code)
+
+    def test_reader_reads_plain_old_save(self):
+        """读档自描述:没有 gk_check 的裸 JSON(老存档)原样读回来。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveWrite, "保存", gk_slot="save1",
+                             gk_save_verify=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn('if box.has("gk_check"):', code)
+        # 裸 JSON 那条路:原样返回解析出来的字典(老档继续能读)
+        self.assertIn("return box", code)
+
+    def test_verify_flag_is_per_node(self):
+        """开关逐节点生效:同图里一个防一个不防,调用点各按各的写。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        guarded = tree.new_node(NN.GKNodeSaveWrite, "防改档的", gk_slot="save1",
+                                gk_save_verify=True)
+        plain = tree.new_node(NN.GKNodeSaveWrite, "不防的", gk_slot="slotB",
+                              gk_save_verify=False)
+        gk_stub.connect(tree, event, "执行", guarded, "执行")
+        gk_stub.connect(tree, guarded, "完成", plain, "执行")
+        code, _ = gen(tree, V2)
+        calls = [line.strip() for line in code.splitlines()
+                 if line.strip().startswith("_gk_write_save(")]
+        self.assertIn("_gk_write_save(_gk_save_path, _gk_save_data, true)", calls)
+        self.assertIn("_gk_write_save(_gk_save_path, _gk_save_data)", calls)
+
+    def test_load_only_graph_has_no_salt(self):
+        """只载入不保存的图不生成盐 / 校验 —— 老图一行都不多。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeSaveLoad, "载入", gk_slot="save1")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_GK_SAVE_SALT", code)
+        self.assertNotIn("sha256_text", code)
+        self.assertIn("func _gk_read_save(path: String) -> Dictionary:", code)
+        self.assertNotIn('box.has("gk_check")', code)
+
+
 class TestScreenEffectNodes(Base):
     def _ready(self, tree, name="准备"):
         return tree.new_node(NN.GKNodeOnReady, name)

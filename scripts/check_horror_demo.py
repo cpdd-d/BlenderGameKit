@@ -15,7 +15,11 @@
   2. 走廊:AI 在巡逻、紧张度远低近高 + 心跳建起来、走过惊吓区 ->
      相机在震 + Master 被压低;
   3. 楼梯间:**先写一份"纸条数 = 3"的存档**(模拟第一关存过),再走到门口
-     -> 弹出结局选择 -> 按 2 -> `结局` = 2 且真的落盘。
+     -> 弹出结局选择 -> 按 2 -> `结局` = 2 且真的落盘
+     (落的是**带校验的信封** —— 第九十三轮『防改档』);
+  4. 『防改档』两趟(第九十三轮):读回上一趟**生成代码自己写下**的信封
+     (往返通);塞一份**被手改过**的档(哈希对不上)-> 当没有存档:
+     纸条数回默认 0、门口不放行。
 
 另外还会查脚本里的**跨幕证据**:标题有 `change_scene_to_file` + `教室.tscn`,
 教室有运镜曲线(`_gk_cam_fly_curve`)+ 切走廊,走廊切楼梯间,楼梯间有读档 +
@@ -280,7 +284,63 @@ func _physics_process(delta: float) -> void:
 				print("HORROR_ENDING ended=", _var("结局"),
 					" saved=", FileAccess.file_exists("user://gk_save1.json"),
 					" picked=", _var("_gk_choice_picked"))
+				# 第九十三轮:落盘的该是**带校验的信封**(gk_check 在文件里)
+				print("HORROR_SAVE_FORMAT check=",
+					FileAccess.get_file_as_string("user://gk_save1.json"
+						).contains("gk_check"))
 				print("HORROR_STAIRS_DONE")
+				set_physics_process(false)
+				get_tree().quit()
+''' % {"stairs": STAIRS_SCENE}
+
+# ── 第九十三轮『防改档』:两趟补充探针 ──────────────────────────────
+# 上面那趟楼梯间验证的是**老存档(裸 JSON)照旧能读**;这里把另外两件事
+# 钉死:①生成代码自己写的信封,自己读得回来(往返);②被手改过的信封
+# (哈希对不上)当没有存档 —— 纸条数回默认 0、门口不放行。
+PROBE_ENVELOPE = PROBE_HEAD + '''
+
+func _ready() -> void:
+	# ⚠ **不**预先写档:读的就是上一趟楼梯间用生成代码写下的那个信封。
+	#   读得回来 = "自己写的档自己认得"(哈希算在原文上,不走重新序列化)。
+	_boot("%(stairs)s", "楼梯间玩家", "")
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	if phase == 0 and elapsed >= 0.5:
+		phase = 1
+		print("HORROR_ENVELOPE notes=", _var("纸条数"))
+		set_physics_process(false)
+		get_tree().quit()
+''' % {"stairs": STAIRS_SCENE}
+
+PROBE_TAMPER = PROBE_HEAD + '''
+
+func _ready() -> void:
+	# 手改过的档:格式还像那么回事,但 gk_check 是假哈希(模拟"在记事本里
+	# 把 3 改成 9999"—— 数值一动手写的那串哈希就对不上了)。
+	var file := FileAccess.open("user://gk_save1.json", FileAccess.WRITE)
+	if file != null:
+		file.store_string('{"gk_check": "0000deadbeef", "gk_data": "{\\"纸条数\\": 9999}"}')
+		file.close()
+	_boot("%(stairs)s", "楼梯间玩家", "")
+	_find_areas(["门口"])
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
+	match phase:
+		0:
+			if elapsed >= 0.2:
+				phase = 1
+				_put_at("门口")
+		1:
+			if elapsed >= 1.0:
+				phase = 2
+				var panel = _var("_gk_choice_panel")
+				print("HORROR_TAMPER notes=", _var("纸条数"),
+					" panel=", panel != null and panel.visible)
+				print("HORROR_TAMPER_DONE")
 				set_physics_process(false)
 				get_tree().quit()
 ''' % {"stairs": STAIRS_SCENE}
@@ -355,6 +415,11 @@ def _code_checks(problems):
             ("res://scenes/走廊.tscn", "教室切到走廊的路径"),
             ("_gk_write_save(", "教室把纸条数落盘"),
             ('_gk_save_data["纸条数"]', "纸条数写进存档"),
+            # 『防改档』(第九十三轮):教室的保存勾了勾选框 -> 信封 + 盐
+            ("sha256_text", "存档校验和(防改档)"),
+            ('"gk_check"', "带校验的信封格式"),
+            ("_gk_write_save(_gk_save_path, _gk_save_data, true)",
+             "防改档的写盘调用"),
             # 开场曲线运镜(第七十轮):曲线采样成 Curve3D 资源,相机沿它飞
             ("_gk_cam_fly_curve", "开场运镜的曲线轨道"),
             ("res://curves/", "运镜曲线资源(res://curves/)"),
@@ -378,6 +443,10 @@ def _code_checks(problems):
             ("match _gk_choice_picked:", "结局选择的分支 match"),
             ("gk_choice_input_event(event)", "数字键 1~6 也能选"),
             ("_gk_write_save(", "结局落盘"),
+            # 『防改档』(第九十三轮):结局保存也勾了 -> 写的是信封,
+            # 读档自描述(`if box.has("gk_check")` + 裸 JSON 兜底)
+            ("sha256_text", "存档校验和(防改档)"),
+            ('if box.has("gk_check"):', "读档自描述(认信封)"),
             ("res://scenes/标题.tscn", "演完切回标题页"),
             ("await", "结局停留(等待_秒)"),
         ),
@@ -560,8 +629,39 @@ def main():
                         + _grab(stairs, r"HORROR_ENDING[^\n]*"))
     elif ending.group(2) != "true":
         problems.append("结局没有落盘: " + ending.group(0))
+    envelope_form = re.search(r"HORROR_SAVE_FORMAT check=(\w+)", stairs)
+    if not envelope_form or envelope_form.group(1) != "true":
+        problems.append("结局落盘的不是带校验的信封(『防改档』没生效): "
+                        + _grab(stairs, r"HORROR_SAVE_FORMAT[^\n]*"))
     if "HORROR_STAIRS_DONE" not in stairs:
         problems.append("楼梯间探针没跑完")
+
+    # ── 第九十三轮『防改档』:信封往返 + 改档被拒 ─────────────────────
+    # 顺序有关系:楼梯间那趟刚用**生成代码**写下信封,下一趟接着读它。
+    envelope = _run_probe(args.godot, "probe_envelope", PROBE_ENVELOPE,
+                          "HorrorEnvelopeProbe", 600)
+    _errors(envelope, problems)
+    back = re.search(r"HORROR_ENVELOPE notes=([\d.]+)", envelope)
+    if not back or float(back.group(1)) != 3.0:
+        problems.append("自己写的带校验存档读不回来(信封往返断了): "
+                        + _grab(envelope, r"HORROR_ENVELOPE[^\n]*"))
+
+    tamper = _run_probe(args.godot, "probe_tamper", PROBE_TAMPER,
+                        "HorrorTamperProbe", 600)
+    _errors(tamper, problems)
+    broke = re.search(r"HORROR_TAMPER notes=([\d.]+) panel=(\w+)", tamper)
+    if not broke:
+        problems.append("改档那趟没跑出结论行: "
+                        + _grab(tamper, r"HORROR_TAMPER[^\n]*"))
+    else:
+        if float(broke.group(1)) != 0.0:
+            problems.append("被改过的存档没被拒(纸条数该回默认 0): "
+                            + broke.group(0))
+        if broke.group(2) != "false":
+            problems.append("被改过的存档还放行了(门口不该弹结局选择): "
+                            + broke.group(0))
+    if "HORROR_TAMPER_DONE" not in tamper:
+        problems.append("改档探针没跑完")
 
     # ── 生成物层面的证据 ────────────────────────────────────────────
     _code_checks(problems)
