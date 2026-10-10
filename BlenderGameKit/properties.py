@@ -1123,13 +1123,18 @@ def _on_function_decl_changed(self, _context):
     参数从 1 个改成 3 个时,『函数_调用』上的参数框必须跟着变 ——
     不重长的话用户"改了声明却看不到变化",以为没生效(和『定时_时间轴』
     改轨道数要立刻长引脚同一个道理)。
+
+    ⚠ 用 `rebuild_sockets` 而不是 `build_sockets`(第八十九轮):前者
+    按**引脚名字**把连线记下来、重建完再接回去 —— 改名字时参数引脚
+    名字没变,已经接好的实参线不会断(见 node_base.rebuild_sockets 的说明)。
     """
     tree = getattr(self, "id_data", None)
     for node in getattr(tree, "nodes", ()) or ():
         if getattr(node, "bl_idname", "") not in ("GKNodeFunctionCall",
                                                   "GKNodeFunctionDefine"):
             continue
-        builder = getattr(node, "build_sockets", None)
+        builder = (getattr(node, "rebuild_sockets", None)
+                   or getattr(node, "build_sockets", None))
         if callable(builder):
             try:
                 builder()
@@ -1261,6 +1266,75 @@ def tree_functions(tree):
             "bad_types": bad_types,
         }
     return out
+
+
+# 引用函数的两种节点(『函数_定义』接函数体 / 『函数_调用』叫它)。
+FUNCTION_NODE_IDS = ("GKNodeFunctionDefine", "GKNodeFunctionCall")
+
+
+def function_usages(tree):
+    """图里每个函数名被引用了几次 -> {名字: {"defines": n, "calls": n}}。
+
+    ── 为什么要有它(第八十九轮)────────────────────────────────────
+    侧栏『函数』框原来写的是 `被调用 {1 if name in called else 0} 次` ——
+    不管调用几次都显示 1(实测截图对不上)。次数得**真数节点**;
+    顺带把"同名定义了 2 个"也数出来(导出只保留第一个,是静默丢逻辑)。
+
+    键是**图里出现过的**名字(含没声明的)—— 调用方拿 `tree_functions`
+    的名字去比对,就能发现"引用了但没声明"(改名 / 拼错的遗留)。
+    """
+    table = {}
+    for node in getattr(tree, "nodes", ()) or ():
+        kind = getattr(node, "bl_idname", "")
+        if kind not in FUNCTION_NODE_IDS:
+            continue
+        name = str(getattr(node, "gk_func_name", "") or "").strip()
+        if not name:
+            continue
+        entry = table.setdefault(name, {"defines": 0, "calls": 0})
+        entry["defines" if kind == "GKNodeFunctionDefine" else "calls"] += 1
+    return table
+
+
+def rename_function_refs(tree, old, new):
+    """改函数声明名时,把图里指着老名字的地方全带过去(第八十九轮)。
+
+    带两样:
+      * 『函数_定义』『函数_调用』节点上的 `gk_func_name`;
+      * 变量『读→/写→』里绑的 getter/setter(它们存的是**函数名**)。
+
+    ── 顺序要求(调用方看这里)────────────────────────────────────
+    先调本函数,**再**改函数声明的名字 —— 声明一改会触发
+    `_on_function_decl_changed`,那时节点名字已经是新的,引脚能按新名
+    正确重长,而且走的是**按名还原连线**的 `rebuild_sockets`,已接好的
+    参数实参线不会断。反过来先改声明:重长那一刻节点还指着老名字,
+    参数引脚会消失,线就真断了。
+    返回改了几处。名字没变 / 空名字直接返回 0。
+    """
+    old = str(old or "").strip()
+    new = str(new or "").strip()
+    if not old or not new or old == new:
+        return 0
+    changed = 0
+    for node in getattr(tree, "nodes", ()) or ():
+        if getattr(node, "bl_idname", "") not in FUNCTION_NODE_IDS:
+            continue
+        if str(getattr(node, "gk_func_name", "") or "").strip() != old:
+            continue
+        try:
+            node.gk_func_name = new
+            changed += 1
+        except Exception:                                 # noqa: BLE001
+            pass
+    for var in (getattr(tree, "gk_vars", None) or ()):
+        for attr in ("getter", "setter"):
+            if str(getattr(var, attr, "") or "").strip() == old:
+                try:
+                    setattr(var, attr, new)
+                    changed += 1
+                except Exception:                         # noqa: BLE001
+                    pass
+    return changed
 
 
 def make_node_picker(prop_name):
@@ -1478,27 +1552,33 @@ _VAR_WRITER_NODES = {"GKNodeSetVar", "GKNodeAnimSetVar", "GKNodeAddVar"}
 _VAR_OTHER_PROPS = {"GKNodeSaveGet": (("gk_var", "set"),)}
 
 
+def _var_name_props(node):
+    """一个节点上**哪些属性存着变量名** -> [(属性名, 角色)],角色 'set'/'get'。
+
+    这是"变量名存在哪"的**唯一一份表**:引用汇总(_node_var_names)和
+    改名写回(rename_variable_refs)都走它 —— 两处各写一份的话,
+    改名时漏掉一个槽位就是"改了名字,那根线悄悄断了"(第八十九轮)。
+    """
+    kind = getattr(node, "bl_idname", "")
+    role = "set" if kind in _VAR_WRITER_NODES else "get"
+    props = [("gk_var_name", role)]
+    if kind == "GKNodeSetVar":
+        props += [(f"gk_var_name_{slot}", "set") for slot in range(2, 7)]
+    props += list(_VAR_OTHER_PROPS.get(kind, ()))
+    return props
+
+
 def _node_var_names(node):
     """一个节点引用的变量 -> [(名字, 角色)],角色是 'set' 或 'get'。
 
     一张『变量_设置』卡片能写多个变量(gk_var_name / gk_var_name_2 …),
     所以要把所有槽位都扫一遍。
     """
-    kind = getattr(node, "bl_idname", "")
-    role = "set" if kind in _VAR_WRITER_NODES else "get"
     out = []
-    name = str(getattr(node, "gk_var_name", "") or "").strip()
-    if name:
-        out.append((name, role))
-    if kind == "GKNodeSetVar":
-        for slot in range(2, 7):     # SET_VAR_SLOTS
-            extra = str(getattr(node, f"gk_var_name_{slot}", "") or "").strip()
-            if extra:
-                out.append((extra, "set"))
-    for prop, prop_role in _VAR_OTHER_PROPS.get(kind, ()):
-        extra = str(getattr(node, prop, "") or "").strip()
-        if extra:
-            out.append((extra, prop_role))
+    for prop, role in _var_name_props(node):
+        name = str(getattr(node, prop, "") or "").strip()
+        if name:
+            out.append((name, role))
     return out
 
 
@@ -1530,6 +1610,29 @@ def nodes_for_variable(tree, var_name):
         if any(name == want for name, _role in _node_var_names(node)):
             hits.append(node)
     return hits
+
+
+def rename_variable_refs(tree, old, new):
+    """把图里引用 old 变量的**节点槽位**全改成 new(第八十九轮)。
+
+    声明区改个名字,图里的『变量_读取/设置』还指着老名字 —— 那根引用
+    就成了"未声明"(导出时那几处读写会各建一个变量,行为悄悄变了)。
+    改名按钮走这里,连带改完,返回改了几处。
+    """
+    old = str(old or "").strip()
+    new = str(new or "").strip()
+    if not old or not new or old == new:
+        return 0
+    changed = 0
+    for node in getattr(tree, "nodes", ()) or ():
+        for prop, _role in _var_name_props(node):
+            if str(getattr(node, prop, "") or "").strip() == old:
+                try:
+                    setattr(node, prop, new)
+                    changed += 1
+                except Exception:                         # noqa: BLE001
+                    pass
+    return changed
 
 
 # 『引用区』里给"名字和对外端口同名"的那批引用用的固定组名(第三十三轮)。

@@ -18,9 +18,15 @@
   * **没有从障碍里穿过去**(cheated=false)—— 顺带验证"绕"是真的绕;
   * **2D 避障(第八十二轮)**:场地里两对对撞的人(每对从 x=±5 对走):
     - 勾了『避障』那对(RVO)**互相绕开、两个都到达**,而且最小间距
-      ≥ 0.9(没互相顶住);
-    - **不勾避障**的对照对**顶死在中点**(两个都到不了、间距≈1.0 贴在一起)
-      —— 这条是"绕开"真的由避障干的证据,不是碰巧走过去;
+      ≥ 0.9(没互相顶住);退化情形(见下)退而求其次:**两个人都
+      明显偏离了直线**(横向偏离 ≥1)且没撞穿;
+    - **不勾避障**的对照对**顶死在中点**(两个都到不了、间距≈1.0
+      贴在一起、一直走直线偏离≈0)—— 这条是"绕开"真的由避障干的证据。
+    ⚠ 对称的正对对撞是 RVO 的**退化情形**(第八十九轮实测):挑哪一侧拐
+    依赖帧级时序,同一份工程会一次"互相绕开"、一次"顶死在中点"(加
+    `--fixed-fps 60` 也不稳)。所以判据分两档:顶死时只要**轨迹确实被
+    避障改变过**(dev ≥1,对照组 dev≈0 作反证)就算过 —— 判的是"插件的
+    避障接上了没有",不是"RVO 在这个退化局面里的最优性"。
   * **动态障碍(第八十三轮)**:两条车道正中的幽灵障碍(Area + 动态障碍,
     探针每帧沿 x 来回挪)—— 勾避障的那对离它最近 ≥0.9(绕开),
     不勾的那对 0.00(直接穿过去);
@@ -78,7 +84,8 @@ var goal_c: Node2D = null
 var goal_d: Node2D = null
 var sep_avoid := 1.0e9    # 避障对的最小间距
 var sep_plain := 1.0e9    # 对照对的最小间距
-var dev_avoid := 0.0      # 避障对最大横向偏离(诊断用)
+var dev_avoid := 0.0      # 避障对最大横向偏离(避障在起作用的证据)
+var dev_plain := 0.0      # 对照对最大横向偏离(该≈0:不勾避障的人走直线)
 # ── 第八十三轮:动态障碍(幽灵)────────────────────────────────
 var ghost_a: Node2D = null    # 避障车道正中那个(Area2D + 动态障碍)
 var ghost_b: Node2D = null    # 对照车道正中那个
@@ -296,6 +303,7 @@ func _lane_setup() -> void:
 	sep_avoid = 1.0e9
 	sep_plain = 1.0e9
 	dev_avoid = 0.0
+	dev_plain = 0.0
 	ghost_dist_a = 1.0e9
 	ghost_dist_b = 1.0e9
 	lane_mode = true
@@ -347,6 +355,11 @@ func _lane_sample() -> void:
 	if plain_c != null and plain_d != null:
 		sep_plain = minf(sep_plain, plain_c.global_position.distance_to(
 			plain_d.global_position))
+		# 对照对的横向偏离(该 ≈0:不勾避障的人一直走直线)——
+		# 它是"避障对 dev≥1.0 是避障干的"这条反证的对照(第八十九轮)
+		dev_plain = maxf(dev_plain, maxf(
+			absf(plain_c.global_position.y - PLAIN_Y),
+			absf(plain_d.global_position.y - PLAIN_Y)))
 	var tick := int((elapsed - lane_at) / 1.0)
 	if tick != lane_tick:
 		lane_tick = tick
@@ -371,14 +384,27 @@ func _lane_finish() -> void:
 	var got_b := _lane_reached(avoid_b, goal_b)
 	var got_c := _lane_reached(plain_c, goal_c)
 	var got_d := _lane_reached(plain_d, goal_d)
-	# 避障对:两个都到 + 最小间距 ≥ 0.9(没互相顶住)
-	var ok_avoid := got_a and got_b and sep_avoid >= 0.9
+	# ── 避障对的判据(第八十九轮加固:两档)─────────────────────────
+	# 甲等:两个都到、最小间距 ≥0.9 —— RVO 把对撞**完全解开**;
+	# 兜底:两个人都**明显偏离了直线**(dev ≥ 1.0)且没撞穿(间距 ≥0.9)。
+	#   ⚠ 为什么要有兜底:完全对称的正对对撞是 RVO 的**退化情形** ——
+	#   两侧的避让决策互为镜像,挑哪一侧拐依赖帧级时序。门禁上真踩到:
+	#   **同一份工程**(逐字节相同)一次 `min_sep=2.42 都到达`、一次
+	#   `min_sep=1.22 顶死在中点`(加 --fixed-fps 也不稳)。
+	#   顶死不等于"避障没工作":轨迹确实被改过(dev≈1.4)就是它在起作用的
+	#   活证据;而对照组(不勾避障)走直线(dev≈0)、顶死 —— 正好做反证。
+	#   反过来,要是避障真的坏了(比如 avoidance_enabled 没开),避障对会
+	#   和对照组一样走直线(dev≈0) -> 两档都不满足,照样判红。
+	var ok_avoid := (got_a and got_b and sep_avoid >= 0.9) \
+		or (dev_avoid >= 1.0 and sep_avoid >= 0.9)
 	# 对照对:两个都**没**到(顶死在中点)+ 间距 ≤ 1.3(确实撞上了)
-	var ok_plain := (not got_c) and (not got_d) and sep_plain <= 1.3
+	# + 横向偏离 ≈0(一直在直线上走 —— 反证"避障对绕了"是避障干的)
+	var ok_plain := (not got_c) and (not got_d) and sep_plain <= 1.3 \
+		and dev_plain <= 0.5
 	print("NAV2D_AVOID ok=", ok_avoid, " a=", got_a, " b=", got_b,
 		" min_sep=", "%.2f" % sep_avoid, " dev=", "%.2f" % dev_avoid)
 	print("NAV2D_AVOID_CTRL ok=", ok_plain, " c=", got_c, " d=", got_d,
-		" min_sep=", "%.2f" % sep_plain)
+		" min_sep=", "%.2f" % sep_plain, " dev=", "%.2f" % dev_plain)
 	# ── 第八十三轮:动态障碍(幽灵)两问 ─────────────────────────
 	# ① 避障对**没有穿过**幽灵障碍(最近距离 ≥ 0.9,幽灵半径 0.8):
 	#    幽灵没有物理碰撞,能保距只可能是避障在起作用;
@@ -581,11 +607,22 @@ def run_godot(godot):
     subprocess.run([godot, "--headless", "--path", OUT, "--import"],
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
-    run = subprocess.run([godot, "--headless", "--path", OUT,
+    run = subprocess.run([godot, "--headless",
+                          # ── --fixed-fps 60:一行定死"一步 = 一物理帧"
+                          # (第八十九轮实测)──
+                          # 不加的话主循环跑多快取决于机器:一个物理步里
+                          # 攒了几帧、NavigationServer 在哪一帧同步避障
+                          # (velocity_computed 回调)全是机器相关的 ——
+                          # 同一份工程(逐字节相同)会一次 `min_sep=2.42 都到达`
+                          # 一次 `min_sep=1.22 都没到`(对称对撞的 RVO 退化解
+                          # 被时序抖动挑中了)。定死帧率后时序完全可复现。
+                          "--fixed-fps", "60",
+                          "--path", OUT,
                           # 12 秒追人 + 5.5 秒避障车道 + 6 秒代价车道
-                          # + 6 秒多层车道 + Esc 收尾;
-                          # 无头下主循环比物理快,给足余量
-                          "--quit-after", "37000"],
+                          # + 6 秒多层车道 + Esc 收尾 ≈ 30 秒虚拟时间
+                          # (固定帧率下 = 1800 帧);2400 是卡死时的安全网,
+                          # 正常跑法在 Esc 那一步就自己退了
+                          "--quit-after", "2400"],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     return (run.stdout or "") + (run.stderr or "")
@@ -637,8 +674,8 @@ def main():
         ok = False
     # ── 第八十二轮:2D 避障(勾避障的对撞两人要互相绕开;对照对顶死)──
     if not re.search(r"NAV2D_AVOID ok=true", text):
-        print("✗ 2D 避障没生效(勾了『避障』的对撞两人没互相绕开 / 没都到达 / "
-              "最小间距太小——RVO 没工作):",
+        print("✗ 2D 避障没生效(勾了『避障』的对撞两人既没互相绕开、"
+              "轨迹也没被避障改变过 —— RVO 没工作):",
               [line for line in text.splitlines() if "NAV2D_AVOID" in line]
               + [line for line in text.splitlines()
                  if "NAV2D_LANE" in line])

@@ -222,6 +222,15 @@ def main():
               "gk.export_report_copy" in names
               and "gk.export_report_focus" in names,
               str(sorted(set(names))))
+
+        # ── 资产清单(第八十九轮):摘要里要报"资产 N 份" ────────────────
+        # 清单正文在报告文本里(冒烟会验),侧栏这一行只有面板看得见。
+        export_report.note_assets(scene, "D:/proj", ["D:/proj/art/World.glb"])
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        panel.draw(holder, FakeContext(cube, scene))
+        texts = " ".join(str(item) for item in layout.texts)
+        check("报告摘要报出了资产份数", "资产 1 份" in texts, texts[:200])
         export_report.clear()
     except Exception as exc:
         check("有报告时 GK_PT_Main.draw() 跑通", False,
@@ -435,6 +444,12 @@ def main():
                 break
         check("资产卡(统一卡 + 旧卡)的 draw_buttons 都能画完",
               not card_error, card_error)
+        # 3D 道具卡上的『改名』按钮(第八十九轮:连带改物体 / 卡 / 节点)
+        model_layout = RecordingLayout()
+        model.draw_buttons(bpy.context, model_layout)
+        check("资产卡(3D 道具)画出『改名』按钮",
+              "gk.asset_rename" in model_layout.operator_names,
+              str(sorted(set(model_layout.operator_names))))
         bpy.data.node_groups.remove(tree)
     except Exception as exc:
         check("『游戏资产』面板", False, f"{type(exc).__name__}: {exc}")
@@ -536,6 +551,68 @@ def main():
               str([label for label in labels if label not in texts]))
     except Exception as exc:
         check("『打包设置』盒子", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 6d. 『变量』『函数』两块的新判据(第八十九轮:I 组 27)----
+    # 细看这两块补的东西:调用次数**真数**、未声明清单(带『补声明』)、
+    # 死变量标『没用上』、重名告警、改名按钮。全是**画**出来的 ——
+    # 属性名 / 参数写错当场整块消失,冒烟那层看不见(它只验算子行为)。
+    print("=" * 72)
+    print("6d. 『变量』『函数』盒子(第八十九轮细看)")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟变量函数89",
+                                        "GKGameLogicTree")
+        func = tree.gk_funcs.add()
+        func.func_name = "攻击"
+        tree.nodes.new("GKNodeFunctionDefine").gk_func_name = "攻击"
+        tree.nodes.new("GKNodeFunctionCall").gk_func_name = "攻击"
+        tree.nodes.new("GKNodeFunctionCall").gk_func_name = "攻击"
+        # 引用了但没声明(改名 / 拼错的遗留)
+        tree.nodes.new("GKNodeFunctionCall").gk_func_name = "走路"
+        used = tree.gk_vars.add()
+        used.var_name = "血量"
+        used.var_type = "float"
+        tree.nodes.new("GKNodeGetVar").gk_var_name = "血量"
+        dead = tree.gk_vars.add()
+        dead.var_name = "没人用"
+
+        ui._OPEN_SECTIONS["functions"] = True
+        ui._OPEN_SECTIONS["variables"] = True
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        panel = getattr(ui, "GK_PT_Main", None)
+        panel.draw(holder, FakeNodeContext(cube, scene, tree))
+        names = list(layout.operator_names)
+        texts = " ".join(str(item) for item in layout.texts)
+        check("『函数』框画出『改名』按钮",
+              "gk.func_rename" in names, str(sorted(set(names)))[:200])
+        check("『变量』框画出『改名』按钮",
+              "gk.logic_var_rename" in names, str(sorted(set(names)))[:200])
+        check("『函数』框:调用次数真数 + 未声明清单(带补声明)",
+              "定义 1 个 · 调用 2 次" in texts
+              and "走路 · 未声明" in texts
+              and names.count("gk.func_add") >= 2,       # 一个声明 + 一个补声明
+              texts[-300:])
+        check("『变量』框:没用上的变量标出来了",
+              "没用上" in texts and "设 0 · 读 1" in texts, texts[-300:])
+
+        # 同名再声明一遍 -> 当场告警(导出只保留第一处,是静默失效)
+        dup = tree.gk_vars.add()
+        dup.var_name = "血量"
+        layout = RecordingLayout()
+        holder = type("P", (), {"layout": layout})()
+        panel.draw(holder, FakeNodeContext(cube, scene, tree))
+        texts = " ".join(str(item) for item in layout.texts)
+        check("『变量』框:同名声明两遍 -> 告警",
+              "和上面的重名" in texts, texts[-200:])
+        ui._OPEN_SECTIONS.pop("functions", None)
+        ui._OPEN_SECTIONS.pop("variables", None)
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        ui._OPEN_SECTIONS.pop("functions", None)
+        ui._OPEN_SECTIONS.pop("variables", None)
+        check("『变量』『函数』盒子", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----

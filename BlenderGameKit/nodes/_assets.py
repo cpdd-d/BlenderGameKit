@@ -406,6 +406,11 @@ class GKNodeAssetCard(B.GKStatementNode):
             register.card_name = self.name
             focus = path_row.operator("gk.asset_focus", text="定位", icon="VIEWZOOM")
             focus.asset_name = card_path(self)
+            # 改名(第八十九轮):连带改物体 / 卡 / 引用它的节点 ——
+            # 资产名是它们之间的纽带,只改一处实例就认不出本体了
+            rename = path_row.operator("gk.asset_rename", text="改名",
+                                       icon="GREASEPENCIL")
+            rename.asset_name = card_path(self)
         elif kind == "image":
             picker = path_row.operator("gk.pick_image", text="选图片",
                                        icon="IMAGE_DATA")

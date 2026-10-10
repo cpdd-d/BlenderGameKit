@@ -17803,5 +17803,211 @@ class TestRound88QualitySet(Base):
         self.assertIn("_gk_quality_apply(1.0, 2, 4096, 4)", code)
 
 
+# ==========================================================================
+# 第八十九轮(I 组 27+28):变量 / 函数两块细看 + 资产改名 + 报告资产清单
+# ==========================================================================
+class TestRound89BlueprintAudit(Base):
+    """侧栏『变量』『函数』两块的判据 + 导出报告的资产清单(全是纯函数)。
+
+    第八十九轮把这两块"细看"了一遍,补的是三个**真缺口**:
+      * 『函数』框的调用次数原来是 `1 if 有 else 0` —— 调用几次都显示 1;
+      * 改名(函数 / 变量)只改声明,图里的引用会悄悄断成"未声明";
+      * 导出报告只报"文件数",资产那份清单要用户自己去翻 art/ 目录。
+    """
+
+    class _Scene:
+        """假场景:只要 `scene[key] = ...` 和 `scene.get(key)` 两个口。"""
+
+        def __init__(self):
+            self.data = {}
+
+        def __setitem__(self, key, value):
+            self.data[key] = value
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+    def _declare_func(self, tree, name, return_type="void", params=""):
+        tree.gk_funcs.add()
+        func = tree.gk_funcs[len(tree.gk_funcs) - 1]
+        func.func_name = name
+        func.return_type = return_type
+        func.params = params
+        return func
+
+    def _declare_var(self, tree, name, var_type="float"):
+        tree.gk_vars.add()
+        var = tree.gk_vars[len(tree.gk_vars) - 1]
+        var.var_name = name
+        var.var_type = var_type
+        return var
+
+    # ---- 『函数』框:真数节点 ----
+
+    def test_function_usages_counts_defines_and_calls(self):
+        """调用次数必须**真数节点**(以前恒为 0/1,调用两次也显示 1 次)。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeFunctionDefine, "定义攻击", gk_func_name="攻击")
+        tree.new_node(NN.GKNodeFunctionCall, "调用1", gk_func_name="攻击")
+        tree.new_node(NN.GKNodeFunctionCall, "调用2", gk_func_name="攻击")
+        tree.new_node(NN.GKNodeFunctionDefine, "定义走路", gk_func_name="走路")
+        tree.new_node(NN.GKNodeFunctionCall, "没填", gk_func_name="")
+        usages = props.function_usages(tree)
+        self.assertEqual(usages["攻击"], {"defines": 1, "calls": 2}, usages)
+        self.assertEqual(usages["走路"], {"defines": 1, "calls": 0}, usages)
+        self.assertNotIn("", usages)
+
+    def test_function_usages_keeps_undeclared_names(self):
+        """改名 / 拼错留下的孤儿引用也要在表里(侧栏靠它列"未声明")。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeFunctionCall, "孤儿", gk_func_name="攻击2")
+        usages = props.function_usages(tree)
+        self.assertIn("攻击2", usages)
+        self.assertEqual(usages["攻击2"], {"defines": 0, "calls": 1})
+        # 声明表里没有它 —— 两部分一减就是"未声明清单"
+        self.assertEqual(props.tree_functions(tree), {})
+
+    def test_function_usages_double_define(self):
+        """同名定义两个也要数出来(导出只保留第一个,是静默丢逻辑)。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        tree.new_node(NN.GKNodeFunctionDefine, "定义1", gk_func_name="攻击")
+        tree.new_node(NN.GKNodeFunctionDefine, "定义2", gk_func_name="攻击")
+        self.assertEqual(props.function_usages(tree)["攻击"],
+                         {"defines": 2, "calls": 0})
+
+    # ---- 改名连带引用 ----
+
+    def test_rename_function_refs_carries_nodes_and_bindings(self):
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        define = tree.new_node(NN.GKNodeFunctionDefine, "定义",
+                              gk_func_name="攻击")
+        call = tree.new_node(NN.GKNodeFunctionCall, "调用",
+                             gk_func_name="攻击")
+        other = tree.new_node(NN.GKNodeFunctionCall, "别的",
+                              gk_func_name="走路")
+        var = self._declare_var(tree, "血量")
+        var.getter = "攻击"
+        var.setter = "走路"
+        carried = props.rename_function_refs(tree, "攻击", "攻击_重击")
+        self.assertEqual(carried, 3, carried)      # 定义 + 调用 + getter
+        self.assertEqual(str(define.gk_func_name), "攻击_重击")
+        self.assertEqual(str(call.gk_func_name), "攻击_重击")
+        self.assertEqual(str(other.gk_func_name), "走路")     # 别人的不动
+        self.assertEqual(var.getter, "攻击_重击")
+        self.assertEqual(var.setter, "走路")
+
+    def test_rename_function_refs_ignores_noop(self):
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        node = tree.new_node(NN.GKNodeFunctionCall, "调用",
+                             gk_func_name="攻击")
+        self.assertEqual(props.rename_function_refs(tree, "攻击", "攻击"), 0)
+        self.assertEqual(props.rename_function_refs(tree, "", "新"), 0)
+        self.assertEqual(props.rename_function_refs(tree, "攻击", ""), 0)
+        self.assertEqual(str(node.gk_func_name), "攻击")
+
+    def test_rename_variable_refs_covers_all_slots(self):
+        """『变量_设置』的第 2~6 个槽位也要跟着改(共享同一张属性表)。"""
+        from BlenderGameKit import properties as props
+        tree = make_tree()
+        getter = tree.new_node(NN.GKNodeGetVar, "读", gk_var_name="血量")
+        setter = tree.new_node(NN.GKNodeSetVar, "写", gk_var_name="血量",
+                               gk_var_count=3, gk_var_name_2="血量")
+        other = tree.new_node(NN.GKNodeGetVar, "别的", gk_var_name="分数")
+        carried = props.rename_variable_refs(tree, "血量", "生命值")
+        self.assertEqual(carried, 3, carried)      # 读 1 + 写主槽 + 第 2 槽
+        self.assertEqual(str(getter.gk_var_name), "生命值")
+        self.assertEqual(str(setter.gk_var_name), "生命值")
+        self.assertEqual(str(setter.gk_var_name_2), "生命值")
+        self.assertEqual(str(other.gk_var_name), "分数")
+
+    # ---- 导出报告:资产清单 ----
+
+    def test_classify_assets_groups_by_folder(self):
+        from BlenderGameKit import export_report as er
+        written = [
+            "D:/proj/art/World.glb",
+            "D:/proj/art/asset_树_7b216a3b.glb",
+            "D:/proj/art/tex_c4e80742.png",
+            "D:/proj/audio/sound_c4e80742.wav",
+            "D:/proj/curves/curve_demo.tres",
+            "D:/proj/materials/m_tree.tres",     # 材质不算资产
+            "D:/proj/scripts/game_logic.gd",
+            "D:/proj/scenes/World.tscn",
+            None,                                # written 里混 None 不能崩
+            "art/ui_image_861a9d02.png",         # 相对路径也认
+        ]
+        groups = er.classify_assets("D:/proj", written)
+        self.assertEqual(groups["model"],
+                         ["art/World.glb", "art/asset_树_7b216a3b.glb"])
+        self.assertEqual(groups["image"],
+                         ["art/tex_c4e80742.png", "art/ui_image_861a9d02.png"])
+        self.assertEqual(groups["sound"], ["audio/sound_c4e80742.wav"])
+        self.assertEqual(groups["curve"], ["curves/curve_demo.tres"])
+
+    def test_classify_assets_empty_files_is_zero(self):
+        from BlenderGameKit import export_report as er
+        self.assertEqual(er.asset_total({}), 0)
+        self.assertEqual(er.note_assets(None, "D:/proj", []), 0)
+        groups = er.classify_assets("D:/proj", ["D:/proj/scripts/x.gd"])
+        self.assertEqual(sum(len(entries) for entries in groups.values()), 0)
+
+    def test_note_assets_into_report_and_text(self):
+        """资产清单要能写进报告(.blend)、清掉内存读回来、正文列出来。"""
+        from BlenderGameKit import export_report as er
+        scene = self._Scene()
+        er.clear()
+        er.record(scene, {"ok": True, "script_name": "game_logic.gd",
+                          "directory": "D:/proj", "lines": 10,
+                          "written": ["a"], "warnings": [], "notes": []})
+        total = er.note_assets(scene, "D:/proj", ["D:/proj/art/World.glb",
+                                                  "D:/proj/audio/a.wav"])
+        self.assertEqual(total, 2)
+        er.clear()                                     # 只留 .blend 那份
+        loaded = er.load(scene)
+        self.assertEqual(er.asset_total(loaded), 2)
+        text = er.report_text(loaded)
+        self.assertIn("资产清单(2 份)", text)
+        self.assertIn("模型: art/World.glb", text)
+        self.assertIn("音频: audio/a.wav", text)
+        er.clear()
+
+    def test_note_assets_makes_minimal_report_without_one(self):
+        """用户只导了资产、还没导过脚本 —— 也要有一份能看的清单。"""
+        from BlenderGameKit import export_report as er
+        er.clear()
+        total = er.note_assets(None, "D:/proj", ["D:/proj/art/World.glb"])
+        self.assertEqual(total, 1)
+        self.assertIn("资产清单(1 份)", er.report_text(er.load(None)))
+        er.clear()
+
+    def test_record_carries_assets_forward(self):
+        """只导脚本时,上次记的资产清单要跟着留(那些文件还在磁盘上)。"""
+        from BlenderGameKit import export_report as er
+        scene = self._Scene()
+        er.clear()
+        er.note_assets(scene, "D:/proj", ["D:/proj/art/World.glb"])
+        er.record(scene, {"ok": True, "script_name": "game_logic.gd",
+                          "directory": "D:/proj", "lines": 3,
+                          "written": ["a"], "warnings": [], "notes": []})
+        self.assertEqual(er.asset_total(er.load(scene)), 1)
+        er.clear()
+
+    def test_report_text_caps_long_asset_lists(self):
+        from BlenderGameKit import export_report as er
+        names = [f"D:/proj/art/m{index:02d}.glb" for index in range(14)]
+        report = er.build({"ok": True, "script_name": "g.gd",
+                           "directory": "D:/proj", "lines": 1,
+                           "written": ["a"], "warnings": [], "notes": []})
+        report["assets"] = er.classify_assets("D:/proj", names)
+        text = er.report_text(report)
+        self.assertIn("资产清单(14 份)", text)
+        self.assertIn("…(还有 4 个)", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

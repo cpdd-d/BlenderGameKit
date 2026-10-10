@@ -1755,6 +1755,82 @@ class GK_OT_AssetCollect(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_AssetRename(bpy.types.Operator):
+    """给『资产名』改名,**连带**改场景物体和引用它的节点(第八十九轮)。
+
+    ── 为什么必须"连带"(待办 I 组 28)──────────────────────────────
+    资产名是"本体 / 实例 / 资产卡 / 『资产_创建实例』节点"之间的**唯一纽带**:
+    只改卡上的名字,那几份实例就认不出本体了(导出时这一份资产没有模型,
+    运行时『资产_创建实例』也生不出来 —— 而且是**静默**的)。
+    所以改名一处一起改:
+      * 所有场景里填了老名字的物体(『游戏物理』→『资产名』);
+      * 资产库里指向它的卡(`路径`;卡名等于老名字的一并改);
+      * 所有图里引用它的节点(`gk_asset`,『资产_创建实例』那类)。
+    """
+
+    bl_idname = "gk.asset_rename"
+    bl_label = "资产改名"
+    bl_description = ("改『资产名』,并把场景里的物体 / 资产卡 / 引用它的"
+                      "节点一起改过来(实例不会认不出本体)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    asset_name: StringProperty(name="资产", default="")
+    new_name: StringProperty(name="新名字", default="")
+
+    def invoke(self, context, _event):
+        if not str(self.asset_name or "").strip():
+            return {"CANCELLED"}
+        self.new_name = str(self.asset_name)
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def execute(self, context):
+        old = str(self.asset_name or "").strip()
+        new = str(self.new_name or "").strip()
+        if not old or not new or old == new:
+            return {"CANCELLED"}
+        # ① 物体上的『资产名』(跨全部场景 —— 资产库就是跨场景共用的)
+        objects_changed = 0
+        for obj in bpy.data.objects:
+            physics = getattr(obj, "gk_physics", None)
+            if physics is None:
+                continue
+            if str(getattr(physics, "asset_name", "") or "").strip() == old:
+                physics.asset_name = new
+                objects_changed += 1
+        # ② 资产卡(新统一卡看 gk_path;老卡把名字存在 gk_asset 里)
+        #    ③ 其它节点(『资产_创建实例』等)的 gk_asset 引用
+        cards_changed = 0
+        nodes_changed = 0
+        for group in bpy.data.node_groups:
+            for node in getattr(group, "nodes", ()) or ():
+                if node_lib.is_asset_card(node):
+                    if (node_lib.card_kind(node) == "model"
+                            and node_lib.card_path(node) == old):
+                        node.gk_path = new
+                        cards_changed += 1
+                        card_label = str(getattr(node, "gk_name", "") or "")
+                        if not card_label.strip() or card_label == old:
+                            node.gk_name = new
+                    continue
+                if str(getattr(node, "gk_asset", "") or "").strip() == old:
+                    node.gk_asset = new
+                    nodes_changed += 1
+        # 缩略图按资产名缓存 —— 新名字还没有小图,顺手拍一张
+        for group in _asset_trees():
+            _refresh_asset_thumbs(group)
+        if not (objects_changed or cards_changed or nodes_changed):
+            self.report({"WARNING"},
+                        f"没找到叫『{old}』的资产物体 / 卡 / 节点 —— 名字没改")
+            return {"CANCELLED"}
+        self.report({"INFO"},
+                    f"资产『{old}』->『{new}』:改了 {objects_changed} 个物体、"
+                    f"{cards_changed} 张卡、{nodes_changed} 处节点引用")
+        return {"FINISHED"}
+
+    def draw(self, _context):
+        self.layout.prop(self, "new_name", text="新名字")
+
+
 def place_asset_into_scene(scene, asset_name):
     """把一份资产摆进 scene(跨场景可用)。
 
@@ -3681,6 +3757,52 @@ class GK_OT_LogicVarRemove(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_LogicVarRename(bpy.types.Operator):
+    """给声明的变量改名,**连带**改图里的引用(第八十九轮)。
+
+    和『函数改名』同一个道理:声明行上直接敲名字,图里那些
+    『变量_读取/设置』(含『变量_设置』的第 2~6 个槽位、『存档_读取到变量』)
+    还指着老名字 —— 那几处当场变成"未声明"。改名按钮走
+    `props.rename_variable_refs`,一处不落全带过去,改完报"带了几处"。
+    """
+
+    bl_idname = "gk.logic_var_rename"
+    bl_label = "变量改名"
+    bl_description = "改变量名,并连带改图里读写它的所有节点槽位"
+    bl_options = {"REGISTER", "UNDO"}
+
+    var_name: StringProperty(name="变量名", default="")
+    new_name: StringProperty(name="新名字", default="")
+
+    def invoke(self, context, _event):
+        if not str(self.var_name or "").strip():
+            return {"CANCELLED"}
+        self.new_name = str(self.var_name)
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def execute(self, context):
+        # 带退路地取树(和『函数改名』同一个理由:无头 / 弹窗里没有 space_data)
+        tree = ops._tree_of(self, context) or props.current_tree(context)
+        old = str(self.var_name or "").strip()
+        new = str(self.new_name or "").strip()
+        if tree is None or not old or not new or old == new:
+            return {"CANCELLED"}
+        if new in {str(var.var_name) for var in tree.gk_vars}:
+            self.report({"WARNING"}, f"已经有一个变量叫『{new}』了 —— 换个名字")
+            return {"CANCELLED"}
+        for var in tree.gk_vars:
+            if str(var.var_name) == old:
+                var.var_name = new
+                break
+        carried = props.rename_variable_refs(tree, old, new)
+        self.report({"INFO"}, f"变量『{old}』->『{new}』"
+                              f"(连带改 {carried} 处引用)")
+        return {"FINISHED"}
+
+    def draw(self, _context):
+        self.layout.prop(self, "new_name", text="新名字")
+
+
 class GK_OT_PickVar(bpy.types.Operator):
     """在取/设变量节点上挑一个**已声明**的变量(和『选动画』同一套搜索弹窗)。"""
 
@@ -3730,13 +3852,17 @@ class GK_OT_PickVar(bpy.types.Operator):
                 op.choice = str(var.var_name)
 
 
-def _draw_declared_var_rows(layout, tree, index, var):
+def _draw_declared_var_rows(layout, tree, index, var, usage, duplicate):
     """一个**已声明变量**的全部行(名字 / 取设 / 初值 / 说明 / 监视 / 分组 / 实现)。
 
     抽成函数是为了**按分组**排(第三十二轮):每组一个可折叠盒子,盒子里
     还是这些行,一个控件都没变。『删除』按**名字**传 —— 面板重排过之后,
     列表下标不再等于 `gk_vars` 里的下标。
+
+    `usage` 是 (写它的节点数, 读它的节点数);`duplicate` = 这个名字在
+    声明区里出现了不止一次(见 _draw_variable_box 的"细看"说明)。
     """
+    sets, gets = usage
     row = layout.row(align=True)
     row.prop(var, "var_name", text="")
     row.prop(var, "var_type", text="")
@@ -3746,8 +3872,13 @@ def _draw_declared_var_rows(layout, tree, index, var):
     put = row.operator("gk.var_make_node", text="设")
     put.var_name = str(var.var_name)
     put.make_set = True
+    rename = row.operator("gk.logic_var_rename", text="", icon="GREASEPENCIL")
+    rename.var_name = str(var.var_name)
     remove = row.operator("gk.logic_var_remove", text="", icon="X")
     remove.var_name = str(var.var_name)
+    if duplicate:
+        layout.label(text="⚠ 和上面的重名 —— 导出只保留第一处"
+                          "(类型 / 初值以它为准)", icon="ERROR")
     detail = layout.row(align=True)
     detail.prop(var, "default_value", text="初值")
     detail.prop(var, "comment", text="", icon="INFO")
@@ -3759,6 +3890,8 @@ def _draw_declared_var_rows(layout, tree, index, var):
     # ── 分组(第三十二轮)────────────────────────────────────────────
     # 填同一个名字就归到一组,留空 = 未分组(排在最后)。只影响显示。
     detail.prop(var, "group", text="", icon="FILE_FOLDER")
+    detail.label(text=f"设 {sets} · 读 {gets}" if (sets or gets) else "没用上",
+                 icon="NONE" if (sets or gets) else "INFO")
     # ── 变量的"实现"(用户 2026-10-05:照 UE5 的 getter/setter)────────
     # 读 / 写这个变量时改调的函数。绑了之后图里照样用『变量_读取』
     # 『变量_设置』,生成出来却是函数调用 —— "读的时候要算一下"
@@ -3793,6 +3926,13 @@ def _draw_variable_box(layout, context):
     导出时按这里的类型生成成员变量(打在脚本顶部的成员变量清单里)。
     下半是**引用区**:把整张图扫一遍,列出"谁在读、谁在写" ——
     没声明过的名字会标『未声明』,点放大镜能选中所有引用它的节点。
+
+    第八十九轮(待办 I 组 27,细看这一块)补了三件:
+      * 每个声明行就近报"设 N · 读 M",一个引用都没有的标『没用上』;
+      * 同名声明两遍 -> 告警(导出只保留第一处,第二处的类型 / 初值
+        是静默失效的 —— 以前用户改了不生效会找不到原因);
+      * 每行一个『改名』按钮:**连带改**图里的引用(节点槽位),
+        不像以前直接敲名字那样把引用打断成"未声明"。
     """
     tree = _logic_tree_of(context)
     if tree is None:
@@ -3814,6 +3954,17 @@ def _draw_variable_box(layout, context):
     index_of = {}
     for slot, var in enumerate(declared):
         index_of.setdefault(str(var.var_name), slot)
+    # ── 每行的"用得怎么样"(第八十九轮)────────────────────────────────
+    # usage_of:名字 -> (几个节点写它, 几个节点读它);没出现过的 = (0, 0)
+    # (那就是"声明了却没人用的死变量",行里标『没用上』)。
+    # 重名:同一个名字声明了两次 -> 导出时**只保留第一处**,第二处的
+    # 类型 / 初值静默失效 —— 得当面说,不然用户改了没生效会找不到原因。
+    usage_of = {name: (len(sets), len(gets)) for name, sets, gets in usages}
+    name_counts = {}
+    for var in declared:
+        key = str(var.var_name)
+        name_counts[key] = name_counts.get(key, 0) + 1
+    seen_names = set()
     for group_name, vars_in_group in props.logic_var_groups(tree):
         label = (f"{group_name} ({len(vars_in_group)})" if group_name
                  else f"未分组 ({len(vars_in_group)})")
@@ -3828,8 +3979,12 @@ def _draw_variable_box(layout, context):
         if not opened:
             continue
         for var in vars_in_group:
-            _draw_declared_var_rows(sub, tree,
-                                    index_of.get(str(var.var_name), 0), var)
+            key = str(var.var_name)
+            duplicate = name_counts.get(key, 0) > 1 and key in seen_names
+            seen_names.add(key)
+            _draw_declared_var_rows(
+                sub, tree, index_of.get(key, 0), var,
+                usage_of.get(key, (0, 0)), duplicate)
     add = box.operator("gk.logic_var_add", text="声明一个变量", icon="ADD")
     add.group = ""            # 不选组直接加 = 未分组
     if declared:
@@ -3926,22 +4081,91 @@ class GK_OT_FuncAdd(bpy.types.Operator):
     bl_description = "在当前逻辑图里声明一个函数(名字 / 返回 / 参数)"
     bl_options = {"REGISTER", "UNDO"}
 
+    # 补声明用(第八十九轮):侧栏发现"图里引用了没声明的函数"时,
+    # 直接按这个名字声明一条,省得用户手敲一遍还容易不一致。
+    func_name: StringProperty(name="函数名", default="")
+
     def execute(self, context):
-        tree = _logic_tree_of(context)
+        # 用 ops._tree_of(带"退路")而不是 _logic_tree_of:侧栏按钮有
+        # space_data,但『补声明』也可能从无头 / 搜索弹窗那条路走 ——
+        # 那里 context 里没有 space_data(见 operator_io._tree_of 的说明)。
+        tree = ops._tree_of(self, context) or props.current_tree(context)
         if tree is None:
             self.report({"WARNING"}, "请先打开一张游戏逻辑图")
             return {"CANCELLED"}
         used = {str(item.func_name) for item in tree.gk_funcs}
-        name, index = "新函数", 1
-        while name in used:
-            index += 1
-            name = f"新函数{index}"
+        wanted = str(self.func_name or "").strip()
+        if wanted and wanted in used:
+            self.report({"INFO"}, f"已经声明过函数『{wanted}』了")
+            return {"CANCELLED"}
+        if wanted:
+            name = wanted
+        else:
+            name, index = "新函数", 1
+            while name in used:
+                index += 1
+                name = f"新函数{index}"
         func = tree.gk_funcs.add()
         func.func_name = name
         tree.gk_func_index = len(tree.gk_funcs) - 1
-        self.report({"INFO"}, f"声明了函数『{name}』—— 用『函数_定义』写它、"
-                              f"『函数_调用』用它")
+        if wanted:
+            self.report({"INFO"}, f"补声明了函数『{name}』—— 图里原来引用它"
+                                  f"的节点现在都算数了")
+        else:
+            self.report({"INFO"}, f"声明了函数『{name}』—— 用『函数_定义』写它、"
+                                  f"『函数_调用』用它")
         return {"FINISHED"}
+
+
+class GK_OT_FuncRename(bpy.types.Operator):
+    """给函数改名,**连带**改图里的引用(第八十九轮)。
+
+    ── 为什么要专门做一个按钮 ──────────────────────────────────────
+    声明行上的名字栏能直接敲,但敲完图里的『函数_定义』『函数_调用』
+    还指着老名字 —— 那几处引用当场变成"没声明"(导出时被跳过,
+    逻辑悄悄少一截)。改名按钮走 `props.rename_function_refs`:
+    名字、节点引用、变量读→/写→ 三处一起改,改完还报"带了几处"。
+    """
+
+    bl_idname = "gk.func_rename"
+    bl_label = "函数改名"
+    bl_description = "改函数名,并连带改图里引用它的节点和变量绑定"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="第几个", default=0)
+    new_name: StringProperty(name="新名字", default="")
+
+    def invoke(self, context, _event):
+        tree = ops._tree_of(self, context) or props.current_tree(context)
+        if tree is None or not (0 <= self.index < len(tree.gk_funcs)):
+            return {"CANCELLED"}
+        self.new_name = str(tree.gk_funcs[self.index].func_name)
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def execute(self, context):
+        tree = ops._tree_of(self, context) or props.current_tree(context)
+        if tree is None or not (0 <= self.index < len(tree.gk_funcs)):
+            return {"CANCELLED"}
+        func = tree.gk_funcs[self.index]
+        old = str(func.func_name)
+        new = str(self.new_name or "").strip()
+        if not new or new == old:
+            return {"CANCELLED"}
+        if new in {str(item.func_name) for item in tree.gk_funcs}:
+            self.report({"WARNING"}, f"已经有一个函数叫『{new}』了 —— 换个名字")
+            return {"CANCELLED"}
+        # ⚠ 顺序:先把图里的引用带过去,**再**改声明名 —— 声明改名会触发
+        # `_on_function_decl_changed` 重长引脚(按名还原连线);那时节点名字
+        # 已经是新的,参数引脚能长对、已接好的实参线不断(见
+        # properties.rename_function_refs 的"顺序要求")。
+        carried = props.rename_function_refs(tree, old, new)
+        func.func_name = new
+        self.report({"INFO"}, f"函数『{old}』->『{new}』"
+                              f"(连带改 {carried} 处引用)")
+        return {"FINISHED"}
+
+    def draw(self, _context):
+        self.layout.prop(self, "new_name", text="新名字")
 
 
 class GK_OT_FuncRemove(bpy.types.Operator):
@@ -4044,25 +4268,25 @@ def _draw_function_box(layout, context):
 
     上半是**声明区**:一处写好名字 / 返回 / 参数,节点上从下拉里挑;
     每个函数旁边两个按钮直接造『函数_定义』『函数_调用』节点。
-    下半是**清单**:图里哪些函数真的有定义 / 有被调用 ——
+    下半是**清单**:图里哪些函数真的有定义 / 被调用了多少次 ——
     "声明了但从来没定义"是最常见的忘接线,这里一眼能看出来。
+
+    第八十九轮(待办 I 组 27,细看这一块)补了四件:
+      * 调用次数**真数节点**(以前恒显示"被调用 1 次",调用几次都看不出来);
+      * 同名定义了多个 -> 告警(导出只保留第一个,是**静默丢逻辑**);
+      * 图里引用了**没声明**的函数 -> 单列一段(改名 / 拼错的遗留,
+        导出时才告警就太晚了);
+      * 每行一个『改名』按钮:**连带改**图里的引用(节点 + 变量读→/写→),
+        不像以前直接敲名字那样悄悄把引用打断。
     """
     tree = _logic_tree_of(context)
     if tree is None:
         return
     declared = getattr(tree, "gk_funcs", None) or ()
     specs = props.tree_functions(tree)
-    # 扫图:哪些函数有『函数_定义』、哪些被调用过
-    defined, called = set(), set()
-    for node in getattr(tree, "nodes", ()) or ():
-        name = str(getattr(node, "gk_func_name", "") or "").strip()
-        idname = getattr(node, "bl_idname", "")
-        if not name:
-            continue
-        if idname == "GKNodeFunctionDefine":
-            defined.add(name)
-        elif idname == "GKNodeFunctionCall":
-            called.add(name)
+    # 扫图:每个函数名被定义 / 被调用了几次(含没声明的名字)
+    usages = props.function_usages(tree)
+    defined = {name for name, entry in usages.items() if entry["defines"]}
 
     box, opened = collapsible_box(
         layout, "functions",
@@ -4076,6 +4300,8 @@ def _draw_function_box(layout, context):
         row = box.row(align=True)
         row.prop(func, "func_name", text="")
         row.prop(func, "return_type", text="")
+        rename = row.operator("gk.func_rename", text="", icon="GREASEPENCIL")
+        rename.index = index
         remove = row.operator("gk.func_remove", text="", icon="X")
         remove.index = index
         detail = box.row(align=True)
@@ -4091,13 +4317,33 @@ def _draw_function_box(layout, context):
         name = str(func.func_name)
         if name in specs:
             spec = specs[name]
-            note = [text for text in (
-                "有定义" if name in defined else "⚠ 没有『函数_定义』节点",
-                f"被调用 {1 if name in called else 0} 次") if text]
-            box.label(text=" · ".join(note), icon="INFO")
+            entry = usages.get(name) or {"defines": 0, "calls": 0}
+            if entry["defines"]:
+                note = f"定义 {entry['defines']} 个 · 调用 {entry['calls']} 次"
+            else:
+                note = f"⚠ 没有『函数_定义』节点 · 调用 {entry['calls']} 次"
+            box.label(text=note, icon="INFO")
+            if entry["defines"] > 1:
+                box.label(text=f"⚠ 定义了 {entry['defines']} 个 —— 导出只保留"
+                               f"第一个,请删掉重复的『函数_定义』",
+                          icon="ERROR")
             if spec.get("bad_types"):
                 box.label(text="⚠ 参数类型不认识(已按浮点): "
                                + "、".join(spec["bad_types"]), icon="ERROR")
+    # ── 引用了但没声明的函数(改名 / 拼错的遗留)──────────────────────
+    # 以前只有导出时才告警(还只是一条 warning,很容易被忽略);
+    # 这里当场列出来,还带一个『补声明』(声明成同名,一按就修好)。
+    stray = sorted(name for name in usages if name not in specs)
+    for name in stray:
+        entry = usages[name]
+        row = box.row(align=True)
+        row.label(text=f"⚠ {name} · 未声明", icon="ERROR")
+        row.label(text=f"定义 {entry['defines']} · 调用 {entry['calls']}")
+        fix = row.operator("gk.func_add", text="补声明", icon="ADD")
+        fix.func_name = name
+    if stray:
+        box.label(text="这些名字图里在用,但声明里没有 —— 拼错了,"
+                       "或者声明被改名 / 删掉了", icon="INFO")
     box.operator("gk.func_add", text="声明一个函数", icon="ADD")
     if declared:
         box.label(text="函数体 = 从『函数_定义』的执行口接出去的那串节点",
@@ -5290,6 +5536,10 @@ def _draw_export_report(box, report):
     if report.get("script_name"):
         summary += f" · {report['script_name']}({report.get('lines', 0)} 行)"
     summary += f" · {report.get('written', 0)} 个文件"
+    # 资产份数(第八十九轮):清单正文在报告文本里,摘要给个总数
+    asset_count = export_report.asset_total(report)
+    if asset_count:
+        summary += f" · 资产 {asset_count} 份"
     if report.get("elapsed_ms"):
         summary += f" · {report['elapsed_ms']:.0f} ms"
     box.label(text=summary,
@@ -6122,11 +6372,13 @@ GK_CLASSES = (
     # 逻辑图的变量声明 + 节点下拉选(用户 2026-10-04)
     GK_OT_LogicVarAdd,
     GK_OT_LogicVarRemove,
+    GK_OT_LogicVarRename,
     GK_OT_PickVar,
     # 变量的"实现"(UE5 的 getter/setter;用户 2026-10-05 第十七轮)
     GK_OT_VarBindImpl,
     # 逻辑图的函数声明 + 函数节点(用户 2026-10-05 第十七轮)
     GK_OT_FuncAdd,
+    GK_OT_FuncRename,
     GK_OT_FuncRemove,
     GK_OT_MakeFunctionNode,
     GK_OT_PickFunction,
@@ -6158,6 +6410,8 @@ GK_CLASSES = (
     GK_OT_AssetPlace,
     GK_OT_AssetFocus,
     GK_OT_AssetFocusNode,
+    # 资产改名:连带改物体 / 卡 / 节点引用(第八十九轮)
+    GK_OT_AssetRename,
     GK_OT_SwitchTree,
     GK_OT_AnimVarAdd,
     GK_OT_AnimVarRemove,

@@ -2494,7 +2494,10 @@ def main():
                     "gk.apply_advisor_action", "gk.dismiss_advisor_action",
                     "gk.run_advisor_action",
                     # 分组框折叠(第六十二轮)+ 一键预设角色(第六十三轮补登记)
-                    "gk.toggle_group", "gk.character_preset"):
+                    "gk.toggle_group", "gk.character_preset",
+                    # 变量 / 函数改名 + 资产改名(第八十九轮:I 组 27+28)
+                    "gk.func_rename", "gk.logic_var_rename",
+                    "gk.asset_rename"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -4980,6 +4983,160 @@ def main():
             bpy.data.node_groups.remove(r87_out["tree"])
     except Exception as exc:
         check("第八十七轮(关卡预设模板)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 第八十九轮(I 组 27+28):改名连带引用 + 报告资产清单 ----
+    # 真 Blender 里验四件事:
+    #   ① 『函数』框的调用次数是真数出来的(1 定义 + 2 调用);
+    #   ② `gk.func_rename` / `gk.logic_var_rename` 真跑:改名后**图里的
+    #      引用**(节点 gk_func_name / 变量槽位 / 变量 getter)都跟着变 ——
+    #      这是"改名不再悄悄打断引用"的活证据;
+    #   ③ `gk.asset_rename` 连带改物体 / 卡 / 节点;
+    #   ④ 导出报告的资产清单真的写进 .blend 和文本块。
+    try:
+        r89_props = import_module(f"{module_name}.properties")
+        r89_report = import_module(f"{module_name}.export_report")
+
+        r89_tree = bpy.data.node_groups.new("改名冒烟89", "GKGameLogicTree")
+        r89_tree.use_fake_user = True
+        r89_func = r89_tree.gk_funcs.add()
+        r89_func.func_name = "旧函数"
+        r89_func.return_type = "void"
+        # 带一个参数 —— 顺手验"改名不会把实参线扯断"(第八十九轮实测踩点)
+        r89_func.params = "hp:float"
+        r89_define = r89_tree.nodes.new("GKNodeFunctionDefine")
+        r89_define.gk_func_name = "旧函数"
+        r89_call_a = r89_tree.nodes.new("GKNodeFunctionCall")
+        r89_call_a.gk_func_name = "旧函数"
+        r89_call_a.build_sockets()               # 长出参数引脚 hp
+        r89_call_b = r89_tree.nodes.new("GKNodeFunctionCall")
+        r89_call_b.gk_func_name = "旧函数"
+        r89_const = r89_tree.nodes.new("GKNodeConstFloat")
+        r89_const.gk_value = 3.5
+        r89_tree.links.new(r89_const.outputs["值"], r89_call_a.inputs["hp"])
+        r89_var = r89_tree.gk_vars.add()
+        r89_var.var_name = "旧变量"
+        r89_var.var_type = "float"
+        r89_var.getter = "旧函数"
+
+        r89_usages = r89_props.function_usages(r89_tree)
+        check("第八十九轮:函数调用次数是真数出来的(1 定义 · 2 调用)",
+              r89_usages.get("旧函数") == {"defines": 1, "calls": 2},
+              str(r89_usages))
+
+        # 算子走 ops._tree_of 的退路(无头模式没有 space_data)—— 用
+        # "选中节点"这条路告诉它动哪棵树(和『折叠成函数』同一套)
+        for r89_group in bpy.data.node_groups:
+            if getattr(r89_group, "bl_idname", "") != "GKGameLogicTree":
+                continue
+            for r89_node in r89_group.nodes:
+                r89_node.select = False
+        r89_define.select = True
+        r89_result = bpy.ops.gk.func_rename(index=0, new_name="新函数")
+        check("第八十九轮:『函数改名』算子跑通", r89_result == {"FINISHED"},
+              str(r89_result))
+        r89_ok_func = (str(r89_func.func_name) == "新函数"
+                       and str(r89_define.gk_func_name) == "新函数"
+                       and str(r89_call_a.gk_func_name) == "新函数"
+                       and str(r89_call_b.gk_func_name) == "新函数"
+                       and str(r89_var.getter) == "新函数")
+        check("第八十九轮:函数改名连带图里的引用(节点 + 变量 getter)",
+              r89_ok_func,
+              f"声明={r89_func.func_name} 定义={r89_define.gk_func_name} "
+              f"调用={r89_call_a.gk_func_name} getter={r89_var.getter}")
+        # 实参线必须还在(重长引脚走的是"按名还原连线"的 rebuild_sockets)
+        # ⚠ 按**名字**比,不能用 `is` —— Blender 每次读 node 都新造包装对象
+        #   (`node.parent is frame` 恒为 False,项目里记过的坑)
+        r89_param_link = any(
+            str(link.from_node.name) == str(r89_const.name)
+            and str(link.to_node.name) == str(r89_call_a.name)
+            and str(link.to_socket.name) == "hp" for link in r89_tree.links)
+        check("第八十九轮:改名后参数引脚还在、实参线没断",
+              r89_param_link
+              and r89_call_a.inputs.get("hp") is not None,
+              f"links={[(l.from_node.name, l.to_node.name, l.to_socket.name) for l in r89_tree.links]}")
+
+        r89_get = r89_tree.nodes.new("GKNodeGetVar")
+        r89_get.gk_var_name = "旧变量"
+        r89_result = bpy.ops.gk.logic_var_rename(var_name="旧变量",
+                                                 new_name="新变量")
+        check("第八十九轮:『变量改名』连带改节点槽位",
+              r89_result == {"FINISHED"}
+              and str(r89_var.var_name) == "新变量"
+              and str(r89_get.gk_var_name) == "新变量",
+              f"{r89_result} 声明={r89_var.var_name} "
+              f"节点={r89_get.gk_var_name}")
+
+        # ③ 资产改名:物体 / 卡 / 『资产_创建实例』节点三处一起改
+        r89_mesh = bpy.data.meshes.new("改名树网格")
+        r89_body = bpy.data.objects.new("改名树本体", r89_mesh)
+        bpy.context.scene.collection.objects.link(r89_body)
+        r89_body.gk_physics.asset_name = "旧树"
+        r89_body.gk_physics.body_type = "StaticBody3D"
+        r89_inst = bpy.data.objects.new("改名树实例", r89_mesh)
+        bpy.context.scene.collection.objects.link(r89_inst)
+        r89_inst.gk_physics.asset_name = "旧树"
+        r89_inst.gk_physics.body_type = "StaticBody3D"
+        r89_inst.gk_physics.asset_instance = True
+
+        r89_asset_tree = bpy.data.node_groups.new("资产改名冒烟89",
+                                                  "GKAssetTree")
+        r89_card = r89_asset_tree.nodes.new("GKNodeAssetCard")
+        r89_card.gk_kind = "model"
+        r89_card.gk_path = "旧树"
+        r89_card.gk_name = "旧树"
+        r89_spawn = r89_tree.nodes.new("GKNodeAssetSpawn")
+        r89_spawn.gk_asset = "旧树"
+
+        r89_result = bpy.ops.gk.asset_rename(asset_name="旧树", new_name="新树")
+        check("第八十九轮:『资产改名』连带物体 / 卡 / 节点",
+              r89_result == {"FINISHED"}
+              and str(r89_body.gk_physics.asset_name) == "新树"
+              and str(r89_inst.gk_physics.asset_name) == "新树"
+              and str(r89_card.gk_path) == "新树"
+              and str(r89_card.gk_name) == "新树"
+              and str(r89_spawn.gk_asset) == "新树",
+              f"{r89_result} 物体={r89_body.gk_physics.asset_name} "
+              f"卡={r89_card.gk_path} 节点={r89_spawn.gk_asset}")
+
+        # ④ 导出报告:资产清单进 .blend + 文本块
+        r89_report.clear()
+        r89_ops = import_module(f"{module_name}.operator_io")
+        r89_ops.remember_export(bpy.context.scene, {
+            "ok": True, "script_name": "r89.gd", "directory": "D:/proj",
+            "lines": 5, "elapsed_ms": 1.0, "written": ["a"],
+            "warnings": [], "notes": [],
+        })
+        r89_total = r89_report.note_assets(
+            bpy.context.scene, "D:/proj",
+            ["D:/proj/art/World.glb", "D:/proj/audio/a.wav"])
+        r89_report.clear()                       # 只留 .blend 里那份
+        r89_loaded = r89_report.load(bpy.context.scene)
+        r89_text = r89_report.report_text(r89_loaded)
+        check("第八十九轮:导出报告记下资产清单(2 份)",
+              r89_total == 2 and r89_report.asset_total(r89_loaded) == 2,
+              f"total={r89_total} report={r89_report.asset_total(r89_loaded)}")
+        check("第八十九轮:报告正文列出资产清单",
+              "资产清单(2 份)" in r89_text
+              and "模型: art/World.glb" in r89_text
+              and "音频: audio/a.wav" in r89_text,
+              r89_text[-300:])
+        r89_block = bpy.data.texts.get(r89_report.EXPORT_REPORT_TEXT_NAME)
+        check("第八十九轮:整份报告(含清单)写进文本块",
+              r89_block is not None and "资产清单" in r89_block.as_string())
+        if r89_block is not None:
+            bpy.data.texts.remove(r89_block)
+        r89_report.clear()
+
+        # 清理
+        bpy.data.objects.remove(r89_inst, do_unlink=True)
+        bpy.data.objects.remove(r89_body, do_unlink=True)
+        bpy.data.meshes.remove(r89_mesh)
+        bpy.data.node_groups.remove(r89_asset_tree)
+        bpy.data.node_groups.remove(r89_tree)
+    except Exception as exc:
+        check("第八十九轮(改名连带引用 + 资产清单)", False,
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 

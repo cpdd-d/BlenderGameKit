@@ -102,14 +102,18 @@ def build(result):
 def record(scene, result):
     """记住一份导出报告(内存 + .blend + 文本块)。返回报告字典。"""
     report = build(result)
+    # ── 资产清单往前带(第八十九轮)──────────────────────────────────
+    # 资产是**另一步**导的(art/glb、audio/…在『导出场景与模型』里写)。
+    # 只导脚本时新报告里没有资产信息,但它记的那几份文件还在磁盘上 ——
+    # 丢掉的话用户每次导完脚本都要"咦,资产清单呢"。带过去。
+    if report and not report.get("assets"):
+        carried = LAST_REPORT.get("assets")
+        if carried:
+            report["assets"] = carried
     LAST_REPORT.clear()
     if report:
         LAST_REPORT.update(report)
-    if scene is not None and report:
-        try:
-            scene[PERSIST_KEY] = json.dumps(report, ensure_ascii=False)
-        except Exception:                                 # noqa: BLE001
-            pass          # 存不进去不影响导出本身(只是重开看不到)
+    _persist(scene, report)
     if report:
         try:
             sync_text_block(report)
@@ -171,6 +175,127 @@ def clear():
     LAST_REPORT.clear()
 
 
+# ==========================================================================
+# 资产清单(第八十九轮:待办 I 组 28)
+# ==========================================================================
+# 「导出报告列资产清单」——资产这一步(art/*.glb、art/*.png、audio/*、
+# curves/*)是在脚本导出**之后**跑的,报告那时已经记过一份。这里不改报告
+# 的形状,只往里补一节 `assets`:{类型: [相对路径, …]}。
+#
+# 分类只看"落在哪个目录 + 什么后缀",不动磁盘 —— 纯函数、离线可测。
+ASSET_GROUPS = (("model", "模型"), ("image", "图片"),
+                ("sound", "音频"), ("curve", "曲线"))
+# 一组最多列几个名字(报告要能读;超了写"…还有 N 个")。
+ASSET_LINE_LIMIT = 10
+_SOUND_EXTS = (".wav", ".ogg", ".mp3", ".flac")
+
+
+def _asset_dirs():
+    """(art, audio, curves) 三个目录名。
+
+    优先用 project / curve_assets 里的常量(单一出处);拿不到时
+    (离线裁剪环境)退回字面量 —— 只在报告里用,错了是清单少一行,
+    不影响导出本身。
+    """
+    art, audio, curves = "art", "audio", "curves"
+    try:
+        from .project import layout
+        art = layout.ART_DIR
+        audio = layout.AUDIO_DIR
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        from .curve_assets import CURVES_DIR
+        curves = CURVES_DIR
+    except Exception:                                     # noqa: BLE001
+        pass
+    return art, audio, curves
+
+
+def classify_assets(directory, written):
+    """把"这次写出来的文件"里属于资产的挑出来分组(**纯函数**)。
+
+    返回 `{"model": [相对路径, …], "image": [...], "sound": [...],
+    "curve": [...]}`,每组按名字排序、去重;不是资产的
+    (scripts/ scenes/ materials/ shaders/)一律不收。
+
+    `directory` 是项目根;`written` 里混着绝对路径 / 相对路径 / None,
+    都以项目根为准算相对路径,算不出来的按原样比目录名。
+    """
+    art, audio, curves = _asset_dirs()
+    groups = {key: set() for key, _label in ASSET_GROUPS}
+    root = str(directory or "")
+    for raw in (written or ()):
+        if not raw:
+            continue
+        path = str(raw).replace("\\", "/")
+        if root:
+            prefix = root.replace("\\", "/").rstrip("/") + "/"
+            if path.lower().startswith(prefix.lower()):
+                path = path[len(prefix):]
+        parts = path.split("/")
+        if len(parts) < 2:
+            continue
+        folder = parts[0]
+        ext = ("." + parts[-1].rsplit(".", 1)[-1].lower()
+               if "." in parts[-1] else "")
+        if folder == art and ext == ".glb":
+            groups["model"].add(path)
+        elif folder == art and ext == ".png":
+            groups["image"].add(path)
+        elif folder == audio and ext in _SOUND_EXTS:
+            groups["sound"].add(path)
+        elif folder == curves and ext == ".tres":
+            groups["curve"].add(path)
+    return {key: sorted(values) for key, values in groups.items()}
+
+
+def asset_total(report):
+    """一份报告里记了几份资产(没记过就是 0)。"""
+    assets = report.get("assets") if isinstance(report, dict) else None
+    if not isinstance(assets, dict):
+        return 0
+    return sum(len(entries or ()) for entries in assets.values())
+
+
+def _persist(scene, report):
+    """报告写回 .blend(内存那份由调用方管)。"""
+    if scene is None or not report:
+        return
+    try:
+        scene[PERSIST_KEY] = json.dumps(report, ensure_ascii=False)
+    except Exception:                                     # noqa: BLE001
+        pass          # 存不进去不影响导出本身(只是重开看不到)
+
+
+def note_assets(scene, directory, written):
+    """把这次真的落了哪些资产记进最近那份报告(第八十九轮)。
+
+    调用点在**导出资产/模型之后**(脚本导出那一步已经记过报告)。
+    没有报告(用户只导了资产、还没导过脚本)就开一份最简的 ——
+    这样资产导出也有个能看的清单。返回记了几份资产。
+    """
+    groups = classify_assets(directory, written)
+    total = sum(len(entries) for entries in groups.values())
+    if not total:
+        return 0
+    report = dict(LAST_REPORT) or dict(load(scene))
+    if not report:
+        report = {"ok": True, "error": "", "stage": "", "script_name": "",
+                  "directory": str(directory or ""), "lines": 0,
+                  "elapsed_ms": 0.0, "written": 0, "items": [], "dropped": 0,
+                  "at": time.strftime("%Y-%m-%d %H:%M")}
+    report["assets"] = groups
+    LAST_REPORT.clear()
+    LAST_REPORT.update(report)
+    _persist(scene, report)
+    try:
+        sync_text_block(report)
+    except Exception:                                     # noqa: BLE001
+        pass          # 写不进文本块不影响导出本身
+    return total
+
+
 def counts(report):
     """(错误数, 警告数, 提示数)。"""
     error = warning = info = 0
@@ -213,6 +338,20 @@ def report_text(report):
     error, warning, info = counts(report)
     lines.append(f"问题: {error} 个错误 / {warning} 个警告 / {info} 个提示"
                  if (error or warning or info) else "问题: 没有")
+    # ── 资产清单(第八十九轮)────────────────────────────────────────
+    # 记的是"这次真的落了哪些资产文件"(见 note_assets)——用户靠它核对
+    # "我的三份资产都进去了没",不用去翻 art/ 目录。
+    if asset_total(report):
+        lines.append(f"资产清单({asset_total(report)} 份):")
+        for key, label in ASSET_GROUPS:
+            entries = (report.get("assets") or {}).get(key) or []
+            if not entries:
+                continue
+            shown = list(entries[:ASSET_LINE_LIMIT])
+            line = f"  {label}: " + "、".join(shown)
+            if len(entries) > len(shown):
+                line += f"…(还有 {len(entries) - len(shown)} 个)"
+            lines.append(line)
     for index, item in enumerate(report.get("items") or (), start=1):
         mark = _LEVEL_MARK.get(str(item.get("level")), "[警告]")
         lines.append("")

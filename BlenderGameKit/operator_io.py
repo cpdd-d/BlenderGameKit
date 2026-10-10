@@ -2794,6 +2794,15 @@ class GK_OT_ExportAssets(bpy.types.Operator):
         written = outcome.get("written", [])
         asset_export.ensure_project_file(directory)
 
+        # ── 资产清单记进导出报告(第八十九轮)────────────────────────────
+        # 报告是脚本导出那一步记的;资产这一步走完,把"真的落了哪些资产"
+        # 补进去(art/*.glb、art/*.png、audio/*、curves/*)—— 用户靠它
+        # 核对"我的资产都进去了没",不用去翻工程目录。
+        try:
+            export_report.note_assets(context.scene, directory, written)
+        except Exception as exc:                          # noqa: BLE001
+            gk_log.warn(f"资产清单记录失败(不影响导出): {exc}")
+
         if not outcome.get("single") and not LAST_EXPORT.get("script_name"):
             # 多场景时可能看到"还没导出过脚本"的告警 —— 那不算问题:
             # 每个场景的逻辑图是这次导出时**自动**导出的。
@@ -3287,6 +3296,13 @@ def _auto_prepare(operator, context, directory):
                     f"已自动导出:{outcome['materials']} 个材质、"
                     f"{outcome['bodies']} 个碰撞体、"
                     f"{outcome['cameras']} 个相机、{outcome['lights']} 盏灯")
+            # 资产清单同样记进报告(第八十九轮):这条路上用户按的是
+            # "运行游戏",但资产已经落盘了,清单该和『导出场景与模型』一致。
+            try:
+                export_report.note_assets(context.scene, directory,
+                                          outcome.get("written", []))
+            except Exception as exc:                      # noqa: BLE001
+                gk_log.warn(f"资产清单记录失败(不影响运行): {exc}")
     except Exception as exc:
         _report(operator, "WARNING", f"自动导出模型失败(继续): {exc}")
 
