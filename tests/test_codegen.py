@@ -12888,11 +12888,13 @@ class TestRound56AdvisorTools(Base):
                      if item["function"]["name"] not in proposal_tools
                      and item["function"]["name"] not in advisor_tools._READERS]
         self.assertEqual(modifying, [], f"出现了非只读工具: {modifying}")
-        # 而且 propose_action 的参数就是"动作名 + 参数",没有可执行代码
+        # 而且 propose_action 的参数就是"动作名 + 目标 + 值 + 自由参数(args)"
+        # —— 全是数据,里面**没有**能执行代码的字段。args 是第一百零七轮加的
+        # (改节点图那几个动作要"哪张图 / 哪种节点"),它只是个对象槽。
         propose = [item for item in advisor_tools.tools_schema()
                    if item["function"]["name"] == "propose_action"][0]
         props = propose["function"]["parameters"]["properties"]
-        self.assertEqual(set(props), {"action", "target", "value", "why"})
+        self.assertEqual(set(props), {"action", "target", "value", "args", "why"})
         self.assertIn("action", propose["function"]["parameters"]["required"])
         # 批量那条也一样:只有"动作清单"这一个数组参数(同样没有可执行代码)
         batch = [item for item in advisor_tools.tools_schema()
@@ -20085,6 +20087,216 @@ class TestRound106ExportSlim(Base):
         for name in ("export_glb", "export_scene_glb", "export_subtree_glb"):
             body = source.split(f"def {name}(", 1)[1].split("\ndef ", 1)[0]
             self.assertIn("kwargs.update(_slim_gltf_kwargs(", body, name)
+
+
+class TestRound107AdvisorEdits(Base):
+    """第一百零七轮:AI 能改节点图了(6 个新动作)。
+
+    ── 这一层锁住的东西 ──────────────────────────────────────────────
+    1. 6 个新动作**登记齐了**(名字 / needs / args_hint 的键都对得上);
+    2. `build_proposal` 对它们照常校验:缺参数不出卡片、错误里带 args 说明;
+       参数齐了出卡片且卡片里有 args 字典;args 写成 **JSON 字符串**也收;
+    3. "提议不改数据"这条铁律:改图的动作离线跑不了(要真 bpy),所以拿
+       **纯逻辑函数**(分层布局)验 —— 它只接收名字 + 边表、只吐坐标,
+       绝不碰节点;
+    4. 纯逻辑的边界:空图 / 孤立节点 / 环 / 重名 / 找不到的节点。
+    """
+
+    # 动作名 -> (needs, args_hint 必须有的键)。args_hint 的键要和动作真正读
+    # 的键一致,否则模型照着说明填了、动作却读不到(或反过来漏说明)。
+    EXPECT = {
+        "add_node": (("args:type",), {"tree", "type", "after", "pin"}),
+        "set_node_prop": (("args:node", "args:prop", "args:value"),
+                          {"tree", "node", "prop", "value"}),
+        "delete_node": (("args:node",), {"tree", "node"}),
+        "rename_node": (("args:node", "args:name"), {"tree", "node", "name"}),
+        "group_nodes": (("args:nodes",), {"tree", "nodes", "title"}),
+        "tidy_tree": ((), {"tree"}),
+    }
+
+    class _N:
+        """假节点:只带 advisor_edits 会碰的 `.name` / `.location`。"""
+
+        def __init__(self, name):
+            self.name = name
+            self.location = (999.0, 999.0)
+
+    class _Cls:
+        """假节点类:只带 bl_idname / bl_label。"""
+
+        def __init__(self, idname, label):
+            self.bl_idname = idname
+            self.bl_label = label
+
+    def _fake(self, *names):
+        return [self._N(name) for name in names]
+
+    # ---- 1:登记齐了 ----
+    def test_actions_registered(self):
+        from BlenderGameKit import advisor_tools
+        for name in self.EXPECT:
+            self.assertIn(name, advisor_tools.ACTIONS)
+            entry = advisor_tools.ACTIONS[name]
+            self.assertEqual(entry["name"], name)
+            self.assertTrue(entry["label"], name)
+            self.assertTrue(entry["hint"], name)
+            self.assertTrue(callable(entry["apply"]), name)
+
+    def test_needs_and_args_hint_match(self):
+        from BlenderGameKit import advisor_tools
+        for name, (needs, keys) in self.EXPECT.items():
+            entry = advisor_tools.ACTIONS[name]
+            self.assertEqual(entry["needs"], tuple(needs), name)
+            self.assertEqual(set(entry["args_hint"]), keys, name)
+
+    def test_catalog_lists_new_actions(self):
+        """动作说明书要带上新动作名和每个 args 键(模型靠它才知道怎么填)。"""
+        from BlenderGameKit import advisor_tools
+        text = advisor_tools.action_catalog()
+        for name, (_needs, keys) in self.EXPECT.items():
+            self.assertIn(name, text)
+            for key in keys:
+                self.assertIn(f"args.{key}", text)
+
+    # ---- 2:提议校验 ----
+    def test_build_proposal_validates_args(self):
+        from BlenderGameKit import advisor_tools
+        # 缺 args.type -> 不出卡片,错误里带 args 说明
+        note, card = advisor_tools.build_proposal(
+            {"action": "add_node", "why": "建个打印"})
+        self.assertIsNone(card)
+        self.assertIn("type", note)
+        self.assertIn("args.type", note)
+        # 参数齐 -> 出卡片,且卡片带 args 字典
+        note2, card2 = advisor_tools.build_proposal(
+            {"action": "add_node", "why": "建个打印",
+             "args": {"type": "打印_输出", "after": "开场"}})
+        self.assertIsNotNone(card2)
+        self.assertEqual(card2["action"], "add_node")
+        self.assertEqual(card2["args"]["type"], "打印_输出")
+        self.assertEqual(card2["args"]["after"], "开场")
+
+    def test_every_action_reports_missing_key(self):
+        from BlenderGameKit import advisor_tools
+        for name in ("set_node_prop", "delete_node", "rename_node",
+                     "group_nodes", "add_node"):
+            note, card = advisor_tools.build_proposal(
+                {"action": name, "why": "x"})
+            self.assertIsNone(card, name)
+            self.assertIn("还缺参数", note, name)
+        # tidy_tree 不需要参数 -> 直接就能出卡片
+        note, card = advisor_tools.build_proposal(
+            {"action": "tidy_tree", "why": "排一下"})
+        self.assertIsNotNone(card)
+        self.assertEqual(card["args"], {})
+
+    def test_args_accepts_json_string(self):
+        """`args` 写成 JSON 字符串也收(模型很容易糊成字符串)。"""
+        from BlenderGameKit import advisor_tools
+        note, card = advisor_tools.build_proposal(
+            {"action": "tidy_tree", "why": "排一下",
+             "args": '{"tree": "玩法"}'})
+        self.assertIsNotNone(card)
+        self.assertEqual(card["args"], {"tree": "玩法"})
+
+    # ---- 3:纯逻辑(提议不改数据的证据)----
+    def test_layout_is_pure_and_non_overlapping(self):
+        from BlenderGameKit import advisor_edits as edits
+        nodes = self._fake("准备", "移动", "打印", "取值")
+        edges = [("准备", "移动"), ("移动", "打印"), ("取值", "打印")]
+        spots = edits.layer_positions([n.name for n in nodes], edges)
+        # 纯:返回值只有字符串键 + 坐标,不含任何节点对象
+        for name, spot in spots.items():
+            self.assertIsInstance(name, str)
+            self.assertEqual(len(spot), 2)
+            self.assertTrue(all(isinstance(v, float) for v in spot))
+        # 纯:传进去的假节点一个字节没动
+        self.assertEqual([n.location for n in nodes], [(999.0, 999.0)] * 4)
+        # 不重叠:两层各两个,坐标两两不同
+        self.assertEqual(len(spots), 4)
+        self.assertEqual(len(set(spots.values())), 4)
+        # 分层:执行流往右走;『取值』无前驱,与『准备』同层
+        self.assertLess(spots["准备"][0], spots["移动"][0])
+        self.assertLess(spots["移动"][0], spots["打印"][0])
+        self.assertEqual(spots["取值"][0], spots["准备"][0])
+        # 再算一遍结果一致(确定性)
+        again = edits.layer_positions([n.name for n in nodes], edges)
+        self.assertEqual(again, spots)
+
+    def test_layout_empty_isolated_cycle(self):
+        from BlenderGameKit import advisor_edits as edits
+        self.assertEqual(edits.layer_positions([], []), {})
+        # 孤立节点:摆在第一层
+        self.assertEqual(edits.layer_positions(["独苗"], []),
+                         {"独苗": (0.0, 0.0)})
+        # 环:能算完、不重叠、不无限循环
+        ring = edits.layer_positions(["甲", "乙"], [("甲", "乙"), ("乙", "甲")])
+        self.assertEqual(len(ring), 2)
+        self.assertEqual(len(set(ring.values())), 2)
+        # 自环 / 指向不存在的名字 -> 忽略,不崩
+        weird = edits.layer_positions(["A"], [("A", "A"), ("A", "没有"),
+                                              ("没有", "A")])
+        self.assertEqual(weird, {"A": (0.0, 0.0)})
+
+    def test_non_overlapping_spot(self):
+        from BlenderGameKit import advisor_edits as edits
+        taken = [(0.0, 0.0), (280.0, 0.0)]
+        spot = edits.non_overlapping_spot(taken)
+        self.assertNotIn(spot, taken)
+        self.assertEqual(edits.non_overlapping_spot([]), (0.0, 0.0))
+
+    # ---- 4:纯逻辑边界 ----
+    def test_resolve_node_type_by_label_and_id(self):
+        from BlenderGameKit import advisor_edits as edits
+        classes = [self._Cls("GKNodePrint", "打印_输出"),
+                   self._Cls("GKNodeMoveDirection", "移动_按方向")]
+        cls, err = edits.resolve_node_type("移动_按方向", classes)
+        self.assertIs(cls, classes[1])
+        self.assertEqual(err, "")
+        cls2, _ = edits.resolve_node_type("GKNodePrint", classes)
+        self.assertIs(cls2, classes[0])
+        cls3, err3 = edits.resolve_node_type("根本没这个", classes)
+        self.assertIsNone(cls3)
+        self.assertIn("打印_输出", err3)          # 找不到要给可用标签提示
+        cls4, err4 = edits.resolve_node_type("", classes)
+        self.assertIsNone(cls4)
+        self.assertIn("没给", err4)
+
+    def test_unique_name_rejects_duplicate(self):
+        from BlenderGameKit import advisor_edits as edits
+        self.assertEqual(edits.unique_name(["开场", "走动"], "打印"),
+                         ("打印", ""))
+        self.assertEqual(edits.unique_name(["开场", "走动"], "开场"),
+                         ("", "开场"))
+        self.assertEqual(edits.unique_name([], ""), ("", ""))
+
+    def test_find_by_name(self):
+        from BlenderGameKit import advisor_edits as edits
+        nodes = self._fake("甲", "乙")
+        self.assertIs(edits.find_by_name(nodes, "乙"), nodes[1])
+        self.assertIsNone(edits.find_by_name(nodes, "丙"))
+        self.assertIsNone(edits.find_by_name(nodes, ""))
+
+    def test_parse_name_list(self):
+        from BlenderGameKit import advisor_edits as edits
+        self.assertEqual(edits.parse_name_list("甲,乙"), ["甲", "乙"])
+        self.assertEqual(edits.parse_name_list("甲，乙、丙; 丁"),
+                         ["甲", "乙", "丙", "丁"])
+        self.assertEqual(edits.parse_name_list(" 甲 , ,甲 "), ["甲"])
+        self.assertEqual(edits.parse_name_list(""), [])
+
+    def test_coerce_value_by_type(self):
+        from BlenderGameKit import advisor_edits as edits
+        self.assertEqual(edits.coerce_value(True, "true"), (True, True))
+        self.assertEqual(edits.coerce_value(True, "否"), (True, False))
+        self.assertEqual(edits.coerce_value(3.0, "0.5"), (True, 0.5))
+        self.assertEqual(edits.coerce_value(2, "7"), (True, 7))
+        self.assertEqual(edits.coerce_value("x", "你好"), (True, "你好"))
+        self.assertFalse(edits.coerce_value(1.0, "不是数")[0])
+        self.assertFalse(edits.coerce_value(True, "也许")[0])
+        ok, value = edits.coerce_value((0.0, 0.0, 0.0), "1,2,3")
+        self.assertTrue(ok)
+        self.assertEqual(value, [1.0, 2.0, 3.0])
 
 
 if __name__ == "__main__":

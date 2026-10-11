@@ -2916,6 +2916,125 @@ def main():
         check("AI 亲自操作", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零七轮:AI 扩充的 6 个"改节点图"动作 ----
+    # 在一棵**临时建的节点树**上真跑一遍这 6 个动作(建节点 / 连线 / 改属性 /
+    # 改名 / 删节点 / 加分组框 / 重排布局)。走的是 `apply_proposal` ——
+    # 和用户点『执行』**同一条路**(提议通道没被绕过)。
+    # 这一节最要紧的两条证据:
+    #   * `tidy_tree` 只动 `node.location`:节点数、连线数一个不变;
+    #   * `delete_node` 真的把跟它相连的线也清了(不是留一堆断头线)。
+    try:
+        at4 = import_module(f"{module_name}.advisor_tools")
+        ng = import_module(f"{module_name}.node_groups")
+
+        r107 = bpy.data.node_groups.new("AI改图冒烟107", "GKGameLogicTree")
+        r107.use_fake_user = True
+        ready = r107.nodes.new("GKNodeOnReady")
+        ready.name = "开场"
+        ready.location = (100.0, 50.0)
+        move = r107.nodes.new("GKNodeMoveDirection")
+        move.name = "走动"
+        move.location = (100.0, 50.0)          # 故意和开场同点,验重排会分开
+        r107.links.new(ready.outputs["执行"], move.inputs["执行"])
+
+        def _r107(action, **args):
+            # 和 build_proposal 产出的卡片同形状 -> 直接喂 apply_proposal
+            return at4.apply_proposal(
+                bpy.context,
+                {"action": action, "target": "", "value": "", "args": args})
+
+        # ① add_node:建节点 + 自动连线
+        nodes_before, links_before = len(r107.nodes), len(r107.links)
+        ok, msg = _r107("add_node", tree=r107.name, type="打印_输出",
+                        after="走动")
+        printer = next((n for n in r107.nodes
+                        if n.bl_idname == "GKNodePrint"), None)
+        check("add_node:建出了节点", ok and printer is not None
+              and len(r107.nodes) == nodes_before + 1, msg)
+        check("add_node:自动连了线,连的是给的那两个",
+              len(r107.links) == links_before + 1
+              and any(l.from_node.name == "走动"
+                      and l.to_node.name == printer.name
+                      for l in r107.links),
+              f"{len(r107.links)} 条 {msg}")
+        check("add_node:摆在了『走动』右边(不叠在别人身上)",
+              printer is not None and printer.location[0] > move.location[0])
+
+        # ② set_node_prop:真改了属性 + 拼错属性名被拒
+        ok, msg = _r107("set_node_prop", tree=r107.name, node=printer.name,
+                        prop="gk_text", value="你好")
+        check("set_node_prop:真改了属性(读回来对得上)",
+              ok and printer.gk_text == "你好", msg)
+        bad_ok, bad_msg = _r107("set_node_prop", tree=r107.name,
+                                node=printer.name, prop="gk_textt", value="x")
+        check("set_node_prop:拼错属性名被拒绝",
+              not bad_ok and "没有" in bad_msg, bad_msg)
+
+        # ③ rename_node:成功 + 重名被拒
+        ok, msg = _r107("rename_node", tree=r107.name, node=printer.name,
+                        name="打招呼")
+        check("rename_node:改成功了且按新名找得到",
+              ok and r107.nodes.get("打招呼") is not None, msg)
+        dup_ok, dup_msg = _r107("rename_node", tree=r107.name, node="打招呼",
+                                name="开场")
+        check("rename_node:重名被拒绝(不让 Blender 悄悄加 .001)",
+              not dup_ok and "已经有" in dup_msg, dup_msg)
+
+        # ④ delete_node:节点没了,跟它相连的线也没了
+        links_before = len(r107.links)
+        ok, msg = _r107("delete_node", tree=r107.name, node="打招呼")
+        check("delete_node:节点没了",
+              ok and r107.nodes.get("打招呼") is None, msg)
+        check("delete_node:跟它相连的线也没了",
+              len(r107.links) == links_before - 1,
+              f"{len(r107.links)} 条 {msg}")
+
+        # ⑤ group_nodes:真建了一个分组框罩住那两个节点
+        ok, msg = _r107("group_nodes", tree=r107.name, nodes="开场,走动",
+                        title="开局")
+        frames = [n for n in r107.nodes if n.bl_idname == "NodeFrame"]
+        frame = frames[0] if frames else None
+        check("group_nodes:建出分组框并罩住两个节点",
+              ok and frame is not None and frame.label == "开局"
+              and ng.count_nodes(r107, frame) == 2
+              and {n.name for n in ng.direct_children(r107, frame)}
+              == {"开场", "走动"},
+              f"{msg} frames={len(frames)}")
+        check("group_nodes:框有宽高和颜色",
+              frame is not None and frame.width > 0.0 and frame.height > 0.0
+              and bool(frame.use_custom_color))
+
+        # ⑥ tidy_tree:位置变了,但节点数 / 连线数一个不变(只改布局)
+        nodes_before, links_before = len(r107.nodes), len(r107.links)
+        pos_before = {n.name: tuple(n.location) for n in r107.nodes
+                      if n.bl_idname != "NodeFrame"}
+        ok, msg = _r107("tidy_tree", tree=r107.name)
+        pos_after = {n.name: tuple(n.location) for n in r107.nodes
+                     if n.bl_idname != "NodeFrame"}
+        check("tidy_tree:跑通了且位置真的变了",
+              ok and pos_before != pos_after, msg)
+        check("tidy_tree:只改布局 —— 节点数 / 连线数一个没变",
+              len(r107.nodes) == nodes_before
+              and len(r107.links) == links_before,
+              f"{len(r107.nodes)} 节点 / {len(r107.links)} 连线")
+        check("tidy_tree:执行流从左到右(走动 在 开场 右边)",
+              r107.nodes["走动"].location[0]
+              > r107.nodes["开场"].location[0])
+
+        # ⑦ 提议工具的描述里带上了动作说明书(模型才知道新动作怎么填)
+        descs = " ".join(entry["function"]["description"]
+                         for entry in at4.tools_schema())
+        check("工具描述带上了新动作说明书(动作名 + args 键)",
+              "add_node" in descs and "tidy_tree" in descs
+              and "args.after" in descs and "args.prop" in descs,
+              descs[:160])
+
+        bpy.data.node_groups.remove(r107)
+    except Exception as exc:
+        check("第一百零七轮(AI 改节点图的 6 个动作)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 第九十轮(待办 31):批量提议 + 『全部执行』 ----
     # 真 Blender 里验四件事:
     #   ① `propose_actions` 一次提多条:合格的都出卡片,不合格的点名;

@@ -6369,6 +6369,14 @@ def _draw_advisor_box(layout, context, settings):
                 title.label(text=f"→ {proposal['target']}")
             elif proposal.get("value"):
                 title.label(text=f"→ {proposal['value']}")
+            # ── 动作自己的参数(第一百零七轮)──────────────────────────
+            # 建节点 / 改属性这类动作要的参数不止 target + value(哪张图、
+            # 哪种节点、接在谁后面…)。**必须画出来**:用户点『执行』之前
+            # 得看清"它到底要改哪儿",否则这张卡片就不是"待确认"而是"盲签"。
+            args = proposal.get("args") or {}
+            if isinstance(args, dict) and args:
+                for key, value in args.items():
+                    card.label(text=f"{key}: {value}", icon="DOT")
             if proposal.get("why"):
                 for line in advisor.wrap(proposal["why"], 44)[:3]:
                     card.label(text=line, icon="DOT")

@@ -125,6 +125,11 @@ _SUBMODULES = (
     # 项目顾问(收集项目快照 + 调 OpenAI 兼容接口)。排在 operator_io 之前,
     # 因为它 import diagnostics / export_report / packaging
     "advisor",
+    # 节点图编辑动作的**纯逻辑层**(第一百零七轮:名字解析 / 查重 / 类型转换 /
+    # 分层布局 —— 不 import bpy)。**必须排在 advisor_tools 之前** ——
+    # advisor_tools 一加载就 `from . import advisor_edits`,顺序反了重载时
+    # 拿到的是上一版(和上面 advisor 那条同一个坑)
+    "advisor_edits",
     # AI 能用的工具(只读 + 提议动作)。**必须排在 advisor 之后** ——
     # advisor.tools_payload() 会 import 它,顺序错了重载时拿到的是上一版
     "advisor_tools",

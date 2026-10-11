@@ -20,9 +20,20 @@
 # 需要时可以换个更具体的工具再问,而不是一口气塞爆上下文。
 MAX_OUTPUT = 6000
 
+# 名字解析 / 查重 / 分层布局这些**纯计算**放在单独模块里(它不 import bpy),
+# 这样那几段最容易写歪的逻辑能离线秒级回归(见 advisor_edits 模块开头)。
+from . import advisor_edits as edits  # noqa: E402
+
 
 def tools_schema():
     """给 OpenAI 请求用的工具清单(function calling 的标准格式)。"""
+    # 动作说明书拼进描述里(第一百零七轮):只给 enum 的话模型不知道
+    # target / value / args 该填什么,只能猜 —— 猜错就是一张点了会报错的卡片。
+    catalog = ("**提议**一个修改动作。注意:这不会真的改项目 —— "
+               "用户会在侧栏看到一张待确认卡片,点了才执行。"
+               "不要在回答里说『我已经改好了』。"
+               "要一次改好几处时用 `propose_actions`(整批一起提)。\n\n"
+               "可用的动作(含各自要的参数):\n" + action_catalog())
     return [
         {
             "type": "function",
@@ -108,10 +119,7 @@ def tools_schema():
             "type": "function",
             "function": {
                 "name": "propose_action",
-                "description": ("**提议**一个修改动作。注意:这不会真的改项目 —— "
-                                "用户会在侧栏看到一张待确认卡片,点了才执行。"
-                                "不要在回答里说『我已经改好了』。"
-                                "要一次改好几处时用 `propose_actions`(整批一起提)。"),
+                "description": catalog,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -123,11 +131,17 @@ def tools_schema():
                         "target": {
                             "type": "string",
                             "description": ("动作作用的对象名(物体名 / 节点图名 / "
-                                            "属性名)。不需要就留空"),
+                                            "节点名)。不需要就留空"),
                         },
                         "value": {
                             "type": "string",
                             "description": "要设成的值(字符串;不需要就留空)",
+                        },
+                        "args": {
+                            "type": "object",
+                            "description": ("动作自己的参数(对象)。**每个动作"
+                                            "要哪些键见上面的动作说明**;"
+                                            "不需要就留空对象"),
                         },
                         "why": {
                             "type": "string",
@@ -145,7 +159,8 @@ def tools_schema():
                 "description": ("**一次提议多条**修改(看完项目后,把要改的"
                                 "一次全提出来 —— 别一条一条分好几轮)。"
                                 "同样不会真的改项目:侧栏会一起摆出这几张"
-                                "待确认卡片,用户点『全部执行』或逐张点才生效。"),
+                                "待确认卡片,用户点『全部执行』或逐张点才生效。\n\n"
+                                "每个动作要的参数:\n" + action_catalog()),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -167,6 +182,11 @@ def tools_schema():
                                     "value": {
                                         "type": "string",
                                         "description": "要设成的值(不需要就留空)",
+                                    },
+                                    "args": {
+                                        "type": "object",
+                                        "description": ("动作自己的参数对象"
+                                                        "(见上面的动作说明)"),
                                     },
                                     "why": {
                                         "type": "string",
@@ -197,11 +217,23 @@ def tools_schema():
 ACTIONS = {}
 
 
-def _action(name, label, needs, hint):
-    """登记一个动作(装饰器)。"""
+def _action(name, label, needs, hint, args_hint=None):
+    """登记一个动作(装饰器)。
+
+    ── `args` 是干什么的(第一百零七轮)────────────────────────────
+    卡片原来只有 `target` + `value` 两个字符串槽 —— 够表达"改哪个开关",
+    但表达不了"在哪张图、建哪种节点、接在谁后面"。硬塞进两个槽会变成
+    `target="游戏逻辑|界面_按钮"` 这种要靠分隔符猜的写法:模型容易写错,
+    用户看卡片也看不懂。
+    所以卡片多了第三个槽 **`args`**(一个对象),每个动作用 `args_hint`
+    声明自己认识哪些键 —— 这份说明会**拼进给模型的工具描述里**
+    (见 `action_catalog`),模型不用猜参数名;校验不过时也会回给模型,
+    它能自己改对再提一次。
+    """
     def wrap(func):
         ACTIONS[name] = {"name": name, "label": label, "needs": tuple(needs),
-                         "hint": hint, "apply": func}
+                         "hint": hint, "args_hint": dict(args_hint or {}),
+                         "apply": func}
         return func
     return wrap
 
@@ -341,6 +373,350 @@ def _export_assets(context, params):
     return True, "已导出模型和材质"
 
 
+# ---------------------------------------------------------------------------
+# 改节点图的动作(第一百零七轮)
+# ---------------------------------------------------------------------------
+# 这一组和上面那批"改设置 / 开关"不一样:它们动的是**节点图**这种结构化数据
+# (建节点、连线、改属性、删改名字、加分组框、重排布局)。所以卡片多了 `args`
+# 那一层参数(哪张图 / 哪种节点 / 接在谁后面),见 `_action` 里的说明。
+#
+# ── 安全模型一个字没动 ──────────────────────────────────────────────
+# 这些函数**只会在用户点『执行』之后**被 `apply_proposal` 调到;AI 那头
+# 能做的仍然只是"提议"。加动作 ≠ 给 AI 开直通车。
+def _resolve_tree(args):
+    """动作要动手的节点图。返回 (图 或 None, 错误说明)。
+
+    `args.tree` 留空 = 参与导出的那张游戏逻辑图(和 `_read_nodes` 一个口径)。
+    """
+    import bpy
+
+    name = str((args or {}).get("tree") or "").strip()
+    if name:
+        group = bpy.data.node_groups.get(name)
+        if group is None:
+            return None, f"找不到节点图『{name}』(用 list_trees 看有哪些图)"
+        return group, ""
+    group = _logic_tree()
+    if group is None:
+        return None, ("没有参与导出的游戏逻辑图 —— 先在侧栏『游戏逻辑』里"
+                      "新建或指定一张")
+    return group, ""
+
+
+def _node_not_found(tree, name):
+    """找不到节点时的人话(顺带把图里现有的节点名报几个)。"""
+    names = [node.name for node in tree.nodes]
+    if names:
+        more = "…" if len(names) > 12 else ""
+        return (f"图『{tree.name}』里找不到节点『{name}』。"
+                f"图里的节点有:{'、'.join(names[:12])}{more}")
+    return f"图『{tree.name}』里还没有节点(先 add_node 建一个)"
+
+
+def _editable_hint(node):
+    """列出这个节点上几个 `gk_` 属性名 —— 拼错属性名时给用户/模型照着改。
+
+    只列前几个:节点动辄十几二十个 `gk_` 属性,全倒出来是噪音。
+    """
+    names = []
+    try:
+        for prop in getattr(node, "bl_rna", None).properties:
+            identifier = getattr(prop, "identifier", "")
+            if identifier.startswith("gk_"):
+                names.append(identifier)
+    except Exception:                                     # noqa: BLE001
+        return ""
+    names.sort()
+    if not names:
+        return ""
+    tail = "…" if len(names) > 8 else ""
+    return "这个节点能改的属性有:" + "、".join(names[:8]) + tail
+
+
+def _flow_outputs(node):
+    return [socket for socket in (getattr(node, "outputs", None) or ())
+            if str(getattr(socket, "bl_idname", "")) == "GKSocketFlow"]
+
+
+def _flow_inputs(node):
+    return [socket for socket in (getattr(node, "inputs", None) or ())
+            if str(getattr(socket, "bl_idname", "")) == "GKSocketFlow"]
+
+
+@_action("add_node", "新建节点并连线", ("args:type",),
+         "在图里建一个节点,可以顺手接在某个节点后面",
+         args_hint={
+             "tree": "节点图名(留空 = 参与导出的游戏逻辑图)",
+             "type": "节点类型,填中文标签(如『移动_按方向』/『界面_按钮』)"
+                     "或内部名(如 GKNodePrint)",
+             "after": "接在哪个节点之后(节点名);留空 = 只建不连",
+             "pin": "从上游的哪个输出口接;留空 = 第一个执行口(通常是『完成』)",
+         })
+def _add_node(context, params):
+    from .nodes import nodes as node_lib
+
+    args = (params or {}).get("args") or {}
+    tree, error = _resolve_tree(args)
+    if tree is None:
+        return False, error
+    cls, error = edits.resolve_node_type(args.get("type"), node_lib.ALL_CLASSES)
+    if cls is None:
+        return False, error
+
+    # ── 先拦"这张图收不收这种节点"(踩过的坑)────────────────────────
+    # 在『游戏逻辑』图里加『动画状态』节点,Blender 会甩出一句英文 RuntimeError
+    # (poll 挡下来了)。给一句人话告诉用户该去哪种树(复用 operator_io 的判据)。
+    try:
+        from .operator_io import node_tree_error
+        problem = node_tree_error(cls, tree)
+    except Exception:                                     # noqa: BLE001
+        problem = ""
+    if problem:
+        return False, problem
+
+    after_name = str(args.get("after") or "").strip()
+    anchor = edits.find_by_name(tree.nodes, after_name) if after_name else None
+    if after_name and anchor is None:
+        # 目标节点不存在就**在建之前**失败,以免留下一个没人接的孤儿节点
+        return False, _node_not_found(tree, after_name)
+
+    try:
+        node = tree.nodes.new(cls.bl_idname)
+    except Exception as exc:                              # noqa: BLE001
+        return False, f"这张图放不下『{cls.bl_label}』: {exc}"
+
+    # 摆位:有 after 就摆它右边一列;否则挑个不重叠的空白格
+    if anchor is not None:
+        width = float(getattr(anchor, "width", 0.0) or 0.0) or 160.0
+        node.location = (float(anchor.location[0]) + width + 60.0,
+                         float(anchor.location[1]))
+    else:
+        node.location = edits.non_overlapping_spot(
+            [(item.location[0], item.location[1]) for item in tree.nodes])
+
+    linked = ""
+    if anchor is not None:
+        pin_name = str(args.get("pin") or "").strip()
+        if pin_name:
+            output = (anchor.outputs.get(pin_name)
+                      if hasattr(anchor.outputs, "get") else None)
+            if output is None:
+                names = [socket.name for socket in
+                         (getattr(anchor, "outputs", None) or ())]
+                tree.nodes.remove(node)
+                return False, (f"『{anchor.name}』没有叫『{pin_name}』的输出口。"
+                               f"它的输出口有:{'、'.join(names) or '（没有）'}")
+        else:
+            outputs = _flow_outputs(anchor)
+            if not outputs:
+                tree.nodes.remove(node)
+                return False, (f"『{anchor.name}』没有执行流输出口,"
+                               f"不能从它往下接(它是取值节点?)")
+            output = outputs[0]
+        inputs = _flow_inputs(node)
+        if not inputs:
+            tree.nodes.remove(node)
+            return False, (f"『{cls.bl_label}』没有执行流输入口,不能接在别人"
+                           f"后面(它是事件 / 取值节点?)")
+        try:
+            tree.links.new(output, inputs[0])
+        except Exception as exc:                          # noqa: BLE001
+            tree.nodes.remove(node)
+            return False, (f"接线失败(引脚类型对不上?): {exc}")
+        linked = f",并从『{anchor.name}』的『{output.name}』接上了『{inputs[0].name}』"
+
+    return True, f"已新建『{cls.bl_label}』节点,名字是『{node.name}』{linked}"
+
+
+@_action("set_node_prop", "改节点卡片上的属性",
+         ("args:node", "args:prop", "args:value"),
+         "改节点上填的参数(如按钮上的文字、控件显示与否)",
+         args_hint={
+             "tree": "节点图名(留空 = 游戏逻辑图)",
+             "node": "节点名(卡片标题上的名字)",
+             "prop": "属性名(如 gk_text / gk_visible)",
+             "value": "要设成的值(字符串;布尔填 true/false、是/否)",
+         })
+def _set_node_prop(context, params):
+    args = (params or {}).get("args") or {}
+    tree, error = _resolve_tree(args)
+    if tree is None:
+        return False, error
+    node = edits.find_by_name(tree.nodes, args.get("node"))
+    if node is None:
+        return False, _node_not_found(tree, args.get("node"))
+    prop = str(args.get("prop") or "").strip()
+    if not prop:
+        return False, "没给属性名(如 gk_text)"
+    # ── 必须 **hasattr** 验一遍 ───────────────────────────────────────
+    # 拼错的属性名如果直接 setattr,Blender 不报错、静默造一个没用的自定义
+    # 属性(节点看着"改成功了",行为却一点没变)。先验存在再改。
+    if not hasattr(node, prop):
+        return False, (f"『{node.name}』上没有『{prop}』这个属性(名字拼错了?)"
+                       f"{_editable_hint(node)}")
+    current = getattr(node, prop)
+    ok, value = edits.coerce_value(current, args.get("value"))
+    if not ok:
+        return False, f"『{prop}』{value}{_editable_hint(node)}"
+    try:
+        setattr(node, prop, value)
+    except Exception as exc:                              # noqa: BLE001
+        return False, f"写『{prop}』失败: {exc}"
+    return True, f"『{node.name}』的 {prop} 已改成 {getattr(node, prop)!r}"
+
+
+@_action("delete_node", "删除节点(连带清线)", ("args:node",),
+         "删掉一个节点,连着它接的线一起清掉",
+         args_hint={
+             "tree": "节点图名(留空 = 游戏逻辑图)",
+             "node": "要删的节点名",
+         })
+def _delete_node(context, params):
+    args = (params or {}).get("args") or {}
+    tree, error = _resolve_tree(args)
+    if tree is None:
+        return False, error
+    node = edits.find_by_name(tree.nodes, args.get("node"))
+    if node is None:
+        return False, _node_not_found(tree, args.get("node"))
+    name = node.name
+    # 先数一遍要连带清掉的线(remove 之后这些线就查不到了,数不出"清了几条")
+    removed = 0
+    for link in list(getattr(tree, "links", None) or ()):
+        ends = (getattr(getattr(link, "from_node", None), "name", ""),
+                getattr(getattr(link, "to_node", None), "name", ""))
+        if name in ends:
+            removed += 1
+    try:
+        # Blender 会自动清掉跟这个节点相连的所有连线,不用手动断
+        tree.nodes.remove(node)
+    except Exception as exc:                              # noqa: BLE001
+        return False, f"删不掉『{name}』: {exc}"
+    return True, f"已删除『{name}』,顺带清掉 {removed} 条连线"
+
+
+@_action("rename_node", "改节点名", ("args:node", "args:name"),
+         "给节点换个名字(连线不受影响)",
+         args_hint={
+             "tree": "节点图名(留空 = 游戏逻辑图)",
+             "node": "原名(当前节点名)",
+             "name": "新名字",
+         })
+def _rename_node(context, params):
+    args = (params or {}).get("args") or {}
+    tree, error = _resolve_tree(args)
+    if tree is None:
+        return False, error
+    node = edits.find_by_name(tree.nodes, args.get("node"))
+    if node is None:
+        return False, _node_not_found(tree, args.get("node"))
+    new_name = str(args.get("name") or "").strip()
+    if not new_name:
+        return False, "没给新名字"
+    usable, clash = edits.unique_name([n.name for n in tree.nodes], new_name)
+    if not usable:
+        return False, (f"已经有节点叫『{clash}』了,换个名字。"
+                       f"(不拦的话 Blender 会自动把新名加成『{clash}.001』——"
+                       f"看着像改名没生效)")
+    old = node.name
+    try:
+        node.name = new_name
+    except Exception as exc:                              # noqa: BLE001
+        return False, f"改名失败: {exc}"
+    return True, f"『{old}』已改名为『{node.name}』"
+
+
+@_action("group_nodes", "加分组框", ("args:nodes",),
+         "把几个节点框成一个分组框(能折叠、拖动整组)",
+         args_hint={
+             "tree": "节点图名(留空 = 游戏逻辑图)",
+             "nodes": "要框起来的节点名,**逗号分隔**(如『准备,移动』)",
+             "title": "框的标题(留空 = 『分组』)",
+         })
+def _group_nodes(context, params):
+    from . import operator_io
+
+    args = (params or {}).get("args") or {}
+    tree, error = _resolve_tree(args)
+    if tree is None:
+        return False, error
+    names = edits.parse_name_list(args.get("nodes"))
+    if not names:
+        return False, "没给要框起来的节点名(逗号分隔,如『准备,移动』)"
+    found = []
+    missing = []
+    for name in names:
+        node = edits.find_by_name(tree.nodes, name)
+        if node is None:
+            missing.append(name)
+        else:
+            found.append(node)
+    if missing:
+        return False, (f"找不到这些节点:{'、'.join(missing)}(先在侧栏列表里"
+                       f"核对名字)")
+    # ── 就用插件早就有的那套"分组框"机制 ────────────────────────────
+    # 分组框在数据上就是 Blender 原生的 `NodeFrame`(带标题 / 颜色 / 认子
+    # 节点),`GK_OT_AddCommentBox` 也是这么建的。包围盒也用它的纯函数
+    # `comment_box_rect` —— 不另发明一套结构,免得和"折叠 / 展开"那条链脱节。
+    location, width, height = operator_io.comment_box_rect(found)
+    try:
+        frame = tree.nodes.new("NodeFrame")
+    except Exception as exc:                              # noqa: BLE001
+        return False, f"建分组框失败: {exc}"
+    # 顺序要紧:先定框的位置,再认子(认子时 Blender 会把子节点坐标换算成
+    # 相对框的坐标,框没定好子节点就会被算歪 —— 见 add_comment_box 那段)。
+    frame.location = location
+    frame.width = width
+    frame.height = height
+    frame.use_custom_color = True
+    frame.color = (0.16, 0.30, 0.45)
+    frame.label = str(args.get("title") or "").strip() or "分组"
+    frame.label_size = 16
+    for node in found:
+        node.parent = frame
+    return True, (f"已把 {len(found)} 个节点框进『{frame.label}』"
+                  f"(分组框名字『{frame.name}』,可折叠)")
+
+
+@_action("tidy_tree", "自动整理节点布局", (),
+         "按连线重新排一下位置(执行流从左上到右下),只动位置、不动连线",
+         args_hint={
+             "tree": "节点图名(留空 = 游戏逻辑图)",
+         })
+def _tidy_tree(context, params):
+    args = (params or {}).get("args") or {}
+    tree, error = _resolve_tree(args)
+    if tree is None:
+        return False, error
+    # ── 只重排"真节点",分组框留在原地 ───────────────────────────────
+    # 分组框(NodeFrame)在连线里根本不出现,拉进来会被全塞到第一层、
+    # 和它罩着的节点叠在一起。跳过后框位置不变,子节点的相对坐标照旧有效。
+    real_nodes = [node for node in tree.nodes
+                  if str(getattr(node, "bl_idname", "")) != "NodeFrame"]
+    if not real_nodes:
+        return False, f"图『{tree.name}』里还没有节点,没得整理"
+    names = [node.name for node in real_nodes]
+    edges = []
+    for link in list(getattr(tree, "links", None) or ()):
+        edges.append((getattr(getattr(link, "from_node", None), "name", ""),
+                      getattr(getattr(link, "to_node", None), "name", "")))
+    # 纯函数只算坐标,**不碰任何节点** —— 写回 node.location 的只有下面这段,
+    # 连线 / 节点数量一个字都不变(所以这是零风险动作)。
+    positions = edits.layer_positions(names, edges)
+    moved = 0
+    for node in real_nodes:
+        spot = positions.get(node.name)
+        if spot is None:
+            continue
+        before = (round(float(node.location[0]), 3),
+                  round(float(node.location[1]), 3))
+        if before != (round(spot[0], 3), round(spot[1], 3)):
+            moved += 1
+        node.location = spot
+    return True, (f"已按连线重排 {len(names)} 个节点的位置(实际挪动 {moved} 个),"
+                  f"连线一条没动")
+
+
 def action_label(name):
     """动作的中文标签(卡片标题用)。"""
     entry = ACTIONS.get(name)
@@ -356,6 +732,62 @@ def action_hint(name):
 def action_names():
     """所有动作名(系统提示里列给模型看)。"""
     return sorted(ACTIONS)
+
+
+def action_catalog():
+    """给模型看的动作说明书:每个动作要哪些参数、`args` 里能填什么键。
+
+    ── 为什么必须带上这段(第一百零七轮)──────────────────────────
+    以前工具描述里只列了动作**名字**(一个 enum)。模型知道有
+    `add_node` 这个动作,却不知道 `args` 该填 `tree` / `type` / `after` ——
+    只能猜,猜错就是一张"点了会报错"的卡片。把每个动作的参数说明拼进
+    描述里,它一次就能写对;校验失败时这段也一起回给它,能自己改对。
+    """
+    lines = []
+    for name in sorted(ACTIONS):
+        entry = ACTIONS[name]
+        need = "、".join(entry["needs"]) or "不需要参数"
+        lines.append(f"- {name}({entry['label']}):{entry['hint']}｜需要:{need}")
+        for key, text in (entry.get("args_hint") or {}).items():
+            lines.append(f"    · args.{key} = {text}")
+    return "\n".join(lines)
+
+
+def _parse_args(raw):
+    """把 `args` 收成一个 dict。返回 (字典, 错误说明)。
+
+    模型有时会把 `args` 写成一个 **JSON 字符串**(function calling 的
+    arguments 本来就是字符串嵌套,很容易糊在一起),有时写成真正的对象。
+    两种都收下,别让格式问题浪费用户一张卡片。
+    """
+    if raw in (None, "", {}):
+        return {}, ""
+    if isinstance(raw, dict):
+        return dict(raw), ""
+    text = str(raw).strip()
+    if not text:
+        return {}, ""
+    if not text.startswith("{"):
+        return {}, (f"它得是一个对象(形如 {{\"type\": \"界面_按钮\"}}),"
+                    f"收到『{text[:60]}』")
+    try:
+        import json
+        loaded = json.loads(text)
+    except Exception as exc:                              # noqa: BLE001
+        return {}, f"JSON 解析失败({exc})"
+    if not isinstance(loaded, dict):
+        return {}, "解析出来不是对象"
+    return loaded, ""
+
+
+def _args_doc(name):
+    """某个动作的 `args` 说明(校验失败时回给模型)。"""
+    entry = ACTIONS.get(name) or {}
+    hints = entry.get("args_hint") or {}
+    if not hints:
+        return ""
+    return "\n这个动作的 args 可以填:\n" + "\n".join(
+        f"  · {key} = {text}" for key, text in hints.items())
 
 
 def action_menu_items(self, context=None):
@@ -379,17 +811,32 @@ def _validate_card(params):
     entry = ACTIONS.get(name)
     if entry is None:
         return f"没有叫『{name}』的动作。可用的动作:{action_names()}", None
-    missing = [key for key in entry["needs"]
-               if not str(params.get(key) or "").strip()]
-    if missing:
-        return f"动作『{name}』还缺参数:{missing}。请补齐后重新提议。", None
+    args, arg_error = _parse_args(params.get("args"))
+    if arg_error:
+        return (f"动作『{name}』的 args 不行:{arg_error}"
+                + _args_doc(name)), None
     target = str(params.get("target") or "").strip()
     value = str(params.get("value") or "").strip()
+    missing = []
+    for key in entry["needs"]:
+        if key == "args":
+            if not args:
+                missing.append("args")
+        elif key.startswith("args:"):
+            if not str(args.get(key[len("args:"):]) or "").strip():
+                missing.append("args." + key[len("args:"):])
+        elif not str(params.get(key) or "").strip():
+            missing.append(key)
+    if missing:
+        hint = _args_doc(name)
+        return (f"动作『{name}』还缺参数:{missing}。请补齐后重新提议。"
+                + (("\n" + hint) if hint else "")), None
     card = {
         "action": name,
         "label": entry["label"],
         "target": target,
         "value": value,
+        "args": args,
         "why": str(params.get("why") or "").strip(),
         "hint": entry["hint"],
     }
@@ -457,7 +904,10 @@ def apply_proposal(context, card):
     if entry is None:
         return False, "这个动作已经不存在了(可能插件版本变了)"
     params = {"target": (card or {}).get("target", ""),
-              "value": (card or {}).get("value", "")}
+              "value": (card or {}).get("value", ""),
+              # 老卡片(第一百零六轮之前存的)没有 args 这一项 —— 给个空对象,
+              # 动作自己按"没填 = 默认"处理
+              "args": (card or {}).get("args") or {}}
     try:
         return entry["apply"](context, params)
     except Exception as exc:                              # noqa: BLE001

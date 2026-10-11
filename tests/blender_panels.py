@@ -657,6 +657,53 @@ def main():
         check("AI 建议卡片的批量按钮", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6e-2. AI 建议卡片带 args 的动作(第一百零七轮)----
+    # 改节点图的动作要的参数不止 target / value(哪张图、哪种节点、接在谁
+    # 后面),这些全在 `args` 里。卡片**必须把它们画出来** —— 否则用户点
+    # 『执行』前根本不知道它要改哪儿,那就不是"待确认"而是"盲签"。
+    # 参数名 / 值写错在 Blender 里是当场抛异常、整块卡片消失(侧栏一漏,
+    # 冒烟那层只验算子行为,看不见画的事)。
+    print("=" * 72)
+    print("6e-2. AI 建议卡片的 args(改节点图)")
+    print("=" * 72)
+    try:
+        advisor = import_module(f"{module_name}.advisor")
+        advisor.clear_proposals()
+        panel = getattr(ui, "GK_PT_Main", None)
+        advisor.add_proposal({
+            "action": "add_node", "label": "新建节点并连线",
+            "target": "", "value": "",
+            "args": {"tree": "游戏逻辑", "type": "打印_输出",
+                     "after": "开场"},
+            "why": "给你接一个打印,方便看变量值"})
+        layout = None
+        draw_error = ""
+        try:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeContext(cube, scene))
+        except Exception as exc:                          # noqa: BLE001
+            draw_error = f"{type(exc).__name__}: {exc}"
+        texts = " ".join(str(item) for item in (layout.texts if layout else []))
+        check("带 args 的建议卡片画得完", not draw_error, draw_error)
+        check("卡片把 args 的键值都画出来了",
+              "tree: 游戏逻辑" in texts and "type: 打印_输出" in texts
+              and "after: 开场" in texts,
+              texts[:260])
+        check("带 args 的卡片仍画出了『执行』按钮",
+              "gk.apply_advisor_action" in
+              [str(name) for name in (layout.operator_names if layout else [])],
+              str(layout.operator_names if layout else [])[:160])
+    except Exception as exc:
+        check("带 args 的建议卡片", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+    finally:
+        # 画完一定要把这张卡片清掉 —— 残留的提议会影响后面小节的断言
+        try:
+            import_module(f"{module_name}.advisor").clear_proposals()
+        except Exception:                                  # noqa: BLE001
+            pass
+
     # ---- 6f. 『存档_保存』的卡片(第九十三轮:多了一个『防改档』勾选框)----
     # 存档卡片上原来只有『存档槽』一个输入框,现在多一行勾选框 ——
     # 属性名写错 / 参数配错在 Blender 里是**当场抛异常、卡片整块消失**,
