@@ -6019,6 +6019,146 @@ def main():
         check("第一百零三轮(界面所见即所得)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零四轮:设置面板三件套 + 界面层级(互斥组 / 置顶)----
+    # 这一批查:三个新节点能注册、出码的关键几条都在、卡片(含循环里补上的
+    # 『互斥组』行)画得完、12 张控件卡统一带上了那个属性。
+    # **行为**由界面示例的探针在真 Godot 里查(见 check_ui_demo.py:
+    # 滑块数值字跟着变 / 下拉两种样式 / 复选框 / 互斥组与置顶)。
+    try:
+        r104_tree = bpy.data.node_groups.new("三件套冒烟104", "GKGameLogicTree")
+        r104_ready = r104_tree.nodes.new("GKNodeOnReady")
+        r104_panel = r104_tree.nodes.new("GKNodeUiPanel")
+        r104_panel.name = "设置面板"
+        r104_panel.gk_mutex_group = "侧栏面板"
+        r104_panel.gk_start_hidden = True
+        r104_slider = r104_tree.nodes.new("GKNodeUiSlider")
+        r104_slider.name = "音量滑块"
+        r104_slider.gk_min = -40.0
+        r104_slider.gk_max = 0.0
+        r104_slider.gk_value = -14.0
+        r104_slider.gk_label = "音量"
+        r104_slider.gk_suffix = " dB"
+        r104_slider.gk_parent_widget = "设置面板"
+        r104_pick = r104_tree.nodes.new("GKNodeUiDropdown")
+        r104_pick.name = "画质选择"
+        r104_pick.gk_items = "低|中|高"
+        r104_pick.gk_style = "NATIVE"
+        r104_pick.gk_index = 3
+        r104_arrows = r104_tree.nodes.new("GKNodeUiDropdown")
+        r104_arrows.name = "难度选择"
+        r104_arrows.gk_style = "ARROWS"
+        r104_box = r104_tree.nodes.new("GKNodeUiCheckbox")
+        r104_box.name = "静音"
+        r104_box.gk_checked = True
+        r104_box.gk_style = "SWITCH"
+        r104_hide = r104_tree.nodes.new("GKNodeUiHide")
+        r104_hide.name = "开设置"
+        r104_hide.gk_widget = "设置面板"
+        r104_hide.gk_visible = True
+        r104_hide.gk_raise = True
+        r104_bus = r104_tree.nodes.new("GKNodeBusVolume")
+        r104_bus.gk_fade = 0.0
+        r104_switch = r104_tree.nodes.new("GKNodeSwitch")
+        r104_switch.gk_case_count = 4
+        r104_apply = r104_tree.nodes.new("GKNodeQualitySet")
+        r104_branch = r104_tree.nodes.new("GKNodeBranch")
+        r104_tree.links.new(r104_ready.outputs["执行"], r104_panel.inputs["执行"])
+        r104_tree.links.new(r104_panel.outputs["完成"], r104_slider.inputs["执行"])
+        r104_tree.links.new(r104_slider.outputs["完成"], r104_pick.inputs["执行"])
+        r104_tree.links.new(r104_pick.outputs["完成"], r104_arrows.inputs["执行"])
+        r104_tree.links.new(r104_arrows.outputs["完成"], r104_box.inputs["执行"])
+        r104_tree.links.new(r104_box.outputs["完成"], r104_hide.inputs["执行"])
+        r104_tree.links.new(r104_slider.outputs["变了"], r104_bus.inputs["执行"])
+        r104_tree.links.new(r104_slider.outputs["值"], r104_bus.inputs["目标音量"])
+        r104_tree.links.new(r104_pick.outputs["选了"], r104_switch.inputs["执行"])
+        r104_tree.links.new(r104_pick.outputs["选了第几个"],
+                            r104_switch.inputs["值"])
+        r104_tree.links.new(r104_switch.outputs["1"], r104_apply.inputs["执行"])
+        # 复选框的『勾了吗』也接一条(不然那个读值辅助函数"没用到不生成")
+        r104_tree.links.new(r104_box.outputs["改了"], r104_branch.inputs["执行"])
+        r104_tree.links.new(r104_box.outputs["勾了吗"], r104_branch.inputs["条件"])
+        r104_code, r104_warn = codegen.generate(r104_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True,
+        })
+        check("三件套:三个新节点都建出来了(已注册)",
+              (r104_slider.bl_idname, r104_pick.bl_idname,
+               r104_box.bl_idname) == ("GKNodeUiSlider", "GKNodeUiDropdown",
+                                       "GKNodeUiCheckbox"))
+        check("三件套:出口形状(完成 + 信号出口 + 数据出口)",
+              [s.name for s in r104_slider.outputs] == ["完成", "变了", "值"]
+              and [s.name for s in r104_box.outputs]
+              == ["完成", "改了", "勾了吗"],
+              str([s.name for s in r104_slider.outputs]))
+        check("三件套:滑块 / 下拉 / 复选框的出码都在",
+              "HSlider.new()" in r104_code
+              and "OptionButton.new()" in r104_code
+              and "CheckButton.new()" in r104_code
+              and '["低", "中", "高"]' in r104_code
+              and 'set_meta("gk_index", 2)' in r104_code
+              and "value_changed.connect(func(_v: float) -> void:" in r104_code,
+              r104_code[-400:])
+        check("三件套:三个值输出都走『按名字现读』的辅助函数",
+              "func _gk_widget_value(widget_name: String) -> float:" in r104_code
+              and "func _gk_widget_index(widget_name: String) -> int:" in r104_code
+              and "func _gk_widget_checked(widget_name: String) -> bool:" in r104_code
+              and '_gk_widget_value("音量滑块")' in r104_code
+              and '_gk_widget_index("画质选择")' in r104_code)
+        check("层级:互斥组挂上、置顶走 _gk_ui_raise(挪最上层 + 收起同组)",
+              'add_to_group("gk_ui_mutex_侧栏面板")' in r104_code
+              and "func _gk_ui_raise(widget: Control) -> void:" in r104_code
+              and "widget.move_to_front()" in r104_code
+              and "_gk_ui_raise(" in r104_code)
+        check("三件套:生成无告警", not r104_warn, str(r104_warn)[:300])
+
+        # 卡片:三个新节点 + 隐藏控件 + 面板的 draw_buttons(含包装上来的
+        # 『互斥组』那一行)都要能画完 —— 画一半崩了 = 卡片"没作用"
+        class _R104Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r104_draw_ok = True
+        r104_draw_error = ""
+        for card in (r104_slider, r104_pick, r104_arrows, r104_box,
+                     r104_hide, r104_panel):
+            try:
+                card.draw_buttons(bpy.context, _R104Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r104_draw_ok = False
+                r104_draw_error = (f"{card.bl_label}: "
+                                   f"{type(exc).__name__}: {exc}")
+                break
+        check("三件套:六张卡片(含『互斥组』行)都能画完",
+              r104_draw_ok, r104_draw_error)
+
+        # 12 张控件卡统一带『互斥组』:属性表里有,而且**真物化过**
+        # (只写进 gk_prop_defs 而没重新 materialize 的话,Blender 那边
+        # 读这个属性会直接 AttributeError —— 这里是那一步的把关)
+        # ⚠ 走 `module_name`(冒烟里插件是在 bl_ext.* 命名空间下加载的,
+        #   直接 `from BlenderGameKit import ...` 会 ModuleNotFoundError)
+        _nn104 = import_module(f"{module_name}.nodes.nodes")
+        r104_missing = []
+        for cls in _nn104.CLASSES:
+            if cls.bl_idname not in _nn104.UI_DESIGN_BUILDER_NODES:
+                continue
+            if "gk_mutex_group" not in [e[0] for e in cls.gk_prop_defs]:
+                r104_missing.append(cls.bl_label)
+            elif "gk_mutex_group" not in getattr(cls, "__annotations__", {}):
+                r104_missing.append(cls.bl_label + "(没物化)")
+        check("层级:全部控件卡都带『互斥组』属性", not r104_missing,
+              str(r104_missing))
+
+        bpy.data.node_groups.remove(r104_tree)
+    except Exception as exc:
+        check("第一百零四轮(设置面板三件套)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

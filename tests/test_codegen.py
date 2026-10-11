@@ -2055,7 +2055,11 @@ class TestUiDesignTree(Base):
         from BlenderGameKit import properties as props
         for cls in (NN.GKNodeUiText, NN.GKNodeUiBar, NN.GKNodeUiButton,
                     NN.GKNodeUiImage, NN.GKNodeUiPanel, NN.GKNodeUiList,
-                    NN.GKNodeUiNinePatch, NN.GKNodeUiInput):
+                    NN.GKNodeUiNinePatch, NN.GKNodeUiInput,
+                    NN.GKNodeUiTextEdit,
+                    # 第一百零四轮:设置面板三件套
+                    NN.GKNodeUiSlider, NN.GKNodeUiDropdown,
+                    NN.GKNodeUiCheckbox):
             self.assertTrue(props.node_fits_tree(cls, "GKUiDesignTree"),
                             cls.bl_label + " 应该能放进设计图")
             # 老图不受影响:玩法图照旧能放(用户选的"两棵树都能放")
@@ -19367,6 +19371,302 @@ class TestRound103UiWysiwyg(Base):
             self.assertLessEqual(x, 40.0 + 1e-6)
             self.assertGreaterEqual(y, -1e-6)
             self.assertLessEqual(y, 20.0 + 1e-6)
+
+
+class TestRound104UiTrio(Base):
+    """第一百零四轮:设置面板三件套(滑块 / 下拉 / 复选框)+ 界面层级。
+
+    ── 这一层锁住的六条事实(改代码前先看)────────────────────────
+    1. **出口不叫『完成』**(叫『变了』/『选了』/『改了』)—— 叫『完成』
+       会被自动续接,"控件刚建出来后面那条链就跑了"(按钮老坑的变体);
+       真正的续接在信号回调里,单独成一节;
+    2. **初始值在接信号之前设好** —— 接完再设会当场触发信号,同样提前跑链;
+    3. **值从控件现读**(`_gk_widget_value/_index/_checked` 三个按名字读的
+       辅助函数,用到才生成)—— 拖动 / 选择后立刻能读到新值;
+    4. 下拉**两种样式**:原生 OptionButton 与 ◀ 当前项 ▶(环形切换),
+       选的是第几个统一记在控件 meta `gk_index`(0 起存,输出 +1);
+    5. **互斥组**:控件卡填了组名才挂 Godot 组,留空老图一字不变;
+    6. **『置顶』**:勾了且是"显示"才生成 `_gk_ui_raise`(挪最上层 +
+       收起同组其他成员);不勾 = 老行为一字不变。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    # ---- 滑块 ----
+    def test_trio_exit_shape(self):
+        """两个出口(『完成』接着建下一个 + 信号出口)+ 一个数据出口。
+
+        和『界面_按钮』(『完成』+『点击』)同形 —— 链上要能摆一排控件,
+        所以『完成』必须有;玩家的动作走信号出口(独立回调)。
+        """
+        for cls, names in (
+                (NN.GKNodeUiSlider, ["完成", "变了", "值"]),
+                (NN.GKNodeUiDropdown, ["完成", "选了", "选了第几个"]),
+                (NN.GKNodeUiCheckbox, ["完成", "改了", "勾了吗"])):
+            got = [spec["name"] for spec in cls.gk_outputs]
+            self.assertEqual(got, names, cls.bl_label)
+
+    def test_slider_builds_row_with_live_value_label(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="拖了")
+        slider = tree.new_node(NN.GKNodeUiSlider, "音量滑块", gk_min=-40.0,
+                               gk_max=0.0, gk_value=-14.0, gk_label="音量",
+                               gk_suffix=" dB")
+        gk_stub.connect(tree, event, "执行", slider, "执行")
+        gk_stub.connect(tree, slider, "变了", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 一整行:名称 + 滑轨 + 数值
+        self.assertIn("HBoxContainer.new()", code)
+        self.assertIn("HSlider.new()", code)
+        self.assertIn(".min_value = -40.0", code)
+        self.assertIn(".max_value = 0.0", code)
+        self.assertIn('.text = "音量"', code)
+        # 右边的数值 = 当前值 + 后缀(格式化走 _gk_num_text,整数不带 .0)
+        self.assertIn('_gk_num_text(-14.0) + " dB"', code)
+        # 拖动时实时刷新 + 走『变了』出口
+        self.assertIn("value_changed.connect(func(_v: float) -> void:", code)
+        self.assertIn("_gk_num_text(_v) + \" dB\"", code)
+        # 『变了』那条链在**回调函数**里,不在 _ready(否则刚建出来就跑了)
+        funcs = self.functions(code)
+        handler = next((name for name in funcs if name.endswith("_changed")), None)
+        self.assertIsNotNone(handler, f"没有滑块回调函数:\n{code}")
+        self.assertIn("func " + handler + "(_value: float) -> void:", code)
+        self.assertIn('print("拖了")', funcs[handler])
+        self.assertNotIn('print("拖了")', funcs["_ready"])
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_slider_value_output_reads_widget_live(self):
+        """『值』= 按名字现读控件(`_gk_widget_value`),不是缓存。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        slider = tree.new_node(NN.GKNodeUiSlider, "音量滑块")
+        to_text = tree.new_node(NN.GKNodeConvert, "转文字", gk_to="String")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", slider, "执行")
+        gk_stub.connect(tree, slider, "变了", printer, "执行")
+        gk_stub.connect(tree, slider, "值", to_text, "输入")
+        gk_stub.connect(tree, to_text, "输出", printer, "内容")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('str(_gk_widget_value("音量滑块"))', code)
+        self.assertIn("func _gk_widget_value(widget_name: String) -> float:", code)
+        # 没用到就不生成:另一张图里不该有这四个辅助函数
+        plain = make_tree()
+        only = self._ready(plain)
+        node = plain.new_node(NN.GKNodeUiSlider, "滑块")
+        gk_stub.connect(plain, only, "执行", node, "执行")
+        plain_code, _ = gen(plain, V3)
+        self.assertNotIn("func _gk_widget_value(", plain_code)
+        self.assertNotIn("func _gk_widget_index(", plain_code)
+        self.assertNotIn("func _gk_widget_checked(", plain_code)
+        self.assertNotIn("func _gk_ui_raise(", plain_code)
+
+    def test_slider_value_label_can_be_hidden(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        slider = tree.new_node(NN.GKNodeUiSlider, "亮度滑块",
+                               gk_show_value=False, gk_label="")
+        gk_stub.connect(tree, event, "执行", slider, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("custom_minimum_size = Vector2(64.0", code)
+        self.assertNotIn('_gk_num_text(50.0)', code)      # 没有初始数值那行
+        self.assertIn("HSlider.new()", code)
+
+    # ---- 下拉 ----
+    def test_dropdown_native_option_button(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        pick = tree.new_node(NN.GKNodeUiDropdown, "画质选择",
+                             gk_items="低|中| 高 |", gk_style="NATIVE",
+                             gk_index=3, gk_label="画质")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="选了")
+        gk_stub.connect(tree, event, "执行", pick, "执行")
+        gk_stub.connect(tree, pick, "选了", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("OptionButton.new()", code)
+        self.assertIn('["低", "中", "高"]', code)          # | 分隔 + 去空项
+        self.assertIn("add_item(str(_item))", code)
+        self.assertIn(".selected = 2", code)               # 属性 1 起数 -> 内部 0 起
+        self.assertIn('set_meta("gk_index", 2)', code)
+        self.assertIn("item_selected.connect(func(_i: int) -> void:", code)
+        funcs = self.functions(code)
+        handler = next((name for name in funcs if name.endswith("_selected")), None)
+        self.assertIsNotNone(handler, f"没有下拉回调函数:\n{code}")
+        self.assertIn("func " + handler + "(_index: int) -> void:", code)
+        self.assertIn('print("选了")', funcs[handler])
+
+    def test_dropdown_arrows_style_wraps_around(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        pick = tree.new_node(NN.GKNodeUiDropdown, "难度选择",
+                             gk_items="简单|普通|困难", gk_style="ARROWS",
+                             gk_index=1)
+        gk_stub.connect(tree, event, "执行", pick, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("OptionButton.new()", code)
+        self.assertIn('.text = "◀"', code)
+        self.assertIn('.text = "▶"', code)
+        self.assertIn('set_meta("gk_index", 0)', code)
+        # 环形切换:到头按回另一头(先 -1 再取模,负数也不会越界)
+        self.assertIn('- 1 + ', code)
+        self.assertIn(") % ", code)
+        self.assertIn('.text = str(_gk_items', code)        # 中间那格跟着换字
+        self.assertIn(".pressed.connect(func() -> void:", code)
+
+    def test_dropdown_empty_items_warns_with_fallback(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        pick = tree.new_node(NN.GKNodeUiDropdown, "空下拉", gk_items="")
+        gk_stub.connect(tree, event, "执行", pick, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("选项" in w for w in warnings), warnings)
+        self.assertIn('["选项"]', code)
+
+    def test_dropdown_index_output_is_one_based(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        pick = tree.new_node(NN.GKNodeUiDropdown, "画质选择", gk_index=2)
+        to_text = tree.new_node(NN.GKNodeConvert, "转文字", gk_to="String")
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        gk_stub.connect(tree, event, "执行", pick, "执行")
+        gk_stub.connect(tree, pick, "选了", printer, "执行")
+        gk_stub.connect(tree, pick, "选了第几个", to_text, "输入")
+        gk_stub.connect(tree, to_text, "输出", printer, "内容")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('str(_gk_widget_index("画质选择"))', code)
+        self.assertIn("func _gk_widget_index(widget_name: String) -> int:", code)
+        # 读出来 +1(和『对话_选择』的『选了第几个』一个规矩)
+        self.assertIn('return int(found.get_meta("gk_index")) + 1', code)
+
+    # ---- 复选框 ----
+    def test_checkbox_box_and_switch_styles(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        box = tree.new_node(NN.GKNodeUiCheckbox, "显示背景板",
+                            gk_text="显示背景板", gk_checked=True)
+        gk_stub.connect(tree, event, "执行", box, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("CheckBox.new()", code)
+        self.assertIn(".button_pressed = true", code)
+        self.assertIn(".toggled.connect(", code)
+        funcs = self.functions(code)
+        handler = next((name for name in funcs if name.endswith("_toggled")), None)
+        self.assertIsNotNone(handler, f"没有复选框回调函数:\n{code}")
+        self.assertIn("func " + handler + "(_on: bool) -> void:", code)
+
+        switch_tree = make_tree()
+        switch_event = self._ready(switch_tree)
+        switch = switch_tree.new_node(NN.GKNodeUiCheckbox, "静音",
+                                      gk_style="SWITCH")
+        gk_stub.connect(switch_tree, switch_event, "执行", switch, "执行")
+        switch_code, _ = gen(switch_tree, V3)
+        self.assertIn("CheckButton.new()", switch_code)
+        self.assertIn(".button_pressed = false", switch_code)
+
+    def test_checkbox_output_feeds_branch(self):
+        """『勾了吗』接『如果_否则』的条件 —— 布尔值真的接上了。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        box = tree.new_node(NN.GKNodeUiCheckbox, "静音")
+        branch = tree.new_node(NN.GKNodeBranch, "如果勾了")
+        yes_printer = tree.new_node(NN.GKNodePrint, "响了", gk_text="静音了")
+        gk_stub.connect(tree, event, "执行", box, "执行")
+        gk_stub.connect(tree, box, "改了", branch, "执行")
+        gk_stub.connect(tree, box, "勾了吗", branch, "条件")
+        gk_stub.connect(tree, branch, "是", yes_printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('if _gk_widget_checked("静音"):', code)
+        self.assertIn("func _gk_widget_checked(widget_name: String) -> bool:", code)
+        self.assertIn('print("静音了")', code)
+        self.assert_indent_sane(code)
+
+    # ---- 互斥组 / 置顶 ----
+    def test_mutex_group_registered_on_creation_only_when_filled(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        panel = tree.new_node(NN.GKNodeUiPanel, "设置面板",
+                              gk_mutex_group="侧栏面板")
+        plain = tree.new_node(NN.GKNodeUiPanel, "普通面板")
+        gk_stub.connect(tree, event, "执行", panel, "执行")
+        gk_stub.connect(tree, panel, "完成", plain, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('.add_to_group("gk_ui_mutex_侧栏面板")', code)
+        # 留空不挂组(老图生成物一字不变)
+        self.assertEqual(code.count("add_to_group"), 1, code)
+
+    def test_raise_only_when_ticked_and_showing(self):
+        def build(**props):
+            tree = make_tree()
+            event = self._ready(tree)
+            panel = tree.new_node(NN.GKNodeUiPanel, "设置面板")
+            hide = tree.new_node(NN.GKNodeUiHide, "开面板", gk_widget="设置面板",
+                                 **props)
+            gk_stub.connect(tree, event, "执行", panel, "执行")
+            gk_stub.connect(tree, panel, "完成", hide, "执行")
+            return gen(tree, V3)[0]
+
+        code = build(gk_visible=True, gk_raise=True)
+        self.assertIn("_gk_ui_raise(", code)
+        self.assertIn("func _gk_ui_raise(widget: Control) -> void:", code)
+        self.assertIn("widget.move_to_front()", code)
+        self.assertIn('begins_with("gk_ui_mutex_")', code)
+        self.assertIn("get_tree().get_nodes_in_group(key)", code)
+        # 没勾『置顶』= 老行为(只改 visible)
+        old = build(gk_visible=True, gk_raise=False)
+        self.assertNotIn("_gk_ui_raise", old)
+        self.assertNotIn("move_to_front", old)
+        # 勾了但这次是"隐藏" -> 不置顶(置顶只对打开有意义)
+        hiding = build(gk_visible=False, gk_raise=True)
+        self.assertNotIn("_gk_ui_raise", hiding)
+
+    def test_hide_node_default_is_unchanged(self):
+        """老图兼容:没勾『置顶』的『界面_隐藏控件』出码和以前一模一样。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        hide = tree.new_node(NN.GKNodeUiHide, "藏提示", gk_widget="提示")
+        gk_stub.connect(tree, event, "执行", hide, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("提示")', code)
+        self.assertIn(".visible = false", code)
+        self.assertNotIn("_gk_ui_raise", code)
+        prop_names = [entry[0] for entry in NN.GKNodeUiHide.gk_prop_defs]
+        self.assertEqual(prop_names,
+                         ["gk_widget", "gk_visible", "gk_raise"])
+
+    def test_ui_builder_cards_all_have_mutex_group(self):
+        """12 个控件构建节点统一带『互斥组』(属性 + 卡片那一行)。"""
+        builders = set(NN.UI_DESIGN_BUILDER_NODES)
+        self.assertIn("GKNodeUiSlider", builders)
+        self.assertIn("GKNodeUiDropdown", builders)
+        self.assertIn("GKNodeUiCheckbox", builders)
+        for cls in NN.CLASSES:
+            if cls.bl_idname not in builders:
+                continue
+            prop_names = [entry[0] for entry in cls.gk_prop_defs]
+            self.assertIn("gk_mutex_group", prop_names, cls.bl_label)
+            # 物化过:Blender 那边真的有这个属性(不能只写进 tuple)
+            self.assertIn("gk_mutex_group", getattr(cls, "__annotations__", {}),
+                          cls.bl_label)
+
+    def test_dropdown_item_texts_helper(self):
+        """选项解析只有一份(卡片预览和出码共用)。"""
+        node = NN.GKNodeUiDropdown()
+        node.gk_items = "低|中| 高 |"
+        self.assertEqual(NN.dropdown_item_texts(node), ["低", "中", "高"])
+        node.gk_items = "   "
+        self.assertEqual(NN.dropdown_item_texts(node), ["选项"])
 
 
 if __name__ == "__main__":

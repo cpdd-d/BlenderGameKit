@@ -44,6 +44,21 @@
 | **界面_套用设计** | 玩法图里就这一个节点:运行时把设计图里的 3 个控件(底板 / 标题 / 按钮)一次建出来 |
 | **界面_按钮点击** | 点右上角『点我』-> "得分"变成"设计按钮被点了"(设计图只管长什么样,点了做什么写在玩法图,按控件名接) |
 
+── 第一百零四轮:设置面板三件套 + 界面层级 ─────────────────────
+
+| 用到的 | 在游戏里怎么看 |
+|---|---|
+| **界面_滑块** | 按 **O** 弹出的设置面板里那行『音量 ●———○ -14 dB』—— 右边那串数字**跟着拖动实时变**;拖一次就走一遍『变了』-> 真的改了 Godot 的 Master 总线音量 |
+| **界面_下拉(下拉菜单)** | 『画质』那一行:点开小列表选 低/中/高 -> 『选了』-> 多路分支 -> 『画质_设置』(视口缩放 / 抗锯齿真的变) |
+| **界面_下拉(左右切换)** | 『难度』那一行:`◀ 困难 ▶` 点箭头换项(到头绕回);选完把『选了第几个』写进"得分"(`界面_设置` 改文字) |
+| **界面_复选框** | 『显示背景板』:勾/不勾 -> 『改了』-> 背景板跟着显隐(布尔输出直接接『显示_设置可见』的『可见』) |
+| **互斥组 + 置顶**(层级) | 『设置面板』和『背包面板』卡上都填了互斥组『侧栏面板』,打开它们的『界面_隐藏控件』都勾了『置顶』—— 按 **O** 开设置、按 **B** 开背包(互相挤掉,只留一块);按 **C** 都收起来 |
+
+── 界面层级怎么理解(用户问:"设置 UI 和背包 UI 重叠了怎么办")──────
+* **置顶**(打开时 `move_to_front`)= 谁后开谁在上 —— 同时按两个键,最后受理的那块盖在上面;
+* **互斥组**(控件卡上填组名)= 同组的界面只留一个开着 —— 按 O 时背包自动收起,反之亦然;
+* 两块面板**都没有**进组时才需要靠"置顶"判断谁在前面。
+
 跑法(Godot):打开 `界面示例_godot` 直接 F5。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ui_demo.py`
 """
@@ -416,10 +431,69 @@ def _build_ui_chain(tree, ready, design):
                      gk_widget="昵称")
     write_name = _add(tree, "GKNodeUiSet", "把名字写进得分", 3120.0, 0.0,
                       gk_widget="分数", gk_set_text=True)
+    # ── 第一百零四轮:设置面板(滑块 / 下拉 / 复选框)─────────────
+    # 两块面板填**同一个互斥组**『侧栏面板』+ 打开它们的节点勾『置顶』:
+    # 开一块 -> 另一块自动收起(同时按两个键也只会开出一块)。
+    settings = _add(tree, "GKNodeUiPanel", "设置面板", 2860.0, 900.0,
+                    gk_width=420.0, gk_height=300.0, gk_radius=18,
+                    gk_align="CENTER_RIGHT", gk_margin=24.0,
+                    gk_start_hidden=True, gk_mutex_group="侧栏面板",
+                    gk_color=(0.05, 0.06, 0.09, 0.88))
+    settings_title = _add(tree, "GKNodeUiText", "设置标题", 3120.0, 900.0,
+                          gk_text="设置", gk_size=28, gk_align="TOP_CENTER",
+                          gk_margin=14.0, gk_parent_widget="设置面板")
+    volume = _add(tree, "GKNodeUiSlider", "音量滑块", 3380.0, 900.0,
+                  gk_min=-40.0, gk_max=0.0, gk_step=1.0, gk_value=-14.0,
+                  gk_label="音量", gk_suffix=" dB",
+                  gk_x=28.0, gk_y=70.0, gk_width=364.0, gk_height=36.0,
+                  gk_parent_widget="设置面板")
+    quality_pick = _add(tree, "GKNodeUiDropdown", "画质选择", 3380.0, 700.0,
+                        gk_items="低|中|高", gk_style="NATIVE", gk_index=3,
+                        gk_label="画质",
+                        gk_x=28.0, gk_y=122.0, gk_width=364.0, gk_height=36.0,
+                        gk_parent_widget="设置面板")
+    level_pick = _add(tree, "GKNodeUiDropdown", "难度选择", 3380.0, 500.0,
+                      gk_items="简单|普通|困难", gk_style="ARROWS", gk_index=1,
+                      gk_label="难度",
+                      gk_x=28.0, gk_y=174.0, gk_width=364.0, gk_height=36.0,
+                      gk_parent_widget="设置面板")
+    plate_box = _add(tree, "GKNodeUiCheckbox", "显示背景板", 3380.0, 300.0,
+                     gk_text="显示背景板", gk_checked=True, gk_style="BOX",
+                     gk_x=28.0, gk_y=232.0, gk_width=220.0, gk_height=36.0,
+                     gk_parent_widget="设置面板")
+    bag = _add(tree, "GKNodeUiPanel", "背包面板", 2860.0, 1500.0,
+               gk_width=260.0, gk_height=170.0, gk_radius=16,
+               gk_align="CENTER_LEFT", gk_margin=24.0,
+               gk_start_hidden=True, gk_mutex_group="侧栏面板",
+               gk_color=(0.09, 0.07, 0.05, 0.88))
+    bag_title = _add(tree, "GKNodeUiText", "背包标题", 3120.0, 1500.0,
+                     gk_text="背包", gk_size=26, gk_align="TOP_CENTER",
+                     gk_margin=14.0, gk_parent_widget="背包面板")
+    bag_text = _add(tree, "GKNodeUiText", "背包内容", 3120.0, 1300.0,
+                    gk_text="钥匙 ×1 / 手电 ×1", gk_size=20,
+                    gk_align="TOP_CENTER", gk_margin=64.0,
+                    gk_parent_widget="背包面板")
+    # 三条行为链(挂在三件套的出口上;生成物在独立回调里,不会开场就跑)
+    volume_bus = _add(tree, "GKNodeBusVolume", "滑块调音量", 3640.0, 900.0,
+                      gk_bus="Master", gk_fade=0.0)
+    quality_switch = _add(tree, "GKNodeSwitch", "看画质走哪条", 3640.0, 620.0,
+                          gk_case_count=4)
+    quality_nodes = []
+    for _index, (_label, _level) in enumerate((("低", "LOW"), ("中", "MID"),
+                                               ("高", "HIGH"))):
+        quality_nodes.append(_add(tree, "GKNodeQualitySet", f"画质{_label}档",
+                                  3920.0, 520.0 - _index * 60.0,
+                                  gk_level=_level))
+    level_text = _add(tree, "GKNodeConvert", "难度转文字", 3640.0, 340.0,
+                      gk_to="String")
+    write_level = _add(tree, "GKNodeUiSet", "显示难度", 3920.0, 340.0,
+                       gk_widget="分数", gk_set_text=True)
+    plate_visible = _add(tree, "GKNodeSetVisible", "背景板跟着勾走",
+                         3640.0, 120.0, gk_target="背景板")
     hotkey = _add(tree, "GKNodeUiPauseGame", "暂停热键", 3380.0, 0.0,
                   gk_pause=False, gk_menu="暂停菜单", gk_hotkey=True)
     hint = _add(tree, "GKNodeUiText", "底部提示", 3640.0, 0.0,
-                gk_text="点一下继续对话 / Esc 暂停 / 对话后在昵称框回车",
+                gk_text="点一下继续对话 / Esc 暂停 / O 设置 / B 背包 / C 收起 / 昵称框回车",
                 gk_size=20, gk_align="BOTTOM_CENTER", gk_margin=28.0)
     dialog = _add(tree, "GKNodeUiDialog", "开场白", 3900.0, 0.0,
                   gk_speaker="向导", gk_text=DIALOG_TEXT,
@@ -503,7 +577,18 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, chat, "完成", nickname, "执行")
     # ⚠ 顺序:『暂停热键』在前(它在准备时会调一次"取消暂停"—— 它是开/关型),
     #   我的『开局选单态』在后,才不会被它覆盖(实测踩过:paused=false)。
-    _link(tree, nickname, "完成", hotkey, "执行")
+    # 第一百零四轮把设置面板/背包面板插在中间:它们只"建出来"(开局都藏着),
+    # 什么时候开由 O / B 键决定(见 _build_frame_chain)。
+    _link(tree, nickname, "完成", settings, "执行")
+    _link(tree, settings, "完成", settings_title, "执行")
+    _link(tree, settings_title, "完成", volume, "执行")
+    _link(tree, volume, "完成", quality_pick, "执行")
+    _link(tree, quality_pick, "完成", level_pick, "执行")
+    _link(tree, level_pick, "完成", plate_box, "执行")
+    _link(tree, plate_box, "完成", bag, "执行")
+    _link(tree, bag, "完成", bag_title, "执行")
+    _link(tree, bag_title, "完成", bag_text, "执行")
+    _link(tree, bag_text, "完成", hotkey, "执行")
     _link(tree, hotkey, "完成", startup, "执行")
     _link(tree, startup, "完成", hint, "执行")
     _link(tree, hint, "完成", dialog, "执行")
@@ -564,6 +649,25 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, read_chat, "文字", send_chat, "文字")
     _link(tree, chat, "提交", send_chat, "执行")
 
+    # ── 第一百零四轮:三件套的行为链 ──────────────────────────────
+    # ① 滑块『变了』-> 『音效_总线音量』(目标音量接『值』)—— 拖一下,
+    #    Master 总线当场变(时长 0 = 立刻生效,探针好断言);
+    # ② 画质下拉『选了』-> 多路分支(拔『选了第几个』)-> 三档画质;
+    # ③ 难度(箭头)『选了』-> 把"第几个"转成文字写进"得分"(整数输出);
+    # ④ 复选框『改了』-> 『显示_设置可见』(『可见』接『勾了吗』)——
+    #    勾/不勾两个方向都跟着走(不接分支,一个节点管来回)。
+    _link(tree, volume, "变了", volume_bus, "执行")
+    _link(tree, volume, "值", volume_bus, "目标音量")
+    _link(tree, quality_pick, "选了", quality_switch, "执行")
+    _link(tree, quality_pick, "选了第几个", quality_switch, "值")
+    for _index, _apply in enumerate(quality_nodes):
+        _link(tree, quality_switch, str(_index + 1), _apply, "执行")
+    _link(tree, level_pick, "选了", write_level, "执行")
+    _link(tree, level_pick, "选了第几个", level_text, "输入")
+    _link(tree, level_text, "输出", write_level, "文字")
+    _link(tree, plate_box, "改了", plate_visible, "执行")
+    _link(tree, plate_box, "勾了吗", plate_visible, "可见")
+
     # 菜单里的按钮:先解除暂停,再回到游戏 / 退出
     back = _add(tree, "GKNodeUiPauseGame", "继续游戏", 3380.0, -260.0,
                 gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
@@ -585,22 +689,56 @@ def _build_ui_chain(tree, ready, design):
     log("界面链:皮肤 -> 套用设计图(右上角 HUD,3 个控件) -> 接设计按钮行为 -> "
         "面板 -> 图片 -> 文本 -> 进度条 -> 引擎声(循环) -> 暂停菜单(九宫格标题条 + "
         "存档列表 + 画质三档) -> 日志列表(填充) -> 聊天框(多行) -> "
-        "昵称输入框(输入法) -> 提示 -> 对话框 -> 淡入 + 聚焦 -> "
+        "昵称输入框(输入法) -> 设置面板(滑块 + 下拉 + 左右切换 + 复选框)+ "
+        "背包面板(互斥组/置顶,O/B/C 开关) -> 提示 -> 对话框 -> 淡入 + 聚焦 -> "
         "结局选择(3 个选项) -> 字幕(带立绘) -> 对话回顾(导出 + 点句重放)")
     return choice
 
 
 def _build_frame_chain(tree, physics):
-    """每物理帧:把血条调成半透明(『界面_设置』的现场)。
+    """每物理帧:把血条调成半透明 + 三个按键开关面板。
 
     ── 为什么留一个"每帧都设一遍"的节点在图上 ──────────────────────
     探针要断言的是"运行时改控件真的生效"(血条的 modulate.a = 0.6);
     一次性设置也行,但每帧刷一遍才是真实用法(血条/图标会随状态变化)。
     顺带还能看出"暂停之后它停了" —— 暂停时血条透明度不会再被刷新。
+
+    ── 第一百零四轮:O / B / C 三个键 ────────────────────────────
+    每个键都是"从『每当_物理帧』拉一条独立分支"(curve 示例同一套写法:
+    一个执行出口接多条的,生成时按画布上下位置依次出码)。
+      * O = 开设置面板、B = 开背包面板 —— **都勾了『置顶』**,所以
+        开一块就自动收起互斥组(『侧栏面板』)里的另一块;
+      * C = 两块都收起来。
     """
     setter = _add(tree, "GKNodeUiSet", "血条半透明", 260.0, -320.0,
                   gk_widget="血条", gk_set_alpha=True, gk_alpha=0.6)
     _link(tree, physics, "执行", setter, "执行")
+
+    def open_panel(key_name, panel_name, y):
+        key = _add(tree, "GKNodeKey", f"{key_name} 键", 520.0, y,
+                   gk_key=key_name, gk_trigger="JUST")
+        branch = _add(tree, "GKNodeBranch", f"按了 {key_name}?", 780.0, y)
+        opener = _add(tree, "GKNodeUiHide", f"开{panel_name}", 1040.0, y,
+                      gk_widget=panel_name, gk_visible=True, gk_raise=True)
+        _link(tree, key, "结果", branch, "条件")
+        _link(tree, physics, "执行", branch, "执行")
+        _link(tree, branch, "是", opener, "执行")
+        return opener
+
+    open_panel("O", "设置面板", -640.0)
+    open_panel("B", "背包面板", -900.0)
+
+    key_c = _add(tree, "GKNodeKey", "C 键", 520.0, -1160.0,
+                 gk_key="C", gk_trigger="JUST")
+    branch_c = _add(tree, "GKNodeBranch", "按了 C?", 780.0, -1160.0)
+    close_settings = _add(tree, "GKNodeUiHide", "关设置面板", 1040.0, -1160.0,
+                          gk_widget="设置面板", gk_visible=False)
+    close_bag = _add(tree, "GKNodeUiHide", "关背包面板", 1300.0, -1160.0,
+                     gk_widget="背包面板", gk_visible=False)
+    _link(tree, key_c, "结果", branch_c, "条件")
+    _link(tree, physics, "执行", branch_c, "执行")
+    _link(tree, branch_c, "是", close_settings, "执行")
+    _link(tree, close_settings, "完成", close_bag, "执行")
 
 
 def _apply_settings(scene, pairs):

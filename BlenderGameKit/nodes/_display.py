@@ -1536,18 +1536,33 @@ class GKNodeUiHide(B.GKStatementNode):
     bl_label = "界面_隐藏控件"
     bl_icon = "HIDE_ON"
     gk_category = "界面"
-    gk_doc = "隐藏某个界面控件(比如捡到道具后让提示消失)。控件名就是创建它的节点名"
+    gk_doc = ("显示 / 隐藏某个界面控件(比如捡到道具后让提示消失、按键"
+              "开关设置面板)。控件名就是创建它的节点名。\n"
+              "── 『置顶』(第一百零四轮:多个界面的层级)────────────────\n"
+              "勾上之后,**显示**这块面板时会顺带做两件事:\n"
+              "  ① `move_to_front()` —— 挪到最上层,**谁后开谁在上**;"
+              "同时开两块面板时最后按的那个盖在上面;\n"
+              "  ② 把**『互斥组』里同组的其他面板自动收起来** —— "
+              "同组只留一个开着(组名填在控件卡上,和这个节点无关;"
+              "没进组的控件不受影响)。\n"
+              "⇢ 设置面板 + 背包面板填同一个互斥组、各自的打开节点勾"
+              "『置顶』,同时按两个键也只会开出一块。\n"
+              "⚠ 取消勾选 = 老行为一字不变(只改 visible,不动层级)。")
     gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "控件名", "提示"),)
     gk_input_props = {"控件名": "gk_widget"}
     gk_prop_defs = (
         ("gk_widget", "string", "提示", "控件名", "要隐藏的界面节点名"),
         ("gk_visible", "bool", False, "显示", "勾上=显示，取消=隐藏"),
+        ("gk_raise", "bool", False, "置顶",
+         "显示时挪到最上层(谁后开谁在上),并自动收起『互斥组』里同组的"
+         "其他面板 —— 只对『显示』有意义"),
     )
 
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         row.prop(self, "gk_widget", text="")
         row.prop(self, "gk_visible", text="", toggle=True)
+        row.prop(self, "gk_raise", text="置顶", toggle=True)
 
 
 @N
@@ -2378,6 +2393,200 @@ class GKNodeUiTextEdit(B.GKStatementNode):
         B.draw_ui_align_row(self, layout)
 
 
+# ==========================================================================
+# 第一百零四轮:设置面板三件套(滑块 / 下拉 / 复选框)
+# ==========================================================================
+# 背景(用户):"设置面板三件套" + "右边的数值要自动跟当前值"。
+#
+# ── 为什么三个都是"一整行 HBox"(而不是裸控件)────────────────────
+# 设置面板里的样子是 `音量 ●———○ -14 dB` —— 名称、滑轨、当前值三样东西
+# 得排成一行。裸 HSlider 只能自己占一块,名称 / 数值还得用户另摆文本节点
+# 再手动更新(那就不是"自动跟"了)。所以节点自己建一个 HBox:
+#   * HBox 用**节点名**命名(『界面_设置』『界面_隐藏控件』按名字找它);
+#   * 里面的滑轨 / 按钮是它的子节点,和它一起显隐、一起挪位置。
+# 复选框不包 HBox:CheckBox 自带文字,一个控件就够。
+#
+# ── 值从哪读(『值』/『选了第几个』/『勾了吗』)─────────────────────
+# 三个数据输出走**按名字读控件**的辅助函数(见 codegen.generator 里的
+# `_gk_widget_value` / `_gk_widget_index` / `_gk_widget_checked`)——
+# 和『界面_取文字』同一套做法:值随玩家操作实时变,读的时候现取。
+# 下拉框的"第几个"记在控件自己的 meta `gk_index` 上(**0 起存**,
+# 输出给用户时 +1 —— 1 起数和『对话_选择』一个规矩)。
+def dropdown_item_texts(node):
+    """下拉框的选项文字(| 分隔,去掉空项;全空时给一个兜底项)。
+
+    纯函数:卡片上的预览、代码生成两边共用 —— 各解析一份迟早对不上。
+    """
+    raw = str(getattr(node, "gk_items", "") or "")
+    items = [part.strip() for part in raw.split("|") if part.strip()]
+    return items or ["选项"]
+
+
+@N
+class GKNodeUiSlider(B.GKStatementNode):
+    bl_idname = "GKNodeUiSlider"
+    bl_label = "界面_滑块"
+    bl_icon = "DRIVER"
+    gk_category = "界面"
+    gk_doc = ("一根能拖的滑块 + 左边名称 + **右边自动跟当前数值**"
+              "(`音量 ●———○ -14 dB` 那样)。设置面板里的音量 / 灵敏度 / "
+              "亮度都用它。\n"
+              "── 右边那串数字怎么来的 ──\n"
+              "当前值 + 『后缀』:填 `%` 就是 `80%`,填 ` dB` 就是 `-14 dB`,"
+              "留空只显示数字;拖动时**实时刷新**。不要它就取消『显示数值』。\n"
+              "── 拖完做什么 ──\n"
+              "沿『变了』出口继续(拖一次走一遍 —— 接『音效_总线音量』就是"
+              "实时调音量);当前值还能用『值』(数值输出)随时读。\n"
+              "⚠ 实际控件是一整行(名称 + 滑轨 + 数值),按**节点名**找它 ——"
+              "『界面_设置』改透明度 / 『界面_隐藏控件』显隐都作用在整行上。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_min", "float", 0.0, "最小", "滑到最左边 = 这个值"),
+        ("gk_max", "float", 100.0, "最大", "滑到最右边 = 这个值"),
+        ("gk_step", "float", 1.0, "步长", "每次拖动最小变化多少(0 = 连续)"),
+        ("gk_value", "float", 50.0, "初始值", "一建出来停在哪"),
+        ("gk_label", "string", "音量", "名称", "左边那行字(留空不显示)"),
+        ("gk_show_value", "bool", True, "显示数值", "右边跟着当前值变的那串字"),
+        ("gk_suffix", "string", "%", "后缀", "数值后面拼的字(比如 % 或  dB)"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 320.0, "宽", "像素"),
+        ("gk_height", "float", 36.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+    # 两个出口(和『界面_按钮』同一个道理):
+    #   * 『完成』= 建好了,接着建下一个控件(链上摆一排就要它);
+    #   * 『变了』= 玩家拖了滑块 —— 放在独立回调里,不会刚建出来就触发。
+    # 『值』是数据出口(数值),拖动后立刻能读到新值。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "变了"),
+                  S.pin(FLOAT, "值", 50.0))
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_min", text="最小")
+        row.prop(self, "gk_max", text="最大")
+        row.prop(self, "gk_step", text="步长")
+        row = layout.row(align=True)
+        row.prop(self, "gk_value", text="值")
+        row.prop(self, "gk_label", text="名称")
+        row.prop(self, "gk_suffix", text="后缀")
+        row.prop(self, "gk_show_value", text="显示", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiDropdown(B.GKStatementNode):
+    bl_idname = "GKNodeUiDropdown"
+    bl_label = "界面_下拉"
+    bl_icon = "COLLAPSEMENU"
+    gk_category = "界面"
+    gk_doc = ("从几个选项里**挑一个**(画质档位 / 难度 / 分辨率)。点中哪个就走"
+              "『选了』出口;选中的是第几个用『选了第几个』读(1 起数,和"
+              "『对话_选择』一个规矩)。\n"
+              "── 两种样式(卡片上选)──\n"
+              "  * **下拉菜单** = Godot 原生 OptionButton:点开一个小列表,"
+              "鼠标顺手;\n"
+              "  * **左右切换** = `◀ 当前项 ▶`:点两边箭头换项,到头会绕回"
+              "另一头(键盘 / 手柄也方便)。\n"
+              "选项按 `|` 分隔写(`低|中|高`)。\n"
+              "── 和『对话_选择』的区别 ──\n"
+              "那个是**一次性选择**(等玩家选完才往下走,会卡执行流);"
+              "这个是**随时可改的设置项** —— 选完立刻走『选了』,不卡。\n"
+              "⚠ 控件是一整行(可选名称 + 选项控件),按**节点名**找它。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_items", "string", "低|中|高", "选项", "按 | 分隔写每个选项"),
+        ("gk_style", "enum", "NATIVE", "样式", "下拉菜单 / 左右切换",
+         (("NATIVE", "下拉菜单", "Godot 原生 OptionButton:点开一个小列表"),
+          ("ARROWS", "左右切换", "◀ 当前项 ▶:点两边箭头换项"))),
+        ("gk_index", "int", 1, "默认选第几个", "1 起数(第 1 项 = 1)",
+         None, {"min": 1, "max": 20}),
+        ("gk_label", "string", "", "名称", "左边那行字(留空不显示)"),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 240.0, "宽", "像素"),
+        ("gk_height", "float", 36.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+    # 两个出口(和『界面_按钮』同一个道理):『完成』接着建下一个,
+    # 『选了』是玩家换项(独立回调)。『选了第几个』1 起数,随时可读。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "选了"),
+                  S.pin(INT, "选了第几个", 1))
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_items", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_style", text="")
+        row.prop(self, "gk_index", text="选第几个")
+        row.prop(self, "gk_label", text="名称")
+        texts = dropdown_item_texts(self)
+        filled = str(getattr(self, "gk_items", "") or "").strip()
+        head = "、".join(texts[:6]) + ("…" if len(texts) > 6 else "")
+        if filled:
+            layout.label(text=f"{len(texts)} 个选项:{head}", icon="INFO")
+        else:
+            layout.label(text="还没填『选项』(按 | 分隔写)", icon="ERROR")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiCheckbox(B.GKStatementNode):
+    bl_idname = "GKNodeUiCheckbox"
+    bl_label = "界面_复选框"
+    bl_icon = "CHECKBOX_DEHLT"
+    gk_category = "界面"
+    gk_doc = ("一个勾选框(勾上 / 不勾):全屏、静音、显示伤害数字这类**开关型"
+              "设置**都用它。\n"
+              "勾上或取消都走『改了』出口;当前是勾着还是没勾,用『勾了吗』"
+              "(布尔输出)读。\n"
+              "── 两种样式 ──\n"
+              "  * **勾选框** = Godot 的 CheckBox(一个 ☑ 方块);\n"
+              "  * **开关** = CheckButton(一条会滑的小开关,手机上常见)。\n"
+              "『文字』就写在框旁边(框自带文字,不另算一行)。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_text", "string", "全屏", "文字", "框旁边那行字"),
+        ("gk_checked", "bool", False, "默认勾上", "一建出来就是勾着的"),
+        ("gk_style", "enum", "BOX", "样式", "勾选框 / 开关",
+         (("BOX", "勾选框", "一个 ☑ 方块(CheckBox)"),
+          ("SWITCH", "开关", "一条会滑的小开关(CheckButton)"))),
+        ("gk_x", "float", 20.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 20.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 180.0, "宽", "像素(0 = 按文字自己撑开)"),
+        ("gk_height", "float", 36.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+    # 两个出口(和『界面_按钮』同一个道理):『完成』接着建下一个,
+    # 『改了』是玩家勾/取消(独立回调)。『勾了吗』随时可读。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "改了"),
+                  S.pin(BOOL, "勾了吗", False))
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_text", text="")
+        row.prop(self, "gk_style", text="")
+        row.prop(self, "gk_checked", text="默认勾", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
 @N
 class GKNodeUiSkin(B.GKStatementNode):
     bl_idname = "GKNodeUiSkin"
@@ -2595,8 +2804,36 @@ class GKNodeUiOnClick(B.GKStatementNode):
 UI_DESIGN_BUILDER_NODES = (
     "GKNodeUiText", "GKNodeUiBar", "GKNodeUiButton", "GKNodeUiImage",
     "GKNodeUiPanel", "GKNodeUiList", "GKNodeUiNinePatch", "GKNodeUiInput",
-    "GKNodeUiTextEdit",
+    "GKNodeUiTextEdit", "GKNodeUiSlider", "GKNodeUiDropdown",
+    "GKNodeUiCheckbox",
 )
+
+# ── 所有控件共用的『互斥组』一行(第一百零四轮)─────────────────────
+# 用户:"多个游戏UI界面怎么设置层级的……有时同时按两个键"。答案是一对组合拳:
+#   * 控件卡上填『互斥组』= 给自己挂个 Godot 组(留空不参与);
+#   * 打开它的『界面_隐藏控件』勾『置顶』= 开的时候挪到最上层 +
+#     把同组的其他成员收起来("同组只留一个开着")。
+# 属性**加在下面这个循环里**,而不是抄进 12 个类的 gk_prop_defs ——
+# 一个概念只有一处定义,以后加新控件也不会漏。代价是要手动再物化一次
+# (`materialize_props`):@N 在类创建时就把属性表用掉了,之后再往
+# gk_prop_defs 里补条目,**Blender 那边不会自动长出属性**。
+_UI_MUTEX_PROP = ("gk_mutex_group", "string", "", "互斥组",
+                  "同组的控件只留一个开着:别人打开自己时,自动收起同组的"
+                  "其他成员(留空 = 不参与)")
+
+
+def _ui_mutex_card_row(node, layout):
+    """控件卡片收尾那行『互斥组』(滑块 / 下拉 / 复选框…都画它)。"""
+    layout.prop(node, "gk_mutex_group", text="互斥组", icon="DOT")
+
+
+def _wrap_ui_card_draw(original):
+    """给控件的 draw_buttons 尾巴上加一行『互斥组』。"""
+    def draw_buttons(self, context, layout):
+        original(self, context, layout)
+        _ui_mutex_card_row(self, layout)
+    return draw_buttons
+
 
 for _cls in CLASSES:
     if _cls.bl_idname in UI_DESIGN_BUILDER_NODES:
@@ -2604,6 +2841,12 @@ for _cls in CLASSES:
         _cls.gk_tree_type = UI_TREES
         # 『界面_套用设计』按这个标记挑节点,见 codegen.services._ui_design_nodes
         _cls.gk_ui_builder = True
+        _cls.gk_prop_defs = tuple(_cls.gk_prop_defs) + (_UI_MUTEX_PROP,)
+        B.materialize_props(_cls)
+        # 自定义过 draw_buttons 的补一行;没自定义的走基类"自动画属性"那条路
+        # (新加的属性在 gk_prop_defs 里,基类会自己把它画出来,别画两遍)
+        if "draw_buttons" in _cls.__dict__:
+            _cls.draw_buttons = _wrap_ui_card_draw(_cls.draw_buttons)
 
 
 # ==========================================================================

@@ -1142,6 +1142,79 @@ class Generator:
                     "empty_body": "    pass",
                     "separator": True,
                 })
+            # ── 设置面板三件套的"读值"三个小函数(第一百零四轮)──────────
+            # 都是"按名字找控件 -> 取状态":滑块读 value / 下拉读 gk_index
+            # (0 起存的 meta,给用户时 +1)/ 复选框读 button_pressed。
+            # 控件还没建出来 / 名字填错时给中性值(0 / 0 / false),不炸。
+            if self.ctx.need_widget_value_helper:
+                sections.append({
+                    "signature": ("func _gk_widget_value(widget_name: String) "
+                                  "-> float:"),
+                    "lines": [
+                        "    var found := _gk_find_widget(widget_name)",
+                        "    if found == null:",
+                        "        return 0.0",
+                        "    if found is Range:",
+                        "        return (found as Range).value",
+                        "    for child in found.get_children():",
+                        "        if child is Range:",
+                        "            return (child as Range).value",
+                        "    return 0.0",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+            if self.ctx.need_widget_index_helper:
+                sections.append({
+                    "signature": ("func _gk_widget_index(widget_name: String) "
+                                  "-> int:"),
+                    "lines": [
+                        "    # 下拉框现在选的是第几个(**1 起数**):meta 里存的是 0 起",
+                        "    var found := _gk_find_widget(widget_name)",
+                        "    if found == null:",
+                        "        return 0",
+                        '    if found.has_meta("gk_index"):',
+                        '        return int(found.get_meta("gk_index")) + 1',
+                        "    return 0",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+            if self.ctx.need_widget_checked_helper:
+                sections.append({
+                    "signature": ("func _gk_widget_checked(widget_name: String) "
+                                  "-> bool:"),
+                    "lines": [
+                        "    var found := _gk_find_widget(widget_name)",
+                        "    if found == null:",
+                        "        return false",
+                        "    if found is BaseButton:",
+                        "        return (found as BaseButton).button_pressed",
+                        "    return false",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+            if self.ctx.need_raise_helper:
+                sections.append({
+                    # 『界面_隐藏控件』勾了『置顶』才生成:打开一块面板时
+                    # 挪到最上层,并把它所在互斥组的其他成员收起来。
+                    # 没进组的控件 get_groups() 里没有那个前缀 —— 空转,安全。
+                    "signature": "func _gk_ui_raise(widget: Control) -> void:",
+                    "lines": [
+                        "    # 谁后开谁在上:挪到同层最后(画在最上面)",
+                        "    widget.move_to_front()",
+                        "    # 互斥组:同组的其他面板自动收起来(填了组名才进组)",
+                        "    for key in widget.get_groups():",
+                        '        if not str(key).begins_with("gk_ui_mutex_"):',
+                        "            continue",
+                        "        for other in get_tree().get_nodes_in_group(key):",
+                        "            if other != widget and other is CanvasItem:",
+                        "                (other as CanvasItem).visible = false",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
             sections.append({
                 # 不带 host 参数:它从来没被用过,而 Godot 会把
                 # "参数没用上" 报成 UNUSED_PARAMETER(调试器里一条错误)。

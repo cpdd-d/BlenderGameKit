@@ -747,7 +747,17 @@ def _ui_add_to(ctx, indent, widget, node, root, after=None):
     "容器"的语义;顺带锚点也变成**相对底板**算,按钮在菜单里居中排。
 
     没有父控件(或名字填错)时退回挂界面根 + 告警 —— 不静默丢控件。
+
+    ── 顺手登记互斥组(第一百零四轮)────────────────────────────────
+    控件卡上填了『互斥组』的,建出来时挂进一个 Godot 组(前缀
+    `gk_ui_mutex_`)—— 『界面_隐藏控件』勾『置顶』显示一块面板时,
+    按这个组把同组其他成员收起来("同组只留一个开着")。
+    留空 = 不挂组,老图生成物一字不变。
     """
+    group = str(getattr(node, "gk_mutex_group", "") or "").strip()
+    if group:
+        ctx.add_line(indent,
+                     f"{widget}.add_to_group({gd_string('gk_ui_mutex_' + group)})")
     after = list(after or [])
     parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
     if not parent_name:
@@ -774,6 +784,24 @@ def _ui_add_to(ctx, indent, widget, node, root, after=None):
     ctx.add_line(indent + 1,
                  f'push_warning("找不到父控件『{parent_name}』，'
                  f'『{node.name}』已挂到界面根下")')
+
+
+def _ui_name_label(ctx, indent, parent_var, text):
+    """控件前面那个名称小标签(滑块 / 下拉共用),返回变量名。
+
+    第一百零四轮:`音量 ●———○ -14 dB` 里最左那截。文字留空就整块不要
+    (返回 None)—— "没有名称"不是空标签,是**没有**这个控件。
+    """
+    text = str(text or "").strip()
+    if not text:
+        return None
+    var = ctx.new_temp("gk_name")
+    ctx.add_line(indent, f"var {var} := Label.new()")
+    ctx.add_line(indent, f"{var}.text = {gd_string(text)}")
+    ctx.add_line(indent, f"{var}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent, f"{var}.vertical_alignment = VERTICAL_ALIGNMENT_CENTER")
+    ctx.add_line(indent, f"{parent_var}.add_child({var})")
+    return var
 
 
 def _ui_image_res(value):
@@ -930,8 +958,18 @@ def _stmt_ui_button(ctx, node, indent):
 
 @stmt_node("GKNodeUiHide")
 def _stmt_ui_hide(ctx, node, indent):
+    """显示 / 隐藏某个界面控件。
+
+    ── 『置顶』(第一百零四轮)──────────────────────────────────────
+    勾了『置顶』且这次是**显示**时,多走一句 `_gk_ui_raise(控件)`:
+      * 挪到最上层(谁后开谁在上,同时开两块面板时最后按的盖在上面);
+      * 把『互斥组』里同组的其他成员收起来("同组只留一个开着")。
+    没勾 = 老行为一字不变(只改 visible)—— 老图生成物不受影响。
+    """
     widget_name = (getattr(node, "gk_widget", "") or "").strip()
     visible = "true" if getattr(node, "gk_visible", False) else "false"
+    show = bool(getattr(node, "gk_visible", False))
+    raise_it = show and bool(getattr(node, "gk_raise", False))
     if not widget_name:
         ctx.warn(f"『{node.bl_label}』没有填控件名，这一句被跳过了")
         return
@@ -941,6 +979,10 @@ def _stmt_ui_hide(ctx, node, indent):
     ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
     ctx.add_line(indent, f"if {var} != null:")
     ctx.add_line(indent + 1, f"{var}.visible = {visible}")
+    if raise_it:
+        ctx.need_ui_helpers = True
+        ctx.need_raise_helper = True
+        ctx.add_line(indent + 1, f"_gk_ui_raise({var})")
     ctx.add_line(indent, "else:")
     ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
     ctx.need_ui_helpers = True
@@ -1824,6 +1866,247 @@ def _stmt_ui_text_edit(ctx, node, indent):
     })
 
 
+# ==========================================================================
+# 设置面板三件套(第一百零四轮):滑块 / 下拉 / 复选框
+# ==========================================================================
+# 三个都是"运行时自己建、玩家动它、沿出口继续"—— 和『界面_按钮』同一套路数:
+#   * 两个出口:**『完成』**(建好了,接着建下一个控件)+ **信号出口**
+#     (『变了』/『选了』/『改了』)—— 信号出口的链放独立回调里;
+#   * 真正的续接放在信号回调里,回调单独成一节(见 _ui_signal_section);
+#   * 滑块 / 下拉是一整行 HBox(名称 + 控件 + …),复选框是单控件;
+#     两者都按**节点名**建控件 —— 『界面_设置』『界面_隐藏控件』找得到。
+#
+# ⚠ 三个都有个共同纪律:初始值(滑块的 value / 下拉的 selected / 复选框的
+#   button_pressed)**在接信号之前**设好 —— 接完再设会当场触发信号,
+#   "刚建出来就把出口后面那条链跑一遍"(『界面_按钮』那个老坑的变体)。
+@stmt_node("GKNodeUiSlider")
+def _stmt_ui_slider(ctx, node, indent):
+    """『界面_滑块』:一行 = 名称 + 滑轨 + **右边自动跟当前数值**。
+
+    ── 数值那串字谁在刷 ──
+    `value_changed` 接一个 lambda:显示数值时先把 `名称 + 当前值 + 后缀`
+    写进右边那个 Label,再走 `{handler}(_v)`(『变了』出口那条链)。
+    一次拖动刷一次,不用用户手动更新。
+    值的格式化走 `_gk_num_text`(『文本_数字』同一个函数,整数不带 .0)。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "HBoxContainer",
+                             key=node_lib.node_key(node))
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(node.name, 'slider')}_changed",
+        key=node_lib.node_key(node))
+    label = str(getattr(node, "gk_label", "") or "")
+    minimum = gd_number(float(getattr(node, "gk_min", 0.0) or 0.0))
+    maximum = gd_number(float(getattr(node, "gk_max", 100.0) or 0.0))
+    step = gd_number(float(getattr(node, "gk_step", 1.0) or 0.0))
+    value = gd_number(float(getattr(node, "gk_value", 50.0) or 0.0))
+    suffix = gd_string(str(getattr(node, "gk_suffix", "") or ""))
+    show_value = bool(getattr(node, "gk_show_value", True))
+    width = gd_number(getattr(node, "gk_width", 320.0))
+    height = gd_number(getattr(node, "gk_height", 36.0))
+    from .expressions import ensure_num_text_helper
+    num_text = ensure_num_text_helper(ctx)
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = HBoxContainer.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    # 整行不吃鼠标:事件要落到滑轨上(行的空白处点不到东西)
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    _ui_name_label(ctx, indent + 1, widget, label)
+    bar = ctx.new_temp("gk_slider")
+    ctx.add_line(indent + 1, f"var {bar} := HSlider.new()")
+    ctx.add_line(indent + 1, f"{bar}.min_value = {minimum}")
+    ctx.add_line(indent + 1, f"{bar}.max_value = {maximum}")
+    ctx.add_line(indent + 1, f"{bar}.step = {step}")
+    ctx.add_line(indent + 1, f"{bar}.value = {value}")
+    ctx.add_line(indent + 1, f"{bar}.size_flags_horizontal = Control.SIZE_EXPAND_FILL")
+    ctx.add_line(indent + 1, f"{bar}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    ctx.add_line(indent + 1, f"{widget}.add_child({bar})")
+    shown = None
+    if show_value:
+        shown = ctx.new_temp("gk_value")
+        ctx.add_line(indent + 1, f"var {shown} := Label.new()")
+        ctx.add_line(indent + 1, f"{shown}.text = {num_text}({value}) + {suffix}")
+        # 数值宽度固定一块:数字长短变化时滑轨不会跟着抖
+        ctx.add_line(indent + 1, f"{shown}.custom_minimum_size = Vector2(64.0, 0.0)")
+        ctx.add_line(indent + 1, f"{shown}.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT")
+        ctx.add_line(indent + 1, f"{shown}.vertical_alignment = VERTICAL_ALIGNMENT_CENTER")
+        ctx.add_line(indent + 1, f"{shown}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+        ctx.add_line(indent + 1, f"{widget}.add_child({shown})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    ctx.add_line(indent + 1, f"{bar}.value_changed.connect(func(_v: float) -> void:")
+    if shown:
+        ctx.add_line(indent + 2, f"{shown}.text = {num_text}(_v) + {suffix}")
+    ctx.add_line(indent + 2, f"{handler}(_v))")
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+    _ui_signal_section(ctx, node, handler, output="变了",
+                       signature=f"func {handler}(_value: float) -> void:")
+
+
+@expr_node("GKNodeUiSlider")
+def _expr_ui_slider(ctx, node):
+    """『值』:滑块现在停在哪个数(拖到哪读到哪)。
+
+    按**自己节点的名字**找控件(控件就是用节点名建的);读的时候现取,
+    所以拖动后立刻能读到新值(不缓存)。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_widget_value_helper = True
+    return f"_gk_widget_value({gd_string(str(getattr(node, 'name', '')))})"
+
+
+@stmt_node("GKNodeUiDropdown")
+def _stmt_ui_dropdown(ctx, node, indent):
+    """『界面_下拉』:原生 OptionButton 或 ◀ 当前项 ▶ 两种样式。
+
+    ── 当前选的是第几个记在哪 ──
+    记在**控件自己的 meta `gk_index`** 上(**0 起存**):两种样式
+    (原生的 item_selected / 箭头的 pressed)都往它写,『选了第几个』
+    输出按名字读它(见 `_gk_widget_index`,给用户时 +1)。
+    不读 `OptionButton.selected` 是因为左右切换样式里根本没有
+    OptionButton —— 两种样式一条读法,用户不用管自己选的是哪种。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "HBoxContainer",
+                             key=node_lib.node_key(node))
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(node.name, 'dropdown')}_selected",
+        key=node_lib.node_key(node))
+    items = list(node_lib.dropdown_item_texts(node))
+    items_literal = "[" + ", ".join(gd_string(text) for text in items) + "]"
+    style = str(getattr(node, "gk_style", "NATIVE") or "NATIVE").upper()
+    label = str(getattr(node, "gk_label", "") or "")
+    if not str(getattr(node, "gk_items", "") or "").strip():
+        ctx.warn(f"『{node.bl_label}』没有填『选项』——先按一个『选项』占位生成")
+    try:
+        picked = int(getattr(node, "gk_index", 1) or 1) - 1      # 属性是 1 起数
+    except (TypeError, ValueError):
+        picked = 0
+    picked = max(0, min(len(items) - 1, picked))
+    width = gd_number(getattr(node, "gk_width", 240.0))
+    height = gd_number(getattr(node, "gk_height", 36.0))
+    items_var = ctx.new_temp("gk_items")
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = HBoxContainer.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"var {items_var} := {items_literal}")
+    ctx.add_line(indent + 1, f'{widget}.set_meta("gk_index", {picked})')
+    _ui_name_label(ctx, indent + 1, widget, label)
+    if style == "ARROWS":
+        # ── 左右切换:◀ [当前项] ▶(到头按回另一头)──────────────────
+        prev = ctx.new_temp("gk_prev")
+        middle = ctx.new_temp("gk_pick")
+        following = ctx.new_temp("gk_next")
+        ctx.add_line(indent + 1, f"var {prev} := Button.new()")
+        ctx.add_line(indent + 1, f'{prev}.text = "◀"')
+        ctx.add_line(indent + 1, f"{prev}.custom_minimum_size = Vector2(40.0, 0.0)")
+        ctx.add_line(indent + 1, f"{prev}.mouse_filter = Control.MOUSE_FILTER_STOP")
+        ctx.add_line(indent + 1, f"{widget}.add_child({prev})")
+        ctx.add_line(indent + 1, f"var {middle} := Label.new()")
+        ctx.add_line(indent + 1, f"{middle}.text = str({items_var}[{picked}])")
+        ctx.add_line(indent + 1, f"{middle}.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER")
+        ctx.add_line(indent + 1, f"{middle}.vertical_alignment = VERTICAL_ALIGNMENT_CENTER")
+        ctx.add_line(indent + 1, f"{middle}.size_flags_horizontal = Control.SIZE_EXPAND_FILL")
+        ctx.add_line(indent + 1, f"{middle}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+        ctx.add_line(indent + 1, f"{widget}.add_child({middle})")
+        ctx.add_line(indent + 1, f"var {following} := Button.new()")
+        ctx.add_line(indent + 1, f'{following}.text = "▶"')
+        ctx.add_line(indent + 1, f"{following}.custom_minimum_size = Vector2(40.0, 0.0)")
+        ctx.add_line(indent + 1, f"{following}.mouse_filter = Control.MOUSE_FILTER_STOP")
+        ctx.add_line(indent + 1, f"{widget}.add_child({following})")
+        ctx.add_line(indent + 1, f"{prev}.pressed.connect(func() -> void:")
+        ctx.add_line(indent + 2,
+                     f"var _next := (int({widget}.get_meta(\"gk_index\")) - 1 + "
+                     f"{items_var}.size()) % {items_var}.size()")
+        ctx.add_line(indent + 2, f'{widget}.set_meta("gk_index", _next)')
+        ctx.add_line(indent + 2, f"{middle}.text = str({items_var}[_next])")
+        ctx.add_line(indent + 2, f"{handler}(_next))")
+        ctx.add_line(indent + 1, f"{following}.pressed.connect(func() -> void:")
+        ctx.add_line(indent + 2,
+                     f"var _next := (int({widget}.get_meta(\"gk_index\")) + 1) % "
+                     f"{items_var}.size()")
+        ctx.add_line(indent + 2, f'{widget}.set_meta("gk_index", _next)')
+        ctx.add_line(indent + 2, f"{middle}.text = str({items_var}[_next])")
+        ctx.add_line(indent + 2, f"{handler}(_next))")
+    else:
+        # ── 原生下拉:OptionButton(点开一个小列表)──────────────────
+        picker = ctx.new_temp("gk_option")
+        ctx.add_line(indent + 1, f"var {picker} := OptionButton.new()")
+        ctx.add_line(indent + 1, f"for _item in {items_var}:")
+        ctx.add_line(indent + 2, f"{picker}.add_item(str(_item))")
+        ctx.add_line(indent + 1, f"{picker}.selected = {picked}")
+        ctx.add_line(indent + 1, f"{picker}.size_flags_horizontal = Control.SIZE_EXPAND_FILL")
+        ctx.add_line(indent + 1, f"{picker}.mouse_filter = Control.MOUSE_FILTER_STOP")
+        ctx.add_line(indent + 1, f"{widget}.add_child({picker})")
+        ctx.add_line(indent + 1, f"{picker}.item_selected.connect(func(_i: int) -> void:")
+        ctx.add_line(indent + 2, f'{widget}.set_meta("gk_index", _i)')
+        ctx.add_line(indent + 2, f"{handler}(_i))")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+    _ui_signal_section(ctx, node, handler, output="选了",
+                       signature=f"func {handler}(_index: int) -> void:")
+
+
+@expr_node("GKNodeUiDropdown")
+def _expr_ui_dropdown(ctx, node):
+    """『选了第几个』:下拉框现在选中的是第几个(**1 起数**)。
+
+    和『对话_选择』的『选了第几个』同一个规矩(第 1 项 = 1),
+    两张图里的编号不用来回换算。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_widget_index_helper = True
+    return f"_gk_widget_index({gd_string(str(getattr(node, 'name', '')))})"
+
+
+@stmt_node("GKNodeUiCheckbox")
+def _stmt_ui_checkbox(ctx, node, indent):
+    """『界面_复选框』:CheckBox(勾选框)或 CheckButton(开关)。
+
+    勾上 / 取消都走 `toggled` -> `{handler}(_on)`(『改了』出口那条链);
+    『勾了吗』输出按名字读控件的 `button_pressed`(见 `_gk_widget_checked`)。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    style = str(getattr(node, "gk_style", "BOX") or "BOX").upper()
+    kind = "CheckButton" if style == "SWITCH" else "CheckBox"
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", kind,
+                             key=node_lib.node_key(node))
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(node.name, 'toggle')}_toggled",
+        key=node_lib.node_key(node))
+    text = gd_string(str(getattr(node, "gk_text", "") or ""))
+    checked = "true" if getattr(node, "gk_checked", False) else "false"
+    width = float(getattr(node, "gk_width", 180.0) or 0.0)
+    height = gd_number(getattr(node, "gk_height", 36.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = {kind}.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.text = {text}")
+    ctx.add_line(indent + 1, f"{widget}.button_pressed = {checked}")
+    # 复选框要能吃鼠标,否则点不动
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    ctx.add_line(indent + 1, f"{widget}.toggled.connect({handler})")
+    _ui_add_to(ctx, indent + 1, widget, node, root)
+    if width > 0.0:
+        _ui_size(ctx, indent, widget, node, gd_number(width), height)
+    _ui_place(ctx, indent, widget, node, "20.0", "20.0")
+    _ui_signal_section(ctx, node, handler, output="改了",
+                       signature=f"func {handler}(_on: bool) -> void:")
+
+
+@expr_node("GKNodeUiCheckbox")
+def _expr_ui_checkbox(ctx, node):
+    """『勾了吗』:这个复选框现在是勾着的吗(布尔)。"""
+    ctx.need_ui_helpers = True
+    ctx.need_widget_checked_helper = True
+    return f"_gk_widget_checked({gd_string(str(getattr(node, 'name', '')))})"
+
+
 @stmt_node("GKNodeUiSkin")
 def _stmt_ui_skin(ctx, node, indent):
     """『界面_皮肤』:建一套 Theme 挂到 UI 根上(第八十一轮)。
@@ -2061,8 +2344,12 @@ def _stmt_ui_apply_design(ctx, node, indent):
     ctx._active.update(saved_active)
 
 
-def _ui_click_section(ctx, node, handler):
-    """把『点击』出口那条链收进一个独立回调函数(照『界面_按钮』的做法)。
+def _ui_signal_section(ctx, node, handler, output="点击", signature=None):
+    """把一个信号出口后面的链收进独立回调函数(照『界面_按钮』的做法)。
+
+    第一百零四轮起不只给『点击』用:滑块『变了』/ 下拉『选了』/ 复选框
+    『改了』都走这里 —— 各自的回调**带信号参数**(value / index / toggled),
+    `signature` 不传就按老样子生成无参签名。
 
     ⚠ `new_section()` 换了写入目标而且**不会自己换回来**,所以这里必须
     手动存一份再还回去(见『界面_按钮』那条踩坑记录);执行栈也一样,
@@ -2074,7 +2361,7 @@ def _ui_click_section(ctx, node, handler):
     ctx._active.clear()
     prev_event = ctx._current_event
     ctx._current_event = node.name
-    _chain(ctx, node, 1, "点击")
+    _chain(ctx, node, 1, output)
     if len(lines) == 0:
         lines.add(1, "pass")
     ctx._current_event = prev_event
@@ -2082,7 +2369,7 @@ def _ui_click_section(ctx, node, handler):
     ctx._active.update(saved_active)
     ctx.sink = saved_sink
     ctx.extra_sections.append({
-        "signature": f"func {handler}() -> void:",
+        "signature": signature or f"func {handler}() -> void:",
         "lines": list(lines.lines),
         "empty_body": "    pass",
         "separator": True,
@@ -2109,7 +2396,7 @@ def _stmt_ui_on_click(ctx, node, indent):
     ctx.add_line(indent + 1,
                  f'push_warning("找不到按钮『{widget_name}』:先确认设计图里摆了'
                  f'它,并且之前已经『界面_套用设计』")')
-    _ui_click_section(ctx, node, handler)
+    _ui_signal_section(ctx, node, handler)
 
 
 @stmt_node("GKNodeFloatText")

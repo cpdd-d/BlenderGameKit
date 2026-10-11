@@ -236,6 +236,15 @@ class GenContext:
         self.need_list_fill_helper = False
         # 界面_取文字:生成 `_gk_widget_text()`(按名字取控件上的文字)
         self.need_widget_text_helper = False
+        # ── 设置面板三件套(第一百零四轮)────────────────────────────
+        # 滑块『值』/ 下拉『选了第几个』/ 复选框『勾了吗』——
+        # 三个"按名字读控件状态"的小函数,各用各的才生成
+        self.need_widget_value_helper = False
+        self.need_widget_index_helper = False
+        self.need_widget_checked_helper = False
+        # 『界面_隐藏控件』勾了『置顶』:生成 `_gk_ui_raise()`
+        # (挪到最上层 + 收起同互斥组的其他面板)
+        self.need_raise_helper = False
         # 只有真的用了手柄节点才生成摇杆死区辅助函数
         self.need_joy_helpers = False
         # 只有真的用了屏幕滤镜才生成全屏材质辅助函数

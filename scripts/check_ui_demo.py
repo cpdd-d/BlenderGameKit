@@ -65,6 +65,19 @@
     `user://对话历史.txt`,而且**点面板里不关**(开了点句重放);
   * **对话历史 点句重放**:点列表里第一句 -> 面板收起 + 那一句像字幕一样
     重飘一遍(对话框面板上的正文就是那一句)—— 执行流也随之往下走。
+
+第一百零四轮(设置面板三件套 + 界面层级)再看七样:
+  * **互斥组 / 置顶**:按 B 开背包、按 O 开设置 —— 开一块时同组(『侧栏面板』)
+    的另一块**自动收起来**,而且设置被 `move_to_front` 挪到最上层
+    (谁后开谁在上);反过来按 B 也一样;按 C 两块都收起来;
+  * **界面_滑块**:把滑轨设成 -30 -> 右边那串字变成 `-30 dB`(自动跟当前值),
+    而且走『变了』链**真的改了 Master 总线**的音量;
+  * **界面_复选框**:取消勾选 -> 『改了』-> 『显示_设置可见』(『可见』接
+    『勾了吗』)-> 场景里那块背景板跟着隐藏;
+  * **界面_下拉(原生)**:选『低』-> 『选了』-> 多路分支 -> 『画质_设置』
+    (视口缩放 0.6 倍、抗锯齿关 —— 看的是 Godot 自己的渲染设置);
+  * **界面_下拉(左右切换)**:点 ▶ 两次 -> 中间那格的字从 `简单` 换到 `困难`,
+    同时『选了第几个』(1 起数)被写进"得分"(`界面_设置` 改文字)。
 """
 
 import argparse
@@ -226,6 +239,47 @@ func _physics_process(delta: float) -> void:
 	elif phase == 14 and elapsed >= 5.8:
 		phase = 15
 		_check_quality()
+		# 第一百零四轮:先开背包(等会儿会被"开设置"挤掉)
+		_send_key(KEY_B, true)
+		_send_key(KEY_B, false)
+	elif phase == 15 and elapsed >= 6.15:
+		phase = 16
+		_check_bag_open()
+		_send_key(KEY_O, true)                 # 开设置:互斥收起背包 + 置顶
+		_send_key(KEY_O, false)
+	elif phase == 16 and elapsed >= 6.5:
+		phase = 17
+		_check_panel_mutex()
+		_set_slider(-30.0)                     # 拖滑块 -> 数值字 + 总线
+	elif phase == 17 and elapsed >= 6.85:
+		phase = 18
+		_check_slider()
+		_set_checkbox(false)                   # 取消勾选 -> 背景板藏起来
+	elif phase == 18 and elapsed >= 7.2:
+		phase = 19
+		_check_checkbox()
+		_pick_quality(0)                       # 原生下拉选『低』
+	elif phase == 19 and elapsed >= 7.55:
+		phase = 20
+		_check_quality_dropdown()
+		_click_arrow()                         # 左右切换:点一下 ▶
+	elif phase == 20 and elapsed >= 7.9:
+		phase = 21
+		_check_arrows(1)
+		_click_arrow()
+	elif phase == 21 and elapsed >= 8.25:
+		phase = 22
+		_check_arrows(2)
+		_send_key(KEY_B, true)                 # 反方向再验一次互斥
+		_send_key(KEY_B, false)
+	elif phase == 22 and elapsed >= 8.6:
+		phase = 23
+		_check_panel_back()
+		_send_key(KEY_C, true)                 # C:两块都收起来
+		_send_key(KEY_C, false)
+	elif phase == 23 and elapsed >= 8.95:
+		phase = 24
+		_check_panels_closed()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
@@ -424,7 +478,10 @@ func _check_widgets() -> void:
 	var names := ["HUD底", "徽标", "分数", "血条", "底部提示",
 		"暂停菜单", "暂停标题", "继续按钮", "退出按钮",
 		"标题条", "存档列表", "存档槽一", "存档槽二", "日志列表", "昵称",
-		"设计底板", "设计标题", "设计按钮", "聊天框"]
+		"设计底板", "设计标题", "设计按钮", "聊天框",
+		# 第一百零四轮:设置面板三件套 + 背包面板(互斥组演示)
+		"设置面板", "设置标题", "音量滑块", "画质选择", "难度选择",
+		"显示背景板", "背包面板", "背包标题", "背包内容"]
 	var missing: Array = []
 	for name in names:
 		if _widget(name) == null:
@@ -620,6 +677,142 @@ func _check_quality() -> void:
 	var msaa_now: int = vp.msaa_3d
 	print("UI_QUALITY ok=", is_equal_approx(scale_now, 0.85) and msaa_now == 1,
 		" scale=", snappedf(scale_now, 0.001), " msaa=", msaa_now)
+
+
+# ── 第一百零四轮:设置面板三件套 + 互斥组 / 置顶 ────────────────────
+
+## B 开了背包:背包可见、设置还藏着(它是"开局藏"的)。
+func _check_bag_open() -> void:
+	var bag := _widget("背包面板")
+	var settings := _widget("设置面板")
+	var bag_on: bool = bag != null and bag.visible
+	var settings_off: bool = settings == null or not settings.visible
+	print("UI_PANEL_OPEN ok=", bag_on and settings_off,
+		" bag=", bag_on, " settings=", settings != null and settings.visible)
+
+
+## O 开了设置:互斥组把背包收起来了;而且设置被挪到最上层(『置顶』)。
+func _check_panel_mutex() -> void:
+	var bag := _widget("背包面板")
+	var settings := _widget("设置面板")
+	var bag_off: bool = bag != null and not bag.visible
+	var settings_on: bool = settings != null and settings.visible
+	var topmost := false
+	if settings_on and ui_root != null:
+		topmost = settings.get_parent() == ui_root \
+			and settings.get_index() == ui_root.get_child_count() - 1
+	print("UI_PANEL_MUTEX ok=", bag_off and settings_on and topmost,
+		" bag_hidden=", bag_off, " settings=", settings_on, " top=", topmost)
+
+
+## 反方向再验一次:按 B 之后背包回来、设置被收起。
+func _check_panel_back() -> void:
+	var bag := _widget("背包面板")
+	var settings := _widget("设置面板")
+	print("UI_PANEL_BACK ok=", bag != null and bag.visible
+		and settings != null and not settings.visible,
+		" bag=", bag != null and bag.visible,
+		" settings=", settings != null and settings.visible)
+
+
+## C 键:两块面板都收起来。
+func _check_panels_closed() -> void:
+	var bag := _widget("背包面板")
+	var settings := _widget("设置面板")
+	var off: bool = bag != null and settings != null \
+		and not bag.visible and not settings.visible
+	print("UI_PANEL_CLOSE ok=", off,
+		" bag=", bag != null and bag.visible,
+		" settings=", settings != null and settings.visible)
+
+
+## 滑块:设成 -30 -> 右边那串字跟着变 + 『变了』链改了 Master 总线。
+func _set_slider(value: float) -> void:
+	var row := _widget("音量滑块")
+	if row == null:
+		return
+	for child in row.get_children():
+		if child is HSlider:
+			(child as HSlider).value = value      # 设值会发 value_changed
+
+
+func _check_slider() -> void:
+	var row := _widget("音量滑块")
+	var label_text := ""
+	if row != null and row.get_child_count() > 0:
+		var shown := row.get_child(row.get_child_count() - 1)
+		if shown is Label:
+			label_text = (shown as Label).text
+	var bus_db := AudioServer.get_bus_volume_db(0)
+	print("UI_SLIDER ok=", label_text == "-30 dB" and absf(bus_db + 30.0) < 0.5,
+		" label=", label_text, " bus_db=", snappedf(bus_db, 0.01))
+
+
+## 复选框:取消勾选 -> 背景板跟着藏起来(『勾了吗』接『可见』)。
+func _set_checkbox(on: bool) -> void:
+	var box := _widget("显示背景板")
+	if box is BaseButton:
+		(box as BaseButton).button_pressed = on   # 会发 toggled
+
+
+func _check_checkbox() -> void:
+	var plate: Node = null
+	if world != null:
+		plate = world.find_child("背景板", true, false)
+	var box := _widget("显示背景板")
+	var hidden: bool = plate != null and not plate.visible
+	print("UI_CHECKBOX ok=", hidden and box is CheckBox,
+		" plate_visible=", plate.visible if plate != null else "<none>")
+
+
+## 原生下拉:选『低』-> 『选了』-> 多路分支 -> 『画质_设置』(0.6 倍 / 不抗锯齿)。
+##
+## ⚠ 真机实测:`OptionButton.selected = i` **不发** item_selected(和
+##   Range.value / BaseButton.button_pressed 都不一样)—— 光设属性链不会跑。
+##   所以这里补一句显式的 `item_selected.emit(i)`:它和"玩家在弹出列表里
+##   点了一下"是同一条接入点(插件的处理函数就接在这个信号上)。
+func _pick_quality(index: int) -> void:
+	var row := _widget("画质选择")
+	if row == null:
+		return
+	for child in row.get_children():
+		if child is OptionButton:
+			var picker := child as OptionButton
+			picker.select(index)
+			picker.item_selected.emit(index)
+
+
+func _check_quality_dropdown() -> void:
+	var vp := get_viewport()
+	print("UI_DROPDOWN ok=", is_equal_approx(vp.scaling_3d_scale, 0.6)
+		and vp.msaa_3d == 0,
+		" scale=", snappedf(vp.scaling_3d_scale, 0.001), " msaa=", vp.msaa_3d)
+
+
+## 点左右切换行里最后那格 ▶ 按钮(走真人点击那条路)。
+func _click_arrow() -> void:
+	var row := _widget("难度选择")
+	if row == null or row.get_child_count() == 0:
+		return
+	var button := row.get_child(row.get_child_count() - 1)
+	if button is Button:
+		_click_at((button as Button).get_global_rect().get_center())
+
+
+## 箭头换项:中间那格的字跟着换 + 『选了第几个』(1 起数)写进"得分"。
+func _check_arrows(step: int) -> void:
+	var row := _widget("难度选择")
+	var mid := ""
+	if row != null and row.get_child_count() > 2:
+		var label := row.get_child(2)
+		if label is Label:
+			mid = (label as Label).text
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	var want_item: String = ["简单", "普通", "困难"][step]
+	var want_score := str(step + 1)
+	print("UI_ARROWS ok=", mid == want_item and text == want_score,
+		" mid=", mid, " score=", text, " step=", step)
 
 
 func _check_log_list() -> void:
@@ -855,6 +1048,19 @@ def main():
          "点句重放不对(面板没收起 / 那一句没重飘:对话框正文和点的行不一致)"),
         (r"UI_CHAT_SEND ok=true",
          "多行框 Ctrl+回车没走『提交』链(得分没变成框里那行字)"),
+        # ---- 第一百零四轮:设置面板三件套 + 互斥组 / 置顶 ----
+        (r"UI_PANEL_OPEN ok=true", "按 B 没开出背包面板(或设置面板提前开着)"),
+        (r"UI_PANEL_MUTEX ok=true",
+         "互斥组 / 置顶没生效(开设置时背包没收起,或设置没被挪到最上层)"),
+        (r"UI_PANEL_BACK ok=true", "反方向互斥不对(按 B 后背包没回来 / 设置没收起)"),
+        (r"UI_PANEL_CLOSE ok=true", "按 C 两块面板没收起来"),
+        (r"UI_SLIDER ok=true",
+         "滑块不对(右边数值没跟着变成 -30 dB,或『变了』链没改 Master 总线音量)"),
+        (r"UI_CHECKBOX ok=true", "取消勾选后背景板没跟着隐藏(『勾了吗』没接上)"),
+        (r"UI_DROPDOWN ok=true",
+         "下拉(原生)选『低』没走多路分支到『画质_设置』(视口缩放该是 0.6)"),
+        (r"UI_ARROWS ok=true",
+         "左右切换不对(中间的字没换到『困难』/『选了第几个』没写进得分)"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -920,6 +1126,17 @@ def main():
                  "text: String) -> void:", "点句重放"),
                 ("_gk_loops[_sfx_key", "『音效_播放』循环登记"),
                 ("_gk_loops.has(_stop_key", "『音效_停止』按名字停循环"),
+                # ---- 第一百零四轮:设置面板三件套 + 互斥组 / 置顶 ----
+                ("HSlider.new()", "『界面_滑块』"),
+                ("OptionButton.new()", "『界面_下拉』(原生下拉菜单)"),
+                ('"◀"', "『界面_下拉』(左右切换的箭头)"),
+                ("CheckBox.new()", "『界面_复选框』"),
+                ('add_to_group("gk_ui_mutex_侧栏面板")', "控件卡的『互斥组』登记"),
+                ("func _gk_ui_raise(widget: Control) -> void:", "置顶 / 互斥辅助函数"),
+                ("widget.move_to_front()", "谁后开谁在上"),
+                ("_gk_widget_value(", "滑块『值』输出(按名字现读)"),
+                ("_gk_widget_index(", "下拉『选了第几个』输出"),
+                ("_gk_widget_checked(", "复选框『勾了吗』输出"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")
