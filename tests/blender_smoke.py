@@ -6159,6 +6159,110 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零五轮:界面收口(X/Y 引脚 / 皮肤补齐 / 模态面板 / 首焦点)----
+    # 这一批查:九个控件的 X / Y **引脚**在 Blender 里真的注册上了、面板三个
+    # 新属性是真的 Blender 属性、出码的关键几条都在、卡片画得完。
+    # **行为**由界面示例的探针在真 Godot 里查(见 check_ui_demo.py:
+    # 模态遮挡 + 点外面关 + 对照组 / 首焦点 + 方向键 / 皮肤补齐)。
+    try:
+        r105_tree = bpy.data.node_groups.new("界面收口冒烟105", "GKGameLogicTree")
+        r105_ready = r105_tree.nodes.new("GKNodeOnReady")
+        r105_menu = r105_tree.nodes.new("GKNodeUiPanel")
+        r105_menu.name = "暂停菜单"
+        r105_menu.gk_focus_first = True
+        r105_modal = r105_tree.nodes.new("GKNodeUiPanel")
+        r105_modal.name = "模态框"
+        r105_modal.gk_block_click = True
+        r105_modal.gk_close_outside = True
+        r105_button = r105_tree.nodes.new("GKNodeUiButton")
+        r105_button.name = "穿透按钮"
+        r105_slider = r105_tree.nodes.new("GKNodeUiSlider")
+        r105_slider.name = "音量滑块"
+        r105_slider.gk_x = 28.0
+        r105_slider.gk_y = 70.0
+        r105_skin = r105_tree.nodes.new("GKNodeUiSkin")
+        r105_pause = r105_tree.nodes.new("GKNodeUiPauseGame")
+        r105_pause.gk_pause = True
+        r105_pause.gk_menu = "暂停菜单"
+        r105_pause.gk_hotkey = True
+        r105_tree.links.new(r105_ready.outputs["执行"], r105_menu.inputs["执行"])
+        r105_tree.links.new(r105_menu.outputs["完成"], r105_modal.inputs["执行"])
+        r105_tree.links.new(r105_modal.outputs["完成"],
+                            r105_button.inputs["执行"])
+        r105_tree.links.new(r105_button.outputs["完成"],
+                            r105_slider.inputs["执行"])
+        r105_tree.links.new(r105_slider.outputs["完成"], r105_skin.inputs["执行"])
+        r105_tree.links.new(r105_skin.outputs["完成"], r105_pause.inputs["执行"])
+        r105_code, r105_warn = codegen.generate(r105_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True,
+        })
+
+        # ① X / Y 引脚:在 Blender 里真的注册上了(不是只有属性)
+        _nn105 = import_module(f"{module_name}.nodes.nodes")
+        r105_missing = []
+        for idname in ("GKNodeUiPanel", "GKNodeUiImage", "GKNodeUiList",
+                       "GKNodeUiNinePatch", "GKNodeUiInput", "GKNodeUiTextEdit",
+                       "GKNodeUiSlider", "GKNodeUiDropdown", "GKNodeUiCheckbox"):
+            cls = getattr(_nn105, idname)
+            pins = [spec["name"] for spec in cls.gk_inputs]
+            if ("X" not in pins or "Y" not in pins
+                    or cls.gk_input_props.get("X") != "gk_x"
+                    or cls.gk_input_props.get("Y") != "gk_y"):
+                r105_missing.append(cls.bl_label)
+        check("第一百零五轮:九个控件都有 X / Y 引脚(卡片上填的坐标不再被忽略)",
+              not r105_missing, str(r105_missing))
+
+        # ② 面板三个新属性:真的 Blender 属性,能读能写
+        r105_props_ok = (isinstance(getattr(r105_modal, "gk_block_click", None),
+                                    bool)
+                         and bool(r105_modal.gk_close_outside)
+                         and bool(r105_menu.gk_focus_first)
+                         and not bool(r105_menu.gk_close_outside))
+        check("第一百零五轮:面板『挡住点击 / 点外面关 / 首焦点』都是真属性",
+              r105_props_ok)
+
+        check("第一百零五轮:X / Y 走到 @export(不再是固定的 20.0)",
+              "= 28.0" in r105_code and "Vector2(ui_x" in r105_code,
+              r105_code[:600])
+        check("第一百零五轮:皮肤补齐滑块 / 下拉 / 勾选框",
+              'set_stylebox("slider", "HSlider"' in r105_code
+              and 'set_stylebox("grabber_area", "HSlider"' in r105_code
+              and 'set_stylebox("normal", "OptionButton"' in r105_code
+              and 'set_stylebox("normal", "CheckBox"' in r105_code)
+        check("第一百零五轮:模态面板(挡住点击 + 点外面关)",
+              "Control.MOUSE_FILTER_STOP" in r105_code
+              and '.add_to_group("gk_ui_close_outside")' in r105_code
+              and "func gk_ui_close_outside_input(event: InputEvent) -> void:"
+              in r105_code)
+        check("第一百零五轮:首焦点(显示时给焦点 + 串方向键)",
+              "func _gk_ui_focus_first(panel: Control) -> void:" in r105_code
+              and "visibility_changed.connect(" in r105_code
+              and "focus_neighbor_bottom" in r105_code)
+        check("第一百零五轮:暂停菜单也参与层级(置顶 + 互斥组)",
+              "func _gk_ui_raise(widget: Control) -> void:" in r105_code
+              and "_gk_ui_raise(widget)" in r105_code)
+        check("第一百零五轮:生成无告警", not r105_warn, str(r105_warn)[:300])
+
+        r105_draw_ok = True
+        r105_draw_error = ""
+        for card in (r105_menu, r105_modal, r105_button, r105_slider,
+                     r105_skin, r105_pause):
+            try:
+                card.draw_buttons(bpy.context, _R104Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r105_draw_ok = False
+                r105_draw_error = (f"{card.bl_label}: "
+                                   f"{type(exc).__name__}: {exc}")
+                break
+        check("第一百零五轮:六张卡片都能画完", r105_draw_ok, r105_draw_error)
+
+        bpy.data.node_groups.remove(r105_tree)
+    except Exception as exc:
+        check("第一百零五轮(界面收口)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

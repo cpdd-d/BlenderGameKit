@@ -78,6 +78,20 @@
     (视口缩放 0.6 倍、抗锯齿关 —— 看的是 Godot 自己的渲染设置);
   * **界面_下拉(左右切换)**:点 ▶ 两次 -> 中间那格的字从 `简单` 换到 `困难`,
     同时『选了第几个』(1 起数)被写进"得分"(`界面_设置` 改文字)。
+
+第一百零五轮(模态弹窗 + 皮肤补齐 + 首焦点)再看五样:
+  * **皮肤补齐**:第 104 轮新加的滑块 / 下拉 / 勾选框也穿上了皮肤 ——
+    从**控件身上**读回它实际用的样式(`get_theme_stylebox`),比对皮肤给的
+    颜色(滑轨 = 面板底 0.06/0.07/0.10/0.92、下拉与勾选框 = 按钮底
+    0.18/0.22/0.34/0.95);
+  * **挡住点击**:『模态框』盖住『穿透按钮』—— 弹窗开着时点那块地方,
+    按钮**不会**被按到(以前面板是 IGNORE,点空白处会穿透到后面的按钮);
+  * **点外面关掉**:点弹窗外面 -> 它自己收起来;
+  * **对照组**:弹窗收了之后**同一个位置**再点一次,按钮正常响应
+    (证明前面那次不是"按钮坏了",而是真的被挡住了);
+  * **打开时首焦点**:按 Esc 弹出暂停菜单时焦点自动落在菜单里第一个能
+    聚焦的控件上,而且方向键链真的串好了(控件自己的 `focus_neighbor`
+    不为空),按一下 ↓ 焦点换到另一个控件。
 """
 
 import argparse
@@ -111,6 +125,7 @@ var score_after := ""
 var paused_before := false
 var replay_text := ""          # 点句重放点的哪一句(下一阶段比正文)
 var replay_who := ""           # 那一句的说话人(重放后说话人栏要比它)
+var focus_before := ""         # 按 ↓ 之前焦点在谁身上(下一阶段比"换没换")
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -175,8 +190,14 @@ func _physics_process(delta: float) -> void:
 		_check_pause()
 		_check_menu_list()                     # 菜单开着,正好看列表 / 九宫格
 		_check_loop_playing()                  # 第八十一轮:引擎声还在响
+		# 第一百零五轮:菜单一弹出来焦点就该自己落到里面,而且方向键串好了
+		_check_menu_focus_first()
+		focus_before = _focus_name()
+		_send_key(KEY_DOWN, true)              # 下一阶段看焦点换没换
+		_send_key(KEY_DOWN, false)
 	elif phase == 5 and elapsed >= 2.15:
 		phase = 6
+		_check_menu_focus_move()               # ↓ 一下,焦点换到别的控件
 		# 暂停中点击列表里的『存档一』(能点的行各接各的链)
 		var slot := _widget("存档槽一")
 		if slot != null:
@@ -280,6 +301,24 @@ func _physics_process(delta: float) -> void:
 	elif phase == 23 and elapsed >= 8.95:
 		phase = 24
 		_check_panels_closed()
+		# 第一百零五轮:M 弹『模态框』(它盖在『穿透按钮』上面)
+		_send_key(KEY_M, true)
+		_send_key(KEY_M, false)
+	elif phase == 24 and elapsed >= 9.3:
+		phase = 25
+		_check_modal_open()
+		_click_pierce()                        # 点被弹窗盖住的那块 -> 该"点不进去"
+	elif phase == 25 and elapsed >= 9.65:
+		phase = 26
+		_check_modal_blocked()
+		_click_outside_modal()                 # 点弹窗外面 -> 它自己收起来
+	elif phase == 26 and elapsed >= 10.0:
+		phase = 27
+		_check_modal_closed()
+		_click_pierce()                        # 弹窗收了,同一个位置再点一次
+	elif phase == 27 and elapsed >= 10.35:
+		phase = 28
+		_check_pierce_ok()
 		print("UI_DONE")
 		set_physics_process(false)
 		# 查完就自己退:无头模式一帧花多少**真实**时间是机器相关的,
@@ -475,13 +514,16 @@ func _check_chat_sent() -> void:
 
 func _check_widgets() -> void:
 	_check_skin()
+	_check_skin_extra()
 	var names := ["HUD底", "徽标", "分数", "血条", "底部提示",
 		"暂停菜单", "暂停标题", "继续按钮", "退出按钮",
 		"标题条", "存档列表", "存档槽一", "存档槽二", "日志列表", "昵称",
 		"设计底板", "设计标题", "设计按钮", "聊天框",
 		# 第一百零四轮:设置面板三件套 + 背包面板(互斥组演示)
 		"设置面板", "设置标题", "音量滑块", "画质选择", "难度选择",
-		"显示背景板", "背包面板", "背包标题", "背包内容"]
+		"显示背景板", "背包面板", "背包标题", "背包内容",
+		# 第一百零五轮:模态弹窗(挡住点击 / 点外面关)
+		"穿透按钮", "模态框", "模态提示"]
 	var missing: Array = []
 	for name in names:
 		if _widget(name) == null:
@@ -902,6 +944,140 @@ func _check_choice_picked() -> void:
 		" hidden=", hidden, " score=", text, " 结局=", ended)
 
 
+# ── 第一百零五轮:皮肤补齐 / 模态弹窗 / 首焦点 ─────────────────────
+
+## 皮肤也要管住第 104 轮新加的三件套 —— 不看"主题里有没有",
+## 而是**从控件身上读回它实际用的样式**(`get_theme_stylebox` 会顺着
+## 主题链找),再比对皮肤给的颜色(滑轨 = 面板底、下拉与勾选框 = 按钮底)。
+## 只查主题字典的话,"控件根本没继承到"这种错会被漏掉。
+func _child_of(node: Node, kind: String) -> Node:
+	if node == null:
+		return null
+	for child in node.get_children():
+		if child.is_class(kind):
+			return child
+	return null
+
+
+func _style_color(box: StyleBox) -> Color:
+	if box is StyleBoxFlat:
+		return (box as StyleBoxFlat).bg_color
+	return Color(-1.0, -1.0, -1.0, -1.0)
+
+
+func _near(a: Color, b: Color) -> bool:
+	return absf(a.r - b.r) < 0.02 and absf(a.g - b.g) < 0.02 \
+		and absf(a.b - b.b) < 0.02 and absf(a.a - b.a) < 0.02
+
+
+func _check_skin_extra() -> void:
+	var theme: Theme = ui_root.theme if ui_root != null else null
+	var slider := _child_of(_widget("音量滑块"), "HSlider") as HSlider
+	var picker := _child_of(_widget("画质选择"), "OptionButton") as OptionButton
+	var box := _widget("显示背景板") as CheckBox
+	var track := _style_color(slider.get_theme_stylebox("slider")) \
+		if slider != null else Color.BLACK
+	var pick := _style_color(picker.get_theme_stylebox("normal")) \
+		if picker != null else Color.BLACK
+	var check := _style_color(box.get_theme_stylebox("normal")) \
+		if box != null else Color.BLACK
+	var font: Color = theme.get_color("font_color", "OptionButton") \
+		if theme != null else Color.BLACK
+	# 滑轨 = 皮肤的面板底(0.06/0.07/0.10/0.92);
+	# 下拉 / 勾选框的底 = 皮肤的按钮底(示例填了 0.18/0.22/0.34/0.95)
+	var ok: bool = _near(track, Color(0.06, 0.07, 0.10, 0.92)) \
+		and _near(pick, Color(0.18, 0.22, 0.34, 0.95)) \
+		and _near(check, Color(0.18, 0.22, 0.34, 0.95)) \
+		and font.a > 0.0
+	print("UI_SKIN_EXTRA ok=", ok, " track=", track, " pick=", pick,
+		" check=", check, " font_a=", font.a)
+
+
+## 暂停菜单:焦点自动落到里面 + 方向键串好了。
+func _focus_name() -> String:
+	var owner := get_viewport().gui_get_focus_owner()
+	return owner.name if owner != null else "<none>"
+
+
+func _check_menu_focus_first() -> void:
+	var menu := _widget("暂停菜单")
+	var owner := get_viewport().gui_get_focus_owner()
+	var inside: bool = owner != null and menu != null and menu.is_ancestor_of(owner)
+	var focusable := 0
+	var chained := 0
+	if menu != null:
+		for node in menu.find_children("*", "Control", true, false):
+			var control := node as Control
+			if control.focus_mode == Control.FOCUS_NONE or not control.visible:
+				continue
+			focusable += 1
+			if not control.get_focus_neighbor(SIDE_BOTTOM).is_empty():
+				chained += 1
+	print("UI_FOCUS_FIRST ok=", inside and focusable >= 2 and chained >= 2,
+		" inside=", inside, " owner=", _focus_name(),
+		" focusable=", focusable, " chained=", chained)
+
+
+## 按一下 ↓:焦点换到另一个控件(链子真的通)。
+func _check_menu_focus_move() -> void:
+	var menu := _widget("暂停菜单")
+	var owner := get_viewport().gui_get_focus_owner()
+	var inside: bool = owner != null and menu != null and menu.is_ancestor_of(owner)
+	print("UI_FOCUS_MOVE ok=", inside and _focus_name() != focus_before,
+		" before=", focus_before, " after=", _focus_name(), " inside=", inside)
+
+
+## 模态框弹出来了(『模态提示』挂在它下面)。
+func _check_modal_open() -> void:
+	var modal := _widget("模态框")
+	var text := _widget("模态提示")
+	var shown: bool = modal != null and modal.visible and text != null
+	print("UI_MODAL_OPEN ok=", shown, " modal=", modal != null and modal.visible,
+		" text=", text != null)
+
+
+## 挡住点击:点被弹窗盖住的那块地方,按钮**没有**被按到
+## (对照组见 _check_pierce_ok:弹窗收了之后同一个位置点得动)。
+func _check_modal_blocked() -> void:
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	var modal := _widget("模态框")
+	var up: bool = modal != null and modal.visible
+	print("UI_MODAL_BLOCK ok=", text != "穿透了!" and up,
+		" score=", text, " modal=", up)
+
+
+## 点外面关掉:点弹窗外面 -> 它自己收起来。
+func _check_modal_closed() -> void:
+	var modal := _widget("模态框")
+	print("UI_MODAL_CLOSE ok=", modal != null and not modal.visible,
+		" modal=", modal != null and modal.visible)
+
+
+## 弹窗收了之后:同一个位置点得到(分数变成『穿透了!』)。
+func _check_pierce_ok() -> void:
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	print("UI_MODAL_PIERCE ok=", text == "穿透了!", " score=", text)
+
+
+func _click_pierce() -> void:
+	var button := _widget("穿透按钮")
+	if button != null:
+		_click_at(button.get_global_rect().get_center())
+
+
+## 点弹窗**外面**的一个点:横坐标对齐弹窗中心、纵坐标在它下边 40 像素。
+## 那个位置这一屏没有别的控件(画质按钮在更下面一截)。
+func _click_outside_modal() -> void:
+	var modal := _widget("模态框")
+	if modal == null:
+		return
+	var rect := modal.get_global_rect()
+	_click_at(Vector2(rect.get_center().x,
+		rect.position.y + rect.size.y + 40.0))
+
+
 func _send_key(code: int, pressed: bool) -> void:
 	var event := InputEventKey.new()
 	event.keycode = code
@@ -1061,6 +1237,24 @@ def main():
          "下拉(原生)选『低』没走多路分支到『画质_设置』(视口缩放该是 0.6)"),
         (r"UI_ARROWS ok=true",
          "左右切换不对(中间的字没换到『困难』/『选了第几个』没写进得分)"),
+        # ---- 第一百零五轮:皮肤补齐 / 模态弹窗 / 首焦点 ----
+        (r"UI_SKIN_EXTRA ok=true",
+         "皮肤没管住滑块 / 下拉 / 勾选框(从控件身上读回的样式不是皮肤给的颜色 ——"
+         " 滑轨该是面板底 0.06/0.07/0.10/0.92,下拉与勾选框该是按钮底 "
+         "0.18/0.22/0.34/0.95)"),
+        (r"UI_FOCUS_FIRST ok=true",
+         "暂停菜单弹出时焦点没自动落到里面第一个能聚焦的控件上 /"
+         "方向键链没串好(控件的 focus_neighbor_bottom 还是空的)"),
+        (r"UI_FOCUS_MOVE ok=true",
+         "按 ↓ 焦点没换到菜单里的另一个控件(方向键链不通)"),
+        (r"UI_MODAL_OPEN ok=true", "按 M 没弹出『模态框』(或『模态提示』没挂上)"),
+        (r"UI_MODAL_BLOCK ok=true",
+         "遮挡没生效:点被弹窗盖住的那块地方,后面的按钮被按到了"
+         "(面板还该是「挡住点击」= MOUSE_FILTER_STOP,弹窗也该还开着)"),
+        (r"UI_MODAL_CLOSE ok=true", "点弹窗外面没把它收起来(『点外面关掉』没生效)"),
+        (r"UI_MODAL_PIERCE ok=true",
+         "弹窗收了之后同一个位置点不到『穿透按钮』(对照组失败 ——"
+         " 说明前面那次不是被挡住,而是按钮本来就点不动)"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -1137,6 +1331,19 @@ def main():
                 ("_gk_widget_value(", "滑块『值』输出(按名字现读)"),
                 ("_gk_widget_index(", "下拉『选了第几个』输出"),
                 ("_gk_widget_checked(", "复选框『勾了吗』输出"),
+                # ---- 第一百零五轮:皮肤补齐 / 模态弹窗 / 首焦点 ----
+                ('set_stylebox("slider", "HSlider"', "皮肤补齐(滑块轨道)"),
+                ('set_stylebox("normal", "OptionButton"', "皮肤补齐(下拉底色)"),
+                ('set_stylebox("normal", "CheckBox"', "皮肤补齐(勾选框底色)"),
+                ("Control.MOUSE_FILTER_STOP", "模态面板『挡住点击』"),
+                ('add_to_group("gk_ui_close_outside")', "『点外面关掉』的组登记"),
+                ("func gk_ui_close_outside_input(event: InputEvent) -> void:",
+                 "『点外面关掉』的 _input 回调"),
+                ("func _gk_ui_focus_first(panel: Control) -> void:",
+                 "『打开时首焦点』辅助函数"),
+                ("visibility_changed.connect(", "显示面板时自动给焦点"),
+                ("focus_neighbor_bottom", "方向键串链"),
+                ("_gk_ui_raise(widget)", "暂停菜单也参与『置顶 / 互斥组』"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")

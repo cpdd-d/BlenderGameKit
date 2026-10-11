@@ -847,6 +847,39 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6i. 『界面_面板』卡片(第一百零五轮:模态三件套勾选框)----
+    # 卡片上原来只有『垫底 / 开局藏』,现在多一行三个勾选框 —— 属性名写错 /
+    # 参数配错在 Blender 里是**当场抛异常、卡片整块消失**,冒烟那层只验
+    # "节点在、代码对",看不见画的事。
+    print("=" * 72)
+    print("6i. 『界面_面板』卡片(挡住点击 / 点外面关 / 首焦点)")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟界面105", "GKGameLogicTree")
+        panel_card = tree.nodes.new("GKNodeUiPanel")
+        card_error = ""
+        try:
+            card_layout = RecordingLayout()
+            panel_card.draw_buttons(bpy.context, card_layout)
+        except Exception as exc:                          # noqa: BLE001
+            card_error = f"{type(exc).__name__}: {exc}"
+        check("『界面_面板』卡片的 draw_buttons 能画完", not card_error,
+              card_error)
+        texts = " ".join(str(item) for item in card_layout.texts)
+        check("『界面_面板』卡片画出了三个新勾选框",
+              "挡住点击" in texts and "点外面关" in texts and "首焦点" in texts,
+              texts[:200])
+        # 属性得是**真的** Blender 属性(写进 tuple 但没物化 -> 卡片一样崩)
+        annotations = getattr(type(panel_card), "__annotations__", {})
+        missing = [name for name in ("gk_block_click", "gk_close_outside",
+                                     "gk_focus_first") if name not in annotations]
+        check("『界面_面板』三个新属性都物化过", not missing, str(missing))
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『界面_面板』卡片(第一百零五轮)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

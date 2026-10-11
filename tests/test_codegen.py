@@ -19669,5 +19669,178 @@ class TestRound104UiTrio(Base):
         self.assertEqual(NN.dropdown_item_texts(node), ["选项"])
 
 
+class TestRound105UiModal(Base):
+    """第一百零五轮:界面收口 —— 坐标真的生效 / 皮肤带新控件 /
+    暂停菜单参与层级 / 模态面板(挡住点击 · 点外面关)/ 首焦点 + 方向键。
+
+    ── 这一层锁住的五条事实(改代码前先看)────────────────────────
+    1. 九个控件都带 **X / Y 引脚**且映射到 `gk_x` / `gk_y`
+       (`_ui_place` 是按**引脚名**取值的:只有属性没有引脚 = 卡片上填的
+       坐标被静默忽略,而设计预览读的是属性 —— "预览在哪儿跑起来不在哪儿");
+    2. 皮肤除了按钮 / 滚动条 / 面板,还给**滑块 / 下拉 / 勾选框**配了样式
+       (第 104 轮才有的控件,以前落在默认主题的浅灰 + 白底上);
+    3. Esc 弹暂停菜单时**也走 `_gk_ui_raise`**(置顶 + 同互斥组收起);
+    4. 面板三个新开关默认**都不勾** = 老行为一字不变(NULL 只改 visible
+       那条老路);勾上才出对应的码;
+    5. 『打开时首焦点』= 显示时把方向键串成一条链 + 焦点给第一个。
+    """
+
+    NINE_WIDGETS = ("GKNodeUiPanel", "GKNodeUiImage", "GKNodeUiList",
+                    "GKNodeUiNinePatch", "GKNodeUiInput", "GKNodeUiTextEdit",
+                    "GKNodeUiSlider", "GKNodeUiDropdown", "GKNodeUiCheckbox")
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    # ---- ① X / Y 引脚 ----
+    def test_nine_widgets_have_xy_pins_and_mapping(self):
+        for idname in self.NINE_WIDGETS:
+            cls = getattr(NN, idname)
+            pins = [spec["name"] for spec in cls.gk_inputs]
+            self.assertIn("X", pins, cls.bl_label)
+            self.assertIn("Y", pins, cls.bl_label)
+            self.assertEqual(cls.gk_input_props.get("X"), "gk_x", cls.bl_label)
+            self.assertEqual(cls.gk_input_props.get("Y"), "gk_y", cls.bl_label)
+
+    def test_widget_xy_card_value_reaches_export_param(self):
+        """卡片上填的 X / Y 变成 `ui_x_N` 的默认值 —— 不再是恒定的 20.0。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        slider = tree.new_node(NN.GKNodeUiSlider, "音量滑块",
+                               gk_x=28.0, gk_y=70.0)
+        gk_stub.connect(tree, event, "执行", slider, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(code, r"@export var ui_x\w*: float = 28\.0")
+        self.assertRegex(code, r"@export var ui_y\w*: float = 70\.0")
+        self.assertRegex(code, r"_gk_ui_音量滑块\.position = "
+                               r"Vector2\(ui_x\w*, ui_y\w*\)")
+
+    # ---- ② 皮肤带新控件 ----
+    def test_skin_covers_slider_dropdown_checkbox(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        skin = tree.new_node(NN.GKNodeUiSkin, "皮肤")
+        gk_stub.connect(tree, event, "执行", skin, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        for needle in (
+                'set_stylebox("slider", "HSlider"',
+                'set_stylebox("slider", "VSlider"',
+                'set_stylebox("grabber_area", "HSlider"',
+                'set_stylebox("normal", "OptionButton"',
+                'set_stylebox("focus", "OptionButton"',
+                'set_stylebox("normal", "CheckBox"',
+                'set_stylebox("normal", "CheckButton"',
+        ):
+            self.assertIn(needle, code)
+        # 字号 / 字色那一圈也要带上新控件(不然它们还是默认字色)
+        self.assertIn('"OptionButton", "CheckBox", "CheckButton"', code)
+        self.assert_indent_sane(code)
+
+    # ---- ③ 暂停菜单参与层级 ----
+    def test_pause_menu_raises_when_opened(self):
+        def build(menu):
+            tree = make_tree()
+            event = self._ready(tree)
+            pause = tree.new_node(NN.GKNodeUiPauseGame, "暂停热键",
+                                  gk_pause=True, gk_menu=menu, gk_hotkey=True)
+            gk_stub.connect(tree, event, "执行", pause, "执行")
+            return gen(tree, V3)[0]
+
+        code = build("暂停菜单")
+        self.assertIn("func _gk_ui_raise(widget: Control) -> void:", code)
+        body = self.functions(code)["_gk_apply_pause"]
+        self.assertIn("widget.visible = paused", body)
+        self.assertIn("if paused:", body)
+        self.assertIn("_gk_ui_raise(widget)", body)
+
+        # 没填菜单 = 没有面板要置顶(老行为:那一整段都不生成)
+        plain = build("")
+        self.assertNotIn("_gk_ui_raise", plain)
+
+    # ---- ④ 模态面板 ----
+    def test_panel_new_switches_default_off(self):
+        prop_names = [entry[0] for entry in NN.GKNodeUiPanel.gk_prop_defs]
+        self.assertEqual(
+            prop_names[:6],
+            ["gk_color", "gk_radius", "gk_x", "gk_y", "gk_width", "gk_height"])
+        for name in ("gk_block_click", "gk_close_outside", "gk_focus_first"):
+            self.assertIn(name, prop_names)
+            self.assertIn(name, getattr(NN.GKNodeUiPanel, "__annotations__", {}))
+        tree = make_tree()
+        event = self._ready(tree)
+        panel = tree.new_node(NN.GKNodeUiPanel, "普通面板")
+        gk_stub.connect(tree, event, "执行", panel, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 不勾 = 老行为:底板不吃鼠标,没有组 / 没有 _input 回调 / 没有焦点
+        self.assertIn("Control.MOUSE_FILTER_IGNORE", code)
+        self.assertNotIn("MOUSE_FILTER_STOP", code)
+        self.assertNotIn("gk_ui_close_outside", code)
+        self.assertNotIn("_gk_ui_focus_first", code)
+
+    def test_panel_block_click_stops_mouse(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        panel = tree.new_node(NN.GKNodeUiPanel, "模态框", gk_block_click=True)
+        gk_stub.connect(tree, event, "执行", panel, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Control.MOUSE_FILTER_STOP", code)
+        self.assertIn("_gk_ui_模态框.mouse_filter = Control.MOUSE_FILTER_STOP",
+                      code)
+        # 只有界面根那一句还是 IGNORE(面板自己不再走"不吃鼠标"的老路)
+        self.assertEqual(code.count("MOUSE_FILTER_IGNORE"), 1, code)
+
+    def test_panel_close_outside_registers_input_handler(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        panel = tree.new_node(NN.GKNodeUiPanel, "模态框", gk_close_outside=True)
+        gk_stub.connect(tree, event, "执行", panel, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 勾『点外面关』= 自动带上『挡住点击』
+        self.assertIn("Control.MOUSE_FILTER_STOP", code)
+        self.assertIn('.add_to_group("gk_ui_close_outside")', code)
+        self.assertIn("func gk_ui_close_outside_input(event: InputEvent) -> void:",
+                      code)
+        funcs = self.functions(code)
+        self.assertIn("gk_ui_close_outside_input(event)", funcs["_input"])
+        # 判"点在框内还是框外"用的是面板自己的矩形
+        self.assertIn("panel.get_global_rect().has_point(click.position)",
+                      funcs["gk_ui_close_outside_input"])
+        self.assertIn("panel.visible = false",
+                      funcs["gk_ui_close_outside_input"])
+
+    # ---- ⑤ 首焦点 + 方向键 ----
+    def test_panel_focus_first_wires_visibility_and_neighbors(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        panel = tree.new_node(NN.GKNodeUiPanel, "暂停菜单", gk_focus_first=True)
+        gk_stub.connect(tree, event, "执行", panel, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("visibility_changed.connect(func() -> void:", code)
+        self.assertIn("_gk_ui_focus_first(_gk_ui_暂停菜单)", code)
+        body = self.functions(code)["_gk_ui_focus_first"]
+        # 只挑能聚焦的控件(Label 这种 focus_mode = NONE 的要跳过)
+        self.assertIn("Control.FOCUS_NONE", body)
+        # 串链 + 焦点给第一个
+        self.assertIn("focus_neighbor_top", body)
+        self.assertIn("focus_neighbor_bottom", body)
+        self.assertIn("focus_next", body)
+        self.assertIn("grab_focus()", body)
+        self.assert_indent_sane(code)
+
+    def test_focus_helper_not_generated_when_unused(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        panel = tree.new_node(NN.GKNodeUiPanel, "普通面板")
+        gk_stub.connect(tree, event, "执行", panel, "执行")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("func _gk_ui_focus_first(", code)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

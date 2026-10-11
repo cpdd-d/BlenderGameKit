@@ -245,6 +245,9 @@ class GenContext:
         # 『界面_隐藏控件』勾了『置顶』:生成 `_gk_ui_raise()`
         # (挪到最上层 + 收起同互斥组的其他面板)
         self.need_raise_helper = False
+        # 面板勾了『打开时首焦点』(第一百零五轮):生成 `_gk_ui_focus_first()`
+        # (显示时按"上->下、左->右"把能聚焦的控件串一条链,焦点给第一个)
+        self.need_focus_first_helper = False
         # 只有真的用了手柄节点才生成摇杆死区辅助函数
         self.need_joy_helpers = False
         # 只有真的用了屏幕滤镜才生成全屏材质辅助函数

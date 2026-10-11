@@ -1215,6 +1215,47 @@ class Generator:
                     "empty_body": "    pass",
                     "separator": True,
                 })
+            if self.ctx.need_focus_first_helper:
+                sections.append({
+                    # 面板勾了『打开时首焦点』(第一百零五轮)才生成:
+                    # 每次面板显示时,把里面**能聚焦**的控件按"上->下、
+                    # 左->右"串成一条链(方向键 / Tab 都走得通),再把焦点
+                    # 交给第一个 —— 键盘 / 手柄玩家不用先按 Tab 摸进去。
+                    # 位置排序用 global_position:面板里的控件是自由摆放的
+                    # (不在容器里),没有容器帮我们定顺序。
+                    "signature": "func _gk_ui_focus_first(panel: Control) -> void:",
+                    "lines": [
+                        "    var items: Array = []",
+                        "    var queue: Array = [panel]",
+                        "    while not queue.is_empty():",
+                        "        var node: Node = queue.pop_front()",
+                        "        for child in node.get_children():",
+                        "            if child is Control and (child as Control).visible "
+                        "and (child as Control).focus_mode != Control.FOCUS_NONE:",
+                        "                items.append(child)",
+                        "            queue.append(child)",
+                        "    items.sort_custom(func(a: Control, b: Control) -> bool:",
+                        "        if absf(a.global_position.y - b.global_position.y) > 2.0:",
+                        "            return a.global_position.y < b.global_position.y",
+                        "        return a.global_position.x < b.global_position.x)",
+                        "    for index in items.size():",
+                        "        var item: Control = items[index]",
+                        "        var up: NodePath = items[index - 1].get_path() "
+                        "if index > 0 else NodePath()",
+                        "        var down: NodePath = items[index + 1].get_path() "
+                        "if index + 1 < items.size() else NodePath()",
+                        "        item.focus_neighbor_top = up",
+                        "        item.focus_neighbor_bottom = down",
+                        "        item.focus_neighbor_left = up",
+                        "        item.focus_neighbor_right = down",
+                        "        item.focus_previous = up",
+                        "        item.focus_next = down",
+                        "    if not items.is_empty():",
+                        "        (items[0] as Control).grab_focus()",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
             sections.append({
                 # 不带 host 参数:它从来没被用过,而 Godot 会把
                 # "参数没用上" 报成 UNUSED_PARAMETER(调试器里一条错误)。
@@ -1267,29 +1308,40 @@ class Generator:
                     "empty_body": "    pass",
                     "separator": True,
                 })
+            pause_lines = [
+                "    var tree := get_tree()",
+                "    if tree == null:",
+                "        return",
+                "    tree.paused = paused",
+                "    if show_mouse:",
+                "        if paused:",
+                "            if _gk_pause_mouse_was < 0:",
+                "                _gk_pause_mouse_was = Input.mouse_mode",
+                "            Input.mouse_mode = Input.MOUSE_MODE_VISIBLE",
+                "        elif _gk_pause_mouse_was >= 0:",
+                "            Input.mouse_mode = _gk_pause_mouse_was as Input.MouseMode",
+                "            _gk_pause_mouse_was = -1",
+                "    if menu != \"\":",
+                "        var widget := _gk_find_widget(menu)",
+                "        if widget != null:",
+                "            widget.visible = paused",
+            ]
+            if self.ctx.need_raise_helper and getattr(
+                    self.ctx, "_pause_menu_raise", False):
+                # 第一百零五轮:弹菜单时也走一遍『置顶 + 互斥组』
+                # (Esc 之前可能已经开着别的面板,不置顶会被压住)
+                pause_lines += [
+                    "            if paused:",
+                    "                _gk_ui_raise(widget)",
+                ]
+            pause_lines += [
+                "        else:",
+                "            push_warning(\"找不到暂停菜单控件: \" + menu)",
+                "    print(\"[GK] 暂停: \", \"开\" if paused else \"关\")",
+            ]
             sections.append({
                 "signature": "func _gk_apply_pause(paused: bool, menu: String, show_mouse: bool) -> void:",
-                "lines": [
-                    "    var tree := get_tree()",
-                    "    if tree == null:",
-                    "        return",
-                    "    tree.paused = paused",
-                    "    if show_mouse:",
-                    "        if paused:",
-                    "            if _gk_pause_mouse_was < 0:",
-                    "                _gk_pause_mouse_was = Input.mouse_mode",
-                    "            Input.mouse_mode = Input.MOUSE_MODE_VISIBLE",
-                    "        elif _gk_pause_mouse_was >= 0:",
-                    "            Input.mouse_mode = _gk_pause_mouse_was as Input.MouseMode",
-                    "            _gk_pause_mouse_was = -1",
-                    "    if menu != \"\":",
-                    "        var widget := _gk_find_widget(menu)",
-                    "        if widget != null:",
-                    "            widget.visible = paused",
-                    "        else:",
-                    "            push_warning(\"找不到暂停菜单控件: \" + menu)",
-                    "    print(\"[GK] 暂停: \", \"开\" if paused else \"关\")",
-                ],
+                "lines": pause_lines,
                 "empty_body": "    pass",
                 "separator": True,
             })

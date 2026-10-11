@@ -1064,7 +1064,19 @@ def _stmt_ui_image(ctx, node, indent):
 
 @stmt_node("GKNodeUiPanel")
 def _stmt_ui_panel(ctx, node, indent):
-    """半透明底板(菜单背景 / 提示条)。"""
+    """半透明底板(菜单背景 / 提示条)。
+
+    ── 模态面板(第一百零五轮)────────────────────────────────────
+    以前面板一律 `MOUSE_FILTER_IGNORE`(它是装饰) —— 于是**点面板的
+    空白处会漏到面板后面的按钮**(真 Godot 会照按)。三个可选开关补上:
+      * 『挡住点击』= 面板自己收点击,空白处不再"隔山打牛";
+      * 『点外面关掉』= 点面板外面就收起它(自动带上『挡住点击』)+
+        把自己挂进 `gk_ui_close_outside` 组,由 `_input` 里那段
+        `gk_ui_close_outside_input` 统一判"点在框内还是框外";
+      * 『打开时首焦点』= 每次显示时把焦点交给第一个能聚焦的控件,
+        并顺手把方向键串成一条链(见 `_gk_ui_focus_first`)。
+    三个开关默认**都不勾** = 老行为一字不变。
+    """
     _layer, root = _ui_root(ctx, indent)
     widget = ctx.declare_var(f"_gk_ui_{node.name}", "Panel", key=node_lib.node_key(node))
     color = getattr(node, "gk_color", (0.06, 0.07, 0.10, 0.72))
@@ -1073,6 +1085,9 @@ def _stmt_ui_panel(ctx, node, indent):
     height = gd_number(getattr(node, "gk_height", 240.0))
     bottom = bool(getattr(node, "gk_bottom", True))
     start_hidden = bool(getattr(node, "gk_start_hidden", False))
+    close_outside = bool(getattr(node, "gk_close_outside", False))
+    block_click = bool(getattr(node, "gk_block_click", False)) or close_outside
+    focus_first = bool(getattr(node, "gk_focus_first", False))
 
     ctx.add_line(indent, f"if {widget} == null:")
     ctx.add_line(indent + 1, f"{widget} = Panel.new()")
@@ -1084,8 +1099,12 @@ def _stmt_ui_panel(ctx, node, indent):
     for corner in ("top_left", "top_right", "bottom_left", "bottom_right"):
         ctx.add_line(indent + 1, f"_box.corner_radius_{corner} = {radius}")
     ctx.add_line(indent + 1, f"{widget}.add_theme_stylebox_override(\"panel\", _box)")
-    # 底板不吃鼠标:它是装饰,不该挡住按钮 / 游戏里的点击
-    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    if block_click:
+        # 模态:面板自己吃点击,空白处不再漏到后面的按钮
+        ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_STOP")
+    else:
+        # 底板不吃鼠标:它是装饰,不该挡住按钮 / 游戏里的点击
+        ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
     # 垫底 / 开局藏 都跟着"挂到谁下面"走:有父控件时是相对**兄弟**
     # 垫底(move_child 只对自家孩子有效,对 root 调会报 not a child)
     after = []
@@ -1094,6 +1113,32 @@ def _stmt_ui_panel(ctx, node, indent):
     if start_hidden:
         after.append(f"{widget}.visible = false")
     _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    if close_outside:
+        ctx.add_line(indent + 1,
+                     f"{widget}.add_to_group(\"gk_ui_close_outside\")")
+        ctx.register_input_handler("gk_ui_close_outside_input", reset=False, body=[
+            "    if not (event is InputEventMouseButton):",
+            "        return",
+            "    var click := event as InputEventMouseButton",
+            "    if not click.pressed or click.button_index != MOUSE_BUTTON_LEFT:",
+            "        return",
+            "    for found in get_tree().get_nodes_in_group(\"gk_ui_close_outside\"):",
+            "        if not (found is Control):",
+            "            continue",
+            "        var panel := found as Control",
+            "        if not panel.visible:",
+            "            continue",
+            "        if panel.get_global_rect().has_point(click.position):",
+            "            continue",
+            "        panel.visible = false",
+        ])
+    if focus_first:
+        # 显示时:串方向键 + 焦点给第一个(见 `_gk_ui_focus_first`)
+        ctx.need_focus_first_helper = True
+        ctx.add_line(indent + 1,
+                     f"{widget}.visibility_changed.connect(func() -> void:")
+        ctx.add_line(indent + 2, f"if {widget}.visible:")
+        ctx.add_line(indent + 3, f"_gk_ui_focus_first({widget}))")
     _ui_size(ctx, indent, widget, node, width, height)
     _ui_place(ctx, indent, widget, node, "20.0", "20.0")
 
@@ -1187,6 +1232,12 @@ def _stmt_ui_pause(ctx, node, indent):
     if not menu:
         ctx.note(f"『{node.bl_label}』没填『菜单控件』—— 世界会暂停,"
                  f"但菜单面板不会自动弹出来")
+    else:
+        # 第一百零五轮:暂停菜单弹出来时**也要参与界面层级** —— 挪到最上层
+        # (Esc 开菜单之前可能已经开着设置 / 背包面板,不置顶就会被压住);
+        # 菜单卡上填了『互斥组』的话,同组的面板一起收起来(见 _gk_ui_raise)。
+        ctx.need_raise_helper = True
+        ctx._pause_menu_raise = True
     action = "true" if paused else "false"
     mouse_literal = "true" if mouse else "false"
     ctx.add_line(indent, f"_gk_apply_pause({action}, {gd_string(menu)}, {mouse_literal})")
@@ -2121,9 +2172,18 @@ def _stmt_ui_skin(ctx, node, indent):
       * VScrollBar / HScrollBar 的 scroll(轨道)+ grabber 三态;
       * Panel 的 panel、LineEdit / TextEdit 的 normal / focus;
       * ProgressBar 的 background / fill;
+      * HSlider / VSlider 的 slider(轨道)+ grabber_area(划过的那截);
+      * OptionButton / CheckBox / CheckButton 的底(和按钮同一套);
       * 常用类型的 font_color + `default_font_size`。
     卡片自己设过 override 的控件(『界面_文本』的颜色、『界面_面板』的
     底色)以卡片为准 —— 主题只兜底。
+
+    ── 第一百零五轮:补上第 104 轮新加的三样控件 ──────────────────
+    滑块 / 下拉 / 勾选框是第 104 轮才有的,皮肤建立时还没它们 ——
+    落到屏幕上就是默认主题的浅灰轨道 + 白底下拉,和这套深色圆角
+    皮肤摆在一起像拼的。
+    ⚠ 勾选框**打勾的那个方块**是引擎自带图标(Theme 只能换图标贴图、
+      换不了颜色),这里没动它 —— 只把它的底色和文字色拉进同一套。
     """
     _layer, root = _ui_root(ctx, indent)
     font_size = int(getattr(node, "gk_font_size", 20) or 20)
@@ -2164,8 +2224,10 @@ def _stmt_ui_skin(ctx, node, indent):
     text_color = ctx.new_temp("gk_ui_color")
     ctx.add_line(indent, f"var {text_color} := {color(font_color)}")
     type_var = ctx.new_temp("gk_ui_t")
-    ctx.add_line(indent, f"for {type_var} in [\"Label\", \"Button\", "
-                         f"\"LineEdit\", \"TextEdit\"]:")
+    font_types = ("Label", "Button", "LineEdit", "TextEdit",
+                  "OptionButton", "CheckBox", "CheckButton")
+    ctx.add_line(indent, f"for {type_var} in ["
+                         + ", ".join(gd_string(t) for t in font_types) + "]:")
     ctx.add_line(indent + 1,
                  f"{theme}.set_color(\"font_color\", {type_var}, {text_color})")
 
@@ -2215,6 +2277,31 @@ def _stmt_ui_skin(ctx, node, indent):
     stylebox(bag_box, "Color(0.0, 0.0, 0.0, 0.35)")
     ctx.add_line(indent, f"{theme}.set_stylebox(\"background\", \"ProgressBar\", {bag_box})")
     ctx.add_line(indent, f"{theme}.set_stylebox(\"fill\", \"ProgressBar\", {fill_box})")
+
+    # 滑块(第一百零五轮):轨道用面板色,划过去的那一截用按钮色
+    slider_track = ctx.new_temp("gk_ui_slider")
+    stylebox(slider_track, color(panel_color))
+    slider_fill = ctx.new_temp("gk_ui_slider_fill")
+    stylebox(slider_fill, color(button_color))
+    for slider_type in ("HSlider", "VSlider"):
+        for key, box in (("slider", slider_track),
+                         ("grabber_area", slider_fill),
+                         ("grabber_area_highlight", slider_fill)):
+            ctx.add_line(indent, f"{theme}.set_stylebox({gd_string(key)}, "
+                                 f"{gd_string(slider_type)}, {box})")
+
+    # 下拉 / 勾选框(第一百零五轮):和按钮同一套底 —— 默认主题里它们
+    # 是白底,摆在这套深色皮肤里一眼就出戏
+    for new_type in ("OptionButton", "CheckBox", "CheckButton"):
+        for key, bg in (("normal", color(button_color)),
+                        ("hover", color(hover_color)),
+                        ("pressed", color(press_color))):
+            box = ctx.new_temp("gk_ui_new")
+            stylebox(box, bg)
+            ctx.add_line(indent, f"{theme}.set_stylebox({gd_string(key)}, "
+                                 f"{gd_string(new_type)}, {box})")
+        ctx.add_line(indent, f"{theme}.set_stylebox(\"focus\", "
+                             f"{gd_string(new_type)}, {focus_box})")
 
     ctx.add_line(indent, f"{root}.theme = {theme}")
 

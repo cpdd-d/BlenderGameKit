@@ -1617,8 +1617,10 @@ class GKNodeUiImage(B.GKStatementNode):
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "图片", ""),
+        S.pin(FLOAT, "X", 20.0),
+        S.pin(FLOAT, "Y", 20.0),
     )
-    gk_input_props = {"图片": "gk_image"}
+    gk_input_props = {"图片": "gk_image", "X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_image", "string", "", "图片",
          "Blender 里的图片名(点右边『选图片』挑),或 res:// 路径"),
@@ -1663,7 +1665,14 @@ class GKNodeUiPanel(B.GKStatementNode):
               "颜色第四位是透明度，『圆角』0 = 直角。"
               "『垫底』勾着时它永远铺在别的控件下面 —— 先加面板、"
               "后加按钮也不会把按钮盖住(菜单都这么搭)")
-    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 20.0),
+                 S.pin(FLOAT, "Y", 20.0),)
+    # ── 为什么 X / Y 既要引脚又要映射(第一百零五轮修)──────────────
+    # `_ui_place` 是按**引脚名**取值的(`_ui_place` -> _tunable_number
+    # 读 "X" / "Y"),只写 `gk_x` 属性这一半,位置就永远是默认值 ——
+    # 卡片上填的 X / Y 被**静默忽略**,而设计预览读的是 `gk_x`,
+    # 于是"预览在哪儿、跑起来不在哪儿"。九个控件都漏了这一半。
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_color", "color", (0.06, 0.07, 0.10, 0.72), "颜色",
          "底色；第四位是透明度(0.7 左右做菜单底刚好)"),
@@ -1676,6 +1685,16 @@ class GKNodeUiPanel(B.GKStatementNode):
          "勾上 = 永远垫在别的控件下面(菜单底板用这个)"),
         ("gk_start_hidden", "bool", False, "一开始就藏起来",
          "勾上 = 建出来是隐藏的(暂停菜单底板必勾 —— 开局不该显示菜单)"),
+        # ── 第一百零五轮:模态面板三件套 ──────────────────────────────
+        ("gk_block_click", "bool", False, "挡住点击",
+         "勾上 = 面板自己吃鼠标点击,不会漏到它后面的按钮 / 游戏画面\n"
+         "(模态弹窗必勾:以前面板是「不挡」的,点面板空白处会按到后面的按钮)"),
+        ("gk_close_outside", "bool", False, "点外面关掉",
+         "勾上 = 点到面板**外面**的地方就把它收起来(点面板里面不算)\n"
+         "自动带上『挡住点击』;和对话框那种「点外面关」是同一个手感"),
+        ("gk_focus_first", "bool", False, "打开时首焦点",
+         "勾上 = 每次显示面板时,焦点自动落到里面第一个能聚焦的控件,\n"
+         "并把方向键串好 —— 键盘 / 手柄玩家不用先按 Tab 摸进去"),
         ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
         ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
         ("gk_parent_widget", "string", "", "父控件",
@@ -1692,6 +1711,10 @@ class GKNodeUiPanel(B.GKStatementNode):
         row.prop(self, "gk_bottom", text="垫底", toggle=True)
         row.prop(self, "gk_start_hidden", text="开局藏", toggle=True)
         row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        row = layout.row(align=True)
+        row.prop(self, "gk_block_click", text="挡住点击", toggle=True)
+        row.prop(self, "gk_close_outside", text="点外面关", toggle=True)
+        row.prop(self, "gk_focus_first", text="首焦点", toggle=True)
         B.draw_ui_align_row(self, layout)
 
 
@@ -2118,7 +2141,9 @@ class GKNodeUiList(B.GKStatementNode):
               "『父控件』填列表名 —— 每个按钮各接各的点击链;"
               "只是**显示**的行(排行榜 / 日志):用『界面_列表_填充』"
               "喂一个文字数组,它按数组建行。")
-    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 12.0),
+                 S.pin(FLOAT, "Y", 60.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_scroll", "bool", True, "可滚动", "内容超了出滚动条(滚轮能滚)"),
         ("gk_vertical", "bool", True, "竖排", "取消勾选 = 横排(工具栏那种)"),
@@ -2256,7 +2281,9 @@ class GKNodeUiNinePatch(B.GKStatementNode):
               "(中间部分拉伸填满)。比如 12 表示四边各 12 像素的花边。\n"
               "图片和『界面_图片』同一套:点『选图片』挑 Blender 图片,"
               "导出时自动落盘成 `art/ui_*.png`。")
-    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 12.0),
+                 S.pin(FLOAT, "Y", 12.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_image", "string", "", "图片", "Blender 图片名(点『选图片』挑)或 res:// 路径"),
         ("gk_slice", "int", 12, "切片", "四边各留多少像素不拉伸(花边宽度)"),
@@ -2302,8 +2329,10 @@ class GKNodeUiInput(B.GKStatementNode):
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "默认文字", ""),
+        S.pin(FLOAT, "X", 20.0),
+        S.pin(FLOAT, "Y", 20.0),
     )
-    gk_input_props = {"默认文字": "gk_text"}
+    gk_input_props = {"默认文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_text", "string", "", "默认文字", "一建出来框里的字(留空 = 只有占位提示)"),
         ("gk_placeholder", "string", "输入昵称…", "占位提示",
@@ -2357,8 +2386,10 @@ class GKNodeUiTextEdit(B.GKStatementNode):
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "默认文字", ""),
+        S.pin(FLOAT, "X", 20.0),
+        S.pin(FLOAT, "Y", 20.0),
     )
-    gk_input_props = {"默认文字": "gk_text"}
+    gk_input_props = {"默认文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_text", "string", "", "默认文字", "一建出来框里的字"),
         ("gk_placeholder", "string", "说点什么…", "占位提示",
@@ -2439,7 +2470,9 @@ class GKNodeUiSlider(B.GKStatementNode):
               "实时调音量);当前值还能用『值』(数值输出)随时读。\n"
               "⚠ 实际控件是一整行(名称 + 滑轨 + 数值),按**节点名**找它 ——"
               "『界面_设置』改透明度 / 『界面_隐藏控件』显隐都作用在整行上。")
-    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 20.0),
+                 S.pin(FLOAT, "Y", 20.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_min", "float", 0.0, "最小", "滑到最左边 = 这个值"),
         ("gk_max", "float", 100.0, "最大", "滑到最右边 = 这个值"),
@@ -2499,7 +2532,9 @@ class GKNodeUiDropdown(B.GKStatementNode):
               "那个是**一次性选择**(等玩家选完才往下走,会卡执行流);"
               "这个是**随时可改的设置项** —— 选完立刻走『选了』,不卡。\n"
               "⚠ 控件是一整行(可选名称 + 选项控件),按**节点名**找它。")
-    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 20.0),
+                 S.pin(FLOAT, "Y", 20.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_items", "string", "低|中|高", "选项", "按 | 分隔写每个选项"),
         ("gk_style", "enum", "NATIVE", "样式", "下拉菜单 / 左右切换",
@@ -2555,7 +2590,9 @@ class GKNodeUiCheckbox(B.GKStatementNode):
               "  * **勾选框** = Godot 的 CheckBox(一个 ☑ 方块);\n"
               "  * **开关** = CheckButton(一条会滑的小开关,手机上常见)。\n"
               "『文字』就写在框旁边(框自带文字,不另算一行)。")
-    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 20.0),
+                 S.pin(FLOAT, "Y", 20.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
     gk_prop_defs = (
         ("gk_text", "string", "全屏", "文字", "框旁边那行字"),
         ("gk_checked", "bool", False, "默认勾上", "一建出来就是勾着的"),

@@ -59,6 +59,15 @@
 * **互斥组**(控件卡上填组名)= 同组的界面只留一个开着 —— 按 O 时背包自动收起,反之亦然;
 * 两块面板**都没有**进组时才需要靠"置顶"判断谁在前面。
 
+── 第一百零五轮:模态弹窗 + 首焦点 ─────────────────────────────
+
+| 用到的 | 在游戏里怎么看 |
+|---|---|
+| **『挡住点击』** | 『模态框』盖住一个按钮 —— 弹窗开着时点那块地方,按钮**不会**被按到(以前面板是"不挡"的,点空白处会穿透到后面的按钮) |
+| **『点外面关掉』** | 点『模态框』外面任意位置,它自己收起来;收了再点原来那个按钮,按钮就正常响应了 |
+| **『打开时首焦点』** | 按 **Esc** 弹出暂停菜单时焦点自己落到里面第一个能聚焦的控件上,方向键直接上下走(不用先摸鼠标 / 按 Tab) |
+| **界面_皮肤(补齐)** | 皮肤顺便管住了第 104 轮新加的滑块 / 下拉 / 勾选框 —— 以前它们还是默认主题的浅灰轨道 + 白底下拉,和这套深色圆角皮肤摆一起像拼的 |
+
 跑法(Godot):打开 `界面示例_godot` 直接 F5。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ui_demo.py`
 """
@@ -372,6 +381,9 @@ def _build_ui_chain(tree, ready, design):
     menu = _add(tree, "GKNodeUiPanel", "暂停菜单", 1040.0, 0.0,
                 gk_width=440.0, gk_height=340.0, gk_radius=18,
                 gk_align="CENTER", gk_start_hidden=True,
+                # 第一百零五轮:一弹出来就把焦点交给里面第一个能聚焦的
+                # 控件,并把方向键串成一条链 —— 键盘直接上下选,不用摸鼠标
+                gk_focus_first=True,
                 gk_color=(0.05, 0.06, 0.09, 0.86))
     title = _add(tree, "GKNodeUiText", "暂停标题", 1300.0, 0.0,
                  gk_text="已暂停", gk_size=30, gk_align="TOP_CENTER",
@@ -473,6 +485,29 @@ def _build_ui_chain(tree, ready, design):
                     gk_text="钥匙 ×1 / 手电 ×1", gk_size=20,
                     gk_align="TOP_CENTER", gk_margin=64.0,
                     gk_parent_widget="背包面板")
+    # ── 第一百零五轮:模态弹窗(挡住点击 + 点外面关)──────────────────
+    # 『穿透按钮』先建、『模态框』后建 —— 后建的画在上面,弹窗才盖得住按钮。
+    # 探针的三步对照:
+    #   ① 弹窗开着时点按钮那一块 -> 点被弹窗吃掉,按钮**没**响应(挡住点击);
+    #   ② 点弹窗外面 -> 弹窗自己收起来(点外面关);
+    #   ③ 弹窗收了再点同一个位置 -> 按钮正常响应("真的被挡住了,不是坏了")。
+    # ⚠ 『垫底』**不能勾**:勾了会被挪到最下面,就盖不住按钮了。
+    pierce = _add(tree, "GKNodeUiButton", "穿透按钮", 2860.0, 1800.0,
+                  gk_text="点我(穿透测试)", gk_x=820.0, gk_y=200.0,
+                  gk_width=200.0, gk_height=44.0)
+    modal = _add(tree, "GKNodeUiPanel", "模态框", 3120.0, 1800.0,
+                 gk_width=240.0, gk_height=84.0, gk_radius=14,
+                 gk_x=800.0, gk_y=180.0,
+                 gk_bottom=False, gk_start_hidden=True,
+                 gk_block_click=True, gk_close_outside=True,
+                 gk_color=(0.24, 0.09, 0.12, 0.92))
+    modal_text = _add(tree, "GKNodeUiText", "模态提示", 3380.0, 1800.0,
+                      gk_text="点外面关掉我", gk_size=22, gk_align="CENTER",
+                      gk_parent_widget="模态框")
+    pierce_reply = _add(tree, "GKNodeUiSet", "穿透回话", 3380.0, 2060.0,
+                        gk_widget="分数", gk_set_text=True,
+                        gk_text="穿透了!")
+    _link(tree, pierce, "点击", pierce_reply, "执行")
     # 三条行为链(挂在三件套的出口上;生成物在独立回调里,不会开场就跑)
     volume_bus = _add(tree, "GKNodeBusVolume", "滑块调音量", 3640.0, 900.0,
                       gk_bus="Master", gk_fade=0.0)
@@ -493,7 +528,7 @@ def _build_ui_chain(tree, ready, design):
     hotkey = _add(tree, "GKNodeUiPauseGame", "暂停热键", 3380.0, 0.0,
                   gk_pause=False, gk_menu="暂停菜单", gk_hotkey=True)
     hint = _add(tree, "GKNodeUiText", "底部提示", 3640.0, 0.0,
-                gk_text="点一下继续对话 / Esc 暂停 / O 设置 / B 背包 / C 收起 / 昵称框回车",
+                gk_text="点一下继续对话 / Esc 暂停 / O 设置 / B 背包 / C 收起 / M 弹窗 / 昵称框回车",
                 gk_size=20, gk_align="BOTTOM_CENTER", gk_margin=28.0)
     dialog = _add(tree, "GKNodeUiDialog", "开场白", 3900.0, 0.0,
                   gk_speaker="向导", gk_text=DIALOG_TEXT,
@@ -588,7 +623,10 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, plate_box, "完成", bag, "执行")
     _link(tree, bag, "完成", bag_title, "执行")
     _link(tree, bag_title, "完成", bag_text, "执行")
-    _link(tree, bag_text, "完成", hotkey, "执行")
+    _link(tree, bag_text, "完成", pierce, "执行")
+    _link(tree, pierce, "完成", modal, "执行")
+    _link(tree, modal, "完成", modal_text, "执行")
+    _link(tree, modal_text, "完成", hotkey, "执行")
     _link(tree, hotkey, "完成", startup, "执行")
     _link(tree, startup, "完成", hint, "执行")
     _link(tree, hint, "完成", dialog, "执行")
@@ -709,6 +747,9 @@ def _build_frame_chain(tree, physics):
       * O = 开设置面板、B = 开背包面板 —— **都勾了『置顶』**,所以
         开一块就自动收起互斥组(『侧栏面板』)里的另一块;
       * C = 两块都收起来。
+      * M = 弹『模态框』(第一百零五轮)—— 它勾了『挡住点击』+
+        『点外面关掉』,所以点它盖住的那块地方不会"隔山打牛"到按钮,
+        点它外面它自己收起来。
     """
     setter = _add(tree, "GKNodeUiSet", "血条半透明", 260.0, -320.0,
                   gk_widget="血条", gk_set_alpha=True, gk_alpha=0.6)
@@ -727,6 +768,8 @@ def _build_frame_chain(tree, physics):
 
     open_panel("O", "设置面板", -640.0)
     open_panel("B", "背包面板", -900.0)
+    # 第一百零五轮:模态框(挡住点击 + 点外面关)
+    open_panel("M", "模态框", -1450.0)
 
     key_c = _add(tree, "GKNodeKey", "C 键", 520.0, -1160.0,
                  gk_key="C", gk_trigger="JUST")
