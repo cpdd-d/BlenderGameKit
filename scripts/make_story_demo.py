@@ -36,7 +36,8 @@
   `玩家.001`,而图里的弹簧臂 / 触发过滤都是按名字找对象的(踩过)。
 
 按键:WASD 走 / 空格 跳 / 鼠标转视角 / 滚轮 缩放 / **C 第一人称 · V 第三人称** /
-**F 手电开关键** / 大堂里走钥匙、走大门 / 走廊里钻柜子 / 结局按 **1 或 2**。
+**F 手电开关键** / **Esc 暂停** / **Alt 呼出鼠标** / 大堂里走钥匙、走大门 /
+走廊里钻柜子(真潜行)/ 结局按 **1 或 2**。
 (鼠标被锁定,先点一下游戏窗口再按。)
 
 跑法(Godot):打开 `恐怖闯关示例_godot` 直接 F5(主场景 = 大堂)。
@@ -106,7 +107,6 @@ CABINET_B = "柜子乙"
 CORRIDOR_END = "走廊尽头"
 AI_TREE_NAME = "怪物AI"
 PATROL_STATE = "巡逻"
-HIDE_STATE = "躲藏着"        # 一个**不存在**的状态名 —— 见"躲藏"那段注释
 AI_STATE_VAR = "ai_state"    # 和『AI_启用』的『状态变量名』一致
 CHOICE_VAR = "走廊选择"
 
@@ -336,9 +336,14 @@ def build_lobby(scene):
                 (math.radians(90.0), 0.0, 0.0), scene)
     scene.camera = bpy.data.objects[CAM3_LOBBY]
     # 手电筒:聚光灯,运行时每帧对齐相机(手电筒的手感)—— 开局关着(见逻辑图)
-    make_light(TORCH, "SPOT", (0.0, -8.0, 1.6), 1400.0, (1.0, 0.96, 0.85),
-               scene, rotation=(math.radians(80.0), 0.0, 0.0),
-               spot_size=math.radians(46.0))
+    # ── bug5:用户说"看不到光",除了不知道按 F(按键提示已补),灯本身也得够:
+    #   能量调大(2400W≈Godot 2.4)、锥角放宽到 76°、显式给 24m 范围
+    #   (不填的话 Godot 默认 spot_range 只有 10m,照不了多远)。
+    torch_light = make_light(TORCH, "SPOT", (0.0, -8.0, 1.6), 2400.0,
+                             (1.0, 0.96, 0.85), scene,
+                             rotation=(math.radians(80.0), 0.0, 0.0),
+                             spot_size=math.radians(76.0))
+    torch_light.data.cutoff_distance = 24.0
     make_light("大堂吊灯", "POINT", (0.0, 0.0, 5.0), 120.0, (0.85, 0.80, 0.62),
                scene, cutoff=16.0)
     log(f"{LOBBY}:地面 + 四壁 + 3 根柱子 + {DOOR_PANEL} + {DOOR_AREA} + "
@@ -372,10 +377,19 @@ def build_corridor():
         make_box(name, (0.5, 0.5, 2.0), (x, 0.0, 1.0),
                  (0.25, 0.30, 0.28, 1.0), scene=scene)
     # 2 个"柜子":躲藏区(区域 + 看得见的柜体)
-    make_box(CABINET_A, (2.0, 2.0, 3.2), (-4.0, 5.2, 1.6),
-             (0.28, 0.22, 0.18, 1.0), scene=scene)
-    make_box(CABINET_B, (2.0, 2.0, 3.2), (6.0, -5.2, 1.6),
-             (0.28, 0.22, 0.18, 1.0), scene=scene)
+    # ── 真潜行(第一百零九轮)─────────────────────────────────────
+    # 柜子触发区勾『躲藏区』:导出后那个 Area 挂进 Godot group
+    # `gk_hide_spot`,怪物的『看见』判定(`_gk_ai_can_see_3d`)会先扫这个组
+    # —— 玩家和躲藏区重叠就判看不见(哪怕正对、够近)。以前只能把 AI 状态
+    # 冻成不存在的名字,现在这是真能力。
+    cab_a = make_box(CABINET_A, (2.0, 2.0, 3.2), (-4.0, 5.2, 1.6),
+                     (0.28, 0.22, 0.18, 1.0), scene=scene)
+    cab_b = make_box(CABINET_B, (2.0, 2.0, 3.2), (6.0, -5.2, 1.6),
+                     (0.28, 0.22, 0.18, 1.0), scene=scene)
+    for cab in (cab_a, cab_b):
+        cab_physics = getattr(cab, "gk_physics", None)
+        if cab_physics is not None:
+            cab_physics.is_hide_spot = True
     make_camera(CAM3_CORRIDOR, (0.0, -20.0, 5.5),
                 (math.radians(72.0), 0.0, 0.0), scene)
     make_camera(CAM1_CORRIDOR, (0.0, -10.0, 1.6),
@@ -503,8 +517,16 @@ def build_ai_tree(player_name):
                 gk_speed=INVESTIGATE_SPEED, gk_stop_distance=1.0,
                 gk_facing="MOVE")
     start = _add(tree, "GKNodeAiStart", "AI开始", -520.0, 0.0)
+    # ── 真潜行(第一百零九轮):『看见』走『AI_看得见』(PIN),而不是转场里
+    #   那个『看见目标』快捷(SEE)。两者的区别:快捷只看距离;『AI_看得见』
+    #   生成的 `_gk_ai_can_see_3d` 会先扫 `gk_hide_spot` 组 —— 玩家在柜子里
+    #   就判看不见。视野角填 0 = 只看距离(和原来的 SEE 一样),只多躲藏判定,
+    #   老玩法"凑到正前方就追"一字不变。
+    eye = _add(tree, "GKNodeAiSee", "看见玩家(潜行)", 100.0, 380.0,
+               gk_goal=player_name, gk_distance=SIGHT, gk_angle=0.0)
     see = _add(tree, "GKNodeAiTransition", "看见玩家", 300.0, 200.0,
-               gk_cond_source="SEE", gk_goal=player_name, gk_sight=SIGHT)
+               gk_cond_source="PIN")
+    _link(tree, eye, "看得见", see, "条件")
     back = _add(tree, "GKNodeAiTransition", "丢失玩家", 300.0, -220.0,
                 gk_cond_source="LOST", gk_goal=player_name, gk_sight=LOST_RANGE)
     calm = _add(tree, "GKNodeAiTransition", "安静下来", 980.0, 220.0,
@@ -559,6 +581,40 @@ def _make_first_person(logic, cam_first):
     log(f"第一/三人称:C→{cam_first}(第一人称) ;改写了 {changed} 根杆子")
 
 
+def _wire_first_person_model(logic, cam_first, cam_third):
+    """第一人称时把角色自己的网格藏掉,第三人称再显示回来。
+
+    ── 为什么会有"看到自己身体"的 bug ─────────────────────────────
+    角色是预设生成的 CharacterBody3D,下面挂着一个 `Model` 子节点(角色的
+    网格)。第一人称把相机贴到头上的枢轴,相机就**落在网格内部**—— 画面
+    里全是自己盒子的内壁 / 面。所以切到第一人称那一帧要把 `Model` 藏掉,
+    切回第三人称再显示。
+
+    做法:挂在预设那两台 `相机_切换` 节点(已被 `_make_first_person` 改名成
+    『切到第一人称』/『切到第三人称』)的『完成』后面 —— C 藏、V 显。
+    不每帧读"当前相机是谁":切换那一刻就知道结果,少一条每帧开销。
+    """
+    for node in logic.nodes:
+        if getattr(node, "bl_idname", "") != "GKNodeCameraSetCurrent":
+            continue
+        target = str(getattr(node, "gk_target", "") or "")
+        # ⚠ gk_target 填 "Model" 会被生成器按**全局名字**找:场景里门板 /
+        #   柜子也有各自的 Model 子节点,全局找会拿到**第一个** Model(不是
+        #   角色的)。填 "./Model" = 显式"自己脚下的 Model" —— 全局按名
+        #   找不到 "./Model",生成器退回 `_gk_ref` 的相对路径查找,正好命中
+        #   脚本所在角色自己的网格(真 Godot 探针踩出来的)。
+        if target == cam_first:
+            hide = _add(logic, "GKNodeSetVisible", "藏自身模型",
+                        node.location[0] + 320.0, node.location[1],
+                        gk_target="./Model", gk_visible=False)
+            _link(logic, node, "完成", hide, "执行")
+        elif target == cam_third:
+            show = _add(logic, "GKNodeSetVisible", "显自身模型",
+                        node.location[0] + 320.0, node.location[1] + 120.0,
+                        gk_target="./Model", gk_visible=True)
+            _link(logic, node, "完成", show, "执行")
+
+
 def build_character(logic_scene, player, logic_name, class_name, cam_third,
                     cam_first):
     """用『角色预设』生成"跑得起来"的角色图(WASD / 空格 / 鼠标 / 滚轮 / C·V)。
@@ -580,6 +636,7 @@ def build_character(logic_scene, player, logic_name, class_name, cam_third,
     for note in notes:
         log(f"预设({logic_name}): {note}")
     _make_first_person(logic, cam_first)
+    _wire_first_person_model(logic, cam_first, cam_third)
     ready = None
     for node in logic.nodes:
         if node.bl_idname == "GKNodeOnReady":
@@ -641,6 +698,16 @@ def build_hud(logic, chapter, goal, keys=False, battery=False, hint=False):
         _link(logic, tail, "完成", hint_text, "执行")
         tail = hint_text
         handles["hint"] = hint_text.name
+    # ── 按键提示(第六轮 bug3):一行字让玩家知道有哪些键 ──────────────
+    # 挂在常驻 HUD 里、章节卡之前 —— 第一帧就出现,不用等 3 秒章节卡;
+    # 三关都有(这是"知道按哪个键"的落点,解决 bug2/5 的"不知道按 F / Esc")。
+    keyhint = _add(logic, "GKNodeUiText", "按键提示", 540.0, 1500.0,
+                   gk_text="WASD 移动 · 鼠标视角 · C/V 视角 · F 手电 · Esc 暂停 · Alt 呼出鼠标",
+                   gk_align="BOTTOM_CENTER", gk_margin=8.0, gk_size=16,
+                   gk_color=(0.85, 0.88, 0.95, 0.9))
+    _link(logic, tail, "完成", keyhint, "执行")
+    tail = keyhint
+    handles["keyhint"] = keyhint.name
     # 章节卡排链尾:亮 3 秒 → 淡出(生成的 await 也就落在最后一句)
     card = _add(logic, "GKNodeUiText", "章节卡", 660.0, 1500.0,
                 gk_text=chapter, gk_align="CENTER", gk_size=40,
@@ -654,8 +721,111 @@ def build_hud(logic, chapter, goal, keys=False, battery=False, hint=False):
     _link(logic, hold, "完成", fade, "执行")
     log(f"HUD『{chapter}』:{goal}"
         f"{' + 钥匙数' if keys else ''}{' + 电量' if battery else ''}"
-        f"{' + 提示' if hint else ''} + 章节卡")
+        f"{' + 提示' if hint else ''} + 按键提示 + 章节卡")
     return head, handles
+
+
+# ==========================================================================
+# 三关共用的两块:暂停菜单 + Alt 呼出鼠标
+# ==========================================================================
+def build_pause_menu(logic, y=1700.0):
+    """三关共用的暂停菜单(Esc 开关):继续 / 设置 / 退出。
+
+    照 demo_ui 的暂停菜单搭(『界面_面板』居中开局藏 + 按钮挂它下面 +
+    『界面_暂停游戏』勾 Esc 热键)。**一处定义、三关复用**,像 build_hud。
+
+    ── 为什么按钮在暂停时点得动 ──────────────────────────────────
+    `get_tree().paused = true` 之后按钮的 `pressed` 照样触发(GUI 输入是
+    视口在收),所以普通『界面_按钮』就能做继续 / 退出,不用改 process_mode。
+
+    返回 (面板头节点, 热键节点):面板这条链(建控件 + 热键)由调用方接到
+    『每当_准备』;热键是这条链的**尾**,第二 / 三关再把它接到"开局选单态"
+    (暂停世界 + 放鼠标,供开场对话点选)前面 —— 顺序是:先建菜单、再挂
+    Esc 热键、再暂停(照 demo_ui"暂停热键在前、选单态在后")。
+    """
+    menu = _add(logic, "GKNodeUiPanel", "暂停菜单", -200.0, y,
+                gk_width=320.0, gk_height=250.0, gk_radius=18,
+                gk_align="CENTER", gk_start_hidden=True, gk_focus_first=True,
+                gk_color=(0.05, 0.06, 0.09, 0.90))
+    title = _add(logic, "GKNodeUiText", "暂停标题", 40.0, y,
+                 gk_text="已暂停", gk_size=26, gk_align="TOP_CENTER",
+                 gk_margin=18.0, gk_parent_widget="暂停菜单")
+    resume_btn = _add(logic, "GKNodeUiButton", "继续按钮", 280.0, y,
+                      gk_text="继续游戏", gk_x=90.0, gk_y=72.0,
+                      gk_width=140.0, gk_height=42.0, gk_parent_widget="暂停菜单")
+    settings_btn = _add(logic, "GKNodeUiButton", "设置按钮", 280.0, y - 200.0,
+                        gk_text="设置", gk_x=90.0, gk_y=120.0,
+                        gk_width=140.0, gk_height=42.0,
+                        gk_parent_widget="暂停菜单")
+    quit_btn = _add(logic, "GKNodeUiButton", "退出按钮", 280.0, y - 400.0,
+                    gk_text="退出游戏", gk_x=90.0, gk_y=168.0,
+                    gk_width=140.0, gk_height=42.0, gk_parent_widget="暂停菜单")
+    # 设置:点一下把"按键说明"显出来(占位做法 —— 继续 / 退出才是硬功能)
+    settings_hint = _add(logic, "GKNodeUiText", "设置说明", 520.0, y - 200.0,
+                         gk_text="WASD 移动 · C/V 视角 · F 手电 · Esc 暂停 · Alt 鼠标",
+                         gk_size=14, gk_align="CENTER", gk_margin=180.0,
+                         gk_parent_widget="暂停菜单")
+    hide_settings = _add(logic, "GKNodeUiHide", "开局藏设置说明", 760.0, y - 260.0,
+                         gk_widget="设置说明", gk_visible=False)
+    show_settings = _add(logic, "GKNodeUiHide", "显示设置说明", 760.0, y - 140.0,
+                         gk_widget="设置说明", gk_visible=True)
+    # 建控件的链:面板 → 标题 → 继续 → 设置 → 退出 → 设置说明 → 藏起来
+    _link(logic, menu, "完成", title, "执行")
+    _link(logic, title, "完成", resume_btn, "执行")
+    _link(logic, resume_btn, "完成", settings_btn, "执行")
+    _link(logic, settings_btn, "完成", quit_btn, "执行")
+    _link(logic, quit_btn, "完成", settings_hint, "执行")
+    _link(logic, settings_hint, "完成", hide_settings, "执行")
+    # 按钮行为:继续 → 解除暂停;退出 → 解除暂停 + 退出游戏
+    resume_act = _add(logic, "GKNodeUiPauseGame", "继续游戏", 520.0, y - 520.0,
+                      gk_pause=False, gk_menu="暂停菜单", gk_hotkey=False)
+    quit_unpause = _add(logic, "GKNodeUiPauseGame", "退出前解除暂停", 520.0,
+                        y - 720.0, gk_pause=False, gk_menu="暂停菜单",
+                        gk_hotkey=False)
+    quit_game = _add(logic, "GKNodeQuitGame", "退出游戏", 760.0, y - 720.0)
+    _link(logic, resume_btn, "点击", resume_act, "执行")
+    _link(logic, settings_btn, "点击", show_settings, "执行")
+    _link(logic, quit_btn, "点击", quit_unpause, "执行")
+    _link(logic, quit_unpause, "完成", quit_game, "执行")
+    # Esc 热键(开/关型;准备时它会调一次"取消暂停",所以要在"选单态"之前)
+    hotkey = _add(logic, "GKNodeUiPauseGame", "暂停热键", -200.0, y + 80.0,
+                  gk_pause=False, gk_menu="暂停菜单", gk_hotkey=True)
+    _link(logic, hide_settings, "完成", hotkey, "执行")
+    log("暂停菜单:Esc 开关 / 继续 / 设置(按键说明) / 退出")
+    return menu, hotkey
+
+
+def build_alt_mouse(logic):
+    """每关物理帧:按住 Alt 鼠标可见、松开锁回(不暂停世界,方便点 HUD)。
+
+    读 Alt(『输入_按键』按住)→ 分支:按住走『鼠标_模式』VISIBLE、
+    没按走 CAPTURED。挂在角色预设那台『每当_物理帧』后面 —— 暂停时
+    物理帧不跑,不会和暂停菜单的鼠标互抢。
+    """
+    physics = None
+    for node in logic.nodes:
+        if node.bl_idname == "GKNodeOnPhysicsProcess" and node.name == "每当_物理帧":
+            physics = node
+            break
+    if physics is None:
+        for node in logic.nodes:
+            if node.bl_idname == "GKNodeOnPhysicsProcess":
+                physics = node
+                break
+    if physics is None:
+        return
+    alt = _add(logic, "GKNodeKey", "按Alt", -1200.0, -3400.0,
+               gk_key="LEFT_ALT", gk_trigger="PRESSED")
+    branch = _add(logic, "GKNodeBranch", "Alt分支", -950.0, -3400.0)
+    show_mouse = _add(logic, "GKNodeMouseMode", "Alt显鼠标", -700.0, -3300.0,
+                      gk_mode="VISIBLE")
+    lock_mouse = _add(logic, "GKNodeMouseMode", "Alt锁鼠标", -700.0, -3500.0,
+                      gk_mode="CAPTURED")
+    _link(logic, physics, "执行", branch, "执行")
+    _link(logic, alt, "结果", branch, "条件")
+    _link(logic, branch, "是", show_mouse, "执行")
+    _link(logic, branch, "否", lock_mouse, "执行")
+    log("Alt 呼出鼠标:按住 Alt 鼠标可见、松开锁回(挂物理帧)")
 
 
 # ==========================================================================
@@ -824,6 +994,10 @@ def build_lobby_logic(scene, player, player_name, cam_third, cam_first):
 
     # HUD 头节点最后接 ready(它的 await 不能挡前面几句)
     _link(logic, ready, "执行", hud_head, "执行")
+    # 三关共用的暂停菜单(Esc)+ Alt 呼出鼠标
+    pause_head, _pause_hotkey = build_pause_menu(logic, y=1700.0)
+    _link(logic, ready, "执行", pause_head, "执行")
+    build_alt_mouse(logic)
     log(f"{LOBBY}逻辑:章节/HUD + 手电(F/电量) + 钥匙拾取 + 大门升起 -> "
         f"切 {CORRIDOR_RES} + 存档 story")
     return logic
@@ -839,6 +1013,8 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
                                    "StoryCorridorPlayer", cam_third, cam_first)
     hud_head, hud = build_hud(logic, "第二章:走廊",
                               "目标:穿过走廊,别被它看见", hint=True)
+    # 三关共用的暂停菜单:这里多拿一个『热键』节点,接到"开局选单态"前面
+    pause_head, pause_hotkey = build_pause_menu(logic, y=1700.0)
 
     # 开局:启动 AI + 自动存档
     enable = _add(logic, "GKNodeAiEnable", "启动怪物AI", -900.0, 700.0,
@@ -850,8 +1026,12 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
     _link(logic, ready, "执行", save, "执行")
 
     # ---- 开场:旁白 + 主角两句 + 剧情选择 ----
-    # ⚠ 对话框是**阻塞**的(await 等玩家点),所以这一串的 Y 排在 HUD 之后
-    #   (1900),它是最后一段 —— 让章节卡先播 3 秒、再弹对话。
+    # ⚠ 对话框是**阻塞**的(await 等玩家点)。开场先把世界暂停 + 鼠标放出
+    #   (『开局选单态』,照 demo_ui):不然玩家鼠标还是 CAPTURED 锁着,点不到
+    #   选择按钮;选完再继续世界 + 锁回鼠标(见下面『合流函数』)。
+    startup = _add(logic, "GKNodeUiPauseGame", "开局选单态", -540.0, 1900.0,
+                   gk_pause=True, gk_show_mouse=True, gk_menu="",
+                   gk_hotkey=False)
     d1 = _add(logic, "GKNodeUiDialog", "旁白", -300.0, 1900.0,
               gk_speaker="", gk_text="走廊很长,灯全灭了。", gk_speed=24.0)
     d2 = _add(logic, "GKNodeUiDialog", "主角1", -60.0, 1900.0,
@@ -861,7 +1041,10 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
     choice = _add(logic, "GKNodeUiChoice", "走廊选择", 420.0, 1900.0,
                   gk_question="怎么办?", gk_option_count=2,
                   gk_options="往前跑|先躲一下", gk_speed=24.0)
-    _link(logic, ready, "执行", d1, "执行")
+    # 暂停菜单的热键 → 选单态 → 对话(热键由 build_pause_menu 返回,顺序讲究:
+    # 热键是"开/关"型,准备时会先调一次"取消暂停",必须排在"选单态"之前)
+    _link(logic, pause_hotkey, "完成", startup, "执行")
+    _link(logic, startup, "完成", d1, "执行")
     _link(logic, d1, "完成", d2, "执行")
     _link(logic, d2, "完成", d3, "执行")
     _link(logic, d3, "完成", choice, "执行")
@@ -880,7 +1063,15 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
                       gk_func_name="走廊合流")
     shared = _add(logic, "GKNodeUiSubtitle", "合流字幕", 180.0, 1300.0,
                   gk_text="穿过走廊 —— 别被它看见。", gk_seconds=3.0)
+    # 选完之后:继续世界 + 把鼠标锁回去(开场"选单态"的反向操作)
+    resume = _add(logic, "GKNodeUiPauseGame", "选完恢复", 420.0, 1300.0,
+                  gk_pause=False, gk_show_mouse=True, gk_menu="",
+                  gk_hotkey=False)
+    lock_mouse = _add(logic, "GKNodeMouseMode", "锁回鼠标", 660.0, 1300.0,
+                      gk_mode="CAPTURED")
     _link(logic, merge_head, "执行", shared, "执行")
+    _link(logic, shared, "完成", resume, "执行")
+    _link(logic, resume, "完成", lock_mouse, "执行")
 
     for number, pin, label in ((1, "选项1", "往前跑"), (2, "选项2", "先躲一下")):
         row = 1600.0 - number * 220.0
@@ -930,47 +1121,32 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
     _link(logic, cool, "可以", scare, "执行")
 
     # ---- 躲藏(2 个柜子)----
-    # ── 这是**近似**做法,插件没有"潜行 / 玩家隐藏"设施 ────────────────
-    # 钻进柜子 → 把 AI 的**状态变量**设成一个**不存在的状态名**(『躲藏着』):
-    # 生成的 `if ai_state == "巡逻" / "追击" / "去查看"` 一条都不成立,行为
-    # 和转场全不跑 → 等于把这台 AI **冻住**(这就借用"AI 停用一段时间"的
-    # 效果);同时暗角加深、HUD 提示"屏住呼吸…"。
-    # 离开柜子 → 把状态写回『巡逻』,AI 恢复。
-    # ⚠ 它不是真潜行:冻结期间玩家若站在怪物正前方,一出柜子它照样会看见 ——
-    #   插件的 AI 没有"看不见躲藏的玩家"这个概念,只能做到这个程度。
+    # ── 真潜行(第一百零九轮)────────────────────────────────────────
+    # 柜子触发区已经勾了『躲藏区』(见 build_corridor),怪物的『看见』判定
+    # 会自动跳过躲在里面的玩家 —— **不用再把 AI 状态冻成不存在的名字**。
+    # 这里只留"钻柜 / 出柜"的氛围:暗角加深 + HUD 提示"屏住呼吸…"、
+    # 出柜恢复。看不见这件事由 `gk_hide_spot` 那套真能力负责。
     for index, cab in enumerate(cabinets):
         row = -2400.0 - index * 500.0
         entered = _add(logic, "GKNodeOnAreaEntered", f"躲进{cab}", -900.0, row,
                        gk_area=cab, gk_filter=player_name)
-        hide_state = _add(logic, "GKNodeConstText", f"躲藏状态{index + 1}",
-                          -660.0, row - 120.0, gk_value=HIDE_STATE)
-        freeze = _add(logic, "GKNodeSetVar", f"冻结AI{index + 1}", -660.0, row,
-                      gk_var_name=AI_STATE_VAR)
         vig_in = _add(logic, "GKNodeScreenVignette", f"暗角加深{index + 1}",
-                      -420.0, row, gk_amount=0.82, gk_radius=0.42,
+                      -660.0, row, gk_amount=0.82, gk_radius=0.42,
                       gk_edge=0.5, gk_fade=0.4)
         hint_in = _add(logic, "GKNodeUiSet", f"屏息提示{index + 1}",
-                       -180.0, row, gk_widget=hud["hint"], gk_set_text=True,
+                       -420.0, row, gk_widget=hud["hint"], gk_set_text=True,
                        gk_text="屏住呼吸…")
-        _link(logic, hide_state, "值", freeze, "值")
-        _link(logic, entered, "执行", freeze, "执行")
-        _link(logic, freeze, "完成", vig_in, "执行")
+        _link(logic, entered, "执行", vig_in, "执行")
         _link(logic, vig_in, "完成", hint_in, "执行")
 
         left = _add(logic, "GKNodeOnAreaExited", f"离开{cab}", 300.0, row,
                     gk_area=cab, gk_filter=player_name)
-        back_state = _add(logic, "GKNodeConstText", f"巡逻状态{index + 1}",
-                          540.0, row - 120.0, gk_value=PATROL_STATE)
-        resume = _add(logic, "GKNodeSetVar", f"恢复AI{index + 1}", 540.0, row,
-                      gk_var_name=AI_STATE_VAR)
         vig_out = _add(logic, "GKNodeScreenVignette", f"暗角复原{index + 1}",
-                       780.0, row, gk_amount=0.45, gk_radius=0.60,
+                       540.0, row, gk_amount=0.45, gk_radius=0.60,
                        gk_edge=0.40, gk_fade=0.4)
-        hint_out = _add(logic, "GKNodeUiSet", f"清提示{index + 1}", 1020.0, row,
+        hint_out = _add(logic, "GKNodeUiSet", f"清提示{index + 1}", 780.0, row,
                         gk_widget=hud["hint"], gk_set_text=True, gk_text="")
-        _link(logic, back_state, "值", resume, "值")
-        _link(logic, left, "执行", resume, "执行")
-        _link(logic, resume, "完成", vig_out, "执行")
+        _link(logic, left, "执行", vig_out, "执行")
         _link(logic, vig_out, "完成", hint_out, "执行")
 
     # ---- 走到尽头 → 切到结局 ----
@@ -981,6 +1157,9 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
     _link(logic, end, "执行", change, "执行")
 
     _link(logic, ready, "执行", hud_head, "执行")
+    # 暂停菜单头节点接 ready(Y=1700,排在 HUD 之后);Alt 呼出鼠标挂物理帧
+    _link(logic, ready, "执行", pause_head, "执行")
+    build_alt_mouse(logic)
     log(f"{CORRIDOR}逻辑:章节/HUD + AI(3 巡逻点) + 心跳/惊吓 + 躲藏 x2 + "
         f"开场对话/选择(合流函数)-> 切 {ENDING_RES}")
     return logic
@@ -994,11 +1173,17 @@ def build_ending_logic(scene, player, cam_third, cam_first):
     logic, ready = build_character(scene, player, "结局逻辑", "StoryEndingPlayer",
                                    cam_third, cam_first)
     hud_head, _hud = build_hud(logic, "终章:抉择", "目标:做出你的选择")
+    # 三关共用的暂停菜单;热键接到"开局选单态"前面(和走廊同一个顺序讲究)
+    pause_head, pause_hotkey = build_pause_menu(logic, y=1700.0)
 
     vig = _add(logic, "GKNodeScreenVignette", "结局暗角", -900.0, 800.0,
                gk_amount=0.60, gk_radius=0.50, gk_edge=0.35)
     _link(logic, ready, "执行", vig, "执行")
 
+    # 开场:暂停世界 + 放鼠标(不然结局选择点不到),选完再继续 + 锁回
+    startup = _add(logic, "GKNodeUiPauseGame", "开局选单态", -540.0, 1900.0,
+                   gk_pause=True, gk_show_mouse=True, gk_menu="",
+                   gk_hotkey=False)
     d1 = _add(logic, "GKNodeUiDialog", "旁白", -300.0, 1900.0,
               gk_speaker="", gk_text="出口就在前面。", gk_speed=24.0)
     d2 = _add(logic, "GKNodeUiDialog", "主角", -60.0, 1900.0,
@@ -1006,15 +1191,21 @@ def build_ending_logic(scene, player, cam_third, cam_first):
     choice = _add(logic, "GKNodeUiChoice", "结局选择", 180.0, 1900.0,
                   gk_question="你要怎么做?", gk_option_count=2,
                   gk_options="回头救她|独自逃出去", gk_speed=24.0)
-    _link(logic, ready, "执行", d1, "执行")
+    _link(logic, pause_hotkey, "完成", startup, "执行")
+    _link(logic, startup, "完成", d1, "执行")
     _link(logic, d1, "完成", d2, "执行")
     _link(logic, d2, "完成", choice, "执行")
 
-    # 两个结局:各走各的链(存档 story_end + 记「结局」键 → 大字 → 总线淡出
-    # → 停留 → 回大堂,形成闭环)。
+    # 两个结局:每个选项先"继续世界 + 锁回鼠标",再走各自结局链(存档
+    # story_end + 记「结局」键 → 大字 → 总线淡出 → 停留 → 回大堂闭环)。
     endings = ((1, "选项1", "回头救她"), (2, "选项2", "独自逃出去"))
     for number, pin, label in endings:
         row = 1600.0 - number * 320.0
+        resume = _add(logic, "GKNodeUiPauseGame", f"选完恢复{number}",
+                      420.0, row - 140.0, gk_pause=False, gk_show_mouse=True,
+                      gk_menu="", gk_hotkey=False)
+        lock_mouse = _add(logic, "GKNodeMouseMode", f"锁回鼠标{number}",
+                          420.0, row + 20.0, gk_mode="CAPTURED")
         value = _add(logic, "GKNodeConstFloat", f"结局值{number}", 420.0, row,
                      gk_value=float(number))
         set_end = _add(logic, "GKNodeSetVar", f"记结局{number}", 660.0, row,
@@ -1034,7 +1225,9 @@ def build_ending_logic(scene, player, cam_third, cam_first):
                     gk_scene_path=LOBBY_RES)
         _link(logic, value, "值", set_end, "值")
         _link(logic, value, "值", write, "值")
-        _link(logic, choice, pin, set_end, "执行")
+        _link(logic, choice, pin, resume, "执行")
+        _link(logic, resume, "完成", lock_mouse, "执行")
+        _link(logic, lock_mouse, "完成", set_end, "执行")
         _link(logic, set_end, "完成", write, "执行")
         _link(logic, write, "完成", save, "执行")
         _link(logic, save, "完成", text, "执行")
@@ -1043,6 +1236,8 @@ def build_ending_logic(scene, player, cam_third, cam_first):
         _link(logic, wait, "完成", back, "执行")
 
     _link(logic, ready, "执行", hud_head, "执行")
+    _link(logic, ready, "执行", pause_head, "执行")
+    build_alt_mouse(logic)
     log(f"{ENDING}逻辑:章节/HUD + 旁白/结局选择(2 结局:存档 story_end + "
         f"「结局」键 + 大字 + BGM 淡出)-> 回 {LOBBY_RES}")
     return logic
@@ -1207,7 +1402,8 @@ def main():
     log(f"已保存 {BLEND_PATH}")
     log(f"工程目录: {directory}")
     log("按键:WASD 走 / 空格 跳 / 鼠标转视角 / 滚轮 缩放 / "
-        "C 第一人称 · V 第三人称 / F 手电 / 结局按 1 或 2")
+        "C 第一人称 · V 第三人称 / F 手电 / Esc 暂停 / Alt 呼出鼠标 / "
+        "结局按 1 或 2")
     return 0
 
 

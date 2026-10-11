@@ -6465,6 +6465,55 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零九轮:真潜行(躲藏区)—— 敌人看不见躲藏区里的玩家 ----
+    # 真 Blender 才能验的:①『躲藏区』属性真的物化出来了(不在 annotations 里
+    # 的话 `obj.gk_physics.is_hide_spot` 直接 AttributeError);② `hide_spot_
+    # group_header` 勾了才出 `groups=["gk_hide_spot"]`、不勾空串(老场景不变);
+    # ③ codegen 生成的『看见』helper 真的带上了躲藏区检查(离线已验,这里再
+    # 用真 Blender 的 codegen 走一遍)。**行为**(躲进柜子 AI 就看不见)由
+    # demo_story 的端到端探针在真 Godot 里验。
+    try:
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        r109_box = bpy.context.active_object
+        r109_box.name = "躲藏区探针柜"
+        r109_phys = r109_box.gk_physics
+        check("第一百零九轮:物体有『躲藏区』属性",
+              hasattr(r109_phys, "is_hide_spot"))
+        check("第一百零九轮:默认不勾(老场景行为不变)",
+              not r109_phys.is_hide_spot
+              and asset_export.hide_spot_group_header(r109_phys) == "")
+
+        r109_phys.is_hide_spot = True
+        check("第一百零九轮:勾了 -> 节点头带躲藏组",
+              asset_export.hide_spot_group_header(r109_phys)
+              == ' groups=["gk_hide_spot"]',
+              repr(asset_export.hide_spot_group_header(r109_phys)))
+        bpy.data.objects.remove(r109_box, do_unlink=True)
+
+        # ③ 真 Blender 的 codegen:『看见』helper 带躲藏检查
+        r109_tree = bpy.data.node_groups.new("躲藏冒烟109", "GKGameLogicTree")
+        r109_ready = r109_tree.nodes.new("GKNodeOnReady")
+        r109_see = r109_tree.nodes.new("GKNodeAiSee")
+        r109_see.gk_goal = "玩家"
+        r109_branch = r109_tree.nodes.new("GKNodeBranch")
+        r109_print = r109_tree.nodes.new("GKNodePrint")
+        r109_tree.links.new(r109_ready.outputs["执行"],
+                            r109_branch.inputs["执行"])
+        r109_tree.links.new(r109_see.outputs["看得见"],
+                            r109_branch.inputs["条件"])
+        r109_tree.links.new(r109_branch.outputs["是"], r109_print.inputs["执行"])
+        r109_code, r109_warn = codegen.generate(r109_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+        })
+        check("第一百零九轮:『看见』helper 带躲藏区检查",
+              'get_nodes_in_group("gk_hide_spot")' in r109_code
+              and "_hide is Area3D and target is PhysicsBody3D" in r109_code
+              and not r109_warn, str(r109_warn)[:200])
+        bpy.data.node_groups.remove(r109_tree)
+    except Exception as exc:
+        check("第一百零九轮(真潜行)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

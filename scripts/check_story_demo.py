@@ -17,13 +17,15 @@
 用**出码文本**验(见 `_code_checks`)。
 
 断言(全是"现象",不是"代码长什么样"):
-  * 关卡 1 大堂:章节卡 + HUD(目标 / 钥匙数 / 电量 / 提示)建出来;
-    **C → 第一人称机位 / V → 第三人称机位**;走进钥匙触发区 -> 钥匙数 = 1、
-    钥匙物体隐掉、目标文字改了;F 开手电(SpotLight 亮 + 掉电)、再按 F 关;
+  * 关卡 1 大堂:章节卡 + HUD(目标 / 钥匙数 / 电量 / 提示 / 按键提示)建出来;
+    **C → 第一人称机位(自身模型藏掉)/ V → 第三人称机位(模型显回来)**;
+    走进钥匙触发区 -> 钥匙数 = 1、钥匙物体隐掉、目标文字改了;
+    F 开手电(SpotLight 亮 + 掉电)、再按 F 关;**Esc 暂停 + 点继续解冻**;
     走进大门区域 -> 大门链真的跑了(时间轴开始 + 门板在升起);
-  * 关卡 2 走廊:开场对话 / 剧情选择弹出来;AI 在巡逻;钻柜子 -> 冻结成
-    『躲藏着』+ 提示『屏住呼吸…』+ 暗角变深,出来恢复;凑到怪物正前方近处 ->
-    转追击 + 紧张度上去 + 心跳播放器在响 + 贴身惊吓(相机在震);
+  * 关卡 2 走廊:开场对话 / 剧情选择弹出来;AI 在巡逻;钻柜子 -> 提示
+    『屏住呼吸…』+ 暗角变深、**AI 状态仍是巡逻(不再冻结)**、出来恢复;
+    **真潜行:玩家在柜子里、怪物贴在正前方也看不见(仍巡逻),挪出柜子才追击**;
+    凑到怪物正前方近处 -> 转追击 + 紧张度上去 + 心跳在响 + 贴身惊吓;
   * 关卡 3 结局:选择框弹出 -> 按 1 -> 存档落盘(user://)+ 结局大字显示。
 """
 
@@ -78,6 +80,13 @@ var hide_vig := -1.0
 var heard := false
 var max_shake := 0.0
 var advance_at := 0.0
+# 第一人称藏模型 / 真潜行 / 暂停菜单 三项新断言的采样值
+var fp_model := false
+var tp_model := true
+var pause_on := false
+var resume_ok := false
+var hide_see_in := ""
+var hide_see_out := ""
 
 
 func _ready() -> void:
@@ -165,6 +174,23 @@ func _cam_name() -> String:
 	return String(cam.name) if cam != null else "<无>"
 
 
+func _model_visible() -> bool:
+	# 角色网格是玩家节点下的 Model 子节点(导出时生成的角色自带网格)。
+	# 第一人称要把它藏掉,否则相机贴头会看到自己身体的面。
+	if player == null:
+		return false
+	var m := player.find_child("Model", true, false)
+	return m != null and m.visible
+
+
+func _click_widget(name: String) -> void:
+	# 直接发按钮的 pressed 信号:暂停时 GUI 点击照常触发(见生成脚本注释),
+	# 这里不用真的把鼠标挪过去点。
+	var node := _widget(name)
+	if node is BaseButton:
+		(node as BaseButton).pressed.emit()
+
+
 func _physics_process(delta: float) -> void:
 	t += delta
 	match step:
@@ -182,6 +208,9 @@ func _physics_process(delta: float) -> void:
 					" battery=", _text("电量文本"),
 					" hint=", _text("提示文本"),
 					" card=", _text("章节卡"))
+				var keyhint_node := _widget("按键提示")
+				var keyhint_ok := keyhint_node != null and String(keyhint_node.text).strip_edges() != ""
+				print("STORY_KEYHINT ok=", keyhint_ok)
 				_push_key(KEY_C, true)      # C = 第一人称
 				step = 2
 				t = 0.0
@@ -193,6 +222,7 @@ func _physics_process(delta: float) -> void:
 		3:
 			if t >= 0.3:
 				after_c = _cam_name()
+				fp_model = _model_visible()
 				_push_key(KEY_V, true)      # V = 第三人称
 				step = 4
 				t = 0.0
@@ -204,7 +234,9 @@ func _physics_process(delta: float) -> void:
 		5:
 			if t >= 0.3:
 				after_v = _cam_name()
+				tp_model = _model_visible()
 				print("STORY_LOBBY_CAM after_c=", after_c, " after_v=", after_v)
+				print("STORY_FP_HIDE fp=", fp_model, " tp=", tp_model)
 				# 挪进钥匙触发区(物理帧之后 Area3D 才会报进出事件)
 				var key_area := _find("钥匙", "Area3D")
 				if key_area != null and player != null:
@@ -254,74 +286,103 @@ func _physics_process(delta: float) -> void:
 					" drain=", snappedf(drain, 0.01),
 					" battery_ui=", battery_ui,
 					" off_visible=", off_visible)
+				_push_key(KEY_ESCAPE, true)    # 按住 Esc:暂停菜单热键是每帧轮询的
+				step = 12
+				t = 0.0
+		12:
+			if t >= 0.2:
+				_push_key(KEY_ESCAPE, false)
+				step = 13
+				t = 0.0
+		13:
+			# Esc 之后:世界暂停 + 暂停菜单弹出来;点『继续游戏』
+			if t >= 0.25:
+				var menu := _widget("暂停菜单")
+				pause_on = get_tree().paused and menu != null and menu.visible
+				_click_widget("继续按钮")
+				step = 14
+				t = 0.0
+		14:
+			if t >= 0.25:
+				var menu2 := _widget("暂停菜单")
+				resume_ok = (not get_tree().paused) and (menu2 == null or not menu2.visible)
+				print("STORY_PAUSE on=", pause_on, " resumed=", resume_ok)
 				var door := _find("大门门板", "AnimatableBody3D")
 				door_y0 = door.global_position.y if door != null else 0.0
 				var door_area := _find("大门区域", "Area3D")
 				if door_area != null and player != null:
 					player.global_position = door_area.global_position
-				step = 12
+				step = 15
 				t = 0.0
-		12:
+		15:
 			if t >= 0.45:
 				var door2 := _find("大门门板", "AnimatableBody3D")
 				print("STORY_LOBBY_DOOR tl_play=", _var("_gk_tl_play"),
 					" door_y0=", snappedf(door_y0, 0.01),
 					" door_y=", snappedf(door2.global_position.y, 0.01) if door2 != null else 0.0)
-				step = 13
+				step = 16
 				t = 0.0
-		13:
+		16:
 			# 大门的时间轴 0.9 秒后会自动切场景(会换掉探针)—— 看完副作用就放掉
 			if t >= 0.1:
 				_drop_world()
 				print("STORY_LOBBY_DONE")
-				step = 14
+				step = 17
 				t = 0.0
 		# ── 关卡 2 走廊 ────────────────────────────────────────────
-		14:
+		17:
 			if t >= 0.1:
 				_load("%(corridor)s")
 				player = _find("走廊玩家", "CharacterBody3D")
 				enemy = _find("怪物", "CharacterBody3D")
-				step = 15
+				step = 18
 				t = 0.0
-		15:
+		18:
 			if t >= 0.5:
 				spawn = player.global_position if player != null else Vector3.ZERO
 				print("STORY_CORRIDOR_START state=", _var("ai_state"),
 					" has_enemy=", enemy != null,
 					" far_tension=", snappedf(float(_var("_gk_heart_tension")), 0.001))
-				step = 16
+				step = 19
 				t = 0.0
-		16:
+		19:
 			# 开场章节卡 3 秒之后才弹对话
 			if t >= 3.0:
 				print("STORY_CORRIDOR_DIALOG visible=", _panel_visible("_gk_dialog_panel"))
 				advance_at = 0.0
-				step = 17
+				step = 20
 				t = 0.0
-		17:
+		20:
 			# 反复敲回车推进对话,直到**剧情选择**弹出(或超时兜底)
 			if _panel_visible("_gk_choice_panel"):
 				print("STORY_CORRIDOR_CHOICE visible=true")
-				step = 18
+				# 选第一个选项(按 1)→ 合流函数"继续世界 + 锁回鼠标";之后的
+				# 躲藏 / 追击必须在世界不暂停的状态下跑(暂停时物理和触发区都停)。
+				_push_key(KEY_1, true)
+				_push_key(KEY_1, false)
+				step = 21
 				t = 0.0
 			elif t >= 8.0:
 				print("STORY_CORRIDOR_CHOICE visible=false")
-				step = 18
+				step = 21
 				t = 0.0
 			elif t >= advance_at:
 				_push_key(KEY_ENTER, true)
 				_push_key(KEY_ENTER, false)
 				advance_at = t + 0.35
-		18:
-			if t >= 0.2:
-				# 躲进柜子甲
+		21:
+			if t >= 0.6:
+				# 等合流函数跑完(继续世界 + 锁回鼠标 + 字幕),再躲进柜子甲。
+				# 同时把怪物挪远:玩家"传送进柜子"那一帧物理重叠还没登记,
+				# 怪物若正好在 6 米内会趁这 1 帧看见玩家、直接转追击。
 				var cab := _find("柜子甲", "Area3D")
 				if cab != null and player != null:
 					player.global_position = cab.global_position
-				step = 19
+				if cab != null and enemy != null:
+					enemy.global_position = cab.global_position + Vector3(20.0, 0.0, 0.0)
+				step = 22
 				t = 0.0
-		19:
+		22:
 			if t >= 0.6:
 				hide_state = String(_var("ai_state"))
 				hide_hint = _text("提示文本")
@@ -329,9 +390,9 @@ func _physics_process(delta: float) -> void:
 				# 挪出去(回出生点)
 				if player != null:
 					player.global_position = spawn
-				step = 20
+				step = 23
 				t = 0.0
-		20:
+		23:
 			if t >= 0.6:
 				print("STORY_CORRIDOR_HIDE in_state=", hide_state,
 					" in_hint=", hide_hint,
@@ -340,14 +401,42 @@ func _physics_process(delta: float) -> void:
 				print("STORY_CORRIDOR_VIGNETTE hide=", snappedf(hide_vig, 0.01),
 					" exit=", snappedf(_vig_amount(), 0.01),
 					" layer=", _var("_gk_vignette_layer") != null)
+				# 真潜行第一步:先只把玩家放进柜子(怪物还在远处),等物理重叠登记。
+				var cab2 := _find("柜子甲", "Area3D")
+				if cab2 != null and player != null:
+					player.global_position = cab2.global_position
+				step = 24
+				t = 0.0
+		24:
+			# 等一帧物理重叠登记好,再把怪物挪到柜子旁(3 米)—— 不能和"进柜子"
+			# 同帧做,否则那 1 帧怪物会趁重叠还没登记就看见玩家(踩过)。
+			if t >= 0.3:
+				var cab3 := _find("柜子甲", "Area3D")
+				if cab3 != null and enemy != null:
+					enemy.global_position = cab3.global_position + Vector3(-3.0, 0.0, 0.0)
+				step = 25
+				t = 0.0
+		25:
+			# 躲在柜子里看 0.8 秒:怪物就在 3 米外,却看不见(躲藏区生效)
+			if t >= 0.8:
+				hide_see_in = String(_var("ai_state"))
+				# 挪出柜子(仍在怪物附近、正前方)→ 才该看见
+				if enemy != null and player != null:
+					player.global_position = enemy.global_position + Vector3(0.0, 0.0, 3.0)
+				step = 26
+				t = 0.0
+		26:
+			if t >= 0.8:
+				hide_see_out = String(_var("ai_state"))
+				print("STORY_HIDE_SEE in=", hide_see_in, " out=", hide_see_out)
 				# 挪到怪物正前方近处:看见就追 + 贴身惊吓
 				if enemy != null and player != null:
 					player.global_position = enemy.global_position + Vector3(2.0, 0.0, 0.0)
 				heard = false
 				max_shake = 0.0
-				step = 21
+				step = 27
 				t = 0.0
-		21:
+		27:
 			# 追 + 吓:这 1.2 秒里每帧采样心跳 / 震动
 			var heart = _var("_gk_heart_player")
 			if heart != null and heart.playing:
@@ -359,61 +448,61 @@ func _physics_process(delta: float) -> void:
 					" heart=", heart != null,
 					" playing=", heard,
 					" shake=", snappedf(max_shake, 0.01))
-				step = 22
+				step = 28
 				t = 0.0
-		22:
+		28:
 			if t >= 0.1:
 				_drop_world()
 				print("STORY_CORRIDOR_DONE")
-				step = 23
+				step = 29
 				t = 0.0
 		# ── 关卡 3 结局 ────────────────────────────────────────────
-		23:
+		29:
 			if t >= 0.1:
 				_load("%(ending)s")
 				player = _find("结局玩家", "CharacterBody3D")
-				step = 24
+				step = 30
 				t = 0.0
-		24:
+		30:
 			# 章节卡 3 秒之后才弹对话
 			if t >= 3.0:
 				advance_at = 0.0
-				step = 25
+				step = 31
 				t = 0.0
-		25:
+		31:
 			# 推进开场两句对话,直到**结局选择**弹出
 			if _panel_visible("_gk_choice_panel"):
 				print("STORY_ENDING_CHOICE visible=true")
-				step = 26
+				step = 32
 				t = 0.0
 			elif t >= 8.0:
 				print("STORY_ENDING_CHOICE visible=false")
-				step = 26
+				step = 32
 				t = 0.0
 			elif t >= advance_at:
 				_push_key(KEY_ENTER, true)
 				_push_key(KEY_ENTER, false)
 				advance_at = t + 0.35
-		26:
+		32:
 			# 选第一个选项(按 1 = 回头救她)
 			_push_key(KEY_1, true)
-			step = 27
+			step = 33
 			t = 0.0
-		27:
+		33:
 			if t >= 0.25:
 				_push_key(KEY_1, false)
-				step = 28
+				step = 34
 				t = 0.0
-		28:
+		34:
 			if t >= 0.6:
 				var big := _widget("结局大字1")
 				print("STORY_ENDING_RESULT ending=", int(_var("结局")),
 					" saved=", FileAccess.file_exists("user://gk_story_end.json"),
 					" big_visible=", big != null and big.visible,
 					" big_text=", String(big.text) if big != null else "<无>")
-				step = 29
+				step = 35
 				t = 0.0
-		29:
+		35:
 			if t >= 0.1:
 				_drop_world()
 				print("STORY_ENDING_DONE")
@@ -585,11 +674,20 @@ def main():
         elif float(hud.group(3).split(":", 1)[1]) != 100.0:
             problems.append("大堂开局电量不是满格: " + hud.group(0))
         _expect(problems, hud, 5, "第一章:门厅", "大堂章节卡文字")
+    keyhint = _need(problems, text, "KEYHINT",
+                    r"STORY_KEYHINT ok=(\S+)", "按键提示 HUD")
+    if keyhint:
+        _expect(problems, keyhint, 1, "true", "按键提示控件存在且文本非空")
     cam = _need(problems, text, "LOBBY_CAM",
                 r"STORY_LOBBY_CAM after_c=(\S+) after_v=(\S+)", "大堂 C/V 切机位")
     if cam:
         _expect(problems, cam, 1, "大堂第一人称机位", "按 C 后当前相机(应第一人称)")
         _expect(problems, cam, 2, "大堂第三人称机位", "按 V 后当前相机(应第三人称)")
+    fp = _need(problems, text, "FP_HIDE",
+               r"STORY_FP_HIDE fp=(\S+) tp=(\S+)", "第一人称藏自身模型")
+    if fp:
+        _expect(problems, fp, 1, "false", "第一人称时自身模型应隐藏")
+        _expect(problems, fp, 2, "true", "第三人称时自身模型应显示")
     key = _need(problems, text, "LOBBY_KEY",
                 r"STORY_LOBBY_KEY picked=(\S+) visible=(\S+) keys_ui=(\S+) "
                 r"goal_ui=(\S+)", "大堂拾钥匙")
@@ -622,6 +720,11 @@ def main():
         if not (float(door.group(3)) > float(door.group(2)) + 0.3):
             problems.append(f"大门时间轴启动了但门板没升起"
                             f"({door.group(2)} -> {door.group(3)}): " + door.group(0))
+    pause = _need(problems, text, "PAUSE",
+                  r"STORY_PAUSE on=(\S+) resumed=(\S+)", "暂停菜单")
+    if pause:
+        _expect(problems, pause, 1, "true", "按 Esc 后世界应暂停 + 菜单弹出")
+        _expect(problems, pause, 2, "true", "点『继续游戏』后应解冻 + 菜单收起")
     if "STORY_LOBBY_DONE" not in text:
         problems.append("大堂探针没跑完")
 
@@ -644,10 +747,17 @@ def main():
                  r"STORY_CORRIDOR_HIDE in_state=(\S+) in_hint=(\S+) "
                  r"out_state=(\S+) out_hint=(\S*)", "走廊躲藏")
     if hide:
-        _expect(problems, hide, 1, "躲藏着", "钻进柜子后 AI 状态(应冻结)")
+        # 真潜行后不再把 AI 冻成『躲藏着』:躲柜子里它仍保持巡逻(看不见),
+        # 只是提示 / 暗角照旧。所以这里断言状态一直是『巡逻』而不是冻结。
+        _expect(problems, hide, 1, "巡逻", "钻进柜子后 AI 状态(应仍巡逻,不再冻结)")
         _expect(problems, hide, 2, "屏住呼吸…", "钻进柜子后 HUD 提示")
-        _expect(problems, hide, 3, "巡逻", "离开柜子后 AI 状态(应恢复)")
+        _expect(problems, hide, 3, "巡逻", "离开柜子后 AI 状态(应仍巡逻)")
         _expect(problems, hide, 4, "", "离开柜子后 HUD 提示(应清空)")
+    hide_see = _need(problems, text, "HIDE_SEE",
+                     r"STORY_HIDE_SEE in=(\S+) out=(\S+)", "真潜行:躲藏区挡视线")
+    if hide_see:
+        _expect(problems, hide_see, 1, "巡逻", "躲藏区里正前方怪物应看不见(仍巡逻)")
+        _expect(problems, hide_see, 2, "追击", "挪出躲藏区(仍正前方)后才应追击")
     vig = _need(problems, text, "CORRIDOR_VIGNETTE",
                 r"STORY_CORRIDOR_VIGNETTE hide=([\d.\-]+) exit=([\d.\-]+) "
                 r"layer=(\S+)", "走廊暗角")

@@ -20299,5 +20299,52 @@ class TestRound107AdvisorEdits(Base):
         self.assertEqual(value, [1.0, 2.0, 3.0])
 
 
+class TestRound109HideSpot(Base):
+    """第一百零九轮:真潜行(躲藏区)—— 敌人看不见躲藏区里的玩家。
+
+    ── 锁住的两条事实 ────────────────────────────────────────────
+    1. 『看见』判定的 helper(`_gk_ai_can_see_3d` / `_2d`)会先扫
+       `gk_hide_spot` 组:目标(玩家)和某个躲藏区(Area)重叠就**直接判
+       看不见**,距离和视野角都不再看(躲进柜子 = 隐形);
+    2. 组名 `gk_hide_spot` 是**两处硬编码**的契约(asset_export 的
+       HIDE_SPOT_GROUP 和 ai.py 的生成文本),这里用"常量 = 字面量"
+       钉死 —— 谁改一边忘了另一边,测试当场红。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _see_code(self, options):
+        """一张『看见』接在分支条件上的图,返回生成代码。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "说")
+        see = tree.new_node(NN.GKNodeAiSee, "看得见吗", gk_goal="玩家",
+                            gk_distance=8.0, gk_angle=120.0)
+        branch = tree.new_node(NN.GKNodeBranch, "看见?")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, see, "看得见", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        return gen(tree, options)[0]
+
+    def test_see_helper_checks_hide_spot_3d(self):
+        code = self._see_code(V3)
+        self.assertIn("func _gk_ai_can_see_3d(", code)
+        self.assertIn('get_nodes_in_group("gk_hide_spot")', code)
+        self.assertIn("_hide is Area3D and target is PhysicsBody3D", code)
+        self.assertIn("(_hide as Area3D).overlaps_body(target as PhysicsBody3D)",
+                      code)
+
+    def test_see_helper_checks_hide_spot_2d(self):
+        code = self._see_code(V2)
+        self.assertIn("func _gk_ai_can_see_2d(", code)
+        self.assertIn('get_nodes_in_group("gk_hide_spot")', code)
+        self.assertIn("_hide is Area2D and target is PhysicsBody2D", code)
+
+    def test_hide_spot_group_name_is_pinned(self):
+        from BlenderGameKit import asset_export
+        self.assertEqual(asset_export.HIDE_SPOT_GROUP, "gk_hide_spot")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

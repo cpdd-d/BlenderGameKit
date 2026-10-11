@@ -1014,6 +1014,14 @@ def _ensure_ai_see_helper(ctx):
             f"    var diff := {reader}(target) - {reader}(watcher)",
             "    if diff.length() > dist:",
             "        return false",
+            # 真潜行(第一百零九轮):目标躲进 `gk_hide_spot` 组里的躲藏区就判
+            # 看不见 —— 哪怕距离够近、正对着。组名和 asset_export 的
+            # HIDE_SPOT_GROUP **逐字一致**(不抽常量是因为这里是给 Godot 的
+            # 生成文本,和 .tscn 那边是两份代码,靠注释互相钉住)。
+            "    for _hide in get_tree().get_nodes_in_group(\"gk_hide_spot\"):",
+            "        if _hide is Area2D and target is PhysicsBody2D:",
+            "            if (_hide as Area2D).overlaps_body(target as PhysicsBody2D):",
+            "                return false",
             "    if angle_deg <= 0.0 or angle_deg >= 360.0:",
             "        return true",
             "    if watcher is not Node2D:",
@@ -1031,6 +1039,11 @@ def _ensure_ai_see_helper(ctx):
             f"    var diff := {reader}(target) - {reader}(watcher)",
             "    if diff.length() > dist:",
             "        return false",
+            # 真潜行(第一百零九轮):同上,3D 用 Area3D / PhysicsBody3D。
+            "    for _hide in get_tree().get_nodes_in_group(\"gk_hide_spot\"):",
+            "        if _hide is Area3D and target is PhysicsBody3D:",
+            "            if (_hide as Area3D).overlaps_body(target as PhysicsBody3D):",
+            "                return false",
             "    if angle_deg <= 0.0 or angle_deg >= 360.0:",
             "        return true",
             "    if watcher is not Node3D:",

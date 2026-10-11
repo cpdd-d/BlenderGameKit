@@ -2506,6 +2506,22 @@ def _nav_settings(scene):
 NAV_LAYER_MAX = 4
 NAV_LAYER_GROUP_PREFIX = "gk_nav_layer_"
 
+# 躲藏区(第一百零九轮:真潜行)挂的 Godot group 名 —— codegen/ai.py 的
+# 『看见』判定 helper 会扫这个组,玩家在里面就判看不见。两边必须**逐字一致**。
+HIDE_SPOT_GROUP = "gk_hide_spot"
+
+
+def hide_spot_group_header(physics):
+    """躲藏区(Area 触发区)勾了『躲藏区』时,节点头要加的 `groups=[...]`。
+
+    没勾 / 不是触发区 / 没属性(老 .blend)一律空串 —— 老场景逐字不变。
+    ⚠ group 必须写在**节点头**里(单独一行 groups=[...] 会被解析器丢掉),
+    和 `nav_group_header` 同一个坑(多层导航那轮踩的)。
+    """
+    if not getattr(physics, "is_hide_spot", False):
+        return ""
+    return f' groups=["{HIDE_SPOT_GROUP}"]'
+
 
 def _clamp_nav_layer(value):
     """层号钳到 1~4(填 0 / 负数 / 超大值都不至于把导出写坏)。
@@ -4118,6 +4134,11 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             nav_group = ""
             if body_type.startswith("StaticBody"):
                 nav_group = nav_group_header(physics, multi_nav)
+            elif body_type.startswith("Area"):
+                # 躲藏区(第一百零九轮:真潜行):勾了的触发区挂进 `gk_hide_spot`
+                # 组,AI 的『看见』判定扫它判"躲起来的人看不见"。Area 和
+                # StaticBody 互斥,不会和上面的导航组撞上。
+                nav_group = hide_spot_group_header(physics)
 
             lines.append(f'[node name="{_sanitize_node_name(obj.name)}" '
                          f'type="{body_type}" parent="Colliders"'

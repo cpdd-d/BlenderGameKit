@@ -3435,6 +3435,14 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             row.prop(physics, "collision_layer", text="")
             row.prop(physics, "collision_mask", text="")
             col.prop(physics, "is_trigger")
+            # ── 躲藏区(第一百零九轮:真潜行)────────────────────────
+            # 只有触发区(Area)才可能是躲藏点;非触发区勾了也不导出组。
+            # 勾上 = 玩家躲进来敌人『看不见』(AI 的『看见』判定扫
+            # `gk_hide_spot` 组)。
+            hide_row = col.row(align=True)
+            hide_row.prop(physics, "is_hide_spot", toggle=True)
+            if not physics.is_trigger:
+                hide_row.enabled = False
             # ── 地面响度倍率(第八十轮 D-12②)──────────────────────────
             # 触发器是 Area、脚下射线不打 Area,给它设倍率没有意义 -> 置灰。
             loud_row = col.row(align=True)
