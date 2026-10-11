@@ -841,6 +841,43 @@ if ($SkipGodot) {
         }
     }
 
+    # 5w. 剧情闯关示例(第一百零四轮:3D 恐怖闯关,第一/三人称可切换)——
+    #     三关(大堂 / 走廊 / 结局)各一张 .tscn。这一层验的是:章节卡 + HUD、
+    #     **C 切第一人称 / V 切第三人称**、拾钥匙、F 手电(亮 + 掉电)、大门链、
+    #     走廊 AI(巡逻 / 躲藏 / 看见就追 + 心跳惊吓)、结局选择 + 存档落盘。
+    #     ⚠ 关底切关卡那句探测不了(change_scene 会把探针换掉),改用
+    #     **出码文本**验 —— 这就是和 5o 那层"全靠真 Godot 行为"的区别。
+    #     (5p..5v 已被别的示例占用,故按顺序追加在末尾。)
+    Write-Output ""
+    $storyDir = Join-Path $Root "examples\demo_story"
+    $storyMaker = Join-Path $Root "scripts\make_story_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过剧情闯关示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $storyDir)) {
+        Write-Output "跳过剧情闯关示例:还没有 examples\demo_story"
+    } else {
+        $storyLog = & $Blender -b --python $storyMaker 2>&1 | Out-String
+        if ($storyLog -notmatch "已保存") {
+            Write-Host "---- 重建剧情闯关示例失败,尾部 20 行 ----"
+            ($storyLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $storyChecker = Join-Path $Root "scripts\check_story_demo.py"
+            $storyOut = & python $storyChecker --godot $Godot 2>&1 | Out-String
+            $storyOut -split "`n" | Where-Object {
+                $_ -match "^(STORY_|CHECK_STORY_DEMO|跳过|✗)"
+            } | ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($storyOut -match "CHECK_STORY_DEMO=OK") {
+                $godotRan += "剧情闯关示例"
+            } elseif ($storyOut -match "跳过") {
+                Write-Output "（剧情闯关示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {
