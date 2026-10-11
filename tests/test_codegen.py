@@ -18994,5 +18994,219 @@ class TestRound101SpecTexture(Base):
         self.assertIn("write_npr_material(", source)
 
 
+class TestRound102Collections(Base):
+    """第一百零二轮:保留 Blender 集合层级的场景树。
+
+    ── 这一层锁住的四条事实(改代码前先看)────────────────────────────
+    1. glb 里那层"场景根集合"(Scene Collection)导出后要**展平** ——
+       Godot 里直接看到用户自己的集合名(`关卡一/装饰/树`);
+    2. 展平**只改 `scenes[0].nodes` 和根集合自己的 `children`**,
+       `nodes` 数组一个字节都不动(动画通道 / skin 的索引引用
+       不可能被弄坏 —— 删节点重排索引是另一条路,别走);
+    3. 与 `.tscn` 根下节点重名的顶层集合(碰撞 / 粒子 / 环境 / 导航 /
+       遮挡)**保留一层前缀**,否则 Godot 里两个同名兄弟节点会打架;
+    4. 只在"唯一一个根 + 名字对得上"时才动手 —— 老版本 Blender 不支持
+       集合模式,导出的是扁平的多个根,绝不能误伤。
+    """
+
+    @staticmethod
+    def _payload(children_names, root_name="Scene Collection", extra_roots=0):
+        """模拟 Blender 集合模式的 glb:根(集合)-> 一串子节点。
+
+        前几个子节点是"集合 / 物体"都行 —— 这个函数只关心名字。
+        """
+        nodes = [{"name": root_name}]
+        children = []
+        for name in children_names:
+            children.append(len(nodes))
+            nodes.append({"name": name})
+        nodes[0]["children"] = children
+        roots = [0]
+        for index in range(extra_roots):
+            roots.append(len(nodes))
+            nodes.append({"name": f"游离物体{index}"})
+        return {"nodes": nodes, "scenes": [{"nodes": roots}]}
+
+    @staticmethod
+    def _tiny_glb(payload, binary=b"\x01\x02\x03\x04"):
+        """把 payload 拼成最小合法 .glb(JSON 块 + BIN 块)。"""
+        import json
+        import struct
+
+        text = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        text += b" " * ((4 - len(text) % 4) % 4)
+        total = 12 + 8 + len(text) + 8 + len(binary)
+        blob = struct.pack("<III", 0x46546C67, 2, total)
+        blob += struct.pack("<II", len(text), 0x4E4F534A) + text
+        blob += struct.pack("<II", len(binary), 0x004E4942) + binary
+        return blob
+
+    # ---- 纯逻辑:展平 ----
+    def test_flatten_lifts_children_to_root(self):
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一", "地面"])
+        _payload, kept, changed = ae.flatten_collection_root(payload, "Scene Collection")
+        self.assertTrue(changed)
+        self.assertEqual(kept, [])
+        self.assertEqual(payload["scenes"][0]["nodes"], [1, 2])
+        # 根集合的 children 已清空(它不再被任何地方引用 -> Godot 直接忽略)
+        self.assertNotIn("children", payload["nodes"][0])
+
+    def test_nested_collections_survive(self):
+        """嵌套集合是**节点自己的 children**,展平不动它们。"""
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一"])
+        payload["nodes"].append({"name": "装饰", "children": []})
+        payload["nodes"].append({"name": "树"})
+        payload["nodes"][3]["children"] = [4]
+        payload["nodes"][1]["children"] = [3]
+        ae.flatten_collection_root(payload, "Scene Collection")
+        self.assertEqual(payload["nodes"][1]["children"], [3])
+        self.assertEqual(payload["nodes"][3]["children"], [4])
+
+    def test_reserved_collection_keeps_prefix(self):
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["Colliders", "关卡一"])
+        _payload, kept, changed = ae.flatten_collection_root(payload, "Scene Collection")
+        self.assertTrue(changed)
+        self.assertEqual(kept, ["Colliders"])
+        # 根集合保留(它挂着撞名那个),其它提升
+        self.assertEqual(payload["scenes"][0]["nodes"], [0, 2])
+        self.assertEqual(payload["nodes"][0]["children"], [1])
+
+    def test_all_reserved_keeps_everything(self):
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["Colliders", "Particles"])
+        _payload, kept, changed = ae.flatten_collection_root(payload, "Scene Collection")
+        self.assertFalse(changed)
+        self.assertEqual(sorted(kept), ["Colliders", "Particles"])
+        self.assertEqual(payload["scenes"][0]["nodes"], [0])
+        self.assertEqual(payload["nodes"][0]["children"], [1, 2])
+
+    def test_multiple_roots_untouched(self):
+        """老版本 Blender(没有集合模式)导的是"多个平根"—— 不许动。"""
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一"], extra_roots=1)
+        before = list(payload["scenes"][0]["nodes"])
+        _payload, kept, changed = ae.flatten_collection_root(payload, "Scene Collection")
+        self.assertFalse(changed)
+        self.assertEqual(kept, [])
+        self.assertEqual(payload["scenes"][0]["nodes"], before)
+        self.assertEqual(payload["nodes"][0]["children"], [1])
+
+    def test_wrong_root_name_untouched(self):
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一"], root_name="别的集合")
+        _payload, _kept, changed = ae.flatten_collection_root(
+            payload, "Scene Collection")
+        self.assertFalse(changed)
+        self.assertEqual(payload["scenes"][0]["nodes"], [0])
+
+    def test_empty_root_untouched(self):
+        from BlenderGameKit import asset_export as ae
+        payload = {"nodes": [{"name": "Scene Collection"}],
+                   "scenes": [{"nodes": [0]}]}
+        _payload, _kept, changed = ae.flatten_collection_root(
+            payload, "Scene Collection")
+        self.assertFalse(changed)
+
+    def test_reserved_name_match(self):
+        from BlenderGameKit import asset_export as ae
+        for name in ("Colliders", "Particles", "Environment",
+                     "WorldEnvironment", "Navigation",
+                     "Navigation_2", "Navigation_10", "Occluder_0",
+                     "Occluder_12"):
+            self.assertTrue(ae.is_scene_root_reserved(name), name)
+        for name in ("关卡一", "Colliders2", "Navigation_x", "Occluder",
+                     "Occluder_", "装饰", "", None, "environment"):
+            self.assertFalse(ae.is_scene_root_reserved(name), name)
+
+    # ---- 纯逻辑:glb 读写 ----
+    def test_glb_round_trip_keeps_binary(self):
+        import struct
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一", "地面"])
+        blob = self._tiny_glb(payload, b"\x0a\x0b\x0c\x0d")
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "test.glb")
+            with open(path, "wb") as handle:
+                handle.write(blob)
+            loaded = ae.read_glb_payload(path)
+            self.assertEqual(loaded["scenes"][0]["nodes"], [0])
+            ae.flatten_collection_root(loaded, "Scene Collection")
+            self.assertTrue(ae.write_glb_payload(path, loaded))
+            with open(path, "rb") as handle:
+                data = handle.read()
+        magic, version, total = struct.unpack_from("<III", data, 0)
+        self.assertEqual((magic, version), (0x46546C67, 2))
+        self.assertEqual(total, len(data))          # 头里的总长必须对得上
+        self.assertEqual(len(data) % 4, 0)          # 规范:4 字节对齐
+        text_len, kind = struct.unpack_from("<II", data, 12)
+        self.assertEqual(kind, 0x4E4F534A)
+        self.assertEqual(text_len % 4, 0)
+        bin_len, bin_kind = struct.unpack_from("<II", data, 20 + text_len)
+        self.assertEqual(bin_kind, 0x004E4942)
+        binary = data[28 + text_len:28 + text_len + bin_len]
+        self.assertEqual(binary, b"\x0a\x0b\x0c\x0d")   # 顶点数据原样
+
+    def test_flatten_scene_glb_leaves_flat_file_alone(self):
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一"], extra_roots=1)
+        blob = self._tiny_glb(payload)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "flat.glb")
+            with open(path, "wb") as handle:
+                handle.write(blob)
+            changed, kept, note = ae.flatten_scene_glb(path, "Scene Collection")
+            with open(path, "rb") as handle:
+                after = handle.read()
+        self.assertFalse(changed)
+        self.assertEqual(kept, [])
+        self.assertEqual(note, "")
+        self.assertEqual(after, blob)               # 一个字节都不该动
+
+    def test_flatten_scene_glb_fixes_collection_export(self):
+        from BlenderGameKit import asset_export as ae
+        payload = self._payload(["关卡一", "Colliders"])
+        blob = self._tiny_glb(payload)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "coll.glb")
+            with open(path, "wb") as handle:
+                handle.write(blob)
+            changed, kept, note = ae.flatten_scene_glb(path, "Scene Collection")
+            after = ae.read_glb_payload(path)
+        self.assertTrue(changed)
+        self.assertEqual(kept, ["Colliders"])
+        self.assertEqual(note, "")
+        self.assertEqual(after["scenes"][0]["nodes"], [0, 1])
+
+    # ---- 接线:导出流程真的开了集合模式、也真的收了提示 ----
+    def test_export_scene_glb_turns_collection_mode_on(self):
+        import inspect
+        from BlenderGameKit import asset_export as ae
+        source = inspect.getsource(ae.export_scene_glb)
+        self.assertIn('"export_hierarchy_full_collections": True', source)
+        self.assertIn("flatten_scene_glb(", source)
+        self.assertIn('scene.collection', source)
+
+    def test_pipeline_collects_collection_notes(self):
+        import inspect
+        from BlenderGameKit import asset_export as ae
+        source = inspect.getsource(ae.export_assets_pipeline)
+        self.assertIn('export_scene_glb, "last_notes"', source)
+
+    def test_character_and_asset_glb_stay_flat(self):
+        """角色 / 资产 glb 是"一个模型一次"—— 不能开集合模式。
+
+        它们靠 `_glb_root_inverse_transform` 抵消 glb 根节点变换,
+        多一层集合节点就会算错。
+        """
+        import inspect
+        from BlenderGameKit import asset_export as ae
+        for func in (ae.export_subtree_glb, ae.export_glb):
+            self.assertNotIn("export_hierarchy_full_collections",
+                             inspect.getsource(func))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

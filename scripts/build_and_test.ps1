@@ -783,6 +783,42 @@ if ($SkipGodot) {
         }
     }
 
+    # 5u. 集合层级示例(第一百零二轮:集合 -> Godot 节点分组)—— 同样
+    #     "先重建再跑探针":真 Blender 里摆几个集合(含嵌套 / 撞名 / 空),
+    #     导出后真 Godot 里用**路径**取节点(`房间A/A_墙`)—— 证明 Blender
+    #     的集合真的成了场景树分组,而且碰撞 / 材质 / 走路都没被弄坏。
+    Write-Output ""
+    $groupsDir = Join-Path $Root "examples\demo_groups"
+    $groupsMaker = Join-Path $Root "scripts\make_groups_demo.py"
+    if ($godotSkipped) {
+        Write-Output "跳过集合层级示例:本机找不到 Godot"
+    } elseif (-not (Test-Path $Blender)) {
+        Write-Output "跳过集合层级示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $groupsDir)) {
+        Write-Output "跳过集合层级示例:还没有 examples\demo_groups"
+    } else {
+        $groupsLog = & $Blender -b --python $groupsMaker 2>&1 | Out-String
+        if ($groupsLog -notmatch "已保存") {
+            Write-Host "---- 重建集合层级示例失败,尾部 20 行 ----"
+            ($groupsLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $groupsChecker = Join-Path $Root "scripts\check_groups_demo.py"
+            $groupsOut = & python $groupsChecker --godot $Godot 2>&1 | Out-String
+            $groupsOut -split "`n" | Where-Object {
+                $_ -match "^(GROUPS_|CHECK_GROUPS_DEMO|跳过|✗)"
+            } | ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($groupsOut -match "CHECK_GROUPS_DEMO=OK") {
+                $godotRan += "集合层级示例"
+            } elseif ($groupsOut -match "跳过") {
+                Write-Output "（集合层级示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

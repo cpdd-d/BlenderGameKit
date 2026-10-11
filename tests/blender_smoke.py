@@ -5771,6 +5771,103 @@ def main():
         check("第一百零一轮(高光贴图)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零二轮:集合层级(Blender 集合 -> Godot 节点分组)---------
+    # 真 Blender 才能验的:导出器真按集合树写了 glb、我们真把"场景根集合"
+    # 那一层展平了、撞名集合真保留了一层前缀、空集合真被丢掉 ——
+    # 离线单测只能验"拿到 payload 之后怎么改",验不了 Blender 导了什么。
+    try:
+        import shutil
+
+        r102_scene = bpy.data.scenes.new("冒烟集合场景")
+        r102_previous = bpy.context.scene
+        r102_root = r102_scene.collection
+
+        def _r102_coll(name, parent):
+            coll = bpy.data.collections.new(name)
+            parent.children.link(coll)
+            return coll
+
+        def _r102_box(name, colls):
+            mesh = bpy.data.meshes.new(name + "网格")
+            mesh.from_pydata([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)],
+                             [], [(0, 1, 2, 3)])
+            obj = bpy.data.objects.new(name, mesh)
+            for coll in colls:
+                coll.objects.link(obj)
+            return obj
+
+        r102_lv = _r102_coll("冒烟关卡", r102_root)
+        r102_deco = _r102_coll("冒烟装饰", r102_lv)           # 嵌套子集合
+        r102_clash = _r102_coll("Colliders", r102_root)       # 和碰撞分组撞名
+        r102_empty = _r102_coll("冒烟空集合", r102_root)       # 空集合:该被丢掉
+        _r102_box("冒烟地面", [r102_root])
+        _r102_box("冒烟墙", [r102_lv])
+        _r102_box("冒烟树", [r102_deco])
+        _r102_box("冒烟重名", [r102_clash])
+
+        asset_export._activate_scene(r102_scene)   # glTF 算子只认活动场景
+        r102_dir = tempfile.mkdtemp(prefix="gk_groups_")
+        r102_path, r102_ok, r102_msg = asset_export.export_scene_glb(
+            r102_dir, "World", scene=r102_scene)
+        asset_export._activate_scene(r102_previous)
+        check("第一百零二轮:集合场景导出成功", r102_ok, str(r102_msg))
+
+        r102_payload = asset_export.read_glb_payload(r102_path or "")
+        r102_nodes = (r102_payload or {}).get("nodes", [])
+
+        def _r102_names(indices):
+            return [r102_nodes[i].get("name", "") for i in indices]
+
+        def _r102_children(parent_name):
+            """按名字找节点,返回它的子节点名列表;找不到回 None。"""
+            for node in r102_nodes:
+                if node.get("name") == parent_name:
+                    return _r102_names(node.get("children", []))
+            return None
+
+        r102_roots = _r102_names(
+            (r102_payload or {}).get("scenes", [{}])[0].get("nodes", []))
+        check("第一百零二轮:根下直接看到集合与直接物体(Scene Collection 已展平)",
+              sorted(r102_roots) == sorted(["Scene Collection", "冒烟地面",
+                                            "冒烟关卡"]),
+              str(r102_roots))
+        check("第一百零二轮:嵌套集合保留(冒烟关卡/冒烟装饰/冒烟树)",
+              _r102_children("冒烟关卡") == ["冒烟墙", "冒烟装饰"]
+              and _r102_children("冒烟装饰") == ["冒烟树"],
+              str(_r102_children("冒烟关卡")))
+        check("第一百零二轮:撞名集合保留了一层前缀",
+              _r102_children("Scene Collection") == ["Colliders"]
+              and _r102_children("Colliders") == ["冒烟重名"],
+              str(_r102_children("Scene Collection")))
+        check("第一百零二轮:空集合不出现在 glb 里",
+              [node.get("name") for node in r102_nodes].count("冒烟空集合") == 0)
+        r102_notes = list(
+            getattr(asset_export.export_scene_glb, "last_notes", []) or [])
+        check("第一百零二轮:撞名保留写进了导出提示",
+              any("Colliders" in note for note in r102_notes), str(r102_notes))
+        r102_meshes = asset_export.glb_scene_nodes(
+            r102_dir, "World").get("meshes", {})
+        check("第一百零二轮:网格名还是物体名(材质映射不受分组影响)",
+              "冒烟树" in r102_meshes and "冒烟墙" in r102_meshes,
+              str(sorted(r102_meshes)))
+        r102_tscn, _r102_bodies = asset_export.write_world_scene(
+            r102_dir, "World", scene=r102_scene, dimension="3")
+        with open(r102_tscn, encoding="utf-8") as handle:
+            r102_text = handle.read()
+        check("第一百零二轮:.tscn 里 glb 实例还是单节点(结构没变)",
+              '[node name="World" instance=ExtResource("1_world")]'
+              in r102_text)
+
+        for obj in list(r102_scene.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        for coll in (r102_deco, r102_lv, r102_clash, r102_empty):
+            bpy.data.collections.remove(coll)
+        bpy.data.scenes.remove(r102_scene)
+        shutil.rmtree(r102_dir, ignore_errors=True)
+    except Exception as exc:
+        check("第一百零二轮(集合层级)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

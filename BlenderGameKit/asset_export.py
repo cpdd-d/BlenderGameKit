@@ -2914,6 +2914,183 @@ def export_glb(export_dir, name, use_selection, objects):
     return _run_gltf_export(kwargs, path)
 
 
+# ── 集合层级(第一百零二轮)─────────────────────────────────────────────
+#
+# 整场景导出时开 `export_hierarchy_full_collections`:Blender 会把
+# **集合树**原样写进 glb(集合 -> 空节点,嵌套保留,名字就是集合名;
+# 物体挂在"所属集合"下面)。但它的根永远是那个 `Scene Collection`
+# (场景根集合)——不管用户建没建集合,集合模式下都多出这一层。
+# 所以导出后把那层**展平**:把它的子节点提升成 glb 的根,
+# Godot 里就直接看到用户自己的集合名(`关卡一/树`)。
+#
+# ── 用户看不见的原生行为(要写进文档)────────────────────────────────
+#   * 空集合(或"里面的物体全被排除"的集合)Blender 直接丢掉;
+#   * 一个物体属于多个集合时,归到它所属的"第一个"集合;
+#   * 父子不在同一个集合时,导出后父子关系被拉平(位置/大小不变 ——
+#     导出器会按世界变换重算);同一集合内的父子关系完整保留。
+#
+# ── 撞名保护 ────────────────────────────────────────────────────────
+# .tscn 的根下我们自己要建这些节点(见 write_world_scene):
+#   Colliders(碰撞代理组)/ Particles(粒子容器)/ Environment(环境脚本)
+#   / WorldEnvironment / Navigation、Navigation_N(多层导航)
+#   / Occluder_N(遮挡体)
+# 用户的顶层集合如果也叫这些名字,那个集合**保留一层
+# `Scene Collection/` 前缀**(不提升到根)—— 免得 Godot 里出现两个
+# 同名兄弟节点(其中一个会被自动改名,用户会一脸问号)。
+SCENE_ROOT_NODE_NAMES = ("Colliders", "Particles", "Environment",
+                         "WorldEnvironment", "Navigation")
+
+
+def is_scene_root_reserved(name):
+    """这个名字会不会和 .tscn 根下我们生成的节点撞名。"""
+    text = str(name or "")
+    if text in SCENE_ROOT_NODE_NAMES:
+        return True
+    # Navigation_2 / Occluder_0 这类带序号的名字(多层导航 / 遮挡体)
+    for prefix in ("Navigation_", "Occluder_"):
+        if text.startswith(prefix) and text[len(prefix):].isdigit():
+            return True
+    return False
+
+
+def flatten_collection_root(payload, root_name, reserved=True):
+    """展平 glb 里 `root_name`(场景根集合)那一层,返回 (payload, 保留名单, 改过没)。
+
+    只改 `payload` 里的 `scenes[0].nodes` 和根集合自己的 `children` ——
+    **不动 nodes 数组**(所以不需要重映射任何索引,动画通道 / skin 引用
+    全都不受影响)。
+
+    * 与 `.tscn` 根下节点重名的顶层集合(见 is_scene_root_reserved)
+      **留在原地**:根集合节点因此保留,它们挂在 `Scene Collection/` 下;
+    * 只有**唯一一个根节点、且名字等于 root_name** 时才动手 ——
+      老版本 Blender 不支持集合模式,导出的是"扁平的多个根",
+      绝不能把某个碰巧叫这个名字的对象当集合展平;
+    * `root_name` 下面没有子节点时也不动手(空场景,没什么可展平的)。
+    """
+    scenes = payload.get("scenes") or []
+    nodes = payload.get("nodes") or []
+    if not scenes or not nodes:
+        return payload, [], False
+    roots = scenes[0].get("nodes")
+    if not isinstance(roots, list) or len(roots) != 1:
+        return payload, [], False
+    head = roots[0]
+    if not isinstance(head, int) or not (0 <= head < len(nodes)):
+        return payload, [], False
+    if nodes[head].get("name") != root_name:
+        return payload, [], False
+    children = nodes[head].get("children")
+    if not isinstance(children, list) or not children:
+        return payload, [], False
+
+    def name_of(index):
+        if isinstance(index, int) and 0 <= index < len(nodes):
+            return str(nodes[index].get("name") or "")
+        return ""
+
+    keep = [child for child in children
+            if reserved and is_scene_root_reserved(name_of(child))]
+    lift = [child for child in children if child not in keep]
+    if not lift:
+        # 顶层全撞名 -> 一个都不提升(Scene Collection 保持原样)
+        return payload, [name_of(child) for child in keep], False
+    if keep:
+        nodes[head]["children"] = keep
+        roots[:] = [head] + lift
+    else:
+        nodes[head].pop("children", None)
+        roots[:] = lift
+    return payload, [name_of(child) for child in keep], True
+
+
+def read_glb_payload(path):
+    """读 .glb 的 JSON 块;读不到返回 None(离线可测的纯函数)。"""
+    import json
+    import struct
+
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    offset = 12
+    while offset + 8 <= len(data):
+        length, kind = struct.unpack_from("<II", data, offset)
+        offset += 8
+        if kind == 0x4E4F534A:              # "JSON"
+            try:
+                return json.loads(data[offset:offset + length].decode("utf-8"))
+            except ValueError:
+                return None
+        offset += length
+    return None
+
+
+def write_glb_payload(path, payload):
+    """把 JSON 写回 .glb(二进制块原样搬走)。返回是否成功。
+
+    ── 为什么要自己写 ──────────────────────────────────────────────
+    展平场景根集合只能**导出之后**做(导出器永远会带上那一层),
+    而 .glb 是个二进制容器:12 字节头 + JSON 块 + BIN 块。
+    重排时要守规范:JSON 块 4 字节对齐(补空格)、BIN 块原样保留
+    (不足 4 字节才在末尾补零)、头里的总长度重算。只在末尾补字节,
+    已经写好的顶点数据一个 bit 都不动。
+    """
+    import json
+    import struct
+
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return False
+    if len(data) < 12:
+        return False
+    binary = b""
+    offset = 12
+    while offset + 8 <= len(data):
+        length, kind = struct.unpack_from("<II", data, offset)
+        offset += 8
+        body = data[offset:offset + length]
+        offset += length
+        if kind == 0x004E4942:              # "BIN\0"
+            binary = body
+    text = json.dumps(payload, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+    text += b" " * ((4 - len(text) % 4) % 4)
+    if binary and len(binary) % 4:
+        binary += b"\x00" * (4 - len(binary) % 4)
+    total = 12 + 8 + len(text) + (8 + len(binary) if binary else 0)
+    blob = bytearray()
+    blob += struct.pack("<III", 0x46546C67, 2, total)   # magic / version / 总长
+    blob += struct.pack("<II", len(text), 0x4E4F534A) + text
+    if binary:
+        blob += struct.pack("<II", len(binary), 0x004E4942) + binary
+    try:
+        with open(path, "wb") as handle:
+            handle.write(bytes(blob))
+    except OSError:
+        return False
+    return True
+
+
+def flatten_scene_glb(path, root_name):
+    """展平 .glb 里的场景根集合。返回 (是否改过, 保留名单, 提示文本)。
+
+    提示文本 = "该让用户知道的事"(重名保留了一层 / 处理失败的原因);
+    什么都没发生时是空串 —— 调用方把它收进导出报告的提示里。
+    """
+    payload = read_glb_payload(path)
+    if payload is None:
+        return False, [], ""
+    _payload, kept, changed = flatten_collection_root(payload, root_name, True)
+    if not changed:
+        return False, kept, ""
+    if not write_glb_payload(path, payload):
+        return False, kept, "集合分组写回失败(glb 文件没能更新,场景仍是扁平结构)"
+    return True, kept, ""
+
+
 def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
     """把**整个 Blender 场景**导出成一个 .glb(保持层级与变换)。
 
@@ -2937,6 +3114,11 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
     导出后再恢复原来的选中状态。
     """
     import bpy
+
+    # 集合层级的提示出口(第一百零二轮):和 `_run_gltf_export._notes`
+    # 同一套路 —— 函数属性当日志,调用方(export_assets_pipeline)
+    # 在调用之后读走、收进导出报告。每次调用都重置,不会串上次的。
+    export_scene_glb.last_notes = []
 
     scene = scene or bpy.context.scene
     if scene is None:
@@ -3027,6 +3209,11 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         # (能按 Blender 的强度算 energy)。实测:导出的场景灯光效果一样。
         "export_lights": False,
         "export_extras": True,
+        # ── 集合层级(第一百零二轮)────────────────────────────────────
+        # 集合树原样进 glb(见文件上方那一节)。老版本 Blender 没有这个
+        # 参数时 `_run_gltf_export` 会自动降级重试(丢掉参数、导扁平结构),
+        # 后面展平那一步找不到 `Scene Collection` 节点,自然什么都不做。
+        "export_hierarchy_full_collections": True,
     }
     # ── 只导出**当前这个场景**(第八十七轮:多场景时串场景)────────────
     # 不传这个开关时,导出器会把 **.blend 里所有场景**都算进来,
@@ -3062,6 +3249,22 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
             obj.hide_set(True)
         except Exception:
             pass
+
+    # ── 集合层级(第一百零二轮):把 glb 里"场景根集合"那一层展平 ───────
+    # 只在导出成功时做。`scene.collection.name` 就是 Blender 场景根集合的
+    # 数据名(不随界面语言变),按它找那一层 —— 找不到(老版本 Blender
+    # 降级成了扁平导出)就什么都不做,不会有任何误伤。
+    if result[1]:
+        _changed, kept, note = flatten_scene_glb(
+            path, str(getattr(scene.collection, "name", "") or ""))
+        if note:
+            export_scene_glb.last_notes.append(note)
+        if kept:
+            export_scene_glb.last_notes.append(
+                "有集合和导出生成的分组重名,已保留『Scene Collection』前缀:"
+                + "、".join(f"『{name}』" for name in kept)
+                + "(重名的就是碰撞 / 粒子 / 环境 / 导航 / 遮挡这几类节点;"
+                "想让它们也直接出现在场景根下,把集合改个名再导出即可)")
 
     if result[1] and skipped:
         return result[0], True, (f"已导出 {os.path.basename(path)}"
@@ -7247,7 +7450,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     """
     import bpy
 
-    result = {"written": [], "warnings": [], "error": None,
+    result = {"written": [], "warnings": [], "notes": [], "error": None,
               "bodies": 0, "materials": 0, "textures": 0,
               "cameras": 0, "lights": 0}
     if scene is None or not directory:
@@ -7358,6 +7561,13 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         # 结果是"导出失败"这件事本身又把插件搞崩一次,用户看到的是
         # 一堆看不懂的 Python traceback,而不是"导出失败了,原因是…"。
         result["warnings"].append(f"整场景导出失败: {world_message}")
+
+    # ── 集合层级的提示(第一百零二轮)────────────────────────────────
+    # 整场景导出会把 Blender 的集合树写进 glb,再把"场景根集合"那一层
+    # 展平,Godot 里直接看到用户的集合名。这里把"重名保留了一层 /
+    # 展平失败"这类值得让用户知道的事收进报告 —— 平时是空的,不占地方。
+    for note in getattr(export_scene_glb, "last_notes", ()) or ():
+        result["notes"].append(note)
 
     # ---- 2) 材质(必须在包装场景之前)----
     #
@@ -7697,7 +7907,7 @@ def export_all_scenes(directory, dimension=None, script_name=None):
     from . import exporter
 
     merged = {"error": None, "scenes": [], "written": [], "warnings": [],
-              "main_scene": "", "single": True, "deleted": [],
+              "notes": [], "main_scene": "", "single": True, "deleted": [],
               "materials": 0, "bodies": 0, "cameras": 0, "lights": 0}
     if not directory:
         merged["error"] = "没有项目目录"
@@ -7806,6 +8016,7 @@ def export_all_scenes(directory, dimension=None, script_name=None):
 
         merged["written"].extend(entry["written"])
         merged["warnings"].extend(entry["warnings"])
+        merged["notes"].extend(outcome.get("notes", []) or [])
         merged["materials"] += int(outcome.get("materials", 0) or 0)
         merged["bodies"] += int(outcome.get("bodies", 0) or 0)
         merged["cameras"] += int(outcome.get("cameras", 0) or 0)
