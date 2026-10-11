@@ -19208,5 +19208,166 @@ class TestRound102Collections(Base):
                              inspect.getsource(func))
 
 
+class TestRound103UiWysiwyg(Base):
+    """第一百零三轮:界面设计"所见即所得"(拖动摆放)的纯逻辑。
+
+    ── 这一层锁住的四条事实(改代码前先看)────────────────────────────
+    1. **画和拖共用同一份布局**(`preview_layout`)—— 各算各的就会出现
+       "看到的位置和拖到的位置差一截";
+    2. **自由拖的基准是"当前实际位置"**(`current`),不是卡片上的旧 X/Y
+       —— "贴底居中"这类对齐下卡片 X/Y 不参与布局,拿旧值加会**跳位**;
+    3. **约束拖只改边距**:对齐全含 LEFT/RIGHT/TOP/BOTTOM 时按"位移大的
+       方向"折算,纯『居中』拖不动(返回空 + 提示按 Shift);
+    4. 命中测试取**最上层**(父先子后 -> 从后往前找);圆角几何纯函数
+       (radius=0 退化成直角、半径被夹到 min(宽,高)/2)。
+    """
+
+    class FakeNode(dict):
+        """最小节点替身:只带拖动真正读的那几个属性。"""
+
+        def __init__(self, align="TOP_LEFT", x=0.0, y=0.0, margin=24.0):
+            super().__init__()
+            self.name = "假控件"
+            self.gk_align = align
+            self.gk_x = x
+            self.gk_y = y
+            self.gk_margin = margin
+
+    # ---- 布局 ----
+    def test_layout_scales_to_fit_and_centers(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        layout = wys.preview_layout(800, 600, 1152, 648)
+        self.assertIsNotNone(layout)
+        expected = min(752.0 / 1152.0, 552.0 / 648.0)
+        self.assertAlmostEqual(layout["scale"], expected, places=9)
+        self.assertAlmostEqual(layout["box_w"], 1152 * expected, places=6)
+        self.assertAlmostEqual(layout["x0"],
+                               (800 - layout["box_w"]) * 0.5, places=6)
+
+    def test_layout_rejects_bad_sizes(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        self.assertIsNone(wys.preview_layout(0, 600, 1152, 648))
+        self.assertIsNone(wys.preview_layout(800, 600, 0, 648))
+        self.assertIsNone(wys.preview_layout(40, 40, 1152, 648))  # 比 pad 还小
+
+    def test_design_screen_round_trip(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        layout = wys.preview_layout(800, 600, 1152, 648)
+        left, bottom, _right, top = wys.design_to_screen(
+            (100.0, 50.0, 200.0, 80.0), layout, 648.0)
+        self.assertAlmostEqual(left,
+                               layout["x0"] + 100 * layout["scale"], places=6)
+        got_x, got_y = wys.screen_to_design(left, top, layout, 648.0)
+        self.assertAlmostEqual(got_x, 100.0, places=6)
+        self.assertAlmostEqual(got_y, 50.0, places=6)
+
+    # ---- 命中 ----
+    def test_hit_test_prefers_topmost(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        parent = ("父", 0.0, 0.0, 300.0, 200.0, 0, self.FakeNode())
+        child = ("子", 10.0, 10.0, 100.0, 80.0, 1, self.FakeNode())
+        hit = wys.hit_test([parent, child], 50.0, 50.0)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "子")            # 子画在父上面
+        self.assertIsNone(wys.hit_test([parent, child], 500.0, 500.0))
+
+    # ---- 拖动写回 ----
+    def test_free_drag_uses_current_position_not_card_value(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        node = self.FakeNode("BOTTOM_CENTER", x=0.0, y=0.0, margin=44.0)
+        changes = wys.drag_writeback(node, 30.0, -20.0, free=True,
+                                     current=(120.0, 500.0))
+        self.assertEqual(changes["gk_align"], "TOP_LEFT")
+        # 基准是"当前实际位置"(120,500),不是卡片上的旧 X/Y(0,0)
+        self.assertAlmostEqual(changes["gk_x"], 150.0, places=6)
+        self.assertAlmostEqual(changes["gk_y"], 480.0, places=6)
+
+    def test_top_left_drag_uses_card_values_when_no_current(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        node = self.FakeNode("TOP_LEFT", x=40.0, y=30.0)
+        changes = wys.drag_writeback(node, 10.0, 5.0)
+        self.assertAlmostEqual(changes["gk_x"], 50.0, places=6)
+        self.assertAlmostEqual(changes["gk_y"], 35.0, places=6)
+
+    def test_constrained_drag_changes_margin_only(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        # 贴底居中:往上拖 20 -> 离底边更远 -> margin +20
+        node = self.FakeNode("BOTTOM_CENTER", margin=24.0)
+        changes = wys.drag_writeback(node, 5.0, -20.0)
+        self.assertEqual(list(changes), ["gk_margin"])
+        self.assertAlmostEqual(changes["gk_margin"], 44.0, places=6)
+        # 贴顶居中:往下拖 -> margin +20
+        self.assertAlmostEqual(
+            wys.drag_writeback(self.FakeNode("TOP_CENTER", margin=24.0),
+                               0.0, 20.0)["gk_margin"], 44.0, places=6)
+        # 靠左居中:往右拖 -> margin +20
+        self.assertAlmostEqual(
+            wys.drag_writeback(self.FakeNode("CENTER_LEFT", margin=24.0),
+                               20.0, 0.0)["gk_margin"], 44.0, places=6)
+        # 靠右居中:往右拖 -> 离右边更近 -> margin -20
+        self.assertAlmostEqual(
+            wys.drag_writeback(self.FakeNode("CENTER_RIGHT", margin=44.0),
+                               20.0, 0.0)["gk_margin"], 24.0, places=6)
+
+    def test_margin_never_negative(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        node = self.FakeNode("BOTTOM_CENTER", margin=10.0)
+        self.assertAlmostEqual(
+            wys.drag_writeback(node, 0.0, 50.0)["gk_margin"], 0.0, places=6)
+
+    def test_diagonal_align_uses_main_axis(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        # 右上:两个方向都含 -> 位移大的方向说了算(横向大 -> 用 RIGHT 公式)
+        changes = wys.drag_writeback(self.FakeNode("TOP_RIGHT", margin=30.0),
+                                     25.0, -5.0)
+        self.assertAlmostEqual(changes["gk_margin"], 5.0, places=6)
+        # 纵向大 -> 用 TOP 公式
+        changes = wys.drag_writeback(self.FakeNode("TOP_RIGHT", margin=30.0),
+                                     5.0, 25.0)
+        self.assertAlmostEqual(changes["gk_margin"], 55.0, places=6)
+
+    def test_center_cannot_constrained_drag(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        node = self.FakeNode("CENTER", margin=24.0)
+        self.assertEqual(wys.drag_writeback(node, 30.0, 30.0), {})
+        self.assertIn("Shift", wys.drag_hint(node))
+        self.assertEqual(wys.drag_hint(self.FakeNode("TOP_LEFT")), "")
+
+    def test_clamp_design_point(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        self.assertEqual(wys.clamp_design_point(-5.0, 700.0, 1152.0, 648.0),
+                         (0.0, 648.0))
+        self.assertEqual(wys.clamp_design_point(100.0, 200.0, 1152.0, 648.0),
+                         (100.0, 200.0))
+
+    # ---- 圆角几何 ----
+    def test_rounded_rect_degenerates_to_rect(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        points = wys.rounded_rect_fan(0.0, 0.0, 100.0, 50.0, 0.0)
+        self.assertEqual(len(points), 6)          # 中心 + 4 角 + 首点
+        self.assertEqual(points[0], (50.0, 25.0))
+        self.assertEqual(sorted(points[1:5]), sorted([(0.0, 0.0), (100.0, 0.0),
+                                                      (100.0, 50.0), (0.0, 50.0)]))
+
+    def test_rounded_rect_stays_inside_bounds(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        points = wys.rounded_rect_fan(10.0, 20.0, 200.0, 100.0, 16.0)
+        self.assertGreater(len(points), 6)
+        for x, y in points:
+            self.assertGreaterEqual(x, 10.0 - 1e-6)
+            self.assertLessEqual(x, 210.0 + 1e-6)
+            self.assertGreaterEqual(y, 20.0 - 1e-6)
+            self.assertLessEqual(y, 120.0 + 1e-6)
+
+    def test_rounded_rect_clamps_huge_radius(self):
+        from BlenderGameKit import ui_wysiwyg as wys
+        points = wys.rounded_rect_fan(0.0, 0.0, 40.0, 20.0, 999.0)
+        for x, y in points:
+            self.assertGreaterEqual(x, -1e-6)
+            self.assertLessEqual(x, 40.0 + 1e-6)
+            self.assertGreaterEqual(y, -1e-6)
+            self.assertLessEqual(y, 20.0 + 1e-6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

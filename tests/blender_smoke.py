@@ -5868,6 +5868,157 @@ def main():
         check("第一百零二轮(集合层级)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零三轮:界面"所见即所得"(拖动摆放)--------------------
+    # 真 Blender 才能验的:拖动这条链路的**换算 + 写回 + 状态机** ——
+    # 假鼠标事件直接喂 modal 方法(它只读 region 的宽高 / 鼠标坐标,
+    # 事件就是个普通对象),不用真 GUI。**真正的"画"**仍然只有真 GUI 能跑
+    # (无头没有 gpu 上下文),那部分交给 scripts\check_ui_drag.py。
+    try:
+        import types as _r103_types
+
+        from importlib import import_module as _r103_import
+        r103_ui = _r103_import(f"{module_name}.ui")
+        r103_wys = _r103_import(f"{module_name}.ui_wysiwyg")
+
+        check("第一百零三轮:拖动算子注册了(gk.ui_drag_widget)",
+              "ui_drag_widget" in dir(bpy.ops.gk))
+        # 逻辑层:没在设计图里 -> invoke 返回 CANCELLED(不进入拖动模式)。
+        # ⚠ 这里不用 `bpy.ops` 断精确返回值:无头下没有窗口事件,Blender
+        # 可能给 `PASS_THROUGH`("事件没被处理"),那不代表算子坏了。
+        r103_probe = _r103_types.SimpleNamespace(
+            report=lambda *args, **kwargs: None)
+        r103_blocked = r103_ui.GK_OT_UiDragWidget.invoke(
+            r103_probe, bpy.context, None)
+        check("第一百零三轮:没在设计图里点『拖动摆放』-> 被拦下(不崩)",
+              r103_blocked == {"CANCELLED"}, str(r103_blocked))
+        check("第一百零三轮:从算子入口点一下也不会崩",
+              bpy.ops.gk.ui_drag_widget() != {"RUNNING_MODAL"})
+
+        r103_design = bpy.data.node_groups.new("界面拖动冒烟103", "GKUiDesignTree")
+        r103_panel = r103_design.nodes.new("GKNodeUiPanel")
+        r103_panel.name = "冒烟拖底板"
+        r103_panel.gk_width = 300.0
+        r103_panel.gk_height = 200.0
+        r103_panel.gk_x = 40.0
+        r103_panel.gk_y = 30.0
+        r103_tip = r103_design.nodes.new("GKNodeUiText")
+        r103_tip.name = "冒烟拖提示"
+        r103_tip.gk_text = "贴底"
+        r103_tip.gk_align = "BOTTOM_CENTER"
+        r103_tip.gk_margin = 24.0
+
+        r103_region = _r103_types.SimpleNamespace(width=800, height=600,
+                                                  x=0.0, y=0.0)
+        # 拿**未绑定方法** + 假 self 跑 modal 逻辑:算子实例要真 GUI 才建得
+        # 出来,而这段逻辑只依赖 region / 事件 / 节点属性。
+        r103_self = _r103_types.SimpleNamespace(
+            _tree=r103_design, _region=r103_region, _area=None,
+            _row=None, _free=False, _anchor=(0.0, 0.0))
+        r103_self._set_header = lambda text: None
+        r103_self._redraw = lambda: None
+        r103_self._point = lambda event: r103_ui.GK_OT_UiDragWidget._point(
+            r103_self, event)
+        r103_self._current_offset = lambda node: (
+            r103_ui.GK_OT_UiDragWidget._current_offset(r103_self, node))
+        r103_self._drag_to = lambda point: r103_ui.GK_OT_UiDragWidget._drag_to(
+            r103_self, point)
+        r103_self._finish = lambda context: r103_ui.GK_OT_UiDragWidget._finish(
+            r103_self, context)
+
+        r103_ui._UI_DRAG_STATE.update({"hover": "", "active": "", "hint": ""})
+
+        def _r103_event(kind, value="PRESS", mx=0.0, my=0.0, shift=False):
+            return _r103_types.SimpleNamespace(
+                type=kind, value=value, mouse_x=mx, mouse_y=my, shift=shift)
+
+        def _r103_mouse(dx, dy):
+            """设计坐标 -> 窗口鼠标坐标(和拖动用同一份布局换算)。"""
+            layout = r103_wys.preview_layout(800, 600, 1152, 648)
+            return (layout["x0"] + dx * layout["scale"],
+                    layout["y0"] + (648.0 - dy) * layout["scale"])
+
+        def _r103_send(kind, value="PRESS", dx=0.0, dy=0.0, shift=False):
+            mx, my = _r103_mouse(dx, dy)
+            return r103_ui.GK_OT_UiDragWidget._modal(
+                r103_self, bpy.context, _r103_event(kind, value, mx, my, shift))
+
+        def _r103_center_of(name):
+            """控件中心的设计坐标(拖动前后位置会变,每次现算)。"""
+            for row in r103_ui._ui_preview_rects(r103_design):
+                if row[0] == name:
+                    return (row[1] + row[3] * 0.5, row[2] + row[4] * 0.5)
+            return (0.0, 0.0)
+
+        # ① 悬停:鼠标底下的控件加亮
+        cx, cy = _r103_center_of("冒烟拖底板")
+        _r103_send("MOUSEMOVE", "NOTHING", cx, cy)
+        check("第一百零三轮:鼠标底下的控件会加亮(hover 命中)",
+              r103_ui._UI_DRAG_STATE["hover"] == "冒烟拖底板",
+              str(r103_ui._UI_DRAG_STATE["hover"]))
+
+        # ② 按下 + 拖动:左上对齐 -> 写 X/Y(增量 = 鼠标位移的设计像素)
+        _r103_send("LEFTMOUSE", "PRESS", cx, cy)
+        check("第一百零三轮:按住后进入拖动(active 记着是谁)",
+              r103_ui._UI_DRAG_STATE["active"] == "冒烟拖底板")
+        _r103_send("MOUSEMOVE", "NOTHING", cx + 40.0, cy + 30.0)
+        check("第一百零三轮:拖着走(写回 X/Y,增量按设计像素)",
+              abs(float(r103_panel.gk_x) - 80.0) < 0.6
+              and abs(float(r103_panel.gk_y) - 60.0) < 0.6,
+              f"x={r103_panel.gk_x} y={r103_panel.gk_y}")
+        _r103_send("LEFTMOUSE", "RELEASE", cx + 40.0, cy + 30.0)
+        check("第一百零三轮:松手结束这一次拖(active 清空)",
+              r103_ui._UI_DRAG_STATE["active"] == "")
+
+        # ③ 约束拖:贴底居中的控件竖着拖 -> 只改『边距』、对齐不动
+        cx, cy = _r103_center_of("冒烟拖提示")
+        _r103_send("LEFTMOUSE", "PRESS", cx, cy)
+        _r103_send("MOUSEMOVE", "NOTHING", cx + 5.0, cy - 20.0)
+        check("第一百零三轮:贴底居中拖着动『边距』(对齐没坏)",
+              abs(float(r103_tip.gk_margin) - 44.0) < 0.6
+              and str(r103_tip.gk_align) == "BOTTOM_CENTER",
+              f"margin={r103_tip.gk_margin} align={r103_tip.gk_align}")
+        _r103_send("LEFTMOUSE", "RELEASE", cx + 5.0, cy - 20.0)
+
+        # ④ Shift 自由拖:切成『左上』并写 X/Y —— 基准是**当前实际位置**,
+        #    不能拿卡片上的旧 gk_x(=0)加,否则会跳位(纯逻辑单测锁着这条)
+        cx, cy = _r103_center_of("冒烟拖提示")
+        r103_row = [row for row in r103_ui._ui_preview_rects(r103_design)
+                    if row[0] == "冒烟拖提示"][0]
+        r103_box_x, r103_box_y = float(r103_row[1]), float(r103_row[2])
+        _r103_send("LEFTMOUSE", "PRESS", cx, cy, shift=True)
+        _r103_send("MOUSEMOVE", "NOTHING", cx + 30.0, cy, shift=True)
+        check("第一百零三轮:Shift 自由拖 -> 切成『左上』+ X/Y 不跳位",
+              str(r103_tip.gk_align) == "TOP_LEFT"
+              and abs(float(r103_tip.gk_x) - (r103_box_x + 30.0)) < 1.5
+              and abs(float(r103_tip.gk_y) - r103_box_y) < 1.5,
+              f"align={r103_tip.gk_align} x={r103_tip.gk_x} "
+              f"y={r103_tip.gk_y}(期望 x≈{r103_box_x + 30.0} "
+              f"y≈{r103_box_y})")
+        _r103_send("LEFTMOUSE", "RELEASE", cx + 30.0, cy, shift=True)
+
+        # ⑤ Esc 退出:状态清干净
+        _r103_send("MOUSEMOVE", "NOTHING", cx, cy)
+        _r103_send("ESC", "PRESS", cx, cy)
+        check("第一百零三轮:Esc 退出后悬停/提示/拖拽都清干净",
+              not any(r103_ui._UI_DRAG_STATE.values()),
+              str(r103_ui._UI_DRAG_STATE))
+
+        # ⑥ 接线:预览改用纯函数布局 + 图片贴真图(出错会退回底色)
+        import inspect as _r103_inspect
+        r103_draw_src = _r103_inspect.getsource(r103_ui._ui_preview_draw)
+        r103_image_src = _r103_inspect.getsource(
+            r103_ui._ui_preview_draw_images)
+        check("第一百零三轮:预览用纯函数布局 + 圆角 + 真图(有兜底)",
+              "preview_layout(" in r103_draw_src
+              and "design_to_screen(" in r103_draw_src
+              and "rounded_rect_fan(" in r103_draw_src
+              and 'from_builtin("IMAGE")' in r103_image_src)
+
+        bpy.data.node_groups.remove(r103_design)
+    except Exception as exc:
+        check("第一百零三轮(界面所见即所得)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

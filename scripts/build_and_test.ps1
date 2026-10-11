@@ -819,6 +819,28 @@ if ($SkipGodot) {
         }
     }
 
+    # 5v. 界面"所见即所得"的真 GUI 校验(第一百零三轮)—— 真开一次 Blender
+    #     窗口,在真 3D 视口上把界面预览画一遍(无头模式没有 GPU 上下文,
+    #     圆角 / 贴真图这条链只能这样验),并截图到 _dist 供人工看。
+    #     ⚠ 会闪一下窗口;没装 Blender / 起不了窗口时自动跳过。
+    Write-Output ""
+    $dragChecker = Join-Path $Root "scripts\check_ui_drag.py"
+    if (-not (Test-Path $dragChecker)) {
+        Write-Output "跳过界面真机校验:还没有 scripts\check_ui_drag.py"
+    } else {
+        $dragOut = & python $dragChecker --blender $Blender 2>&1 | Out-String
+        $dragOut -split "`n" | Where-Object {
+            $_ -match "^(UI_DRAG|CHECK_UI_DRAG|跳过|✗)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($dragOut -match "CHECK_UI_DRAG=OK") {
+            $godotRan += "界面真机校验"
+        } elseif ($dragOut -match "跳过") {
+            Write-Output "（界面真机校验跳过）"
+        } else {
+            $godotOk = $false
+        }
+    }
+
     if ($godotSkipped) {
         Write-Output "（本机没装 Godot,端到端这一关跳过;装了 Godot 才能算真正跑通）"
     } elseif ($godotOk) {

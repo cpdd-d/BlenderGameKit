@@ -814,6 +814,39 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零三轮:界面设计图面板(拖动按钮 + 从 0 到 1 引导)------
+    # 拖动按钮必须画出来(第 7 节还会自动验它是个真算子);引导那五行要
+    # 真的出现在面板上 —— 用户问的"从什么到什么"就是靠它回答的。
+    print("=" * 72)
+    print("6.5 界面设计图面板(第一百零三轮)")
+    print("=" * 72)
+    try:
+        design = bpy.data.node_groups.new("面板冒烟界面103", "GKUiDesignTree")
+        widget = design.nodes.new("GKNodeUiText")
+        widget.name = "面板冒烟标题"
+        widget.gk_text = "标题"
+        panel = getattr(ui, "GK_PT_UiDesign", None)
+        if panel is None:
+            check("GK_PT_UiDesign 存在", False, "类找不到")
+        else:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, design))
+            ops_drawn = [str(name) for name in layout.operator_names]
+            texts = " ".join(str(item) for item in layout.texts)
+            check("界面面板:画出了『拖动摆放控件』按钮",
+                  "gk.ui_drag_widget" in ops_drawn, str(ops_drawn))
+            check("界面面板:『从 0 到 1』五步引导都在",
+                  "从 0 到 1" in texts and "① 定屏幕" in texts
+                  and "⑤ 验收" in texts, texts[:260])
+            check("界面面板:控件清单还在(父 → 子)",
+                  "面板冒烟标题" in texts, texts[:260])
+        bpy.data.node_groups.remove(design)
+    except Exception as exc:
+        check("界面设计图面板(第一百零三轮)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

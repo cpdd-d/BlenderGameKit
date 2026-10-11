@@ -10,6 +10,7 @@ from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
                exporter, gk_log, logic_info, project)
 from . import asset_export
 from . import node_groups
+from . import ui_wysiwyg
 from . import operator_io as ops
 from . import packaging
 from . import properties as props
@@ -667,6 +668,289 @@ def _ui_preview_average_color(node):
     except Exception:                                     # noqa: BLE001
         return (0.35, 0.35, 0.40, 0.85)
 
+def _ui_rect_lines(left, bottom, right, top):
+    """矩形的四条边(LINES 模式要的点对)。"""
+    return ((left, bottom), (right, bottom),
+            (right, bottom), (right, top),
+            (right, top), (left, top),
+            (left, top), (left, bottom))
+
+
+# 图片 / 九宫格控件的 GPU 纹理缓存:按 "图片名|宽x高" 存。
+# 每帧新建纹理太贵;图片换了 / 改了尺寸就会算出新键 —— 旧键留在字典里
+# 没关系(注销时整个清掉)。
+_UI_PREVIEW_TEXTURES = {}
+
+
+def _ui_preview_image_texture(name):
+    """按图片名拿一个缓存的 GPU 纹理(建不出来返回 None)。"""
+    try:
+        image = bpy.data.images.get(str(name))
+        size = getattr(image, "size", None)
+        if image is None or not size or int(size[0]) == 0:
+            return None
+        key = f"{name}|{int(size[0])}x{int(size[1])}"
+        texture = _UI_PREVIEW_TEXTURES.get(key)
+        if texture is None:
+            import gpu
+            texture = gpu.texture.from_image(image)
+            _UI_PREVIEW_TEXTURES[key] = texture
+        return texture
+    except Exception as exc:                              # noqa: BLE001
+        _UI_PREVIEW_ERROR[:] = [f"纹理 {name}: {type(exc).__name__}: {exc}"]
+        return None
+
+
+def _ui_preview_draw_images(images):
+    """把图片 / 九宫格控件贴成**真图**(整图拉伸,先不做九宫切片)。
+
+    ── 出错就退(这几层 try 是故意的)────────────────────────────────
+    这一段是"锦上添花":shader 名字对不上 / 图片格式怪 / 没有 GPU 上下文
+    (无头模式)……任何一种不成立都只是"没有真图",控件底色(平均色)还在 ——
+    绝不能因为贴图失败把整帧预览吞掉。
+    """
+    if not images:
+        return
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        shader = gpu.shader.from_builtin("IMAGE")
+    except Exception as exc:                              # noqa: BLE001
+        _UI_PREVIEW_ERROR[:] = [f"图片 shader: {type(exc).__name__}: {exc}"]
+        return
+    for name, (left, bottom, right, top) in images:
+        texture = _ui_preview_image_texture(name)
+        if texture is None:
+            continue
+        try:
+            verts = [(left, bottom), (right, bottom), (right, top),
+                     (left, bottom), (right, top), (left, top)]
+            uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0),
+                   (0.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+            batch = batch_for_shader(shader, "TRIS",
+                                     {"pos": verts, "texCoord": uvs})
+            shader.bind()
+            shader.uniform_sampler("image", texture)
+            batch.draw(shader)
+        except Exception as exc:                          # noqa: BLE001
+            _UI_PREVIEW_ERROR[:] = [
+                f"贴图 {name}: {type(exc).__name__}: {exc}"]
+            continue
+
+
+# ── 拖动控件(第一百零三轮:所见即所得)─────────────────────────────────
+# 在 3D 视口里直接拖预览里的控件 —— 拖完自动写回卡片(X/Y 或边距)。
+# 绘制回调通过 `_UI_DRAG_STATE` 拿"鼠标底下是谁 / 正在拖谁 / 提示说什么"。
+_UI_DRAG_STATE = {"hover": "", "active": "", "hint": ""}
+
+# 绘制回调里最后一次异常(只留最近一条)。
+# ── 为什么要留这个(第一百零三轮真 GUI 校验踩出来的)────────────────
+# 绘制回调**不许抛异常**(会刷满控制台、连累别的绘制),所以整段包在
+# try 里静默跳过这一帧 —— 副作用是"预览悄悄不画了"几乎没法查:
+# 真 GUI 校验里 `batch_for_shader(..., "TRIANGLE_FAN")` 名字写错,
+# 抛在第一个控件上,后面的图片 / 进度条 / 文字全被吞,而脚本这边
+# 只看到"没贴出图"。留一条最近异常,同一个坑下次一眼就能看见。
+_UI_PREVIEW_ERROR = []
+
+
+def _find_view3d_region(context):
+    """找一个 3D 视口的 WINDOW region(拖动要靠它的坐标换算)。
+
+    点侧栏按钮时 `context.region` 是**侧栏**那个 —— 3D 视口是另一个
+    area,所以要自己从屏幕布局里找。有多个时取**面积最大**的
+    (通常就是用户在看的那个大视口)。
+    """
+    window = getattr(context, "window", None)
+    screen = getattr(window, "screen", None) or getattr(context, "screen", None)
+    best = None
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") != "VIEW_3D":
+            continue
+        for region in getattr(area, "regions", ()) or ():
+            if getattr(region, "type", "") != "WINDOW":
+                continue
+            if best is None or (region.width * region.height
+                                > best.width * best.height):
+                best = region
+    return best
+
+
+class GK_OT_UiDragWidget(bpy.types.Operator):
+    """在 3D 视口里直接拖动界面控件(所见即所得)。
+
+    ── 用法 ────────────────────────────────────────────────────────
+    在设计图侧栏点『拖动摆放』后,鼠标移到 3D 视口的预览上:
+      * 底下的控件会**加亮**,按住左键就能拖;
+      * **默认"约束拖"**:改的是『边距』 —— "贴底居中"这种对齐不会被
+        拖坏(多分辨率自适应还在);位移大的那个方向说了算;
+      * **按住 Shift 拖 = 自由摆放**:自动切成"左上 + X/Y",拖到哪就是哪;
+      * 纯『居中』对齐没有边距可调 —— 视口里会提示按 Shift;
+      * 松手还能继续拖下一个;Esc / 右键退出。
+    """
+    bl_idname = "gk.ui_drag_widget"
+    bl_label = "拖动摆放控件"
+    bl_description = ("在 3D 视口里的预览上直接拖控件(左键拖;"
+                      "按住 Shift = 自由摆放;Esc 退出)")
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        tree = props.current_tree(context)
+        if tree is None or str(getattr(tree, "bl_idname", "")) != "GKUiDesignTree":
+            self.report({"WARNING"}, "先切到『游戏界面』设计图再拖")
+            return {"CANCELLED"}
+        if not getattr(tree, "gk_preview", True):
+            self.report({"WARNING"}, "这张设计图的『显示控件框』关着 —— "
+                                     "先把预览打开再拖")
+            return {"CANCELLED"}
+        region = _find_view3d_region(context)
+        if region is None:
+            self.report({"WARNING"}, "没找到 3D 视口 —— "
+                                     "请在能看到 3D 视口的布局里拖动")
+            return {"CANCELLED"}
+        self._tree = tree
+        self._region = region
+        self._area = getattr(context, "area", None)
+        self._row = None
+        self._free = False
+        self._anchor = (0.0, 0.0)
+        _UI_DRAG_STATE.update({"hover": "", "active": "", "hint": ""})
+        context.window_manager.modal_handler_add(self)
+        self._set_header("拖动摆放:左键拖控件;按住 Shift 自由摆放;Esc 退出")
+        return {"RUNNING_MODAL"}
+
+    # ---- 内部 ----
+    def _set_header(self, text):
+        try:
+            if self._area is not None:
+                self._area.header_text_set(text)
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    def _redraw(self):
+        try:
+            self._region.tag_redraw()
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    def _point(self, event):
+        """鼠标(窗口坐标)-> 设计坐标。布局和预览用同一份计算。"""
+        layout = ui_wysiwyg.preview_layout(
+            self._region.width, self._region.height,
+            float(getattr(self._tree, "gk_design_width", 1152) or 1152),
+            float(getattr(self._tree, "gk_design_height", 648) or 648))
+        if layout is None:
+            return None
+        sx = float(getattr(event, "mouse_x", 0.0)) - float(self._region.x)
+        sy = float(getattr(event, "mouse_y", 0.0)) - float(self._region.y)
+        point = ui_wysiwyg.screen_to_design(
+            sx, sy, layout,
+            float(getattr(self._tree, "gk_design_height", 648) or 648))
+        return ui_wysiwyg.clamp_design_point(
+            point[0], point[1],
+            float(getattr(self._tree, "gk_design_width", 1152) or 1152),
+            float(getattr(self._tree, "gk_design_height", 648) or 648))
+
+    def _current_offset(self, node):
+        """控件**当前实际位置**(相对父控件左上)—— 从预览矩形回读。
+
+        自由拖 / 左上对齐写回时的基准。不能用卡片上的旧 `gk_x`:
+        "贴底居中"这类对齐下 X/Y 不参与布局,拿旧值加增量会跳位
+        (见 ui_wysiwyg.drag_writeback 的说明)。
+        """
+        rows = _ui_preview_rects(self._tree)
+        by_name = {str(row[0]): row for row in rows}
+        row = by_name.get(str(getattr(node, "name", "")))
+        if row is None:
+            return None
+        parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
+        parent = by_name.get(parent_name)
+        px = float(parent[1]) if parent is not None else 0.0
+        py = float(parent[2]) if parent is not None else 0.0
+        return (float(row[1]) - px, float(row[2]) - py)
+
+    def _drag_to(self, point):
+        """按拖动增量写回卡片(增量式:每次只加"这一小段")。"""
+        if self._row is None or len(self._row) < 7:
+            return
+        node = self._row[6]
+        dx = float(point[0]) - float(self._anchor[0])
+        dy = float(point[1]) - float(self._anchor[1])
+        if abs(dx) < 0.01 and abs(dy) < 0.01:
+            return
+        align = str(getattr(node, "gk_align", "") or "").upper()
+        current = None
+        if self._free or align in ("", "TOP_LEFT"):
+            current = self._current_offset(node)
+        changes = ui_wysiwyg.drag_writeback(node, dx, dy, free=self._free,
+                                            current=current)
+        if not changes:
+            _UI_DRAG_STATE["hint"] = ui_wysiwyg.drag_hint(node, self._free)
+            self._redraw()
+            return
+        try:
+            for key, value in changes.items():
+                setattr(node, key, value)
+        except Exception:                                 # noqa: BLE001
+            return
+        self._anchor = point
+        self._redraw()
+
+    def _modal(self, context, event):
+        kind = str(getattr(event, "type", ""))
+        value = str(getattr(event, "value", ""))
+        if kind in {"ESC", "RIGHTMOUSE"} and value == "PRESS":
+            self._finish(context)
+            return {"CANCELLED"}
+        if kind == "MOUSEMOVE":
+            point = self._point(event)
+            if point is not None:
+                if self._row is None:
+                    row = ui_wysiwyg.hit_test(_ui_preview_rects(self._tree),
+                                              point[0], point[1])
+                    name = str(row[0]) if row is not None else ""
+                    if _UI_DRAG_STATE["hover"] != name:
+                        _UI_DRAG_STATE["hover"] = name
+                        self._redraw()
+                else:
+                    self._drag_to(point)
+            return {"RUNNING_MODAL"}
+        if kind == "LEFTMOUSE":
+            if value == "PRESS":
+                point = self._point(event)
+                row = None if point is None else ui_wysiwyg.hit_test(
+                    _ui_preview_rects(self._tree), point[0], point[1])
+                if row is not None and point is not None:
+                    self._row = row
+                    self._anchor = point
+                    # Shift 在**按下那一刻**定:拖到一半再按不算,
+                    # 免得同一段拖动一会儿约束一会儿自由。
+                    self._free = bool(getattr(event, "shift", False))
+                    _UI_DRAG_STATE["active"] = str(row[0])
+                    _UI_DRAG_STATE["hint"] = ui_wysiwyg.drag_hint(row[6],
+                                                                  self._free)
+                    self._redraw()
+            else:
+                self._row = None
+                _UI_DRAG_STATE["active"] = ""
+                _UI_DRAG_STATE["hint"] = ""
+                self._redraw()
+            return {"RUNNING_MODAL"}
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        try:
+            return self._modal(context, event)
+        except Exception:                                 # noqa: BLE001
+            gk_log.exception("拖动界面控件时出错")
+            self._finish(context)
+            return {"CANCELLED"}
+
+    def _finish(self, context):
+        _UI_DRAG_STATE.update({"hover": "", "active": "", "hint": ""})
+        self._set_header(None)
+        self._redraw()
+
+
 # 挂在 3D 视口上的绘制句柄(注册时加、注销时摘)
 _UI_PREVIEW_HANDLE = []
 
@@ -710,15 +994,17 @@ def _ui_preview_draw():
         import gpu
         from gpu_extras.batch import batch_for_shader
 
-        rw, rh = float(region.width), float(region.height)
         design_w = float(getattr(tree, "gk_design_width", 1152) or 1152)
         design_h = float(getattr(tree, "gk_design_height", 648) or 648)
-        scale = min((rw - 48.0) / design_w, (rh - 48.0) / design_h)
-        if scale <= 0.0:
+        # 布局(屏幕框 / 缩放)和**拖动**用同一份计算 —— 看到的和拖到的
+        # 永远一致(见 ui_wysiwyg.preview_layout 的说明)。
+        layout = ui_wysiwyg.preview_layout(region.width, region.height,
+                                           design_w, design_h)
+        if layout is None:
             return
-        box_w, box_h = design_w * scale, design_h * scale
-        x0 = (rw - box_w) * 0.5
-        y0 = (rh - box_h) * 0.5
+        scale = layout["scale"]
+        box_w, box_h = layout["box_w"], layout["box_h"]
+        x0, y0 = layout["x0"], layout["y0"]
 
         shader = gpu.shader.from_builtin("UNIFORM_COLOR")
         gpu.state.blend_set("ALPHA")
@@ -726,7 +1012,11 @@ def _ui_preview_draw():
             # 屏幕框:底色 + 亮边(这就是"游戏窗口"的范围)
             quad = [(x0, y0), (x0 + box_w, y0), (x0 + box_w, y0 + box_h),
                     (x0, y0), (x0 + box_w, y0 + box_h), (x0, y0 + box_h)]
-            batch = batch_for_shader(shader, "TRIANGLES", {"pos": quad})
+            # ⚠ 原语名是 `TRIS`(不是 "TRIANGLES")—— 第一百零三轮真 GUI 校验抓到的:
+            # 名字给错 `batch_for_shader` 直接抛 ValueError,而绘制回调的
+            # 异常被静默吞掉 —— 表现是"预览一直画不出来"却毫无线索
+            # (这个坑从第四十轮起就在,这次一并修掉)。
+            batch = batch_for_shader(shader, "TRIS", {"pos": quad})
             shader.bind()
             shader.uniform_float("color", (0.04, 0.05, 0.08, 0.55))
             batch.draw(shader)
@@ -744,25 +1034,46 @@ def _ui_preview_draw():
             #   进度条 -> 按『当前值/最大值』画比例;图片 -> 平均色打底;
             #   非文字控件补一个小名字(方便对着节点找)。
             # 全部**每帧重读节点值** —— 改设计图里的任何参数,视口这一帧就变。
-            fills = []
+            drag_state = _UI_DRAG_STATE
+            fills = []          # 底色 / 面板:圆角多边形(TRIANGLE_FAN)
+            frames = []         # 每个控件的细边框(LINES)
+            images = []         # 图片 / 九宫格:待会儿贴真图
+            highlights = []     # 拖动模式:鼠标底下 / 正在拖的控件
             texts = []
             bars = []
             for name, rx, ry, width, height, depth, node in _ui_preview_rects(tree):
-                left = x0 + rx * scale
-                bottom = y0 + (design_h - ry - height) * scale
-                right = left + width * scale
-                top = bottom + height * scale
+                # 设计坐标 -> 屏幕坐标:和拖动共用同一个换算
+                left, bottom, right, top = ui_wysiwyg.design_to_screen(
+                    (rx, ry, width, height), layout, design_h)
                 blob = str(getattr(node, "bl_idname", ""))
-                color = (_ui_preview_average_color(node)
-                         if blob == "GKNodeUiImage"
-                         else _ui_preview_rect_color(node, depth))
-                fills.append((((left, bottom), (right, bottom), (right, top),
-                               (left, bottom), (right, top), (left, top)), color))
-                fills.append((((left, bottom), (right, bottom),
-                               (right, bottom), (right, top),
-                               (right, top), (left, top),
-                               (left, top), (left, bottom)),
-                              (0.85, 0.92, 1.0, 0.45)))
+                if blob == "GKNodeUiText":
+                    # 文字控件的 `gk_color` 是**文字色**(不是底色)——
+                    # 拿它填底会"白底白字"把字糊掉(真 GUI 截图看出来的)。
+                    # 文字控件只画字 + 细边框(边框用来"看见范围")。
+                    color = None
+                elif blob in ("GKNodeUiImage", "GKNodeUiNinePatch"):
+                    color = _ui_preview_average_color(node)
+                else:
+                    color = _ui_preview_rect_color(node, depth)
+                if color is not None:
+                    # 填充画**圆角**(控件自己设了『圆角』才画:面板 / 输入框
+                    # 有,其余按直角)。几何是纯函数算的,和拖动共用坐标。
+                    radius = float(getattr(node, "gk_radius", 0.0) or 0.0) * scale
+                    fills.append((ui_wysiwyg.rounded_rect_fan(
+                        left, bottom, right - left, top - bottom, radius),
+                        color))
+                frames.append((_ui_rect_lines(left, bottom, right, top),
+                               (0.85, 0.92, 1.0, 0.45)))
+                if blob in ("GKNodeUiImage", "GKNodeUiNinePatch"):
+                    image_name = str(getattr(node, "gk_image", "") or "")
+                    if image_name:
+                        images.append((image_name, (left, bottom, right, top)))
+                if drag_state.get("hover") == name:
+                    highlights.append((_ui_rect_lines(left, bottom, right, top),
+                                       (1.0, 1.0, 1.0, 0.9)))
+                if drag_state.get("active") == name:
+                    highlights.append((_ui_rect_lines(left, bottom, right, top),
+                                       (1.0, 0.85, 0.30, 1.0)))
                 if blob == "GKNodeUiBar":
                     try:
                         value = float(getattr(node, "gk_value", 0.0) or 0.0)
@@ -771,7 +1082,8 @@ def _ui_preview_draw():
                             0.0, min(1.0, value / biggest))
                     except Exception:                     # noqa: BLE001
                         ratio = 0.0
-                    bars.append((left, bottom, left + (right - left) * ratio, top))
+                    bars.append((left, bottom, right, top,
+                                 left + (right - left) * ratio))
                 text = str(getattr(node, "gk_text", "") or "")
                 raw_color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
                 try:
@@ -799,30 +1111,62 @@ def _ui_preview_draw():
                     texts.append((name, left + 3.0, top - 13.0, 11.0,
                                   (0.85, 0.9, 1.0, 0.75)))
             for verts, color in fills:
-                batch = batch_for_shader(
-                    shader, "LINES" if len(verts) == 8 else "TRIANGLES",
-                    {"pos": verts})
+                # ⚠ primitive 名字是 `TRI_FAN`(不是 "TRIANGLE_FAN")——
+                # 真 GUI 里试出来的:给错名字 batch_for_shader 直接抛,
+                # 而且**一处抛会把后面的图片 / 进度条 / 文字全吞掉**。
+                # 所以这里逐条 try:坏一个控件,别的照画。
+                try:
+                    batch = batch_for_shader(shader, "TRI_FAN",
+                                             {"pos": verts})
+                    shader.bind()
+                    shader.uniform_float("color", color)
+                    batch.draw(shader)
+                except Exception:                         # noqa: BLE001
+                    continue
+            for verts, color in frames:
+                batch = batch_for_shader(shader, "LINES", {"pos": verts})
                 shader.bind()
                 shader.uniform_float("color", color)
                 batch.draw(shader)
-            for left, bottom, right, top in bars:
-                if right - left <= 0.5:
-                    continue
+            # 图片 / 九宫格:贴真图(拿不到图 / 纹理建不出来就保持底色)
+            _ui_preview_draw_images(images)
+            for left, bottom, right, top, filled in bars:
                 verts = ((left, bottom), (right, bottom), (right, top),
                          (left, bottom), (right, top), (left, top))
-                batch = batch_for_shader(shader, "TRIANGLES", {"pos": verts})
+                batch = batch_for_shader(shader, "TRIS", {"pos": verts})
                 shader.bind()
-                shader.uniform_float("color", (0.35, 0.85, 0.45, 0.85))
+                shader.uniform_float("color", (0.10, 0.12, 0.16, 0.85))
+                batch.draw(shader)
+                if filled - left > 0.5:
+                    verts = ((left, bottom), (filled, bottom), (filled, top),
+                             (left, bottom), (filled, top), (left, top))
+                    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+                    shader.bind()
+                    shader.uniform_float("color", (0.35, 0.85, 0.45, 0.85))
+                    batch.draw(shader)
+            for verts, color in highlights:
+                batch = batch_for_shader(shader, "LINES", {"pos": verts})
+                shader.bind()
+                shader.uniform_float("color", color)
                 batch.draw(shader)
             for text, tx, ty, size, color in texts:
                 blf.size(0, size)
                 blf.color(0, color[0], color[1], color[2], color[3])
                 blf.position(0, tx, ty, 0.0)
                 blf.draw(0, text)
+            hint = str(drag_state.get("hint") or "")
+            if hint:
+                blf.size(0, 13)
+                blf.color(0, 1.0, 0.92, 0.55, 0.95)
+                blf.position(0, x0, max(8.0, y0 - 20.0), 0.0)
+                blf.draw(0, hint)
         finally:
             gpu.state.blend_set("NONE")
-    except Exception:                                     # noqa: BLE001
-        # 绘制回调的异常没有任何去处 —— 静默跳过这一帧
+    except Exception as exc:                                 # noqa: BLE001
+        # 绘制回调的异常没有任何去处 —— 静默跳过这一帧。
+        # 但**留一条最近异常**(见 _UI_PREVIEW_ERROR 的说明):"预览悄悄
+        # 不画了"这类问题只能靠它查。
+        _UI_PREVIEW_ERROR[:] = [f"{type(exc).__name__}: {exc}"]
         return
 
 
@@ -835,6 +1179,9 @@ def _remove_ui_preview_handler():
             _bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
         except Exception:                                 # noqa: BLE001
             pass
+    # 纹理缓存跟着一起清(图片可能已经被删/被替换,留着就是悬空引用)
+    _UI_PREVIEW_TEXTURES.clear()
+    _UI_DRAG_STATE.update({"hover": "", "active": "", "hint": ""})
 
 
 class GK_PT_UiDesign(bpy.types.Panel):
@@ -907,14 +1254,23 @@ class GK_PT_UiDesign(bpy.types.Panel):
         row.prop(tree, "gk_design_width", text="宽")
         row.prop(tree, "gk_design_height", text="高")
         box.label(text="按这块屏幕的比例画(近似预览)", icon="INFO")
-
-        # ---- 用法 ----
-        box = layout.box()
-        box.label(text="玩法图放『界面_套用设计』引用本图", icon="INFO")
-        box.label(text="点了做什么 -> 『界面_按钮点击』填控件名")
+        # ── 拖动摆放(第一百零三轮:所见即所得)────────────────────────
         row = box.row(align=True)
-        back = row.operator("gk.switch_tree", text="← 回到游戏逻辑",
-                            icon="LOOP_BACK")
+        row.operator("gk.ui_drag_widget", text="拖动摆放控件", icon="TRACKER")
+        box.label(text="点它 -> 到 3D 视口里直接拖控件", icon="INFO")
+        box.label(text="默认改『边距』(贴边/居中不会坏);Shift = 自由摆放")
+
+        # ---- 从 0 到 1(照这个顺序做一套界面)----
+        box = layout.box()
+        box.label(text="从 0 到 1(按这个顺序来)", icon="CHECKMARK")
+        box.label(text="① 定屏幕:上面的『宽 / 高』")
+        box.label(text="② 摆控件:加控件 + 『拖动摆放控件』")
+        box.label(text="③ 定主题:玩法图放『界面_皮肤』")
+        box.label(text="④ 接行为:玩法图放『界面_套用设计』+『界面_按钮点击』")
+        box.label(text="⑤ 验收:『运行游戏』(F5)看最终观感")
+        row = box.row(align=True)
+        back = row.operator("gk.switch_tree", text="→ 去玩法图摆节点",
+                            icon="LOOP_FORWARD")
         back.target = "GKGameLogicTree"
 
 
@@ -2145,7 +2501,7 @@ def _draw_asset_thumb(shader, batch_for_shader, gpu, blf,
     x1, y1 = x0 + side, y0 + side
 
     def _fill(vertices, color):
-        batch = batch_for_shader(shader, "TRIANGLES", {"pos": vertices})
+        batch = batch_for_shader(shader, "TRIS", {"pos": vertices})
         shader.bind()
         shader.uniform_float("color", color)
         batch.draw(shader)
@@ -6514,6 +6870,8 @@ GK_CLASSES = (
     diagnostics.GK_OT_DumpDiagnostics,
     GK_OT_OpenAnimTree,
     GK_OT_OpenUiDesignTree,
+    # 拖动摆放控件(第一百零三轮:所见即所得)
+    GK_OT_UiDragWidget,
     GK_OT_OpenAiTree,
     GK_OT_OpenDisplayTree,
     GK_OT_DisplayFillCards,
