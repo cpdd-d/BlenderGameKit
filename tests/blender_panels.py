@@ -880,6 +880,73 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 6j. 『导出设置』盒子的瘦身开关(第一百零六轮 B)----
+    # 这个盒子**默认收起**,新加的两个开关只在展开时才画 ——
+    # 属性名 / 参数写错在 Blender 里是当场抛异常、整个 GK_PT_Main 消失。
+    # 这里先把盒子展开再画一遍,顺带验 `text=` 的文字真画出来了
+    # (RecordingLayout 会把 text= 记进 texts)。
+    print("=" * 72)
+    print("6j. 『导出设置』盒子(不导形态键 / 不导切线)")
+    print("=" * 72)
+    try:
+        panel = getattr(ui, "GK_PT_Main", None)
+        gk_settings = getattr(scene, "gk_settings", None)
+        previous = getattr(gk_settings, "show_export_settings", False)
+        gk_settings.show_export_settings = True
+        layout = None
+        draw_error = ""
+        try:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeContext(cube, scene))
+        except Exception as exc:                          # noqa: BLE001
+            draw_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            gk_settings.show_export_settings = previous
+        check("『导出设置』盒子加上两个瘦身开关后仍能画完", not draw_error,
+              draw_error)
+        texts = " ".join(str(item) for item in (layout.texts if layout else []))
+        check("『导出设置』盒子画出了『不导形态键』", "不导形态键" in texts,
+              texts[:200])
+        check("『导出设置』盒子画出了『不导切线』", "不导切线" in texts,
+              texts[:200])
+    except Exception as exc:
+        check("『导出设置』盒子(第一百零六轮 B)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 6k. 『界面_列表_填充』卡片(第一百零六轮 A:每行可点)----
+    # 卡片上多了一行『每行可点』勾选框 —— 属性名 / 参数配错在 Blender 里是
+    # **当场抛异常、卡片整块消失**,冒烟那层只验"节点在、代码对"。
+    print("=" * 72)
+    print("6k. 『界面_列表_填充』卡片(每行可点)")
+    print("=" * 72)
+    try:
+        tree = bpy.data.node_groups.new("面板冒烟列表106", "GKGameLogicTree")
+        fill_card = tree.nodes.new("GKNodeUiListFill")
+        card_error = ""
+        try:
+            card_layout = RecordingLayout()
+            fill_card.draw_buttons(bpy.context, card_layout)
+        except Exception as exc:                          # noqa: BLE001
+            card_error = f"{type(exc).__name__}: {exc}"
+        check("『界面_列表_填充』卡片的 draw_buttons 能画完", not card_error,
+              card_error)
+        texts = " ".join(str(item) for item in card_layout.texts)
+        check("『界面_列表_填充』卡片画出了『每行可点』勾选框",
+              "每行可点" in texts, texts[:200])
+        # 三个出口 + 那个新属性都得是**真的**(写进 tuple 没物化 -> 卡片一样崩)
+        outputs = [pin.name for pin in getattr(fill_card, "outputs", ())]
+        check("『界面_列表_填充』有三个出口(完成 / 点行 / 第几行)",
+              outputs == ["完成", "点行", "第几行"], str(outputs))
+        check("『界面_列表_填充』的『每行可点』真物化过",
+              "gk_clickable" in getattr(type(fill_card), "__annotations__", {}))
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("『界面_列表_填充』卡片(第一百零六轮 A)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 7. 面板画出来的按钮必须都是**真算子**(第六十三轮)----
     #
     # ── 为什么补这一关(用户报的"这里显示得没意义")────────────────────

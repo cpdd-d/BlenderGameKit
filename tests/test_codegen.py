@@ -19842,5 +19842,250 @@ class TestRound105UiModal(Base):
         self.assertNotIn("func _gk_ui_focus_first(", code)
 
 
+class TestRound106ListAndSlim(Base):
+    """第一百零六轮:A 列表可交互 + B 导出瘦身。
+
+    ── A 这一层锁住的三条事实 ─────────────────────────────────────
+    1. 『界面_列表_填充』**不勾『每行可点』时生成物一字不变**(行还是
+       Label、还是 `_gk_list_fill`),勾了才换成按钮版 `_gk_list_fill_click`;
+    2. 行按钮是 **`toggle_mode` + 同一个 `ButtonGroup`** —— 一组只允许
+       一个"按下" = "选中的那一行";`theme_type_variation = "GKListItem"`
+       让皮肤只管列表行(普通按钮的 pressed 不受影响);
+    3. 『第几行』(1 起数)和下拉『选了第几个』**同一条读法**:按列表控件
+       的名字现读它 meta 里的 `gk_index`(`_gk_widget_index`),点行时写进去。
+
+    ── B 这一层锁住的 ────────────────────────────────────────────
+    4. 两个瘦身开关默认**不勾**,勾了才往 gltf 参数里塞
+       `export_morph=False` / `export_tangents=False`;
+    5. Draco **永远显式关掉**(标定过:Godot 4.7 读不了 Draco 压缩的 glb,
+       同一颗球未压缩能加载、压缩后 `Failed loading resource`)。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _list_tree(self, clickable, linked=False):
+        tree = make_tree()
+        event = self._ready(tree)
+        widget = tree.new_node(NN.GKNodeUiList, "日志列表")
+        fill = tree.new_node(NN.GKNodeUiListFill, "填日志", gk_list="日志列表",
+                             gk_text="拾取了钥匙|打开了大门|抵达终点",
+                             gk_clickable=clickable)
+        gk_stub.connect(tree, event, "执行", widget, "执行")
+        gk_stub.connect(tree, widget, "完成", fill, "执行")
+        printer = None
+        if linked:
+            printer = tree.new_node(NN.GKNodePrint, "打印")
+            gk_stub.connect(tree, fill, "点行", printer, "执行")
+        return tree, fill, printer
+
+    # ---- A:出口形状与默认不变 ----
+    def test_list_fill_outputs_shape(self):
+        got = [spec["name"] for spec in NN.GKNodeUiListFill.gk_outputs]
+        self.assertEqual(got, ["完成", "点行", "第几行"])
+
+    def test_list_fill_default_unchanged(self):
+        tree, _fill, _printer = self._list_tree(clickable=False)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 老路:Label + _gk_list_fill;新东西一个字都不多
+        self.assertIn("func _gk_list_fill(list_name: String, items: Array,", code)
+        self.assertIn("var label := Label.new()", code)
+        self.assertNotIn("_gk_list_fill_click", code)
+        self.assertNotIn("GKListItem", code)
+        self.assertNotIn("ButtonGroup", code)
+
+    def test_list_fill_clickable_builds_buttons(self):
+        tree, _fill, _printer = self._list_tree(clickable=True, linked=True)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_list_fill_click(list_name: String, items: Array,",
+                      code)
+        self.assertIn("var row := Button.new()", code)
+        self.assertIn("row.toggle_mode = true", code)
+        self.assertIn("row.button_group = group", code)
+        self.assertIn('row.theme_type_variation = "GKListItem"', code)
+        self.assertIn("row.mouse_filter = Control.MOUSE_FILTER_STOP", code)
+        self.assertIn("row.pressed.connect(_gk_list_row_pressed.bind("
+                      "list_name, index, handler))", code)
+        # 行号写进**列表控件自己**的 meta,再走用户的回调
+        self.assertIn("func _gk_list_row_pressed(list_name: String, index: int,"
+                      " handler: Callable) -> void:", code)
+        funcs = self.functions(code)
+        self.assertIn('found.set_meta("gk_index", index)', funcs["_gk_list_row_pressed"])
+        self.assertIn("handler.call(index)", funcs["_gk_list_row_pressed"])
+        # 『点行』那条链在独立回调里(不会刚建出来就跑)
+        handlers = [name for name in funcs if name.endswith("_row")]
+        handler = next(name for name in handlers
+                       if name != "_gk_list_row_pressed")
+        self.assertIn("func " + handler + "(_index: int) -> void:", code)
+        self.assertIn('print', funcs[handler])
+        self.assertNotIn('print', funcs["_ready"])
+        self.assert_indent_sane(code)
+
+    def test_list_row_index_output_reads_widget_live(self):
+        tree, fill, _printer = self._list_tree(clickable=True, linked=True)
+        to_text = tree.new_node(NN.GKNodeConvert, "转文字", gk_to="String")
+        setter = tree.new_node(NN.GKNodeUiSet, "写分", gk_widget="分数",
+                               gk_set_text=True)
+        gk_stub.connect(tree, fill, "第几行", to_text, "输入")
+        gk_stub.connect(tree, fill, "点行", setter, "执行")
+        gk_stub.connect(tree, to_text, "输出", setter, "文字")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('str(_gk_widget_index("日志列表"))', code)
+        self.assertIn("func _gk_widget_index(widget_name: String) -> int:", code)
+        # 没用『第几行』的图里不生成那个读值辅助函数
+        plain, _f, _p = self._list_tree(clickable=True, linked=True)
+        plain_code, _ = gen(plain, V3)
+        self.assertNotIn("func _gk_widget_index(", plain_code)
+
+    # ---- A:皮肤给列表行一个类型变体 ----
+    def test_skin_defines_list_item_variation(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        skin = tree.new_node(NN.GKNodeUiSkin, "皮肤")
+        gk_stub.connect(tree, event, "执行", skin, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('set_type_variation("GKListItem", "Button")', code)
+        self.assertIn('set_stylebox("pressed", "GKListItem"', code)
+        self.assertIn('set_stylebox("focus", "GKListItem"', code)
+        self.assertIn('set_color("font_pressed_color", "GKListItem"', code)
+
+    # ---- B:两个瘦身开关 ----
+    def _settings(self, **props):
+        class _Props:
+            pass
+
+        holder = _Props()
+        for key, value in props.items():
+            setattr(holder, key, value)
+        return holder
+
+    def test_slim_switches_default_off(self):
+        from BlenderGameKit import exporter
+        plain = exporter.build_settings(_FakeScene())
+        self.assertFalse(plain.get("no_morph"))
+        self.assertFalse(plain.get("no_tangents"))
+        on = exporter.build_settings(_FakeScene(gk_settings=self._settings(
+            gk_skip_morph=True, gk_skip_tangents=True)))
+        self.assertTrue(on.get("no_morph"))
+        self.assertTrue(on.get("no_tangents"))
+
+
+class _FakeScene:
+    """给 `exporter.build_settings` 的一个最小场景替身(离线可跑)。"""
+
+    def __init__(self, gk_settings=None):
+        self.gk_settings = gk_settings
+        self.render = None
+        self.name = "测试场景"
+        self.objects = ()
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+class TestRound106ExportSlim(Base):
+    """第一百零六轮 B:导出瘦身开关(形态键 / 切线 / Draco)。
+
+    ── 这一层锁住的三条事实 ────────────────────────────────────────
+    1. `asset_export._slim_gltf_kwargs` 的三种行为:默认**只关 Draco**;
+       勾形态键 -> 多一条 `export_morph=False`;勾切线 -> 多一条
+       `export_tangents=False`(两者互不影响);
+    2. 三个 gltf 参数字典**真的被 merge 了** —— `export_glb` 用真的导出
+       算子(monkeypatch 成"记录参数 + 落个空文件"的假函数)验一遍真行为;
+       另外两个(整场景 / 子树)退化成"源码里确实调了 helper"的文本断言
+       (见下面那条用例的说明);
+    3. Draco 那条**恒定**在,和两个开关勾不勾无关 ——
+       标定过:Godot 4.7 读不了 Draco 压缩的 glb。
+    """
+
+    def _props(self, **values):
+        """一个最小场景替身(同 _FakeScene / 前一个类的 _settings 写法)。"""
+        return _FakeScene(gk_settings=type("Props", (), dict(values))())
+
+    # ---- 1:helper 的三种行为 ----
+    def test_slim_kwargs_default_only_draco(self):
+        from BlenderGameKit import asset_export
+        got = asset_export._slim_gltf_kwargs(self._props())
+        self.assertEqual(got, {"export_draco_mesh_compression_enable": False})
+
+    def test_slim_kwargs_morph_and_tangents(self):
+        from BlenderGameKit import asset_export
+        morph = asset_export._slim_gltf_kwargs(self._props(gk_skip_morph=True))
+        self.assertIs(morph.get("export_morph"), False)
+        self.assertNotIn("export_tangents", morph)
+        tangents = asset_export._slim_gltf_kwargs(
+            self._props(gk_skip_tangents=True))
+        self.assertIs(tangents.get("export_tangents"), False)
+        self.assertNotIn("export_morph", tangents)
+        both = asset_export._slim_gltf_kwargs(self._props(
+            gk_skip_morph=True, gk_skip_tangents=True))
+        self.assertIs(both.get("export_morph"), False)
+        self.assertIs(both.get("export_tangents"), False)
+        # Draco 无论勾不勾都在(见类注释第 3 条)
+        for kwargs in (morph, tangents, both):
+            self.assertIs(
+                kwargs.get("export_draco_mesh_compression_enable"), False)
+
+    # ---- 2:真的 merge 进 gltf 参数 ----
+    def test_slim_kwargs_merged_into_export_glb(self):
+        """`export_glb` 真把 helper 的结果并进 gltf 参数了。
+
+        桩 bpy 里没有 `ops` / `context`,这里**临时补上**:把导出算子换成
+        "记下 kwargs + 落个空文件"的假函数(真算子离线跑不了),导完还原,
+        不给别的用例留副作用。
+        """
+        import types
+        from BlenderGameKit import asset_export
+        bpy = sys.modules["bpy"]
+        captured = {}
+
+        def fake_gltf(**kwargs):
+            captured.update(kwargs)
+            open(kwargs["filepath"], "wb").close()
+
+        sentinel = object()
+        old_ops = bpy.__dict__.get("ops", sentinel)
+        old_context = bpy.__dict__.get("context", sentinel)
+        bpy.ops = types.SimpleNamespace(
+            export_scene=types.SimpleNamespace(gltf=fake_gltf))
+        # export_glb 没有 scene 形参 -> helper 退回 bpy.context.scene
+        bpy.context = types.SimpleNamespace(scene=self._props(gk_skip_morph=True))
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                asset_export.export_glb(work, "瘦身模型", False, [])
+        finally:
+            if old_ops is sentinel:
+                bpy.__dict__.pop("ops", None)
+            else:
+                bpy.ops = old_ops
+            if old_context is sentinel:
+                bpy.__dict__.pop("context", None)
+            else:
+                bpy.context = old_context
+        self.assertTrue(captured, "导出算子没被调用:参数没经过 _run_gltf_export")
+        self.assertIs(captured.get("export_morph"), False)
+        self.assertIs(captured.get("export_draco_mesh_compression_enable"), False)
+
+    def test_slim_kwargs_called_in_all_three_exporters(self):
+        """另外两个导出函数也得调 helper(退化成源码文本断言)。
+
+        ── 为什么退化 ────────────────────────────────────────────────
+        `export_scene_glb` / `export_subtree_glb` 要遍历真场景的
+        select_get / hide_get / modifiers,离线桩里造一个"能跑完全程"的
+        假场景成本高、又脆;"三个 kwargs 字典都调了 helper"这件事
+        用源码断言就能锁死,而且三处写法本来就要求一致。
+        """
+        path = os.path.join(ROOT, "BlenderGameKit", "asset_export.py")
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        for name in ("export_glb", "export_scene_glb", "export_subtree_glb"):
+            body = source.split(f"def {name}(", 1)[1].split("\ndef ", 1)[0]
+            self.assertIn("kwargs.update(_slim_gltf_kwargs(", body, name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

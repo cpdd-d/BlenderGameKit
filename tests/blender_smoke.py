@@ -6263,6 +6263,89 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百零六轮 A:能点的列表(『每行可点』)----------------------
+    # 这一批查:节点在 Blender 里有三个出口、新属性真物化、出码的关键几条
+    # 都在、卡片画得完。**行为**由界面示例的探针在真 Godot 里查
+    # (见 check_ui_demo.py:行是按钮 + 只有被点的那行亮着 + 『第几行』写进得分)。
+    try:
+        r106_tree = bpy.data.node_groups.new("能点列表冒烟106", "GKGameLogicTree")
+        r106_ready = r106_tree.nodes.new("GKNodeOnReady")
+        r106_list = r106_tree.nodes.new("GKNodeUiList")
+        r106_list.name = "日志列表"
+        r106_fill = r106_tree.nodes.new("GKNodeUiListFill")
+        r106_fill.name = "填日志"
+        r106_fill.gk_list = "日志列表"
+        r106_fill.gk_text = "甲|乙|丙"
+        r106_fill.gk_clickable = True
+        r106_setter = r106_tree.nodes.new("GKNodeUiSet")
+        r106_setter.gk_widget = "分数"
+        r106_setter.gk_set_text = True
+        r106_to_text = r106_tree.nodes.new("GKNodeConvert")
+        r106_to_text.gk_to = "String"
+        r106_plain = r106_tree.nodes.new("GKNodeUiList")
+        r106_plain.name = "日志列表2"
+        r106_plain_fill = r106_tree.nodes.new("GKNodeUiListFill")
+        r106_plain_fill.gk_list = "日志列表2"
+        r106_plain_fill.gk_text = "甲|乙"
+        r106_tree.links.new(r106_ready.outputs["执行"], r106_list.inputs["执行"])
+        r106_tree.links.new(r106_list.outputs["完成"], r106_fill.inputs["执行"])
+        r106_tree.links.new(r106_fill.outputs["完成"], r106_plain.inputs["执行"])
+        r106_tree.links.new(r106_plain.outputs["完成"],
+                            r106_plain_fill.inputs["执行"])
+        r106_tree.links.new(r106_fill.outputs["点行"], r106_setter.inputs["执行"])
+        r106_tree.links.new(r106_fill.outputs["第几行"],
+                            r106_to_text.inputs["输入"])
+        r106_tree.links.new(r106_to_text.outputs["输出"],
+                            r106_setter.inputs["文字"])
+        r106_code, r106_warn = codegen.generate(r106_tree, {
+            "dimension": "3", "base_class": "CharacterBody3D",
+            "export_tunables": True,
+        })
+        check("能点列表:出口形状(完成 / 点行 / 第几行)",
+              [pin.name for pin in r106_fill.outputs]
+              == ["完成", "点行", "第几行"],
+              str([pin.name for pin in r106_fill.outputs]))
+        check("能点列表:『每行可点』是真属性",
+              bool(r106_fill.gk_clickable)
+              and "gk_clickable" in getattr(type(r106_fill), "__annotations__",
+                                            {}))
+        check("能点列表:勾了才走按钮版(没勾的那句还是 Label 版)",
+              "func _gk_list_fill_click(list_name: String, items: Array,"
+              in r106_code
+              and "var row := Button.new()" in r106_code
+              and "row.toggle_mode = true" in r106_code
+              and "row.button_group = group" in r106_code
+              and 'row.theme_type_variation = "GKListItem"' in r106_code
+              and "func _gk_list_row_pressed(" in r106_code
+              and 'found.set_meta("gk_index", index)' in r106_code
+              # 同图里没勾的那个列表还在走老路
+              and "func _gk_list_fill(list_name: String, items: Array,"
+              in r106_code
+              and "var label := Label.new()" in r106_code)
+        check("能点列表:『第几行』走『按名字现读』那条路",
+              'str(_gk_widget_index("日志列表"))' in r106_code
+              and "func _gk_widget_index(widget_name: String) -> int:"
+              in r106_code)
+        check("能点列表:生成无告警", not r106_warn, str(r106_warn)[:300])
+
+        r106_draw_ok = True
+        r106_draw_error = ""
+        for card in (r106_list, r106_fill, r106_plain_fill):
+            try:
+                card.draw_buttons(bpy.context, _R104Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r106_draw_ok = False
+                r106_draw_error = (f"{card.bl_label}: "
+                                   f"{type(exc).__name__}: {exc}")
+                break
+        check("能点列表:三张卡片都能画完", r106_draw_ok, r106_draw_error)
+
+        bpy.data.node_groups.remove(r106_tree)
+    except Exception as exc:
+        check("第一百零六轮 A(能点的列表)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

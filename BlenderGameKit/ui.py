@@ -6270,6 +6270,14 @@ class GK_PT_Main(bpy.types.Panel):
                 row = col.row(align=True)
                 row.prop(settings, "export_tunables", toggle=True)
                 row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
+                # ── 导出瘦身(第一百零六轮 B)──────────────────────────
+                # 侧栏这个盒子已经很挤,两个开关挤在**同一行**里;
+                # "实测各能省多少"放 tooltip(属性的 description),不占地方。
+                # 默认都不勾 = 一个字都不省,老工程导出结果完全不变。
+                row = col.row(align=True)
+                row.prop(settings, "gk_skip_morph", text="不导形态键", toggle=True)
+                row.prop(settings, "gk_skip_tangents", text="不导切线", toggle=True)
+                col.label(text="用了形态键 / 法线贴图的模型别勾", icon="INFO")
 
         # ---- 出问题了? + 项目顾问(第五十五轮合成一块)----------------
         # 两者本来就是一对:一个把诊断**导出成文件**,一个把诊断

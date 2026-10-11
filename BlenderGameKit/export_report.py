@@ -25,6 +25,7 @@ level / code / message / hint / node_name —— 见 validation.py 里的
 """
 
 import json
+import os
 import time
 
 # 一份报告最多记这么多条(超了就在末尾报"还有 N 条")。
@@ -110,6 +111,10 @@ def record(scene, result):
         carried = LAST_REPORT.get("assets")
         if carried:
             report["assets"] = carried
+        # 合计体积也跟着带(见 note_assets / report_text)。
+        carried_bytes = LAST_REPORT.get("assets_bytes")
+        if carried_bytes:
+            report["assets_bytes"] = carried_bytes
     LAST_REPORT.clear()
     if report:
         LAST_REPORT.update(report)
@@ -258,6 +263,27 @@ def asset_total(report):
     return sum(len(entries or ()) for entries in assets.values())
 
 
+def _total_bytes(directory, groups):
+    """把资产清单里那些文件在磁盘上的大小加起来(字节)。
+
+    ── 为什么要有它(第一百零六轮 B:导出瘦身)──────────────────────
+    用户勾『不导形态键』前后想知道"到底省了多少",光有份数看不出来 ——
+    这里算一个**合计体积**,由 report_text 写成一行 MB 数字给他对比。
+    只是给人看的数,所以**读不到的文件当 0**(被删了 / 路径算错了都不该
+    把整个导出报告搞挂)。
+    """
+    root = str(directory or "")
+    total = 0
+    for entries in (groups or {}).values():
+        for relative in entries or ():
+            path = os.path.join(root, str(relative).replace("/", os.sep))
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                pass
+    return total
+
+
 def _persist(scene, report):
     """报告写回 .blend(内存那份由调用方管)。"""
     if scene is None or not report:
@@ -286,6 +312,9 @@ def note_assets(scene, directory, written):
                   "elapsed_ms": 0.0, "written": 0, "items": [], "dropped": 0,
                   "at": time.strftime("%Y-%m-%d %H:%M")}
     report["assets"] = groups
+    # 产物总体积(第一百零六轮 B):清单进报告时顺手算一遍合计大小,
+    # 用户靠 report_text 里那一行对比"勾瘦身开关前后"。
+    report["assets_bytes"] = _total_bytes(directory, groups)
     LAST_REPORT.clear()
     LAST_REPORT.update(report)
     _persist(scene, report)
@@ -343,6 +372,13 @@ def report_text(report):
     # "我的三份资产都进去了没",不用去翻 art/ 目录。
     if asset_total(report):
         lines.append(f"资产清单({asset_total(report)} 份):")
+        # ── 产物总体积(第一百零六轮 B)──────────────────────────────
+        # 一项量化数字:用户勾『导出瘦身』开关前后各导一次,对比这一行
+        # 就知道省了多少(形态键那块实测能省七成)。读不到文件 / 老报告
+        # 没记过就不显示,别凭空写个 0.00 MB。
+        total_bytes = int(report.get("assets_bytes") or 0)
+        if total_bytes:
+            lines.append(f"  合计大小: {total_bytes / (1024 * 1024):.2f} MB")
         for key, label in ASSET_GROUPS:
             entries = (report.get("assets") or {}).get(key) or []
             if not entries:

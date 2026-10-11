@@ -68,6 +68,14 @@
 | **『打开时首焦点』** | 按 **Esc** 弹出暂停菜单时焦点自己落到里面第一个能聚焦的控件上,方向键直接上下走(不用先摸鼠标 / 按 Tab) |
 | **界面_皮肤(补齐)** | 皮肤顺便管住了第 104 轮新加的滑块 / 下拉 / 勾选框 —— 以前它们还是默认主题的浅灰轨道 + 白底下拉,和这套深色圆角皮肤摆一起像拼的 |
 
+── 第一百零六轮:能点的列表 ───────────────────────────────────
+
+| 用到的 | 在游戏里怎么看 |
+|---|---|
+| **『每行可点』** | 暂停菜单里的『道具列表』:每行是一个**按钮**(点得动),点哪行走『点行』那条链(**点第 2 行 -> "得分"变成 `2`**);左下角那个『日志列表』**故意没勾**,它继续是纯文字行 —— 两个版本同屏对照 |
+| **选中高亮** | 点过的行**一直亮着**,再点另一行时前一行自动灭(行是 toggle + 同一个按钮组 = 单选,亮的是皮肤给列表行的 `GKListItem` 样式) |
+| **『第几行』** | 整数输出(1 起数),和下拉『选了第几个』同一条读法 —— 按列表控件的名字现读,不用自己存变量 |
+
 跑法(Godot):打开 `界面示例_godot` 直接 F5。
 自动检查(不用 Blender,要 Godot):`python scripts\\check_ui_demo.py`
 """
@@ -379,7 +387,7 @@ def _build_ui_chain(tree, ready, design):
     # ── 暂停菜单:底板(正中、开局藏)+ 控件挂在它下面 ──────────
     # 菜单里从上往下:标题条(九宫格底图)→ 存档列表(两个槽)→ 两个按钮
     menu = _add(tree, "GKNodeUiPanel", "暂停菜单", 1040.0, 0.0,
-                gk_width=440.0, gk_height=340.0, gk_radius=18,
+                gk_width=440.0, gk_height=430.0, gk_radius=18,
                 gk_align="CENTER", gk_start_hidden=True,
                 # 第一百零五轮:一弹出来就把焦点交给里面第一个能聚焦的
                 # 控件,并把方向键串成一条链 —— 键盘直接上下选,不用摸鼠标
@@ -414,6 +422,24 @@ def _build_ui_chain(tree, ready, design):
                        gk_text="退出游戏", gk_x=130.0, gk_y=262.0,
                        gk_width=180.0, gk_height=48.0,
                        gk_parent_widget="暂停菜单")
+    # ── 第一百零六轮:能点的列表(『每行可点』)──────────────────────
+    # 以前要"能点的行"得自己一个个摆『界面_按钮』(父控件填列表名);
+    # 现在『列表_填充』勾一个开关就行 —— 行建成按钮,点哪行走『点行』,
+    # 『第几行』(1 起数)直接可读,而且**选中的那一行会一直亮着**
+    # (行是 toggle + 同一个按钮组 = 单选,亮的是皮肤的列表行样式)。
+    # ⚠ 左下角那个『日志列表』**故意不勾**:它继续走"纯文字行"的老路,
+    #   两个版本摆在同一屏里,一眼能看出区别。
+    tool_list = _add(tree, "GKNodeUiList", "道具列表", 2340.0, -700.0,
+                     gk_x=30.0, gk_y=318.0, gk_width=380.0, gk_height=84.0,
+                     gk_separation=4, gk_parent_widget="暂停菜单")
+    fill_tools = _add(tree, "GKNodeUiListFill", "填道具", 2600.0, -700.0,
+                      gk_list="道具列表", gk_clickable=True,
+                      gk_text="手电筒|钥匙|绷带", gk_size=20,
+                      gk_color=(0.90, 0.93, 1.0, 1.0))
+    tool_index = _add(tree, "GKNodeConvert", "道具转文字", 2860.0, -700.0,
+                      gk_to="String")
+    tool_reply = _add(tree, "GKNodeUiSet", "道具回话", 3120.0, -700.0,
+                      gk_widget="分数", gk_set_text=True)
     # ── 左下角:日志列表(只显示的行,用『列表_填充』灌三行)────────
     logs = _add(tree, "GKNodeUiList", "日志列表", 2340.0, 0.0,
                 gk_width=260.0, gk_height=120.0, gk_separation=4,
@@ -603,7 +629,9 @@ def _build_ui_chain(tree, ready, design):
                              gk_level=_level)
         _link(tree, quality_button, "点击", quality_apply, "执行")
         quality_buttons.append(quality_button)
-    _link(tree, quit_button, "完成", quality_buttons[0], "执行")
+    _link(tree, quit_button, "完成", tool_list, "执行")
+    _link(tree, tool_list, "完成", fill_tools, "执行")
+    _link(tree, fill_tools, "完成", quality_buttons[0], "执行")
     _link(tree, quality_buttons[0], "完成", quality_buttons[1], "执行")
     _link(tree, quality_buttons[1], "完成", quality_buttons[2], "执行")
     _link(tree, quality_buttons[2], "完成", logs, "执行")
@@ -705,6 +733,13 @@ def _build_ui_chain(tree, ready, design):
     _link(tree, level_text, "输出", write_level, "文字")
     _link(tree, plate_box, "改了", plate_visible, "执行")
     _link(tree, plate_box, "勾了吗", plate_visible, "可见")
+
+    # ── 第一百零六轮:能点的列表 ──────────────────────────────────
+    # 『点行』-> 改"得分";写进去的字来自**『第几行』(1 起数)** ——
+    # 探针点第 2 行,断言"得分"正好是 `2`:回调链和整数输出一起验了。
+    _link(tree, fill_tools, "点行", tool_reply, "执行")
+    _link(tree, fill_tools, "第几行", tool_index, "输入")
+    _link(tree, tool_index, "输出", tool_reply, "文字")
 
     # 菜单里的按钮:先解除暂停,再回到游戏 / 退出
     back = _add(tree, "GKNodeUiPauseGame", "继续游戏", 3380.0, -260.0,

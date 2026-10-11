@@ -81,6 +81,12 @@ def build_settings(scene):
         # ⚠ 以前这里把 2D 强按成"没勾"—— 现在 2D 也烤导航多边形了,
         #   再按掉的话 2D 场景永远走直线(哪怕 .tscn 里真有导航区)。
         "nav_enabled": bool(getattr(props, "nav_enabled", False)),
+        # ── 导出瘦身开关(第一百零六轮 B)────────────────────────────
+        # 场景属性 -> 设置字典。键名统一取"取反后的动作"(`no_*`),
+        # 导出侧(asset_export._slim_gltf_kwargs)照它决定要不要关参数。
+        # 默认都是 False = 一个字都不省,老工程导出结果完全不变。
+        "no_morph": bool(getattr(props, "gk_skip_morph", False)),
+        "no_tangents": bool(getattr(props, "gk_skip_tangents", False)),
     })
 
     manual = (getattr(props, "output_dir", "") or "").strip()

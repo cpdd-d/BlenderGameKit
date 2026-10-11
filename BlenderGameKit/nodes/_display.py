@@ -2179,9 +2179,12 @@ class GKNodeUiListFill(B.GKStatementNode):
               "『列表』填『界面_列表』的名字;文字从『内容』引脚接一个"
               "列表变量(『列表_新建』/『列表_添加』那套)或者写死的"
               "『文字』(每行一条,用竖线 `|` 分隔)。\n"
-              "每次调用会**先清空旧行再建**,所以每物理帧刷也不会越堆越多。"
-              "注意:这样建出来的行是**文字**(显示用);要能点的行请自己放"
-              "『界面_按钮』(父控件填列表名)。")
+              "每次调用会**先清空旧行再建**,所以每物理帧刷也不会越堆越多。\n"
+              "── 勾了『每行可点』(第一百零六轮)──────────────────────────\n"
+              "每行建成**按钮**(不再是纯文字):点哪行走『点行』那条链,"
+              "点在**第几行**从整数输出读(1 起数);"
+              "而且**选中的那一行会一直高亮**(点第二行,第一行自己灭)。"
+              "要能点的行就用它,不用再自己一个个摆『界面_按钮』。")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(ANY, "内容", []),
@@ -2192,10 +2195,18 @@ class GKNodeUiListFill(B.GKStatementNode):
          "没接『内容』时用它:每行一条,用竖线分隔(如 `第一名|第二名`)"),
         ("gk_var", "string", "", "变量名",
          "没接『内容』时也可以填一个**列表变量**的名字(优先于『文字』)"),
+        ("gk_clickable", "bool", False, "每行可点",
+         "勾上 = 每行建成按钮:点哪行走『点行』,选中那行会高亮"),
         ("gk_line_height", "float", 0.0, "行高", "像素;0 = 按字体自动"),
         ("gk_size", "int", 20, "字号", "像素"),
         ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "行的文字颜色"),
     )
+    # 出口形状和『界面_滑块』一样三个(第一百零六轮):
+    #   * 『完成』= 灌完了,接着往下建别的控件(链上摆一排要它);
+    #   * 『点行』= 玩家点了某一行 —— 独立回调,不会刚建出来就触发;
+    #   * 『第几行』= 数据出口(整数,**1 起数**),点了哪行就记着哪行。
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(FLOW, "点行"),
+                  S.pin(INT, "第几行", 0))
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_list", text="", icon="LINENUMBERS_ON")
@@ -2203,6 +2214,8 @@ class GKNodeUiListFill(B.GKStatementNode):
         row.prop(self, "gk_var", text="", icon="OUTLINER_DATA_GP_LAYER")
         row.prop(self, "gk_line_height", text="行高")
         row.prop(self, "gk_size", text="字号")
+        row = layout.row(align=True)
+        row.prop(self, "gk_clickable", text="每行可点", toggle=True)
         layout.prop(self, "gk_text", text="")
         layout.prop(self, "gk_color", text="")
 

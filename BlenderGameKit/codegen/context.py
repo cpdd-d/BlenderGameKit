@@ -234,6 +234,9 @@ class GenContext:
         self.need_list_helper = False
         # 列表_填充:生成 `_gk_list_fill()`(清空旧行 + 按数组建 Label)
         self.need_list_fill_helper = False
+        # 列表_填充勾了『每行可点』(第一百零六轮):生成 `_gk_list_fill_click()`
+        # (每行建成按钮 + 同一个按钮组 = 单选,选中那行走 pressed 态高亮)
+        self.need_list_fill_click_helper = False
         # 界面_取文字:生成 `_gk_widget_text()`(按名字取控件上的文字)
         self.need_widget_text_helper = False
         # ── 设置面板三件套(第一百零四轮)────────────────────────────

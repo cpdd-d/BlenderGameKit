@@ -92,6 +92,13 @@
   * **打开时首焦点**:按 Esc 弹出暂停菜单时焦点自动落在菜单里第一个能
     聚焦的控件上,而且方向键链真的串好了(控件自己的 `focus_neighbor`
     不为空),按一下 ↓ 焦点换到另一个控件。
+
+第一百零六轮(A:能点的列表)再看两样:
+  * **每行可点**:暂停菜单里的『道具列表』每行是 **Button**(挂着皮肤给的
+    `GKListItem` 行样式)—— 对照组是左下角『日志列表』,它没勾这个开关,
+    行还是纯文字 Label;
+  * **点行 + 选中高亮**:点第 2 行 -> 整组里**只有那一行亮着**(toggle +
+    同一个按钮组 = 单选),而且『第几行』(1 起数)= 2 真的写进了"得分"。
 """
 
 import argparse
@@ -198,6 +205,11 @@ func _physics_process(delta: float) -> void:
 	elif phase == 5 and elapsed >= 2.15:
 		phase = 6
 		_check_menu_focus_move()               # ↓ 一下,焦点换到别的控件
+		_check_tool_rows()                     # 能点的行是按钮 + 挂皮肤变体
+		_click_tool_row(1)                     # 点第 2 行
+		# ⚠ 当帧就要看:`push_input` 是**同步**的,点了立刻就走链改"得分";
+		#   等下一阶段再看的话,下面点『存档一』会把"得分"又改掉(踩过)。
+		_check_tool_row_clicked()
 		# 暂停中点击列表里的『存档一』(能点的行各接各的链)
 		var slot := _widget("存档槽一")
 		if slot != null:
@@ -1061,6 +1073,60 @@ func _check_pierce_ok() -> void:
 	print("UI_MODAL_PIERCE ok=", text == "穿透了!", " score=", text)
 
 
+# ── 第一百零六轮:能点的列表(『每行可点』)────────────────────────
+
+## 行是**按钮**(不是纯文字)、而且挂着皮肤给的 `GKListItem` 变体
+## (选中高亮就靠它)。对照组:左下角的『日志列表』没勾这个开关,
+## 它的行走的是 Label 那条老路(见 UI_LIST_FILL)。
+func _tool_body() -> Node:
+	var list := _widget("道具列表")
+	if list == null or list.get_child_count() == 0:
+		return null
+	return list.get_child(0)
+
+
+func _check_tool_rows() -> void:
+	var body := _tool_body()
+	var rows: Array = body.get_children() if body != null else []
+	var buttons := 0
+	var themed := 0
+	for child in rows:
+		if child is Button:
+			buttons += 1
+			if (child as Button).theme_type_variation == "GKListItem":
+				themed += 1
+	print("UI_LIST_ROWS ok=", rows.size() == 3 and buttons == 3 and themed == 3,
+		" rows=", rows.size(), " buttons=", buttons, " themed=", themed)
+
+
+func _click_tool_row(index: int) -> void:
+	var body := _tool_body()
+	if body == null or body.get_child_count() <= index:
+		return
+	var row := body.get_child(index)
+	if row is Button:
+		_click_at((row as Button).get_global_rect().get_center())
+
+
+## 点第 2 行之后:整组里**只有那一行亮着**(toggle + 同一个按钮组 = 单选,
+## 亮的是皮肤的 GKListItem pressed 态),而且『第几行』(1 起数)= 2
+## 真的走到了"得分"上(整数输出 + 回调链一起验)。
+func _check_tool_row_clicked() -> void:
+	var body := _tool_body()
+	var lit := 0
+	var lit_index := -1
+	if body != null:
+		for index in body.get_child_count():
+			var child := body.get_child(index)
+			if child is Button and (child as Button).button_pressed:
+				lit += 1
+				lit_index = index
+	var score := _widget("分数") as Label
+	var text := score.text if score != null else "<none>"
+	print("UI_LIST_ROW_CLICK ok=", lit == 1 and lit_index == 1 and text == "2",
+		" lit=", lit, " at=", lit_index, " score=", text)
+
+
 func _click_pierce() -> void:
 	var button := _widget("穿透按钮")
 	if button != null:
@@ -1255,6 +1321,13 @@ def main():
         (r"UI_MODAL_PIERCE ok=true",
          "弹窗收了之后同一个位置点不到『穿透按钮』(对照组失败 ——"
          " 说明前面那次不是被挡住,而是按钮本来就点不动)"),
+        # ---- 第一百零六轮:能点的列表(『每行可点』)----
+        (r"UI_LIST_ROWS ok=true",
+         "『每行可点』没生效(行该是 Button 而且挂皮肤给的行样式"
+         " GKListItem;还是 Label 就说明走的还是老路)"),
+        (r"UI_LIST_ROW_CLICK ok=true",
+         "点行不对(整组里该只有被点的那一行亮着 /"
+         " 或写进『得分』的『第几行』不是 2)"),
     )
     for pattern, why in checks:
         if not re.search(pattern, text):
@@ -1344,6 +1417,15 @@ def main():
                 ("visibility_changed.connect(", "显示面板时自动给焦点"),
                 ("focus_neighbor_bottom", "方向键串链"),
                 ("_gk_ui_raise(widget)", "暂停菜单也参与『置顶 / 互斥组』"),
+                # ---- 第一百零六轮:能点的列表 ----
+                ("func _gk_list_fill_click(list_name: String, items: Array,",
+                 "『每行可点』的按钮版列表填充"),
+                ("row.toggle_mode = true", "行是 toggle(选中那行一直亮)"),
+                ("row.button_group = group", "同一个按钮组 = 单选"),
+                ('row.theme_type_variation = "GKListItem"', "行挂皮肤的行样式"),
+                ('set_type_variation("GKListItem", "Button")', "皮肤声明行样式变体"),
+                ("func _gk_list_row_pressed(", "点行回调(写行号 + 走用户的链)"),
+                ('str(_gk_widget_index("道具列表"))', "『第几行』按名字现读"),
         ):
             if needle not in code:
                 print(f"✗ 生成的脚本里没有{why}: 找不到 {needle!r}")

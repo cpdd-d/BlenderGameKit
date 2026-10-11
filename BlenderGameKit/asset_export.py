@@ -2891,6 +2891,48 @@ def object_bounds(objects, local=False):
     return {"min": tuple(mins), "max": tuple(maxs), "size": tuple(size), "center": tuple(center)}
 
 
+# ── 导出瘦身(第一百零六轮 B)────────────────────────────────────────
+# 用户实测标定(8066 顶点 + 8 个形态键的球,导出 .glb):
+#   * `export_morph=False`    关形态键:8.16 MB -> 2.20 MB(**-73%**,最大一块);
+#   * `export_tangents=False` 关切线:  8.16 MB -> 7.66 MB(-6%);
+#   * 自定义属性关掉是 **0 变化**(8.16 MB -> 8.16 MB,即使网格带第二层 UV +
+#     顶点色),所以**没有**这个开关。
+#
+# ── 为什么 Draco 恒定关掉 ────────────────────────────────────────────
+# Draco 压缩率很漂亮(412KB -> 42KB),但 **Godot 4.7 读不了 Draco 压缩的 glb**:
+# 实测同一颗球,未压缩的 normal 能加载出 11904 个三角面,压缩后直接
+#     ERROR: Failed loading resource: res://art/cube.glb
+# 场景里拿不到网格。宁可文件大,也不能让用户导出一个 Godot 打不开的东西 ——
+# 所以这里**显式**写死 False(哪怕将来 Blender 默认值变了也不受影响)。
+#
+# ⚠ 参数名不兼容时由 `_run_gltf_export` 的"TypeError 逐个降级重试"兜底,
+#   老版本 Blender 没有这些参数也不会炸(会被丢掉重试)。
+SLIM_GLTF_ALWAYS = {"export_draco_mesh_compression_enable": False}
+
+
+def _slim_gltf_kwargs(scene=None):
+    """把场景上的『导出瘦身』开关翻译成要合并进 gltf kwargs 的字典。
+
+    勾了才加参数(默认一个都不加,老图导出结果一字不变);
+    Draco 那条**恒定**带上(见上面标定)。
+    `scene` 拿不到时退回 `bpy.context.scene`(拿不到 `scene` 形参的
+    `export_glb` 就走这条路),两边都拿不到(离线桩环境)就只返回恒定项。
+    """
+    if scene is None:
+        try:
+            import bpy
+            scene = bpy.context.scene
+        except Exception:                                 # noqa: BLE001
+            scene = None
+    settings = getattr(scene, "gk_settings", None)
+    out = dict(SLIM_GLTF_ALWAYS)
+    if getattr(settings, "gk_skip_morph", False):
+        out["export_morph"] = False
+    if getattr(settings, "gk_skip_tangents", False):
+        out["export_tangents"] = False
+    return out
+
+
 def export_glb(export_dir, name, use_selection, objects):
     """调用 Blender 的 glTF 导出。返回 (路径, 是否成功, 消息)。"""
     import bpy
@@ -2911,6 +2953,9 @@ def export_glb(export_dir, name, use_selection, objects):
         "export_texcoords": True,
         "export_normals": True,
     }
+    # 导出瘦身(第一百零六轮 B):形态键 / 切线 / Draco —— 见 _slim_gltf_kwargs。
+    # 这个函数没有 scene 形参,helper 会退回 bpy.context.scene(当前场景)。
+    kwargs.update(_slim_gltf_kwargs())
     return _run_gltf_export(kwargs, path)
 
 
@@ -3215,6 +3260,8 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         # 后面展平那一步找不到 `Scene Collection` 节点,自然什么都不做。
         "export_hierarchy_full_collections": True,
     }
+    # 导出瘦身(第一百零六轮 B):形态键 / 切线 / Draco —— 见 _slim_gltf_kwargs。
+    kwargs.update(_slim_gltf_kwargs(scene))
     # ── 只导出**当前这个场景**(第八十七轮:多场景时串场景)────────────
     # 不传这个开关时,导出器会把 **.blend 里所有场景**都算进来,
     # 而 `use_selection` 只筛"选中的物体" —— 别的场景里选中的东西会
@@ -8214,6 +8261,8 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
         "export_lights": False,
         "export_extras": True,
     }
+    # 导出瘦身(第一百零六轮 B):形态键 / 切线 / Draco —— 见 _slim_gltf_kwargs。
+    kwargs.update(_slim_gltf_kwargs(scene))
     # ── 只导出**当前这个场景**(第八十七轮:多场景时串场景)────────────
     # 不传这个开关时,导出器会把 **.blend 里所有场景**都算进来,
     # 而 `use_selection` 只筛"选中的物体" —— 别的场景里选中的东西会

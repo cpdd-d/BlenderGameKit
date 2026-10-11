@@ -1129,6 +1129,54 @@ class Generator:
                     "empty_body": "    pass",
                     "separator": True,
                 })
+            if self.ctx.need_list_fill_click_helper:
+                sections.append({
+                    # 『每行可点』(第一百零六轮):行建成**按钮**,而且一组
+                    # 里只允许一个"按下"—— 那就是"选中的那一行"(pressed 态
+                    # 由皮肤给的 `GKListItem` 变体上色,不用自己算高亮)。
+                    # 点哪行就把**行号(0 起)**写进**列表控件自己的 meta**,
+                    # 再走用户接的『点行』回调;『第几行』输出按名字现读它。
+                    "signature": ("func _gk_list_fill_click(list_name: String, items: Array, "
+                                  "line_height: float, font_size: int, color: Color, "
+                                  "handler: Callable) -> void:"),
+                    "lines": [
+                        "    var body := _gk_list_body(list_name)",
+                        "    if body == null:",
+                        '        push_warning("找不到列表控件: " + list_name)',
+                        "        return",
+                        "    for child in body.get_children():",
+                        "        body.remove_child(child)",
+                        "        child.queue_free()",
+                        "    var group := ButtonGroup.new()",
+                        "    for index in items.size():",
+                        "        var row := Button.new()",
+                        "        row.text = str(items[index])",
+                        "        row.toggle_mode = true",
+                        "        row.button_group = group",
+                        '        row.theme_type_variation = "GKListItem"',
+                        '        row.add_theme_font_size_override("font_size", font_size)',
+                        '        row.add_theme_color_override("font_color", color)',
+                        "        row.mouse_filter = Control.MOUSE_FILTER_STOP",
+                        "        if line_height > 0.0:",
+                        "            row.custom_minimum_size = Vector2(0.0, line_height)",
+                        "        row.pressed.connect(_gk_list_row_pressed.bind(list_name, index, handler))",
+                        "        body.add_child(row)",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
+                sections.append({
+                    "signature": ("func _gk_list_row_pressed(list_name: String, index: int, "
+                                  "handler: Callable) -> void:"),
+                    "lines": [
+                        "    var found := _gk_find_widget(list_name)",
+                        "    if found != null:",
+                        '        found.set_meta("gk_index", index)',
+                        "    handler.call(index)",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
             if self.ctx.need_widget_text_helper:
                 sections.append({
                     "signature": "func _gk_widget_text(widget_name: String) -> String:",

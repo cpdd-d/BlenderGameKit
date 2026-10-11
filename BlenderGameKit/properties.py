@@ -703,6 +703,34 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="额外生成一个最小 .tscn 与 project.godot，导出目录可直接用 Godot 打开",
         default=True,
     )
+
+    # ── 导出瘦身(第一百零六轮 B)──────────────────────────────────────
+    # 用户实测标定(8066 顶点 + 8 个形态键的球,导出 .glb):
+    #   * 形态键关掉:8.16 MB -> 2.20 MB(**-73%**,体积最大的一块);
+    #   * 切线关掉:  8.16 MB -> 7.66 MB(-6%);
+    #   * 自定义属性关掉:8.16 MB -> 8.16 MB(**0 变化**,即使网格带第二层
+    #     UV + 顶点色)—— 所以**不做**这个开关,只留上面两个。
+    #   * Draco 压缩率很漂亮(412KB -> 42KB),但 **Godot 4.7 读不了**,
+    #     所以在导出参数里**恒定关掉**(见 asset_export._slim_gltf_kwargs)。
+    #
+    # 为什么**默认都不勾**:关形态键 = 表情 / 形变(shape key / morph)没了,
+    # 关切线 = 法线贴图会发暗发花。这种"用户自己知道才敢关"的开关,
+    # 绝不能悄悄替他们打开 —— 宁可体积大,也不能让人一导出就丢表情。
+    gk_skip_morph: BoolProperty(
+        name="不导形态键",
+        description=("导出时**不写形态键**(morph target)。"
+                     "实测能省一大半体积(8.16MB -> 2.20MB)。"
+                     "⚠ 用了表情 / 形变(shape key / morph)的模型别关 —— "
+                     "关了表情就没了"),
+        default=False,
+    )
+    gk_skip_tangents: BoolProperty(
+        name="不导切线",
+        description=("导出时**不写切线**(tangent)。省得不多(约 6%)。"
+                     "⚠ 用了法线贴图的模型别关 —— 少了切线,法线贴图会发暗 / 发花"),
+        default=False,
+    )
+
     # (原 `show_log` 第五十五轮删掉:侧栏那份日志块删了,它没有使用者了。
     #  属性留着会让面板出现一个点了没反应的开关。)
 

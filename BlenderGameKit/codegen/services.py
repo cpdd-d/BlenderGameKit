@@ -1680,12 +1680,44 @@ def _stmt_ui_list_fill(ctx, node, indent):
     size = int(getattr(node, "gk_size", 20) or 20)
     color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
     ctx.need_list_helper = True      # _gk_list_fill 内部要用 _gk_list_body
+    clickable = bool(getattr(node, "gk_clickable", False))
+    if clickable:
+        # ── 每行可点(第一百零六轮)──────────────────────────────────
+        # 行建成按钮(不再是 Label):点哪行走『点行』那条独立回调,
+        # 点在**第几行**记进**列表控件自己的 meta `gk_index`**(0 起存,
+        # 『第几行』输出 +1)—— 和下拉『选了第几个』同一条读法
+        # (`_gk_widget_index`),按名字现读,不用另外存变量。
+        handler = ctx.declare_func_name(
+            f"gk_on_{snake_case(node.name, 'list')}_row",
+            key=node_lib.node_key(node))
+        ctx.need_list_fill_click_helper = True
+        helper = ctx.declare_func_name("_gk_list_fill_click", key="__list_click__")
+        ctx.add_line(indent, f"{helper}({gd_string(list_name)}, {source}, "
+                             f"{line_height}, {size}, "
+                             f"Color({gd_number(color[0])}, "
+                             f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                             f"{gd_number(color[3])}), {handler})")
+        _ui_signal_section(ctx, node, handler, output="点行",
+                           signature=f"func {handler}(_index: int) -> void:")
+        return
     ctx.need_list_fill_helper = True
     helper = ctx.declare_func_name("_gk_list_fill", key="__list_fill__")
     ctx.add_line(indent, f"{helper}({gd_string(list_name)}, {source}, "
                          f"{line_height}, {size}, "
                          f"Color({gd_number(color[0])}, {gd_number(color[1])}, "
                          f"{gd_number(color[2])}, {gd_number(color[3])}))")
+
+
+@expr_node("GKNodeUiListFill")
+def _expr_ui_list_fill(ctx, node):
+    """『第几行』:玩家点的是第几行(**1 起数**)。
+
+    和下拉『选了第几个』同一个规矩 —— 按**列表控件的名字**现读它 meta 里的
+    `gk_index`(点行时写进去的)。一次都没点过时是 0(不是 1)。
+    """
+    ctx.need_ui_helpers = True
+    ctx.need_widget_index_helper = True
+    return f"_gk_widget_index({gd_string(str(getattr(node, 'gk_list', '')))})"
 
 
 @stmt_node("GKNodeUiTween")
@@ -2174,6 +2206,9 @@ def _stmt_ui_skin(ctx, node, indent):
       * ProgressBar 的 background / fill;
       * HSlider / VSlider 的 slider(轨道)+ grabber_area(划过的那截);
       * OptionButton / CheckBox / CheckButton 的底(和按钮同一套);
+      * 列表行 `GKListItem`(Button 的**类型变体**,第一百零六轮)——
+        『界面_列表_填充』勾了『每行可点』的行挂着它:选中的那行走
+        `pressed` 态 = 高亮;
       * 常用类型的 font_color + `default_font_size`。
     卡片自己设过 override 的控件(『界面_文本』的颜色、『界面_面板』的
     底色)以卡片为准 —— 主题只兜底。
@@ -2302,6 +2337,30 @@ def _stmt_ui_skin(ctx, node, indent):
                                  f"{gd_string(new_type)}, {box})")
         ctx.add_line(indent, f"{theme}.set_stylebox(\"focus\", "
                              f"{gd_string(new_type)}, {focus_box})")
+
+    # ── 列表行(第一百零六轮)──────────────────────────────────────
+    # 『界面_列表_填充』勾了『每行可点』的行用它。做法是 Godot 的
+    # **类型变体**:`set_type_variation("GKListItem", "Button")` 声明
+    # "这型是 Button 的一种",行按钮再挂 `theme_type_variation = "GKListItem"`
+    # —— 于是只改列表行,普通按钮一点不受影响(`pressed` 还是"按下变深")。
+    # 「选中高亮」在这里落地:行是 `toggle_mode` + 同一个按钮组 = 单选,
+    # 选中的那行一直停在 `pressed` 态 —— 所以**它的 pressed 色就是选中色**
+    # (用皮肤的『焦点色』,焦点高亮 / 选中高亮同一套色,和文档里那句话对上)。
+    # 主题里没有这个变体时(不是这张皮肤建的界面)Godot 自动退回 Button 的样式,
+    # 所以挂 `theme_type_variation` 永远安全。
+    ctx.add_line(indent,
+                 f"{theme}.set_type_variation(\"GKListItem\", \"Button\")")
+    for key, bg in (("normal", color(panel_color)),
+                    ("hover", color(hover_color)),
+                    ("pressed", color(focus_color))):
+        box = ctx.new_temp("gk_ui_row")
+        stylebox(box, bg)
+        ctx.add_line(indent, f"{theme}.set_stylebox({gd_string(key)}, "
+                             f"\"GKListItem\", {box})")
+    ctx.add_line(indent, f"{theme}.set_stylebox(\"focus\", \"GKListItem\", {focus_box})")
+    ctx.add_line(indent, f"{theme}.set_color(\"font_color\", \"GKListItem\", {text_color})")
+    ctx.add_line(indent, f"{theme}.set_color(\"font_pressed_color\", "
+                         f"\"GKListItem\", Color(0.10, 0.09, 0.06, 1.0))")
 
     ctx.add_line(indent, f"{root}.theme = {theme}")
 
