@@ -1617,7 +1617,10 @@ def _ensure_overlay_helpers(ctx):
             "AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE)",
             "    if hold <= 0.0:",
             "        return",
-            "    var timer := tree.get_tree().create_timer(hold)",
+            # ⚠ `process_always=false`:暂停时这个"过一会儿自己收回"的定时器
+            #   也要停,不然暂停期间动画还在后台自己结束(第 125 轮同一条
+            #   原则:`SceneTreeTimer` 的默认值是"暂停照走",谁都不该白拿)。
+            "    var timer := tree.get_tree().create_timer(hold, false)",
             "    timer.timeout.connect(func() -> void:",
             "        if tree != null and is_instance_valid(tree):",
             "            tree.set(\"parameters/oneshot/request\", "

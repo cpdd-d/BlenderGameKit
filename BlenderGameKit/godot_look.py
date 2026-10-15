@@ -45,7 +45,8 @@ Blender 和 Godot 的"出厂画面"差得很远,在 Blender 里调好一看 Godo
 | 背景 纯色 | 世界底色 = 那个颜色 | 精确 |
 | 背景 天空 | 用**地平线色**铺平(真实是三段渐变) | **近似** |
 | 环境光 | 两边都**不加**:卡通材质是 unshaded,运行时也不吃环境光 | 对卡通口径精确 |
-| 雾 / 泛光 / 色调调整 | 做不出来(Godot 的后处理)—— 保持关着 | —— |
+| 雾 | 按『密度 / 颜色』做一个体积盒子 —— 见下面「雾」一节 | **近似** |
+| 泛光 / 色调调整 | 做不出来(Godot 的后处理)—— 保持关着 | —— |
 
 sRGB 换算(第九十五轮标定 + 第九十六轮修导出):
   * **写进 `.tscn` 的 Color 数字 = 屏幕上显示的值**(标定:
@@ -57,6 +58,28 @@ sRGB 换算(第九十五轮标定 + 第九十六轮修导出):
     那个显示值,两边对上;
   * 只有"设置卡没开"的**出厂灰**要换算 `srgb_to_linear(0.30)` —— 那个
     0.30 是 Godot 给的**显示值**,不换的话背景会比 Godot 亮一大截。
+
+── 第一百一十一轮:把『雾』也画出来 ────────────────────────────────
+用户实测原话:"blender 预览是有灯光,但无雾气" —— 设置卡上雾开着、
+Godot 里也真的是雾茫茫,只有预览干干净净,于是"预览又不算数了"。
+
+做法:按 Godot 的深度雾公式搭一个**体积盒子**
+(`Principled Volume`,真机渲图标定过):
+
+    Godot:            L = L0*(1-f) + fog_color*f,  f = 1 - exp(-density*depth)
+    吸收 + 自发光体积:  L = L0*exp(-s*d) + (E/s)*(1-exp(-s*d))
+    =>  让 s = density、E = density*fog_color,两条式子**同形**
+
+标定结果(灰幕 40 米、密度 0.05、雾色 (0.20,0.22,0.32)):
+    解析解 [0.465, 0.485, 0.572]   vs   预览 [0.478, 0.502, 0.588]
+—— 差 0.01 上下(体积散射多给的那一点点),对着屏幕看不出来。
+
+三条边界,都不是"糊弄":
+  * 盒子**包住场景**(网格包围盒外扩 40 米),相机在里面就一路有雾;
+    相机飞出盒子之外就看不到雾 —— 预览用的近似,写在面板说明里;
+  * 盒子是**看得见选不中**的(`hide_select`)+ 线框显示,不碍事;
+  * 不是"把背景糊一层灰":物体是**真的被雾挡掉**的,近处清楚、远处发白,
+    和 Godot 一致。『雾』没开(或设置卡没开)时**一个盒子都不建**。
 """
 
 import bpy
@@ -70,6 +93,13 @@ GODOT_CLEAR_COLOR_SRGB = (0.3, 0.3, 0.3)
 
 # 我们建的世界叫这个名。带 GK 前缀,方便识别和清理。
 WORLD_NAME = "GK Godot 环境"
+
+# 预览用的雾盒子(第一百一十一轮)。同一个 GK 前缀规矩:能识别、能清理。
+FOG_NAME = "GK Godot 雾"
+FOG_MATERIAL_NAME = "GK Godot 雾材质"
+# 盒子要把场景**包进去**再往外扩这么多米(相机飞出去就看不到雾了,
+# 这是近似的一部分;外扩足够大时正常视角都在里面)
+FOG_MARGIN = 40.0
 
 # ── 色调映射 -> Blender 视图变换(第九十五轮)────────────────────
 # 键 = properties.ENV_TONEMAPS 的 value(即 Godot 的 tonemap_mode 枚举名)。
@@ -174,6 +204,10 @@ def env_display(scene):
             "view_transform": TONEMAP_VIEW_TRANSFORMS["LINEAR"],
             "background": "COLOR",
             "backdrop": (grey_linear, grey_linear, grey_linear, 1.0),
+            # 设置卡没开 = Godot 出厂画面:雾是**关**的(跟着一起关)
+            "fog": False,
+            "fog_color": (0.30, 0.34, 0.42, 1.0),
+            "fog_density": 0.0,
         }
     tonemap = str(getattr(settings, "env_tonemap", "LINEAR") or "LINEAR")
     if tonemap not in TONEMAP_VIEW_TRANSFORMS:
@@ -194,10 +228,17 @@ def env_display(scene):
         "view_transform": TONEMAP_VIEW_TRANSFORMS[tonemap],
         "background": background,
         "backdrop": backdrop,
+        # 雾(第一百一十一轮):颜色和密度**直接用设置值** —— 和背景同一条
+        # 换算规矩(导出把线性换算成显示值写进 .tscn,Blender 显示线性色
+        # 正好等于那个显示值)。密度两边单位一样(每米)。
+        "fog": bool(getattr(settings, "env_fog", False)),
+        "fog_color": _rgba(getattr(settings, "env_fog_color", None),
+                           (0.30, 0.34, 0.42, 1.0)),
+        "fog_density": float(getattr(settings, "env_fog_density", 0.02) or 0.0),
     }
 
 
-def build_world(backdrop=None):
+def build_world(backdrop=None, *, scene=None, ambient_color=None, ambient_energy=0.0):
     """建/刷新那个"看得见、不照亮"的世界。返回世界对象。
 
     backdrop = **线性的世界底色**(env_display 已经算好换算;不给就用
@@ -207,9 +248,10 @@ def build_world(backdrop=None):
         grey = srgb_to_linear(GODOT_CLEAR_COLOR_SRGB[0])
         backdrop = (grey, grey, grey, 1.0)
     backdrop = _rgba(backdrop, (0.0, 0.0, 0.0, 1.0))
-    world = bpy.data.worlds.get(WORLD_NAME)
+    name = WORLD_NAME if scene is None else WORLD_NAME + " · " + scene.name
+    world = bpy.data.worlds.get(name)
     if world is None:
-        world = bpy.data.worlds.new(WORLD_NAME)
+        world = bpy.data.worlds.new(name)
     world.use_nodes = True
 
     tree = world.node_tree
@@ -230,8 +272,9 @@ def build_world(backdrop=None):
     # Godot 默认没有环境光,所以非相机射线必须看到纯黑。
     shade = tree.nodes.new("ShaderNodeBackground")
     shade.location = (100, -110)
-    shade.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
-    shade.inputs["Strength"].default_value = 1.0
+    shade.inputs["Color"].default_value = (_rgba(ambient_color, (0.0, 0.0, 0.0, 1.0))
+                                           if ambient_energy > 0.0 else (0.0, 0.0, 0.0, 1.0))
+    shade.inputs["Strength"].default_value = max(0.0, ambient_energy)
 
     mix = tree.nodes.new("ShaderNodeMixShader")
     mix.location = (280, 0)
@@ -249,6 +292,153 @@ def build_world(backdrop=None):
     # Solid 模式(实体着色)的背景用的是 world.color,是另一个值
     world.color = colour
     return world
+
+
+def _scene_bounds(scene):
+    """场景里所有网格物体的世界包围盒 -> (中心, 尺寸);一个网格都没有 -> None。
+
+    用 `bound_box`(物体本地空间的 8 个角)乘 `matrix_world` —— 那是导出
+    也认的那份几何,不含修改器结果,对"给雾盒子定个大小"足够。
+    """
+    from mathutils import Vector
+    low = [1.0e30, 1.0e30, 1.0e30]
+    high = [-1.0e30, -1.0e30, -1.0e30]
+    found = False
+    for obj in scene.objects:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        if getattr(obj, "name", "").startswith(FOG_NAME):
+            continue                       # 我们自己建的雾盒子不算场景
+        try:
+            corners = [obj.matrix_world @ Vector(corner)
+                       for corner in obj.bound_box]
+        except Exception:                  # noqa: BLE001 —— 拿不到就跳过这个物体
+            continue
+        for corner in corners:
+            for index in range(3):
+                low[index] = min(low[index], corner[index])
+                high[index] = max(high[index], corner[index])
+        found = True
+    if not found:
+        return None
+    centre = Vector([(low[i] + high[i]) * 0.5 for i in range(3)])
+    size = Vector([max(high[i] - low[i], 1.0) for i in range(3)])
+    return centre, size
+
+
+def _camera_bounds(scene):
+    """没有网格时的兜底范围:以相机(没有就原点)为中心的一块默认体积。
+
+    空场景 / 只有灯和相机的调试场景也要能看到雾 —— 不然"预览没雾"和
+    "设置卡上没开"看起来一模一样,又要来回查。
+    """
+    from mathutils import Vector
+    camera = getattr(scene, "camera", None)
+    if camera is not None:
+        try:
+            return Vector(camera.matrix_world.translation), Vector((1.0, 1.0, 1.0))
+        except Exception:                  # noqa: BLE001
+            pass
+    return Vector((0.0, 0.0, 0.0)), Vector((1.0, 1.0, 1.0))
+
+
+def build_fog(scene, values):
+    """建/刷新预览用的雾盒子。返回盒子对象;不需要雾时返回 None。
+
+    ── 怎么近似 Godot 的雾(真机渲图标定,见模块头)────────────────────
+    `Principled Volume`:Color = 雾色、Density = 密度、
+    Emission Color = 雾色、Emission Strength = 密度 —— 于是
+        L = L0*exp(-d*depth) + fog_color*(1-exp(-d*depth))
+    和 Godot 的 `fog_density / fog_light_color` 那条公式**同形**。
+    ⚠ 自发光强度必须**跟着密度走**(不是 1.0):它对应的是"每米放多少
+      光",填成常数的话密度一调,雾色就会跟着过曝或发灰(标定时试过)。
+    """
+    existing = None
+    wanted = bool(values.get("fog")) and float(values.get("fog_density", 0.0)) > 0.0
+    if not wanted:
+        # ⚠ "不需要雾"这条要在**碰 bpy.data 之前**返回:离线单测的桩里
+        #   没有 bpy.data,而这条路径也不需要任何数据(纯判断)。
+        return None
+    fog_name = FOG_NAME + " · " + scene.name
+    material_name = FOG_MATERIAL_NAME + " · " + scene.name
+    existing = bpy.data.objects.get(fog_name)
+    bounds = _scene_bounds(scene) or _camera_bounds(scene)
+    centre, size = bounds
+
+    obj = existing
+    if obj is None or obj.name not in bpy.data.objects:
+        mesh = bpy.data.meshes.new(fog_name)
+        # 单位立方体(-1..1),再靠 object.scale 撑到要的大小
+        verts = [(-1.0, -1.0, -1.0), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0),
+                 (-1.0, 1.0, -1.0), (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0),
+                 (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0)]
+        faces = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+                 (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new(fog_name, mesh)
+        scene.collection.objects.link(obj)
+    obj["gk_environment_preview"] = True
+
+    # 选中/点击不碍事:看得见(线框),但选不中、也不进大纲的选中链
+    obj.hide_select = True
+    try:
+        obj.display_type = "WIRE"
+    except Exception:
+        pass
+    obj.scale = ((size.x * 0.5) + FOG_MARGIN,
+                 (size.y * 0.5) + FOG_MARGIN,
+                 (size.z * 0.5) + FOG_MARGIN)
+    obj.location = centre
+
+    material = bpy.data.materials.get(material_name)
+    if material is None:
+        material = bpy.data.materials.new(material_name)
+    material.use_nodes = True
+    # 相机在盒子**里面**:剔背面,免得正/反两层一起算(密度会翻倍)
+    material.use_backface_culling = True
+    tree = material.node_tree
+    for node in list(tree.nodes):
+        tree.nodes.remove(node)
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    output.location = (320, 0)
+    volume = tree.nodes.new("ShaderNodeVolumePrincipled")
+    volume.location = (60, 0)
+    colour = tuple(values.get("fog_color", (0.3, 0.34, 0.42, 1.0))[:3])
+    density = float(values.get("fog_density", 0.0))
+    volume.inputs["Color"].default_value = colour + (1.0,)
+    volume.inputs["Density"].default_value = density
+    volume.inputs["Emission Color"].default_value = colour + (1.0,)
+    volume.inputs["Emission Strength"].default_value = density
+    tree.links.new(volume.outputs["Volume"], output.inputs["Volume"])
+
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+    return obj
+
+
+def clear_fog(scene=None):
+    """把雾盒子连它的网格 / 材质一起清掉(幂等;没有就什么都不做)。"""
+    suffix = " · " + scene.name if scene is not None else ""
+    obj = bpy.data.objects.get(FOG_NAME + suffix)
+    mesh = None
+    if obj is not None:
+        mesh = obj.data
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:                  # noqa: BLE001
+            pass
+    if mesh is not None:
+        try:
+            bpy.data.meshes.remove(mesh)
+        except Exception:                  # noqa: BLE001
+            pass
+    material = bpy.data.materials.get(FOG_MATERIAL_NAME + suffix)
+    if material is not None and material.users == 0:
+        try:
+            bpy.data.materials.remove(material)
+        except Exception:                  # noqa: BLE001
+            pass
 
 
 def apply(scene):
@@ -278,10 +468,15 @@ def apply(scene):
     view.gamma = 1.0
     view.use_curve_mapping = False
 
-    # ---- 2. 世界:设置卡上的背景色 + 零环境光 ----
-    # 环境光**不加**:卡通材质是 unshaded,运行时也不吃环境光 —— 两边一致;
-    # (关掉卡通材质用 PBR 时,暗部会有点差别,说明里写着)
-    world = build_world(values["backdrop"])
+    # 每个场景保留自己的世界，避免切换关卡时覆盖另一关的预览。
+    settings = getattr(scene, "gk_settings", None)
+    lit = (not getattr(settings, "toon_materials", True)
+           or getattr(settings, "toon_follow_light", False))
+    ambient_energy = (getattr(settings, "env_ambient_energy", 0.0)
+                      if values["enabled"] and lit else 0.0)
+    world = build_world(values["backdrop"], scene=scene,
+                        ambient_color=getattr(settings, "env_ambient_color", None),
+                        ambient_energy=ambient_energy)
     scene.world = world
     if values["background"] == "SKY":
         notes.append("世界用天空的地平线色铺平(真实是三段渐变,近似)")
@@ -298,7 +493,19 @@ def apply(scene):
         except Exception:
             pass
 
-    # ---- 3. 关掉 Godot 没有的那些效果 ----
+    # ---- 3. 雾:按设置卡的密度 / 颜色做一个体积盒子(第一百一十一轮)----
+    if values["fog"] and values["fog_density"] > 0.0:
+        fog = build_fog(scene, values)
+        if fog is not None:
+            notes.append(f"雾 密度 {values['fog_density']:.4f}"
+                         f"(近处清楚、远处发白,近似)")
+    else:
+        # 关掉雾时也要把上一轮的盒子收走,否则"改了设置没生效"
+        clear_fog(scene)
+        if values["enabled"]:
+            notes.append("雾:设置卡上没开,预览也不加")
+
+    # ---- 4. 关掉 Godot 没有的那些效果 ----
     eevee = getattr(scene, "eevee", None)
     if eevee is not None:
         for attr, label in (("use_raytracing", "光线追踪"),
@@ -310,8 +517,8 @@ def apply(scene):
                 except Exception:
                     pass
 
-    # ---- 4. 说清"对不上的那些"(第九十五轮)----
-    notes.append("雾 / 泛光 / 色调调整 / 描边 / 逐片元 SDF 预览里对不上")
+    # ---- 5. 说清"对不上的那些"(第九十五轮 / 第一百一十一轮去掉雾)----
+    notes.append("泛光 / 色调调整 / 描边 / 逐片元 SDF 预览里对不上")
     return True, "；".join(notes)
 
 
@@ -365,12 +572,15 @@ def restore(scene):
                     pass
 
     # 我们建的那个世界不用留着了
-    ours = bpy.data.worlds.get(WORLD_NAME)
-    if ours is not None and ours is not scene.world:
+    ours = bpy.data.worlds.get(WORLD_NAME + " · " + scene.name)
+    if ours is not None and ours is not scene.world and ours.users == 0:
         try:
             bpy.data.worlds.remove(ours)
         except Exception:
             pass
+
+    # 雾盒子(第一百一十一轮)也是我们建的 —— 一起收走
+    clear_fog(scene)
 
     scene[_BACKUP["active"]] = False
     return True, "已还原成原来的观感"
@@ -392,7 +602,9 @@ def summary(scene=None):
                 f"色调映射 Linear(与 Godot 默认一致)")
     exact = "" if values["tonemap"] in TONEMAP_EXACT else "(近似)"
     where = "天空(地平线色近似)" if values["background"] == "SKY" else "纯色"
-    return (f"背景 {where} · 色调映射 {values['tonemap']}{exact} -> "
+    fog = (f" · 雾 {values['fog_density']:.4f}"
+           if values.get("fog") else " · 无雾")
+    return (f"背景 {where}{fog} · 色调映射 {values['tonemap']}{exact} -> "
             f"视图变换 {values['view_transform']}")
 
 
@@ -403,8 +615,10 @@ def describe():
         "· 色调映射:Linear -> Standard、AgX -> AgX 是精确的;"
         "Filmic / ACES / Reinhard 只能挑同族近似",
         "· 背景:纯色精确;天空用地平线色铺平(真实是三段渐变)",
-        "· 环境光:卡通材质是 unshaded,运行时也不吃它(预览同样不加)",
-        "· 对不上的:雾 / 泛光 / 色调调整(后处理)、描边、逐片元面部 SDF",
+        "· 环境光:跟随场景光照或 PBR 模式按设置卡补光；固定卡通模式不加",
+        "· 雾:按『密度 / 颜色』做一个包住场景的体积盒子 —— 近处清楚、"
+        "远处发白,和 Godot 同一条公式;相机飞出盒子就看不到了(近似)",
+        "· 对不上的:泛光 / 色调调整(后处理)、描边、逐片元面部 SDF",
     )
 
 

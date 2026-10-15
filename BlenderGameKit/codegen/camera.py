@@ -357,9 +357,36 @@ def _stmt_camera_spring_arm(ctx, node, indent):
     yaw_offset = float(getattr(node, "gk_yaw_offset", 0.0) or 0.0)
     collision = bool(getattr(node, "gk_collision", True))
     radius = float(getattr(node, "gk_radius", 0.3) or 0.0)
+    # ── 最短臂长(第 126 轮)─────────────────────────────────────────
+    # 撞得再近,杆子也不会短过这个数 —— 兜底,别让相机贴到枢轴上。
+    #
+    # ── 为什么默认还是 0.2(试过调大,量出来是错的)──────────────────
+    # 直觉是"调大到角色半径 0.5 + 近平面 0.1 = 0.6,相机就进不了身体"。
+    # 真机 A/B 打脸:0.6 会把**贴墙静止**时相机离墙的余量从 0.3500 压到
+    # **0.0475**(< near 0.1)—— 角色的穿模换成了**墙**被近平面切,
+    # 画面更糟(相机都快贴到墙皮上了)。所以默认保持 0.2:没改这个值的老图
+    # 生成结果**逐字不变**。
+    #
+    # 那 0.6 什么时候有用:角色**原点在脚底**时(枢轴 1.4 米 = 胸口),
+    # 贴墙静止时相机离枢轴只有 0.2975 米 —— 那已经在胸腔里了,而示例里
+    # 之所以没事,纯粹因为它的模型以身体中心为原点、枢轴比头顶还高 0.5 米。
+    # 这种工程把这一项调到 0.6 左右能救;代价是墙比它近时会切墙,见属性说明。
+    min_arm = float(getattr(node, "gk_min_arm", 0.2) or 0.0)
+    # 第一人称"眼睛"要在碰撞体上沿**往里留**多少(米)。见下面夹取那段的说明:
+    # 正好夹到上沿时,胶囊顶和眼睛一起贴天花板,真机仍有 7 帧相机在实心体里。
+    # 留一点(比相机 near 0.1 略大)让胶囊顶先顶住。
+    eye_margin = 0.15
     lag = float(getattr(node, "gk_lag", 8.0) or 0.0)
     lag_rot = float(getattr(node, "gk_lag_rot", 0.0) or 0.0)
     enabled = bool(getattr(node, "gk_enabled", True))
+    # A camera with a very short arm and no pitch/lag is the convention used
+    # by the story demo for first-person view.  In that mode movement must not
+    # become an accidental yaw input: CharacterBody rotation can change while
+    # sliding against geometry, so capture the arm yaw once and let only the
+    # explicit mouse-yaw value update the view.
+    first_person_lock = (abs(float(getattr(node, "gk_arm", 4.0) or 0.0)) <= 0.5
+                         and abs(float(getattr(node, "gk_pitch", 15.0) or 0.0)) <= 0.001
+                         and lag <= 0.0)
     if enabled and str(arm) in ("0.0", "0"):
         # 臂长填 0 = 杆子收到底,相机贴在枢轴上 —— 那是"第一人称"的做法,
         # 但多数人填 0 是想"先不生效"。这里给一句提醒,免得画面变成贴脸。
@@ -381,22 +408,93 @@ def _stmt_camera_spring_arm(ctx, node, indent):
     # 存成员变量,所以**别的地方**随时读都是最新值(不是只在执行点算一次)
     pivot_var = ctx.declare_var(f"_gk_spring_pivot{tag}", "Vector3")
     dir_var = ctx.declare_var(f"_gk_spring_dir{tag}", "Vector3")
+    base_yaw_var = None
+    base_yaw_ready_var = None
+    if first_person_lock:
+        base_yaw_var = ctx.declare_var(f"_gk_spring_base_yaw{tag}", "float")
+        base_yaw_ready_var = ctx.declare_var(
+            f"_gk_spring_base_yaw_ready{tag}", "bool", initial="false")
 
     follow3d = f"({follow} as Node3D)"
     arm3d = f"({arm_node} as Node3D)"
+    # ── ★ 枢轴不许跑到角色的碰撞体**外面**(第 129 轮)────────────────────
+    # ── 用户原话 + 真机量出来的链条 ──────────────────────────────────────
+    # 用户:"2.还有第一人称还会触发穿模（幅度变小了）。"
+    # 真机(第三关方块顶跳,113 帧,`.`audit/camclip`):
+    #     第一人称枢轴 = 玩家原点 + **1.55**,而玩家胶囊是
+    #     `CapsuleShape3D(r=0.5, h=1.8)` -> 沿 y 只到 **+0.9**。
+    #     于是"眼睛"恒定落在**头顶上方 0.65 米处**(1.55 - 0.9):
+    #        相机高出胶囊顶 = **+0.6500 恒定**
+    #        相机→最近表面 = **-1.0 ~ 0.5497**(负数 = 已经在实心体里)
+    #        比 near(0.1) 更近 = **5 帧**,最坏 **0.0066 米**
+    #        相机在实心体里的帧 = **10 帧**(撞 `结局天花板`)
+    #     而玩家胶囊中心到最近表面始终 0.9002~1.4725 ——
+    #     **身体一直在外面,只有眼睛伸出去了**。
+    #
+    # 为什么 `1.55` 会是错的:`1.55` 是**按"角色原点在脚底"写的**(1.8 米的人,
+    # 眼睛离地 1.55 = 标准写法)。可这个示例的角色原点在**身体中心**,
+    # 于是同一串数字把眼睛顶到离地 2.45 米 —— 水平方向还被胶囊挡着(相机
+    # 只在轴线外 0.25 米,胶囊半径 0.5),**竖直方向完全裸奔**,顶天花板就穿。
+    #
+    # 修法:夹一次,不让枢轴超出跟随对象碰撞形状的**半高**。
+    #   * 原点在**中心** -> 半高约 0.9,1.55 被夹到 0.9 以内 -> 眼睛回到身体里;
+    #   * 原点在**脚底** -> 碰撞形状的中心在 +0.9,上沿在 +1.8,1.55 合法不动。
+    # 也就是说**同一个属性值两种原点都对**,不用让用户去猜该填多少。
+    # ⚠ 只在**第一人称**夹(第三人称的 1.4 是要"举过头顶看",必须允许超出),
+    #   而且只在拿得到碰撞形状时才夹(拿不到就保持原值,老工程行为不变)。
+    # ⚠ 夹的是"沿**角色自身竖直轴**的高度",不是世界 y —— 角色躺着也成立。
+    clamp_lines = []
+    if first_person_lock:
+        # 让 generator 把 `_gk_body_half_up()` 写出来(只声明需要,不重复生成)
+        ctx.need_pivot_clamp = True
+        # ── 为什么要留 0.15 的余量(真机量出来的,别改成 0)────────────────
+        # 第一版夹到**正好等于胶囊上沿**,真机复跑仍然有 **7 帧**相机在实心体里、
+        # 水平离表面 **0.0001 米**:站在方块上跳时胶囊顶(0.9)会顶到天花板底面,
+        # 而眼睛正好也在 0.9 —— **眼睛和胶囊顶一起贴到天花板上了**。
+        # 留 0.15(比相机 near 0.1 略大)之后眼睛落在胶囊内更低处,
+        # 天花板由**胶囊顶**先顶上,眼睛够不着。
+        # 0.15 这个数是"near + 一点",不是随手填的:比 near 小就等于没留。
+        clamp_lines = [
+            f"    var _gk_half_up := _gk_body_half_up({follow3d})",
+            "    if _gk_half_up > 0.0:",
+            f"        var _gk_axis: Vector3 = {arm3d}.global_transform.basis.y",
+            "        if _gk_axis.length_squared() > 1e-8:",
+            "            _gk_axis = _gk_axis.normalized()",
+            f"            var _gk_up_off: float = (_gk_pivot "
+            f"- {follow3d}.global_position).dot(_gk_axis)",
+            "            var _gk_limit: float = _gk_half_up "
+            f"- {gd_number(eye_margin)}",
+            "            if _gk_limit < 0.0:",
+            "                _gk_limit = 0.0",
+            "            if _gk_up_off > _gk_limit:",
+            "                _gk_pivot -= _gk_axis * (_gk_up_off - _gk_limit)",
+        ]
     lines = [
         f"if {cam_var} != null and {arm_node} is Node3D:",
         # 枢轴 = 杆子挂点的位置 + 偏移向量(偏移可以接线,运行中改)
         f"    var _gk_pivot: Vector3 = {arm3d}.global_position "
         f"+ ({offset_expr})",
-        # 偏航 = 挂点自己的朝向 **减去** 节点上的偏移与『偏航』引脚。
+        # ── 偏航 = 挂点自己的朝向 **减去** 节点上的偏移与『偏航』引脚。
         # ── 为什么是"减"(用户 2026-10-04:"视角旋转逻辑感觉颠倒了")──────
         # Godot 里 rotation.y 正向 = 从上看**逆时针 = 左转**;鼠标右移给出的
         # 是正值,直接加就成了"鼠标往右、视角往左"。取负之后:鼠标右移 ->
         # 杆子绕到角色左后方 -> 视线右转,和直觉一致。挂点自己的旋转
         # (rotation.y)保持原样,杆子才始终待在角色**正后方**。
-        f"    var _gk_yaw: float = {arm3d}.rotation.y "
-        f"- deg_to_rad({gd_number(yaw_offset)} + ({yaw_in}))",
+    ] + clamp_lines
+    if first_person_lock:
+        lines += [
+            f"    if not {base_yaw_ready_var}:",
+            f"        {base_yaw_var} = {arm3d}.rotation.y",
+            f"        {base_yaw_ready_var} = true",
+            f"    var _gk_yaw: float = {base_yaw_var} "
+            f"- deg_to_rad({gd_number(yaw_offset)} + ({yaw_in}))",
+        ]
+    else:
+        lines += [
+            f"    var _gk_yaw: float = {arm3d}.rotation.y "
+            f"- deg_to_rad({gd_number(yaw_offset)} + ({yaw_in}))",
+        ]
+    lines += [
         # 杆子的方向 = 先按俯仰抬起来、再按偏航绕一圈。
         # 从 Basis 取 .z 是因为 Godot 的相机朝 -Z 看 —— 杆子往 +Z 退,
         # 相机正好回头看向枢轴,不用再手动翻 180°。
@@ -429,11 +527,64 @@ def _stmt_camera_spring_arm(ctx, node, indent):
             "    var _gk_query := PhysicsRayQueryParameters3D.create("
             "_gk_pivot, _gk_want, 0xFFFFFFFF, _gk_exclude)",
             "    var _gk_hit := _gk_space.intersect_ray(_gk_query)",
+            # ── 兜底:撞到的**就是跟随对象自己**时不算数(第 126 轮)────────
+            # 上面虽然排除了 follow,但排除**只在 follow 是 CollisionObject3D
+            # 时**才拿得到 RID。拿不到 RID 的那一刻,射线在枢轴处就会打中
+            # 玩家自己的身体(真机量过:从枢轴往身后打,在 **0.11 米**处命中
+            # 自己的胶囊)-> `0.11-0.35` 变负数 -> 被最短臂长夹住 ->
+            # **相机被永久钉在最短距离上 = 每一帧都穿模**。
+            # 一行判断把这条最容易踩的路堵死(拿不到 RID 也不会毁掉画面)。
+            f"    if not _gk_hit.is_empty() and _gk_hit[\"collider\"] == {follow}:",
+            "        _gk_hit = {}",
             "    if not _gk_hit.is_empty():",
             "        var _gk_dist: float = _gk_pivot.distance_to("
             "_gk_hit[\"position\"])",
-            f"        _gk_dist = maxf(_gk_dist - {gd_number(radius)}, 0.2)",
+            f"        _gk_dist = maxf(_gk_dist - {gd_number(radius)},"
+            f" {gd_number(min_arm)})",
             "        _gk_want = _gk_pivot + _gk_dir * _gk_dist",
+        ]
+        # ── 天花板兜底:相机不许跑到"头顶那块天花板"上面(第 128 轮)────────
+        # 用户原话:"摄像机穿模是我站在**第三关卡的那个正方体上面**,然后跳跃,
+        # 就出现了"。
+        #
+        # ── 真机量到的链条(示例产物副本,Godot 4.7.2;第 3 关小房间)────────
+        # 房间:地板 y=0、天花板底面 y=5.0(结局天花板 18×0.3×18 @ y=5.15)。
+        # 玩家站在 `结局箱甲`(2.2×2.0×2.2,顶面 y=2.0)上:原点 y=2.90、
+        # 枢轴(= 原点 + 1.4)y=4.30,离天花板还有 0.70 —— 这时射线撞天花板,
+        # 相机被压在底面下方 y=4.927(**88/90 帧卡着不动**,是对的)。
+        # 一发跳:头顶顶住天花板(原点最高 4.10,胶囊顶 4.10+0.9 = 5.0),
+        # 而**枢轴冲到 y=5.50 —— 比天花板底面高 0.50、比它顶面还高 0.20**。
+        # 从那时起主射线**什么都撞不到**(起点已经在天花板里/上面,
+        # `intersect_ray` 不报自己所在的那块实心体)-> 杆子恢复到全长 5 米 ->
+        # 相机跟着枢轴跑到 **y=6.539 = 屋子外面**。真机:f116~f140 共 25 帧
+        # (0.42 秒)相机在天花板上面,屏幕上只剩天花板顶面、玩家不见了。
+        # 截图对照:.audit/camclip/shot_before_up_jump.png(满屏一片紫)
+        #           .audit/camclip/shot_after_up_jump.png(正常看到房间)
+        #
+        # ⚠⚠ 起点**必须是跟随对象(身体)的位置,不能是枢轴** ⚠⚠
+        # 这一条是整套修法的关键,后来人千万别"顺手统一成枢轴":
+        #   身体的位置一定在天花板**下面**(它就在屋里),从它往上打永远打得中;
+        #   而枢轴正是那个穿到天花板里/上面的点,从固体内部往外打**打不到背面**
+        #   —— 实测"从枢轴竖直向上打一条"完全没用(相机照样停在 y=6.0)。
+        # 射线顺着"物体向上"而不是顺着杆子方向,也正是为了**够得着**:
+        # 另外试过"从身体再打一条与杆子同方向的射线",仰角 12° 时天花板在
+        # 那条线上有 5~10 米远、而杆子只有 5 米,玩家站得低时它**够不到**
+        # (25 帧里只救回 12 帧);竖直向上那条只要"天花板-身体"这么长。
+        #
+        # 为什么加 10 米:相机最高也就到"枢轴 + 杆长"这个量级,封顶 10 米足够
+        # 覆盖任何真能挡到它的天花板;打得更远也不会误夹(只有 `_gk_want`
+        # 比命中点还高时才夹)。
+        # 为什么留 0.1 米余量:相机的近平面是 0.1 —— 贴着天花板底面放会切天花板。
+        lines += [
+            f"    var _gk_up: Vector3 = {follow3d}.global_position",
+            "    var _gk_up_hit := _gk_space.intersect_ray("
+            "PhysicsRayQueryParameters3D.create("
+            "_gk_up, _gk_up + Vector3(0.0, 10.0, 0.0), "
+            "0xFFFFFFFF, _gk_exclude))",
+            "    if not _gk_up_hit.is_empty():",
+            "        var _gk_ceil_y: float = _gk_up_hit[\"position\"].y - 0.1",
+            "        if _gk_want.y > _gk_ceil_y:",
+            "            _gk_want.y = _gk_ceil_y",
         ]
     if lag > 0.0:
         # 指数平滑:系数按 delta 换算,**和帧率无关**。
@@ -452,6 +603,31 @@ def _stmt_camera_spring_arm(ctx, node, indent):
             f"    if not {ready_var}:",
             f"        {ready_var} = true",
             f"        {pos_var} = _gk_want",
+            # ── 竖直方向**硬跟**:相机不许在角色上下移动时落后(第 126 轮)──
+            # 用户原话:"有时跳跃,切换摄像机会穿模"。
+            #
+            # ── 真机量到的机制(示例产物副本,Godot 4.7.2,窗口化+无头各一遍)──
+            # 平滑的是**世界坐标**,而跳跃时角色以 ~7 m/s 上升:
+            # 系数 8*dt ≈ 0.133/帧 -> 相机相对枢轴下沉 0.42~0.49 米
+            # (实测相机在玩家局部系里的 y:静止 +1.462 -> 跳跃中 **+0.939**,
+            #  而玩家模型的盒顶在 **+0.900**)—— 正好掉到头顶那一层。
+            # 模型是玩家的子节点、**零滞后**,于是两边错开半个身位;
+            # 再叠上"贴着墙时杆子被压到 0.29 米",相机离模型表面只剩
+            # **0.0385~0.0756 米**,比相机自己的近平面(near=0.1)还近 ——
+            # 比近平面更近的面片被裁掉 + 背面剔除 -> 看到身体内部 = 穿模。
+            # 开阔地跳不穿(2.5 米),贴墙跳才穿 —— 这正是用户说的"有时"。
+            #
+            # 这一行只把 Y 先拨到当前的 `_gk_want.y`:紧接着的整段 lerp 在 Y 上
+            # 就是恒等(连"回弹"曲线的过冲也影响不到 Y),XZ 仍是原来的
+            # 世界位置 lerp —— 走路时那股"松垮感"和贴墙时的画面**一个像素都不变**
+            # (真机 A/B:贴墙静止 0.5619 -> 0.5619、离墙余量 0.3500 -> 0.3500、
+            #  走路稳态臂长 5.4051 -> 5.4124;而穿模那几帧 0.0756->0.5416 /
+            #  0.0539->0.5618,进近平面的帧数 3->0 / 12->0)。
+            #
+            # ── 为什么不用"整根杆向量一起平滑"(试过,量过)────────────────
+            # 那样水平也变成硬跟:走路稳态臂长从 5.405 掉到 **4.821**,
+            # "相机追不上角色"的跟随感没了 —— 修好穿模但把手感改掉了。
+            f"    {pos_var}.y = _gk_want.y",
             f"    {pos_var} = {pos_var}.lerp(_gk_want, {factor})",
         ]
         lines.append(f"    if {blend_left} <= 0.0:")
@@ -1049,7 +1225,8 @@ def _stmt_camera_follow(ctx, node, indent):
     # 改成按**名字在场景里搜**,搜不到就退回"场景里第一个相机":
     # 填错只是退回自动模式,不会把脚本搞崩。
     if raw_cam and raw_cam != TARGET_SELF:
-        camera = f"_gk_find_camera_named(self, {gd_string(raw_cam)})"
+        camera = (ctx.target_expr(node, "gk_camera", hint="cam") if raw_cam.startswith("@")
+                  else f"_gk_find_camera_named(self, {gd_string(raw_cam)})")
     else:
         # 交给一个纯查询函数:这个节点每帧都在跑，而相机可能还没进场景。
         # 用函数而不是内联代码，是为了把 null 情况收在一处处理。

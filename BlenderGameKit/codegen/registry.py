@@ -142,14 +142,13 @@ def _next_nodes(node, output="完成"):
                 break
     if socket is None:
         return []
-    result = []
-    for link in getattr(socket, "links", ()):  # 离线桩里 links 是列表
-        target = getattr(link, "to_node", None)
-        if target is not None:
-            entry = getattr(getattr(link, "to_socket", None), "name", "")
-            result.append((target, entry or "执行"))
-    result.sort(key=lambda item: (getattr(item[0], "location", (0.0, 0.0))[1],
-                                  getattr(item[0], "location", (0.0, 0.0))[0]))
+    from .graph import downstream, position_key
+    try:
+        result = downstream(socket)
+    except ValueError as exc:
+        from .context import CodegenAbort
+        raise CodegenAbort(str(exc)) from exc
+    result.sort(key=lambda item: position_key(item[0]))
     return result
 
 

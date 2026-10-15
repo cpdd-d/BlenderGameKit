@@ -108,6 +108,32 @@ class Base(unittest.TestCase):
 
 
 class TestBasic(Base):
+    def test_waiting_branch_fanout_reports_order_risk(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        wait = tree.new_node(NN.GKNodeWait, "等待")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="ready")
+        gk_stub.connect(tree, ready, "执行", wait, "执行")
+        gk_stub.connect(tree, ready, "执行", printer, "执行")
+        result = codegen.generate_result(tree, V3)
+        self.assertIn("SUSPENDING_FLOW_FANOUT",
+                      [item.code for item in result.diagnostics])
+
+    def test_sequence_makes_waiting_order_explicit(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        sequence = tree.new_node(NN.GKNodeSequence, "顺序", gk_step_count=2)
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="ready")
+        wait = tree.new_node(NN.GKNodeWait, "等待")
+        gk_stub.connect(tree, ready, "执行", sequence, "执行")
+        gk_stub.connect(tree, sequence, "1", printer, "执行")
+        gk_stub.connect(tree, sequence, "2", wait, "执行")
+        result = codegen.generate_result(tree, V3)
+        self.assertNotIn("SUSPENDING_FLOW_FANOUT",
+                         [item.code for item in result.diagnostics])
+        self.assertLess(result.code.index('print("ready")'),
+                        result.code.index("create_timer"))
+
     def test_empty_tree_warns(self):
         tree = make_tree()
         code, warnings = gen(tree)
@@ -879,7 +905,7 @@ class TestLightNodes(Base):
         node = tree.new_node(NN.GKNodeSetLight, "灯", gk_light="台灯")
         gk_stub.connect(tree, event, "执行", node, "执行")
         code, _ = gen(tree, V3)
-        self.assertIn("host.get_tree().current_scene", code)
+        self.assertIn("host.get_tree().root", code)
         self.assertIn("light.visible = on", code)
         self.assertIn("light.light_energy = energy", code)
 
@@ -895,20 +921,20 @@ class TestLightNodes(Base):
         self.assertIn("func _gk_pick_light(", text)
 
     def test_light_energy_mapping(self):
-        """能量换算:太阳 ×1.2 夹 [0.2,4];点光 1000W ≈ 1.0,夹 [0.05,8]。"""
+        """能量连续映射，极暗与极亮的灯都不被静默截断。"""
         from BlenderGameKit import asset_export
         sun = types.SimpleNamespace(
             data=types.SimpleNamespace(type="SUN", energy=1.0))
         self.assertAlmostEqual(asset_export._light_energy_for(sun), 1.2)
         bright = types.SimpleNamespace(
             data=types.SimpleNamespace(type="SUN", energy=10.0))
-        self.assertAlmostEqual(asset_export._light_energy_for(bright), 4.0)
+        self.assertAlmostEqual(asset_export._light_energy_for(bright), 12.0)
         lamp = types.SimpleNamespace(
             data=types.SimpleNamespace(type="POINT", energy=1000.0))
         self.assertAlmostEqual(asset_export._light_energy_for(lamp), 1.0)
         dim = types.SimpleNamespace(
             data=types.SimpleNamespace(type="POINT", energy=10.0))
-        self.assertAlmostEqual(asset_export._light_energy_for(dim), 0.05)
+        self.assertAlmostEqual(asset_export._light_energy_for(dim), 0.01)
 
 
 class TestAudioNodes(Base):
@@ -2023,7 +2049,7 @@ class TestUiDesignTree(Base):
 
     用户选的方案:
       * 设计图只管"长什么样",玩法图的『界面_套用设计』一键建出来;
-      * 界面控件节点**两棵树都能放**(老图一字不变);
+      * 界面控件只放在设计图;逻辑图用运行时接口绑定行为;
       * 点击行为用『界面_按钮点击』按名字接(控件的名字 = 设计图里的节点名)。
     """
 
@@ -2051,7 +2077,7 @@ class TestUiDesignTree(Base):
                 setattr(bpy_module(), "data", original)
 
     # ---- 树类型 / 菜单归属 ----
-    def test_ui_widget_nodes_fit_both_trees(self):
+    def test_ui_widget_nodes_belong_to_design_tree_and_logic_keeps_interface(self):
         from BlenderGameKit import properties as props
         for cls in (NN.GKNodeUiText, NN.GKNodeUiBar, NN.GKNodeUiButton,
                     NN.GKNodeUiImage, NN.GKNodeUiPanel, NN.GKNodeUiList,
@@ -2062,22 +2088,76 @@ class TestUiDesignTree(Base):
                     NN.GKNodeUiCheckbox):
             self.assertTrue(props.node_fits_tree(cls, "GKUiDesignTree"),
                             cls.bl_label + " 应该能放进设计图")
-            # 老图不受影响:玩法图照旧能放(用户选的"两棵树都能放")
+            self.assertFalse(props.node_fits_tree(cls, "GKGameLogicTree"),
+                             cls.bl_label + " 应从玩法图移到设计图")
+        # ── 第一百一十二轮:三条线(界面搬家)──────────────────────────
+        # ① 界面**自己的行为** → 设计图专属(**菜单层面**;poll 照旧放行,
+        #    否则老脚本/示例重建会失败 —— 见 properties.node_menu_allowed):
+        for cls in (NN.GKNodeUiPauseGame, NN.GKNodeUiOnClick,
+                    NN.GKNodeUiOnValueChanged, NN.GKNodeUiTween,
+                    NN.GKNodeUiSkin, NN.GKNodeUiListFill):
+            self.assertTrue(props.node_fits_tree(cls, "GKUiDesignTree"),
+                            cls.bl_label + " 设计图里要能放")
             self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"),
-                            cls.bl_label + " 仍然要能放进玩法图")
-        # 动作类不进设计图 —— 它们管"运行时改控件",是玩法图的事
-        self.assertFalse(props.node_fits_tree(NN.GKNodeUiHide, "GKUiDesignTree"))
-        self.assertFalse(props.node_fits_tree(NN.GKNodeUiApplyDesign,
-                                              "GKUiDesignTree"))
+                            cls.bl_label + " 老图还能编辑(poll 放行)")
+            self.assertFalse(props.node_menu_allowed(cls, "GKGameLogicTree"),
+                             cls.bl_label + " 应从玩法图的**菜单**里消失")
+            self.assertTrue(props.node_menu_allowed(cls, "GKUiDesignTree"),
+                            cls.bl_label + " 设计图菜单里要有")
+        # ② 运行时控件接口 → 两棵树都能放、菜单里也都列:
+        for cls in (NN.GKNodeUiSet, NN.GKNodeUiHide, NN.GKNodeUiReadText,
+                    NN.GKNodeUiFocus):
+            for kind in ("GKUiDesignTree", "GKGameLogicTree"):
+                self.assertTrue(props.node_fits_tree(cls, kind),
+                                cls.bl_label + " 两棵树都能放")
+                self.assertTrue(props.node_menu_allowed(cls, kind),
+                                cls.bl_label + " 两棵树的菜单都要有")
+        # ③ 玩法图的界面接口:套用设计 + 主界面(布尔)+ 剧情对话一族:
+        for cls in (NN.GKNodeUiApplyDesign, NN.GKNodeUiMain,
+                    NN.GKNodeUiDialog, NN.GKNodeUiChoice,
+                    NN.GKNodeUiSubtitle, NN.GKNodeDialogHistory):
+            self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"),
+                            cls.bl_label + " 应保留在玩法图")
+            self.assertFalse(props.node_fits_tree(cls, "GKUiDesignTree"),
+                             cls.bl_label + " 不进设计图")
+        # 例外:『界面_飘字』跟的是**场景里的物体**(金币头顶冒 +1),
+        # 不是界面控件 —— 留在玩法图。
+        self.assertTrue(props.node_fits_tree(NN.GKNodeFloatText,
+                                             "GKGameLogicTree"))
 
-    def test_design_tree_menu_lists_only_widgets(self):
+    def test_design_tree_menu_lists_widgets_and_behavior(self):
         from BlenderGameKit import properties as props
-        labels = [cls.bl_label
-                  for _cat, items in props.node_menu_entries("GKUiDesignTree")
-                  for cls in items]
-        self.assertIn("界面_文本", labels)
-        self.assertIn("界面_面板", labels)
-        self.assertNotIn("界面_隐藏控件", labels)
+        design_labels = [cls.bl_label
+                         for _cat, items in props.node_menu_entries("GKUiDesignTree")
+                         for cls in items]
+        self.assertIn("界面_文本", design_labels)
+        self.assertIn("界面_面板", design_labels)
+        # 第一百一十二轮:界面自带的行为在设计图菜单里
+        self.assertIn("界面_按钮点击", design_labels)
+        self.assertIn("界面_暂停游戏", design_labels)
+        # 运行时接口两棵树都能放 -> 设计图菜单里也有
+        self.assertIn("界面_隐藏控件", design_labels)
+        # 玩法图专属的接口不进设计图菜单
+        self.assertNotIn("界面_套用设计", design_labels)
+        self.assertNotIn("界面_主界面", design_labels)
+
+    def test_logic_menu_drops_ui_behavior_nodes(self):
+        """玩法图菜单:界面**自己的行为**不再列(用户要的"删了")。
+
+        但**接口**还在:套用设计 / 主界面 / 设置 / 显隐 / 对话框一族的。
+        poll 照旧放行 —— 那条由上一个测试锁着(老脚本不受影响)。
+        """
+        from BlenderGameKit import properties as props
+        logic_labels = [cls.bl_label
+                        for _cat, items in props.node_menu_entries("GKGameLogicTree")
+                        for cls in items]
+        for gone in ("界面_按钮点击", "界面_暂停游戏", "界面_缓动",
+                     "界面_皮肤", "界面_列表_填充", "界面_值变化"):
+            self.assertNotIn(gone, logic_labels,
+                             gone + " 应从玩法图菜单里搬走")
+        for kept in ("界面_套用设计", "界面_主界面", "界面_设置",
+                     "界面_隐藏控件", "界面_对话框", "对话_选择"):
+            self.assertIn(kept, logic_labels, kept + " 是玩法图的界面接口")
 
     # ---- 『界面_套用设计』----
     def test_apply_design_builds_widgets_parent_first(self):
@@ -2124,11 +2204,12 @@ class TestUiDesignTree(Base):
         # 挂进容器的控件用最小尺寸,而不是自己设 size
         self.assertIn("custom_minimum_size", code)
 
-    def test_apply_design_skips_action_nodes(self):
-        """兜底:设计图里混进动作节点时,『套用设计』不该把它"建出来"。
+    def test_apply_design_runs_design_behavior(self):
+        """第一百一十二轮:设计图里的动作节点 = 界面的**自带行为**,会执行。
 
-        真 Blender 里节点基类的 poll 会**直接拒绝**把动作节点放进设计图
-        (冒烟测试锁着这条);桩环境不校验,所以这里再锁一道 codegen 过滤。
+        旧版这里是"跳过动作节点"(设计图只管长相)。用户要求把界面逻辑
+        搬进设计图之后,『界面_套用设计』的语义 = 建控件 + 跑图里那些
+        **没从别处接进来**的顶层语句 —— 这条行为链就在这里验证。
         """
         design = self._design()
         design.new_node(NN.GKNodeUiText, "标题", gk_text="标题")
@@ -2137,8 +2218,8 @@ class TestUiDesignTree(Base):
             design, self._apply_tree(design))
         self.assertEqual(warnings, [], warnings)
         self.assertIn("_gk_ui_标题", code)
-        # 『界面_隐藏控件』的产物(.visible = false)不该出现
-        self.assertNotIn(".visible = false", code)
+        # 『界面_隐藏控件』(顶层行为)的产物现在**应该**出现
+        self.assertIn(".visible = false", code)
 
     def _apply_tree(self, design):
         tree = make_tree()
@@ -2157,6 +2238,246 @@ class TestUiDesignTree(Base):
         _code, warnings = self._gen_with_design(
             design, self._apply_tree(design))
         self.assertTrue(any("没有控件" in w for w in warnings), warnings)
+
+    # ---- 『界面_主界面』+ 主界面脚本(第一百一十二轮)----
+    def _gen_with_designs(self, designs, tree):
+        """把一组设计图挂到 bpy.data 上生成(用完还原)。"""
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=list(designs)))
+        try:
+            return gen(tree, V2)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def test_ui_main_node_codegen(self):
+        """『界面_主界面』:按 /root/GkMainUi 找 autoload 调 show_main。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiMain, "显示主界面", gk_show=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('get_node_or_null("/root/GkMainUi")', code)
+        self.assertIn(".show_main(true)", code)
+        # 没有主界面时是运行期警告,不是直接崩
+        self.assertIn("push_warning", code)
+        # 收起那一档
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        hide = tree2.new_node(NN.GKNodeUiMain, "收起主界面", gk_show=False)
+        gk_stub.connect(tree2, event2, "执行", hide, "执行")
+        code2, warnings2 = gen(tree2, V2)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn(".show_main(false)", code2)
+
+    def test_ui_main_node_registered(self):
+        from BlenderGameKit import properties as props
+        cls = NN.GKNodeUiMain
+        self.assertEqual(cls.bl_label, "界面_主界面")
+        self.assertEqual(cls.gk_category, "界面")
+        self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"))
+        self.assertFalse(props.node_fits_tree(cls, "GKUiDesignTree"))
+
+    def test_generate_main_ui_script(self):
+        """主界面单独生成:整张图(控件 + 自带行为)进 _ready,附接口函数。"""
+        from BlenderGameKit import codegen as codegen_mod
+        design = self._design("主界面")
+        design.new_node(NN.GKNodeUiText, "标题", gk_text="标题")
+        design.new_node(NN.GKNodeUiHide, "藏标题", gk_widget="标题")
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[design]))
+        try:
+            result = codegen_mod.generate_main_ui(design, {"dimension": "3"})
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+        code = result.code
+        self.assertEqual(result.warnings, [], result.warnings)
+        self.assertIn("extends Node", code)
+        self.assertIn("_gk_ensure_ui(self)", code)
+        self.assertIn("_gk_ui_标题", code)
+        # 界面自带的行为(顶层语句)也进来了
+        self.assertIn(".visible = false", code)
+        # 玩法图『界面_主界面』节点调的两个接口
+        self.assertIn("func show_main(on: bool = true) -> void:", code)
+        self.assertIn("func main_shown() -> bool:", code)
+
+    def test_design_behavior_signal_chain_not_double_run(self):
+        """按钮『点击』出口后面的链只走回调 —— 不被当成顶层行为再跑一遍。"""
+        design = self._design()
+        button = design.new_node(NN.GKNodeUiButton, "开始", gk_text="开始")
+        printer = design.new_node(NN.GKNodePrint, "开跑", gk_text="go")
+        gk_stub.connect(design, button, "点击", printer, "执行")
+        code, warnings = self._gen_with_design(
+            design, self._apply_tree(design))
+        self.assertEqual(warnings, [], warnings)
+        # 只出现一次,而且在回调函数体里(不是接上就立刻跑)
+        self.assertEqual(code.count('print("go")'), 1, code)
+        lines = code.splitlines()
+        callback = next(i for i, line in enumerate(lines) if "func gk_on_" in line)
+        call = next(i for i, line in enumerate(lines) if 'print("go")' in line)
+        self.assertGreater(call, callback, code)
+
+    def test_find_widget_falls_back_to_main_ui_only_when_marked(self):
+        """有『主界面』时控件查找多一条兜底;没有时保持老文本逐字不变。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        setter = tree.new_node(NN.GKNodeUiSet, "改字",
+                               gk_widget="标题", gk_text="x")
+        gk_stub.connect(tree, event, "执行", setter, "执行")
+        code, _ = self._gen_with_designs([], tree)
+        self.assertIn("if _gk_ui_layer == null:", code)
+        self.assertNotIn("GkMainUi", code)
+        design = self._design()
+        design.gk_main_ui = True
+        code2, _ = self._gen_with_designs([design], tree)
+        self.assertIn('get_node_or_null("/root/GkMainUi")', code2)
+
+    # ---- P1(第一百二十六轮):暂停菜单出现时旧界面必须让位 ----
+    # 用户原话:"有时点快了,就会有这样的情况,那么在如ESC菜单出现时
+    # 就立刻隐藏旧的界面,或者添加模糊背景" —— 配图是章节卡「第一章:门厅」
+    # 糊在暂停面板的「继续游戏」上。
+    #
+    # 真机(`.audit/ui_overlay_probe`,Godot 4.7.2)量出来的两根因:
+    #   ① 主界面那份 CanvasLayer 和关卡自己那份**层号同为 10**,而层号相同时
+    #      由 /root 里的树序决定先后 —— 主界面排在前面,于是整个被关卡界面
+    #      **画在下面**;`_gk_ui_raise()` 的 `move_to_front()` 只在同一个父节点
+    #      的兄弟之间挪,跨 CanvasLayer 一步都迈不出去;
+    #   ② 章节卡这类"过场控件"没人在暂停时收起来,半透明暂停面板挡不住字。
+    # 所以修法是**两层**:主界面抬到 layer 20 + 过场控件整批收起(原样还原)。
+    def _gen_main_ui(self, design):
+        """按主界面模式生成(和导出侧 generate_main_ui 同一条路)。"""
+        from BlenderGameKit import codegen as codegen_mod
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[design]))
+        try:
+            return codegen_mod.generate_main_ui(design, {"dimension": "3"})
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def test_main_ui_layer_is_above_level_ui(self):
+        """主界面那层要抬到 20(> 关卡界面 10),否则暂停菜单跨不过去。"""
+        design = self._design("主界面")
+        design.gk_main_ui = True
+        design.new_node(NN.GKNodeUiPanel, "暂停菜单", gk_start_hidden=True)
+        result = self._gen_main_ui(design)
+        self.assertEqual(result.warnings, [], result.warnings)
+        self.assertIn("_gk_ui_layer.layer = 20", result.code)
+        # ⚠ 层号必须**还低于**屏幕滤镜(90)/ 暗角(92)/ 闪白转场(100)——
+        #   那些是"盖住一切"的全屏效果,抬过它们反而把暂停菜单压回去。
+        self.assertNotIn("_gk_ui_layer.layer = 90", result.code)
+        # 普通关卡脚本仍然是 10(老行为一字不变)
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiText, "目标", gk_text="目标:找钥匙")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertIn("_gk_ui_layer.layer = 10", code)
+
+    def test_transient_widget_joins_group_and_pause_hides_it(self):
+        """过场控件(章节卡 / 居中提示)要在暂停时收起来,恢复时原样还原。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        card = tree.new_node(NN.GKNodeUiText, "章节卡", gk_text="第一章:门厅",
+                             gk_align="CENTER")
+        # 角落里的 HUD:**不能**进过场组(玩家暂停时还要看)
+        hud = tree.new_node(NN.GKNodeUiText, "目标文本", gk_text="目标:找钥匙")
+        pause = tree.new_node(NN.GKNodeUiPauseGame, "暂停", gk_pause=True,
+                              gk_menu="暂停菜单", gk_hotkey=True)
+        gk_stub.connect(tree, event, "执行", card, "执行")
+        gk_stub.connect(tree, card, "完成", hud, "执行")
+        gk_stub.connect(tree, hud, "完成", pause, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_ui_章节卡.add_to_group("gk_ui_transient")', code)
+        self.assertNotIn('_gk_ui_目标文本.add_to_group("gk_ui_transient")', code)
+        self.assertIn("_gk_hide_transient(true)", code)
+        self.assertIn("_gk_hide_transient(false)", code)
+        # 收起来之前先记下"各自可不可见",恢复时按同一顺序还回去 ——
+        # 一律 `visible = true` 会把本来就该藏着的过场控件亮出来
+        self.assertIn("_gk_transient_hidden.append(canvas.visible)", code)
+        # 没有过场控件的图:一个字都不多生成(老图逐字不变)
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        goal = tree2.new_node(NN.GKNodeUiText, "目标文本", gk_text="目标")
+        pause2 = tree2.new_node(NN.GKNodeUiPauseGame, "暂停2", gk_pause=True,
+                                gk_menu="暂停菜单", gk_hotkey=False)
+        gk_stub.connect(tree2, event2, "执行", goal, "执行")
+        gk_stub.connect(tree2, goal, "完成", pause2, "执行")
+        code2, _ = gen(tree2, V2)
+        self.assertNotIn("_gk_hide_transient", code2)
+        self.assertNotIn("gk_ui_transient", code2)
+
+    def test_explicit_transient_flag_covers_corner_widgets(self):
+        """控件卡勾了『过场界面』:角落里的控件也进过场组。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        overlay = tree.new_node(NN.GKNodeUiText, "过场题字", gk_text="第一章",
+                                gk_transient=True)
+        gk_stub.connect(tree, event, "执行", overlay, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_ui_过场题字.add_to_group("gk_ui_transient")', code)
+
+    def test_pause_dim_backdrop_below_menu(self):
+        """压暗底:全屏 ColorRect,建在根部最底,暂停时跟着菜单显隐。"""
+        design = self._design("主界面")
+        design.gk_main_ui = True
+        design.new_node(NN.GKNodeUiText, "按键提示", gk_text="WASD")
+        design.new_node(NN.GKNodeUiPanel, "暂停菜单", gk_start_hidden=True)
+        design.new_node(NN.GKNodeUiPauseGame, "暂停热键", gk_pause=False,
+                        gk_menu="暂停菜单", gk_hotkey=True)
+        result = self._gen_main_ui(design)
+        self.assertEqual(result.warnings, [], result.warnings)
+        code = result.code
+        self.assertIn("_gk_pause_dim_init()", code)
+        self.assertIn("ColorRect.new()", code)
+        # 半透明黑 = 压暗(用户说的"或者添加模糊背景"走的就是这条轻的路)
+        self.assertIn("Color(0.0, 0.0, 0.0, 0.45)", code)
+        self.assertIn("_gk_pause_dim.visible = paused", code)
+        # 建完就提到根部第一个孩子 = 同层最底 —— 否则会把暂停面板也压暗
+        self.assertIn("_gk_ui_root.move_child(_gk_pause_dim, 0)", code)
+        # 不吃鼠标:菜单照点
+        self.assertIn("MOUSE_FILTER_IGNORE", code)
+        # 初始化调用必须真的写进 `_ready()`(踩过:放到设计图遍历**之前**
+        # 判断,标志还没置上,函数定义生成了、调用没生成 -> 底永远是 null)
+        lines = code.splitlines()
+        ready_at = next(i for i, line in enumerate(lines)
+                        if line.startswith("func _ready"))
+        call_at = next(i for i, line in enumerate(lines)
+                       if "_gk_pause_dim_init()" in line)
+        self.assertGreater(call_at, ready_at, code)
+        self.assertLess(call_at, next(i for i, line in enumerate(lines)
+                                      if line.startswith("func show_main")), code)
+
+    def test_no_pause_dim_for_level_script(self):
+        """关卡脚本不该引用压暗底(它在主界面那份 autoload 里)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeUiPauseGame, "暂停", gk_pause=True,
+                             gk_menu="暂停菜单", gk_hotkey=True)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V2)
+        self.assertNotIn("_gk_pause_dim", code)
 
     # ---- 『界面_按钮点击』----
     def test_on_click_binds_once_and_runs_click_chain(self):
@@ -2185,6 +2506,27 @@ class TestUiDesignTree(Base):
         gk_stub.connect(tree, event, "执行", click, "执行")
         _code, warnings = gen(tree, V2)
         self.assertTrue(any("控件名" in w for w in warnings), warnings)
+
+    def test_on_value_changed_binds_design_slider_and_passes_value(self):
+        design = self._design()
+        design.new_node(NN.GKNodeUiSlider, "总线音量", gk_min=-40.0,
+                        gk_max=0.0, gk_value=-14.0)
+        tree = make_tree()
+        event = self._ready(tree)
+        apply_node = tree.new_node(NN.GKNodeUiApplyDesign, "套用主界面")
+        changed = tree.new_node(NN.GKNodeUiOnValueChanged, "监听音量",
+                                gk_widget="总线音量")
+        volume = tree.new_node(NN.GKNodeBusVolume, "应用音量", gk_bus="Master")
+        gk_stub.connect(tree, event, "执行", apply_node, "执行")
+        gk_stub.connect(tree, event, "执行", changed, "执行")
+        gk_stub.connect(tree, changed, "变了", volume, "执行")
+        gk_stub.connect(tree, changed, "值", volume, "目标音量")
+        code, warnings = self._gen_with_design(design, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('value_changed.is_connected(', code)
+        self.assertIn('value_changed.connect(gk_on_', code)
+        self.assertRegex(code, r"func gk_on_.*_changed\(_value: float\) -> void:")
+        self.assertIn("AudioServer.set_bus_volume_db", code)
 
 
 class TestRaycastNodes(Base):
@@ -7488,10 +7830,27 @@ class TestOldFileCleanup(Base):
         self.assertEqual(ae._collider_dims(box), [26.0, 26.0, 0.4])
         capsule = ('[sub_resource type="CapsuleShape3D" id="shape"]\n'
                    'radius = 0.500000\nheight = 1.600000')
-        # 半径 0.5 -> 直径 1.0;高 1.6(比直径大,所以取 1.6)
+        # ── 第 125 轮(真机纠正,别再改回去)──────────────────────────
+        # `CapsuleShape3D.height` **是总高**,而且引擎强制 `height >= 2r`:
+        # 真机实验(与插件无关)——`radius=0.5 / height=0.8` 会被引擎改成
+        # `radius=0.4 / height=0.8`,外形 (0.8, 0.8, 0.8)。
+        # 所以外形 = (2r, height, 2r),r 先按引擎规则夹一遍。
+        # 前两次错法留在这儿当反面教材:
+        #   第一版按"height = 圆柱段"算 —— 数值上碰巧一样,但语义错,
+        #        `height < 2r` 时就骗人;
+        #   第二版又加了一遍 2r -> [2.6, 1.0, 1.0] —— **虚报**,于是
+        #        "碰撞体比网格小"这条告警从来没响过(而它正是要抓的 bug)。
         self.assertEqual(ae._collider_dims(capsule), [1.6, 1.0, 1.0])
+        # 半径被引擎夹细的那种(写 r=0.5 / h=0.8 -> 实到 r=0.4 / h=0.8)
+        # ⚠ 这一条正是"1.8 米的角色拿到一个 0.8 米的球"的形状:
+        #   总高 0.8、半径被夹到 0.4 -> 外形 (0.8, 0.8, 0.8)。
+        #   这条诊断必须能**读出它是一个球**,才能报出"碰撞体比网格小"。
+        squashed = ('[sub_resource type="CapsuleShape3D" id="shape"]\n'
+                    'radius = 0.500000\nheight = 0.800000')
+        self.assertEqual(ae._collider_dims(squashed), [0.8, 0.8, 0.8])
         sphere = ('[sub_resource type="SphereShape3D" id="shape"]\n'
                   'radius = 0.300000')
+        # 球**没有"总高"这回事**(只有半径)—— 不能被胶囊那条公式带上 2r
         self.assertEqual(ae._collider_dims(sphere), [0.6, 0.6, 0.6])
 
     def test_manifest_broken_file_is_ignored(self):
@@ -7587,6 +7946,37 @@ class TestOldFileCleanup(Base):
         self.assertEqual(gf.cleanup_after_export(directory, []), [])
         self.assertEqual(gf.read_manifest(directory), [])
 
+    def test_cleanup_takes_orphan_uid_with_the_script(self):
+        """删旧脚本时要**连它的 .uid 一起收走**(第一百一十一轮)。
+
+        Godot 4.4+ 给每个 .gd 写一个 `xx.gd.uid`。脚本被我们删掉后 uid
+        会留在原地,下一轮编辑器扫描对着"没主人的 uid"就可能把旧脚本的
+        全局类名重新捡回来 —— 真机症状是 `Class "X" hides a global
+        script class`,整个工程报错。
+        """
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        old = self._write(directory, "scripts/game_logic_旧关.gd",
+                          "# 由 BlenderGameKit 自动生成\n")
+        uid = self._write(directory, "scripts/game_logic_旧关.gd.uid",
+                          "uid://abcdefgh")
+        stale_audio = self._write(directory, "audio/旧音效.wav", "RIFF")
+        stale_import = self._write(directory, "audio/旧音效.wav.import",
+                                   "[remap]")
+        fresh = self._write(directory, "scripts/game_logic_新关.gd",
+                            "# 由 BlenderGameKit 自动生成\n")
+        gf.write_manifest(directory, gf.relative_files(
+            directory, [old, fresh, stale_audio]))
+        deleted = gf.cleanup_after_export(directory, [fresh])
+        self.assertIn("scripts/game_logic_旧关.gd", deleted)
+        self.assertIn("scripts/game_logic_旧关.gd.uid", deleted)
+        self.assertIn("audio/旧音效.wav", deleted)
+        self.assertIn("audio/旧音效.wav.import", deleted)
+        self.assertFalse(os.path.exists(old))
+        self.assertFalse(os.path.exists(uid))
+        self.assertFalse(os.path.exists(stale_import))
+        self.assertTrue(os.path.exists(fresh))
+
     # ---- 接到导出流程上:全成功才清 ----
     def _fake_export(self, directory, failing):
         """用假场景跑一遍 export_all_scenes(不碰真 bpy)。
@@ -7600,7 +7990,7 @@ class TestOldFileCleanup(Base):
                   types.SimpleNamespace(name="关卡2")]
 
         def fake_pipeline(scene, directory, dimension="3", script_name=None,
-                          scene_name="World"):
+                          scene_name="World", world_script_name=None):
             written = [self._write(directory, f"materials/{scene_name}_m.tres",
                                    "gk_toon shader")] if not (
                 failing and scene.name == "关卡2") else []
@@ -7666,7 +8056,7 @@ class TestOldFileCleanup(Base):
         seen = {}
 
         def fake_pipeline(scene, directory, dimension="3", script_name=None,
-                          scene_name="World"):
+                          scene_name="World", world_script_name=None):
             seen[scene.name] = dimension
             return {"written": [], "warnings": [], "materials": 0,
                     "bodies": 0, "cameras": 0, "lights": 0, "error": None}
@@ -7695,6 +8085,59 @@ class TestOldFileCleanup(Base):
         seen.clear()
         ae.export_all_scenes(directory, dimension="3")
         self.assertEqual(seen, {"2D关": "3", "3D关": "3"})
+
+    def test_duplicate_class_name_is_dropped(self):
+        """第一百一十一轮:两个场景填了同一个类名 -> 后面那个不带类名。
+
+        class_name 全工程唯一,重名时 Godot 报 `Class "X" hides a global
+        script class` 并让**整个工程**报错(真机见过)。导出按顺序认名额,
+        后面重复的丢掉类名(脚本照常导出),同时给一条告警。
+        """
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import exporter as ex
+        scenes = [types.SimpleNamespace(name="关卡1"),
+                  types.SimpleNamespace(name="关卡2")]
+        seen = []
+
+        def fake_export_tree(tree, settings=None, write_scene=None):
+            seen.append((tree, (settings or {}).get("class_name", "")))
+            return {"script_name": f"game_logic_{tree}.gd", "written": [],
+                    "warnings": [], "input_actions": []}
+
+        def fake_pipeline(scene, directory, dimension="3", script_name=None,
+                          scene_name="World", world_script_name=None):
+            return {"written": [], "warnings": [], "materials": 0,
+                    "bodies": 0, "cameras": 0, "lights": 0, "error": None}
+
+        patches = [
+            mock.patch.object(ex, "exportable_scenes", lambda: scenes),
+            mock.patch.object(ex, "resolve_scene_tree",
+                              lambda scene: (scene.name, "")),
+            mock.patch.object(ex, "build_settings",
+                              lambda scene: {"class_name": "StoryPlayer"}),
+            mock.patch.object(ex, "export_tree", fake_export_tree),
+            mock.patch.object(ae, "_activate_scene", lambda scene: None),
+            mock.patch.object(ae, "_active_scene", lambda: None),
+            mock.patch.object(ae, "_safe_scene_name", lambda name: name),
+            mock.patch.object(ae, "export_assets_pipeline", fake_pipeline),
+            mock.patch.object(ae.gk_log, "info"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+        directory = self._project()
+        out = ae.export_all_scenes(directory, dimension="3")
+        self.assertIsNone(out["error"], out)
+        # 第一个保留类名,第二个被丢掉(脚本仍各导一份)
+        self.assertEqual(seen, [("关卡1", "StoryPlayer"), ("关卡2", "")])
+        self.assertEqual([(entry["scene"], entry["script_name"])
+                          for entry in out["scenes"]],
+                         [("关卡1", "game_logic_关卡1.gd"),
+                          ("关卡2", "game_logic_关卡2.gd")])
+        warnings = [text for entry in out["scenes"]
+                    for text in entry["warnings"]]
+        self.assertTrue(any("撞了" in text for text in warnings), warnings)
 
 
 class TestColliderSyncAndGodGuard(Base):
@@ -7981,6 +8424,13 @@ class TestStaticAssets(Base):
         with mock.patch.object(ae, "object_bounds",
                                return_value={"size": (1.0, 1.0, 1.0),
                                              "center": (0.0, 0.0, 0.0)}):
+            self.assertEqual(ae.guess_collision_shape(obj, True), "box")
+
+    def test_horizontal_beam_does_not_get_upright_capsule(self):
+        from unittest import mock
+        from BlenderGameKit import asset_export as ae
+        obj = self._mesh_obj("横梁", self._CUBE_POINTS)
+        with mock.patch.object(ae, "object_bounds", return_value={"size": (30.0, .16, .18)}):
             self.assertEqual(ae.guess_collision_shape(obj, True), "box")
 
     # ---- 碰撞系统打磨(本轮:偏移 / 碰撞块 / 凸包 / 预览=导出)----
@@ -8548,6 +8998,20 @@ class TestPaths(unittest.TestCase):
         self.addCleanup(shutil.rmtree, directory, True)
         self.assertEqual(paths.normalize_dir(directory), os.path.abspath(directory))
 
+    def test_chinese_blend_names_get_distinct_project_directories(self):
+        self.assertEqual(project.safe_project_name("恐怖游戏"), "恐怖游戏")
+        self.assertEqual(project.safe_project_name("恐怖游戏续作"), "恐怖游戏续作")
+        self.assertEqual(project.safe_project_name("con"), "game")
+        with mock.patch.object(project.layout.blender_adapter, "filepath",
+                               return_value=os.path.join("D:\\games", "恐怖游戏.blend")):
+            first = project.derive_project_dir()
+        with mock.patch.object(project.layout.blender_adapter, "filepath",
+                               return_value=os.path.join("D:\\games", "恐怖游戏续作.blend")):
+            second = project.derive_project_dir()
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.endswith("恐怖游戏_godot"), first)
+        self.assertTrue(second.endswith("恐怖游戏续作_godot"), second)
+
     def test_to_res_path_variants(self):
         # 相对路径 -> 补前缀;反斜杠被统一成正斜杠
         self.assertEqual(paths.to_res_path("scripts/player.gd"),
@@ -8701,6 +9165,29 @@ class TestMultiScene(Base):
         got, why = exporter.resolve_scene_tree(self._Scene("关卡1"))
         self.assertIs(got, tree)
         self.assertIn("自动", why)
+
+    def test_character_tree_is_not_auto_used_as_level_tree(self):
+        role = self._Tree("角色逻辑")
+        role.gk_scope = "ROLE"
+        role.is_property_set = lambda name: name == "gk_scope"
+        level = self._Tree("关卡逻辑")
+        level.gk_scope = "LEVEL"
+        level.is_property_set = lambda name: name == "gk_scope"
+        self._patch_data(node_groups=[role, level])
+        self.assertEqual(exporter.game_logic_trees("ROLE"), [role])
+        self.assertEqual(exporter.game_logic_trees("LEVEL"), [level])
+        got, _why = exporter.resolve_scene_tree(self._Scene("关卡"))
+        self.assertIs(got, level)
+
+    def test_role_tree_cannot_be_bound_as_level_tree(self):
+        role = self._Tree("玩家逻辑")
+        role.gk_scope = "ROLE"
+        role.is_property_set = lambda name: name == "gk_scope"
+        self._patch_data(node_groups=[role])
+        got, why = exporter.resolve_scene_tree(
+            self._Scene("关卡", logic_tree="玩家逻辑"))
+        self.assertIsNone(got)
+        self.assertIn("角色逻辑图", why)
 
     def test_explicit_selection_wins(self):
         a, b = self._Tree("A"), self._Tree("B")
@@ -8997,6 +9484,13 @@ class TestEnvironmentGodCamera(Base):
             "按 T 解冻"永远不会发生(把自己锁在冻住的世界里);
           * **开**只认上帝视角(玩家相机时按 T 不该冻住游戏),
             **关**不挑视角 + 离开上帝机自动解冻(兜底)。
+
+        ── 第 131 轮:断言从"某句 print"改成"那条**行为**在不在" ──────────
+        用户要求"进上帝机 = 自动全局冻结",所以离开上帝机那条解冻路径
+        改走 `_gk_god_freeze(false)`([自己冻的才解]),原来那句
+        `print("时停:关(离开上帝机)")` 不再生成 —— 断言同步跟上。
+        ⚠ 这里刻意不再钉 print **文案**:文案是给人看的,行为才是契约;
+        钉文案会让"改一句话就红"这种假红反复出现(这轮真踩了一次)。
         """
         text = self._env(god="true")
         self.assertIn("const _GK_TIME_STOP_KEY := KEY_T", text)
@@ -9007,7 +9501,54 @@ class TestEnvironmentGodCamera(Base):
         # 开只认上帝视角
         self.assertIn("and _gk_god_cam.is_current())", text)
         # 离开上帝机就解冻(不然玩家看着一个冻住的画面按什么都没反应)
-        self.assertIn("时停:关(离开上帝机)", text)
+        self.assertIn("_gk_god_freeze(false)", text)
+        # 解冻要"只解自己冻的那一次",别把别人的暂停一起解了
+        self.assertIn("_gk_frozen_by_god", text)
+
+    def test_god_camera_freezes_world_on_enter(self):
+        """进上帝机 = 自动全局冻结(第 131 轮,用户明确要求)。
+
+        用户原话:"在上帝机启用中，游戏AI还可以攻击我，应该设置上帝机启用时
+        全局暂停（冻结全局时间流速），按某个键如enter解除"。
+
+        钉四件事:
+          * 进上帝机那条路径上有 `_gk_god_freeze(true)`;
+          * 有一个独立按键(Enter)能解冻 —— 不能只有"退出上帝机"这一条路;
+          * 冻结期间**环境脚本照跑**(PROCESS_MODE_ALWAYS),否则 Enter
+            根本没人读 -> 把自己锁死在冻住的世界里;
+          * 离开上帝机解冻**只解自己冻的那一次**(玩家可能用暂停菜单冻过)。
+        """
+        text = self._env(god="true")
+        self.assertIn("_gk_god_freeze(true)", text)
+        self.assertIn("const _GK_FREEZE_KEY := KEY_ENTER", text)
+        self.assertIn("func _gk_freeze_tick() -> void:", text)
+        self.assertIn("process_mode = Node.PROCESS_MODE_ALWAYS", text)
+        # 解冻必须记账,不能无条件 tree.paused = false：
+        # 那会把"玩家按 Esc 暂停菜单"冻的世界也一起解掉
+        self.assertIn("_gk_frozen_by_god", text)
+
+    def test_god_guard_only_in_3d(self):
+        """上帝机守卫**只在 3D** 里生成(第 131 轮,队友查边界时挖到)。
+
+        上帝机是 3D 独有的(整段逻辑围着 Camera3D 转),可 `generator` 那道门
+        原来不看维度:2D 工程勾了『上帝摄像机』就会带上
+        `get_viewport().get_camera_3d()` 这个 3D-only API。
+        证据(2D 图只放一个『打印』、没有任何 AI 节点,那两样照样出现)。
+
+        这条钉住"2D 里一个字节都不生成"。
+        ⚠ 必须走**整张图的生成**(`codegen.generate`),不能只调
+        `render_env_script` —— 那道维度门在 `generator._emit_...` 里,
+        环境脚本模板本身不看维度(它只是模板)。所以这里造一张 2D 图,
+        勾上上帝机,看生成出来的**角色脚本**里有没有那个 helper。
+        """
+        from BlenderGameKit import codegen
+        tree = make_tree()
+        # 图里什么都不用放:门本身漏了维度,空图就会带上那个 helper
+        code, _warn = codegen.generate(tree, {
+            "dimension": "2", "base_class": "CharacterBody2D",
+            "god_camera": True})
+        self.assertNotIn("_gk_god_camera_active", code)
+        self.assertNotIn("get_camera_3d()", code)
 
     def test_god_camera_forces_environment_node(self):
         """开关开着时,即使场景里没相机/灯/材质,也要生成 Environment 节点。
@@ -11675,15 +12216,21 @@ class TestRound41Ai(Base):
         self.assertTrue(any("互相覆盖" in w for w in warnings), warnings)
 
     def test_required_base_class_from_ai_tree(self):
-        """AI 图里的行为要 CharacterBody —— validation 必须**先扫出来**定基类。"""
+        """AI 图的操作在**目标物体**上(怪物自己就是 CharacterBody),
+        宿主脚本不该被抬成 CharacterBody —— 第一百二十轮修正。
+
+        以前 AI 树扫进来、见到『AI_状态』就把宿主判成 CharacterBody3D,
+        导致"关卡图挂场景根(Node3D)"时脚本 extends 对不上节点类型、
+        整个关卡逻辑加载失败。AI 的 velocity/move_and_slide 作用在
+        『作用在谁』那个目标上(它自己就是 CharacterBody),宿主不用。
+        """
         ai = self._ai_tree()
         ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
                     gk_behavior="STAND")
         need, why = codegen.required_base_class(ai, {"dimension": "3"})
-        self.assertEqual(need, "CharacterBody3D")
-        self.assertIn("AI", why + "AI")           # 只说"用到了它才有的成员"即可
+        self.assertIsNone(need, why)
         need2, _ = codegen.required_base_class(ai, {"dimension": "2"})
-        self.assertEqual(need2, "CharacterBody2D")
+        self.assertIsNone(need2)
 
     def test_target_typed_as_character_body(self):
         """『作用在谁』的 @onready 必须带 CharacterBody 类型。
@@ -11749,9 +12296,13 @@ class TestRound42Display(Base):
         labels = [cls.bl_label
                   for _cat, items in props.node_menu_entries("GKDisplayTree")
                   for cls in items]
+        # 第 123 轮:`显示_环境氛围` 改名为 `游戏环境设置`(用户原话:"并且把
+        # 环境预设改成游戏环境设置这样")。改的是**标签**,`bl_idname` 没动
+        # —— 老 .blend 里的节点原样有效。判据不变:这五张卡都得在。
         for wanted in ("显示_碰撞线框", "显示_调试面板", "显示_画面风格",
-                       "显示_视口预览", "显示_环境氛围"):
+                       "显示_视口预览", "游戏环境设置"):
             self.assertIn(wanted, labels)
+        self.assertNotIn("显示_环境氛围", labels)
         self.assertNotIn("移动_按方向", labels)
         # 反过来:玩法图的菜单里不该冒出设置卡
         logic_labels = [cls.bl_label
@@ -11943,13 +12494,16 @@ class TestRound50UiChoice(Base):
         self.assertNotIn("_gk_choice_panel", code)
         self.assertNotIn("gk_choice_input_event", code)
 
-    def test_choice_only_in_game_logic_tree(self):
+    def test_choice_stays_logic_dialogs_are_gameplay(self):
         from BlenderGameKit import properties as props
         cls = NN.GKNodeUiChoice
+        # 第一百一十二轮定稿:剧情对话那一族(对话框 / 选择 / 字幕 / 历史)
+        # 是**玩法在驱动**,保留在玩法图;"界面自己行为"的才搬去设计图
+        # (按钮绑定 / 暂停热键 / 缓动…)。
         self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"))
         self.assertFalse(props.node_fits_tree(cls, "GKUiDesignTree"))
         self.assertFalse(props.node_fits_tree(cls, "GKAnimationTree"))
-        # 不是"控件构建"节点:不该被『界面_套用设计』建出来
+        # 不是"控件构建"节点:不会被当成控件建出来
         self.assertFalse(getattr(cls, "gk_ui_builder", False))
 
 
@@ -13631,6 +14185,92 @@ class TestRound57AiHearing(Base):
         enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
         gk_stub.connect(tree, event, "执行", enable, "执行")
         return tree, enable
+
+
+class TestRound111AudioClip(Base):
+    """第一百一十一轮:音效节点上的**本地路径**也要被复制进 audio/。
+
+    真机报错逼出来的:恐怖关示例的 wav 是脚本直接写进"它自己那个工程"的,
+    用户按 F5 导出到**推导出来的另一个工程**时文件不在 -> 运行刷屏
+    `Resource file not found`。现在节点上填磁盘路径,导出时复制 + 改写。
+    """
+
+    def test_resolve_clip_keeps_res_paths(self):
+        from BlenderGameKit import sound_assets
+        for path in ("res://audio/x.wav", "res://art/bgm.ogg", "", "  "):
+            script_path, local = sound_assets.resolve_clip(path)
+            self.assertEqual(local, "")
+            self.assertEqual(script_path, str(path or "").strip())
+
+    def test_resolve_clip_non_audio_untouched(self):
+        """不是音频的路径(比如相机的曲线名)一律别动。"""
+        from BlenderGameKit import sound_assets
+        script_path, local = sound_assets.resolve_clip("运镜轨道")
+        self.assertEqual((script_path, local), ("运镜轨道", ""))
+
+    def test_resolve_clip_local_gets_hashed_name(self):
+        from BlenderGameKit import sound_assets
+        local = os.path.join("D:", os.sep, "素材", "心跳.wav")
+        script_path, reported = sound_assets.resolve_clip(local)
+        self.assertEqual(reported, local)
+        self.assertTrue(script_path.startswith("res://audio/"))
+        self.assertTrue(script_path.endswith(".wav"))
+        # 同一个文件算两次必须一样(代码里写死的名字 = 复制出来的名字)
+        self.assertEqual(script_path, sound_assets.sound_res_path(local))
+
+    def test_codegen_rewrites_local_clip(self):
+        """脚本里必须写**复制后**的 res:// 名字,不能把磁盘路径写进去。"""
+        from BlenderGameKit import sound_assets
+        local = os.path.join("D:", os.sep, "素材", "叮.wav")
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        play = tree.new_node(NN.GKNodePlaySound, "音效",
+                             gk_path=local, gk_2d=False)
+        gk_stub.connect(tree, event, "执行", play, "执行")
+        code = gen(tree, V3)[0]
+        self.assertIn(f'load("{sound_assets.sound_res_path(local)}")', code)
+        self.assertNotIn(local, code)
+
+    def test_export_copies_node_clip(self):
+        """节点引用的本地文件:导出要真的复制进 audio/ 并写进清单。"""
+        folder = tempfile.mkdtemp(prefix="gk_clip_export_")
+        try:
+            source = os.path.join(folder, "叮.wav")
+            with open(source, "wb") as handle:
+                handle.write(b"RIFF....WAVEfmt ")
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            play = tree.new_node(NN.GKNodePlaySound, "音效", gk_path=source)
+            gk_stub.connect(tree, event, "执行", play, "执行")
+            out = os.path.join(folder, "proj")
+            os.makedirs(out, exist_ok=True)
+            result = exporter.export_tree(
+                tree, {"output_dir": out, "dimension": "3",
+                       "base_class": "CharacterBody3D"}, write_scene=False)
+            self.assertTrue(result["ok"], result)
+            files = os.listdir(os.path.join(out, "audio"))
+            self.assertEqual(len(files), 1, files)
+            self.assertIn(f"audio/{files[0]}", result["manifest"])
+            script = open(os.path.join(out, "scripts", "game_logic.gd"),
+                          encoding="utf-8").read()
+            self.assertIn(f"res://audio/{files[0]}", script)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_heartbeat_and_scare_also_rewritten(self):
+        """『氛围_心跳』和『惊吓_事件』的音效走同一条改写。"""
+        from BlenderGameKit import sound_assets
+        local = os.path.join("D:", os.sep, "素材", "咚.wav")
+        wanted = sound_assets.sound_res_path(local)
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        heart = tree.new_node(NN.GKNodeHeartbeat, "心跳", gk_path=local)
+        scare = tree.new_node(NN.GKNodeScare, "惊吓", gk_path=local)
+        gk_stub.connect(tree, event, "执行", heart, "执行")
+        gk_stub.connect(tree, heart, "完成", scare, "执行")
+        code = gen(tree, V3)[0]
+        self.assertIn(f'load("{wanted}")', code)
+        self.assertNotIn(local, code)
 
 
 class TestRound59Horror(Base):
@@ -15416,7 +16056,10 @@ class TestRound70ReadyAwaitOrder(Base):
 
         code, warnings = gen(tree, V3)
         self.assertEqual(warnings, [], warnings)
-        self.assertIn("await get_tree().create_timer(4.0).timeout", code)
+        # 第 125 轮:`process_always` 从默认 true 改成显式 false ——
+        # 暂停时"等待"也必须停(用户实测:结局按 Esc 暂停,4 秒后关卡
+        # 还是被后台切走了,暂停菜单还开着)。
+        self.assertIn("await get_tree().create_timer(4.0, false).timeout", code)
         self.assertIn("body_entered.connect(", code)
         self.assertLess(code.index("body_entered.connect("),
                         code.index("await get_tree().create_timer("),
@@ -15678,7 +16321,8 @@ class TestRound73OverlayLayer(Base):
         self.assertIn("_gk_overlay_fire(blend_tree, 0.4)", code)
         self.assertIn("ONE_SHOT_REQUEST_FIRE", code)
         # 『保持秒数』不是 0 -> 到点强制收起
-        self.assertIn("create_timer(hold)", code)
+        # 第 125 轮:显式 `process_always=false`,暂停时这个定时器也要停
+        self.assertIn("create_timer(hold, false)", code)
         # 收尾**不是协程**(用 SceneTreeTimer + lambda):不 await 的协程
         # 会让 Godot 打一条"coroutine called without await"的告警。
         self.assertNotIn("await ", code)
@@ -18383,6 +19027,40 @@ class TestRound95PreviewAlign(Base):
         self.assertFalse(values["enabled"])
         self.assertEqual(values["view_transform"], "Standard")
 
+    def test_fog_follows_settings(self):
+        """第一百一十一轮:雾也要跟着设置卡走(不能"预览里当它不存在")。
+
+        真机抱怨:"blender 预览是有灯光,但无雾气" —— 设置卡上雾开着、
+        Godot 里也是雾茫茫,只有预览干干净净。现在预览按同一条公式
+        (密度/颜色)搭体积盒子,所以这两个值必须先传出来。
+        """
+        from BlenderGameKit import godot_look
+        values = godot_look.env_display(self._scene(self._settings(
+            env_fog=True, env_fog_color=(0.2, 0.22, 0.32, 1.0),
+            env_fog_density=0.05)))
+        self.assertTrue(values["fog"])
+        self.assertAlmostEqual(values["fog_density"], 0.05, places=5)
+        self.assertAlmostEqual(values["fog_color"][1], 0.22, places=5)
+
+    def test_fog_off_or_disabled_means_no_fog(self):
+        from BlenderGameKit import godot_look
+        # 设置卡开着但雾没勾
+        values = godot_look.env_display(self._scene(
+            self._settings(env_fog=False)))
+        self.assertFalse(values["fog"])
+        # 设置卡没开 = 出厂画面(出厂雾是关的)
+        values = godot_look.env_display(self._scene(None))
+        self.assertFalse(values["fog"])
+        self.assertEqual(values["fog_density"], 0.0)
+
+    def test_build_fog_skips_when_not_wanted(self):
+        """不需要雾时不建盒子;需要时密度/自发光一起写进去。"""
+        from BlenderGameKit import godot_look
+        scene = self._scene(None)
+        self.assertIsNone(godot_look.build_fog(scene, {"fog": False}))
+        self.assertIsNone(godot_look.build_fog(
+            scene, {"fog": True, "fog_density": 0.0}))
+
 
 class TestRound96ColorSpace(Base):
     """第九十六轮:写进 .tscn 的颜色按"显示值"语义换算(线性 -> sRGB)。
@@ -18992,11 +19670,13 @@ class TestRound101SpecTexture(Base):
 
         ⚠ 这一条是**必须的**:场景导出原来写死用 TOON_MATERIAL_TEMPLATE
         (`specular_amount = 0.0`)—— 高光参数根本到不了游戏里。
+        第一百一十三轮:触发条件从"只有 specular_amount"放宽到"有任何
+        NPR 参数"—— 用户只调了明暗分界 / 阴影色时风格也不会丢失。
         """
         import inspect
         from BlenderGameKit import asset_export as ae
         source = inspect.getsource(ae.write_materials)
-        self.assertIn('has_param(material, "specular_amount")', source)
+        self.assertIn('has_any_param(material)', source)
         self.assertIn("write_npr_material(", source)
 
 
@@ -20344,6 +21024,396 @@ class TestRound109HideSpot(Base):
     def test_hide_spot_group_name_is_pinned(self):
         from BlenderGameKit import asset_export
         self.assertEqual(asset_export.HIDE_SPOT_GROUP, "gk_hide_spot")
+
+
+class TestRound126AiSightOcclusion(Base):
+    """第一百二十六轮:AI 遮挡射线(用户第 1 条需求)。
+
+    用户原话:"1. AI 遮挡射线"。
+
+    ── 修的是什么 ────────────────────────────────────────────────
+    『AI_看得见』原来只看 距离 + 躲藏区 + 视野角,**中间有没有墙完全不看** ——
+    真机(4.7.2)实测:玩家在 6 米高的『走廊墙北』外面,连线上命中那堵墙,
+    `_gk_ai_can_see_3d(dist=100, angle=0)` 仍返回 true(隔着墙能看见)。
+
+    ── 这里钉死四条 ──────────────────────────────────────────────
+    1. 场景设置 `gk_settings.ai_sight_occluded` **默认开**(用户要"能挡");
+    2. 开着 = 生成体里有遮挡射线,而且**必须排除双方自己**(节点 + 子碰撞体),
+       否则射线立刻打到自己身上 -> 永远看不见;
+    3. 关着 = 生成体里**一个字都没有**(老工程产物逐字不变);
+    4. 这一轮只做 3D,2D 的 helper 开关前后**逐字一样**。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _see_code(self, options):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "说")
+        see = tree.new_node(NN.GKNodeAiSee, "看得见吗", gk_goal="玩家",
+                            gk_distance=8.0, gk_angle=120.0)
+        branch = tree.new_node(NN.GKNodeBranch, "看见?")
+        gk_stub.connect(tree, event, "执行", branch, "执行")
+        gk_stub.connect(tree, see, "看得见", branch, "条件")
+        gk_stub.connect(tree, branch, "是", printer, "执行")
+        return gen(tree, options)[0]
+
+    def _helper(self, code, key="3d"):
+        """抠出 `func _gk_ai_can_see_<key>(` 那一整段(不含别的函数)。"""
+        start = code.index(f"func _gk_ai_can_see_{key}(")
+        out = []
+        for line in code[start:].splitlines():
+            if out and line.strip() and not line.startswith(("    ", "\t")):
+                break
+            out.append(line)
+        return "\n".join(out)
+
+    # ── 1. 默认值 ──────────────────────────────────────────────────
+    def test_scene_setting_defaults_to_on(self):
+        """默认必须是**开** —— 用户要的就是"墙能挡视线",默认关等于没修。
+
+        走 `__annotations__` 而不是 `bl_rna`(离线桩里没有 bl_rna,
+        仓库里别的场景属性测试也是这么读的,见 test_scene_settings_has_env_props)。
+        """
+        from BlenderGameKit import properties as props
+        annotations = props.GKSceneSettings.__annotations__ or {}
+        self.assertIn("ai_sight_occluded", annotations)
+        self.assertTrue(
+            getattr(annotations["ai_sight_occluded"], "default", False),
+            "ai_sight_occluded 默认必须为 True(用户诉求就是'要能挡')")
+
+    def test_option_defaults_to_on_when_absent(self):
+        """不传这个键时也按**开**走(context 兜底 True)。"""
+        code = self._see_code(V3)
+        self.assertIn("direct_space_state", code)
+
+    # ── 2. 开着:射线真的生成,而且排除双方自己 ───────────────────
+    def test_occlusion_ray_generated(self):
+        code = self._see_code(dict(V3, ai_sight_occluded=True))
+        self.assertIn("PhysicsRayQueryParameters3D.create(", code)
+        self.assertIn("get_world_3d().direct_space_state", code)
+        self.assertIn("intersect_ray", code)
+        # 空 = 没挡住 = 看得见;非空 -> 被挡 -> 直接 false
+        self.assertIn("if not _gk_space.intersect_ray(_gk_query).is_empty():",
+                      code)
+        # 眼睛 / 胸口高度:用节点原点打射线会被地板挡住
+        self.assertIn("_gk_eye_h := 1.4", code)
+        self.assertIn("_gk_chest_h := 1.0", code)
+
+    def test_occlusion_excludes_both_sides(self):
+        """⚠ 不排除双方自己 = 射线第一个命中观察者 -> **永远看不见**。
+
+        示例走廊里『怪物』本身就在 `Colliders/` 下(**和节点同位置**),
+        所以除了节点自己的 RID,还得排除它子孙里的碰撞体。
+        """
+        code = self._see_code(dict(V3, ai_sight_occluded=True))
+        self.assertIn("var _gk_exclude: Array[RID] = []", code)
+        self.assertIn("(_gk_node as CollisionObject3D).get_rid()", code)
+        self.assertIn(
+            'find_children("*", "CollisionObject3D", true, false)', code)
+        self.assertIn("for _gk_node in [watcher, target]:", code)
+
+    # ── 3. 关着:逐字回到旧行为 ───────────────────────────────────
+    def test_off_keeps_legacy_body_verbatim(self):
+        off = self._helper(self._see_code(dict(V3, ai_sight_occluded=False)))
+        self.assertNotIn("intersect_ray", off)
+        self.assertNotIn("_gk_eye_h", off)
+        # 旧行为那几行必须原封不动还在
+        self.assertIn('get_nodes_in_group("gk_hide_spot")', off)
+        self.assertIn("if diff.length() > dist:", off)
+        self.assertIn("signed_angle_to(flat, Vector3.UP)", off)
+
+    # ── 4. 2D 这一轮一个字都不动 ──────────────────────────────────
+    def test_2d_unchanged_by_the_flag(self):
+        on = self._helper(self._see_code(dict(V2, ai_sight_occluded=True)), "2d")
+        off = self._helper(self._see_code(dict(V2, ai_sight_occluded=False)), "2d")
+        self.assertEqual(on, off)
+        self.assertNotIn("intersect_ray", on)
+
+
+class TestRound110ModifierKeysAndTyping(Base):
+    """第一百一十轮:修饰键 keycode + 逐字冒出不被暂停冻住 + 选项带数字。
+
+    用户第二次实测报的五条 / 一条优化里,能在**离线**钉死的有三条:
+      1. **Alt 键绑错**(bug4)—— `KEY_TO_GODOT` 把 LEFT_ALT 写成 4194327,
+         那是 Godot 的 **META(Windows 键)**;真正的 ALT 是 4194328。
+         症状:按 Alt 呼不出鼠标("alt 并未调出鼠标显示")。
+      2. **对话 / 选择的逐字冒出被暂停冻住**(bug1)—— 那些 tween 是配合
+         『界面_暂停游戏』用的(暂停世界 + 放鼠标),默认 `TWEEN_PAUSE_BOUND`
+         会跟着暂停一起停,`visible_characters` 永远停在 0,玩家看到空面板。
+         修法是 `set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)`。
+      3. **选项按钮要写键盘数字**(bug3)—— 选项本来就能按 1~6 选,卡片上不写
+         玩家不知道,所以按钮文字必须是 `1. xxx`。
+
+    ⚠ 这三条**离线**能验"生成的代码长什么样";"真跑起来画面里有没有字"要靠
+      `scripts/check_story_demo.py` 的真 Godot 探针(那才是上一轮漏掉的地方)。
+    """
+
+    def test_modifier_keys_are_not_split_left_right(self):
+        """Godot 的修饰键只有四个枚举值,别把左右各写一格(会整段错位)。"""
+        from BlenderGameKit.project import input_map
+        table = input_map.KEY_TO_GODOT
+        # 真的 ALT / SHIFT / CTRL / META 四个值(0x400000 | index)
+        self.assertEqual(table["LEFT_ALT"], 4194328)
+        self.assertEqual(table["RIGHT_ALT"], 4194328)
+        self.assertEqual(table["LEFT_SHIFT"], 4194325)
+        self.assertEqual(table["RIGHT_SHIFT"], 4194325)
+        self.assertEqual(table["LEFT_CTRL"], 4194326)
+        self.assertEqual(table["RIGHT_CTRL"], 4194326)
+        self.assertEqual(table["META"], 4194327)
+        # 4194327 是 META —— 谁把 ALT 又写回它,这里当场红
+        self.assertNotEqual(table["LEFT_ALT"], 4194327)
+
+    def test_captured_alt_exports_key_alt(self):
+        """『输入_按键』捕获到 Alt,导出时 project.godot 里必须绑到 KEY_ALT。"""
+        from BlenderGameKit.project import input_map
+        self.assertEqual(input_map.key_code_for("key_left_alt", "LEFT_ALT"),
+                         4194328)
+        self.assertEqual(input_map.key_code_for("mouse_toggle", "RIGHT_ALT"),
+                         4194328)
+
+    def _tree_with(self, kind, name, **props):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(kind, name, **props)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        return tree, node
+
+    def test_dialog_typing_runs_while_paused(self):
+        """对话的逐字冒出必须 `TWEEN_PAUSE_PROCESS`(暂停时也要冒字)。"""
+        tree, _node = self._tree_with(NN.GKNodeUiDialog, "开场白",
+                                      gk_speaker="我", gk_text="你好")
+        code = gen(tree, V3)[0]
+        self.assertIn("_gk_dialog_tween = _gk_dialog_panel.create_tween()", code)
+        self.assertIn("_gk_dialog_tween.set_pause_mode("
+                      "Tween.TWEEN_PAUSE_PROCESS)", code)
+
+    def test_choice_typing_runs_while_paused(self):
+        tree, _node = self._tree_with(NN.GKNodeUiChoice, "选一个",
+                                      gk_option_count=2,
+                                      gk_options="往前跑|先躲一下")
+        code = gen(tree, V3)[0]
+        self.assertIn("_gk_q_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)",
+                      code)
+        # 选择标题会追加"按 1-N 选择",逐字长度必须覆盖追加的提示。
+        self.assertIn("var chars := _gk_choice_question.text.length()", code)
+
+    def test_choice_buttons_show_key_numbers(self):
+        tree, _node = self._tree_with(NN.GKNodeUiChoice, "选一个",
+                                      gk_option_count=2,
+                                      gk_options="往前跑|先躲一下")
+        code = gen(tree, V3)[0]
+        self.assertIn('button.text = str(index + 1) + ". " '
+                      '+ str(options[index])', code)
+
+    def test_modal_ui_keeps_processing_when_tree_is_paused(self):
+        tree, _node = self._tree_with(NN.GKNodeUiChoice, "暂停选择",
+                                      gk_option_count=2,
+                                      gk_options="是|否")
+        code = gen(tree, V3)[0]
+        self.assertIn("_gk_ui_layer.process_mode = Node.PROCESS_MODE_ALWAYS",
+                      code)
+        self.assertIn("_gk_ui_root.process_mode = Node.PROCESS_MODE_ALWAYS",
+                      code)
+
+    def test_alt_held_uses_physical_key_fallback(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        branch = tree.new_node(NN.GKNodeBranch, "Alt分支")
+        alt = tree.new_node(NN.GKNodeKey, "Alt", gk_key="LEFT_ALT",
+                            gk_trigger="PRESSED")
+        gk_stub.connect(tree, ready, "执行", branch, "执行")
+        gk_stub.connect(tree, alt, "结果", branch, "条件")
+        code = gen(tree, V3)[0]
+        self.assertIn("Input.is_key_pressed(KEY_ALT)", code)
+
+
+class TestRound131AiPauseWithGod(Base):
+    """第一百三十一轮:『AI_启用』的『被上帝机暂停』(用户第 13 轮)。
+
+    用户原话:"第二关,在上帝机启用中,游戏AI还可以攻击我,应该设置上帝机
+    启用时全局暂停(冻结全局时间流速),按某个键如enter解除,且此时靠近游戏AI
+    按F键确实可以接管,但AI的移动逻辑等 和我的在抢夺控制权(可以在游戏AI的
+    侧边栏添加是否被上帝机暂停,默认启用,不启用的话这可以在上帝视角观察
+    世界运行)"。
+
+    ── 锁住的四条 ────────────────────────────────────────────────
+    1. 属性 `gk_pause_with_god` 存在、bool、**默认 True**、名字『被上帝机暂停』;
+    2. ⚠ **读属性兜底必须是 True** —— 老 .blend 里这轮之前建的节点没有这个
+       属性,用 False 兜底会让老工程悄悄退回"上帝机里 AI 照跑"(正是用户
+       报的毛病)。这里用一个**真的没有该属性**的节点来钉住;
+    3. 上帝机开着 + 属性 True -> 整段 AI 落进
+       `if not _gk_god_camera_active():`,而且 `_gk_god_camera_active()`
+       的**定义**也在(只调用不定义 = Godot 报 not found in base self);
+    4. 属性 False / 没导上帝机 -> **没有**守卫,老工程生成结果逐字不变。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        ai.use_fake_user = True
+        return ai
+
+    def _gen(self, pause_with_god, god_camera, options=None):
+        """造"巡逻 -> 看见玩家 -> 追击"的最小 AI 图并生成代码。"""
+        tree = make_tree()
+        ready = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "AI启用")
+        if pause_with_god is None:
+            # 模拟"老 .blend:节点上根本没有这个属性"
+            try:
+                del enable.gk_pause_with_god
+            except AttributeError:
+                pass
+        else:
+            enable.gk_pause_with_god = pause_with_god
+        gk_stub.connect(tree, ready, "执行", enable, "执行")
+
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="PATROL", gk_patrol_a="点A",
+                             gk_patrol_b="点B", gk_speed=3.0)
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="CHASE", gk_goal="玩家", gk_speed=4.0)
+        trans = ai.new_node(NN.GKNodeAiTransition, "看见玩家",
+                            gk_cond_source="SEE", gk_goal="玩家",
+                            gk_sight=10.0, gk_from_state="巡逻",
+                            gk_to_state="追击")
+        gk_stub.connect(ai, patrol, "转到", trans, "上游")
+        gk_stub.connect(ai, trans, "转到", chase, "进入")
+        enable.gk_tree_name = ai.name
+
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data", types.SimpleNamespace(node_groups=[ai]))
+        try:
+            base = dict(options or V3)
+            return gen(tree, dict(base, god_camera=god_camera))
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _physics_block(self, code):
+        start = code.index("func _physics_process(")
+        out = []
+        for line in code[start:].splitlines():
+            if out and line.strip() and not line.startswith(("    ", "\t")):
+                break
+            out.append(line)
+        return "\n".join(out)
+
+    # ── 1. 属性本身 ────────────────────────────────────────────────
+    def test_prop_def_exists_with_default_on(self):
+        defs = {item[0]: item for item in NN.GKNodeAiEnable.gk_prop_defs}
+        self.assertIn("gk_pause_with_god", defs)
+        item = defs["gk_pause_with_god"]
+        self.assertEqual(item[1], "bool")
+        self.assertIs(item[2], True, "默认必须是 True(用户:'默认启用')")
+        self.assertEqual(item[3], "被上帝机暂停")
+
+    # ── 2. 上帝机开 + True -> 有守卫 ──────────────────────────────
+    # ⚠ 守卫文案(补上"附身优先"之后)是:
+    #     if not _gk_god_camera_active() and not (X).is_in_group("gk_god_possessed"):
+    #   所以断言用**片段**,不写整行 —— 以后再拼条件不会全红。
+    GUARD_HEAD = "if not _gk_god_camera_active()"
+    GUARD_TAIL = 'is_in_group("gk_god_possessed")'
+
+    def test_guard_wraps_whole_ai_block(self):
+        code, warnings = self._gen(True, True)
+        self.assertEqual(warnings, [], warnings)
+        block = self._physics_block(code)
+        self.assertIn(self.GUARD_HEAD, block)
+        # 附身优先也必须在(用户:"AI 的移动逻辑等 和我的在抢夺控制权")
+        self.assertIn(self.GUARD_TAIL, block)
+        # ⚠ 守卫和它的块体必须差一层缩进 —— 我第一版写成同一层,
+        #    Godot 会报 "Expected indented block after if"。
+        lines = block.splitlines()
+        guard_at = next(i for i, line in enumerate(lines)
+                        if self.GUARD_HEAD in line)
+        guard_indent = len(lines[guard_at]) - len(lines[guard_at].lstrip())
+        inner = lines[guard_at + 1]
+        inner_indent = len(inner) - len(inner.lstrip())
+        self.assertGreater(inner_indent, guard_indent,
+                           f"块体没缩进:\n{block}")
+
+    def test_guard_uses_controlled_body_not_self(self):
+        """⚠ 附身判据挂在 **AI 控制的那个角色体**上。
+
+        走廊那关脚本挂在**场景根**(`extends Node3D`),`self` 不是
+        CharacterBody —— 我第一版速度按住写成 `self`,真机 A/B 才发现
+        "位置冻住、速度却还是 4.399"(那句一次都没进去)。
+        """
+        code, _ = self._gen(True, True)
+        block = self._physics_block(code)
+        # 目标没接线 -> 默认是脚本所在物体,生成成 `self`
+        self.assertIn('(self).is_in_group("gk_god_possessed")', block)
+
+    def test_possessed_group_name_matches_environment(self):
+        """组名 `gk_god_possessed` 是**两处硬编码的契约**(第 131 轮)。
+
+        AI 侧(`codegen/ai.py` 的生成文本)和环境脚本侧
+        (`asset_export._gk_god_possess_begin/release`)各写一遍 —— 谁改一边
+        忘了另一边,AI 就永远/从不认为"被附身"了。照 `gk_hide_spot` 那种
+        "用测试互相钉住"的做法。
+        """
+        from BlenderGameKit import asset_export
+        text = asset_export.ENVIRONMENT_SCRIPT
+        self.assertIn('add_to_group("gk_god_possessed")', text)
+        self.assertIn('remove_from_group("gk_god_possessed")', text)
+        code, _ = self._gen(True, True)
+        self.assertIn('is_in_group("gk_god_possessed")', code)
+
+    def test_guard_includes_velocity_hold(self):
+        """停摆时要顺手按住水平速度,否则附身时角色带着 AI 的速度滑。"""
+        code, _ = self._gen(True, True)
+        block = self._physics_block(code)
+        self.assertIn("is CharacterBody3D:", block)
+        self.assertIn(".velocity.x = 0.0", block)
+        self.assertIn(".velocity.z = 0.0", block)
+
+    def test_god_guard_helper_definition_emitted(self):
+        """只调用不定义 -> Godot: Function _gk_god_camera_active() not found。"""
+        code, _ = self._gen(True, True)
+        self.assertIn("func _gk_god_camera_active() -> bool:", code)
+
+    # ── 3. ⚠ 老节点(没有该属性)-> 兜底 True ─────────────────────
+    def test_missing_prop_falls_back_to_true(self):
+        """老 .blend 的节点没有这个属性 —— 必须兜底成 True,不能 False。"""
+        code, _ = self._gen(None, True)
+        self.assertIn(self.GUARD_HEAD, self._physics_block(code))
+
+    # ── 4. 属性 False -> 没守卫(用户要的"上帝视角观察世界运行")──
+    def test_disabled_leaves_ai_running(self):
+        code, _ = self._gen(False, True)
+        self.assertNotIn(self.GUARD_HEAD, self._physics_block(code))
+
+    # ── 5. 没导上帝机 -> 完全不引用那个函数(老工程逐字不变)──────
+    def test_no_god_camera_emits_no_reference(self):
+        code, _ = self._gen(True, False)
+        self.assertNotIn("_gk_god_camera_active", code)
+        self.assertNotIn(self.GUARD_HEAD, self._physics_block(code))
+
+    # ── 6. 2D 不参与(上帝机是 3D 独有概念)────────────────────────
+    def test_2d_has_no_guard(self):
+        """2D 工程即使误勾了『上帝摄像机』也不该有这条守卫。
+
+        ⚠ 两个理由:① 判据 `get_viewport().get_camera_3d()` 在 2D 里永远
+        返回 false(守卫是死代码);② `if X is CharacterBody3D` 在
+        `CharacterBody2D` 脚本里是**类型错**(整个脚本编译不过)。
+        顺带保证 2D 工程生成结果逐字不变。
+        """
+        code, warnings = self._gen(True, True, options=V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn(self.GUARD_HEAD, self._physics_block(code))
+        self.assertNotIn("is CharacterBody3D", code)
 
 
 if __name__ == "__main__":

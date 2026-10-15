@@ -1,6 +1,7 @@
 """UI:侧栏面板、添加节点菜单、节点引用选择器。"""
 
 import os
+import time
 
 import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
@@ -9,6 +10,9 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
 from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
                exporter, gk_log, logic_info, project)
 from . import asset_export
+# 三种线框标记物体(第 122 轮):KINDS 是那三种标记的**单一定义源** ——
+# 面板的标签 / 图标 / 线框颜色全部从这里取,ui.py 不再自己抄一份。
+from . import markers
 from . import node_groups
 from . import ui_wysiwyg
 from . import operator_io as ops
@@ -33,6 +37,13 @@ class GKGameLogicTree(bpy.types.NodeTree):
     gk_enabled: BoolProperty(
         name="参与导出", default=True,
         description="关掉 = 这张图暂时不导出(节点和连线都留着,随时能开回来)")
+
+    gk_scope: EnumProperty(
+        name="逻辑用途",
+        items=(("ROLE", "角色逻辑", "挂在角色物体上的输入、移动和交互"),
+               ("LEVEL", "关卡逻辑", "挂在场景上的关卡事件与流程")),
+        default="LEVEL",
+    )
 
     # ── 这张逻辑图对外的**端口**(用户第 21 轮要的"真接口")───────────
     # 声明过的端口 = 导出成脚本变量 `输出_<名字>`;『逻辑_输出结果』
@@ -89,11 +100,18 @@ class GKGameLogicTree(bpy.types.NodeTree):
         layout.operator("gk.open_godot", text="运行",
                         icon="PLAY").editor = False
         layout.separator()
-        layout.operator("gk.export_script", text="导出脚本", icon="FILE_TICK")
+        # 第 122 轮:和侧栏一样,这里也只留**一个**导出按钮(脚本 + 模型 +
+        # 材质 + 场景一次导完)。以前它只导脚本,用户在这里点完以为导完了,
+        # 进 Godot 一看模型还是旧的。
+        layout.operator("gk.export_godot", text="导出到 Godot", icon="FILE_TICK")
 
 
 def _node_space(context):
     """找到当前可用的节点编辑器区域(拿不到就返回 None)。"""
+    area = getattr(context, "area", None)
+    space = getattr(context, "space_data", None)
+    if getattr(area, "type", "") == "NODE_EDITOR" and space is not None:
+        return space
     window = getattr(context, "window", None)
     screen = getattr(window, "screen", None) if window else None
     for area in getattr(screen, "areas", ()) or ():
@@ -188,12 +206,92 @@ class GK_OT_SwitchTree(bpy.types.Operator):
                 # 起始状态现在由**拓扑**决定(『进入』没被任何『转到』
                 # 指到的那个),不需要勾选框,见 codegen._anim_tree_entry。
             else:
-                tree = bpy.data.node_groups.new("游戏逻辑", "GKGameLogicTree")
+                tree = bpy.data.node_groups.new("关卡逻辑", "GKGameLogicTree")
+                tree.gk_scope = "LEVEL"
             self.report({"INFO"}, f"已新建『{tree.name}』")
 
         space.tree_type = wanted
         space.node_tree = tree
         _LAST_TREE[wanted] = tree
+        return {"FINISHED"}
+
+
+# ==========================================================================
+# 新建角色/关卡逻辑图，仍共用原有的代码生成树类型。
+# ==========================================================================
+class GK_OT_NewLogicTree(bpy.types.Operator):
+    bl_idname = "gk.new_logic_tree"
+    bl_label = "新建逻辑图"
+    bl_options = {"REGISTER", "UNDO"}
+
+    scope: EnumProperty(items=(("ROLE", "角色逻辑", ""),
+                               ("LEVEL", "关卡逻辑", "")), default="LEVEL")
+
+    def execute(self, context):
+        space = _node_space(context)
+        if space is None:
+            self.report({"WARNING"}, "请先打开节点编辑器")
+            return {"CANCELLED"}
+        title = "角色逻辑" if self.scope == "ROLE" else "关卡逻辑"
+        tree = bpy.data.node_groups.new(title, "GKGameLogicTree")
+        tree.gk_scope = self.scope
+        tree.use_fake_user = True
+        if self.scope == "LEVEL":
+            settings = getattr(context.scene, "gk_settings", None)
+            if settings is not None:
+                settings.logic_tree = tree.name
+        else:
+            obj = getattr(context, "object", None)
+            physics = getattr(obj, "gk_physics", None) if obj is not None else None
+            if physics is not None and getattr(obj, "type", "") == "MESH":
+                physics.logic_tree = tree.name
+                physics.script_target = True
+        space.tree_type = "GKGameLogicTree"
+        space.pin = True
+        space.node_tree = tree
+        return {"FINISHED"}
+
+
+class GK_OT_SetLogicScope(bpy.types.Operator):
+    bl_idname = "gk.set_logic_scope"
+    bl_label = "设置逻辑用途"
+    bl_options = {"REGISTER", "UNDO"}
+
+    tree_name: StringProperty(default="")
+    scope: EnumProperty(items=(("ROLE", "角色逻辑", ""),
+                               ("LEVEL", "关卡逻辑", "")), default="LEVEL")
+
+    def execute(self, context):
+        tree = bpy.data.node_groups.get(self.tree_name)
+        if tree is None or getattr(tree, "bl_idname", "") != "GKGameLogicTree":
+            return {"CANCELLED"}
+        tree.gk_scope = self.scope
+        return {"FINISHED"}
+
+
+class GK_OT_SyncLogicBindings(bpy.types.Operator):
+    bl_idname = "gk.sync_logic_bindings"
+    bl_label = "同步角色引用"
+    bl_description = "收集角色图中以 @ 开头的引用，在物体上指定对应场景对象"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        physics = getattr(getattr(context, "object", None), "gk_physics", None)
+        if physics is None:
+            return {"CANCELLED"}
+        tree = bpy.data.node_groups.get(physics.logic_tree)
+        if tree is None:
+            return {"CANCELLED"}
+        existing = {item.binding_name for item in physics.logic_bindings}
+        for node in tree.nodes:
+            for prop_name, kind, *_rest in getattr(node, "gk_prop_defs", ()):
+                if kind != "node":
+                    continue
+                value = getattr(node, prop_name, "")
+                if value.startswith("@") and value[1:] not in existing:
+                    item = physics.logic_bindings.add()
+                    item.binding_name = value[1:]
+                    existing.add(item.binding_name)
         return {"FINISHED"}
 
 
@@ -389,7 +487,7 @@ class GK_PT_AnimTree(bpy.types.Panel):
         # 所以换成一行**说明**,把"去哪导出"讲清楚。
         hint = layout.box()
         hint.label(text="动画图跟着游戏逻辑一起导出", icon="INFO")
-        hint.label(text="切到『游戏逻辑』那张图 -> 导出为 Godot 脚本")
+        hint.label(text="切到『游戏逻辑』那张图 -> 导出到 Godot")
 
 
 # ==========================================================================
@@ -409,13 +507,21 @@ class GK_PT_AnimTree(bpy.types.Panel):
 #
 # 界面节点**两棵树都能放**(老图一字不变)—— 这不是强制迁移,是多一个地方摆。
 class GKUiDesignTree(bpy.types.NodeTree):
-    """游戏界面节点树:控件摆在这里,由玩法图的『界面_套用设计』建出来。"""
+    """游戏界面节点树:控件 + 界面行为都摆在这里。
+
+    控件是"长什么样";按钮点击 / Esc 暂停 / 对话框这些**行为**也写在这张
+    图里(没有从别处接进来的语句 = 界面建好后执行一次)。勾了『主界面』的
+    那张跨场景常驻 —— 导出成 autoload,切关卡不消失。
+    玩法图只留两个接口:『界面_套用设计』(在场景里建出来)和
+    『界面_主界面』(常驻那份的显示开关)。
+    """
 
     bl_idname = "GKUiDesignTree"
     bl_label = "游戏界面"
     bl_icon = "WINDOW"
     bl_description = ("BlenderGameKit 的界面设计图 —— 控件(文本 / 按钮 / 面板 / "
-                      "列表…)摆在这里,玩法图放一个『界面_套用设计』引用它")
+                      "列表…)和界面自己的行为都摆在这里;勾『主界面』= "
+                      "跨场景常驻(切关卡不消失)")
 
     # ── 视口叠加预览(用户第 40 轮选的"清单 + 视口叠加")───────────────
     # 编辑这张图时,3D 视口里按屏幕比例把控件画成框 —— 不用导出就能看出
@@ -428,6 +534,17 @@ class GKUiDesignTree(bpy.types.NodeTree):
     # 控件里填的 X / Y / 宽 / 高 都是这个坐标系里的像素。
     gk_design_width: IntProperty(name="设计宽", default=1152, min=64, max=7680)
     gk_design_height: IntProperty(name="设计高", default=648, min=64, max=7680)
+
+    # ── 主界面(第一百一十二轮)───────────────────────────────────────
+    # 用户:"在游戏界面那里设置一个主界面:无论在什么场景,什么事件中,
+    # 都会生效的"。勾上 → 导出成 `scripts/gk_main_ui.gd`(autoload):
+    # 开局建一次、切关卡不消失;玩法图的『界面_主界面』节点显示 / 收起它。
+    gk_main_ui: BoolProperty(
+        name="主界面(所有场景常驻)",
+        default=False,
+        description=("勾上 = 这张设计图导出成跨场景常驻的主界面(开局建一次、"
+                     "切关卡不消失)。常驻的 HUD / 暂停菜单 / 按键提示放这里,"
+                     "不用每一关各搭一遍;玩法图用『界面_主界面』显示 / 收起它"))
 
     @classmethod
     def poll(cls, context):
@@ -951,6 +1068,37 @@ class GK_OT_UiDragWidget(bpy.types.Operator):
         self._redraw()
 
 
+# ==========================================================================
+# 视口"上帝机":**用 Blender 原生的那个**(第 128 轮:我删掉了自己写的那套)
+# ==========================================================================
+# ── 用户原话 ────────────────────────────────────────────────────────
+# "呃，我发现了 blender 原生的上帝机了...按 SHIFT+~ 就可以进入了，
+#  你可以把现在做的这个给删了。"
+#
+# ── 我当初为什么自己写(以及为什么错了)────────────────────────────
+# 第 7 轮用户问"能不能做个像虚幻5那样的预览上帝机",我调研后写道:
+# "原生 `view3d.walk / fly / navigate` **零属性**,速度/按键/重力全写死,
+#  配不出手感" —— **这个结论是错的**。
+# 我只看了**算子**自己的属性(那三个确实没有属性),没去看
+# `Preferences → 视图导航 → 飞行 & 行走`:那里有完整的
+# **步行速度 / 传送持续时间 / 速度系数 / 鼠标敏感度 / 重力**,而且
+# 规格还能在 行走 ↔ 飞行 之间切、能"缩放至鼠标位置"。全都能配。
+# 于是我自己那套(模态 + HUD + 接管原生导航)变成了**净负担**:
+#   * 连炸三次(算子构造签名 / delta 未绑定 / 向量乘四元数);
+#   * 和原生 `Shift+~` 功能重叠,用户不知道该按哪个;
+#   * 白占一个快捷键(F6)。
+# 教训:**"原生做不到"这种结论,要把"用户偏好设置那一层"也翻一遍再下** ——
+# 算子上没属性 ≠ 功能不可配。
+#
+# ── 现在怎么用 ──────────────────────────────────────────────────────
+# 在 3D 视口里按 **Shift + `**(反引号,`键)进入原生"行走/飞行导航":
+#   鼠标移动 = 转视角 · WASD = 平移 · Q/E = 上下 · 滚轮 = 调速
+#   左键 = 确认停留 · 右键或 Esc = 取消回原位
+# 规格(步行速度等)在 `编辑 → 偏好设置 → 视图导航 → 飞行 & 行走` 里调。
+# 侧栏"世界设置"里那两行提示就是指向它(见 `_draw_...` 里的说明)。
+_VIEWPORT_FLY_REMOVED = True       # 第 128 轮移除;留着给测试断言"确实删干净了"
+
+
 # 挂在 3D 视口上的绘制句柄(注册时加、注销时摘)
 _UI_PREVIEW_HANDLE = []
 
@@ -1237,12 +1385,38 @@ class GK_PT_UiDesign(bpy.types.Panel):
                 row.label(text="    " * depth + name, icon=icon)
                 pick = row.operator("gk.select_node", text="", icon="VIEWZOOM")
                 pick.node_name = name
+                # 『单独显示』(用户第一百一十八轮):把其他控件收起(hide),
+                # 只看这一个 + 它的父链 —— 调整嵌套深的控件时不受干扰;
+                # 再点一次全部恢复。
+                solo = row.operator("gk.solo_ui_widget", text="", icon="HIDE_OFF")
+                solo.tree_name = tree.name
+                solo.node_name = name
             missing = [str(n.name) for n in widgets
                        if str(getattr(n, "gk_parent_widget", "") or "").strip()
                        and str(getattr(n, "gk_parent_widget", "") or "").strip() not in known]
             if missing:
                 box.label(text=f"父控件名字对不上:{'、'.join(missing[:3])}",
                           icon="ERROR")
+
+        # ---- 主界面(跨场景常驻,第一百一十二轮)----
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(tree, "gk_main_ui", text="主界面(所有场景常驻)",
+                 toggle=True, icon="WINDOW")
+        if getattr(tree, "gk_main_ui", False):
+            box.label(text="导出成 autoload:开局建一次、切关卡不消失",
+                      icon="INFO")
+            box.label(text="玩法图用『界面_主界面』显示 / 收起它", icon="INFO")
+            others = [g for g in bpy.data.node_groups
+                      if getattr(g, "bl_idname", "") == "GKUiDesignTree"
+                      and g is not tree
+                      and getattr(g, "gk_main_ui", False)]
+            if others:
+                box.label(text=f"还有 {len(others)} 张也勾了主界面"
+                               f"(导出只用文件里第一张)", icon="ERROR")
+        else:
+            box.label(text="常驻的 HUD / 暂停菜单 / 按键提示放一张这里",
+                      icon="INFO")
 
         # ---- 预览 ----
         box = layout.box()
@@ -1265,12 +1439,14 @@ class GK_PT_UiDesign(bpy.types.Panel):
         box.label(text="从 0 到 1(按这个顺序来)", icon="CHECKMARK")
         box.label(text="① 定屏幕:上面的『宽 / 高』")
         box.label(text="② 摆控件:加控件 + 『拖动摆放控件』")
-        box.label(text="③ 定主题:玩法图放『界面_皮肤』")
-        box.label(text="④ 接行为:玩法图放『界面_套用设计』+『界面_按钮点击』")
-        box.label(text="⑤ 验收:『运行游戏』(F5)看最终观感")
+        box.label(text="③ 定主题:这张图里放『界面_皮肤』")
+        box.label(text="④ 接行为:『界面_按钮点击』也放这张图里(界面自带)")
+        box.label(text="⑤ 常驻整局:勾『主界面』;单关界面用")
+        box.label(text="    玩法图『界面_套用设计』建出来")
+        box.label(text="⑥ 验收:『运行游戏』(F5)看最终观感")
         row = box.row(align=True)
         back = row.operator("gk.switch_tree", text="→ 去玩法图摆节点",
-                            icon="LOOP_FORWARD")
+                            icon="LOOP_FORWARDS")
         back.target = "GKGameLogicTree"
 
 
@@ -1297,6 +1473,12 @@ class GKGameAiTree(bpy.types.NodeTree):
     bl_description = ("BlenderGameKit 的 AI 图 —— 『AI_状态』(巡逻 / 追击…)"
                       "和『AI_转场』(看见 / 丢失目标…)摆在这里,"
                       "玩法图放一个『AI_启用』引用它")
+
+    @classmethod
+    def draw_header(cls, layout, context):
+        # 用户实测:状态机转场链成环被 Blender 画红,以为 AI 出了 bug。
+        layout.label(text="转场回到走过的状态 = 状态机正常循环(红线只是成环提醒)",
+                     icon="INFO")
 
     # ── 视口叠加预览(和界面设计图同一套)─────────────────────────────
     # 编辑这张图时,3D 视口里画**巡逻路线**和**感知范围圈** ——
@@ -2837,7 +3019,8 @@ class GK_PT_AiDesign(bpy.types.Panel):
 # 添加节点菜单
 # ==========================================================================
 def _menu_name(category):
-    return "GK_MT_NODES_" + str(abs(hash(category)) % 100000)
+    import hashlib
+    return "GK_MT_NODES_" + hashlib.sha256(category.encode("utf-8")).hexdigest()[:16]
 
 
 class GK_OT_AddNodeMenu(bpy.types.Operator):
@@ -2888,7 +3071,7 @@ def _menu_link_from(context):
     if tree is None:
         return ""
     active = getattr(tree.nodes, "active", None)
-    return active.name if active is not None else ""
+    return active.name if active is not None and active.select else ""
 
 
 def _menu_add(menu_layout, cls, link_from):
@@ -2917,7 +3100,7 @@ def _make_category_menu(category, classes, subcategories=None):
                 # **根本没过滤**,于是动画树里点『运算 ▸ 常量 ▸ 常量_数值』
                 # 会弹 `RuntimeError:『常量_数值』是游戏逻辑树里的节点`
                 # (用户截图里的那条)。空菜单 / 必错的菜单项比没有更糟。
-                if any(props.node_fits_tree(cls, kind) for cls in sub_classes):
+                if any(props.node_menu_allowed(cls, kind) for cls in sub_classes):
                     layout.menu(_menu_name(f"{category}/{sub_name}"),
                                 text=sub_name)
             return
@@ -2928,7 +3111,7 @@ def _make_category_menu(category, classes, subcategories=None):
         # 在 draw 里(此时一定有 context)按当前树类型再筛一遍。
         shown = 0
         for cls in classes:
-            if not props.node_fits_tree(cls, kind):
+            if not props.node_menu_allowed(cls, kind):
                 continue
             _menu_add(layout, cls, link_from)
             shown += 1
@@ -2956,7 +3139,7 @@ def _make_subcategory_menu(category, sub_name, classes):
         kind = props.current_tree_type(context)
         shown = 0
         for cls in classes:
-            if not props.node_fits_tree(cls, kind):
+            if not props.node_menu_allowed(cls, kind):
                 continue
             _menu_add(layout, cls, link_from)
             shown += 1
@@ -2992,7 +3175,7 @@ def _menu_has_entries(menu_name, context, classes_getter):
     for cls in classes:
         if getattr(cls, "gk_hidden", False):
             continue
-        if props.node_fits_tree(cls, kind):
+        if props.node_menu_allowed(cls, kind):
             return True
     return False
 
@@ -3007,7 +3190,7 @@ def _make_common_menu():
         for cls in props.common_node_classes():
             # 同 _make_category_menu:按当前树类型过滤,
             # 不然动画树里点开会是一串必然报错的玩法节点
-            if not props.node_fits_tree(cls, kind):
+            if not props.node_menu_allowed(cls, kind):
                 continue
             if getattr(cls, "gk_hidden", False):
                 continue
@@ -3056,7 +3239,7 @@ def _make_recent_menu():
         for cls in recent:
             # 和『常用』一样按当前树类型过滤 —— 最近用过玩法节点之后
             # 切到动画树,这个菜单里原来会列一串点了必然报错的节点。
-            if not props.node_fits_tree(cls, kind):
+            if not props.node_menu_allowed(cls, kind):
                 continue
             _menu_add(layout, cls, link_from)
             shown += 1
@@ -3080,9 +3263,6 @@ def _make_top_menu():
 
     def draw(self, context):
         layout = self.layout
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
         # 与 _draw_node_menu_contents 一致:当前树没有可用常用节点时就不画
         if _menu_has_entries("常用", context, props.common_node_classes):
             layout.menu(_menu_name("常用"), text="常用", icon="SOLO_ON")
@@ -3113,6 +3293,9 @@ def _make_tools_menu():
                         icon="TRIA_RIGHT")
         layout.operator("gk.collapse_to_function",
                         text="折叠成函数(框住选中节点)", icon="FILE_SCRIPT")
+        op = layout.operator("node.add_node", text="添加转接点", icon="NODE_INSERT_ON")
+        op.type = "NodeReroute"
+        op.use_transform = True
 
     return type("GK_MT_NodeTools", (bpy.types.Menu,), {
         "bl_idname": _menu_name("节点工具"),
@@ -3179,7 +3362,7 @@ class GK_MT_TargetPicker(bpy.types.Menu):
         if node is None:
             layout.label(text="节点已不存在", icon="ERROR")
             return
-        for key, text, description, icon, index in NB.node_items_for(node):
+        for key, text, description, icon, index in NB.node_items_for(node, self.prop_name):
             op = layout.operator("gk.set_target", text=text, icon=icon)
             op.node_name = self.node_name
             op.prop_name = self.prop_name
@@ -3206,6 +3389,44 @@ class GK_OT_SetTarget(bpy.types.Operator):
             self.report({"ERROR"}, "节点或属性不存在")
             return {"CANCELLED"}
         setattr(node, self.prop_name, self.value)
+        return {"FINISHED"}
+
+
+class GK_OT_NewRoleReference(bpy.types.Operator):
+    bl_idname = "gk.new_role_reference"
+    bl_label = "新建角色引用"
+    bl_description = "把场景对象引用改为角色实例参数，同一张图可用于不同关卡"
+    bl_options = {"REGISTER", "UNDO"}
+
+    node_name: StringProperty(default="")
+    prop_name: StringProperty(default="gk_target")
+    reference_name: StringProperty(name="引用名", default="相机")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "reference_name")
+
+    def execute(self, context):
+        tree = props.current_tree(context)
+        node = tree.nodes.get(self.node_name) if tree else None
+        name = self.reference_name.strip().lstrip("@").strip()
+        if node is None or not name or not hasattr(node, self.prop_name):
+            return {"CANCELLED"}
+        original = getattr(node, self.prop_name)
+        setattr(node, self.prop_name, "@" + name)
+        for obj in bpy.data.objects:
+            physics = getattr(obj, "gk_physics", None)
+            if physics is None or physics.logic_tree != tree.name:
+                continue
+            if any(b.binding_name == name for b in physics.logic_bindings):
+                continue
+            binding = physics.logic_bindings.add()
+            binding.binding_name = name
+            target = bpy.data.objects.get(original)
+            if target is not None and any(target.name in s.objects for s in obj.users_scene):
+                binding.target = target
         return {"FINISHED"}
 
 
@@ -3239,11 +3460,16 @@ def _make_target_picker_draw(node_name, prop_name):
         if node is None:
             layout.label(text="节点已不存在", icon="ERROR")
             return
-        for key, text, description, icon, index in NB.node_items_for(node):
+        for key, text, description, icon, index in NB.node_items_for(node, prop_name):
             op = layout.operator("gk.set_target", text=text, icon=icon)
             op.node_name = node_name
             op.prop_name = prop_name
             op.value = key
+        if getattr(tree, "gk_scope", "") == "ROLE":
+            layout.separator()
+            op = layout.operator("gk.new_role_reference", text="新建角色引用…", icon="ADD")
+            op.node_name = node_name
+            op.prop_name = prop_name
 
     return draw
 
@@ -3279,7 +3505,7 @@ class GK_OT_PickLogicTree(bpy.types.Operator):
 
     def invoke(self, context, event):
         from . import exporter
-        trees = exporter.game_logic_trees()
+        trees = exporter.game_logic_trees("LEVEL")
         settings = getattr(context.scene, "gk_settings", None)
         current = str(getattr(settings, "logic_tree", "") or "")
 
@@ -3543,7 +3769,15 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
         col = box.column(align=True)
         col.prop(physics, "script_target")
         if physics.script_target:
-            box.label(text="节点图导出的脚本会挂到这个物体上", icon="INFO")
+            col.prop(physics, "logic_tree", text="角色逻辑图")
+            col.operator("gk.sync_logic_bindings", icon="FILE_REFRESH")
+            for binding in physics.logic_bindings:
+                col.prop(binding, "target", text=binding.binding_name)
+            if str(getattr(physics, "logic_tree", "") or "").strip():
+                box.label(text="这张图会导成独立脚本挂到这个物体上"
+                              "(场景那张图 = 关卡/世界逻辑)", icon="INFO")
+            else:
+                box.label(text="节点图导出的脚本会挂到这个物体上", icon="INFO")
 
         # ---- 静态资产(用户 2026-10-05:"游戏静态资产设计")----------
         # 一个模型只导一次、场景里摆很多份:同名的算同一个资产,
@@ -3748,6 +3982,603 @@ def auto_shape_for(obj, is_3d=True):
       * 其余(扁平的墙/地板) -> 盒子
     """
     return asset_export.guess_collision_shape(obj, is_3d)
+
+
+# ==========================================================================
+# 第 122 轮:三种『线框标记物体』(用户第 1 条)
+# ==========================================================================
+# 用户原话:
+#     "在3D视图中创建三个线框物体,一个是指定玩家出生点,一个是区域环境
+#      影响点,即拖动这个物体就可以移动区域环境的影响范围,一个是类似于
+#      整体的调节,指定为一个关卡的父级……这三个是在物体属性中来添加,
+#      而不是在游戏逻辑添加,因为那里太多功能显示了"
+#
+# ── 三个标记分别是什么、为什么要有 ──────────────────────────────────
+#   玩家出生点  每关一个,决定"默认角色切到这一关时落在哪"。以前它只能
+#               在侧栏『世界设置』里用一个物体下拉去指 —— 场景里看不见,
+#               建关卡时会漏(用户上一版就是每个场景各塞了一个角色).
+#               现在它是**视口里看得见的一个线框物体**,指着哪就是哪。
+#   区域环境点  一个范围盒子:玩家走进去,这一片的环境(背景/雾/环境光/
+#               泛光)整套切过去,走出去还原。**拖动物体 = 挪影响范围**,
+#               拉 scale = 改范围大小 —— 这就是用户要的"拖动即可移动"。
+#   关卡父级    这一关的一坨东西挂到它下面;导出到 Godot 后它们是同一个
+#               父节点下的一组。想整块卸载 / 换掉 / 挪位置时,动一个节点
+#               就行,不用逐个抓。
+#
+# ── 为什么放在**物体属性**而不是游戏逻辑侧栏 ────────────────────────
+# 用户原话:"因为那里太多功能显示了"。而且这三个东西本来就是**物体**——
+# 选中谁就改谁、视口里拖着走,这才是 Blender 里最自然的操作方式。
+# 侧栏那边一行都不加。
+#
+# ── 它们不会被当成模型导出 ────────────────────────────────────────
+# 建标记时会给物体打上自定义属性 `gk_marker`,导出侧靠它把标记从
+# "要导的网格 / 碰撞体"里剔掉(见 asset_export 的 is_marker_object)。
+# 所以视口里看得见的线框盒子**不会**变成 Godot 里的一个怪方块。
+
+# ── 三种标记的定义**不在这里**(第 122 轮)────────────────────────────
+# 单一定义源是 `markers.KINDS`(kind / 中文标签 / 图标 / 说明 / 线框颜色)。
+# 我一开始在 ui.py 里抄了一份 —— 但那正是这个项目踩过好几次的坑
+# (加了类型忘了改另一处)。所以下面全部改成**转发**:properties.py 的下拉
+# items、导出侧按 kind 找物体、面板上色,读的都是 markers 那一份。
+# `KIND_LABELS` / `KIND_ICONS` / `KIND_COLORS` 是给面板用的短名字。
+MARKER_KINDS = markers.KINDS
+MARKER_KIND_IDS = markers.KIND_IDS
+
+
+def _marker_enum_items():
+    """给属性枚举用。**直接转发** markers.enum_items()(它带 NONE 那一项)。"""
+    return markers.enum_items()
+
+
+def marker_kind_of(obj):
+    """物体是哪种标记;不是标记 -> ""。真值源:`markers.kind_of`。
+
+    ⚠ 别在这里自己读属性(第 122 轮踩到):属性枚举里"无"的值是
+    `markers.NONE_VALUE`("NONE")而**不是空字符串** —— Blender 4.5 会把
+    空标识符的枚举项丢掉(读一次刷一条 RNA 警告、写 `""` 直接抛
+    TypeError)。所以"先读属性,空就退回自定义属性"这种写法**永远走不到
+    兜底**:NONE 是个真值,不是空。`markers.kind_of` 里已经按
+    "三个来源 + NONE 归一成 ''"处理干净了,这里只转发。
+    """
+    try:
+        return markers.kind_of(obj)
+    except Exception:                                       # noqa: BLE001
+        return ""
+
+
+def marker_kind_info(kind):
+    """面板要的 (kind, 标签, 图标, 说明, 颜色);找不到返回 None。"""
+    if not kind:
+        return None
+    return (kind, markers.label_of(kind), markers.icon_of(kind),
+            markers.KIND_DESCRIPTIONS.get(kind, ""), markers.color_of(kind))
+
+
+def marker_spawn_in(scene):
+    """本场景的『玩家出生点』标记(多个时按名字取第一个,保证导出稳定)。"""
+    return markers.player_start(scene)
+
+
+def _marker_color_material(name, rgba):
+    """给标记做一个**纯色线框**材质(视口里一眼能认出这是标记,不是模型)。
+
+    不用 Blender 自带的 `display_type='WIRE'`:那个只在实体模式生效,
+    材质预览 / 渲染里还是实心方块 —— 而"实心大方块挡着视线"正是标记
+    最讨人厌的地方。这里用 `blend_method` + 背面剔除做一个"看得见的框"。
+    """
+    existing = bpy.data.materials.get(name)
+    if existing is not None:
+        return existing
+    material = bpy.data.materials.new(name)
+    material.diffuse_color = rgba
+    material.use_nodes = True
+    try:
+        material.blend_method = "BLEND"          # 半透明(4.2+ 仍可写)
+    except Exception:                                       # noqa: BLE001
+        pass
+    for node in getattr(getattr(material, "node_tree", None), "nodes", ()) or ():
+        if getattr(node, "type", "") != "BSDF_PRINCIPLED":
+            continue
+        try:
+            node.inputs["Base Color"].default_value = rgba
+            node.inputs["Alpha"].default_value = 0.22
+            node.inputs["Roughness"].default_value = 1.0
+        except Exception:                                   # noqa: BLE001
+            pass
+    material.use_backface_culling = True
+    return material
+
+
+def _marker_target_collection(context):
+    """标记放哪个集合:场景主集合(和用户自己摆的东西在一起)。"""
+    scene = context.scene
+    return getattr(scene, "collection", None) or context.collection
+
+
+def create_marker(context, kind):
+    """建一个标记物体(1 米的立方体 + 纯色线框材质)。返回物体。
+
+    为什么是**立方体**而不是空物体:用户要的是"线框物体",而且要能
+    "拖动/拉缩放" —— 立方体的包围盒就是区域范围,拉 scale 改大小最直观;
+    空物体没有可拉的范围感。
+    """
+    scene = context.scene
+    info = marker_kind_info(kind)
+    if info is None:
+        raise ValueError(f"未知的标记类型: {kind}")
+    label = info[1]
+    # ⚠ 颜色**只从 markers 取**(别再按下标去 info 里掏 —— 我第一版就是
+    # 这么写的,`markers.KINDS` 的字段顺序和我猜的不一样,`obj.color`
+    # 被塞进一整段说明文字,当场 ValueError)。
+    rgba = tuple(markers.color_of(kind))
+    mesh = bpy.data.meshes.new(f"GK标记_{label}")
+    # 1 米见方的立方体(顶点直接写死:不调 bpy.ops,免得受"当前模式"影响
+    # —— 在编辑模式下调 primitive_add 会插进正在编辑的网格里,踩过一次)
+    half = 0.5
+    verts = [(x * half, y * half, z * half)
+             for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+    faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+             (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(f"{label}", mesh)
+    obj["gk_marker"] = kind
+    obj.display_type = "WIRE"
+    obj.show_in_front = True               # 挡在墙里也看得见(标记的意义就在这)
+    obj.show_name = True
+    obj.color = rgba
+    mesh.materials.append(_marker_color_material(
+        f"GK标记材质_{label}", rgba))
+    collection = _marker_target_collection(context)
+    if collection is not None:
+        collection.objects.link(obj)
+    else:                                                   # pragma: no cover
+        scene.collection.objects.link(obj)
+    # 物理侧同步:标记**不参与**几何/碰撞导出,但导出的节点类型由这里决定
+    physics = getattr(obj, "gk_physics", None)
+    if physics is not None:
+        try:
+            physics.gk_marker_kind = kind
+            physics.collision_shape = "none"
+            physics.script_target = False
+        except Exception:                                   # noqa: BLE001
+            pass
+    # 摆在视口中心,别建在原点"看不见"
+    try:
+        region = context.region
+        space = context.space_data
+        if (getattr(context, "area", None) is not None
+                and getattr(context.area, "type", "") == "VIEW_3D"
+                and space is not None and getattr(space, "region_3d", None)):
+            from mathutils import Vector
+            depth = getattr(space.region_3d, "view_distance", 12.0)
+            target = (space.region_3d.view_location
+                      + space.region_3d.view_rotation @ Vector((0.0, 0.0, -depth)))
+            obj.location = target
+    except Exception:                                       # noqa: BLE001
+        pass
+    return obj
+
+
+def _marker_fit(objects, axis):
+    """返回 (世界中心, 半径) —— 把标记摆到这些物体正中、缩放到刚好框住。
+
+    `axis` 只是**省心开关**:XYZ = 三轴都框;XY / XZ / YZ = 那一层贴着
+    物体的范围、另一轴给一个薄厚度(做"地板上的范围"时不用手动压扁)。
+    """
+    from mathutils import Vector
+
+    mins = Vector((1e9, 1e9, 1e9))
+    maxs = Vector((-1e9, -1e9, -1e9))
+    found = False
+    for obj in objects:
+        for corner in obj.bound_box:
+            world = obj.matrix_world @ Vector(corner)
+            for index in range(3):
+                mins[index] = min(mins[index], world[index])
+                maxs[index] = max(maxs[index], world[index])
+            found = True
+    if not found:
+        return None
+    size = maxs - mins
+    thin = max(0.1, min(size.x, size.y, size.z) * 0.05)
+    keep = {"XYZ": (True, True, True),
+            "XY": (True, True, False),
+            "XZ": (True, False, True),
+            "YZ": (False, True, True)}.get(axis, (True, True, True))
+    for index in range(3):
+        if not keep[index]:
+            size[index] = thin
+    center = (maxs + mins) * 0.5
+    half = Vector((max(size.x, 0.05), max(size.y, 0.05),
+                   max(size.z, 0.05))) * 0.5
+    return center, half
+
+
+def _marker_zone_size(obj):
+    """环境区域点的世界尺寸(和导出用的是同一个口径)。
+
+    优先走 markers 模块(那边是导出的**唯一**口径);它还没就绪时用
+    `dimensions` 兜底 —— 宁可面板显示的数字和导出的差一点,
+    也不能因为一个 import 让面板整块画不出来。
+    """
+    try:
+        from . import markers as marker_lib
+        return tuple(marker_lib.zone_size(obj))
+    except Exception:                                       # noqa: BLE001
+        pass
+    dims = getattr(obj, "dimensions", None)
+    try:
+        return (max(float(dims[0]), 0.05), max(float(dims[1]), 0.05),
+                max(float(dims[2]), 0.05))
+    except Exception:                                       # noqa: BLE001
+        return (1.0, 1.0, 1.0)
+
+
+def _draw_spawn_hint(layout, context):
+    """『世界设置』盒里那几行:当前场景的出生点在哪 + 没有就给个按钮。
+
+    抽出来是因为面板分两块(世界设置盒 / 物体属性面板)都要说同一件事,
+    两份文字迟早会不一致。
+    """
+    marker = marker_spawn_in(context.scene)
+    if marker is None:
+        layout.label(text=f"『{context.scene.name}』还没有玩家出生点",
+                     icon="ERROR")
+        layout.operator("gk.add_marker", text="建一个玩家出生点",
+                        icon="ADD").kind = markers.KIND_PLAYER_START
+    else:
+        layout.label(text=f"本关出生点: {marker.name}", icon="CHECKMARK")
+
+
+def _detect_default_player():
+    """猜"这个文件里哪个是玩家角色";猜不出来返回 None。
+
+    判据和导出侧完全一致(`persistent_player.infer_default_player`),
+    这里只做一层"模块还没就绪"的兜底 —— 面板宁可少显示一行提示,
+    也不能因为一个 import 整块画不出来。
+    """
+    try:
+        from .persistent_player import infer_default_player
+        return infer_default_player()
+    except Exception:                                       # noqa: BLE001
+        pass
+    try:
+        candidates = []
+        for scene in bpy.data.scenes:
+            for obj in scene.objects:
+                physics = getattr(obj, "gk_physics", None)
+                # ⚠ 兜底也要和导出侧**同一个判据**(识别出来的角色必须真能
+                # 当跨关卡角色:是 3D 角色体**且有角色逻辑图**),
+                # 否则面板上会出现一个"用它当默认角色"的按钮,点了之后
+                # 导出直接报错 —— 那种"界面鼓励你踩坑"最糟。
+                if (getattr(obj, "type", "") != "MESH"
+                        or str(getattr(physics, "body_type", ""))
+                        != "CharacterBody3D"):
+                    continue
+                if not str(getattr(physics, "logic_tree", "") or "").strip():
+                    continue
+                candidates.append(obj)
+        unique = {obj.name: obj for obj in candidates}
+        return next(iter(unique.values())) if len(unique) == 1 else None
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+class GK_OT_InferDefaultPlayer(bpy.types.Operator):
+    """把"自动识别到的那个角色"填进世界设置的默认角色。"""
+
+    bl_idname = "gk.infer_default_player"
+    bl_label = "用它当默认角色"
+    bl_description = ("把自动识别到的 3D 角色填进『世界设置 → 默认角色』。"
+                      "之后整局只生成一次这个角色,切关卡只挪位置")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        player = _detect_default_player()
+        if player is None:
+            self.report({"WARNING"},
+                        "认不出哪个是角色(要恰好一个 3D 角色体 CharacterBody3D)")
+            return {"CANCELLED"}
+        world = world_settings()
+        world.default_player = player
+        if world.default_map is None and len(bpy.data.scenes) > 1:
+            world.default_map = bpy.data.scenes[0]
+        self.report({"INFO"}, f"默认角色已设为『{player.name}』")
+        return {"FINISHED"}
+
+
+class GK_OT_AddMarker(bpy.types.Operator):
+    """在 3D 视口里建一个标记物体(玩家出生点 / 区域环境点 / 关卡父级)。"""
+
+    bl_idname = "gk.add_marker"
+    bl_label = "新建标记物体"
+    bl_description = ("建一个线框标记物体:玩家出生点 / 区域环境点 / 关卡父级。"
+                      "建好后在『物体属性』里改它,拖着走就能挪位置")
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: EnumProperty(name="类型", items=_marker_enum_items(),
+                       default=markers.KIND_PLAYER_START)
+
+    def execute(self, context):
+        # ── 出生点**每关只该有一个**:多了以后"到底用哪个"变成运气 ──
+        # 不直接拒绝(用户可能是想换一个位置),而是说清楚并仍然建出来 ——
+        # 导出时按名字取第一个,面板上会显示"用了哪个"。
+        if self.kind == markers.KIND_PLAYER_START:
+            existing = marker_spawn_in(context.scene)
+            if existing is not None:
+                self.report({"WARNING"},
+                            f"『{context.scene.name}』已经有出生点『{existing.name}』"
+                            f"了 —— 导出时按名字取第一个,建议删掉多余的")
+        try:
+            obj = create_marker(context, self.kind)
+        except Exception as exc:                            # noqa: BLE001
+            gk_log.exception("建标记物体失败")
+            self.report({"ERROR"}, f"建标记物体失败: {exc}")
+            return {"CANCELLED"}
+        for other in context.selected_objects:
+            other.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        self.report({"INFO"}, f"已建『{obj.name}』—— 拖动它挪位置,拉缩放改范围")
+        return {"FINISHED"}
+
+
+class GK_OT_FitMarker(bpy.types.Operator):
+    """把选中的标记缩放到刚好框住另一些物体(拖着手调太累)。"""
+
+    bl_idname = "gk.fit_marker"
+    bl_label = "框住选中的物体"
+    bl_description = ("把当前标记摆到选中物体的正中,并缩放到刚好框住它们 —— "
+                      "拉缩放拖不准的时候用这个")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        marker = getattr(context, "object", None)
+        kind = marker_kind_of(marker)
+        if kind == "":
+            self.report({"WARNING"}, "请先选中一个标记物体")
+            return {"CANCELLED"}
+        targets = [obj for obj in context.selected_objects
+                   if obj is not marker and obj.type in ("MESH", "CURVE",
+                                                         "SURFACE", "FONT")]
+        if not targets:
+            self.report({"WARNING"}, "请同时选中要框住的东西(Shift 多选)")
+            return {"CANCELLED"}
+        physics = getattr(marker, "gk_physics", None)
+        axis = str(getattr(physics, "zone_fit_axis", "XYZ") or "XYZ")
+        fitted = _marker_fit(targets, axis)
+        if fitted is None:
+            self.report({"WARNING"}, "选中的东西没有可用范围")
+            return {"CANCELLED"}
+        center, half = fitted
+        marker.location = center
+        marker.scale = (max(half.x / 0.5, 0.01), max(half.y / 0.5, 0.01),
+                        max(half.z / 0.5, 0.01))
+        self.report({"INFO"}, f"『{marker.name}』已框住 {len(targets)} 个物体")
+        return {"FINISHED"}
+
+
+class GK_OT_LevelChildren(bpy.types.Operator):
+    """把选中的物体收进/移出『关卡父级』(改 Blender 的父子关系)。"""
+
+    bl_idname = "gk.level_children"
+    bl_label = "收进 / 移出这组"
+    bl_description = ("把同时选中的其它物体挂到这个关卡父级下面"
+                      "(再点一次 = 把它们移出来)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        root = getattr(context, "object", None)
+        if marker_kind_of(root) != markers.KIND_LEVEL_ROOT:
+            self.report({"WARNING"}, "请先选中一个『关卡父级』标记")
+            return {"CANCELLED"}
+        targets = [obj for obj in context.selected_objects if obj is not root]
+        if not targets:
+            self.report({"WARNING"}, "请同时选中要收进来的物体(Shift 多选)")
+            return {"CANCELLED"}
+        moved = 0
+        for obj in targets:
+            if obj.parent is root:
+                # ── 移出来:保留世界位置 ──────────────────────────────
+                # 不保世界位置的话,物体"跳"到父级原点 —— 用户会以为坏了。
+                matrix = obj.matrix_world.copy()
+                obj.parent = None
+                obj.matrix_world = matrix
+                moved += 1
+                continue
+            matrix = obj.matrix_world.copy()
+            obj.parent = root
+            # 父级是标记(1 米立方,scale 不一定是 1),所以必须把
+            # "父级变换的逆"补回去,否则子物体会被缩放带跑
+            obj.matrix_parent_inverse = root.matrix_world.inverted()
+            obj.matrix_world = matrix
+            moved += 1
+        self.report({"INFO"}, f"已调整 {moved} 个物体的归属")
+        return {"FINISHED"}
+
+
+def _draw_object_add_menu(self, context):
+    """挂到 `VIEW3D_MT_object`(3D 视口的 `物体` 菜单)。
+
+    ── 为什么也挂这里(第 122 轮)──────────────────────────────────
+    用户原话是"在3D视图中创建三个线框物体"。侧栏那两处入口都能建,但
+    "在视口里新建一个东西"这件事,用户的手是往视口的 `添加` / `物体`
+    菜单走的 —— 那里没有,他就会以为"没有这个功能"。
+    菜单只有三项,直接铺开(不再套一层子菜单:三项套一层纯属多一次点击)。
+
+    ⚠ 用 `prepend`(和节点菜单一样,不是 `append`):`物体` 菜单本来就很长,
+      追加到底部会被面板高度截掉 —— 表现就是"菜单里根本没有这一项"。
+    """
+    layout = self.layout
+    layout.separator()
+    for kind_id in MARKER_KIND_IDS:
+        op = layout.operator("gk.add_marker", text=markers.label_of(kind_id),
+                             icon=markers.icon_of(kind_id))
+        op.kind = kind_id
+
+
+class GK_PT_Marker(bpy.types.Panel):
+    """选中的标记物体:它是什么 + 这一个标记自己的设置。
+
+    只画**当前这一个**标记的属性 —— 用户第 122 轮那句"因为那里太多功能
+    显示了"就是这个意思:不要一个大杂烩,选中谁看谁。
+    """
+
+    bl_idname = "GK_PT_Marker"
+    bl_label = "游戏标记 (BlenderGameKit)"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_category = "游戏标记"
+
+    @classmethod
+    def poll(cls, context):
+        return marker_kind_of(getattr(context, "object", None)) != ""
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        physics = getattr(obj, "gk_physics", None)
+        kind = marker_kind_of(obj)
+        info = marker_kind_info(kind)
+        color = tuple(info[4]) if info else (1.0, 1.0, 1.0, 1.0)
+
+        # ---- 它是什么 ----
+        header = layout.box()
+        row = header.row(align=True)
+        row.label(text=f"{info[1] if info else kind}: {obj.name}",
+                  icon=info[2] if info else "OBJECT_DATA")
+        # 线框颜色:和视口里那根线一个颜色,选错了能一眼看出来
+        swatch = row.row(align=True)
+        swatch.alignment = "RIGHT"
+        try:
+            swatch.label(text="", icon="COLOR")
+            swatch.color = color
+        except Exception:                                   # noqa: BLE001
+            pass
+        if info:
+            for line in _wrap(info[4], 34):
+                header.label(text=line, icon="DOT")
+
+        # ---- 类型可以就地改(建错了不用删了重建)----
+        if physics is not None:
+            layout.prop(physics, "gk_marker_kind", text="类型")
+
+        # 导出侧只看 `gk_marker` 这个自定义属性(见 asset_export),
+        # 属性改了就得同步过去 —— 否则"面板显示是区域环境点、导出却没反应"
+        if physics is not None:
+            want = str(getattr(physics, "gk_marker_kind", "") or "")
+            if want in MARKER_KIND_IDS and str(obj.get("gk_marker", "")) != want:
+                obj["gk_marker"] = want
+
+        # ---- 这一个标记自己的设置 ----
+        if kind == markers.KIND_PLAYER_START:
+            box = layout.box()
+            box.label(text="每关一个:默认角色切到本关时落在这里",
+                      icon=markers.icon_of(kind))
+            box.label(text="位置 = 出生点;朝向(Z 轴) = 面朝方向", icon="INFO")
+            box.label(text="只在『世界设置』里选了默认角色后才生效", icon="INFO")
+            _draw_spawn_hint(box, context)
+
+        elif kind == markers.KIND_ENV_ZONE:
+            box = layout.box()
+            box.label(text="范围(拖动物体 = 挪范围;拉缩放 = 改大小)",
+                      icon=markers.icon_of(kind))
+            size = _marker_zone_size(obj)
+            box.label(text=f"当前范围: {size[0]:.2f} × {size[1]:.2f} × "
+                           f"{size[2]:.2f} 米", icon="DRIVER_DISTANCE")
+            if physics is not None:
+                box.prop(physics, "env_preset", text="环境预设")
+                box.prop(physics, "env_restore", toggle=True)
+                row = box.row(align=True)
+                row.prop(physics, "zone_fit_axis", text="")
+                row.operator("gk.fit_marker", text="框住选中的物体",
+                             icon="FULLSCREEN_ENTER")
+            preset = ""
+            if physics is not None:
+                preset = str(getattr(physics, "env_preset", "") or "").strip()
+            if not preset:
+                box.label(text="没填预设 —— 这个区域导出时会被跳过", icon="ERROR")
+                box.label(text="填内置名:恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜",
+                          icon="INFO")
+                try:
+                    from . import properties as _props
+                    names = [str(getattr(item, "preset_name", ""))
+                             for item in getattr(
+                                 _props.env_preset_library(), "env_presets", ())]
+                except Exception:                           # noqa: BLE001
+                    names = []
+                if names:
+                    box.label(text="库里的预设:" + "、".join(names[:4]),
+                              icon="DOT")
+
+        elif kind == markers.KIND_LEVEL_ROOT:
+            box = layout.box()
+            children = [child for child in context.scene.objects
+                        if child.parent is obj]
+            box.label(text=f"这一组里有 {len(children)} 个物体",
+                      icon="OUTLINER_COLLECTION")
+            for child in children[:6]:
+                box.label(text=child.name, icon="DOT")
+            if len(children) > 6:
+                box.label(text=f"…还有 {len(children) - 6} 个", icon="INFO")
+            box.operator("gk.level_children",
+                         text="收进 / 移出选中的物体", icon="LINKED")
+            box.label(text="导出后它们是同一个父节点下的一组", icon="INFO")
+
+        # ---- 底部:换一个 / 删掉 ----
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator("gk.add_marker", text="再建一个",
+                     icon="ADD").kind = (markers.KIND_ENV_ZONE
+                                         if kind == markers.KIND_PLAYER_START
+                                         else markers.KIND_PLAYER_START)
+        row.operator("gk.delete_marker", text="删掉这个标记", icon="TRASH")
+
+
+class GK_OT_DeleteMarker(bpy.types.Operator):
+    """删掉当前标记物体(连带它的网格数据)。
+
+    为什么不直接用 Blender 的删除:标记带自定义属性 + 材质,用户想
+    "换个位置重来"时,一句人话的入口比"按 X 再确认"顺手。
+    """
+
+    bl_idname = "gk.delete_marker"
+    bl_label = "删掉标记物体"
+    bl_description = "删掉这个标记物体(它不参与导出,删了不影响游戏资源)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = getattr(context, "object", None)
+        if marker_kind_of(obj) == "":
+            self.report({"WARNING"}, "当前物体不是标记")
+            return {"CANCELLED"}
+        name = obj.name
+        data = getattr(obj, "data", None)
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data is not None and getattr(data, "users", 0) == 0:
+            try:
+                if getattr(data, "bl_rdata", None) is not None:
+                    bpy.data.meshes.remove(data, do_unlink=True)
+            except Exception:                               # noqa: BLE001
+                pass
+        self.report({"INFO"}, f"已删掉标记『{name}』")
+        return {"FINISHED"}
+
+
+def _wrap(text, width):
+    """按宽度折行(Blender 的 label 一行一个控件,不折就横着跑出面板)。"""
+    lines = []
+    current = ""
+    for char in str(text):
+        current += char
+        if len(current) >= width:
+            lines.append(current)
+            current = ""
+    if current:
+        lines.append(current)
+    return lines
 
 
 class GK_PT_GodotLook(bpy.types.Panel):
@@ -5326,10 +6157,22 @@ def _draw_tree_list_box(layout, context):
     if not groups:
         box.label(text="还没有节点图", icon="INFO")
         return
+    groups.sort(key=lambda group: (
+        0 if getattr(group, "bl_idname", "") == "GKGameLogicTree"
+        and exporter.logic_tree_scope(group) == "ROLE" else
+        1 if getattr(group, "bl_idname", "") == "GKGameLogicTree" else 2,
+        group.name))
     disabled = 0
+    last_section = ""
     for group in groups:
-        row = box.row(align=True)
         blob = getattr(group, "bl_idname", "")
+        section = ("角色逻辑" if blob == "GKGameLogicTree"
+                   and exporter.logic_tree_scope(group) == "ROLE" else
+                   "关卡逻辑" if blob == "GKGameLogicTree" else "其他图")
+        if section != last_section:
+            box.label(text=section)
+            last_section = section
+        row = box.row(align=True)
         enabled = bool(getattr(group, "gk_enabled", True))
         if not enabled:
             disabled += 1
@@ -5493,7 +6336,7 @@ def _draw_logic_info_box(layout, context):
                        f"{report.get('written', 0)} 个文件)· {report.get('at', '')}",
                   icon="FILE_TICK" if report.get("ok") else "ERROR")
     else:
-        box.label(text="还没导出过 —— 点『导出为 Godot 脚本』", icon="INFO")
+        box.label(text="还没导出过 —— 点『导出到 Godot』", icon="INFO")
 
     # ── 体检(判据在 logic_info.checkup,纯函数)────────────────────
     rows = logic_info.checkup(facts)
@@ -5681,19 +6524,50 @@ def _draw_script_carrier_box(layout, context):
     if not carriers:
         box.label(text="还没有物体挂脚本", icon="ERROR")
         box.label(text="选中角色 -> 『游戏物理』-> 挂游戏逻辑脚本")
-        return
-    if len(carriers) > 1:
+        # ⚠ 这里**不能 return**(第 122 轮踩到):下面那两行"这一关的标记
+        # 现状"是同一盒里的内容。以前这一段后面没有东西,早退没有代价;
+        # 现在早退会让"还没挂脚本"的关卡**看不到出生点有没有建** ——
+        # 而那恰恰是新建关卡时最需要看到的一行(探针实测抓到的)。
+    elif len(carriers) > 1:
         box.label(text=f"⚠ {len(carriers)} 个物体都挂了脚本(会互相覆盖)",
                   icon="ERROR")
+        for obj in carriers[:6]:
+            row = box.row(align=True)
+            row.label(text=obj.name, icon="OBJECT_DATA")
+            op = row.operator("gk.focus_object", text="", icon="VIEWZOOM")
+            op.object_name = obj.name
+        box.label(text="只留一个:选中其它的 -> 取消勾选", icon="INFO")
     else:
         box.label(text=f"脚本挂在这个物体上({len(carriers)} 个)", icon="CHECKMARK")
-    for obj in carriers[:6]:
+        for obj in carriers[:6]:
+            row = box.row(align=True)
+            row.label(text=obj.name, icon="OBJECT_DATA")
+            op = row.operator("gk.focus_object", text="", icon="VIEWZOOM")
+            op.object_name = obj.name
+
+    # ---- 这一关的三个『标记物体』现状(第 122 轮)----------------------
+    # 为什么不单开一个盒子:用户这次投诉的就是"侧栏显示太多"。出生点是
+    # 每关必须有的东西,和"谁挂了脚本"同属**布关时要知道的事实**,
+    # 所以并进这一盒的最后一行 —— 一块也不多占。
+    # 区域环境点 / 关卡父级只报个数(它们的细节在物体属性面板里看)。
+    spawn = marker_spawn_in(context.scene)
+    if spawn is not None:
         row = box.row(align=True)
-        row.label(text=obj.name, icon="OBJECT_DATA")
+        row.label(text=f"出生点: {spawn.name}", icon="ARMATURE_DATA")
         op = row.operator("gk.focus_object", text="", icon="VIEWZOOM")
-        op.object_name = obj.name
-    if len(carriers) > 1:
-        box.label(text="只留一个:选中其它的 -> 取消勾选", icon="INFO")
+        op.object_name = spawn.name
+    else:
+        row = box.row(align=True)
+        row.label(text="本关还没有玩家出生点", icon="ERROR")
+        row.operator("gk.add_marker", text="建", icon="ADD").kind = (
+            markers.KIND_PLAYER_START)
+    zones = [obj for obj in context.scene.objects
+             if marker_kind_of(obj) == markers.KIND_ENV_ZONE]
+    roots = [obj for obj in context.scene.objects
+             if marker_kind_of(obj) == markers.KIND_LEVEL_ROOT]
+    if zones or roots:
+        box.label(text=f"区域环境点 {len(zones)} 个 · 关卡父级 {len(roots)} 个",
+                  icon="OUTLINER_COLLECTION")
 
 
 class GK_OT_FocusTree(bpy.types.Operator):
@@ -5909,7 +6783,7 @@ class GK_OT_ClearCollisionSize(bpy.types.Operator):
 _OPEN_SECTIONS = {}
 
 
-def collapsible_box(layout, key, label, icon="", default_open=True,
+def collapsible_box(layout, key, label, icon="", default_open=False,
                     header_extra=None):
     """画一个可折叠盒子,返回 (盒子布局, 是否展开)。
 
@@ -6003,7 +6877,7 @@ def _draw_export_report(box, report):
       * 进文本块 / 复制文本 / 打开目录 三个入口。
     """
     if not report:
-        box.label(text="还没有导出过 —— 点上面的『导出为 Godot 脚本』导一次",
+        box.label(text="还没有导出过 —— 点上面的『导出到 Godot』导一次",
                   icon="INFO")
         return
     errors, warnings, infos = export_report.counts(report)
@@ -6076,16 +6950,34 @@ class GK_PT_Main(bpy.types.Panel):
         layout = self.layout
         tree = props.current_tree(context)
 
+        row = layout.row(align=True)
+        row.operator("gk.new_logic_tree", text="新建角色逻辑",
+                     icon="OBJECT_DATA").scope = "ROLE"
+        row.operator("gk.new_logic_tree", text="新建关卡逻辑",
+                     icon="NODETREE").scope = "LEVEL"
+        scope = exporter.logic_tree_scope(tree) if tree is not None else ""
+        if tree is not None:
+            row = layout.row(align=True)
+            for value, label in (("ROLE", "角色逻辑"), ("LEVEL", "关卡逻辑")):
+                op = row.operator("gk.set_logic_scope", text=label,
+                                  depress=scope == value)
+                op.tree_name = tree.name
+                op.scope = value
+
+        # ── 快捷行:一个导出按钮(第 122 轮合并)────────────────────────
+        # 原来这里是『导出』+『资产』两个按钮 —— 用户第 122 轮要求
+        # "把导出到godot的脚本与模型和材质整合成导出到godot",所以
+        # 两个并一个(gk.export_godot = 脚本 + 模型 + 材质 + 场景)。
+        row = layout.row(align=True)
+        row.operator("gk.export_godot", text="导出到 Godot", icon="FILE_TICK")
+        row.operator("gk.open_godot", text="运行", icon="PLAY").editor = False
+
         # ---- 空节点树时,先教怎么开始 ----
         # 47 个节点摆在那里但"该从哪开始"完全看不出来,这是新用户最大的坎。
         # 与其写一堆说明文字,不如直接给一条能跑的链路让他照着改。
         if tree is not None and len(tree.nodes) == 0:
             box = layout.box()
-            box.label(text="这棵节点树还是空的", icon="INFO")
-            col = box.column(align=True)
-            col.label(text="怎么用:先放一个『事件』节点当入口,")
-            col.label(text="再用金色『执行』线串起后面要做的事。")
-            col.label(text="接完线后点『导出为 Godot 脚本』。")
+            box.label(text="空节点图", icon="INFO")
             row = box.row(align=True)
             row.scale_y = 1.4
             row.operator("gk.starter_graph", text="生成示例节点图", icon="ADD")
@@ -6095,35 +6987,139 @@ class GK_PT_Main(bpy.types.Panel):
         # ---- 项目绑定(最上面,因为它是所有导出的落点)----
         _draw_project_box(layout, context)
 
-        # ---- 打包设置(第六十八轮:勾平台 + 一键打出多个平台)--------
-        # 单开一盒:勾平台跟"项目建没建"没关系(先想好发哪些平台很正常),
-        # 塞进『Godot 项目』盒里会在"还没保存 / 还没建项目"时整块看不到。
-        _draw_packaging_box(layout, context)
+        _draw_tree_list_box(layout, context)
+        _draw_variable_box(layout, context)
+        _draw_function_box(layout, context)
+        more, opened = collapsible_box(layout, "more_tools", "更多工具",
+                                       "TOOL_SETTINGS")
+        if not opened:
+            return
+        layout = more
+
+        # ---- 世界设置(第一百二十一轮:像虚幻的 Default Map / Pawn)----
+        # 默认地图 = F5 从哪开;默认角色 = 整局只生成一次的那个角色
+        # (它的子对象 —— 相机 / 手电筒 / 库存 —— 全都跟着它跨关卡活下来)。
+        #
+        # ── 第 122 轮:user 问"世界设置的默认角色好像没什么作用" ──────────
+        # 查下来它**没有坏**,是**没被说清楚 + 没被用起来**:
+        #   * `default_player` 是整局唯一那个角色(导出成 scenes/GKDefaultPlayer.tscn,
+        #     由 autoload `GkWorld` 在启动时实例化一次,切关卡时只挪位置);
+        #   * 关卡里的**出生点**决定这个角色每关落在哪 —— 它现在是
+        #     3D 视口里的一个线框物体『玩家出生点』(物体属性里建),
+        #     见 `markers.py` 与 `GK_PT_Marker` 面板。
+        # 所以这里做两件事:
+        #   ① 把"没选默认角色 = 出生点也不会生效"这条因果**写在脸上**
+        #      (原来只有选了才显示出生点,没选时一片空白,看着就像没功能);
+        #   ② 直接给"建出生点"的按钮,不用让用户去翻物体属性。
+        if scope != "ROLE":
+            # ⚠ `settings` 在**这里**就要取一次(第 124 轮被面板门禁抓到):
+            #    下面"上帝摄像机"那一行要用它,而模块级那次赋值在**更后面**
+            #    (导出盒那段)—— 直接引用会 `UnboundLocalError: cannot access
+            #    local variable 'settings'`(Python 因为后面有赋值,就把它当
+            #    局部变量,函数一路走到这里时还没绑上)。整个侧栏会静默消失。
+            settings = getattr(context.scene, "gk_settings", None)
+            box, opened = collapsible_box(layout, "world", "世界设置", "HOME")
+            if opened:
+                world = world_settings()
+                box.prop(world, "default_map")
+                box.prop(world, "default_player")
+                chosen = getattr(world, "default_player", None)
+                if chosen is None:
+                    # ── 没选的时候到底会发生什么,以前这里一句话都没有 ────
+                    # 用户第 122 轮的原话是"世界设置的默认角色好像没什么
+                    # 作用" —— 根因就是**选了才有用、没选时一片空白**,
+                    # 而且"选了会发生什么"从界面上完全看不出来。
+                    # 现在把因果写在脸上,并给一个"帮我认出来"的按钮。
+                    hint = _detect_default_player()
+                    if hint is not None:
+                        box.label(text=f"自动识别到角色: {hint.name}", icon="CHECKMARK")
+                        box.label(text="放一个『玩家出生点』标记才会启用跨关卡角色",
+                                  icon="INFO")
+                        box.operator("gk.infer_default_player",
+                                     text="用它当默认角色", icon="LINKED")
+                    else:
+                        box.label(text="没选 = 每个关卡各生成一个角色、切关重建",
+                                  icon="INFO")
+                        box.label(text="选了才会跨关卡保留(相机/库存都跟着走)",
+                                  icon="INFO")
+                        box.operator("gk.add_marker", text="先建一个玩家出生点",
+                                     icon="ADD").kind = markers.KIND_PLAYER_START
+                else:
+                    box.label(text=f"整局只生成一次: {chosen.name}", icon="LINKED")
+                    box.label(text="切关卡只挪位置,子对象(相机等)全都留着",
+                              icon="CHECKMARK")
+                    _draw_spawn_hint(box, context)
+
+                # ── 上帝摄像机(第 124 轮从『导出到 Godot』盒搬来)────────
+                # 用户原话:"上帝机应该在世界设置那"。
+                # 它确实属于**世界规则**:决定"这一局里你能不能用 Tab 开一台
+                # 自由飞行相机满地看"(调试/验收用),和"默认地图 / 默认角色"
+                # 是一类东西;而『导出到 Godot』那一盒只该管"这次导出导什么"。
+                box.separator()
+                box.label(text="调试用相机", icon="CAMERA_DATA")
+                if settings is None:
+                    # 拿不到场景设置(极早期 / 重载中)—— 画一行说明就好,
+                    # 不要让 `prop(None, ...)` 抛出去把整块侧栏带走
+                    box.label(text="拿不到场景设置(先打开一个场景)", icon="ERROR")
+                else:
+                    god_row = box.row(align=True)
+                    god_row.prop(settings, "god_camera", toggle=True,
+                                 icon="CAMERA_DATA")
+                    if bool(getattr(settings, "god_camera", False)):
+                        box.label(text="游戏里按 Tab 切过去:WASD 平移 / 空格上升 / "
+                                       "Shift 下降 / 鼠标转视角 / 滚轮缩放 / T 时停",
+                                  icon="INFO")
+                        box.label(text="按 Tab 切回玩家相机(暂停时也能切)", icon="DOT")
+                    else:
+                        box.label(text="关着 = 这一关不导上帝机(产物里没有它)",
+                                  icon="INFO")
+
+                # ---- 怎么看模型:指路到 **Blender 原生**的上帝机(第 128 轮)----
+                # 用户原话:"我发现了 blender 原生的上帝机了...按 SHIFT+~
+                # 就可以进入了，你可以把现在做的这个给删了。"
+                # 我自己写的那套已经删掉(理由见文件上方 `_VIEWPORT_FLY_REMOVED`
+                # 那一段:原生不但有,而且 `偏好设置 → 视图导航 → 飞行 & 行走`
+                # 里速度/重力都能调,我当初"原生零属性"的结论是错的)。
+                # 这里只留**一句指路** —— 比一个按钮更有用:用户记住的是键,
+                # 而不是"插件侧栏里那个按钮在哪"。
+                box.separator()
+                box.label(text="看模型:Blender 原生飞行导航 Shift + `",
+                          icon="VIEW3D")
+                box.label(text="鼠标转视角 · WASD 平移 · Q/E 升降 · 左键停留", icon="INFO")
+                box.label(text="速度/重力在 『编辑 → 偏好设置 → 视图导航』 里调",
+                          icon="DOT")
+
+        # ---- 打包设置(第六十八轮)已搬走(第 122 轮)-------------------
+        # 用户原话:"打包设置移动到 blender 原生的导出里"。
+        # 现在在 `文件 → 导出 → 打包游戏(GK)`(见 GK_MT_ExportPackage)。
+        # 搬走的理由不只是"侧栏太长":打包是**发布动作**,和"在 Blender 里
+        # 导出资源"不是同一件事 —— 它和 Blender 自己的『导出』是同一个心理
+        # 位置,放在那儿才找得到。
 
         # ---- 节点图总览 + 参与导出开关(用户 2026-10-03 第五轮)--------
         # 用户原话:"可以在场景集合那里添加节点图显示,可隐藏,可失效的场景功能"。
         # 大纲视图里加不了自定义条目,但**侧栏能列全**:所有逻辑图 / 动画图
         # 一行一个,带『参与导出』勾选 —— 关掉就是"这张图失效"(节点和连线
         # 都留着,随时能开回来)。点名字直接跳进那张图。
-        _draw_tree_list_box(layout, context)
 
         # ---- 预设(用户 2026-10-04 第六条:一键生成第三人称角色)----
-        _draw_preset_box(layout, context)
+        if scope != "LEVEL":
+            _draw_preset_box(layout, context)
 
         # ---- 谁挂了脚本(用户第五轮:"不知道哪个搭载了脚本,容易重复")----
-        _draw_script_carrier_box(layout, context)
+        if scope != "LEVEL":
+            _draw_script_carrier_box(layout, context)
 
         # ---- 场景资产(用户 2026-10-05:"游戏静态资产设计")----
-        _draw_asset_box(layout, context)
+        if scope != "ROLE":
+            _draw_asset_box(layout, context)
 
         # ---- 对外端口(第 21 轮:"一个游戏逻辑最后应该输出布尔变量")----
         _draw_logic_port_box(layout, context)
 
         # ---- 变量集中视图(用户 2026-10-04:"图里有哪些变量?谁读谁写?"）----
-        _draw_variable_box(layout, context)
 
         # ---- 函数(用户 2026-10-05 第十七轮:"查看函数,自定义函数")----
-        _draw_function_box(layout, context)
 
         # ---- 分组框(第六十二轮:"节点图一大就没法整理")----
         _draw_group_box(layout, context)
@@ -6133,14 +7129,21 @@ class GK_PT_Main(bpy.types.Panel):
         # 默认收起 —— 它是"要看才点开"的东西,不常驻占地方。
         _draw_logic_info_box(layout, context)
 
-        # ---- 导出脚本 ----
+        # ---- 导出到 Godot(第 122 轮:两块并成一块)----------------------
+        # 用户原话:"把导出到godot的脚本与模型和材质整合成导出到godot"。
+        # 以前是两个盒子:『导出为 Godot 脚本』(逻辑 + .tscn + 工程骨架)和
+        # 『导出模型和材质』(glb + 材质 + 贴图)。可它们**永远要一起点** ——
+        # 只导脚本,Godot 里模型是旧的;只导模型,逻辑是旧的。拆两块除了
+        # 让人多点一次、还多一次"忘了点另一半"的机会,没有任何好处。
+        # 现在一个按钮把两套都跑完(见 operator_io 的 gk.export_godot)。
         settings = getattr(context.scene, "gk_settings", None)
-        box, opened = collapsible_box(layout, "export_script",
-                                      "导出为 Godot 脚本", "EXPORT")
+        box, opened = collapsible_box(layout, "export_godot",
+                                      "导出到 Godot", "EXPORT",
+                                      default_open=True)
         if opened:
             row = box.row(align=True)
-            row.scale_y = 1.4
-            row.operator("gk.export_script", icon="FILE_TICK")
+            row.scale_y = 1.5
+            row.operator("gk.export_godot", text="导出到 Godot", icon="EXPORT")
             row.operator("gk.preview_script", text="", icon="HIDE_OFF")
 
             if settings is not None:
@@ -6148,94 +7151,64 @@ class GK_PT_Main(bpy.types.Panel):
                 row = col.row(align=True)
                 row.prop(settings, "write_scene", toggle=True)
                 row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
+                box.label(text="逻辑 + 模型 + 材质 + 场景一次导完", icon="CHECKMARK")
                 # ── 这里的四个开关第四十二轮搬走了 ──────────────────────
                 # 预览碰撞体 / 运行日志 / 调试面板 / 卡通材质(含跟随光照)
                 # 全部搬进『游戏显示』设置图(用户:"整合如物理显示等的排列,
                 # 不然不好找")—— 侧栏只留导出流程本身的东西。
-                # 上帝摄像机(用户 2026-10-04:把"主相机"那一行改成这个开关)。
-                # 原来这里是"主相机"下拉 + 拾取按钮 —— 用户的原话是
-                # "改成其他要用的或者删了";改成常驻一台上帝摄像机,
-                # 运行时按 Tab 在玩家相机和它之间切。
-                cam_row = box.row(align=True)
-                cam_row.prop(settings, "god_camera", toggle=True,
-                             icon="CAMERA_DATA")
+                #
+                # ── 上帝摄像机也搬走了(第 124 轮)────────────────────────
+                # 用户原话:"上帝机应该在世界设置那"。
+                # 判据:它**不是**"导出流程的一部分",而是"这一局里玩家能开
+                # 什么视角"—— 和『默认地图 / 默认角色』同属**世界规则**,
+                # 所以搬进『世界设置』盒(默认收起,和那两项在一起)。
+                # 运行时还是按 Tab 切;这里只留一句"当前相机是谁"的提示。
                 cameras = [o.name for o in context.scene.objects
                            if getattr(o, "type", "") == "CAMERA"]
-                # 说明压成一行(第五十五轮):原来是 3 行的按键清单,
-                # 但按键提示在 README 和示例关卡里都有 —— 侧栏这里没必要重复。
-                if getattr(settings, "god_camera", False):
-                    box.label(text="运行时按 Tab 切回来(WASD+空格/Shift+鼠标)",
-                              icon="INFO")
-                elif not cameras:
-                    box.label(text="场景里没相机 —— 运行时会自动造一台",
-                              icon="INFO")
+                if not cameras:
+                    box.label(text="场景里没相机 —— 运行时会自动造一台", icon="INFO")
                 else:
                     box.label(text=f"自动:跟着视口当前相机({cameras[0]})",
                               icon="CHECKMARK")
 
-                # ── 寻路 / 导航网格(第三十四轮;第三十六轮加 2D / 重烤)──
-                # 打开 = 导出的场景里多一块运行时烤的导航网格,
-                # 『移动_寻路』的角色就能绕开墙 / 石头走到目标。
-                nav_row = box.row(align=True)
-                nav_row.prop(settings, "nav_enabled", toggle=True,
-                             icon="TRACKER")
-                # 说明压成一行(第五十五轮):原来是 3~5 行。2D 那条"按障碍物烤"
-                # 是**最容易踩的坑**(把整块地板烤成不可走区),所以留一行短的。
-                if getattr(settings, "nav_enabled", False):
-                    nums = box.row(align=True)
-                    nums.prop(settings, "nav_agent_radius", text="半径")
-                    if str(getattr(settings, "dimension", "3")) != "2":
-                        nums.prop(settings, "nav_agent_height", text="高度")
-                        nums.prop(settings, "nav_max_slope", text="爬坡°")
-                        box.label(text="按静态碰撞体烤;挪了东西用『移动_重烤导航』",
-                                  icon="INFO")
-                    else:
-                        box.label(text="2D 按障碍物烤:地板不要加碰撞体", icon="ERROR")
-                else:
-                    box.label(text="关着:『移动_寻路』退化成直线走", icon="INFO")
+                # ── 寻路 / 开局 BGM 都搬走了(第 122 轮)──────────────────
+                # 用户原话:"把寻路和开局BGM移动到游戏逻辑右键菜单的AI里
+                # 与游戏音乐的右键菜单中"。
+                #   寻路   -> AI 图右键菜单『寻路(GK)』(GK_MT_NavSettings)
+                #   开局BGM -> 音乐图右键菜单『音乐(GK)』(GK_MT_MusicSettings)
+                # 判据:这两个都是**每关一条的规则**(烤不烤导航网格 / 开局放
+                # 哪首),不是"导出流程"的一部分 —— 侧栏这块本来就挤,它们
+                # 又只在建关那一次要看,常驻纯属占地方。
+                #
+                # ── 打包设置也搬走了(第 122 轮)──────────────────────────
+                # 用户原话:"打包设置移动到 blender 原生的导出里" ->
+                # `文件 → 导出 → 打包游戏(GK)`(GK_MT_ExportPackage)。
+                # 打包是**发布动作**,和"在 Blender 里导资源"不是一回事,
+                # 放在 Blender 自己的『导出』菜单里才找得到。
 
-                # ── 开局 BGM(第七十七轮,C 组『场景规则』)────────────────
-                # 选一首 = 开局自动播(循环),音频会被复制进项目的 audio/。
-                # 落的点是**环境脚本**(每场景一份)—— 所以"每关一首"这件事
-                # 天然跟着 Blender 场景走,切场景卡上的值也跟着切。
-                bgm_row = box.row(align=True)
-                bgm_row.prop(settings, "scene_bgm", text="开局BGM")
-                bgm_row.prop(settings, "scene_bgm_volume", text="dB")
-                raw_bgm = str(getattr(settings, "scene_bgm", "") or "").strip()
-                if not raw_bgm:
-                    box.label(text="留空 = 开局不放音乐(想自己控就接『音效_音乐』)",
-                              icon="INFO")
-                elif not asset_export.scene_bgm_path(context.scene):
-                    # 挑了 wav / ogg / mp3 之外的东西 —— 那个导进 Godot 也
-                    # load 不出来,这里直接说清楚
-                    box.label(text="选的不是音频(wav / ogg / mp3)", icon="ERROR")
+                # ── 导出瘦身(第一百零六轮 B)搬来这里(第 122 轮)───────
+                # 原来在下面那个收起状态的『导出设置』盒里。它们直接影响
+                # 这次导出的产物体积,放在"导出"这一块比藏在折叠盒里合理。
+                slim = box.row(align=True)
+                slim.prop(settings, "gk_skip_morph", text="不导形态键",
+                          toggle=True)
+                slim.prop(settings, "gk_skip_tangents", text="不导切线",
+                          toggle=True)
+                box.label(text="用了形态键 / 法线贴图的模型别勾", icon="INFO")
 
-        # ---- 模型导出:把 Blender 的网格 / 材质 / 贴图一起带进 Godot ----
-        #
-        # 材质跟着模型一起导出:没设材质就自动给默认白色。
-        # 以前这里拆成"导出模型"和"导出材质"两个按钮,但用户实际
-        # 永远是两个一起点 —— 拆开只是多一步操作,所以合并成一个。
-        box, opened = collapsible_box(layout, "export_assets",
-                                      "导出模型和材质", "MESH_DATA")
-        if opened:
-            row = box.row(align=True)
-            row.scale_y = 1.4
-            row.operator("gk.export_assets", icon="EXPORT")
-            # 三条说明压成一条(第五十五轮):后两条("没材质用白色"
-            # "描边请在 Godot 里加")属于**看一眼就知道**的事,删掉。
-            box.label(text="选中网格 = 只导选中的；不选 = 导出全部", icon="INFO")
-
-            # ── 上次导出报告(用户 2026-10-05 第二十三轮:导出报告可视化)──
-            # 第五十五轮("侧栏显示的信息太多了"):**正文搬进文本块**,
-            # 用文本编辑器读(能滚动/复制/搜索);侧栏只留摘要 + 交互按钮。
-            # ⚠ 出错时的『定位』按钮**留在侧栏** —— 点了能跳到出问题的那个
-            # 节点,这是文本块替代不了的(文本块里的字点不动)。
-            report = export_report.load(context.scene)
-            report_box, report_open = collapsible_box(
-                layout, "export_report", _report_title(report), "TEXT",
-                default_open=bool(report))
-            if report_open:
-                _draw_export_report(report_box, report)
+        # ---- 上次导出报告(用户 2026-10-05 第二十三轮:导出报告可视化)--
+        # 第五十五轮("侧栏显示的信息太多了"):**正文搬进文本块**,
+        # 用文本编辑器读(能滚动/复制/搜索);侧栏只留摘要 + 交互按钮。
+        # ⚠ 出错时的『定位』按钮**留在侧栏** —— 点了能跳到出问题的那个
+        # 节点,这是文本块替代不了的(文本块里的字点不动)。
+        # 第 122 轮:两块并成一块后它单独成盒 —— 它是**导出结果**,
+        # 两个导出入口(统一导出 / 老的脚本导出)都会写它。
+        report = export_report.load(context.scene)
+        report_box, report_open = collapsible_box(
+            layout, "export_report", _report_title(report), "TEXT",
+            default_open=bool(report))
+        if report_open:
+            _draw_export_report(report_box, report)
 
         # ---- (原『节点图』统计块第五十五轮并进『节点图总览』)----------
         # 它只显示"节点总数 / 事件 / 动作",单开一块太占地方。
@@ -6278,14 +7251,8 @@ class GK_PT_Main(bpy.types.Panel):
                 row = col.row(align=True)
                 row.prop(settings, "export_tunables", toggle=True)
                 row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
-                # ── 导出瘦身(第一百零六轮 B)──────────────────────────
-                # 侧栏这个盒子已经很挤,两个开关挤在**同一行**里;
-                # "实测各能省多少"放 tooltip(属性的 description),不占地方。
-                # 默认都不勾 = 一个字都不省,老工程导出结果完全不变。
-                row = col.row(align=True)
-                row.prop(settings, "gk_skip_morph", text="不导形态键", toggle=True)
-                row.prop(settings, "gk_skip_tangents", text="不导切线", toggle=True)
-                col.label(text="用了形态键 / 法线贴图的模型别勾", icon="INFO")
+                # ── 导出瘦身(第一百零六轮 B)第 122 轮搬进『导出到 Godot』盒
+                # 那两个开关直接影响这次导出的产物体积,跟着导出按钮走更合理。
 
         # ---- 出问题了? + 项目顾问(第五十五轮合成一块)----------------
         # 两者本来就是一对:一个把诊断**导出成文件**,一个把诊断
@@ -6440,7 +7407,10 @@ def _draw_project_box(layout, context):
     项目还没建出来时不显示它(没东西可打开)。所以未建状态下必须
     把下一步说清楚,不能只放一个孤零零的按钮。
     """
-    box, opened = collapsible_box(layout, "project", "Godot 项目", "FILE_FOLDER")
+    directory, _reason = project.resolve(context.scene, adopt=False)
+    needs_project = not bpy.data.filepath or not project.is_project(directory)
+    box, opened = collapsible_box(layout, "project", "Godot 项目",
+                                  "FILE_FOLDER", default_open=needs_project)
     if not opened:
         return
 
@@ -6532,48 +7502,82 @@ def _draw_project_box(layout, context):
                          icon="CHECKMARK")
 
 
-def _draw_packaging_box(layout, context):
-    """『打包设置』(第六十八轮)—— 勾平台 + 一键逐个平台打包。
+# `_draw_packaging_box` 在**第 122 轮删掉了**(函数体整段移除)。
+#
+# 原样保留用户那句话,免得以后有人又把它搬回侧栏:
+#   用户原话:"打包设置移动到 blender 原生的导出里"。
+# 现在的位置:`文件 → 导出 → 打包游戏(GK)`(ui.GK_MT_ExportPackage)。
+#
+# 为什么这个搬法是对的(不只是"侧栏太长"):打包 = **发布**,它跟
+# "在 Blender 里导资源"不是同一件事,却和 Blender 自己的『导出』
+# 在同一个心理位置 —— 用户找"导出一个能发给别人的东西"时,手是往
+# `文件 → 导出` 走的。侧栏那个盒子他得先想起来才会去翻。
+#
+# ⚠ 平台勾选仍然写在 `scene.gk_settings.package_*` 上(菜单里直接
+# `prop(...)`,改完立刻生效)—— **没有**另做一份菜单专用设置,否则
+# "菜单里勾的和侧栏里存的对不上"这类 bug 迟早出现。
 
-    用户原话:"在侧边栏添加打包为 .exe,.apk 等的打包设置"。
 
-    ── 为什么**不塞进『Godot 项目』盒** ──────────────────────────────
-    那个盒在"`.blend` 还没保存 / 项目还没建"时会早退,而"这次要发哪些平台"
-    跟项目建没建**没关系**(先想好目标平台很正常)。所以单开一盒,一直可见。
+class GK_MT_ExportPackage(bpy.types.Menu):
+    """`文件 → 导出 → 打包游戏（GK）`(第 122 轮)。
 
-    ── 为什么这里不查导出模板 ──────────────────────────────────────
-    查一次要跑 `godot --version`(起进程),而 draw() 会被反复调用 ——
-    侧栏会卡住。模板状态改成**打包时逐个平台报**(见 operator_io 那个算子)。
+    ── 为什么是**子菜单**而不是直接铺在导出菜单里 ──────────────────
+    `文件 → 导出` 里已经有一串官方导出器(Olembic / glTF / FBX / …),
+    再往里塞 5 个平台开关 + 3 个文本框会把整张菜单撑得比屏幕还长,
+    而且那些开关和"导出成 .obj"完全不是一类东西。收进一个子菜单:
+    顶层只多一行,点进去才是"打包"这一件事的全部设置。
+
+    ── 为什么参数用 `prop(settings, ...)` 而不是自己记一份 ─────────
+    这些值本来就存在**场景**上(`GKSceneSettings.package_*`),菜单里改
+    立刻生效、和 `gk.export_release` 读到的是同一份。另存一份的话,
+    "菜单里勾的"和"实际打包的"就会对不上 —— 那类 bug 最难查。
+
+    ── 菜单里不查导出模板 ─────────────────────────────────────────
+    查一次要起 `godot --version` 进程;菜单 draw 可能被反复调用,
+    卡住整张菜单。模板状态由打包算子**逐个平台**报(它本来就这么做)。
     """
-    box, opened = collapsible_box(layout, "packaging", "打包设置", "EXPORT")
-    if not opened:
-        return
-    settings = getattr(context.scene, "gk_settings", None)
-    if settings is None:
-        box.label(text="拿不到场景设置(先打开一个场景)", icon="ERROR")
-        return
-    box.label(text="打哪几个平台(可多选):", icon="INFO")
-    for key in packaging.PLATFORM_ORDER:
-        row = box.row(align=True)
-        row.prop(settings, f"package_{key}",
-                 text=packaging.PLATFORMS[key]["label"])
-        if not packaging.platform_buildable(key):
-            row.label(text="只能在 macOS 上导", icon="ERROR")
-    row = box.row(align=True)
-    row.prop(settings, "package_app_name", text="应用名")
-    row = box.row(align=True)
-    row.prop(settings, "package_version", text="版本")
-    row = box.row(align=True)
-    row.prop(settings, "package_android_id", text="安卓包名")
-    row = box.row(align=True)
-    row.scale_y = 1.4
-    row.operator("gk.export_release", text="开始打包", icon="EXPORT")
-    released = ops.LAST_RELEASE.get("output", "")
-    if released:
-        row = box.row(align=True)
-        row.label(text=f"上次打包: {os.path.basename(released)}", icon="CHECKMARK")
-        row.operator("gk.open_release_folder", text="", icon="FILE_FOLDER")
-    box.label(text="缺哪个平台的预设会自动补上(写前备份)", icon="INFO")
+
+    bl_idname = "GK_MT_ExportPackage"
+    bl_label = "打包游戏（GK）"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "gk_settings", None) if scene else None
+        if settings is None:
+            layout.label(text="先打开一个场景才能打包", icon="ERROR")
+            return
+
+        layout.label(text="打哪几个平台(可多选):", icon="INFO")
+        # 「这台机器现在能打哪几个」只有一个判据:`packaging.platform_buildable`
+        # —— 菜单和打包算子读同一份,不在这里另抄一遍。
+        for key in packaging.PLATFORM_ORDER:
+            row = layout.row(align=True)
+            row.prop(settings, f"package_{key}",
+                     text=packaging.platform_label(key),
+                     toggle=True)
+            if not packaging.platform_buildable(key):
+                row.label(text="只能在 macOS 上导", icon="ERROR")
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.prop(settings, "package_app_name", text="应用名")
+        row = layout.row(align=True)
+        row.prop(settings, "package_version", text="版本")
+        row = layout.row(align=True)
+        row.prop(settings, "package_android_id", text="安卓包名")
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("gk.export_release", text="开始打包", icon="EXPORT")
+        released = ops.LAST_RELEASE.get("output", "")
+        if released:
+            row = layout.row(align=True)
+            row.label(text=f"上次打包: {os.path.basename(released)}",
+                      icon="CHECKMARK")
+            row.operator("gk.open_release_folder", text="", icon="FILE_FOLDER")
+        layout.label(text="缺哪个平台的预设会自动补上(写前备份)", icon="INFO")
 
 
 def _draw_node_menu_contents(layout, context, nested=False):
@@ -6603,7 +7607,8 @@ def _draw_node_menu_contents(layout, context, nested=False):
     # ── flat 形态 ──────────────────────────────────────────────────
     # 顶部四项(搜索 / 常用 / 最近使用 / 自动接续提示)收进一个子菜单
     # (用户 2026-10-04:"右键菜单的那几个也可以折叠起来")。
-    layout.menu(_menu_name("搜索与常用"), text="搜索与常用", icon="VIEWZOOM")
+    layout.operator("gk.find_node", text="搜索节点…", icon="VIEWZOOM")
+    layout.menu(_menu_name("搜索与常用"), text="常用与最近", icon="SOLO_ON")
 
     # 全部分类。大类自带二级子菜单(见 props.node_menu_tree)
     #
@@ -6652,6 +7657,430 @@ def _draw_add_menu(self, context):
     _draw_node_menu_contents(self.layout, context, nested=True)
 
 
+# ==========================================================================
+# 右键菜单里的『寻路』与『开局 BGM』
+# ==========================================================================
+# 用户原话:"把寻路和开局BGM移动到游戏逻辑右键菜单的AI里与游戏音乐的
+# 右键菜单中"。
+#
+# ── 为什么收成子菜单,而不是在右键菜单里直接铺开 ──────────────────────
+# 右键菜单(_draw_context_menu)的主体是"加节点":搜索 / 常用与最近 /
+# 七个节点大类 / 节点工具。寻路和 BGM 各有 4 个控件 + 一两行说明,
+# 直接铺进去会把"加节点"挤到看不见。收进子菜单后右键菜单只多一行,
+# 点进去则是**全部**设置 —— 不是只留一个开关:侧栏『导出为 Godot 脚本』
+# 盒里那两块已经删掉(用户:"侧栏显示的信息太多了"),这里是唯一入口,
+# 少任何一项用户就再没地方改了。
+#
+# ── 为什么入口分别落在 AI 图 / 音乐图 ────────────────────────────────
+#   寻路 = 『移动_寻路』节点的行为参数 -> 跟 AI 图走;
+#   BGM  = "每关一首"的场景规则(值落在每场景一份的环境脚本里)
+#          -> 跟『游戏音乐』设置图走。
+# 为了顺手,寻路在**别的树**里也放一份:用户在游戏逻辑图里右键时也能
+# 想起来去开导航网格(它本来就是场景级设置)。BGM 反过来**只在音乐图**
+# 里出现 —— 它是场景规则,出现在玩法图/资产图里会让人以为"这张图管音乐"。
+class GK_MT_NavSettings(bpy.types.Menu):
+    """寻路 / 导航网格的**全部**设置(右键菜单的子菜单)。
+
+    ⚠ 内容要和原来侧栏那块一一对应,不能只留一个 nav_enabled:
+      侧栏那块删掉之后,这里是改这些值的唯一入口。
+    """
+
+    bl_idname = "GK_MT_NAV_SETTINGS"
+    bl_label = "寻路（GK）"
+
+    def draw(self, context):
+        layout = self.layout
+        # 菜单可能在**没有场景**的上下文里被画到(理论上),这时画一句灰字
+        # 就行 —— 菜单 draw 里抛异常会让整个右键菜单消失,比少一项严重。
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "gk_settings", None)
+        if settings is None:
+            layout.label(text="先打开一个场景", icon="INFO")
+            return
+
+        layout.prop(settings, "nav_enabled", toggle=True, icon="TRACKER")
+        if getattr(settings, "nav_enabled", False):
+            nums = layout.row(align=True)
+            nums.prop(settings, "nav_agent_radius", text="半径")
+            nums.prop(settings, "nav_agent_height", text="高度")
+            nums.prop(settings, "nav_max_slope", text="爬坡°")
+            # 说明压成一行(和侧栏当时一样)。2D 那条"按障碍物烤"是**最容易
+            # 踩的坑**(把整块地板烤成不可走区),所以它给 ERROR,别的给 INFO。
+            if str(getattr(settings, "dimension", "3")) == "2":
+                layout.label(text="2D 按障碍物烤:地板不要加碰撞体", icon="ERROR")
+            else:
+                layout.label(text="按静态碰撞体烤;挪了东西用『移动_重烤导航』",
+                             icon="INFO")
+        else:
+            layout.label(text="关着:『移动_寻路』退化成直线走", icon="INFO")
+
+        # ── AI 视线遮挡(第一百二十六轮:用户第 1 条"AI 遮挡射线")──────────
+        # 用户原话:"1. AI 遮挡射线"。
+        # 放在这里(而不是新建一个盒子/侧栏)的理由:它和寻路是**同一个
+        # 性质** —— "这一关的墙挡不挡路 / 挡不挡视线"都是关卡级事实,共用
+        # 一个入口最省地方(用户明确嫌侧栏长)。
+        # 值挂在 `scene.gk_settings` 上,默认**开**(用户诉求就是"要能挡")。
+        layout.separator()
+        layout.prop(settings, "ai_sight_occluded", toggle=True, icon="HIDE_OFF")
+        if getattr(settings, "ai_sight_occluded", True):
+            layout.label(text="视线被墙挡住就看不见(眼 1.4m → 胸口 1.0m)", icon="INFO")
+        else:
+            layout.label(text="关着:隔墙也能看见(只看距离/视野角/躲藏区)", icon="ERROR")
+
+        layout.separator()
+        layout.operator("gk.open_ai_tree", text="打开 AI 设置图", icon="NODETREE")
+
+
+class GK_MT_MusicSettings(bpy.types.Menu):
+    """开局 BGM 的**全部**设置(右键菜单的子菜单,只在『游戏音乐』图里出现)。"""
+
+    bl_idname = "GK_MT_MUSIC_SETTINGS"
+    bl_label = "音乐（GK）"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "gk_settings", None)
+        if settings is None:
+            layout.label(text="先打开一个场景", icon="INFO")
+            return
+
+        row = layout.row(align=True)
+        row.prop(settings, "scene_bgm", text="开局BGM")
+        row.prop(settings, "scene_bgm_volume", text="dB")
+        layout.prop(settings, "scene_bgm_loop", text="循环播放")
+        layout.prop(settings, "scene_bgm_bus", text="总线")
+
+        # 判据和侧栏当时**一字不差**:留空 = 合法(不播);填了但
+        # asset_export.scene_bgm_path() 拿不到路径 = 挑的不是音频
+        # (那个导进 Godot 也 load 不出来,所以直接说清楚)。
+        raw_bgm = str(getattr(settings, "scene_bgm", "") or "").strip()
+        if not raw_bgm:
+            layout.label(text="留空 = 开局不放音乐(想自己控就接『音效_音乐』)",
+                         icon="INFO")
+        elif not asset_export.scene_bgm_path(scene):
+            layout.label(text="选的不是音频(wav / ogg / mp3)", icon="ERROR")
+
+        layout.separator()
+        layout.operator("gk.open_music_tree", text="打开音乐设置图", icon="NODETREE")
+
+
+class GK_MT_EnvPresets(bpy.types.Menu):
+    """右键菜单:`环境预设(GK)` —— 一键把某一档内置氛围套到**当前场景**。
+
+    ── 第 124 轮:为什么把它放进右键菜单(用户原话)──────────────────
+    "可以在环境预设库的右键菜单里加点什么,比如恐怖环境。卡通环境等。"
+
+    设计上分两段,因为这两类预设的**意图完全不同**:
+      * **卡通二次元**三档(日间 / 黄昏 / 夜晚)= "我要动画赛璐璐观感";
+      * **氛围**四档(恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜)= "我要某段气氛"。
+    以前它们混在一个下拉里,名字还都很短(卡通日间 vs 明亮白天),
+    用户得挨个试才知道区别 —— 这里用**两个子菜单**把意图摆到台面上。
+
+    ⚠ 点一下 = **立刻改当前场景的设置**(不是"存起来以后用"):
+      走的是 `gk.env_preset_apply` 同一条路,所以值会写进
+      `scene.gk_settings`,导出立刻生效;想反悔用 Ctrl+Z 或再点一次别的。
+    """
+
+    bl_idname = "GK_MT_ENV_PRESETS"
+    bl_label = "环境预设（GK）"
+
+    def _apply(self, layout, names, icon):
+        from .nodes._common import ENV_PRESET_BUILTINS
+        settings = getattr(getattr(self, "_context_scene", None), "gk_settings", None)
+        for index, name in enumerate(names):
+            values = ENV_PRESET_BUILTINS.get(name, {})
+            hint = ("背景 %s · 环境光 %.2f · 雾 %s"
+                    % ("天空" if values.get("bg_mode") == 2 else "纯色",
+                       float(values.get("amb_e", 0.0)),
+                       "开" if values.get("fog") else "关"))
+            op = layout.operator("gk.env_preset_apply_builtin", text=name,
+                                 icon=icon)
+            op.preset_name = name
+
+    def draw(self, context):
+        layout = self.layout
+        self._context_scene = getattr(context, "scene", None)
+        if getattr(self._context_scene, "gk_settings", None) is None:
+            layout.label(text="先打开一个场景", icon="ERROR")
+            return
+        from .nodes._common import ENV_PRESET_ANIME, ENV_PRESET_HORROR
+        layout.label(text="套到当前场景(立刻生效):", icon="INFO")
+        sub = layout.row()
+        sub.menu(GK_MT_EnvPresetsAnime.bl_idname)
+        sub = layout.row()
+        sub.menu(GK_MT_EnvPresetsMood.bl_idname)
+        layout.separator()
+        op = layout.operator("gk.open_display_tree", text="打开『游戏环境设置』卡",
+                             icon="NODETREE")
+        _ = op
+
+
+class GK_MT_EnvPresetsAnime(bpy.types.Menu):
+    """卡通二次元三档(高调 + 冷暗部 + 高饱和)。"""
+
+    bl_idname = "GK_MT_ENV_PRESETS_ANIME"
+    bl_label = "卡通二次元(动画赛璐璐)"
+
+    def draw(self, context):
+        from .nodes._common import ENV_PRESET_ANIME
+        from .nodes._common import ENV_PRESET_BUILTINS
+        current = active_env_preset_name(getattr(context, "scene", None))
+        for name in ENV_PRESET_ANIME:
+            values = ENV_PRESET_BUILTINS.get(name, {})
+            label, in_use = env_preset_label(name, current)
+            op = self.layout.operator(
+                "gk.env_preset_apply_builtin", text=label,
+                icon="CHECKMARK" if in_use else "MATERIAL")
+            op.preset_name = name
+            self.layout.label(
+                text="  环境光 %.2f · 饱和 %.2f · 三段 %.1f"
+                     % (float(values.get("amb_e", 0.0)),
+                        float(values.get("sat", 1.0)),
+                        float(values.get("three_tone", 0.0))),
+                icon="DOT")
+
+
+class GK_MT_EnvPresetsMood(bpy.types.Menu):
+    """氛围四档(恐怖 / 白天 / 黄昏 / 浓雾)。"""
+
+    bl_idname = "GK_MT_ENV_PRESETS_MOOD"
+    bl_label = "氛围(恐怖 / 白天 / 黄昏 / 浓雾)"
+
+    def draw(self, context):
+        from .nodes._common import ENV_PRESET_HORROR
+        current = active_env_preset_name(getattr(context, "scene", None))
+        for name in ENV_PRESET_HORROR:
+            label, in_use = env_preset_label(name, current)
+            op = self.layout.operator(
+                "gk.env_preset_apply_builtin", text=label,
+                icon="CHECKMARK" if in_use else "WORLD")
+            op.preset_name = name
+
+
+class GK_OT_ApplyBuiltinPreset(bpy.types.Operator):
+    """把某一档**内置**环境预设套到当前场景(右键菜单用)。
+
+    ── 为什么不复用 `gk.env_preset_apply` ──────────────────────────
+    那个算子是从"预设下拉"的**当前选中项**读名字的 —— 右键菜单里点某一档,
+    跟下拉里选中谁没关系。硬要复用就得先改下拉的值再调,那会**顺手改掉**
+    用户的下拉选择(他下次点"应用"就套到别的档上了)。
+    所以这里直接按**名字**套,不改下拉。
+    """
+
+    bl_idname = "gk.env_preset_apply_builtin"
+    bl_label = "套用这个内置环境预设"
+    bl_description = "把这一档内置氛围写进当前场景的环境设置(立刻生效)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_name: StringProperty(name="预设名", default="")
+
+    def execute(self, context):
+        settings = getattr(getattr(context, "scene", None), "gk_settings", None)
+        if settings is None:
+            self.report({"WARNING"}, "拿不到场景设置")
+            return {"CANCELLED"}
+        name = str(self.preset_name or "").strip()
+        values = _env_preset_values_from_builtin(name)
+        if values is None:
+            self.report({"WARNING"}, f"没有内置预设『{name}』")
+            return {"CANCELLED"}
+        # ── 这里以前是**空转**(第 125 轮真机抓到,用户第 8 条的真凶)──────
+        # 老代码写的是 `for p_field, e_field in _ENV_PRESET_FIELDS` ——
+        # 那张表是**自定义预设**(PropertyGroup)的字段名(`p_background`
+        # / `p_bg_color` / ...),而内置档位 `ENV_PRESET_BUILTINS` 用的是
+        # 另一套短名(`bg_mode` / `bg` / `amb` / `amb_e` / `fog_d` ...)。
+        # 两边**一个都对不上**,于是循环里 `if p_field not in values: continue`
+        # 全部跳过 —— 点菜单只有 `env_enabled` 和 `env_background` 被改了,
+        # 环境光 / 雾 / 泛光 / 调色**一个都没写进去**。
+        # 用户看到的就是"点了没反应 / 不知道现在生效的是哪个"。
+        # 现在按内置档位自己的名字写(下面的三张对照表就是名字换算)。
+        applied = []
+        settings.env_enabled = True
+        settings.env_background = ("SKY" if int(values.get("bg_mode", 1)) == 2
+                                   else "COLOR")
+        for preset_key, engine_key in _ENV_BUILTIN_FLAG:
+            if preset_key in values:
+                settings.__setattr__(engine_key, bool(values[preset_key]))
+                applied.append(preset_key)
+        for preset_key, engine_key in _ENV_BUILTIN_NUM:
+            if preset_key in values:
+                settings.__setattr__(engine_key, float(values[preset_key]))
+                applied.append(preset_key)
+        for preset_key, engine_key in _ENV_BUILTIN_COLOR:
+            if preset_key in values:
+                rgb = tuple(float(v) for v in values[preset_key][:3])
+                settings.__setattr__(engine_key, rgb + (1.0,))
+                applied.append(preset_key)
+        # 卡通风格那几项(色阶 / 暗部颜色 / 三段 / 边缘光 / 高光)——
+        # 它们不属于"环境与后处理",属于『全局卡通风格』,但内置档位里带着,
+        # 所以一起写(不然套了"卡通日间"却没有卡通色阶,等于半套)。
+        style_pairs = (("shadow_step", "style_shadow_step"),
+                       ("shadow_tint", "style_shadow_tint"),
+                       ("three_tone", "style_three_tone"),
+                       ("rim", "style_rim"),
+                       ("specular", "style_specular"))
+        style_touched = False
+        for preset_key, engine_key in style_pairs:
+            if preset_key not in values or not hasattr(settings, engine_key):
+                continue
+            value = values[preset_key]
+            if isinstance(value, (tuple, list)):
+                settings.__setattr__(engine_key,
+                                     tuple(float(v) for v in value[:3]) + (1.0,))
+            else:
+                settings.__setattr__(engine_key, float(value))
+            style_touched = True
+        if style_touched and hasattr(settings, "style_enabled"):
+            settings.style_enabled = True
+        self.report({"INFO"},
+                    f"已套用『{name}』({len(applied)} 项环境参数 + "
+                    f"卡通风格已写进本场景,导出立刻生效)")
+        return {"FINISHED"}
+
+
+class GK_PT_EnvLibrary(bpy.types.Panel):
+    """『环境预设库』图的侧栏:列全内置档位 + 一键套用。
+
+    ── 为什么给它一个面板(第 124 轮)────────────────────────────────
+    这张树以前是**纯数据容器**:不进节点图列表、没面板,用户只能在
+    『游戏环境设置』卡的下拉里看到预设 —— 而"预设库"这几个字出现在
+    左下角的下拉里时,他自然会想"那这张图里能干什么"。
+    现在它有一块自己的侧栏:左边列内置那几档(点了就套),下面给
+    "存当前为预设 / 删除选中"两个动作,和卡上那份是同一套数据。
+    """
+
+    bl_idname = "GK_PT_EnvLibrary"
+    bl_label = "环境预设库 (BlenderGameKit)"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "环境"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        return space is not None and getattr(space, "tree_type", "") == "GKEnvLibraryTree"
+
+    def draw(self, context):
+        from .nodes._common import (ENV_PRESET_ANIME, ENV_PRESET_BUILTINS,
+                                    ENV_PRESET_HORROR)
+        layout = self.layout
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "gk_settings", None) if scene else None
+        layout.label(text=f"当前场景: {scene.name if scene else '?'}", icon="SCENE_DATA")
+        # ── 用户第 8 条:得有一眼看出"现在生效的是哪一档"的地方 ──────────
+        current = active_env_preset_name(scene)
+        if settings is None:
+            layout.label(text="这个场景没有 GK 设置(重载插件试试)", icon="ERROR")
+        elif bool(getattr(settings, "env_enabled", False)):
+            if current:
+                layout.label(text=f"正在用:『{current}』", icon="CHECKMARK")
+            else:
+                layout.label(text="环境已开,但没对上任何一档(手动调过)", icon="INFO")
+            layout.label(text="点下面的档位直接换", icon="CHECKMARK")
+        else:
+            layout.label(text="环境关着;点一档会自动打开它", icon="INFO")
+
+        box = layout.box()
+        box.label(text="卡通二次元(动画赛璐璐)", icon="MATERIAL")
+        box.label(text="高调 + 冷暗部 + 高饱和 —— 想要『原神那种』先点这三档",
+                  icon="INFO")
+        for name in ENV_PRESET_ANIME:
+            values = ENV_PRESET_BUILTINS.get(name, {})
+            label, in_use = env_preset_label(name, current)
+            row = box.row(align=True)
+            op = row.operator(
+                "gk.env_preset_apply_builtin", text=label,
+                icon="CHECKMARK" if in_use else "MATERIAL")
+            op.preset_name = name
+            row.label(text="环境光 %.2f · 饱和 %.2f"
+                           % (float(values.get("amb_e", 0.0)),
+                              float(values.get("sat", 1.0))))
+
+        box = layout.box()
+        box.label(text="氛围(恐怖 / 白天 / 黄昏 / 浓雾)", icon="WORLD")
+        for name in ENV_PRESET_HORROR:
+            label, in_use = env_preset_label(name, current)
+            row = box.row(align=True)
+            op = row.operator(
+                "gk.env_preset_apply_builtin", text=label,
+                icon="CHECKMARK" if in_use else "WORLD")
+            op.preset_name = name
+            row.label(text="套到当前场景")
+
+        library = props.env_preset_library()
+        box = layout.box()
+        box.label(text=f"本文件存的预设({len(library.env_presets)} 个)",
+                  icon="BOOKMARKS")
+        for index, preset in enumerate(library.env_presets):
+            row = box.row(align=True)
+            op = row.operator("gk.env_preset_apply", text=preset.preset_name,
+                              icon="CHECKMARK")
+            _ = op
+            pick = row.operator("gk.env_preset_pick_index", text="", icon="EYEDROPPER")
+            pick.index = index
+        row = box.row(align=True)
+        row.prop(library, "env_preset_new_name", text="")
+        row.operator("gk.env_preset_save", text="存当前", icon="ADD")
+        box.operator("gk.env_preset_remove", text="删除选中的预设", icon="X")
+        layout.label(text="预设跨场景共享(存在这张『环境预设库』里)", icon="INFO")
+
+
+class GK_OT_EnvPresetPickIndex(bpy.types.Operator):
+    """把预设库里的第 N 个选进下拉(这样『应用 / 删除』就作用在它身上)。"""
+
+    bl_idname = "gk.env_preset_pick_index"
+    bl_label = "选中这个预设"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="下标", default=0)
+
+    def execute(self, context):
+        library = props.env_preset_library()
+        if self.index < 0 or self.index >= len(library.env_presets):
+            return {"CANCELLED"}
+        library.env_preset_pick = str(self.index)
+        self.report({"INFO"},
+                    f"已选中『{library.env_presets[self.index].preset_name}』")
+        return {"FINISHED"}
+
+
+def _draw_tree_context_extras(layout, context):
+    """右键菜单末尾追加的 GK 子菜单(寻路 / 开局 BGM / 环境预设)。
+
+    单独抽成函数是为了让 `_draw_context_menu` 那段保持一行调用 ——
+    那个函数被"菜单重复"的历史坑占了很多注释,别再往里塞逻辑。
+    """
+    kind = props.current_tree_type(context)
+    if kind is None:
+        # 不是本插件的树(拿不到 tree_type)-> 什么都不加。
+        # 调用方已经挡过一次,这里再挡一次是因为这个函数将来可能被别处调用。
+        return
+    layout.separator()
+    if kind == "GKMusicTree":
+        # BGM 只在音乐图里出现(理由见上方那段长注释)
+        layout.menu(GK_MT_MusicSettings.bl_idname)
+        return
+    if kind == "GKEnvLibraryTree":
+        # 第 124 轮:环境预设库这张图里右键 -> 直接换整套氛围
+        # (用户原话:"可以在环境预设库的右键菜单里加点什么,
+        #  比如恐怖环境。卡通环境等。")
+        # ── 第 125 轮:先写一行"现在生效的是哪一档" ────────────────────
+        # 用户原话:"环境预设里哪个选了但没标颜色,不知道现在生效的是哪个环境。"
+        # 只把每个条目画上对勾没用(每一档本来就都画着对勾,分不出来);
+        # 这里直接写明当前这一档,下面菜单里那一档还会带「← 当前」。
+        current = active_env_preset_name(getattr(context, "scene", None))
+        if current:
+            layout.label(text=f"当前生效:『{current}』", icon="CHECKMARK")
+        else:
+            layout.label(text="当前生效:自定义(没对上任何内置档)", icon="INFO")
+        layout.menu(GK_MT_EnvPresets.bl_idname)
+        return
+    # AI 图 / 游戏逻辑图 / 动画图 / 界面图 / 显示图 / 资产图:都放寻路 ——
+    # 它是场景级设置,在**哪张图里想起来**都应该能改。
+    layout.menu(GK_MT_NavSettings.bl_idname)
+
+
 def _draw_context_menu(self, context):
     """挂到 NODE_MT_context_menu(节点上右键)。
 
@@ -6663,6 +8092,10 @@ def _draw_context_menu(self, context):
         return
     self.layout.separator()
     _draw_node_menu_contents(self.layout, context, nested=False)
+    # ── 追加:寻路 / 开局 BGM(见上方那两个 GK_MT_* 菜单)───────────────
+    # 只在这行**之后**追加:上面那段"加节点"是 Shift+A 和右键共用的,
+    # 改这里会影响两个入口。
+    _draw_tree_context_extras(self.layout, context)
 
 
 # ── 菜单重复:根因与修法(用户报了多次)─────────────────────────
@@ -6712,26 +8145,66 @@ def _purge_gk_hooks(target):
             pass
 
 
-def _install_gk_hook(target, func):
-    """先清掉历次遗留的同名回调，再挂当前这一份 —— 保证菜单只出现一次。"""
+def _install_gk_hook(target, func, append=False):
+    """先清掉历次遗留的同名回调，再挂当前这一份 —— 保证菜单只出现一次。
+
+    ── 为什么多了 `append`(第 122 轮)──────────────────────────────────
+    默认 `prepend` 是给**节点菜单**用的:我们的内容要排在最上面(实测
+    append 会被面板高度截断,表现成"按了 Shift+A 什么都没有")。
+    但挂到 Blender 原生的 `文件 → 导出` 时正好相反 —— 那里已经有一串
+    官方导出项(Olembic / glTF / FBX…),我们的『打包游戏(GK)』必须排在
+    **它们下面**,否则用户找一个官方导出器时先看到我们的东西。
+    """
     _purge_gk_hooks(target)
     setattr(func, _GK_MENU_HOOK, True)
-    target.prepend(func)
+    if append:
+        target.append(func)
+    else:
+        target.prepend(func)
+
+
+def _draw_file_export_menu(self, context):
+    """挂到 `TOPBAR_MT_file_export`(文件 → 导出)。
+
+    ── 第 122 轮:为什么打包设置搬到这里 ────────────────────────────
+    用户原话:"打包设置移动到 blender 原生的导出里"。
+    打包 = 把游戏发布成 .exe / .apk,它和 Blender 自己的『导出』在同一个
+    心理位置 —— 用户想"导出一个能发给别人的东西"时,手是往
+    `文件 → 导出` 走的;而侧栏那个盒子他得先想起来才会去翻。
+
+    ⚠ 三条实现约束(踩过 / 想过才这么写):
+      1. 用 **append**(见 `_install_gk_hook`):官方导出项一个都不能被顶掉。
+      2. 分隔线只在"上面确实有别人"时画 —— 顶头挂一条空线很难看。
+         `self.layout` 拿不到"上面有几项",所以退一步:先画分隔线,
+         但如果我们的菜单类还没注册(插件禁用中的一瞬间)就**整段不画**。
+      3. 回调自己判类在不在 —— 禁用插件后这个回调仍可能被调到。
+    """
+    menu_class = getattr(bpy.types, "GK_MT_ExportPackage", None)
+    if menu_class is None:
+        return
+    self.layout.separator()
+    self.layout.menu(menu_class.bl_idname)
 
 
 def on_register():
     """注册后的自检与菜单挂钩。"""
     # ---- 挂菜单:先按标记清掉历次遗留,再挂当前这一份(见上方说明)----
-    for target_name, func in (
-        ("NODE_MT_add", _draw_add_menu),
-        ("NODE_MT_context_menu", _draw_context_menu),
+    # 第三项是 `append`:True = 追加到菜单最后(原生的『文件 → 导出』
+    # 必须这样,否则会把 Blender 自带的导出器顶下去,见 _install_gk_hook)。
+    for target_name, func, append in (
+        ("NODE_MT_add", _draw_add_menu, False),
+        ("NODE_MT_context_menu", _draw_context_menu, False),
+        # 第 122 轮:打包设置进 文件 → 导出(GK_MT_ExportPackage)
+        ("TOPBAR_MT_file_export", _draw_file_export_menu, True),
+        # 第 122 轮:三个标记物体进 3D 视口的 `物体` 菜单
+        ("VIEW3D_MT_object", _draw_object_add_menu, False),
     ):
         target = getattr(bpy.types, target_name, None)
         if target is None:
             gk_log.warn(f"找不到 {target_name},跳过挂载")
             continue
         try:
-            _install_gk_hook(target, func)
+            _install_gk_hook(target, func, append=append)
         except Exception as exc:  # pragma: no cover
             gk_log.error(f"挂载 {target_name} 失败: {exc}")
 
@@ -6817,13 +8290,28 @@ _addon_keymaps = []
 
 
 def register_keymaps():
-    """注册 F5(节点编辑器)。拿不到 keyconfig 就安静跳过(离线/无头环境)。"""
+    """注册 F5(节点编辑器)与 F6(视口游戏编辑模式)。
+
+    拿不到 keyconfig 就安静跳过(离线 / 无头环境)。
+    """
     try:
         import bpy
         wm = getattr(bpy.context, "window_manager", None)
         kc = getattr(getattr(wm, "keyconfigs", None), "addon", None)
         if kc is None:
             return 0
+        # ── 必须**幂等**(第 125 轮踩到)────────────────────────────────
+        # 重复调用 `register_keymaps()` 会在同一个 keymap 上**再建一条**同名
+        # 快捷键项。真机踩到的形态正是用户上一轮报的:"插件注册太多一样的了"
+        # —— 那条是插件**仓库**层面重复,这里是**快捷键**层面的同一个病:
+        # Blender 会把两条都匹配,于是按一次 F6 进两次模态。
+        # 所以先摘掉自己上次注册的那几条,再重新绑。
+        for km, item in list(_addon_keymaps):
+            try:
+                km.keymap_items.remove(item)
+            except Exception:                               # noqa: BLE001
+                pass
+        _addon_keymaps.clear()
         # ── 必须用 find() 拿**已存在**的那个 keymap(踩过的坑)──────────
         # 用 `keymaps.new()` 会新建一个**同名的孤儿 keymap** ——
         # Blender 只认内置/已有的那个,新建的根本不参与匹配,
@@ -6835,9 +8323,16 @@ def register_keymaps():
         # editor=False 才是"运行游戏";True 是"打开编辑器"
         item.properties.editor = False
         _addon_keymaps.append((km, item))
+        # ── F6 那个"游戏编辑模式"已删(第 128 轮)──────────────────────────
+        # 用户原话:"我发现了 blender 原生的上帝机了...按 SHIFT+~ 就可以
+        # 进入了，你可以把现在做的这个给删了。"
+        # 原生 `Shift+~` 自带行走/飞行导航,而且
+        # `偏好设置 → 视图导航 → 飞行 & 行走` 里能调速度/传送时间/重力 ——
+        # 我当初"原生零属性"的结论是**只看了算子、没看偏好设置**。
+        # 这里不再注册任何视口快捷键(少一个占用,也少一处要维护的模态)。
         return 1
     except Exception as exc:  # noqa: BLE001
-        print(f"[BlenderGameKit] F5 快捷键没注册上: {exc}")
+        print(f"[BlenderGameKit] 快捷键没注册上: {exc}")
         return 0
 
 
@@ -6916,6 +8411,8 @@ GK_CLASSES = (
     # 资产改名:连带改物体 / 卡 / 节点引用(第八十九轮)
     GK_OT_AssetRename,
     GK_OT_SwitchTree,
+    GK_OT_NewLogicTree,
+    GK_OT_SetLogicScope,
     GK_OT_AnimVarAdd,
     GK_OT_AnimVarRemove,
     GK_OT_AnimVarMakeNode,
@@ -6923,12 +8420,14 @@ GK_CLASSES = (
     GK_OT_AddNodeMenu,
     GK_OT_FindNode,
     GK_MT_AddNodeCategories,
+    GK_OT_SyncLogicBindings,
     COMMON_MENU,
     RECENT_MENU,
     TOP_MENU,
     TOOLS_MENU,
     GK_MT_TargetPicker,
     GK_OT_SetTarget,
+    GK_OT_NewRoleReference,
     GK_OT_PickTarget,
     # 场景 -> 逻辑图 绑定(用户 2026-10-04:多场景各导一张 .tscn)
     GK_OT_SetLogicTree,
@@ -6944,6 +8443,22 @@ GK_CLASSES = (
     GK_PT_AssetTree,
     GK_PT_ObjectPhysics,
     GK_PT_GodotLook,
+    # ---- 第 122 轮:三种线框标记物体(物体属性面板 + 三个算子)----
+    GK_PT_Marker,
+    GK_OT_AddMarker,
+    GK_OT_FitMarker,
+    GK_OT_LevelChildren,
+    GK_OT_DeleteMarker,
+    GK_OT_InferDefaultPlayer,
+    # ---- 第 122 轮:打包设置进 Blender 原生 文件 → 导出 ----
+    GK_MT_ExportPackage,
+    # ---- 第 124 轮:环境预设库的右键菜单 + 侧栏面板 + 一键套用 ----
+    GK_MT_EnvPresets,
+    GK_MT_EnvPresetsAnime,
+    GK_MT_EnvPresetsMood,
+    GK_OT_ApplyBuiltinPreset,
+    GK_OT_EnvPresetPickIndex,
+    GK_PT_EnvLibrary,
 ) + tuple(CATEGORY_MENUS)
 
 
@@ -6954,10 +8469,417 @@ def on_unregister():
     _remove_asset_thumb_handler()
     # 摘掉菜单回调。按标记摘 —— 这样连以前重载遗留的旧函数也一起清掉,
     # 禁用插件后不会留野回调。
-    for target_name in ("NODE_MT_add", "NODE_MT_context_menu"):
+    # ⚠ 表必须和 `on_register` 那张**一一对应**:漏一个就会在 Blender 的
+    #   菜单上留下指向已注销函数的回调(第 122 轮补上 TOPBAR_MT_file_export)。
+    for target_name in ("NODE_MT_add", "NODE_MT_context_menu",
+                        "TOPBAR_MT_file_export", "VIEW3D_MT_object"):
         target = getattr(bpy.types, target_name, None)
         if target is None:
             continue
         _purge_gk_hooks(target)
     ops.LAST_EXPORT.clear()
     ops.RECENT_NODES.clear()
+
+# ==========================================================================
+# 环境预设:应用 / 保存 / 删除(第一百一十三轮)
+# ==========================================================================
+def _env_preset_values_from_builtin(name):
+    from .nodes._common import ENV_PRESET_BUILTINS
+    return ENV_PRESET_BUILTINS.get(str(name or ""))
+
+
+_ENV_PRESET_FIELDS = (
+    ("p_background", "env_background"), ("p_bg_color", "env_bg_color"),
+    ("p_ambient_color", "env_ambient_color"),
+    ("p_ambient_energy", "env_ambient_energy"),
+    ("p_fog", "env_fog"), ("p_fog_color", "env_fog_color"),
+    ("p_fog_density", "env_fog_density"), ("p_glow", "env_glow"),
+    ("p_glow_intensity", "env_glow_intensity"),
+    ("p_glow_bloom", "env_glow_bloom"), ("p_adjust", "env_adjust"),
+    ("p_brightness", "env_brightness"), ("p_contrast", "env_contrast"),
+    ("p_saturation", "env_saturation"),
+)
+
+# ── 「内置档位名 <-> 场景设置字段名」的两张对照表(第 125 轮)──────────
+# `_ENV_PRESET_FIELDS` 是**自定义预设**(PropertyGroup)那套的字段名,
+# 内置档位(ENV_PRESET_BUILTINS)用的是另一套短名。判断"当前是哪一档"要
+# 把内置档位的值换算成场景设置来比,所以单独列一张表。
+_ENV_BUILTIN_NUM = (                       # 名字两边不一样 / 要换算的
+    ("amb_e", "env_ambient_energy"),
+    ("fog_d", "env_fog_density"),
+    ("glow_i", "env_glow_intensity"),
+    ("glow_b", "env_glow_bloom"),
+    ("br", "env_brightness"),
+    ("ct", "env_contrast"),
+    ("sat", "env_saturation"),
+)
+_ENV_BUILTIN_FLAG = (
+    ("fog", "env_fog"),
+    ("glow", "env_glow"),
+    ("adjust", "env_adjust"),
+)
+_ENV_BUILTIN_COLOR = (
+    ("bg", "env_bg_color"),
+    ("amb", "env_ambient_color"),
+    ("fog_c", "env_fog_color"),
+)
+
+
+def _env_builtin_matches(settings, values):
+    """这一档内置预设的值,和场景当前的环境设置**是不是同一套**。
+
+    用来回答用户那句:"环境预设里哪个选了但没标颜色,不知道现在生效的是哪个"。
+
+    宽容度:数值 5% 相对差(颜色每分量 0.04)—— 因为:
+      * 导出时数值会被 `%.6f` 格式化、颜色还过一遍 linear->sRGB 换算,
+        往返之后**不可能逐位相等**;
+      * 用户在卡上手动微调一两格,我们**仍然**认为"还是这一档"(不然
+        一调滑块高亮就没了,比没有高亮更让人困惑)。
+    """
+    if not bool(getattr(settings, "env_enabled", False)):
+        return False
+    want_sky = int(values.get("bg_mode", 1)) == 2
+    is_sky = str(getattr(settings, "env_background", "COLOR")) == "SKY"
+    if want_sky != is_sky:
+        return False
+    for preset_key, engine_key in _ENV_BUILTIN_FLAG:
+        if preset_key not in values:
+            continue
+        if bool(values[preset_key]) != bool(getattr(settings, engine_key, False)):
+            return False
+    for preset_key, engine_key in _ENV_BUILTIN_NUM:
+        if preset_key not in values:
+            continue
+        try:
+            want = float(values[preset_key])
+            have = float(getattr(settings, engine_key, 0.0))
+        except (TypeError, ValueError):
+            return False
+        if abs(want - have) > max(0.005, abs(want) * 0.05):
+            return False
+    for preset_key, engine_key in _ENV_BUILTIN_COLOR:
+        if preset_key not in values:
+            continue
+        want_rgb = tuple(float(v) for v in values[preset_key][:3])
+        have_rgb = tuple(float(v) for v in getattr(settings, engine_key, (0, 0, 0))[:3])
+        if any(abs(a - b) > 0.04 for a, b in zip(want_rgb, have_rgb)):
+            return False
+    return True
+
+
+def env_preset_label(name, current):
+    """预设条目要显示的文字 + 图标(生效那一档明写「← 当前」)。
+
+    ── 为什么单独抽出来(第 125 轮)──────────────────────────────────
+    用户原话:"环境预设里哪个选了但没标颜色,不知道现在生效的是哪个环境。"
+    以前每一档都画**一样**的对勾,根本分不出来。现在生效的那一档:
+    文字后面加「← 当前」、图标换成 CHECKMARK。
+    抽成函数有两个好处:
+      * 菜单 / 面板 / 右键菜单三处**共用同一套**规则,不会一处改了一处忘了;
+      * 可测 —— Blender 的 `Menu`/`Panel` 子类**不能**直接 new 出来
+        (`bpy_struct.__new__: expected a single argument`),把规则留在这里
+        就能用普通函数测(见 tests/blender_env_presets.py)。
+    """
+    name = str(name)
+    in_use = bool(current) and name == str(current)
+    return (f"{name}   ← 当前" if in_use else name), in_use
+
+
+def active_env_preset_name(scene):
+    """当前场景的环境设置**匹配哪一档内置预设**(都不匹配就返回空串)。
+
+    ── 为什么要它(用户第 8 条)──────────────────────────────────────
+    "环境预设里哪个选了但没标颜色,不知道现在生效的是哪个环境。"
+    以前面板里每一档都画一样的对勾图标,没有任何"当前"标记 ——
+    用户改完几档之后根本分不清在用的是哪一套。
+    注意:**不是**记一个"上次点了谁"(那只在点菜单时有效,手动改卡上的
+    数值就失配了),而是拿数值**反查** —— 手动改成和某一档一样,它也会亮。
+    """
+    settings = getattr(scene, "gk_settings", None) if scene is not None else None
+    if settings is None:
+        return ""
+    from .nodes._common import ENV_PRESET_BUILTINS
+    for name, values in ENV_PRESET_BUILTINS.items():
+        try:
+            if _env_builtin_matches(settings, values):
+                return str(name)
+        except Exception:                                   # noqa: BLE001
+            continue
+    return ""
+
+
+class GK_OT_EnvPresetApply(bpy.types.Operator):
+    """把选中的预设写进本场景的环境设置 —— 卡上立刻看得到。"""
+
+    bl_idname = "gk.env_preset_apply"
+    bl_label = "应用环境预设"
+    bl_description = "把选中的预设应用到本场景(含内置预设 ★)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    # 第 124 轮:`-1` = 用下拉里选中的那个(老行为);`>= 0` = 直接应用
+    # 第 N 个自定义预设。『环境预设库』面板里一行一个预设,点谁就应用谁 ——
+    # 不能要求用户先去下拉里选中再回来点(那正是"两处来回跳")。
+    index: IntProperty(name="预设下标", default=-1)
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        if settings is None:
+            self.report({"WARNING"}, "拿不到场景设置")
+            return {"CANCELLED"}
+        library = props.env_preset_library()
+        pick = str(getattr(library, "env_preset_pick", "") or "")
+        preset_obj = None
+        if int(getattr(self, "index", -1)) >= 0:
+            # 面板里直接点某一行:用它,不去动下拉(用户的下拉选择保留)
+            try:
+                preset_obj = library.env_presets[int(self.index)]
+            except IndexError:
+                self.report({"WARNING"}, "这个预设已经不在了")
+                return {"CANCELLED"}
+            pick = ""
+        if preset_obj is not None:
+            values = {"bg_mode": 2 if str(preset_obj.p_background) == "SKY"
+                      else 1}
+            for p_field, _e_field in _ENV_PRESET_FIELDS:
+                values[p_field[2:]] = getattr(preset_obj, p_field)
+            name = str(preset_obj.preset_name)
+        elif pick.startswith("builtin_"):
+            # 第 123 轮:名单从唯一真值源取(`properties.builtin_env_preset_names()`
+            # 转发 `nodes._common.ENV_PRESET_NAMES`),不再有第二份中文名单。
+            try:
+                index = int(pick.split("_", 1)[1])
+                name = props.builtin_env_preset_names()[index]
+            except (ValueError, IndexError):
+                self.report({"WARNING"}, "没有这个内置预设")
+                return {"CANCELLED"}
+            values = _env_preset_values_from_builtin(name)
+            if values is None:
+                self.report({"WARNING"}, "没有这个内置预设")
+                return {"CANCELLED"}
+        else:
+            try:
+                preset_obj = library.env_presets[int(pick)]
+            except (ValueError, IndexError):
+                self.report({"WARNING"}, "先在『预设』下拉里挑一个")
+                return {"CANCELLED"}
+            name = str(preset_obj.preset_name)
+            values = {"bg_mode": 2 if str(preset_obj.p_background) == "SKY"
+                      else 1}
+            for p_field, _e_field in _ENV_PRESET_FIELDS:
+                values[p_field[2:]] = getattr(preset_obj, p_field)
+        settings.env_enabled = True
+        settings.env_background = ("SKY" if values.get("bg_mode") == 2
+                                   else "COLOR")
+        for p_field, e_field in _ENV_PRESET_FIELDS:
+            key = p_field[2:]
+            if key in values:
+                setattr(settings, e_field, values[key])
+        # 卡通风格(第一百一十五轮阶段 B):自己存的预设带风格字段,应用时
+        # 一并写回场景 —— 导出即按这套风格生成材质(双向打通)。
+        if preset_obj is not None:
+            settings.style_enabled = True
+            settings.style_shadow_step = preset_obj.p_style_shadow_step
+            settings.style_shadow_tint = preset_obj.p_style_shadow_tint
+            settings.style_three_tone = preset_obj.p_style_three_tone
+            settings.style_rim = preset_obj.p_style_rim
+            settings.style_specular = preset_obj.p_style_specular
+        self.report({"INFO"}, f"已套用『{name}』(导出立刻生效)")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvPresetSave(bpy.types.Operator):
+    """把当前『环境与后处理』的一套值存成命名预设(同名覆盖)。"""
+
+    bl_idname = "gk.env_preset_save"
+    bl_label = "存为环境预设"
+    bl_description = ("把当前背景 / 环境光 / 雾 / 泛光 / 色调的值存成预设;"
+                      "游戏里用『环境_应用预设』按名字切过来")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        if settings is None:
+            self.report({"WARNING"}, "拿不到场景设置")
+            return {"CANCELLED"}
+        library = props.env_preset_library()
+        name = str(getattr(library, "env_preset_new_name", "") or "").strip()
+        if not name:
+            self.report({"WARNING"}, "先在『存为预设』里填一个名字")
+            return {"CANCELLED"}
+        preset = None
+        for existing in library.env_presets:
+            if str(existing.preset_name) == name:
+                preset = existing
+                break
+        if preset is None:
+            preset = library.env_presets.add()
+        preset.preset_name = name
+        for p_field, e_field in _ENV_PRESET_FIELDS:
+            setattr(preset, p_field, getattr(settings, e_field))
+        self.report({"INFO"}, f"预设『{name}』已保存(同名已覆盖)")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvPresetRemove(bpy.types.Operator):
+    """删掉下拉里选中的那个(场景存的)预设。"""
+
+    bl_idname = "gk.env_preset_remove"
+    bl_label = "删除环境预设"
+    bl_description = "删除选中的预设(内置预设删不掉)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        library = props.env_preset_library()
+        pick = str(getattr(library, "env_preset_pick", "") or "")
+        if pick.startswith("builtin_") or not pick.isdigit():
+            self.report({"WARNING"}, "选一个自己存的预设(内置的 ★ 删不掉)")
+            return {"CANCELLED"}
+        index = int(pick)
+        if index >= len(library.env_presets):
+            return {"CANCELLED"}
+        name = str(library.env_presets[index].preset_name)
+        library.env_presets.remove(index)
+        self.report({"INFO"}, f"预设『{name}』已删除")
+        return {"FINISHED"}
+
+
+def _world_color(scene):
+    """当前场景世界的背景色(sRGB 显示值);没世界返回 None。"""
+    world = getattr(scene, "world", None)
+    if world is None:
+        return None
+    color = getattr(world, "color", None)
+    if color is None:
+        return None
+    try:
+        return (float(color[0]), float(color[1]), float(color[2]), 1.0)
+    except (TypeError, IndexError):
+        return None
+
+
+def _key_light_color(scene):
+    """场景主灯的颜色(sRGB);先找太阳灯,再退回任意灯;没有返回 None。"""
+    lights = [obj for obj in getattr(scene, "objects", ())
+              if getattr(obj, "type", "") == "LIGHT"]
+    if not lights:
+        return None
+    sun = next((obj for obj in lights
+                if getattr(getattr(obj, "data", None), "type", "") == "SUN"),
+               None)
+    pick = sun or lights[0]
+    color = getattr(getattr(pick, "data", None), "color", None)
+    if color is None:
+        return None
+    try:
+        return (float(color[0]), float(color[1]), float(color[2]), 1.0)
+    except (TypeError, IndexError):
+        return None
+
+
+class GK_OT_EnvFromWorld(bpy.types.Operator):
+    """把 Blender 世界的背景色抓进本场景的环境背景(所见即所得)。"""
+
+    bl_idname = "gk.env_from_world"
+    bl_label = "从世界取背景色"
+    bl_description = ("把当前 Blender 世界的背景色抓进『背景色』—— "
+                      "游戏里的纯色背景和 Blender 视口一个颜色")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        if settings is None:
+            self.report({"WARNING"}, "拿不到场景设置")
+            return {"CANCELLED"}
+        color = _world_color(context.scene)
+        if color is None:
+            self.report({"WARNING"},
+                        "场景没有世界 —— 到『世界』面板建一个,或先把背景色调好")
+            return {"CANCELLED"}
+        settings.env_enabled = True
+        settings.env_background = "COLOR"
+        settings.env_bg_color = color
+        self.report({"INFO"}, "背景色已从 Blender 世界同步")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvFromLight(bpy.types.Operator):
+    """把场景主灯的颜色抓进环境光颜色(灯光氛围 → 环境光一键同步)。"""
+
+    bl_idname = "gk.env_from_light"
+    bl_label = "从灯光取环境光"
+    bl_description = ("把场景里主太阳光(或第一盏灯)的颜色抓进『环境光颜色』—— "
+                      "让全局补光跟上灯光的冷暖")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = getattr(context.scene, "gk_settings", None)
+        if settings is None:
+            self.report({"WARNING"}, "拿不到场景设置")
+            return {"CANCELLED"}
+        color = _key_light_color(context.scene)
+        if color is None:
+            self.report({"WARNING"}, "场景里没有灯 —— 先放一盏灯再取")
+            return {"CANCELLED"}
+        settings.env_enabled = True
+        settings.env_ambient_color = color
+        self.report({"INFO"}, "环境光颜色已从场景主灯同步")
+        return {"FINISHED"}
+
+
+# ==========================================================================
+# 世界设置(第一百二十一轮:像虚幻的 Default Map / Default Pawn)
+# ==========================================================================
+# 用户原话:"在侧边栏有世界设置:有选择哪个为默认地图,哪个为默认角色,
+# 是像虚幻蓝图的那样"。
+#   * 默认地图  = 启动(F5)时加载哪个关卡(导出时主场景指向它);
+#   * 默认角色  = 物体没指定『角色逻辑图』时套的那张 —— 像虚幻的
+#     Default Pawn Class:一张玩家图全项目复用,不用每关各建。
+# 这棵树是**数据容器**(编辑在侧栏『世界设置』盒),不放节点、不进节点图
+# 列表 —— 和『环境预设库』同一个存法(NodeTree = 文件里跨场景的持久块)。
+class GKWorldTree(bpy.types.NodeTree):
+    bl_idname = "GKWorldTree"
+    bl_label = "世界设置"
+    bl_icon = "HOME"
+    bl_description = ("BlenderGameKit 的世界设置 —— 默认地图 / 默认角色"
+                      "(数据容器,编辑在侧栏『世界设置』盒)")
+
+    default_map: bpy.props.PointerProperty(
+        type=bpy.types.Scene,
+        name="默认地图",
+        description="启动(F5)时加载哪个关卡;不选 = 按导出顺序第一个",
+    )
+    default_character: bpy.props.PointerProperty(
+        type=GKGameLogicTree,
+        name="默认角色",
+        description=("物体没指定『角色逻辑图』时用的那张"
+                     "(像虚幻的 Default Pawn Class)"),
+    )
+    default_player: bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="默认角色",
+        description="游戏启动时生成一次的角色对象；切换关卡保留它的状态、相机及全部子对象。物体需设为 3D 角色体并绑定角色逻辑图",
+        poll=lambda self, obj: obj.type == "MESH" and getattr(obj.gk_physics, "body_type", "") == "CharacterBody3D",
+    )
+
+
+def world_settings():
+    """当前文件的世界设置单例(没有就建一张,fake_user 保底)。"""
+    for group in bpy.data.node_groups:
+        if getattr(group, "bl_idname", "") == "GKWorldTree":
+            return group
+    tree = bpy.data.node_groups.new("世界设置", "GKWorldTree")
+    tree.use_fake_user = True
+    return tree
+
+
+GK_CLASSES = tuple(GK_CLASSES) + (
+    GK_OT_EnvPresetApply,
+    GK_OT_EnvPresetSave,
+    GK_OT_EnvPresetRemove,
+    GK_OT_EnvFromWorld,
+    GK_OT_EnvFromLight,
+    GKWorldTree,
+    # 右键菜单里的『寻路』/『开局 BGM』子菜单(侧栏那两块删掉后**唯一**的入口)
+    GK_MT_NavSettings,
+    GK_MT_MusicSettings,
+)

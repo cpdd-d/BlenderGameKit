@@ -204,3 +204,84 @@ class GKNodeConnect(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_signal_name", text="")
         row.prop(self, "gk_handler", text="")
+
+
+# ==========================================================================
+# 玩家偏好(跨关卡/跨启动,第一百一十三轮)
+# ==========================================================================
+# 用户:"离开一个关卡后,我希望能够保存玩家的视角设置等"。
+#
+# 场景脚本的变量是**每关一份**的 —— C/V 切到第一人称,走进第二关又回
+# 第三人称。『偏好_记住/取回』走导出时生成的 autoload `GkPlayerPrefs`:
+# 切场景不销毁,还能落盘到 user://player_prefs.cfg(下次启动还在)。
+# 视角模式、鼠标灵敏度、画质选择……任何"玩家的选择"都该用它,
+# 而不是塞进存档(存档是"进度",偏好是"习惯")。
+PREF_KINDS = (
+    ("TEXT", "文字", "存一段文字(视角模式'第一'/'第三'这类)"),
+    ("NUMBER", "数字", "存一个数(鼠标灵敏度这类)"),
+    ("BOOL", "真假", "存一个布尔(是否开启某选项)"),
+)
+
+
+@N
+class GKNodePrefSave(B.GKStatementNode):
+    bl_idname = "GKNodePrefSave"
+    bl_label = "偏好_记住"
+    bl_icon = "BOOKMARKS"
+    gk_category = "变量"
+    gk_doc = ("把一个值记到**玩家偏好**里 —— 跨关卡保留,勾了『写入磁盘』"
+              "的话连下次启动游戏都还在。适合存视角模式(C/V 选的第一/第三"
+              "人称)、鼠标灵敏度、画质选择这类\"玩家的选择\"。\n"
+              "在另一关用『偏好_取回』读回来。想存\"游戏进度\"(钥匙/血量)"
+              "请用『存档_保存』—— 进度和偏好是两回事")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(ANY, "值", None),)
+    gk_input_props = {"值": "gk_value_text"}
+    gk_prop_defs = (
+        ("gk_pref_key", "string", "视角", "键", "偏好的名字(取回时填同一个)"),
+        ("gk_kind", "enum", "TEXT", "类型", "没连线时的值是什么类型", PREF_KINDS),
+        ("gk_value_text", "string", "第三", "值", "没连线时记住的文字"),
+        ("gk_value_number", "float", 0.0, "值", "没连线时记住的数字"),
+        ("gk_value_bool", "bool", False, "值", "没连线时记住的真假"),
+        ("gk_save_disk", "bool", True, "写入磁盘",
+         "勾上 = 顺手存进 user://player_prefs.cfg,下次启动游戏还在;"
+         "不勾 = 只活到这次退出"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_pref_key", text="")
+        row.prop(self, "gk_kind", text="")
+        kind = str(getattr(self, "gk_kind", "TEXT") or "TEXT")
+        if kind == "NUMBER":
+            layout.prop(self, "gk_value_number", text="值")
+        elif kind == "BOOL":
+            layout.prop(self, "gk_value_bool", text="值")
+        else:
+            layout.prop(self, "gk_value_text", text="值")
+        layout.prop(self, "gk_save_disk", text="写入磁盘")
+
+
+@N
+class GKNodePrefLoad(B.GKExpressionNode):
+    bl_idname = "GKNodePrefLoad"
+    bl_label = "偏好_取回"
+    bl_icon = "BOOKMARKS"
+    gk_category = "变量"
+    gk_doc = ("读回『偏好_记住』存的值 —— 开局接在『每当_准备』后面就能"
+              "恢复玩家的选择(上一关切了第一人称,这一关开局就是第一人称)。"
+              "『有没有』= 这个键从来没被记住过(第一次玩),用它走默认分支")
+    gk_outputs = (S.pin(ANY, "值", None), S.pin(BOOL, "有没有", False),)
+
+    gk_prop_defs = (
+        ("gk_pref_key", "string", "视角", "键", "『偏好_记住』里填的那个名字"),
+        ("gk_kind", "enum", "TEXT", "类型", "没记住时给『默认』的类型", PREF_KINDS),
+        ("gk_default_text", "string", "第三", "默认", "从没记住过时给什么"),
+        ("gk_default_number", "float", 0.0, "默认", "从没记住过时给什么"),
+        ("gk_default_bool", "bool", False, "默认", "从没记住过时给什么"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_pref_key", text="")
+        row.prop(self, "gk_kind", text="")

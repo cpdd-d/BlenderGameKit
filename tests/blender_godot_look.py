@@ -40,6 +40,10 @@ def check(name, condition, detail=""):
 
 
 def find_addon():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.isfile(os.path.join(root, "BlenderGameKit", "__init__.py")):
+        sys.path.insert(0, root)
+        return "BlenderGameKit"
     for module in addon_utils.modules():
         if "blender_game_kit" in getattr(module, "__name__", ""):
             return module.__name__
@@ -101,7 +105,7 @@ def main():
     print("=" * 72)
     world = scene.world
     check("世界换成了我们建的那个", world is not None and
-          world.name == look.WORLD_NAME,
+          world.name == look.WORLD_NAME + " · " + scene.name,
           getattr(world, "name", "None"))
     if world is not None:
         nodes = world.node_tree.nodes
@@ -193,7 +197,8 @@ def main():
     settings = scene.gk_settings
     keep = {name: getattr(settings, name)
             for name in ("env_enabled", "dimension", "env_tonemap",
-                         "env_background", "env_bg_color")}
+                         "env_background", "env_bg_color",
+                         "env_fog", "env_fog_color", "env_fog_density")}
     try:
         settings.dimension = "3"
         settings.env_enabled = True
@@ -226,6 +231,62 @@ def main():
         horizon = 0.2 * 0.65 + 1.0 * 0.35
         check("天空背景用地平线色(近似)",
               abs(sky["backdrop"][0] - horizon) < 1e-4, str(sky["backdrop"]))
+        look.restore(scene)
+
+        # ---- 9. 雾:按设置卡做一个体积盒子(第一百一十一轮)----
+        print("=" * 72)
+        print("9. 雾:预览也要能看见(密度 / 颜色跟着设置卡)")
+        print("=" * 72)
+        settings.env_background = "COLOR"
+        settings.env_fog = True
+        settings.env_fog_color = (0.2, 0.22, 0.32, 1.0)
+        settings.env_fog_density = 0.05
+        settings.env_bg_color = (0.05, 0.06, 0.10, 1.0)
+        fog_values = look.env_display(scene)
+        check("雾参数传出来了",
+              fog_values["fog"] and fog_values["fog_density"] > 0.04,
+              str(fog_values))
+        ok5, message5 = look.apply(scene)
+        print(f"    apply: {message5}")
+        fog = bpy.data.objects.get(look.FOG_NAME + " · " + scene.name)
+        check("雾盒子建出来了", ok5 and fog is not None, str(fog))
+        if fog is not None:
+            check("雾盒子包住场景(比场景大得多)",
+                  fog.scale.x > 20.0, str(tuple(round(s, 1) for s in fog.scale)))
+            check("雾盒子选不中(不碍事)", bool(fog.hide_select))
+            material = fog.data.materials[0] if fog.data.materials else None
+            nodes = material.node_tree.nodes if material else []
+            volume = next((n for n in nodes
+                           if n.bl_idname == "ShaderNodeVolumePrincipled"), None)
+            check("用的是体积材质(Principled Volume)", volume is not None,
+                  str([n.bl_idname for n in nodes]))
+            if volume is not None:
+                density = volume.inputs["Density"].default_value
+                strength = volume.inputs["Emission Strength"].default_value
+                colour = volume.inputs["Color"].default_value
+                print(f"    密度={density:.4f} 自发光={strength:.4f} "
+                      f"颜色={tuple(round(c, 3) for c in colour)}")
+                check("密度 = 设置卡上的密度",
+                      abs(density - 0.05) < 1e-5, str(density))
+                check("自发光强度跟着密度走(同形公式的关键)",
+                      abs(strength - density) < 1e-5,
+                      f"{strength} != {density}")
+                check("雾色 = 设置卡上的颜色",
+                      abs(colour[1] - 0.22) < 1e-4, str(tuple(colour)))
+        look.restore(scene)
+        check("还原把雾盒子收走了",
+              look.FOG_NAME + " · " + scene.name not in bpy.data.objects,
+              str(list(bpy.data.objects.keys())))
+        check("还原把雾材质也收走了",
+              look.FOG_MATERIAL_NAME + " · " + scene.name not in bpy.data.materials,
+              str(list(bpy.data.materials.keys())))
+
+        # 雾关掉时:连盒子都不该建
+        settings.env_fog = False
+        look.apply(scene)
+        check("设置卡上没开雾 -> 不建盒子",
+              look.FOG_NAME + " · " + scene.name not in bpy.data.objects,
+              str(list(bpy.data.objects.keys())))
         look.restore(scene)
     finally:
         for name, value in keep.items():

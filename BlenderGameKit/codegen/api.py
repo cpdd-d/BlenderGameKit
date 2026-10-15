@@ -15,7 +15,8 @@ from .context import CodegenAbort
 from .generator import Generator
 from .validation import (_check_animation_targets,
                          _check_base_class_supports_graph,
-                         _check_display_switch)
+                         _check_display_switch,
+                         _check_suspending_flow_fanout)
 
 # 上一次生成用到的输入动作 [(动作名, 捕获的键), ...] 与提示(兼容用)
 last_used_actions = []
@@ -39,6 +40,7 @@ def generate_result(tree, options=None):
     _check_base_class_supports_graph(tree, options or {}, collected)
     _check_animation_targets(tree, collected)
     _check_display_switch(tree, collected)
+    _check_suspending_flow_fanout(tree, collected)
     warnings = render_warnings(collected)
     diagnostics = [item for item in collected if isinstance(item, Diagnostic)]
     # 登记本次用到的输入动作，供导出流程写进 project.godot
@@ -81,3 +83,39 @@ def generate_to_dict(tree, options=None):
     result = generate_result(tree, options)
     return {"code": result.code, "warnings": result.warnings,
             "lines": result.code.count("\n") + 1}
+
+
+def generate_main_ui(tree, options=None):
+    """给『主界面』单独生成一份脚本(第一百一十二轮,挂 autoload 用)。
+
+    tree = 勾了 `gk_main_ui` 的界面设计图。生成走 `Generator` 的
+    `ui_main` 模式:整张设计图(控件 + 自带行为)就是 `_ready` 的内容,
+    再附一对接口 —— `show_main(on)`(玩法图『界面_主界面』节点调它)
+    和 `main_shown()`。
+
+    ── 为什么复用主生成器而不是另写一套 ────────────────────────────
+    控件构建、按钮回调、Esc 热键、对话框 helpers……这些发射器全都挂在
+    `Generator` 的流水线上;另写一套 = 两边的 helper 慢慢分家(本项目
+    最忌讳的"两处实现")。这里只差"事件收集"那一步:主界面没有事件,
+    整张图直接就是内容。
+    """
+    if tree is None:
+        raise CodegenAbort("没有主界面设计图")
+    merged = dict(options or {})
+    merged["ui_main"] = True
+    merged.setdefault("base_class", "Node")
+    merged.setdefault("dimension", "3")
+    generator = Generator(tree, merged)
+    code = generator.generate()
+    collected = list(generator.ctx.warnings)
+    warnings = render_warnings(collected)
+    diagnostics = [item for item in collected if isinstance(item, Diagnostic)]
+    # 注意:**不回写** last_used_actions / last_notes —— 那两个全局变量
+    # 是"玩法图生成"的兼容包袱,主界面只是顺带生成的一份别动它,
+    # 否则紧接着读它们的老调用方会拿到主界面的(空)结果。
+    return CodegenResult(
+        code=code,
+        warnings=warnings,
+        diagnostics=diagnostics,
+        notes=list(generator.ctx.notes),
+    )

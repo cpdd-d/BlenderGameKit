@@ -259,8 +259,16 @@ def node_tree_error(cls, tree):
     (不用模拟 Blender 的 space_data 上下文)。
     """
     actual = getattr(tree, "bl_idname", "")
-    if props.node_fits_tree(cls, actual):
+    if props.node_menu_allowed(cls, actual):
         return None
+    if props.node_fits_tree(cls, actual):
+        # 能放、但**菜单里不列**(第一百一十二轮):界面自己的行为已经
+        # 搬进『游戏界面』设计图 —— 新图请去那边加;玩法图只留
+        # 『界面_套用设计』『界面_主界面』这些接口。
+        # (老图里已有的这类节点照常能用;脚本(不过菜单)也照常能建。)
+        return (f"『{cls.bl_label}』是**界面自己的行为**,现在写进"
+                f"『游戏界面』设计图里 —— 玩法图只放『界面_套用设计』"
+                f"『界面_主界面』这类接口")
     kinds = props.node_tree_kinds(cls)
     label_of = {
         "GKGameLogicTree": "游戏逻辑树",
@@ -1336,6 +1344,75 @@ def _auto_link(tree, source, target):
     return False
 
 
+def run_export_script(context, operator):
+    """『导出为 Godot 脚本』的**唯一**本体:节点图 -> GDScript 落盘。
+
+    ── 为什么抽成模块级函数(用户第一百二十三轮)────────────────────
+    用户原话:"把导出到 godot 的脚本与模型和材质整合成导出到 godot"。
+    合并**不能**靠新算子去调 `bpy.ops.gk.export_script()` —— 那会多套
+    一层算子:报告文案在两层里各报一遍(用户看到重复的告警),返回码也
+    没法合并成"哪一半失败了"。所以三个算子
+    (`gk.export_script` / `gk.export_assets` / `gk.export_godot`)
+    共用这个函数 + `run_export_assets`,算子本体只剩"开头结尾"。
+
+    老算子 `gk.export_script` 的 idname、报告文案**一字不变** ——
+    快捷键 F5、顾问动作表、一整套离线/冒烟测试都挂在它上面。
+
+    `operator` 是发起调用的算子(只用来 report)。取不到节点图 / 项目目录时
+    **这里已经上报过错误**,调用方直接返回即可。
+
+    返回 `(是否成功, 结果字典)`。失败时结果字典里的 `stage` 说明停在哪一步
+    (`tree` / `project` / `codegen` / `write`),合并导出靠它判断"另一半还
+    要不要跑"(见 `GK_OT_ExportGodot.execute`)。
+    """
+    tree = _tree_of(operator, context)
+    if tree is None:
+        return False, {"stage": "tree"}
+    settings = exporter.build_settings(context.scene)
+    # 导出目录一律走"当前 .blend 绑定的项目",不再有兜底目录。
+    # create=True:允许导出时顺手把缺的项目骨架补上(用户已经在
+    # 『项目』面板确认过要建了,或者这就是第一次导出)。
+    directory, ok = _resolve_project(operator, context, create=True)
+    if not ok:
+        return False, {"stage": "project"}
+    settings["output_dir"] = directory
+
+    try:
+        result = exporter.export_tree(tree, settings, write_scene=False)
+    except codegen.CodegenAbort as exc:
+        _report(operator, "ERROR", str(exc))
+        return False, {"stage": "codegen"}
+    except OSError as exc:
+        _report(operator, "ERROR", f"写入失败: {exc}")
+        return False, {"stage": "write"}
+
+    # 同时写进 .blend,这样关掉再打开还能看到"上次导出"
+    remember_export(context.scene, result)
+    for warning in result["warnings"]:
+        _report(operator, "WARNING", warning)
+
+    _open_in_text_editor(context, result["code"], result["script_name"])
+    if settings.get("write_scene"):
+        try:
+            scene_path = exporter.write_scene_file(
+                result["directory"],
+                settings.get("node_name", "Player"),
+                settings.get("base_class", "CharacterBody3D"),
+                result["script_name"],
+            )
+            result["written"].append(scene_path)
+            project_path = exporter.write_project_file(result["directory"])
+            if project_path:
+                result["written"].append(project_path)
+        except OSError as exc:
+            _report(operator, "WARNING", f"示例场景写入失败: {exc}")
+
+    message = (f"已导出 {result['script_name']}({result['lines']} 行)"
+               + (f"，{len(result['warnings'])} 条告警" if result["warnings"] else ""))
+    _report(operator, "INFO", message)
+    return True, result
+
+
 class GK_OT_Export(bpy.types.Operator):
     """生成 GDScript 并写到磁盘。"""
 
@@ -1348,52 +1425,8 @@ class GK_OT_Export(bpy.types.Operator):
     preview_only: BoolProperty(name="只预览不写文件", default=False)
 
     def execute(self, context):
-        tree = _tree_of(self, context)
-        if tree is None:
-            return {"CANCELLED"}
-        settings = exporter.build_settings(context.scene)
-        # 导出目录一律走"当前 .blend 绑定的项目",不再有兜底目录。
-        # create=True:允许导出时顺手把缺的项目骨架补上(用户已经在
-        # 『项目』面板确认过要建了,或者这就是第一次导出)。
-        directory, ok = _resolve_project(self, context, create=True)
-        if not ok:
-            return {"CANCELLED"}
-        settings["output_dir"] = directory
-
-        try:
-            result = exporter.export_tree(tree, settings, write_scene=False)
-        except codegen.CodegenAbort as exc:
-            _report(self, "ERROR", str(exc))
-            return {"CANCELLED"}
-        except OSError as exc:
-            _report(self, "ERROR", f"写入失败: {exc}")
-            return {"CANCELLED"}
-
-        # 同时写进 .blend,这样关掉再打开还能看到"上次导出"
-        remember_export(context.scene, result)
-        for warning in result["warnings"]:
-            self.report({"WARNING"}, warning)
-
-        _open_in_text_editor(context, result["code"], result["script_name"])
-        if settings.get("write_scene"):
-            try:
-                scene_path = exporter.write_scene_file(
-                    result["directory"],
-                    settings.get("node_name", "Player"),
-                    settings.get("base_class", "CharacterBody3D"),
-                    result["script_name"],
-                )
-                result["written"].append(scene_path)
-                project_path = exporter.write_project_file(result["directory"])
-                if project_path:
-                    result["written"].append(project_path)
-            except OSError as exc:
-                _report(self, "WARNING", f"示例场景写入失败: {exc}")
-
-        message = (f"已导出 {result['script_name']}({result['lines']} 行)"
-                   + (f"，{len(result['warnings'])} 条告警" if result["warnings"] else ""))
-        _report(self, "INFO", message)
-        return {"FINISHED"}
+        ok, _info = run_export_script(context, self)
+        return {"FINISHED"} if ok else {"CANCELLED"}
 
 
 class GK_OT_ReportCopy(bpy.types.Operator):
@@ -2801,12 +2834,169 @@ class GK_OT_TagAnimCategory(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ── 进度反馈(用户要求)──────────────────────────────────────────────
+# 实测:49 MB / 1056 骨骼的 MMD 工程要导 **26 秒**,其中
+# 14.2s + 12s 全在 Blender 的 glTF 导出器里。
+# 用户原话:"导出时间有点...或许可以加一个进度条,要不然以为卡住了"。
+#
+# 诚实地说明能做到什么程度:导出内部是**同步阻塞**的
+# (bpy.ops.export_scene.gltf 一调就回不来),所以这期间界面不重绘,
+# 进度条**不会动**。真正有效的是:
+#   1. 状态栏文字 —— 明确告诉用户"正在导出,这个模型大概要 20~30 秒"
+#   2. 结束后把每一步的**实测耗时**打出来,下次心里有数
+# 想让它真的动起来,得把整条流水线改成生成器 + 定时器驱动,
+# 那是另一个量级的改动(已记进 docs/待办清单.md)。
+#
+# 放在模块级(不再是算子的方法):合并导出那一步由模块级函数跑,
+# 没有 `self` 可用 —— 见下面 run_export_assets 的说明。
+def _export_progress(context, text):
+    try:
+        context.workspace.status_text_set(f"BlenderGameKit:{text}")
+    except Exception:
+        pass
+
+
+def _finish_export_progress(context):
+    try:
+        context.workspace.status_text_set(None)
+    except Exception:
+        pass
+
+
+def run_export_assets(context, operator):
+    """『导出模型和材质』的**唯一**本体:模型/材质/贴图 + 装配 .tscn。
+
+    ── 为什么抽成模块级函数 ────────────────────────────────────────
+    同 `run_export_script`:新算子 `gk.export_godot`(『导出到 Godot』)
+    要把两半串成**一次点击**,而老算子 `gk.export_assets` 的 idname、
+    报告文案、告警都不能变(顾问动作表、冒烟测试在用)。
+
+    ⚠ 合并后**必须一次点击就通**:下面那段"还没有导出过脚本,先点
+    『导出为 Godot 脚本』"的守卫判断的是 `LAST_EXPORT["script_name"]`,
+    而合并流程会**先**跑 `run_export_script`(它内部 `remember_export`
+    已经把脚本名记下了),所以那条告警在合并路径上不会再出现 ——
+    这正是这次合并要解决的问题(用户点错顺序就会看见它)。
+
+    返回 `(是否成功, 结果字典)`。成功时结果字典里有 `outcome` / `written`
+    / `objects` / `elapsed`,合并导出的收尾报告要用。
+    """
+    started = time.time()
+    # 先按模型规模给个预估,免得用户以为卡死
+    mesh_count = sum(1 for o in context.scene.objects
+                     if getattr(o, "type", "") == "MESH")
+    estimate = "预计 20~30 秒" if mesh_count > 200 else "预计几秒"
+    _export_progress(context, f"正在导出({estimate},请勿关闭 Blender)")
+
+    scene = context.scene
+    settings = exporter.build_settings(scene)
+    directory, ok = _resolve_project(operator, context, create=True)
+    if not ok:
+        _finish_export_progress(context)
+        return False, {"stage": "project"}
+    settings["output_dir"] = directory
+
+    objects, how = asset_export.collect_objects(context)
+    if not objects:
+        _report(operator, "ERROR", "没有可导出的网格:请选中至少一个网格物体")
+        # 状态栏文字这里也要收掉(原来漏了这一条出口:报完错状态栏还挂着
+        # "正在导出…",用户以为 Blender 还在忙)。报告文案没动。
+        _finish_export_progress(context)
+        return False, {"stage": "objects"}
+
+    # 整条流程都在 asset_export.export_assets_pipeline 里,
+    # 这里只负责"取参数 + 报告结果"。
+    # 抽出去的原因:"运行前自动导出"要用同一套流程,
+    # 抄一份必然走偏(顺序、材质引用这些细节很容易漏)。
+    #
+    # ── 多场景(用户 2026-10-04)──────────────────────────────────
+    # 一个 .blend 里可以有好几个 Blender 场景(关卡1 / 关卡2 / ...)。
+    # export_all_scenes 会遍历它们,每个场景各导一张 .tscn ——
+    # 只有一棵场景时行为和以前完全一样(仍是 World.tscn)。
+    try:
+        outcome = asset_export.export_all_scenes(
+            directory,
+            # dimension=None = 逐场景用各自的设置(第八十七轮,同下)
+            dimension=None,
+            script_name=LAST_EXPORT.get("script_name") or None,
+        )
+    except Exception as exc:
+        _finish_export_progress(context)
+        _report(operator, "ERROR", f"导出失败: {type(exc).__name__}: {exc}")
+        return False, {"stage": "pipeline"}
+
+    if outcome.get("error"):
+        _finish_export_progress(context)
+        _report(operator, "ERROR", outcome["error"])
+        return False, {"stage": "pipeline"}
+
+    _finish_export_progress(context)
+
+    for warning in outcome.get("warnings", []):
+        _report(operator, "WARNING", warning)
+
+    written = outcome.get("written", [])
+    asset_export.ensure_project_file(directory)
+
+    # ── 资产清单记进导出报告(第八十九轮)────────────────────────────
+    # 报告是脚本导出那一步记的;资产这一步走完,把"真的落了哪些资产"
+    # 补进去(art/*.glb、art/*.png、audio/*、curves/*)—— 用户靠它
+    # 核对"我的资产都进去了没",不用去翻工程目录。
+    try:
+        export_report.note_assets(context.scene, directory, written)
+    except Exception as exc:                              # noqa: BLE001
+        gk_log.warn(f"资产清单记录失败(不影响导出): {exc}")
+
+    if not outcome.get("single") and not LAST_EXPORT.get("script_name"):
+        # 多场景时可能看到"还没导出过脚本"的告警 —— 那不算问题:
+        # 每个场景的逻辑图是这次导出时**自动**导出的。
+        pass
+    elif not LAST_EXPORT.get("script_name"):
+        _report(operator, "WARNING",
+                "还没有导出过脚本，先点『导出为 Godot 脚本』才能把逻辑挂到模型上")
+
+    bounds = asset_export.object_bounds(objects)
+    size = bounds["size"] if bounds else (0, 0, 0)
+    elapsed = time.time() - started
+    if outcome.get("single"):
+        _report(operator, "INFO",
+                f"已导出 {len(objects)} 个网格、{outcome['materials']} 个材质、"
+                f"{outcome['bodies']} 个碰撞体、{outcome['cameras']} 个相机、"
+                f"{outcome['lights']} 盏灯"
+                f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}，"
+                f"耗时 {elapsed:.1f} 秒）")
+    else:
+        done = [e for e in outcome.get("scenes", []) if e["ok"]]
+        names = "、".join(f"{e['scene']}→{e['scene_name']}.tscn" for e in done)
+        _report(operator, "INFO",
+                f"已导出 {len(done)}/{len(outcome.get('scenes', []))} 个场景:"
+                f"{names}（主场景 {outcome.get('main_scene', '')}，"
+                f"耗时 {elapsed:.1f} 秒）")
+    for path in written:
+        # 防御:written 里理论上不该有 None,但一旦混进来,
+        # `os.path.basename(None)` 会崩,而且崩在"报告结果"这一步 ——
+        # 用户看到的是一堆 traceback 而不是真正的错误原因(实测踩过)。
+        if path:
+            gk_log.info(f"写入 {os.path.basename(str(path))}")
+    # 旧文件清理(第十三轮)要说出来 —— 删了东西却不说,用户会以为
+    # "我的文件怎么没了"。没删就不提。
+    deleted = outcome.get("deleted", [])
+    if deleted:
+        _report(operator, "INFO",
+                f"已清理 {len(deleted)} 个上一次导出留下的旧文件:"
+                + "、".join(deleted[:6])
+                + ("…(详见导出日志)" if len(deleted) > 6 else ""))
+    return True, {"stage": "done", "outcome": outcome, "written": written,
+                  "objects": objects, "elapsed": elapsed}
+
+
 class GK_OT_ExportAssets(bpy.types.Operator):
     """把 Blender 的模型和材质一起导出到 Godot,并装配成"模型+碰撞体+脚本"的场景。
 
     材质跟着模型一起导出:没设材质的物体会用默认白色材质。
     以前这里拆成"导出模型"和"导出材质"两个按钮,但用户实际永远是
     两个一起点 —— 拆开只是多一步操作,所以合并成一个。
+
+    本体在模块级 `run_export_assets`(合并导出 `gk.export_godot` 也调它)。
     """
 
     bl_idname = "gk.export_assets"
@@ -2815,133 +3005,89 @@ class GK_OT_ExportAssets(bpy.types.Operator):
                       "并把上一次导出的脚本挂到根节点上。没材质的用默认白色")
     bl_options = {"REGISTER"}
 
-    # ── 进度反馈(用户要求)──────────────────────────────────────────
-    # 实测:49 MB / 1056 骨骼的 MMD 工程要导 **26 秒**,其中
-    # 14.2s + 12s 全在 Blender 的 glTF 导出器里。
-    # 用户原话:"导出时间有点...或许可以加一个进度条,要不然以为卡住了"。
-    #
-    # 诚实地说明能做到什么程度:导出内部是**同步阻塞**的
-    # (bpy.ops.export_scene.gltf 一调就回不来),所以这期间界面不重绘,
-    # 进度条**不会动**。真正有效的是:
-    #   1. 状态栏文字 —— 明确告诉用户"正在导出,这个模型大概要 20~30 秒"
-    #   2. 结束后把每一步的**实测耗时**打出来,下次心里有数
-    # 想让它真的动起来,得把整条流水线改成生成器 + 定时器驱动,
-    # 那是另一个量级的改动(已记进 docs/待办清单.md)。
-    def _progress(self, context, text):
-        try:
-            context.workspace.status_text_set(f"BlenderGameKit:{text}")
-        except Exception:
-            pass
+    def execute(self, context):
+        ok, _info = run_export_assets(context, self)
+        return {"FINISHED"} if ok else {"CANCELLED"}
 
-    def _finish_progress(self, context):
-        try:
-            context.workspace.status_text_set(None)
-        except Exception:
-            pass
+
+class GK_OT_ExportGodot(bpy.types.Operator):
+    """一次点击,把该导进 Godot 的都导完:脚本 + 场景 + 模型 + 材质 + 贴图。
+
+    ── 为什么合并(用户第一百二十三轮)────────────────────────────
+    用户原话:"把导出到 godot 的脚本与模型和材质整合成导出到 godot"。
+    以前是两个按钮,而且**有先后**:先『导出为 Godot 脚本』(生成 .gd /
+    场景 .tscn / 工程骨架),再『导出模型和材质』(glb + 材质 + 贴图,
+    并把上一次生成的脚本挂到根节点上)。用户点错顺序就会吃到一句
+    "还没有导出过脚本,先点『导出为 Godot 脚本』才能把逻辑挂到模型上" ——
+    他明明只是想"导出一下"。合并后顺序写在代码里,一次点击就通。
+
+    ── 老算子一个都不删 ───────────────────────────────────────────
+    `gk.export_script` / `gk.export_assets` 继续可用(idname / 报告文案
+    一字未改):快捷键 F5、顾问动作表、一整套离线与冒烟测试都挂在它们
+    上面;而且"只想重导脚本,不想重导 26 秒的模型"也确实需要单独入口。
+
+    ── 报告怎么合 ─────────────────────────────────────────────────
+    两半各自的告警/错误照原样报出去(同一条也不合并 —— 用户要能分清
+    是哪一半说的)。任一半失败 -> 返回 CANCELLED,并且**明确说出是哪一半**
+    加上"另一半已经导完了"这句,免得他以为白点了。
+    """
+
+    bl_idname = "gk.export_godot"
+    bl_label = "导出到 Godot"
+    bl_description = ("一次导完:节点图 -> GDScript、场景 .tscn、"
+                      "模型/材质/贴图 -> glb。等于『导出为 Godot 脚本』"
+                      "和『导出模型和材质』连着跑")
+    bl_options = {"REGISTER"}
 
     def execute(self, context):
-        started = time.time()
-        # 先按模型规模给个预估,免得用户以为卡死
-        mesh_count = sum(1 for o in context.scene.objects
-                         if getattr(o, "type", "") == "MESH")
-        estimate = "预计 20~30 秒" if mesh_count > 200 else "预计几秒"
-        self._progress(context, f"正在导出({estimate},请勿关闭 Blender)")
+        script_ok, script_info = run_export_script(context, self)
 
-        scene = context.scene
-        settings = exporter.build_settings(scene)
-        directory, ok = _resolve_project(self, context, create=True)
-        if not ok:
-            self._finish_progress(context)
-            return {"CANCELLED"}
-        settings["output_dir"] = directory
-
-        objects, how = asset_export.collect_objects(context)
-        if not objects:
-            _report(self, "ERROR", "没有可导出的网格:请选中至少一个网格物体")
+        # ── 为什么"脚本那半停在开头"就不跑模型那半 ───────────────────
+        # `tree` / `project` 这两类失败说明连节点图或项目目录都没拿到 ——
+        # 模型那一半用的**是同一个项目目录**,再跑一次只会把同一句错误
+        # 报两遍(用户看到两遍"推不出项目目录",还以为出了两个问题)。
+        # 其余失败(图里有错、写盘失败)无关紧要,模型照导:
+        # 用户改完图再点一次,"模型这半"不用重来。
+        if not script_ok and script_info.get("stage") in ("tree", "project"):
+            _report(self, "ERROR",
+                    "导出到 Godot 没成功:『脚本』那一半没能开始"
+                    "(先按上面那条修好,再点一次)")
             return {"CANCELLED"}
 
-        # 整条流程都在 asset_export.export_assets_pipeline 里,
-        # 这里只负责"取参数 + 报告结果"。
-        # 抽出去的原因:"运行前自动导出"要用同一套流程,
-        # 抄一份必然走偏(顺序、材质引用这些细节很容易漏)。
-        #
-        # ── 多场景(用户 2026-10-04)──────────────────────────────────
-        # 一个 .blend 里可以有好几个 Blender 场景(关卡1 / 关卡2 / ...)。
-        # export_all_scenes 会遍历它们,每个场景各导一张 .tscn ——
-        # 只有一棵场景时行为和以前完全一样(仍是 World.tscn)。
-        try:
-            outcome = asset_export.export_all_scenes(
-                directory,
-                # dimension=None = 逐场景用各自的设置(第八十七轮,同下)
-                dimension=None,
-                script_name=LAST_EXPORT.get("script_name") or None,
-            )
-        except Exception as exc:
-            self._finish_progress(context)
-            _report(self, "ERROR", f"导出失败: {type(exc).__name__}: {exc}")
+        assets_ok, assets_info = run_export_assets(context, self)
+
+        if not script_ok or not assets_ok:
+            failed = []
+            if not script_ok:
+                failed.append("脚本")
+            if not assets_ok:
+                failed.append("模型/材质")
+            done = []
+            if script_ok:
+                done.append("脚本")
+            if assets_ok:
+                done.append("模型/材质")
+            tail = ""
+            if done:
+                tail = (f";『{'、'.join(done)}』那一半已经导完了,"
+                        "上面的错误修掉再点一次即可")
+            _report(self, "ERROR",
+                    f"导出到 Godot 没成功:『{'、'.join(failed)}』那一半失败了{tail}")
             return {"CANCELLED"}
 
-        if outcome.get("error"):
-            self._finish_progress(context)
-            _report(self, "ERROR", outcome["error"])
-            return {"CANCELLED"}
-
-        self._finish_progress(context)
-
-        for warning in outcome.get("warnings", []):
-            _report(self, "WARNING", warning)
-
-        written = outcome.get("written", [])
-        asset_export.ensure_project_file(directory)
-
-        # ── 资产清单记进导出报告(第八十九轮)────────────────────────────
-        # 报告是脚本导出那一步记的;资产这一步走完,把"真的落了哪些资产"
-        # 补进去(art/*.glb、art/*.png、audio/*、curves/*)—— 用户靠它
-        # 核对"我的资产都进去了没",不用去翻工程目录。
-        try:
-            export_report.note_assets(context.scene, directory, written)
-        except Exception as exc:                          # noqa: BLE001
-            gk_log.warn(f"资产清单记录失败(不影响导出): {exc}")
-
-        if not outcome.get("single") and not LAST_EXPORT.get("script_name"):
-            # 多场景时可能看到"还没导出过脚本"的告警 —— 那不算问题:
-            # 每个场景的逻辑图是这次导出时**自动**导出的。
-            pass
-        elif not LAST_EXPORT.get("script_name"):
-            _report(self, "WARNING",
-                    "还没有导出过脚本，先点『导出为 Godot 脚本』才能把逻辑挂到模型上")
-
-        bounds = asset_export.object_bounds(objects)
-        size = bounds["size"] if bounds else (0, 0, 0)
-        elapsed = time.time() - started
+        # 两半都过 —— 给一条合并后的收尾(各自的明细在上面已经报过)
+        outcome = assets_info.get("outcome") or {}
+        objects = assets_info.get("objects") or []
+        script_name = script_info.get("script_name", "")
         if outcome.get("single"):
-            _report(self, "INFO",
-                    f"已导出 {len(objects)} 个网格、{outcome['materials']} 个材质、"
-                    f"{outcome['bodies']} 个碰撞体、{outcome['cameras']} 个相机、"
-                    f"{outcome['lights']} 盏灯"
-                    f"（包围盒 {size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f}，"
-                    f"耗时 {elapsed:.1f} 秒）")
+            detail = (f"{len(objects)} 个网格、{outcome.get('materials', 0)} 个材质、"
+                      f"{outcome.get('bodies', 0)} 个碰撞体")
         else:
-            done = [e for e in outcome.get("scenes", []) if e["ok"]]
-            names = "、".join(f"{e['scene']}→{e['scene_name']}.tscn" for e in done)
-            _report(self, "INFO",
-                    f"已导出 {len(done)}/{len(outcome.get('scenes', []))} 个场景:"
-                    f"{names}（主场景 {outcome.get('main_scene', '')}，"
-                    f"耗时 {elapsed:.1f} 秒）")
-        for path in written:
-            # 防御:written 里理论上不该有 None,但一旦混进来,
-            # `os.path.basename(None)` 会崩,而且崩在"报告结果"这一步 ——
-            # 用户看到的是一堆 traceback 而不是真正的错误原因(实测踩过)。
-            if path:
-                gk_log.info(f"写入 {os.path.basename(str(path))}")
-        # 旧文件清理(第十三轮)要说出来 —— 删了东西却不说,用户会以为
-        # "我的文件怎么没了"。没删就不提。
-        deleted = outcome.get("deleted", [])
-        if deleted:
-            _report(self, "INFO",
-                    f"已清理 {len(deleted)} 个上一次导出留下的旧文件:"
-                    + "、".join(deleted[:6])
-                    + ("…(详见导出日志)" if len(deleted) > 6 else ""))
+            done_scenes = [e for e in outcome.get("scenes", []) if e.get("ok")]
+            detail = f"{len(done_scenes)} 个场景 .tscn"
+        _report(self, "INFO",
+                f"导出到 Godot 完成:{script_name} + {detail}"
+                f"(耗时 {assets_info.get('elapsed', 0.0):.1f} 秒)")
         return {"FINISHED"}
 
 
@@ -4058,6 +4204,38 @@ class GK_OT_ResetSettings(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_SoloUiWidget(bpy.types.Operator):
+    """『单独显示』:把其他控件收起,只看这一个;再点一次全部恢复。"""
+
+    bl_idname = "gk.solo_ui_widget"
+    bl_label = "单独显示控件"
+    bl_description = ("把这张设计图里**其他**控件收起(收成一条),"
+                      "专心调这一个;再点一次全部恢复")
+    bl_options = {"REGISTER", "UNDO"}
+
+    tree_name: StringProperty(name="图名", default="")
+    node_name: StringProperty(name="控件名", default="")
+
+    def execute(self, context):
+        tree = bpy.data.node_groups.get(self.tree_name)
+        node = tree.nodes.get(self.node_name) if tree is not None else None
+        if node is None:
+            _report(self, "WARNING", f"找不到控件: {self.node_name}")
+            return {"CANCELLED"}
+        # 已经是"只看它"的状态 -> 全部恢复
+        soloing = all(other.hide or other is node
+                      for other in tree.nodes
+                      if getattr(other, "gk_ui_builder", False))
+        for other in tree.nodes:
+            if getattr(other, "gk_is_comment", False):
+                continue                      # 注释框不动(它是说明文字)
+            other.hide = (other is not node) if not soloing else False
+        _report(self, "INFO",
+                "已恢复全部控件" if soloing
+                else f"已单独显示『{self.node_name}』(再点一次恢复)")
+        return {"FINISHED"}
+
+
 GK_CLASSES = (
     GK_OT_AddNode,
     GK_OT_AddCommentBox,
@@ -4148,6 +4326,8 @@ GK_CLASSES = (
     GK_OT_DetectGodot,
     GK_OT_Export,
     GK_OT_ExportAssets,
+    # 合并导出(第一百二十三轮):脚本 + 场景 + 模型 + 材质,一次点击
+    GK_OT_ExportGodot,
     GK_OT_SyncFaceAngle,
     GK_OT_Preview,
     # 导出报告(第二十三轮):复制成文本 / 定位到出问题的节点
@@ -4155,6 +4335,7 @@ GK_CLASSES = (
     GK_OT_ReportFocus,
     GK_OT_OpenExportFolder,
     GK_OT_SelectNode,
+    GK_OT_SoloUiWidget,
     GK_OT_ResetSettings,
 )
 

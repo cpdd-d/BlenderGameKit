@@ -119,6 +119,20 @@ def platform_buildable(platform, host=None):
     return (host or sys.platform) in spec["hosts"]
 
 
+def buildable_keys(host=None):
+    """当前主机上**能**打包的平台(按 PLATFORM_ORDER,返回元组)。
+
+    ── 为什么单独留一个 ────────────────────────────────────────────
+    『文件 → 导出 → 打包游戏(GK)』菜单要把不能导的平台**置灰 + 说明**
+    (目前只有 macOS:Godot 只在 macOS 上导 macOS,它要调 codesign /
+    hdiutil,在别的系统上点了也是白等)。判据只留 `platform_buildable`
+    这一处 —— 界面别再手写一份"哪些平台能导",否则界面上说的和打包时
+    做的迟早对不上。返回元组是给"菜单/测试直接遍历"用的,不必再包一层。
+    """
+    return tuple(key for key in PLATFORM_ORDER
+                 if platform_buildable(key, host))
+
+
 def selected_platforms(settings):
     """场景设置里勾了哪些平台(按 PLATFORM_ORDER 排序)。
 

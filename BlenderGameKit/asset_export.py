@@ -28,9 +28,13 @@ from . import curve_assets
 from . import generated_files
 from . import gk_log
 from . import godot_look
+# 线框标记物体(第一百二十四轮):出生点 / 区域环境点 / 关卡父级的 kind
+# 与命名常量只在 markers.py 里定义一份,导出侧只负责"按 kind 找物体"
+from . import markers
 from . import npr_preview
 from . import project
 from . import sound_assets
+from .codegen.literals import gd_class_name
 from .nodes.node_base import gd_node_path, snake_case
 
 # 导出的 .tscn 里，脚本与模型各自的 res:// 路径
@@ -105,7 +109,7 @@ ENVIRONMENT_CAMERA = """
 [node name="{name}" type="Camera3D" parent="."]
 transform = Transform3D({basis}, {cx}, {cy}, {cz})
 fov = {fov:.2f}
-current = true
+current = {current}
 """
 
 # ── 灯光节点(第四十八轮:阶段①灯光扩展)────────────────────────────
@@ -277,6 +281,14 @@ var _gk_god_fov: float = 0.0
 ## 附身(第三十九轮):接管中的角色 + 按键按住标记。
 var _gk_god_possess: Node3D = null
 var _gk_god_possess_held: bool = false
+## ── 上帝机的全局冻结(第 131 轮)──────────────────────────────────
+## `_gk_frozen_by_god` = "这次进上帝机有没有冻过世界"。
+## 为什么要记而不是直接看 `tree.paused`:玩家可能在上帝机里**手动**按 T 解冻
+## (想看世界跑),那时 `tree.paused` 是 false —— 但我们离开上帝机时**只该解
+## 自己冻的那一次**,不能去动"玩家用别的方式冻的世界"(比如暂停菜单)。
+var _gk_frozen_by_god: bool = false
+## Enter 的"按住没"标记(和 Tab / T 同一个套路:暂停不暂停都读得到)。
+var _gk_enter_held: bool = false
 ## ESC 退出的按住标记。
 var _gk_esc_held: bool = false
 
@@ -342,6 +354,12 @@ const _GK_DBG_COPY_KEY := {debug_copy_key}  # 复制全部内容
 ## 解冻**不挑视角**(切回玩家相机才发现还冻着,照样按得开);离开上帝机
 ## 也会自动解冻(见 _gk_god_toggle)。两者都是"别把自己锁在冻住的世界里"。
 const _GK_TIME_STOP_KEY := {time_stop_key}
+
+## ── 解冻键(第 131 轮,用户"按某个键如 enter 解除")────────────────────
+## 进上帝机时世界是**自动冻结**的(见 `_gk_god_freeze`),这个键用来解冻 / 再冻。
+## 用 Enter 的理由:Tab 已经占给"进出上帝机"、T 是老的时停键,
+## 而 Enter 在原示例里没有任何用途(操作提示里也没占),不会抢功能。
+const _GK_FREEZE_KEY := KEY_ENTER
 
 ## ── 附身键(第三十九轮,用户 2026-10-06)──────────────────────────
 ## "上帝机默认属性功能应有:时停、视角缩放、附身(接管角色控制)" ——
@@ -703,6 +721,9 @@ func _collect_materials() -> void:
 			if sm != null and not found.has(sm):
 				found.append(sm)
 		for mat in found:
+			# Scene-lit toon uses the renderer's lights and shadow maps.
+			if mat.shader != null and "gk_toon_lit" in mat.shader.resource_path:
+				continue
 			_gk_mats.append([mesh_node, mat])
 
 
@@ -724,7 +745,48 @@ func _gk_follow_lights_tick() -> void:
 			continue
 		var found := root.find_child(wanted, true, false)
 		if found is Light3D:
-			(found as Light3D).global_transform = cam.global_transform
+			var light := found as Light3D
+			light.global_transform = cam.global_transform
+			# ── ★ 别让手电退到角色**背后**(第 129 轮:用户"位置太靠后")──────
+			# 用户原话:"3.第三人称下手电筒的位置太靠后了。"
+			#
+			# 真机量到的:这句 `global_transform = cam.global_transform` 把灯
+			# **整个**抄成相机的 —— 第一人称下相机≈眼睛,没问题;但
+			# **第三人称下相机在角色身后 5 米**(弹簧臂臂长),灯就跟着退到
+			# 角色背后 5 米,光从背后射过来:角色正面不亮、身前一大片影子,
+			# 而且手电该照的地方全被角色自己挡着 —— 就是用户说的"太靠后"。
+			#
+			# 修法:把灯沿着**相机视线**拉到"角色所在的那个深度"上。
+			#   `depth` = 角色在视线方向上的投影距离(相机到角色的正前方距离)
+			#   * 第一人称:角色就在相机位置 -> depth ≈ 0 -> 灯留在原地(和以前一样)
+			#   * 第三人称:角色在前方 5 米  -> depth ≈ 5 -> 灯跟到角色身上
+			# 朝向仍然是相机的朝向(看哪照哪,这是手电该有的手感)。
+			# 角色在相机**后面**(depth < 0)时不动 —— 那时"往前拉"是反的,
+			# 保持老行为最安全。
+			var anchor := _gk_follow_light_anchor(light)
+			if anchor != null:
+				var forward := -cam.global_transform.basis.z
+				var depth := (anchor.global_position
+					- cam.global_position).dot(forward)
+				if depth > 0.0:
+					light.global_position = cam.global_position + forward * depth
+
+
+## 手电筒"应该挂在谁身上" —— 往上找第一个角色(CharacterBody3D)。
+## 找不到就返回 null(灯是按名字挂的,可能挂在普通 Node3D 下)。
+##
+## ── 为什么往上找"角色"而不是别的(第 129 轮)────────────────────────
+## 示例里手电是**玩家的子节点**(`玩家/手电筒`),用父节点当锚点最自然。
+## 但父节点不一定是 Node3D(可能是个空 Node 分组),所以沿父链往上找
+## **第一个 CharacterBody3D** 最稳:那一定就是"拿手电的这个角色"。
+## 找不到(纯场景灯 / 挂在灯光集合里)就什么都不做 —— 保持老行为。
+func _gk_follow_light_anchor(light: Light3D) -> Node3D:
+	var node := light.get_parent()
+	while node != null:
+		if node is CharacterBody3D:
+			return node as Node3D
+		node = node.get_parent()
+	return null
 
 
 ## 场景灯光 -> 卡通材质(第四十八轮:从"只跟一盏平行光"升级成多光近似)。
@@ -743,6 +805,18 @@ func _update_light(_delta: float) -> void:
 	if not follow_scene_light or _gk_mats.is_empty():
 		return
 	var lights := _gk_lights_on()
+	# ── 手电筒不照亮"拿手电的角色自己"(第一百一十七轮)──────────────
+	# 跟随相机的灯贴在相机上,而玩家模型永远在相机正前方(第三人称看背影 /
+	# 第一人称贴着头)—— 主光选举必然选中它,角色永远被自己的手电照成白色。
+	# 修法:材质宿主和相机同属一个顶层角色时,把手电从该材质的主光候选里
+	# 去掉(世界照常被手电照亮,只有"拿手电的人"不被自己照亮)。
+	var follow_names: Array = []
+	for entry in follow_lights.split("|", false):
+		var fname := entry.strip_edges()
+		if not fname.is_empty():
+			follow_names.append(fname)
+	var cam := get_viewport().get_camera_3d()
+	var cam_host := _gk_scene_top(cam)
 	if lights.is_empty():
 		# 一盏亮的灯都没有 -> 告诉 shader "没光",它会退化成只画环境色
 		# (见 gk_toon.gdshader 里的零向量特判)。不这么做的话,灯关了
@@ -756,13 +830,35 @@ func _update_light(_delta: float) -> void:
 		var sm := pair[1] as ShaderMaterial
 		if sm == null:
 			continue
-		var pick := _gk_pick_light(lights, pair[0] as Node3D)
+		var skip: Array = []
+		if not follow_names.is_empty() and cam_host != null \\
+				and _gk_scene_top(pair[0]) == cam_host:
+			for light in lights:
+				if (light as Light3D).name in follow_names:
+					skip.append(light)
+		var pick := _gk_pick_light(lights, pair[0] as Node3D, skip)
 		if pick.is_empty():
 			continue
 		sm.set_shader_parameter("light_dir", pick[0])
 		sm.set_shader_parameter("light_color", pick[1])
-		# 亮度夹到 shader 的 0~4,免得点光一近就过曝成一片白。
+		# 亮度夹到 shader 的 0~8;手电筒需要能盖过低环境光,
+		# 仍保留上限避免近距离点光把整张卡通材质冲成纯白。
 		sm.set_shader_parameter("light_energy", pick[2])
+
+
+## 节点在场景树里的"顶层宿主"(current_scene 的直接子节点)。
+## 相机挂在角色下、角色的 Model 也在角色下 —— 两者的顶层宿主相同,
+## 就意味着"这个网格属于拿着手电的那个角色"。
+func _gk_scene_top(node: Node) -> Node:
+	if node == null or get_tree() == null:
+		return null
+	var scene := get_tree().current_scene
+	if scene == null:
+		return null
+	var cur: Node = node
+	while cur.get_parent() != null and cur.get_parent() != scene:
+		cur = cur.get_parent()
+	return cur
 
 
 ## 场景里**亮着**的灯(第四十八轮:三种类型都能当主光)。
@@ -785,13 +881,26 @@ func _gk_lights_on() -> Array:
 
 ## 这个材质该用哪盏灯:算"影响"挑最大的那盏(近似,见 _update_light)。
 ## 返回 [照射方向, 颜色, 亮度];空数组 = 没有可用的灯。
-func _gk_pick_light(lights: Array, node: Node3D) -> Array:
+##
+## ── 方向是"从表面**指向**灯",不是"光照过来的方向"(第一百一十一轮修)──
+## shader 那边 `light_dir` 的语义是 "Direction the light comes FROM"
+## (见 gk_toon.gdshader),也就是**从表面指向灯**的单位向量:
+##     亮/暗 = dot(表面法线, light_dir) > 0.05 ?
+## 而这里原来喂的是**相反**的向量(从灯指向表面 / 平行光的照射方向)——
+## 等于把明暗整个翻过来:灯在头顶,地板反而进"全阴影"分支;开手电画面
+## 一点不变(真机截图逐像素比对过:两张图 3D 部分**完全相同**),
+## 用户看到的就是"灯光强度还是很低"、整间屋子黑着。
+## 用同一套材质做了对照实验(dir=(0,1,0) 明显变亮 / (0,-1,0) 变暗),
+## 确认 shader 侧没问题 —— 错的是这里的符号。
+func _gk_pick_light(lights: Array, node: Node3D, exclude: Array = []) -> Array:
 	var best: Array = []
 	var best_score := -1.0
 	var here := Vector3.ZERO
 	if node != null:
 		here = node.global_position
 	for light in lights:
+		if light in exclude:
+			continue
 		var l := light as Light3D
 		if l == null:
 			continue
@@ -802,7 +911,8 @@ func _gk_pick_light(lights: Array, node: Node3D) -> Array:
 			# 平行光照的是全场景 —— 给 0.8 的折扣,让"照到脸上的手电筒"能
 			# 盖过月光(不打折的话,恐怖游戏里手电筒永远赢不了太阳)。
 			score = l.light_energy * 0.8
-			dir = -l.global_transform.basis.z.normalized()
+			# 平行光沿 -Z 照过来 -> "光从哪来" = +Z
+			dir = l.global_transform.basis.z.normalized()
 		else:
 			var span := 5.0
 			if l is OmniLight3D:
@@ -811,23 +921,24 @@ func _gk_pick_light(lights: Array, node: Node3D) -> Array:
 				span = (l as SpotLight3D).spot_range
 			if span <= 0.0:
 				span = 5.0
-			var away := here - l.global_position
-			var dist := away.length()
+			var to_light := l.global_position - here
+			var dist := to_light.length()
 			reach = clampf(1.0 - dist / span, 0.0, 1.0)
 			score = l.light_energy * reach
 			if dist > 0.001:
-				dir = away.normalized()
+				dir = to_light.normalized()
 				if l is SpotLight3D:
 					# 聚光只在锥内有影响:拿"灯的照射方向"和"灯到材质的方向"
 					# 点乘当权重 —— 照不到的方向不该被它染色。
+					# (灯到材质 = -dir,因为 dir 是材质指向灯)
 					var aim := -l.global_transform.basis.z.normalized()
-					score *= clampf(aim.dot(dir), 0.0, 1.0)
+					score *= clampf(aim.dot(-dir), 0.0, 1.0)
 			else:
-				dir = -l.global_transform.basis.z.normalized()
+				dir = l.global_transform.basis.z.normalized()
 		if score > best_score:
 			best_score = score
 			best = [dir, l.light_color,
-					clampf(l.light_energy * reach, 0.0, 4.0)]
+					clampf(l.light_energy * reach, 0.0, 8.0)]
 	return best
 
 
@@ -868,6 +979,10 @@ func _physics_process(delta: float) -> void:
 		# 它排在 _gk_god_tick 后面:Tab 切走的那一刻先解冻(见 _gk_god_toggle),
 		# 这一帧的 T 状态不会再把它冻回去。
 		_gk_time_stop_tick()
+		# 解冻键(第 131 轮):和 T 并列,动的是同一个 `tree.paused`。
+		# 排在时停后面 —— 同一帧两个键都按下时,后跑的那个说了算;
+		# "Enter 是上帝机自己的开关"更具体,让它后跑更合理。
+		_gk_freeze_tick()
 	# 调试面板(第二十二轮):按键 / 刷新都在这里(和上帝机同一个节奏)
 	if debug_panel and not Engine.is_editor_hint():
 		_gk_dbg_tick(delta)
@@ -977,7 +1092,33 @@ func _gk_god_setup() -> void:
 		cam.add_to_group("gk_god_camera")
 		root.get_tree().root.add_child(cam)
 	_gk_god_cam = cam
-	var from := _find_camera()
+	# ── 从那台相机"接过来"(第 129 轮:用户"开上帝机时会带着视角旋转")──────
+	# 用户原话:"1.开上帝机时会带着视角旋转"。
+	#
+	# ⚠ **必须优先用"视口当前那台相机"**,不能用 `_find_camera()` 顶在前面。
+	# 真机量到的证据(大堂,玩家在 (0,1,8)):
+	#     进之前 玩家相机 pos=(0,2,8)/按鼠标后 (0,3,11)  —— 在看他该看的地方
+	#     进来后 上帝机   pos=**(0,8,12)** euler=**(-33.7°, 0, 0)**
+	# 那个 (0,8,12) + 俯角 33.7° **正好等于** `look_at(Vector3.ZERO)` 从
+	# (0,8,12) 看原点 —— 也就是下面那个 `else` 兜底分支,说明
+	# `_find_camera()` **返回了 null**,压根没接上玩家视角。
+	#
+	# 为什么会 null:`_find_camera()` 只在 `_scene_root()`(当前关卡场景)里找,
+	# 而**跨关卡角色是 autoload `GkWorld` 实例化出来的** —— 它的相机挂在
+	# `/root/GkWorld/玩家/Model/玩家/第三人称相机`,**不在场景根下面**
+	# (和第 124 轮 `_gk_god_restore_camera` 踩的是同一个坑,那次也是靠
+	#  `get_tree().root` 兜底才修好的)。
+	# 于是每次**第一次**按 Tab,镜头"啪"地跳到场景角落的那个固定机位 ——
+	# 玩家看到的就是"开上帝机的时候视角被甩着转了一下"。
+	#
+	# 修法:先问**视口当前相机**(玩家此刻正在看的那台,不管它在树的哪里),
+	# 拿不到再退回按场景根找。这样进上帝机是"从你现在的视角往后上挪 6/3 米",
+	# 朝向不变 —— 视角不会被带着转。
+	var from := get_viewport().get_camera_3d()
+	if from == cam:
+		from = null
+	if from == null:
+		from = _find_camera()
 	if from != null and from != cam:
 		cam.global_transform = from.global_transform
 		cam.global_position += from.global_transform.basis.z * 6.0 + Vector3(0.0, 3.0, 0.0)
@@ -1017,6 +1158,50 @@ func _gk_god_restore_camera() -> void:
 			return
 
 
+## 交还镜头之后:按"相机离角色多近"决定要不要藏模型(第 130 轮)。
+##
+## ── 为什么需要(用户"第三人称进上帝机、再按 TAB 出来画面糊成一片")──────
+## "第一人称要隐藏角色模型"是**游戏逻辑的 C/V 分支**干的
+## (『相机_切换』节点切到第一人称时 `节点_model.visible = false`)。
+## 上帝机这条路**不经过那个分支**:如果退出时落在第一人称相机上,
+## 模型还显示着,而第一人称相机在**角色模型内部**
+## (真机量到:相机距跟随对象 0.79 米,而模型 AABB 是 ±1.0)
+## -> 从模型内部朝外看,整片内壁糊满屏幕。
+##
+## ── 为什么用"距离"判断,不用相机名字 ────────────────────────────────
+## 名字用户会改(这个仓库一直守着这条:见上帝机按**分组**而不是按名字判断)。
+## 而"相机离角色多近"是**几何事实**:贴脸 = 第一人称,拉开一个身位 =
+## 第三人称。阈值取 1.5 米:示例里第一人称相机在 0.79 米、第三人称在
+## 3.49 米(真机量到的两个数),1.5 正好落在中间,两边都留足了余量。
+func _gk_god_apply_cam_visibility() -> void:
+	var tree := get_tree()
+	if tree == null:
+		return
+	var cam := get_viewport().get_camera_3d()
+	if cam == null:
+		return
+	# 找"跟随对象":挂了角色逻辑脚本的那个(游戏逻辑自己就是这么判断角色的)
+	var pawn: Node3D = null
+	for found in tree.root.find_children("*", "Node3D", true, false):
+		if found == cam:
+			continue
+		if found.has_method("_gk_god_camera_active"):
+			pawn = found as Node3D
+			break
+	if pawn == null:
+		return
+	var near_first := cam.global_position.distance_to(pawn.global_position) < 1.5
+	# 只动"模型"这一层:优先按约定名 `Model` 找;找不到就退回
+	# "第一个网格节点的父节点"(用户的角色模型可能叫别的名字)。
+	var target: Node = pawn.get_node_or_null(NodePath("Model"))
+	if target == null:
+		for found in pawn.find_children("*", "MeshInstance3D", true, false):
+			target = found.get_parent()
+			break
+	if target is Node3D:
+		(target as Node3D).visible = not near_first
+
+
 ## Tab:在『玩家相机』和『上帝摄像机』之间来回切。
 func _gk_god_toggle() -> void:
 	if _gk_god_cam == null or not is_instance_valid(_gk_god_cam):
@@ -1030,29 +1215,150 @@ func _gk_god_toggle() -> void:
 		# 时停也跟着结束(第三十五轮):离开上帝机就该回到能玩的状态 ——
 		# "在上帝机里冻住看细节"这个用法到切走为止,不然玩家会看着一个
 		# 冻住的画面按什么都没有反应。
-		if get_tree() != null and get_tree().paused:
-			get_tree().paused = false
-			print("[GK] 时停:关(离开上帝机)")
+		#
+		# ── 第 131 轮改成走 `_gk_god_freeze(false)`────────────────────────
+		# 进上帝机现在**自动**冻结(用户要求),所以这里必须能可靠地解冻 ——
+		# 但**只解上帝机冻的那一次**:`_gk_frozen_by_god` 就是那个账本。
+		# ⚠ 不能无条件 `tree.paused = false`(旧写法):那会把**暂停菜单**
+		#   冻的世界也一起解了 —— 玩家按 Esc 暂停着、顺手按 Tab 看了眼上帝机
+		#   再退出来,暂停菜单就"自己没了"。这是"修一个 bug 造一个 bug"的
+		#   典型,所以必须记账。
+		_gk_god_freeze(false)
 		if _gk_god_player_cam != null and is_instance_valid(_gk_god_player_cam):
 			_gk_god_player_cam.make_current()
 		else:
-			var root := _scene_root()
-			if root != null:
-				for found in root.find_children("*", "Camera3D", true, false):
+			# ── 没记住"原来那台"就自己找一台(第 124 轮真机复现的 bug)─────
+			# 除"示例没导上帝机"之外,这里还有一个**真 bug**:进入上帝机时
+			# 如果视口里还没有当前相机(`get_viewport().get_camera_3d()` 是
+			# null),下面 `else` 分支就把 null 记了下来 —— 再按一次 Tab 想
+			# 切回去时,**卡在上帝机上出不来**(真机实测:Tab 切过去正常、
+			# 切回来镜头仍是上帝机)。
+			# ⚠ 兜底必须在 **get_tree().root** 里找,不能用 `_scene_root()`:
+			#   跨关卡角色是 autoload `GkWorld` 实例化出来的,它的相机挂在
+			#   `/root/GkWorld/玩家/Model/玩家/第三人称相机` —— **不在场景根
+			#   下面**,用 `_scene_root()` 搜等于搜不到(诊断实测确认)。
+			var fallback_root := get_tree()
+			var fallback: Camera3D = null
+			if fallback_root != null:
+				for found in fallback_root.root.find_children("*", "Camera3D", true, false):
 					if found != _gk_god_cam:
-						(found as Camera3D).make_current()
+						fallback = found as Camera3D
 						break
+			if fallback != null:
+				fallback.make_current()
+				# 记住它,免得下次又走一遍兜底
+				_gk_god_player_cam = fallback
+		# ── ★ 回到第一人称相机时,模型也要藏起来(第 130 轮)──────────────
+		# 用户原话:"2.在第三人称下开启上帝机后再按TAB时视角会变成如图所示的样子"
+		# —— 满屏一片贴脸的巨大平面。
+		#
+		# "第一人称要隐藏角色模型"这件事是**游戏逻辑的 C/V 分支**干的
+		# (『相机_切换』节点在切到第一人称时 `节点_model.visible = false`)。
+		# 上帝机这条路**不经过那个分支**,所以退出时如果落在一台第一人称相机上,
+		# 模型还是显示的 —— 而第一人称相机在**角色模型内部**
+		# (真机量到:相机距玩家 0.79 米,模型 AABB 是 ±1.0),
+		# 从模型内部朝外看,就是一整片内壁糊满屏幕。
+		#
+		# 修法:交还镜头之后,按"交还的这台相机**离跟随对象有多近**"判断
+		# 它算不算第一人称 —— 近了就把模型藏掉,远了就显示出来。
+		# ⚠ 用**距离**判断,不用相机/节点的名字:名字用户会改
+		#   (这个仓库一直守着这条)。
+		_gk_god_apply_cam_visibility()
 		if _gk_mouse_was >= 0:
 			Input.mouse_mode = _gk_mouse_was
 			_gk_mouse_was = -1
 	else:
 		# 正在用玩家相机 -> 记住它,再切到上帝机
-		_gk_god_player_cam = get_viewport().get_camera_3d()
+		#
+		# ── ★ 记的必须是"**此刻正在用的那一台**"(第 130 轮真机 bug)────────
+		# 用户原话:"2.在第三人称下开启上帝机后再按TAB时视角会变成如图所示的样子。"
+		# 配图是"整个画面被一整片贴脸的巨大平面填满"。
+		#
+		# 真机量到的完整链条(大堂,玩家 (0,1,8)):
+		#     初始第三人称 -> 第三人称相机 pos=(0,3,11) fov=60
+		#     按 TAB 进上帝机 -> 上帝机 pos=(0,7,17) fov=75
+		#     再按 TAB 出来 -> **第一人称相机** pos=(0,2,8) fov=45.7   ✗
+		# 玩家明明在**第三人称**,退出来却切到了**第一人称相机**。
+		#
+		# 为什么:下面这段只在 `_gk_god_player_cam` 为 **null / 失效**时才重新搜,
+		# 否则**一直用第一次记下的那台**。而第一台是开局时记的(那时当前相机是
+		# 第一人称)—— 之后玩家按 V 切到第三人称,这个记录**不会更新**。
+		# 于是"从第三人称进上帝机、出来变第一人称"。
+		#
+		# 而第一人称相机在**角色模型内部**(pos 距玩家 0.79 米,模型 AABB ±1.0),
+		# 隐藏模型那件事是**游戏逻辑的 C/V 分支**干的,上帝机这条路不经过它 ——
+		# 模型没被隐藏,于是从模型内部朝外看,整片内壁糊满画面。
+		#
+		# 修法:进上帝机的这一下,**无条件**把"此刻视口当前相机"记下来。
+		# 它才真正是"玩家刚才在看的那台",出来就该回到它。
+		var current := get_viewport().get_camera_3d()
+		if current != null and current != _gk_god_cam:
+			_gk_god_player_cam = current
+		elif _gk_god_player_cam == null or not is_instance_valid(_gk_god_player_cam):
+			# 视口此刻没有相机(极端:第一帧)—— 全树找一台不是上帝机的。
+			# ⚠ 兜底必须在 **get_tree().root** 里找,不能用 `_scene_root()`:
+			#   跨关卡角色是 autoload `GkWorld` 实例化出来的,它的相机挂在
+			#   `/root/GkWorld/玩家/Model/玩家/第三人称相机` —— **不在场景根
+			#   下面**(第 124/129 轮同一个坑,诊断实测确认)。
+			var fallback_root := get_tree()
+			if fallback_root != null:
+				for found in fallback_root.root.find_children("*", "Camera3D", true, false):
+					if found != _gk_god_cam:
+						_gk_god_player_cam = found as Camera3D
+						break
 		# 锁鼠标:不然光标一碰到窗口边,上帝机的视角就转不动了
 		if _gk_mouse_was < 0:
 			_gk_mouse_was = Input.mouse_mode
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		# ── ★ 每次进上帝机都"接"一次当前视角(第 129 轮)────────────────
+		# 用户原话:"1.开上帝机时会带着视角旋转"。
+		#
+		# `_gk_god_setup()` 只在**开局**跑一次,那之后玩家转了视角、
+		# 走了几关,上帝机还停在开局那一刻的位置/朝向上。于是按 Tab 进来时
+		# 画面从"你现在看的地方"**跳到**"开局那个位置" —— 真机量到的:
+		#     进之前 玩家相机 euler=(-15.0, -50.5, 0.0) pos=(-3.0, 3.0, 10.0)
+		#     进来后 上帝机   euler=(-10.6,   0.0, 0.0) pos=( 0.0, 5.0, 14.0)
+		#     d_yaw = **50.5°**
+		# 偏航差了 50 度、位置差 4.8 米 —— 玩家看到的就是"视角被甩着转了一下"。
+		#
+		# 修法:进来这一下**照抄当前相机的朝向**,位置只往后上挪(6 米 / 3 米)。
+		#
+		# ⚠ `look_at()` 在这里是**错的**,别改回去(我第一版就写错了)——
+		#   上帝机的位置比玩家相机**高 3 米**,从高处 `look_at(前方10米那个点)`
+		#   必然要**往下压**一个角度。真机量到的残留偏差:
+		#       朝向夹角 = 10.62°(全部来自俯仰 d_pitch = -10.6°)
+		#   —— 也就是"接是接了,但接歪了 10 度"。直接抄 `global_transform`
+		#   里的旋转分量才是真正的"视角不变":玩家看到的方向一模一样,
+		#   只是机位退后 6 米、抬高 3 米。
+		# ⚠ 只在**这次进**的时候接;之后每帧由鼠标控制,不能再被覆盖
+		#   (所以放在 `_gk_god_toggle` 里,不放 `_gk_god_tick`)。
+		var here := get_viewport().get_camera_3d()
+		if here != null and here != _gk_god_cam:
+			# 先整体抄(位置 + 朝向都抄过来)
+			_gk_god_cam.global_transform = here.global_transform
+			# 再只挪位置:沿它自己的"后"退 6 米、往上抬 3 米。
+			# 旋转分量**一个字节都不动** —— 这就是"视角不被带着转"。
+			var back := here.global_transform.basis.z
+			if back.length_squared() < 1e-8:
+				back = Vector3(0.0, 0.0, 1.0)
+			_gk_god_cam.global_position = (here.global_position
+				+ back * 6.0 + Vector3(0.0, 3.0, 0.0))
 		_gk_god_cam.make_current()
+		# ── ★ 进上帝机 = **全局冻结**(第 131 轮)──────────────────────────
+		# 用户原话:"在上帝机启用中，游戏AI还可以攻击我，应该设置上帝机启用时
+		# 全局暂停（冻结全局时间流速），按某个键如enter解除"。
+		#
+		# 以前上帝机只是"换一台相机看",**世界照跑** —— 你刚把镜头拉到远处
+		# 想看全局,敌人已经贴脸打完一套了;第 2 关那种有 AI 的关卡尤其明显。
+		# 冻结用的就是第三十五轮那个时停机制(`get_tree().paused`),
+		# 只是从"手动按 T"改成"**进上帝机就自动冻**"。
+		#
+		# 三件事保证冻结不会把自己锁死:
+		#   * 环境脚本是 `PROCESS_MODE_ALWAYS`(第 35 轮加的),冻结后它照跑
+		#     -> 上帝机还能飞、还能按 Tab 出去、还能按 Enter 解冻;
+		#   * **离开上帝机自动解冻**(见上面那个 `if tree.paused` 分支);
+		#   * T 键仍然可以手动切换(老用法不变)。
+		_gk_god_freeze(true)
 
 
 ## 上帝机的每个物理帧:Tab 切换 + 飞行。
@@ -1114,6 +1420,78 @@ func _gk_god_tick(delta: float) -> void:
 		fly -= Vector3.UP
 	if fly != Vector3.ZERO:
 		_gk_god_cam.global_position += fly.normalized() * 8.0 * delta
+
+
+## ── 全局冻结(第 131 轮):进上帝机时自动冻住整个世界 ──────────────────
+## 用户原话:"应该设置上帝机启用时全局暂停（冻结全局时间流速），
+## 按某个键如enter解除"。
+##
+## ── 为什么复用第三十五轮的"时停"而不是另造一套 ──────────────────────
+## 时停本来就是干这个的(`get_tree().paused`),而且**已经被验证过**
+## 不会把环境脚本自己一起冻住(`PROCESS_MODE_ALWAYS`,见 `_ready`)。
+## 再写一套只会多出"两套冻结状态谁说了算"的新麻烦。
+## 区别只在**触发方式**:以前要玩家自己按 T,现在进上帝机就自动冻。
+##
+## ── 为什么要记一个 `_gk_frozen_by_god`(别直接翻 `tree.paused`)──────
+## 玩家可能在上帝机里**手动**按 T 解冻(想看世界跑)—— 那时 `tree.paused`
+## 是 false,但我们不能因此认为"上帝机没冻过"。离开上帝机时**只解自己冻的**:
+## 不记这个标志的话,会去解一个"玩家用别的方式冻的"世界(比如暂停菜单),
+## 那就是"退出上帝机顺手把暂停菜单关掉了"。
+func _gk_god_freeze(on: bool) -> void:
+	var tree := get_tree()
+	if tree == null:
+		return
+	if on:
+		if not tree.paused:
+			tree.paused = true
+			print("[GK] 上帝机:全局冻结(Enter 解冻,再按 Tab 退出)")
+		# 冻过了就记一笔:不管这冻是"我冻的"还是"玩家先按了 T",都算
+		_gk_frozen_by_god = true
+	elif _gk_frozen_by_god:
+		# 只解自己冻的那一次;玩家自己按 T 解冻过之后这里不该再动
+		if tree.paused:
+			tree.paused = false
+			print("[GK] 上帝机:解冻")
+		_gk_frozen_by_god = false
+
+
+## ── Enter:解冻 / 再冻(第 131 轮)────────────────────────────────────
+## 用户原话:"按某个键如enter解除"。
+## 用 Enter 而不是别的:Tab 已经占给"进出上帝机"了,T 是老的时停键,
+## Enter 在游戏里没有任何既有用途(示例的操作提示里也没占)。
+##
+## ⚠ 和 T 的分工(别让它们打架):
+##   * **Enter** = 上帝机自己的冻结开关(**只在上帝机里有效**)——
+##     状态跟着"上帝机这次会话"走,退出上帝机时自动收拾干净;
+##   * **T** = 老的全局时停(进/出上帝机都能按,行为一个字没改)。
+## 两个键动的是同一个 `tree.paused`,所以按哪个都能解 -> 不会锁死。
+func _gk_freeze_tick() -> void:
+	if not god_camera or Engine.is_editor_hint():
+		return
+	if _gk_god_cam == null or not is_instance_valid(_gk_god_cam):
+		return
+	if not _gk_god_cam.is_current():
+		# 不在上帝机里:把"按住没"清掉,免得回到上帝机时误判成刚按下
+		_gk_enter_held = false
+		return
+	if not Input.is_key_pressed(_GK_FREEZE_KEY):
+		_gk_enter_held = false
+		return
+	if _gk_enter_held:
+		return
+	_gk_enter_held = true
+	var tree := get_tree()
+	if tree == null:
+		return
+	if tree.paused:
+		# 玩家自己解冻时**清掉标志**:表示"现在世界是活的",
+		# 但 `_gk_frozen_by_god` 留着 —— 离开上帝机时才知道该不该收拾
+		tree.paused = false
+		print("[GK] 解冻(Enter)")
+	else:
+		tree.paused = true
+		_gk_frozen_by_god = true
+		print("[GK] 冻结(Enter)")
 
 
 ## ── 时停(第三十五轮,用户 2026-10-06:"在上帝摄像机时可以添加时停")──
@@ -1204,6 +1582,20 @@ func _gk_god_possess_begin() -> void:
 		push_warning("[GK] 场景里没有可附身的角色(没有 CharacterBody3D)")
 		return
 	_gk_god_possess = target
+	# ── ★ 把"这具身体正被接管"这件事告诉 AI(第 131 轮)────────────────
+	# 用户原话:"靠近游戏AI按F键确实可以接管,但AI的移动逻辑等 和我的
+	# 在抢夺控制权"。
+	#
+	# 为什么用 **Godot 组** 而不是别的判据:
+	#   * AI 的守卫要知道的是"**这一具**身体正被人接管" —— 这和"上帝机开着"
+	#     是两件不同的事(解冻之后上帝机还开着,但那时 AI 该照跑);
+	#     `_gk_god_camera_active()` 表达不了这个区别。
+	#   * 靠成员名(`_gk_god_possess`)去猜状态不行:那是**变量名**,
+	#     本仓库一直守着"不靠名字判断"(上帝机自己就是靠分组而不是节点名判的)。
+	#   * 组名 `gk_god_possessed` 和 AI 侧是**一对契约**:AI 守卫里会写
+	#     `is_in_group("gk_god_possessed")`。改一边忘了另一边,测试会红
+	#     (照 `gk_god_camera` / `gk_hide_spot` 那种"两处硬编码、靠测试互钉"的做法)。
+	target.add_to_group("gk_god_possessed")
 	# 相机跟到角色身后(用当前朝向):后面每帧由 _gk_god_possess_tick 维持
 	_gk_god_cam.global_position = (target.global_position
 		+ Vector3(0.0, 1.6, 0.0)
@@ -1218,6 +1610,10 @@ func _gk_god_release() -> void:
 	_gk_god_possess = null
 	if body == null or not is_instance_valid(body):
 		return
+	# 交出控制权:AI 从此可以重新接管这具身体(和上面 add_to_group 成对)。
+	# ⚠ 放在 `is_instance_valid` 之后:角色可能已经被删了(切关卡),
+	#   对已释放的实例调 remove_from_group 会抛错。
+	body.remove_from_group("gk_god_possessed")
 	if body is CharacterBody3D:
 		# 松手就刹住:不刹的话角色会带着"上帝机写的速度"自己滑一段
 		var cb := body as CharacterBody3D
@@ -1301,6 +1697,32 @@ func _input(event: InputEvent) -> void:
 	if _gk_god_cam == null or not is_instance_valid(_gk_god_cam):
 		return
 	if not _gk_god_cam.is_current():
+		return
+	# ── ★ 光标是"自由"的时候不许转视角(第 130 轮:用户"暂停后鼠标还转")────
+	# 用户原话:"1.在上帝模式下按暂停游戏，视角旋转仍然受鼠标移动控制。"
+	#
+	# ── 为什么以前是对的、现在成了 bug ────────────────────────────────
+	# 这个 `_input` 是**故意**不管暂停的:第三十五轮的『时停』(按 T 冻住世界)
+	# 就是让玩家在上帝机里冻结画面看细节 —— 那时候必须还能转视角,
+	# 否则"冻住之后连看都看不了",这个功能就没意义了
+	# (见 tests/blender_pause_input.py 里"上帝机在暂停里照旧能转视角"那条判据)。
+	#
+	# 但『暂停菜单』(Esc)是**另一回事**:它会 `Input.mouse_mode = VISIBLE`
+	# 把光标交给玩家去点菜单 —— 这时鼠标一动,`event.relative` 照样有值,
+	# 视角就跟着转。玩家在菜单上挪鼠标选"继续游戏",画面在背后乱转。
+	#
+	# ── 判据为什么用「光标是不是自由的」──────────────────────────────
+	# 这是唯一能把这两种情况**分开**的信号,而且不用引入新状态:
+	#   * 时停(按 T):鼠标模式没动过,还是 CAPTURED -> 照旧转视角 ✓
+	#   * 暂停菜单(Esc):`_gk_apply_pause` 把它设成 VISIBLE -> 不转 ✓
+	#   * 对话 / 选择框这类"暂停树上等玩家点"的界面同理(它们也要光标)。
+	# 换成"看 get_tree().paused"会把时停功能一起杀掉,所以不能用那个。
+	# 光标是自由的时候,玩家是在**用鼠标操作界面**,不是在开飞机。
+	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+		# 顺手把攒着的位移清掉:不清的话,光标自由期间攒的量会在
+		# 重新捕获的那一刻**一次性甩出去**,视角猛地一跳。
+		_gk_god_look = Vector2.ZERO
+		_gk_god_wheel = 0.0
 		return
 	if event is InputEventMouseMotion:
 		_gk_god_look += event.relative
@@ -1403,11 +1825,19 @@ func _gk_dbg_text() -> String:
 		if _gk_god_cam != null and is_instance_valid(_gk_god_cam):
 			god_on = _gk_god_cam.is_current()
 		# 键位提示(第三十九轮补齐:滚轮缩放 / 附身键也一并列出来)
-		lines.append("上帝摄像机:%s(Tab 切 · %s 时停 · 滚轮缩放 · %s 附身%s)" % [
+		# 第 131 轮补上"冻结状态 + Enter 解冻":进上帝机现在是自动冻结的,
+		# 不给个提示的话玩家会以为"游戏卡死了"。
+		var frozen := false
+		if get_tree() != null:
+			frozen = get_tree().paused
+		lines.append("上帝摄像机:%s(%s · 滚轮缩放 · %s 附身%s · %s %s)" % [
 			"开" if god_on else "关",
-			_gk_dbg_key_name(_GK_TIME_STOP_KEY),
+			"%s %s" % [_gk_dbg_key_name(_GK_TIME_STOP_KEY),
+				"解冻" if frozen else "冻结"],
 			_gk_dbg_key_name(_GK_POSSESS_KEY),
-			"中" if _gk_god_possess != null else ""])
+			"中" if _gk_god_possess != null else "",
+			_gk_dbg_key_name(_GK_FREEZE_KEY),
+			"解冻" if frozen else "冻结"])
 	var watch := debug_watch.strip_edges()
 	if not watch.is_empty():
 		lines.append("显示这几项:%s" % watch.replace("|", "、"))
@@ -1932,13 +2362,13 @@ shader_parameter/albedo_color = Color({r:.4f}, {g:.4f}, {b:.4f}, 1)
 shader_parameter/use_albedo_texture = {use_texture:.1f}
 shader_parameter/albedo_strength = 1.0
 shader_parameter/albedo_texture = {albedo_ref}
-shader_parameter/shadow_step = 0.1
+shader_parameter/shadow_step = {shadow_step:.6f}
 shader_parameter/shadow_smooth = 0.02
-shader_parameter/three_tone = 0.0
+shader_parameter/three_tone = {three_tone:.6f}
 shader_parameter/lit_tint = Color(1, 0.976, 0.914, 1)
-shader_parameter/shadow_tint = Color(0.706, 0.627, 0.902, 1)
-shader_parameter/specular_amount = 0.0
-shader_parameter/rim_amount = 0.0
+shader_parameter/shadow_tint = Color({st_r:.6f}, {st_g:.6f}, {st_b:.6f}, 1)
+shader_parameter/specular_amount = {specular:.6f}
+shader_parameter/rim_amount = {rim:.6f}
 shader_parameter/emission_amount = 0.0
 """
 
@@ -2040,6 +2470,10 @@ def _unique_file_names(names, fallback="material", prefix=""):
 # 靠名字判断会误删。导出时也靠它来排除预览线框。
 PREVIEW_MARK = "gk_collision_preview"
 
+
+def is_preview_object(obj):
+    return bool(obj.get(PREVIEW_MARK) or obj.get("gk_environment_preview"))
+
 # 工具生成的辅助物理体带这些自定义属性(目前只认 MMD 的刚体/关节)。
 # 它们既不该当碰撞体,也不该当几何导出 —— 见 is_helper_physics。
 HELPER_PHYSICS_KEYS = ("mmd_type", "mmd_rigid", "mmd_joint")
@@ -2087,16 +2521,26 @@ def _esc_claimed_by_graph(scene):
     from . import exporter
 
     tree, _why = exporter.resolve_scene_tree(scene)
-    if tree is None:
-        return False
-    for node in getattr(tree, "nodes", ()) or ():
-        kind = getattr(node, "bl_idname", "")
-        if kind == "GKNodeUiPauseGame":
-            if bool(getattr(node, "gk_hotkey", False)):
-                return True
-        elif kind == "GKNodeKey":
-            if str(getattr(node, "gk_key", "") or "").strip().upper() == "ESC":
-                return True
+    if tree is not None:
+        for node in getattr(tree, "nodes", ()) or ():
+            kind = getattr(node, "bl_idname", "")
+            if kind == "GKNodeUiPauseGame":
+                if bool(getattr(node, "gk_hotkey", False)):
+                    return True
+            elif kind == "GKNodeKey":
+                if str(getattr(node, "gk_key", "") or "").strip().upper() == "ESC":
+                    return True
+    # ── 主界面(跨场景常驻)里挂的 Esc(第一百一十二轮)────────────────
+    # 暂停菜单搬进『主界面』之后,Esc 热键不在这一关的玩法图里了 ——
+    # 还要问一句"主界面的行为里挂没挂 Esc"。不问的话环境脚本以为
+    # "没人管 Esc",内置的"按 Esc 退出游戏"就会把暂停抢掉
+    # (实测:探针一按 Esc,整个游戏直接退出,后续断言全挂)。
+    from .nodes import nodes as node_lib
+    main_tree = node_lib.main_ui_design_tree()
+    for node in getattr(main_tree, "nodes", ()) or ():
+        if (getattr(node, "bl_idname", "") == "GKNodeUiPauseGame"
+                and bool(getattr(node, "gk_hotkey", False))):
+            return True
     return False
 
 
@@ -2323,6 +2767,10 @@ def environment_scene_blocks(scene):
         contrast="%.6f" % values["contrast"],
         saturation="%.6f" % values["saturation"],
         sky_line=sky_line))
+    settings = getattr(scene, "gk_settings", None)
+    sub_resources[-1] += (
+        '\nssao_enabled = ' + ('true' if getattr(settings, "env_ssao", False) else 'false')
+        + '\nssil_enabled = ' + ('true' if getattr(settings, "env_ssil", False) else 'false'))
     return sub_resources, ENVIRONMENT_NODE_TEXT.format(res_id=ENV_RESOURCE_ID)
 
 
@@ -3218,12 +3666,20 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         # 说明只认标记是不够的:老 .blend 里存的预览物体是**早期版本**建的,
         # 那时候还没写这个标记,于是它一路进了 .glb(连带一条碰撞体)。
         # 名字前缀是这套预览物体固有的,加上它就堵住了。
-        is_preview = bool(obj.get(PREVIEW_MARK)) or \
+        is_preview = is_preview_object(obj) or \
             str(getattr(obj, "name", "")).startswith("__GK碰撞预览__")
+        # 线框标记物体(第一百二十四轮)不进 glb:它只是"给插件看的标记",
+        # 线框在 glTF 里会变成**实心几何**(glTF 没有"线框显示"这个概念),
+        # 用户在 Godot 里会看到一个方块罩着出生点 / 区域。
+        # ⚠ 不计进 `skipped`:那个计数会写成"已排除 N 个碰撞预览"的提示。
+        is_marker = is_marker_object(obj)
         # 子物体碰撞块是**纯辅助物**:网格不进 glb(它在游戏里只是
         # "看不见的碰撞形状",由宿主的碰撞节点代它出现)。
-        if is_preview or obj in excluded or is_collision_piece(obj):
-            skipped.append(obj.name)
+        from .persistent_player import owns
+        if (is_preview or is_marker or obj in excluded
+                or is_collision_piece(obj) or owns(obj)):
+            if not is_marker:
+                skipped.append(obj.name)
             obj.select_set(False)
         else:
             is_hidden = False
@@ -3434,15 +3890,21 @@ def nav_obstacle_radius_of(physics):
     return max(0.05, radius)
 
 
-def nav_obstacle_node_lines(physics, is_3d, parent_name):
-    """动态障碍在 .tscn 里的那几行(没勾 = 空列表,老图一字不变)。"""
+def nav_obstacle_node_lines(physics, is_3d, parent_name, parent_path=None):
+    """动态障碍在 .tscn 里的那几行(没勾 = 空列表,老图一字不变)。
+
+    `parent_path` 是宿主节点在 .tscn 里的完整路径(关卡父级归组时是
+    `组名/物体名`)。不给就按老规矩 `Colliders/物体名` —— 老调用方
+    (离线测试 / 旧代码)行为一字不变。
+    """
     radius = nav_obstacle_radius_of(physics)
     if radius is None:
         return []
     node_type = "NavigationObstacle3D" if is_3d else "NavigationObstacle2D"
+    path = parent_path or f"Colliders/{parent_name}"
     return [
         f'[node name="{NAV_OBSTACLE_NODE}" type="{node_type}" '
-        f'parent="Colliders/{parent_name}"]',
+        f'parent="{path}"]',
         f"radius = {_fmt(radius)}",
         "",
     ]
@@ -3772,10 +4234,696 @@ def ensure_occlusion_culling(directory, enabled=True):
     return True
 
 
+def ensure_main_ui_autoload(directory, enabled=True):
+    """把『主界面』注册进(或从)project.godot 的 [autoload] 摘掉。
+
+    ── 为什么是 autoload(第一百一十二轮)────────────────────────────
+    用户:"在游戏界面那里设置一个主界面:无论在什么场景,什么事件中,
+    都会生效的"。Godot 里"切场景不消失"的正规做法就是 autoload ——
+    它挂在 `/root` 下,`change_scene` 不会碰它。玩法图的
+    『界面_主界面』节点按 `/root/<MAIN_UI_AUTOLOAD>` 找它。
+
+    ── 关掉的时候也必须来动 project.godot ───────────────────────────
+    脚本文件会由"生成物清单"的清理链收走,但 [autoload] 里那一行不摘掉
+    的话,Godot 启动直接报 "Failed to instantiate an autoload",**整个
+    工程起不来**。所以"没勾主界面"这条路也要来把旧注册摘干净(幂等)。
+    """
+    from .nodes import nodes as node_lib
+    project_file = os.path.join(directory, "project.godot")
+    if not os.path.isfile(project_file):
+        return False
+
+    name = node_lib.MAIN_UI_AUTOLOAD
+    want_line = f'{name}="*res://{project.SCRIPTS_DIR}/{node_lib.MAIN_UI_SCRIPT}"'
+    with open(project_file, "r", encoding="utf-8") as handle:
+        text = handle.read()
+
+    existing = re.search(rf"^{re.escape(name)}\s*=.*$", text, re.MULTILINE)
+    if enabled:
+        if existing:
+            if existing.group(0) == want_line:
+                return False
+            text = text[:existing.start()] + want_line + text[existing.end():]
+        elif "[autoload]" in text:
+            index = text.index("[autoload]") + len("[autoload]")
+            text = text[:index] + f"\n\n{want_line}" + text[index:]
+        else:
+            text = text.rstrip() + f"\n\n[autoload]\n\n{want_line}\n"
+    else:
+        if existing is None:
+            return False
+        text = text[:existing.start()] + text[existing.end():]
+        # 顺手收一收删行留下的连续空行(不较真,两个就够了)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+    with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    return True
+
+
+def export_main_ui(directory, dimension="3"):
+    """导出『主界面』设计图 -> `scripts/gk_main_ui.gd` + 注册 autoload。
+
+    返回 {"ok", "written", "warnings", "notes", "script_name"}。
+
+    三种情形:
+      * 勾了一张主界面   -> 生成脚本、登记生成物、写 [autoload];
+      * 勾了多张         -> 只用文件里第一张 + 告警(两份"常驻界面"
+                            叠在一起没有合理语义);
+      * 一张都没勾       -> 只把**旧注册摘掉**(脚本由清理链收走)——
+                            这一步是"取消主界面"时必须做的收尾。
+
+    ⚠ **单次导出要幂等**:多场景循环里每个场景都会碰 project.godot,
+      这里只在 export_all_scenes 收口处调一次,别下沉到逐场景流水线里。
+    """
+    from .nodes import nodes as node_lib
+    result = {"ok": False, "written": [], "warnings": [], "notes": [],
+              "script_name": ""}
+    if not directory:
+        result["warnings"].append("没有项目目录 —— 主界面没有导出")
+        return result
+
+    trees = node_lib.main_ui_design_trees()
+    tree = trees[0] if trees else None
+    if len(trees) > 1:
+        names = "、".join(str(getattr(t, "name", "?")) for t in trees)
+        result["warnings"].append(
+            f"有 {len(trees)} 张设计图都勾了『主界面』({names})—— "
+            f"只用文件里第一张『{getattr(tree, 'name', '?')}』;"
+            f"其余几张把勾去掉(『游戏界面』面板里)")
+    if tree is None:
+        try:
+            changed = ensure_main_ui_autoload(directory, enabled=False)
+        except OSError as exc:                            # noqa: BLE001
+            result["warnings"].append(f"摘除主界面 autoload 注册失败: {exc}")
+            changed = False
+        if changed:
+            result["notes"].append("主界面已取消:[autoload] 里的旧注册已摘掉")
+        result["ok"] = True
+        return result
+
+    from . import codegen as codegen_mod
+    try:
+        generated = codegen_mod.generate_main_ui(
+            tree, {"dimension": str(dimension or "3")})
+    except Exception as exc:                              # noqa: BLE001
+        result["warnings"].append(
+            f"主界面『{tree.name}』生成失败:{type(exc).__name__}: {exc}")
+        return result
+    result["warnings"].extend(generated.warnings)
+    result["notes"].extend(f"主界面:{item}" for item in generated.notes)
+
+    scripts_dir = os.path.join(directory, project.SCRIPTS_DIR)
+    os.makedirs(scripts_dir, exist_ok=True)
+    path = os.path.join(scripts_dir, node_lib.MAIN_UI_SCRIPT)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(generated.code)
+    result["written"].append(path)
+    result["script_name"] = node_lib.MAIN_UI_SCRIPT
+
+    try:
+        changed = ensure_main_ui_autoload(directory, enabled=True)
+    except OSError as exc:                                # noqa: BLE001
+        result["warnings"].append(f"写 project.godot 的 [autoload] 失败: {exc}")
+        changed = False
+    if changed:
+        result["notes"].append(
+            f"主界面『{tree.name}』已注册为 autoload"
+            f"({node_lib.MAIN_UI_AUTOLOAD},切场景不消失)")
+    result["ok"] = True
+    return result
+
+
+# ── 玩家偏好(跨关卡,第一百一十三轮)──────────────────────────────
+# 『偏好_记住』『偏好_取回』用的 autoload:切场景不销毁 + 可落盘。
+# 工程里任何一张图用到了这两个节点,导出时写 scripts/gk_player_prefs.gd
+# 并注册 [autoload];一张都没用时把旧注册摘掉(不然 Godot 起不来)。
+PLAYER_PREFS_AUTOLOAD = "GkPlayerPrefs"
+PLAYER_PREFS_SCRIPT = "gk_player_prefs.gd"
+
+_PLAYER_PREFS_GD = (
+    "# 由 BlenderGameKit 自动生成 —— 玩家偏好(跨关卡常驻)\n"
+    "# 『偏好_记住』『偏好_取回』节点用的就是它:autoload 切场景不销毁;\n"
+    "# 勾了『写入磁盘』的还会落到 user://player_prefs.cfg,下次启动也在。\n"
+    "extends Node\n"
+    "\n"
+    "const SAVE_PATH := \"user://player_prefs.cfg\"\n"
+    "\n"
+    "var _data := {}\n"
+    "\n"
+    "func _ready() -> void:\n"
+    "	var config := ConfigFile.new()\n"
+    "	if config.load(SAVE_PATH) == OK:\n"
+    "		var keys := config.get_section_keys(\"prefs\")\n"
+    "		if keys != null:\n"
+    "			for key in keys:\n"
+    "				_data[key] = config.get_value(\"prefs\", key)\n"
+    "\n"
+    "func put(key: String, value) -> void:\n"
+    "	_data[key] = value\n"
+    "\n"
+    "func save() -> void:\n"
+    "	var config := ConfigFile.new()\n"
+    "	for key in _data:\n"
+    "		config.set_value(\"prefs\", key, _data[key])\n"
+    "	config.save(SAVE_PATH)\n"
+    "\n"
+    "func get_pref(key: String, default = null):\n"
+    "	return _data.get(key, default)\n"
+    "\n"
+    "func has_pref(key: String) -> bool:\n"
+    "	return _data.has(key)\n"
+    "\n"
+    "func erase_pref(key: String) -> void:\n"
+    "	_data.erase(key)\n"
+    "	save()\n"
+    "\n"
+)
+
+
+def _uses_player_prefs():
+    """文件里有没有任何一张图用了『偏好_记住/取回』(要不要导 autoload)。"""
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return False
+    wanted = {"GKNodePrefSave", "GKNodePrefLoad"}
+    for group in getattr(getattr(bpy, "data", None),
+                         "node_groups", ()) or ():
+        for node in getattr(group, "nodes", ()) or ():
+            if getattr(node, "bl_idname", "") in wanted:
+                return True
+    return False
+
+
+def ensure_player_prefs_autoload(directory, enabled=True):
+    """把 GkPlayerPrefs 注册进(或从)project.godot 的 [autoload] 摘掉。
+
+    和 `ensure_main_ui_autoload` 同一个道理:摘注册必须做 —— 脚本被
+    清理链收走后,[autoload] 里还留着那一行的话 Godot 整个工程起不来。
+    """
+    project_file = os.path.join(directory, "project.godot")
+    if not os.path.isfile(project_file):
+        return False
+    want_line = (f'{PLAYER_PREFS_AUTOLOAD}='
+                 f'"*res://{project.SCRIPTS_DIR}/{PLAYER_PREFS_SCRIPT}"')
+    with open(project_file, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    existing = re.search(rf"^{re.escape(PLAYER_PREFS_AUTOLOAD)}\s*=.*$",
+                         text, re.MULTILINE)
+    if enabled:
+        if existing:
+            if existing.group(0) == want_line:
+                return False
+            text = text[:existing.start()] + want_line + text[existing.end():]
+        elif "[autoload]" in text:
+            index = text.index("[autoload]") + len("[autoload]")
+            text = text[:index] + f"\n\n{want_line}" + text[index:]
+        else:
+            text = (text.rstrip()
+                    + f"\n\n[autoload]\n\n{want_line}\n")
+    else:
+        if existing is None:
+            return False
+        text = text[:existing.start()] + text[existing.end():]
+        text = re.sub(r"\n{3,}", "\n\n", text)
+    with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    return True
+
+
+def export_player_prefs(directory):
+    """按需导出玩家偏好 autoload。返回 {"written", "warnings", "notes"}。"""
+    result = {"written": [], "warnings": [], "notes": []}
+    if not directory:
+        return result
+    used = _uses_player_prefs()
+    if used:
+        scripts_dir = os.path.join(directory, project.SCRIPTS_DIR)
+        os.makedirs(scripts_dir, exist_ok=True)
+        path = os.path.join(scripts_dir, PLAYER_PREFS_SCRIPT)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(_PLAYER_PREFS_GD)
+        result["written"].append(path)
+        try:
+            ensure_player_prefs_autoload(directory, enabled=True)
+        except OSError as exc:                            # noqa: BLE001
+            result["warnings"].append(
+                f"写 project.godot 的 [autoload](玩家偏好)失败: {exc}")
+        else:
+            result["notes"].append(
+                "玩家偏好已注册为 autoload(GkPlayerPrefs,切关卡不丢)")
+    else:
+        try:
+            changed = ensure_player_prefs_autoload(directory, enabled=False)
+        except OSError as exc:                            # noqa: BLE001
+            result["warnings"].append(
+                f"摘除玩家偏好 autoload 注册失败: {exc}")
+        else:
+            if changed:
+                result["notes"].append(
+                    "玩家偏好已取消:[autoload] 里的旧注册已摘掉")
+    return result
+
+
+# ==========================================================================
+# 线框标记物体(第一百二十四轮):区域环境点 / 关卡父级的导出
+# ==========================================================================
+#
+# 用户原话:"出生点 / 区域环境点 / 关卡父级这种,做成视口里看得见的线框标记
+# 物体,属性挂在物体属性里,别塞进游戏逻辑侧栏。"
+#
+# 三种标记的 kind / 中文标签 / 颜色在 markers.py 里定义一份;这里只负责导出:
+#   * 区域环境点 -> 一个 Area3D(盒子 = 标记物体的**世界包围盒**)+ 一个
+#     @tool 脚本(见 ENV_ZONES_SCRIPT);几何 / 材质 / 子物体一个都不导;
+#   * 关卡父级   -> 一个 Node3D 分组节点,它的**直接子物体**在 .tscn 里的
+#     那个物理体节点挪到它下面(见 level_root_exports);
+#   * 玩家出生点 -> 归 persistent_player 管(spawn_node),不在这里。
+#
+# ── 硬性要求:没有标记时产物逐字节不变 ──────────────────────────────
+# 下面每个函数在"没有对应标记"时都返回空,write_world_scene 里那几行就
+# 一个分支都不进 —— 一整套回归测试和示例都在比对旧产物,这条不能破。
+
+# 区域脚本是**所有场景共用一份**(参数全在节点属性上,没有场景相关的默认值),
+# 所以不走 env_script_rel 那套"每场景一份"。
+ENV_ZONES_SCRIPT_REL = "scripts/gk_env_zones.gd"
+ENV_ZONES_SCRIPT_RES = "res://scripts/gk_env_zones.gd"
+ENV_ZONES_SCRIPT_ID = "env_zones"
+
+
+def is_marker_object(obj):
+    """这个物体是不是**线框标记物体**(出生点 / 区域环境点 / 关卡父级)。
+
+    ui.py 的注释按这个名字引用它(建标记时打的 `gk_marker` 自定义属性也在
+    markers.kind_of 的识别来源里)。标记不进 glb、不生成碰撞体 ——
+    它只产生"出生点节点 / 区域触发器 / 分组节点"这三样东西。
+    """
+    try:
+        return bool(markers.kind_of(obj))
+    except Exception:                                     # noqa: BLE001
+        return False
+
+# 区域要带的整套参数。**键顺序固定** —— 生成的 zone_data 字典文本才稳定
+# (改一个字都会让比对旧产物的测试红掉)。
+ENV_ZONE_KEYS = ("bg_mode", "bg", "amb", "amb_e", "fog", "fog_c", "fog_d",
+                 "glow", "glow_i", "glow_b", "adjust", "br", "ct", "sat")
+
+# 某一项在预设里缺失时的兜底值 —— 和 codegen/statements.py 里
+# `_ENV_PRESET_HELPER_LINES` 的 `data.get(键, 默认值)` 逐个对齐,
+# 免得同名的『环境_应用预设』节点和区域环境点切出两套氛围。
+ENV_ZONE_FALLBACK = {
+    "bg_mode": 1, "bg": (0.05, 0.06, 0.10), "amb": (0.55, 0.62, 0.80),
+    "amb_e": 0.3, "fog": False, "fog_c": (0.30, 0.34, 0.42), "fog_d": 0.02,
+    "glow": False, "glow_i": 0.8, "glow_b": 0.1, "adjust": False,
+    "br": 1.0, "ct": 1.0, "sat": 1.0,
+}
+
+
+def _env_zone_values(source):
+    """把预设里的一套值裁成 ENV_ZONE_KEYS(缺的用兜底值)。"""
+    out = dict(ENV_ZONE_FALLBACK)
+    for key in ENV_ZONE_KEYS:
+        value = source.get(key) if hasattr(source, "get") else None
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def env_preset_values(name):
+    """预设名 -> 一整套环境参数;找不到返回 None。
+
+    ── 为什么查法和 codegen 那边**必须一致**──────────────────────────
+    同一个名字,玩法图的『环境_应用预设』和这里的『区域环境点』要得到
+    一模一样的一套数,否则用户会看到"图里刚进雾、走两步又变回去"。
+    所以两边同一顺序:文件级预设库(properties.env_preset_library())
+    -> 内置四项(nodes/_common.ENV_PRESET_BUILTINS)。
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    try:
+        from .properties import env_preset_library
+
+        library = env_preset_library()
+        for preset in getattr(library, "env_presets", ()) or ():
+            if str(getattr(preset, "preset_name", "")) != raw:
+                continue
+            return _env_zone_values({
+                "bg_mode": 2 if str(getattr(preset, "p_background",
+                                            "COLOR")) == "SKY" else 1,
+                "bg": tuple(getattr(preset, "p_bg_color")[:3]),
+                "amb": tuple(getattr(preset, "p_ambient_color")[:3]),
+                "amb_e": float(getattr(preset, "p_ambient_energy", 0.3)),
+                "fog": bool(getattr(preset, "p_fog", False)),
+                "fog_c": tuple(getattr(preset, "p_fog_color")[:3]),
+                "fog_d": float(getattr(preset, "p_fog_density", 0.02)),
+                "glow": bool(getattr(preset, "p_glow", False)),
+                "glow_i": float(getattr(preset, "p_glow_intensity", 0.8)),
+                "glow_b": float(getattr(preset, "p_glow_bloom", 0.1)),
+                "adjust": bool(getattr(preset, "p_adjust", False)),
+                "br": float(getattr(preset, "p_brightness", 1.0)),
+                "ct": float(getattr(preset, "p_contrast", 1.0)),
+                "sat": float(getattr(preset, "p_saturation", 1.0)),
+            })
+    except Exception:                                     # noqa: BLE001
+        # 预设库读不到(离线桩 / 老文件里那个类不属于当前包路径)时
+        # 继续查内置 —— 不能因为"库没读上"就整个预设都找不到。
+        pass
+    from .nodes._common import ENV_PRESET_BUILTINS
+    builtin = ENV_PRESET_BUILTINS.get(raw)
+    if builtin is None:
+        return None
+    return _env_zone_values(builtin)
+
+
+def _gd_zone_dict(values):
+    """一整套参数 -> .tscn 里 `zone_data = { ... }` 的字面量。"""
+    parts = []
+    for key in ENV_ZONE_KEYS:
+        value = values.get(key, ENV_ZONE_FALLBACK[key])
+        if key in ("bg", "amb", "fog_c"):
+            rgb = [float(channel) for channel in tuple(value)[:3]]
+            while len(rgb) < 3:
+                rgb.append(0.0)
+            parts.append(f'"{key}": Color({_fmt(rgb[0])}, {_fmt(rgb[1])}, '
+                         f'{_fmt(rgb[2])}, 1.0)')
+        elif key == "bg_mode":
+            parts.append(f'"{key}": {int(value)}')
+        elif key in ("fog", "glow", "adjust"):
+            parts.append(f'"{key}": {"true" if value else "false"}')
+        else:
+            parts.append(f'"{key}": {_fmt(float(value))}')
+    return "{ " + ", ".join(parts) + " }"
+
+
+def env_zone_exports(scene, is_3d=True):
+    """区域环境点 -> .tscn 节点行 / BoxShape3D 子资源 / 告警。
+
+    返回 {"nodes": [...], "resources": [...], "warnings": [...]};
+    **没有区域标记时三样都是空的**(产物与改动前逐字节一致)。
+
+    ── 三种"不生成"的情况都写进告警 ──────────────────────────────
+    1. 预设名为空(zone_missing_preset)—— 用户建了区域忘了选预设;
+    2. 预设名找不到 —— 提示内置名,错的预设名不能生成一个"空区域"
+       (那样玩家走进去什么都没发生,比不生成更难查);
+    3. 2D 项目 —— 2D 没有 WorldEnvironment,区域无从谈起。
+    """
+    result = {"nodes": [], "resources": [], "warnings": []}
+    if scene is None:
+        return result
+    zones = markers.env_zones(scene)
+    if not zones:
+        return result
+    if not is_3d:
+        result["warnings"].append(
+            "『区域环境点』只在 3D 项目里生成 —— 这一关是 2D,"
+            "区域标记会被忽略(2D 想换氛围得自己接『音效』那类节点)")
+        return result
+    for index, obj in enumerate(zones):
+        name = markers.zone_preset(obj)
+        if not name:
+            result["warnings"].append(
+                f"『{obj.name}』是区域环境点,但『环境预设』是空的 —— "
+                f"这一片区域不会生成(在物体属性里选一个预设名)")
+            continue
+        values = env_preset_values(name)
+        if values is None:
+            result["warnings"].append(
+                f"『{obj.name}』的区域预设『{name}』找不到 —— 这一片区域不会"
+                f"生成(在侧栏环境卡里存一个预设,或用内置名:"
+                f"恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜)")
+            continue
+        # ── 节点名 = GKEnvZone_ + 物体名(消毒)──────────────────────
+        # 前缀让 Godot 场景里一眼认出"这是 Blender 的区域标记";
+        # 消毒是因为物体名可能带 `.` / `/`(Godot 拿它们当路径分隔符)。
+        node_name = markers.ENV_ZONE_PREFIX + _sanitize_node_name(obj.name)
+        shape_id = f"env_zone_shape_{index}"
+        # ── 尺寸也要做轴向换算:Blender(x, y, z) -> Godot(x, z, y) ──────
+        # 尺寸没有正负(所以不用像位置那样给 y 取负),但**轴必须换**:
+        # 一块"X/Z 很大、Y 很薄"的区域不换轴就会在 Godot 里立起来 ——
+        # 和碰撞体那边踩过的是同一个坑(见 build_collision 里的说明)。
+        bl_x, bl_y, bl_z = markers.zone_size(obj)
+        result["resources"].append(
+            f'[sub_resource type="BoxShape3D" id="{shape_id}"]\n'
+            f"size = Vector3({_fmt(bl_x)}, {_fmt(bl_z)}, {_fmt(bl_y)})")
+        # ── transform 只用世界**位置**,不带旋转 / 缩放 ─────────────
+        # zone_size() 给的是"世界轴对齐包围盒"(用户的缩放已经算进去了),
+        # 所以盒子在 Godot 里也必须是轴对齐的:
+        #   * 带上旋转 -> 盒子转过去,和那个轴对齐包围盒对不上;
+        #   * 带上缩放 -> 尺寸被乘两次(zone_size 里已经乘过 scale)。
+        # 结果就是把"用户拖出来的范围"原样搬进 Godot。
+        pos_x, pos_y, pos_z = _godot_position(obj, True)
+        result["nodes"].append(
+            f'[node name="{node_name}" type="Area3D" parent="." '
+            f'groups=["{markers.ENV_ZONE_GROUP}"]]\n'
+            f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, "
+            f"{_fmt(pos_x)}, {_fmt(pos_y)}, {_fmt(pos_z)})\n"
+            # 玩家的碰撞层用户可以改,所以区域**监听所有层**,再用
+            # `gk_player` 组筛出玩家 —— 只监听第 1 层的话,
+            # 用户把角色挪到第 3 层就"区域失效",而且完全没有报错。
+            f"collision_layer = 0\n"
+            f"collision_mask = 2147483647\n"
+            f'script = ExtResource("{ENV_ZONES_SCRIPT_ID}")\n'
+            f"zone_data = {_gd_zone_dict(values)}\n"
+            f"zone_restore = {'true' if markers.zone_restore(obj) else 'false'}\n"
+            f"zone_fade = {_fmt(markers.zone_fade(obj))}\n"
+            f"\n"
+            f'[node name="Shape" type="CollisionShape3D" '
+            f'parent="{node_name}"]\n'
+            f'shape = SubResource("{shape_id}")')
+    return result
+
+
+def level_root_exports(scene):
+    """关卡父级 -> (要生成的组节点名列表, {直接子物体名: 组节点名})。
+
+    ── 归组的是"直接子物体"(选定这一种,写清楚)────────────────────
+    只把标记物体的**直接子物体**在 .tscn 里的节点挪进组节点。再往下
+    (孙物体)不挪:glb 里 Blender 的父子关系本来就保留着,孙物体跟着
+    自己的父物体动,把它们提到组节点下面会**多一层**(它们会同时被
+    父物体和组各影响一次),这不是用户要的。
+    没有关卡父级标记时返回 ([], {})。
+
+    ── 组节点名怎么定 ──────────────────────────────────────────────
+    用物体名(消毒后)。撞上 .tscn 根下的保留名(Colliders / Particles /
+    Environment / WorldEnvironment / Navigation)或彼此重名时加
+    `markers.LEVEL_ROOT_SUFFIX` + 序号 —— 同名兄弟节点会被 Godot 自动
+    改名,用户就会看到"我明明叫这个名字,Godot 里却成了 @Node3D@2"。
+    """
+    groups = []
+    parents = {}
+    used = set()
+    for root in markers.level_roots(scene):
+        base = _sanitize_node_name(root.name)
+        name = base
+        if is_scene_root_reserved(name) or name in used:
+            name = f"{base}{markers.LEVEL_ROOT_SUFFIX}"
+        suffix = 2
+        while name in used:
+            name = f"{base}{markers.LEVEL_ROOT_SUFFIX}{suffix}"
+            suffix += 1
+        used.add(name)
+        groups.append(name)
+        try:
+            children = list(root.children)
+        except Exception:                                 # noqa: BLE001
+            children = []
+        for child in children:
+            parents[str(getattr(child, "name", ""))] = name
+    return groups, parents
+
+
+ENV_ZONES_SCRIPT = '''# 由 BlenderGameKit 自动生成 —— 『区域环境点』(Blender 里的线框标记物体)。
+#
+# 每个区域是 .tscn 里的一个 Area3D(盒子 = 标记物体的世界包围盒):
+#   * 玩家(在 gk_player 组里的节点)进入 -> 把 zone_data 这一整套环境
+#     参数应用到 WorldEnvironment.environment;
+#   * 离开 -> 还原;zone_restore = false 的区域离开时**不还原**;
+#   * 多个区域重叠:"最后一个进入的说了算";全部退出后还原成进入前的快照;
+#   * zone_fade > 0 时用 Tween 过渡,并设 TWEEN_PAUSE_PROCESS —— 暂停菜单里
+#     世界是暂停的(游戏脚本是 PROCESS_MODE_ALWAYS),过渡也要跑完。
+@tool
+extends Area3D
+
+## 这一片区域的环境参数(Blender 侧按预设名解析好写进来)
+@export var zone_data: Dictionary = {}
+## 离开时是否还原(Blender 侧『离开还原』)
+@export var zone_restore: bool = true
+## 过渡秒数(0 = 立刻切)
+@export var zone_fade: float = 0.35
+
+# ── 为什么这几份状态是 static(不是每个区域各存一份)────────────────
+# "最后一个进入的说了算"需要一张**跨区域共享**的进入顺序表:每个 Area3D
+# 只管自己进没进,单独看一个实例看不出来谁是最后一个。static 变量在同
+# 一个脚本的所有实例之间共享,正好是这个语义,也不用在场景里找个"管理器"。
+# 用无类型 Array 而不是 Array[Area3D]:元素上要读 `.zone_data` 这种脚本
+# 自己的属性,静态类型化之后 GDScript 会当成"Area3D 上没有这个成员"报错。
+static var _entered: Array = []
+static var _snapshot: Dictionary = {}
+static var _has_snapshot: bool = false
+static var _tween: Tween = null
+
+
+func _ready() -> void:
+\tbody_entered.connect(_on_body_entered)
+\tbody_exited.connect(_on_body_exited)
+
+
+func _exit_tree() -> void:
+\t# 换关 / 删区域时把自己摘出去:static 表是跨场景活着的,留着已释放的
+\t# 节点会让"最后进入的区域"指向一个死对象。
+\t_entered.erase(self)
+\tif _entered.is_empty():
+\t\t_has_snapshot = false
+
+
+func _on_body_entered(body: Node3D) -> void:
+\tif not body.is_in_group("gk_player"):
+\t\treturn
+\t_remember()
+\t_entered.erase(self)
+\t_entered.append(self)
+\t_switch(zone_data, zone_fade)
+
+
+func _on_body_exited(body: Node3D) -> void:
+\tif not body.is_in_group("gk_player"):
+\t\treturn
+\t_entered.erase(self)
+\tif not _entered.is_empty():
+\t\t# 还有别的区域在:让**最后进入的那个**继续说了算
+\t\t_switch(_entered[-1].zone_data, zone_fade)
+\telif zone_restore:
+\t\t# 全部退出:还原成"进入第一个区域之前"的那套值。
+\t\t# zone_restore = false = 这片区域要永久改掉氛围,不还原。
+\t\t_switch(_snapshot, zone_fade)
+
+
+func _remember() -> void:
+\tif _has_snapshot:
+\t\treturn
+\tvar env := _environment()
+\tif env == null:
+\t\treturn
+\t_snapshot = _values_of(env)
+\t_has_snapshot = true
+
+
+func _environment() -> Environment:
+\tif not is_inside_tree():
+\t\treturn null
+\tvar tree := get_tree()
+\tvar scene := tree.current_scene
+\tif scene == null:
+\t\t# 有些跑法没有 current_scene(自定义 MainLoop / 单元测试 / 区域被
+\t\t# 放在一个不是主场景的子树里)—— 那就从树根往下找,别让整片区域
+\t\t# 静默失灵(症状是"走进雾区什么都没发生",最难查的那种)。
+\t\tscene = tree.root
+\tif scene == null:
+\t\treturn null
+\tvar host := scene.get_node_or_null("WorldEnvironment") as WorldEnvironment
+\tif host == null:
+\t\thost = _find_host(scene)
+\tif host == null:
+\t\treturn null
+\treturn host.environment
+
+
+func _find_host(node: Node) -> WorldEnvironment:
+\t# 环境节点一般在场景根下,但用户可能把它挪进某个分组里 —— 找不到就往下找。
+\tfor child in node.get_children():
+\t\tif child is WorldEnvironment:
+\t\t\treturn child as WorldEnvironment
+\t\tvar found := _find_host(child)
+\t\tif found != null:
+\t\t\treturn found
+\treturn null
+
+
+func _values_of(env: Environment) -> Dictionary:
+\t# 快照:和 zone_data 用**同一套键**,还原时直接喂回 _apply
+\treturn {
+\t\t"bg_mode": int(env.background_mode),
+\t\t"bg": env.background_color,
+\t\t"amb": env.ambient_light_color,
+\t\t"amb_e": float(env.ambient_light_energy),
+\t\t"fog": bool(env.fog_enabled),
+\t\t"fog_c": env.fog_light_color,
+\t\t"fog_d": float(env.fog_density),
+\t\t"glow": bool(env.glow_enabled),
+\t\t"glow_i": float(env.glow_intensity),
+\t\t"glow_b": float(env.glow_bloom),
+\t\t"adjust": bool(env.adjustment_enabled),
+\t\t"br": float(env.adjustment_brightness),
+\t\t"ct": float(env.adjustment_contrast),
+\t\t"sat": float(env.adjustment_saturation),
+\t}
+
+
+func _apply(env: Environment, values: Dictionary) -> void:
+\t# 每一项都 `values.get(键, 当前值)`:zone_data 里少一个键就不动它,
+\t# 不会把用户手调的其它项清成默认值。
+\tenv.background_mode = int(values.get("bg_mode", int(env.background_mode)))
+\tenv.background_color = values.get("bg", env.background_color) as Color
+\tenv.ambient_light_color = values.get("amb", env.ambient_light_color) as Color
+\tenv.ambient_light_energy = float(values.get("amb_e", env.ambient_light_energy))
+\tenv.fog_enabled = bool(values.get("fog", env.fog_enabled))
+\tenv.fog_light_color = values.get("fog_c", env.fog_light_color) as Color
+\tenv.fog_density = float(values.get("fog_d", env.fog_density))
+\tenv.glow_enabled = bool(values.get("glow", env.glow_enabled))
+\tenv.glow_intensity = float(values.get("glow_i", env.glow_intensity))
+\tenv.glow_bloom = float(values.get("glow_b", env.glow_bloom))
+\tenv.adjustment_enabled = bool(values.get("adjust", env.adjustment_enabled))
+\tenv.adjustment_brightness = float(values.get("br", env.adjustment_brightness))
+\tenv.adjustment_contrast = float(values.get("ct", env.adjustment_contrast))
+\tenv.adjustment_saturation = float(values.get("sat", env.adjustment_saturation))
+
+
+func _switch(values: Dictionary, seconds: float) -> void:
+\tvar env := _environment()
+\tif env == null or values.is_empty():
+\t\treturn
+\tif _tween != null and _tween.is_valid():
+\t\t_tween.kill()
+\t\t_tween = null
+\tif seconds <= 0.0:
+\t\t_apply(env, values)
+\t\treturn
+\tvar from := _values_of(env)
+\t_tween = create_tween()
+\t# 暂停时过渡也要跑完(暂停菜单里世界是暂停的)
+\t_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)
+\t_tween.tween_method(_fade_step.bind(from, values), 0.0, 1.0, seconds)
+
+
+func _fade_step(ratio: float, from: Dictionary, target: Dictionary) -> void:
+\tvar env := _environment()
+\tif env == null:
+\t\treturn
+\t_apply(env, _blend(from, target, ratio))
+
+
+func _blend(from: Dictionary, target: Dictionary, ratio: float) -> Dictionary:
+\tvar out := {}
+\tfor key in target.keys():
+\t\tvar before = from.get(key, target[key])
+\t\tvar after = target[key]
+\t\tif typeof(after) == TYPE_COLOR and typeof(before) == TYPE_COLOR:
+\t\t\tout[key] = (before as Color).lerp(after as Color, ratio)
+\t\telif typeof(after) == TYPE_FLOAT and typeof(before) == TYPE_FLOAT:
+\t\t\tout[key] = lerp(float(before), float(after), ratio)
+\t\telse:
+\t\t\t# 开关类(雾开 / 泛光开 / 色调调整开)没有"半个"的状态,直接切
+\t\t\tout[key] = after
+\treturn out
+'''
+
+
 def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
                       materials_map=None, character_model=None, file_names=None,
-                      character_object=None, asset_models=None):
+                      character_object=None, asset_models=None,
+                      world_script_name=None):
     """生成主场景:模型 + 卡通材质 + 碰撞体 + 相机灯光。返回 (路径, 碰撞体数量)。
 
     结构(3D):
@@ -3834,17 +4982,24 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     path = os.path.join(export_dir, project.SCENES_DIR, f"{scene_name}.tscn")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     is_3d = str(dimension) != "2"
+    # 线框标记物体(第一百二十四轮):区域环境点的告警攒在这里,由
+    # export_assets_pipeline 收进 result["warnings"] —— 本函数返回的是
+    # (路径, 碰撞体数量),塞不进告警,和 export_scene_glb.last_notes 同一套路。
+    write_world_scene.last_warnings = []
 
     info = glb_scene_nodes(export_dir, scene_name)
     mesh_info = info.get("meshes", {})
-    if not mesh_info:
+    has_character_model = bool(character_model) and os.path.isfile(
+        os.path.join(export_dir, project.ART_DIR, f"{character_model}.glb"))
+    from .persistent_player import default_player
+    if not mesh_info and not has_character_model and default_player() is None:
         return None, 0
 
     # glb 实例本身
-    ext_lines = [
+    ext_lines = ([
         f'[ext_resource type="PackedScene" '
         f'path="res://{project.ART_DIR}/{scene_name}.glb" id="1_world"]'
-    ]
+    ] if mesh_info else [])
 
     use_script = bool(script_name and script_target_name)
     script_id = None
@@ -3854,9 +5009,18 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                          f'path="res://{project.SCRIPTS_DIR}/{script_name}" '
                          f'id="{script_id}"]')
 
+    # 世界/关卡逻辑脚本(第一百一十九轮):挂在场景根节点上,和角色脚本分开。
+    use_world_script = bool(world_script_name)
+    world_script_id = None
+    if use_world_script:
+        world_script_id = "gk_world_script"
+        ext_lines.append(
+            f'[ext_resource type="Script" '
+            f'path="res://{project.SCRIPTS_DIR}/{world_script_name}" '
+            f'id="{world_script_id}"]')
+
     # 角色自己的 glb(让角色节点自带网格,见上面 character_model 的说明)
-    use_character_model = bool(character_model) and os.path.isfile(
-        os.path.join(export_dir, project.ART_DIR, f"{character_model}.glb"))
+    use_character_model = has_character_model
     if use_character_model:
         ext_lines.append(f'[ext_resource type="PackedScene" '
                          f'path="res://{project.ART_DIR}/{character_model}.glb" '
@@ -3925,13 +5089,23 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # 那两行之后它们就被写进文件了(节点文本可以慢慢加,资源不行)。
     fx_blocks = []
     fx_needs_container = False
+    # ── 关卡父级(本轮):先算出"哪些物体的物理体被挪到组节点下"──────
+    # 粒子发射器挂在物体自己的物理体下面,所以它必须跟着**同一个路径**走 ——
+    # 不然会出现"物体被挪进组里、粒子还留在 Colliders 下"(父路径不存在,
+    # Godot 直接把那个节点丢掉)。
+    root_groups, body_parents = level_root_exports(scene)
+    body_parent_paths = {}
+    for entry_obj in bodies:
+        key = _sanitize_node_name(entry_obj[0].name)
+        body_parent_paths[key] = body_parents.get(str(entry_obj[0].name),
+                                                  "Colliders")
     emitter_entries = collect_emitters(scene) if scene is not None else []
-    body_node_names = {_sanitize_node_name(entry[0].name) for entry in bodies}
     for index, (emitter, fx) in enumerate(emitter_entries):
         node_name = _sanitize_node_name(emitter.name)
         texture_id = f"fx_tex{index}"
-        attach = node_name in body_node_names
-        parent = f"Colliders/{node_name}" if attach else "Particles"
+        body_parent = body_parent_paths.get(node_name)
+        attach = body_parent is not None
+        parent = f"{body_parent}/{node_name}" if attach else "Particles"
         if not attach:
             fx_needs_container = True
         built = build_emitter(emitter, fx, is_3d, uid=index,
@@ -3994,6 +5168,25 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         # 21 vs 21)。见 ensure_occlusion_culling 的说明。
         ensure_occlusion_culling(export_dir)
 
+    # ---- 区域环境点(第一百二十四轮:线框标记物体)----
+    # 没有区域标记时下面整块都不进 —— 产物与改动前逐字节一致。
+    # ⚠ ext_lines / sub_resources 必须在下面的 `load_steps` **之前**填完
+    # (那两行之后它们就被写进文件了),节点文本可以慢慢拼。
+    zone_exports = env_zone_exports(scene, is_3d)
+    write_world_scene.last_warnings.extend(zone_exports["warnings"])
+    if zone_exports["nodes"]:
+        sub_resources.extend(zone_exports["resources"])
+        ext_lines.append(f'[ext_resource type="Script" '
+                         f'path="{ENV_ZONES_SCRIPT_RES}" '
+                         f'id="{ENV_ZONES_SCRIPT_ID}"]')
+        # 区域脚本必须真的落盘:节点的 `script = ExtResource("env_zones")`
+        # 指向它,不写的话 Godot 直接 "Can't load resource ... env_zones",
+        # 整个场景打不开(不是"少个功能"那种程度)。
+        zone_script = os.path.join(export_dir, ENV_ZONES_SCRIPT_REL)
+        os.makedirs(os.path.dirname(zone_script), exist_ok=True)
+        with open(zone_script, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(ENV_ZONES_SCRIPT)
+
     load_steps = 1 + len(ext_lines) + len(sub_resources)
 
     lines = ["; 由 BlenderGameKit 自动生成,请勿手动修改",
@@ -4019,8 +5212,16 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # glb 的网格没有按 `文件.glb/网格名` 这种形式暴露成可引用的资源。
     #
     # 所以还是 instance 整个 glb:几何、层级、变换都由它负责,一定是对的。
-    lines.append(f'[node name="{scene_name}" '
-                 f'instance=ExtResource("1_world")]')
+    if mesh_info:
+        lines.append(f'[node name="{scene_name}" '
+                     f'instance=ExtResource("1_world")]')
+    else:
+        lines.append(f'[node name="{scene_name}" type="'
+                     f'{"Node3D" if is_3d else "Node2D"}"]')
+    if use_world_script:
+        # 世界/关卡逻辑挂在场景根节点上(第一百一十九轮)—— 它是 glb 实例,
+        # 脚本直接写在根节点这一行下面即可(和角色场景根节点挂脚本同一套)。
+        lines.append(f'script = ExtResource("{world_script_id}")')
     lines.append("")
 
     # ── 材质:交给运行时脚本挂 ──────────────────────────────────────
@@ -4091,6 +5292,15 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         with open(target, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
 
+    # ---- 关卡父级(第一百二十四轮):分组节点必须先声明,子节点才挂得上 ----
+    # 组节点**不写 transform**(留单位变换):下面每个物理体的 transform 是
+    # **世界坐标**,组上再带一次标记物体的变换就摆两次(和角色 Model 节点
+    # 要抵消 glb 根变换是同一个坑)。用户在 Godot 里挪这个组 = 整组一起挪,
+    # 这正是"关卡父级"的用途。
+    for group_name in root_groups:
+        lines.append(f'[node name="{group_name}" type="Node3D" parent="."]')
+        lines.append("")
+
     # ---- 碰撞体 ----
     if bodies:
         lines.append('[node name="Colliders" type="Node3D" parent="."]')
@@ -4099,6 +5309,12 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         # (层 1 也写 —— 否则层 1 的网格会把层 2 的几何一起烤进去)。
         multi_nav = nav_layers_active(scene)
         for obj, physics, built, shape_id, position, piece_entries in bodies:
+            # 这个物体在 .tscn 里的节点名 / 父路径 —— 关卡父级(本轮)会把
+            # 直接子物体的物理体挪到组节点下,所以**所有**子节点路径都从
+            # 这里算一次,别在下面各处再写一遍 "Colliders/名字"。
+            node_name = _sanitize_node_name(obj.name)
+            body_parent = body_parents.get(str(obj.name), "Colliders")
+            self_path = f"{body_parent}/{node_name}"
             # 节点类型和脚本基类必须由**同一个函数**决定 ——
             # 各算各的就会出现"节点是 CharacterBody3D、脚本却 extends X"
             # 这类错配。而且直接读 physics.body_type 在没有物理设置时
@@ -4140,8 +5356,8 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 # StaticBody 互斥,不会和上面的导航组撞上。
                 nav_group = hide_spot_group_header(physics)
 
-            lines.append(f'[node name="{_sanitize_node_name(obj.name)}" '
-                         f'type="{body_type}" parent="Colliders"'
+            lines.append(f'[node name="{node_name}" '
+                         f'type="{body_type}" parent="{body_parent}"'
                          f'{nav_group}]')
             if attach_model:
                 # ── 位置由**角色节点**说了算,glb 里那份重复的偏移用逆变换抵消 ──
@@ -4200,7 +5416,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 lines.append("")
                 shape_type_name = "CollisionShape3D" if is_3d else "CollisionShape2D"
                 lines.append(f'[node name="Collision" type="{shape_type_name}" '
-                             f'parent="Colliders/{_sanitize_node_name(obj.name)}"]')
+                             f'parent="{self_path}"]')
                 lines.append(f'shape = SubResource("{shape_id}")')
                 # ── 形状落在"包围盒中心"(本轮修复:这句以前整个被漏掉了)──
                 # 原点在脚底的模型(大量导入模型如此),不写这句的话形状以
@@ -4212,19 +5428,18 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 lines.append("")
                 # 子物体碰撞块:和主 Collision 同级各来一个(头/身/腿…)
                 lines.extend(_collision_piece_node_lines(
-                    piece_entries, is_3d, obj.name))
+                    piece_entries, is_3d, obj.name, self_path))
                 # 动态障碍(第八十三轮):勾了『动态障碍』就多挂一个
                 # NavigationObstacle 子节点 —— 勾了『避障』的角色实时绕开它
                 lines.extend(nav_obstacle_node_lines(
-                    physics, is_3d, _sanitize_node_name(obj.name)))
+                    physics, is_3d, node_name, self_path))
                 # ── 网格的重复偏移在这里抵消 ──────────────────────────────
                 # Model 拿到 glb 根节点变换的**逆**,于是
                 #     角色节点变换 × 逆 × glb 根节点变换 = 角色节点变换
                 # 网格正好落在角色节点(以及碰撞体)所在的位置上。
                 # 不抵消的话网格会被摆两次 —— 实测落在 (0, 1.8, 22),
                 # 跑出场地外,相机绕着"空点"转,看起来就是"角色位置不对"。
-                lines.append(f'[node name="Model" parent="Colliders/'
-                             f'{_sanitize_node_name(obj.name)}" '
+                lines.append(f'[node name="Model" parent="{self_path}" '
                              f'instance=ExtResource("{model_id}")]')
                 inverse = _glb_root_inverse_transform(export_dir, model_glb,
                                                       obj, is_3d)
@@ -4269,7 +5484,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             lines.append("")
             shape_type = "CollisionShape3D" if is_3d else "CollisionShape2D"
             lines.append(f'[node name="Collision" type="{shape_type}" '
-                         f'parent="Colliders/{_sanitize_node_name(obj.name)}"]')
+                         f'parent="{self_path}"]')
             lines.append(f'shape = SubResource("{shape_id}")')
             # 形状落在"包围盒中心"(本轮修复:这句以前整个被漏掉了,
             # 原点在脚底的模型会一半埋进地里)
@@ -4279,11 +5494,11 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             lines.append("")
             # 子物体碰撞块:和主 Collision 同级各来一个
             lines.extend(_collision_piece_node_lines(piece_entries, is_3d,
-                                                     obj.name))
+                                                     obj.name, self_path))
             # 动态障碍(第八十三轮):勾了『动态障碍』就多挂一个
             # NavigationObstacle 子节点 —— 勾了『避障』的角色实时绕开它
             lines.extend(nav_obstacle_node_lines(
-                physics, is_3d, _sanitize_node_name(obj.name)))
+                physics, is_3d, node_name, self_path))
 
     # ---- 粒子节点落位(容器要先声明,子节点才挂得上)----
     if fx_blocks:
@@ -4315,6 +5530,13 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # 环境与后处理(第四十九轮):WorldEnvironment + Environment 子资源
     if env_node:
         lines.append(env_node.strip("\n"))
+    from .persistent_player import spawn_node
+    lines.append(spawn_node(scene))
+    # 区域环境点(第一百二十四轮):每个区域一个 Area3D + 一个盒子形状。
+    # 没有标记时 zone_exports["nodes"] 是空表,这一段什么都不写。
+    for zone_block in zone_exports["nodes"]:
+        lines.append(zone_block)
+        lines.append("")
     for occ_node in occ_nodes:
         lines.append(occ_node)
         lines.append("")
@@ -4434,7 +5656,7 @@ def glb_object_names(export_dir, model_name="World"):
 
 
 def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
-                            material_files=None):
+                            material_files=None, material_only=False):
     """决定相机和灯怎么处理。返回 (节点文本, 需要写的文件, 相机名)。
 
     节点文本里如果需要 ext_resource(id="env_script"),调用方要把它写出来。
@@ -4453,6 +5675,15 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     """
     if scene is None:
         return "", {}, ""
+    if material_only:
+        # A character instance inherits the level's cameras, lights and audio.
+        # Duplicating those here doubles illumination and creates stale cameras.
+        fields = dict(ENV_SCRIPT_DEFAULTS)
+        fields.update(camera_name="", fov="0.0", esc_quit="false",
+                      materials=_material_table(material_files),
+                      follow_scene_light="true" if _toon_follow_light(scene) else "false")
+        return (ENVIRONMENT_NODE.format(**fields),
+                {env_script_rel(scene_name): ENVIRONMENT_SCRIPT.format(**fields)}, "")
     if not is_3d:
         # ── 2D(第三十六轮:2D 寻路)────────────────────────────────────
         # 2D 场景也要一份环境脚本 —— **导航烘焙**就在它里面(2D 的碰撞体
@@ -4533,23 +5764,32 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     # ---- 情况 2:glb 里没有,得自己补 ----
     camera_name = ""
     fov_for_env = 0.0
+    from .exporter import resolve_main_camera
+    main_camera, _reason = resolve_main_camera(scene)
     for obj in scene.objects:
         if obj.type != "CAMERA" or obj.hide_get():
+            continue
+        from .persistent_player import owns
+        if owns(obj):
             continue
         position = _godot_position(obj, True)
         fov = 70.0
         try:
-            fov = float(obj.data.angle_x) * _DEG
+            render = getattr(scene, "render", None)
+            aspect = (float(getattr(render, "resolution_y", 1080)) /
+                      max(1.0, float(getattr(render, "resolution_x", 1920))))
+            fov = math.degrees(2.0 * math.atan(math.tan(float(obj.data.angle_x) / 2.0) * aspect))
         except Exception:
             pass
-        camera_name = _sanitize_node_name(obj.name)
-        fov_for_env = fov
+        name = _sanitize_node_name(obj.name)
+        if obj.name == main_camera or not camera_name:
+            camera_name = name
+            fov_for_env = fov
         parts.append(ENVIRONMENT_CAMERA.format(
-            name=camera_name,
+            name=name,
             basis=_camera_basis_text(obj),
             cx=_fmt(position[0]), cy=_fmt(position[1]), cz=_fmt(position[2]),
-            fov=fov))
-        break       # 只补一个
+            fov=fov, current="true" if obj.name == main_camera else "false"))
 
     if not glb_has_light:
         # 第四十八轮:全部类型、全部盏(见上面 _collect_lights 的说明);
@@ -4741,15 +5981,14 @@ def _light_energy_for(obj):
 
     ── 两套单位,两条规则(都写在这,别去猜)──────────────────────
     太阳:Blender 的 energy 是辐照度(新建默认 1.0),Godot 平行光默认也是
-          1.0,但实测 1.0 在 Godot 里偏暗 —— 沿用老的 ×1.2、夹 [0.2, 4.0]。
-    点光 / 聚光:Blender 是**瓦特**(新建一盏默认 1000W),Godot 是倍数
-          (默认 1.0)—— 约定 **1000W ≈ 1.0**,夹 [0.05, 8.0]。
-          想微调就直接改 Blender 里的瓦数,或者导出后在 Godot 里改。
+          1.0,沿用 ×1.2 的标定比例。
+    点光 / 聚光:Blender 是瓦特，Godot 是倍数，沿用 1000W ≈ 1.0。
+    保留完整强度范围，避免暗灯被抬亮、亮灯被截断。两套引擎的单位仍需标定。
     """
     energy = float(getattr(obj.data, "energy", 1.0) or 0.0)
     if str(getattr(obj.data, "type", "")) == "SUN":
-        return max(0.2, min(energy * 1.2, 4.0))
-    return max(0.05, min(energy / 1000.0, 8.0))
+        return max(0.0, energy * 1.2)
+    return max(0.0, energy / 1000.0)
 
 
 def _light_node_text(obj):
@@ -4829,6 +6068,9 @@ def _collect_lights(scene):
     lights = []
     for obj in getattr(scene, "objects", ()) or ():
         if getattr(obj, "type", "") != "LIGHT" or obj.hide_get():
+            continue
+        from .persistent_player import owns
+        if owns(obj):
             continue
         if _light_node_text(obj) is None:
             continue
@@ -4948,9 +6190,22 @@ def _collider_dims(sub_text):
     radius = float(found[0]) if found else 0.0
     found_h = re.findall(r"-?\d+\.?\d*", numbers.get("height", ""))
     height = float(found_h[0]) if found_h else radius * 2.0
-    # 胶囊总高 = 圆柱段 + 两端半球;球就是 2r
-    return sorted((radius * 2.0, max(height, radius * 2.0), radius * 2.0),
-                  reverse=True)
+    # ── 胶囊:半径会被引擎夹细,总高就是 height(第 125 轮纠正)────────
+    # 这里前后错过**两次**,把两次的真机依据都留在这儿,别再改回去:
+    #   第一版 `max(height, radius*2)` —— 把 height 当成"圆柱段",
+    #        于是 0.8 的球被读成 1.8(虚报大),这条"碰撞体比网格小"的
+    #        告警**从来没响过**;
+    #   第二版 `max(height, 2r) + 2r` —— 又加了一遍 2r,同样虚报。
+    # 真相(Godot 4.7.2 实测):`CapsuleShape3D.height` **是总高**,
+    # 而且引擎强制 `height >= 2 * radius` —— 写 `radius=0.5 / height=0.8`
+    # 会被改成 `radius=0.4 / height=0.8`,实际外形 (0.8, 0.8, 0.8)。
+    # 所以:先按引擎的规则把半径夹一遍,总高就是 height 本身。
+    # 球只有半径,没有"总高"这回事(别跟着加 2r)。
+    if "Capsule" in sub_text:
+        radius = min(radius, height * 0.5)
+    else:
+        height = radius * 2.0
+    return sorted((radius * 2.0, height, radius * 2.0), reverse=True)
 
 
 def colliders_that_mismatch_mesh(scene, min_ratio=0.8):
@@ -4978,7 +6233,7 @@ def colliders_that_mismatch_mesh(scene, min_ratio=0.8):
     for obj, physics, enabled in collect_physics(scene):
         if not enabled or getattr(obj, "type", "") != "MESH":
             continue
-        if obj.get(PREVIEW_MARK):
+        if is_preview_object(obj):
             continue
         built = build_collision(obj, True, physics)
         if built is None:
@@ -5233,7 +6488,9 @@ def guess_collision_shape(obj, is_3d=True, prefer_character=False):
         return "box"
     # 细长:一个方向明显更长,另两个方向接近 -> 胶囊(人形、柱子)
     if long_ratio > 1.35 and mid_ratio <= 1.35:
-        return "capsule"
+        # Capsules are exported upright. A horizontal beam must not become an
+        # upright capsule whose radius spans the whole room.
+        return "capsule" if is_3d and abs(size[2]) >= a - 1e-6 else "box"
     # ── 角色优先给胶囊(用户 2026-10-03:"示例那里有些还要自己填")────
     # 三边接近时包围盒分不出球和方盒,默认给球。但**角色**给球是错的:
     # 球会滚、而且会"坐在"地面接触点上(看起来悬空/打滑)。
@@ -5648,7 +6905,29 @@ def build_collision(obj, is_3d=True, physics=None):
         params = {
             "x": _fmt(half[0] * 2.0), "y": _fmt(half[1] * 2.0),
             "z": _fmt(half[2] * 2.0),
-            "r": _fmt(radius), "h": _fmt(max(height, radius * 2.0)),
+            # ── 胶囊:写**网格高**就是对的(第 125 轮真机纠正)──────────
+            # 第 124 轮我在这里写了 `height - 2*radius`,理由是"Godot 的
+            # CapsuleShape3D.height 是总高,所以要减掉两端半球"。
+            # **那个理由对,结论错** —— 正因为它是总高,才应该**直接写网格高**;
+            # 减掉 2r 反而让它矮了 2r。
+            #
+            # 真机数字(Godot 4.7.2,引擎语义实验,与插件无关):
+            #   radius=0.5 / height=0.8 -> 引擎把 height 夹到 >= 2r,
+            #        最终 radius=0.4 / height=0.8,AABB **(0.8, 0.8, 0.8)**
+            #        —— 一个 1.8 米的角色拿到一个 0.8 米的**球**;
+            #        把它放到走廊地板上停在 y=0.4004;
+            #   radius=0.5 / height=1.8 -> AABB **(1.0, 1.8, 1.0)**,
+            #        与网格逐轴一致,停在地板上 y=0.9002。
+            # 用户原话:"你好像把角色碰撞往下移动了，应该是包合住角色模型的，
+            # 然后就导致后面的原因？" —— 用户判断正确,这就是根因:
+            # 碰撞体比模型矮 1 米 -> 模型下半身陷进地板(视觉穿模),
+            # 而且 28 个胶囊碰撞体全中招(怪物 2.0->0.6、柜子 3.2->1.2 …),
+            # 连"躲进柜子"的触发区都够不着玩家,AI 判定跟着失效。
+            #
+            # 2D 的 CapsuleShape2D.height 同样是总高(实测),
+            # 所以这一行走同一个值。圆柱/盒子的 height 本来就是真实高度,不动。
+            "r": _fmt(radius),
+            "h": _fmt(max(height, radius * 2.0)),
         }
         # ── 凸包:按网格真实外形(用户本轮选的"手动选凸包")────────────
         # 尺寸参数对它没用 —— 点集本身就是形状。点取**局部坐标凸包**
@@ -5875,19 +7154,23 @@ def _position_line(offset, is_3d=True):
     return f"position = Vector2({_fmt(values[0])}, {_fmt(values[1])})"
 
 
-def _collision_piece_node_lines(entries, is_3d, owner_name):
+def _collision_piece_node_lines(entries, is_3d, owner_name, parent_path=None):
     """碰撞块的 Collision 节点行 —— 和主 Collision 同级。
 
     entries: [(块, built, shape_id, offset_godot), ...]
     名字用 Collision2 / Collision3…:Godot 的兄弟节点不许重名,用序号
     最稳(中文 / 特殊字符的块名不能直接当节点名)。
+
+    `parent_path` = 宿主节点在 .tscn 里的完整路径(关卡父级归组时是
+    `组名/物体名`);不给就按老规矩 `Colliders/宿主名`。
     """
     lines = []
     shape_type = "CollisionShape3D" if is_3d else "CollisionShape2D"
+    path = parent_path or f"Colliders/{_sanitize_node_name(owner_name)}"
     for order, (_piece, _built, shape_id, offset) in enumerate(entries,
                                                               start=2):
         lines.append(f'[node name="Collision{order}" type="{shape_type}" '
-                     f'parent="Colliders/{_sanitize_node_name(owner_name)}"]')
+                     f'parent="{path}"]')
         lines.append(f'shape = SubResource("{shape_id}")')
         position_line = _position_line(offset, is_3d)
         if position_line:
@@ -5907,8 +7190,21 @@ def collect_physics(scene):
     if scene is None:
         return []
     out = []
+    # `owns()` 逐物体问一遍"这属不属于默认角色" —— 默认角色解析一次就够
+    # (每次重算在几百个物体的场景里是 O(物体数²))。
+    from .persistent_player import default_player, owns
+    player = default_player()
     for obj in scene.objects:
-        if is_helper_physics(obj):
+        if is_helper_physics(obj) or is_preview_object(obj):
+            continue
+        # ── 线框标记物体不是场景内容(第一百二十四轮)────────────────
+        # 出生点 / 区域环境点 / 关卡父级只是"给插件看的标记":网格是线框、
+        # 没有材质,不该生成碰撞体也不该进 glb(否则 Godot 里会冒出一个
+        # 实心方块,正好罩住玩家出生点)。区域自己那个 Area3D 由
+        # env_zone_exports 单独生成,不走这条路。
+        if is_marker_object(obj):
+            continue
+        if owns(obj, player):
             continue
         physics = getattr(obj, "gk_physics", None)
         # 以前这里有个"是否导出"的开关,后来按用户要求删掉了:
@@ -5969,7 +7265,7 @@ def collect_emitters(scene):
         return []
     out = []
     for obj in scene.objects:
-        if is_helper_physics(obj) or obj.get(PREVIEW_MARK):
+        if is_helper_physics(obj) or is_preview_object(obj):
             continue
         fx = getattr(obj, "gk_fx", None)
         if fx is None or not getattr(fx, "enabled", False):
@@ -6377,10 +7673,16 @@ def scene_materials(scene, enabled_only=True, file_names=None):
     out = {}
     if scene is None:
         return out
+    if not getattr(getattr(scene, "gk_settings", None), "toon_materials", True):
+        return out
     for obj in scene.objects:
         if getattr(obj, "type", "") != "MESH":
             continue
-        if obj.get(PREVIEW_MARK) or is_helper_physics(obj) or is_collision_piece(obj):
+        if is_preview_object(obj) or is_helper_physics(obj) or is_collision_piece(obj):
+            continue
+        # 线框标记物体(第一百二十四轮)不进材质表:它的网格根本不进 glb,
+        # 表里留一条只会让运行时刷"没找到网格节点"的告警。
+        if is_marker_object(obj):
             continue
         # 『不显示本体网格』的粒子发射器:网格**刻意不进**世界 glb,
         # 材质表里留一条只会让运行时刷"没找到网格节点"的告警。
@@ -6520,15 +7822,18 @@ def cull_shader_source(base_text):
     return base_text.replace(_BASE_RENDER_MODE, _CULL_RENDER_MODE, 1)
 
 
-def write_cull_shader(export_dir, shader_res_dir="shaders"):
+def write_cull_shader(export_dir, shader_res_dir="shaders", scene_lit=False):
     """把剔面变体写进项目(有材质勾了剔除时才调)。返回写出的路径。"""
-    source = os.path.join(shader_source_dir(), _TOON_SHADER)
+    source = os.path.join(shader_source_dir(),
+                          "gk_toon_lit.gdshader" if scene_lit else _TOON_SHADER)
     with open(source, "r", encoding="utf-8") as handle:
         text = handle.read()
-    target = os.path.join(export_dir, shader_res_dir, CULL_SHADER_NAME)
+    target = os.path.join(export_dir, shader_res_dir,
+                          "gk_toon_lit_cull.gdshader" if scene_lit else CULL_SHADER_NAME)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(cull_shader_source(text))
+        handle.write(text.replace("cull_disabled;", "cull_back;", 1)
+                     if scene_lit else cull_shader_source(text))
     return target
 
 
@@ -6539,11 +7844,11 @@ def derived_shader_names():
     不把派生名并进去的话,项目里这个文件会被当成"用户自己放的东西",
     勾选取消之后也永远删不掉(实测过同类的残留问题)。
     """
-    return (CULL_SHADER_NAME,)
+    return (CULL_SHADER_NAME, "gk_toon_lit_cull.gdshader")
 
 
 def write_npr_material(export_dir, material, shader_res_dir="shaders",
-                       file_name=None):
+                       file_name=None, scene_lit=False):
     """把 Blender 里的 NPR 预览材质导出成 Godot 的 .tres。
 
     这是"在 Blender 里调参"能成立的关键一步:参数存在材质自定义属性上,
@@ -6567,10 +7872,10 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders",
     name = file_name or safe_name(material.name, "material")
     texture = _base_color_texture(material)
     # 背面剔除(第九十四轮):勾了的材质换剔面版着色器(顺手把变体写进项目)
-    shader_name = _TOON_SHADER
+    shader_name = "gk_toon_lit.gdshader" if scene_lit else _TOON_SHADER
     if material_culls_backfaces(material):
-        shader_name = CULL_SHADER_NAME
-        write_cull_shader(export_dir, shader_res_dir)
+        shader_name = "gk_toon_lit_cull.gdshader" if scene_lit else CULL_SHADER_NAME
+        write_cull_shader(export_dir, shader_res_dir, scene_lit=scene_lit)
 
     textures_block = ""
     albedo_ref = "null"
@@ -6651,6 +7956,8 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders",
     for uniform, value in params.items():
         if isinstance(value, (tuple, list)):
             r, g, b = float(value[0]), float(value[1]), float(value[2])
+            if scene_lit:
+                r, g, b = (godot_look.linear_to_srgb(v) for v in (r, g, b))
             lines.append(
                 f"shader_parameter/{uniform} = Color({r:.6f}, {g:.6f}, {b:.6f}, 1)"
             )
@@ -6673,6 +7980,38 @@ def _scene_prefix(scene_name):
     return "" if scene_name == "World" else f"{scene_name}_"
 
 
+def _scene_toon_style_fields(settings):
+    """场景级全局卡通风格(第一百一十五轮阶段 B)-> TOON_MATERIAL_TEMPLATE
+    的 .format 参数字典。
+
+    『显示_画面风格』卡勾了『全局卡通风格』时,这些值作为**默认**写进
+    没有自己调过参数的材质 .tres —— 等于"整关一键定风格",不用逐材质调。
+    没开 / 拿不到设置时返回**老默认值**,老项目产物一字不变。
+    """
+    fields = {
+        "shadow_step": 0.1, "three_tone": 0.0,
+        "st_r": 0.706, "st_g": 0.627, "st_b": 0.902,
+        "specular": 0.0, "rim": 0.0,
+    }
+    if settings is None or not bool(getattr(settings, "style_enabled", False)):
+        return fields
+    try:
+        fields["shadow_step"] = float(
+            getattr(settings, "style_shadow_step", 0.1))
+        fields["three_tone"] = float(
+            getattr(settings, "style_three_tone", 0.0))
+        fields["specular"] = float(getattr(settings, "style_specular", 0.0))
+        fields["rim"] = float(getattr(settings, "style_rim", 0.0))
+        tint = getattr(settings, "style_shadow_tint", None)
+        if tint is not None:
+            fields["st_r"] = float(tint[0])
+            fields["st_g"] = float(tint[1])
+            fields["st_b"] = float(tint[2])
+    except (TypeError, ValueError, IndexError):
+        pass
+    return fields
+
+
 def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
     """给每个 Blender 材质生成一份 Godot 卡通材质。返回 [(材质名, 文件路径, 有无贴图)]。
 
@@ -6691,11 +8030,13 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
         _settings = getattr(_scene, "gk_settings", None) if _scene else None
         if _settings is not None and not getattr(_settings, "toon_materials",
                                                  True):
-            print("[GK] 卡通材质已关闭 —— 按原样导出材质(PBR),"
-                  "运行画面会和 Blender 预览一致")
+            print("[GK] 卡通材质已关闭，导出原始 PBR 材质与贴图")
             return []
+        style_fields = _scene_toon_style_fields(_settings)
+        scene_lit = _toon_follow_light(_scene)
     except Exception:
-        pass
+        style_fields = _scene_toon_style_fields(None)
+        scene_lit = False
 
     if objects is None:
         import bpy
@@ -6703,7 +8044,7 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
         scene = getattr(bpy.context, "scene", None)
         objects = [obj for obj in (scene.objects if scene else [])
                    if getattr(obj, "type", "") == "MESH"
-                   and not obj.get(PREVIEW_MARK)
+                   and not is_preview_object(obj)
                    and not is_helper_physics(obj)
                    and not is_collision_piece(obj)]
 
@@ -6736,26 +8077,33 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
                 continue
             name = file_names[material.name]
             rgb = _base_color_rgb(material)
+            if scene_lit:
+                # Blender stores linear colours; source_color uniforms expect sRGB.
+                rgb = tuple(godot_look.linear_to_srgb(v) for v in rgb)
             texture = _base_color_texture(material)
             # ── 有 NPR 参数的材质:走**完整**导出(第一百零一轮)────────
-            # 用户侧栏『卡通材质』调过高光(或点过『生成预览材质』)之后,
-            # 材质上就带着这一套自定义属性。老模板里 `specular_amount` 是
-            # 写死的 0.0 —— 那些材质在这儿会**永远没有高光**,更别说贴图。
-            # 所以这类材质改走 write_npr_material:按参数写全 + 带上两张
-            # 高光贴图。没有这些属性的老材质**一个字都不变**(还是老模板)。
-            if npr_preview.has_param(material, "specular_amount"):
+            # 用户侧栏『卡通材质』调过**任何一个**风格参数(高光 / 色阶 /
+            # 阴影色 / rim / 三段明暗…)之后,材质上就带着对应的自定义
+            # 属性。老模板里这些值是写死的默认(比如 specular_amount 恒 0),
+            # 那些材质在这儿会**永远丢失用户调过的风格**。
+            # 所以"有任何 NPR 参数"就走 write_npr_material:按参数写全 +
+            # 带上高光贴图。没有这些属性的老材质**一个字都不变**(还是老模板)。
+            # ⚠ 第一百一十三轮:以前只看 `specular_amount` 一个键 —— 用户
+            #   只调了明暗分界 / 阴影色时风格会静默丢失,改成 has_any_param。
+            if npr_preview.has_any_param(material):
                 npr_path, _count = write_npr_material(
-                    export_dir, material, shader_res_dir, file_name=name)
+                    export_dir, material, shader_res_dir, file_name=name,
+                    scene_lit=scene_lit)
                 if npr_path:
                     written.append((material.name, npr_path, bool(texture)))
                     continue
             # 背面剔除(第九十四轮):Blender 材质勾了『背面剔除』-> 这个
             # .tres 引用剔面版着色器;没勾的照旧双面(老项目产物一字不变)。
-            shader_name = _TOON_SHADER
+            shader_name = "gk_toon_lit.gdshader" if scene_lit else _TOON_SHADER
             if material_culls_backfaces(material):
-                shader_name = CULL_SHADER_NAME
+                shader_name = "gk_toon_lit_cull.gdshader" if scene_lit else CULL_SHADER_NAME
                 if not cull_written:
-                    write_cull_shader(export_dir, shader_res_dir)
+                    write_cull_shader(export_dir, shader_res_dir, scene_lit=scene_lit)
                     cull_written = True
 
             textures_block = ""
@@ -6777,6 +8125,7 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
                 r=rgb[0], g=rgb[1], b=rgb[2],
                 albedo_ref=albedo_ref,
                 use_texture=1.0 if texture else 0.0,
+                **style_fields,
             )
             path = os.path.join(export_dir, project.MATERIALS_DIR, f"{name}.tres")
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -7214,7 +8563,11 @@ def meshes_without_material(scene):
     for obj in scene.objects:
         if getattr(obj, "type", "") != "MESH":
             continue
-        if obj.get(PREVIEW_MARK) or is_helper_physics(obj) or is_collision_piece(obj):
+        if is_preview_object(obj) or is_helper_physics(obj) or is_collision_piece(obj):
+            continue
+        # 线框标记物体(第一百二十四轮):网格刻意不进 glb、也没有材质 ——
+        # 报"这个物体没材质"是误报(用户会去找一个根本不该有材质的标记)。
+        if is_marker_object(obj):
             continue
         if not obj.data.materials:
             out.append(obj.name)
@@ -7497,7 +8850,7 @@ def _base_class_for(scene, obj, dimension="3"):
 
 
 def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
-                           scene_name="World"):
+                           scene_name="World", world_script_name=None):
     """完整的资产导出流程:整场景 glb -> 材质 -> 包装场景 -> 角色场景。
 
     返回一个结果字典,不抛异常(出错时把错误放进 "error"),
@@ -7759,6 +9112,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
             file_names=by_material,
             character_object=script_target,
             asset_models=asset_models,
+            world_script_name=world_script_name,
         )
         result["written"].append(world_scene)
         # 环境脚本也是这次导出的产物(写在 write_world_scene 里),
@@ -7767,6 +9121,23 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         if os.path.isfile(env_file) and env_file not in result["written"]:
             result["written"].append(env_file)
         result["bodies"] = body_count
+        # ── 线框标记物体的告警(第一百二十四轮)────────────────────────
+        # 区域环境点缺预设 / 预设名找不到 / 2D 里放了区域 —— write_world_scene
+        # 返回的是 (路径, 数量),塞不进告警,所以它把告警挂在函数属性上,
+        # 这里收进导出报告(和 export_scene_glb.last_notes 同一套路)。
+        for message in getattr(write_world_scene, "last_warnings", ()) or ():
+            if message not in result["warnings"]:
+                result["warnings"].append(message)
+        # 区域脚本也是这次导出的产物:记账给旧文件清理用 —— 不记的话
+        # 下一轮导出会把它当旧残留删掉(自毁)。
+        zone_script = os.path.join(directory, ENV_ZONES_SCRIPT_REL)
+        if os.path.isfile(zone_script) and zone_script not in result["written"]:
+            result["written"].append(zone_script)
+        # 默认角色"自动识别"的告警(多个 3D 角色体 / 没在设置里指定)
+        from .persistent_player import take_infer_warnings
+        for message in take_infer_warnings():
+            if message not in result["warnings"]:
+                result["warnings"].append(message)
         if world_scene is None:
             # 整场景 glb 里**一个网格都没有**(比如场景里只有一个角色,而角色
             # 自己走单独 glb)时 write_world_scene 会静默跳过 —— 结果是
@@ -7991,6 +9362,23 @@ def export_all_scenes(directory, dimension=None, script_name=None):
     original_main = _project_main_scene(directory)
     # 导出前记住用户正在看哪个场景 —— 循环里会一个个切过去,结束时还回去
     original_active = _active_scene()
+    # ── 类名去重(第一百一十一轮,真机报错逼出来的)──────────────────
+    # GDScript 的 `class_name` 是**全工程唯一**的。两个关卡都填了同一个类名
+    # (复制关卡时最常见)时,Godot 会对后一个脚本直接报
+    #     Class "X" hides a global script class
+    # —— 那是**整个工程**级的报错,用户看到的是"游戏跑不起来"。
+    # 这里按导出顺序认名额:第一个保留,后面重复的**丢掉 class_name**
+    # (脚本照常导出、照常挂上场景,只是不再注册全局类名)并给一条告警。
+    used_class_names = {}
+
+    from . import persistent_player
+    try:
+        player_result = persistent_player.export(directory)
+        merged["written"].extend(player_result.get("written", []))
+        merged["warnings"].extend(player_result.get("warnings", []))
+    except Exception as exc:
+        merged["error"] = f"默认角色导出失败: {exc}"
+        return merged
 
     for scene in scenes:
         # 见 _activate_scene:不切的话第二关的物体会选不中,glTF 算子也
@@ -8019,15 +9407,63 @@ def export_all_scenes(directory, dimension=None, script_name=None):
         tree_script = script_name
         tree, why = exporter.resolve_scene_tree(scene)
         entry["tree_reason"] = why
+        # ── 物体级"角色逻辑图"(第一百一十九轮)────────────────────────
+        # 勾了『挂游戏逻辑脚本』又填了『角色逻辑图』的物体,各导一份独立
+        # 脚本挂自己 —— 和场景图(关卡/世界逻辑)分开。这里只取**第一个**
+        # 脚本宿主(script_target 本来就是"唯一挂脚本的物体"这个约定)。
+        object_trees = exporter.object_logic_trees(scene)
+        char_obj, char_tree, _char_reason = (
+            object_trees[0] if object_trees else (None, None, ""))
+        world_script_name = None
+        if char_tree is not None:
+            entry.setdefault("notes", []).append(
+                f"『{char_obj.name}』挂了角色逻辑图『{char_tree.name}』;"
+                f"场景图退居关卡/世界逻辑(挂场景根)")
         # 调用方给了脚本名、但那个文件其实**不在**(比如它只做了别的步骤):
         # 也要自己导一遍 —— 不然 .tscn 会引用一个不存在的脚本,
         # Godot 打开就报 "Failed loading resource"(实测踩过)。
         script_missing = bool(tree_script) and not os.path.isfile(
             os.path.join(directory, project.SCRIPTS_DIR, str(tree_script)))
-        if tree is not None and (multi or not tree_script or script_missing):
+        if tree is None and char_tree is not None and char_obj is not None:
+            char_settings = exporter.build_settings(scene)
+            char_settings["output_dir"] = directory
+            char_settings["dimension"] = scene_dimension
+            char_settings["base_class"] = exporter.resolve_base_class(scene)
+            char_settings["reference_bindings"] = exporter.object_reference_bindings(char_obj, scene)
+            char_settings["script_name"] = (
+                f"game_logic_{scene_name}_{safe_name(char_obj.name, 'char')}.gd")
+            try:
+                char_result = exporter.export_tree(
+                    char_tree, char_settings, write_scene=False)
+                tree_script = char_result.get("script_name") or None
+                entry["script_name"] = tree_script or ""
+                entry["input_actions"] = list(
+                    char_result.get("input_actions") or [])
+                entry["warnings"].extend(char_result.get("warnings", []))
+                entry.setdefault("written", []).extend(
+                    p for p in char_result.get("written", []) if p)
+            except Exception as exc:                    # noqa: BLE001
+                entry["warnings"].append(
+                    f"『{char_obj.name}』的角色逻辑图导出失败:"
+                    f"{type(exc).__name__}: {exc}")
+        if tree is not None and (multi or not tree_script or script_missing
+                                 or char_tree is not None):
             scene_settings = exporter.build_settings(scene)
             scene_settings["output_dir"] = directory
             scene_settings["dimension"] = scene_dimension
+            # 类名重名:后面那个不写 class_name(见 used_class_names 那段)
+            wanted_class = gd_class_name(scene_settings.get("class_name", ""))
+            if wanted_class:
+                first = used_class_names.get(wanted_class)
+                if first is not None and first != scene.name:
+                    scene_settings["class_name"] = ""
+                    entry["warnings"].append(
+                        f"『{scene.name}』的类名『{wanted_class}』和"
+                        f"『{first}』**撞了** —— GDScript 的 class_name 全工程"
+                        f"只能有一个,这一个先不带类名(其余照常)。"
+                        f"想两个都要,去场景设置的『类名』里改一个。")
+                else:
+                    used_class_names[wanted_class] = scene.name
             if multi:
                 # ── 每个场景的逻辑脚本必须**分开命名**(用户 2026-10-04)────
                 # 脚本名默认取节点树名,而中文名会被压成空 -> 回退 game_logic.gd。
@@ -8036,32 +9472,90 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                 # (用户实测:"在第二场景里按 Esc 无法退出"就是这一族问题)。
                 # 按**场景名**各起一个:game_logic_关卡1.gd / game_logic_关卡2.gd。
                 scene_settings["script_name"] = f"game_logic_{scene_name}.gd"
-            try:
-                tree_result = exporter.export_tree(tree, scene_settings,
-                                                   write_scene=False)
-                tree_script = tree_result.get("script_name") or None
-                entry["script_name"] = tree_script or ""
-                entry["input_actions"] = list(
-                    tree_result.get("input_actions", []) or [])
-                entry["warnings"].extend(tree_result.get("warnings", []))
-                # 这次导出写出来的东西(脚本 / 曲线资源)也要记账:
-                # 详见 generated_files —— 脚本漏记的话,下一轮清理会把它
-                # 当成"旧文件"删掉(自毁)。
-                # ⚠ `entry` 这时还没有 "written" 键(它在下面流水线之后才建),
-                # 直接 entry["written"].extend 会 KeyError:'written' ——
-                # 而且被外面的 except 吞成一句"逻辑图导出失败"(实测踩过)。
-                entry.setdefault("written", []).extend(
-                    p for p in tree_result.get("written", []) if p)
-            except Exception as exc:                        # noqa: BLE001
-                entry["warnings"].append(
-                    f"『{scene.name}』的逻辑图导出失败:{type(exc).__name__}: {exc}")
-        elif multi and tree is None:
+            if char_tree is not None and char_obj is not None:
+                # ── 角色逻辑:独立脚本挂角色(base_class 用角色的物理类型)──
+                char_settings = dict(scene_settings)
+                char_settings["base_class"] = exporter.resolve_base_class(scene)
+                char_settings["reference_bindings"] = exporter.object_reference_bindings(char_obj, scene)
+                char_settings["script_name"] = (
+                    f"game_logic_{scene_name}_"
+                    f"{safe_name(char_obj.name, 'char')}.gd")
+                try:
+                    char_result = exporter.export_tree(
+                        char_tree, char_settings, write_scene=False)
+                    tree_script = char_result.get("script_name") or None
+                    entry["script_name"] = tree_script or ""
+                    for actions in (char_result.get("input_actions") or []):
+                        entry.setdefault("input_actions", []).append(actions)
+                    entry["warnings"].extend(char_result.get("warnings", []))
+                    entry.setdefault("written", []).extend(
+                        p for p in char_result.get("written", []) if p)
+                except Exception as exc:                    # noqa: BLE001
+                    entry["warnings"].append(
+                        f"『{char_obj.name}』的角色逻辑图导出失败:"
+                        f"{type(exc).__name__}: {exc}")
+                # ── 场景图:关卡/世界逻辑,挂场景根(extends Node3D)──────
+                level_settings = dict(scene_settings)
+                level_settings["base_class"] = (
+                    "Node2D" if scene_dimension == "2" else "Node3D")
+                level_settings["class_name"] = ""
+                level_settings["script_name"] = (
+                    f"game_logic_{scene_name}.gd"
+                    if multi else f"game_logic_{scene_name}_level.gd")
+                try:
+                    level_result = exporter.export_tree(
+                        tree, level_settings, write_scene=False)
+                    world_script_name = level_result.get("script_name") or None
+                    entry["warnings"].extend(level_result.get("warnings", []))
+                    # 输入映射也要并(第一百二十轮踩到):关卡图里的 F 键等动作
+                    # 不并进来,project.godot 的 [input] 就没有这个 action,
+                    # Godot 每帧报 "action doesn't exist"(手电开关直接失效)。
+                    for actions in (level_result.get("input_actions") or []):
+                        entry.setdefault("input_actions", []).append(actions)
+                    entry.setdefault("written", []).extend(
+                        p for p in level_result.get("written", []) if p)
+                except Exception as exc:                    # noqa: BLE001
+                    entry["warnings"].append(
+                        f"『{scene.name}』的关卡逻辑图导出失败:"
+                        f"{type(exc).__name__}: {exc}")
+            else:
+                level_only = (exporter.logic_tree_scope(tree) == "LEVEL"
+                              and callable(getattr(tree, "is_property_set", None))
+                              and tree.is_property_set("gk_scope"))
+                if level_only:
+                    scene_settings["base_class"] = (
+                        "Node2D" if scene_dimension == "2" else "Node3D")
+                try:
+                    tree_result = exporter.export_tree(tree, scene_settings,
+                                                       write_scene=False)
+                    tree_script = tree_result.get("script_name") or None
+                    if level_only:
+                        world_script_name, tree_script = tree_script, None
+                        entry["script_name"] = world_script_name or ""
+                    else:
+                        entry["script_name"] = tree_script or ""
+                    entry["input_actions"] = list(
+                        tree_result.get("input_actions", []) or [])
+                    entry["warnings"].extend(tree_result.get("warnings", []))
+                    # 这次导出写出来的东西(脚本 / 曲线资源)也要记账:
+                    # 详见 generated_files —— 脚本漏记的话,下一轮清理会把它
+                    # 当成"旧文件"删掉(自毁)。
+                    # ⚠ `entry` 这时还没有 "written" 键(它在下面流水线之后才建),
+                    # 直接 entry["written"].extend 会 KeyError:'written' ——
+                    # 而且被外面的 except 吞成一句"逻辑图导出失败"(实测踩过)。
+                    entry.setdefault("written", []).extend(
+                        p for p in tree_result.get("written", []) if p)
+                except Exception as exc:                    # noqa: BLE001
+                    entry["warnings"].append(
+                        f"『{scene.name}』的逻辑图导出失败:"
+                        f"{type(exc).__name__}: {exc}")
+        elif multi and tree is None and char_tree is None:
             entry["warnings"].append(
                 f"『{scene.name}』没有可用的游戏逻辑图:{why}")
 
         outcome = export_assets_pipeline(
             scene, directory, dimension=scene_dimension, script_name=tree_script,
-            scene_name=scene_name)
+            scene_name=scene_name, world_script_name=world_script_name)
         entry["warnings"].extend(outcome.get("warnings", []))
         # 累加,不能覆盖:上面『逻辑图导出』那一步可能已经记了脚本 / 曲线
         entry["written"] = list(entry.get("written", [])) + [
@@ -8091,15 +9585,61 @@ def export_all_scenes(directory, dimension=None, script_name=None):
         merged["lights"] += int(outcome.get("lights", 0) or 0)
         merged["scenes"].append(entry)
 
-    # ② 主场景:优先保留用户在 Godot 里手动选的(必须是本次导出的某张),
-    #    否则指向第一个场景 —— write_world_scene 每导一个都会把主场景
-    #    改成"它自己",导完最后一个就成了关卡2,所以要在这里纠正回来。
+    # ② 主场景:优先级 = 世界设置的『默认地图』> 用户在 Godot 里手动选的
+    #    (必须是本次导出的某张)> 第一个场景 —— write_world_scene 每导一个
+    #    都会把主场景改成"它自己",导完最后一个就成了关卡2,所以要纠正。
+    #    『默认地图』(第一百二十一轮)是 Blender 侧明确选的启动关卡,
+    #    像虚幻的 Default Map。
     exported_res = [f"res://{project.SCENES_DIR}/{e['scene_name']}.tscn"
                     for e in merged["scenes"] if e["ok"]]
     if exported_res:
-        keep = original_main if original_main in exported_res else exported_res[0]
+        keep = exported_res[0]
+        dm = None
+        try:
+            from .ui import world_settings
+            dm = getattr(world_settings(), "default_map", None)
+            if dm is not None:
+                want_name = _safe_scene_name(dm.name) if multi else "World"
+                want = f"res://{project.SCENES_DIR}/{want_name}.tscn"
+                if want in exported_res:
+                    keep = want
+        except Exception:                                 # noqa: BLE001
+            pass
+        if dm is None and original_main in exported_res:
+            keep = original_main
         project.set_main_scene(directory, keep)
         merged["main_scene"] = keep
+        from .render_quality import apply_startup_quality
+        chosen = next((s for s in scenes if f"res://scenes/{_safe_scene_name(s.name)}.tscn" == keep), scenes[0])
+        apply_startup_quality(directory, chosen)
+
+    # ② 主界面(跨场景常驻,第一百一十二轮)──────────────────────────────
+    # 勾了『主界面』的设计图导出成 scripts/gk_main_ui.gd 并注册 autoload ——
+    # "无论在什么场景都会生效"由它兜住(切关卡不重建)。一张都没勾时会顺手
+    # 把旧注册摘掉 —— 不摘的话 Godot 会因为找不到 autoload 脚本而起不来。
+    # ⚠ 必须排在"③ 旧文件清理"之前:写出的脚本要进 written 清单,不然
+    #   下一轮清理会把刚写的主界面脚本当旧文件删掉(自毁)。
+    try:
+        ui_outcome = export_main_ui(directory)
+    except Exception as exc:                              # noqa: BLE001
+        merged["warnings"].append(
+            f"主界面导出失败:{type(exc).__name__}: {exc}")
+    else:
+        merged["written"].extend(ui_outcome.get("written", []))
+        merged["warnings"].extend(ui_outcome.get("warnings", []))
+        merged["notes"].extend(ui_outcome.get("notes", []))
+
+    # ②⑤ 玩家偏好(跨关卡,第一百一十三轮):工程里有『偏好_记住/取回』
+    #    才导 autoload;没有时摘旧注册(幂等)。
+    try:
+        prefs_outcome = export_player_prefs(directory)
+    except Exception as exc:                              # noqa: BLE001
+        merged["warnings"].append(
+            f"玩家偏好导出失败:{type(exc).__name__}: {exc}")
+    else:
+        merged["written"].extend(prefs_outcome.get("written", []))
+        merged["warnings"].extend(prefs_outcome.get("warnings", []))
+        merged["notes"].extend(prefs_outcome.get("notes", []))
 
     # ② 输入映射:**合并**写一次(第三十一轮)────────────────────────────
     # 每个场景的 export_tree 会各写一次 [input] 标记块,而 set_input_actions
@@ -8107,7 +9647,7 @@ def export_all_scenes(directory, dimension=None, script_name=None):
     # key_e)被关卡2 的覆盖掉,表现是"第一关按 E 没反应、第二关却好好的"。
     # 真实观测:关卡1 车都上不去(输入映射里没有 key_e)。
     # 修法:把各场景这次用到的动作并起来,最后统一写一遍。
-    all_actions = []
+    all_actions = list(player_result.get("input_actions", []) or [])
     for entry in merged["scenes"]:
         all_actions.extend(entry.get("input_actions") or [])
     if all_actions:
@@ -8116,6 +9656,9 @@ def export_all_scenes(directory, dimension=None, script_name=None):
         except Exception as exc:                          # noqa: BLE001
             merged["warnings"].append(
                 f"输入映射合并写入失败:{type(exc).__name__}: {exc}")
+    if persistent_player.default_player() is not None:
+        # Other autoload registrations can reorder the section on first export.
+        persistent_player._autoload(directory, True)
 
     # ③ 旧文件清理(用户 2026-10-04 第十三轮)──────────────────────────
     # 把"上一次导出写过、这一次没写"的文件删掉。这一条修的是**旧残留**:
@@ -8146,7 +9689,7 @@ def export_all_scenes(directory, dimension=None, script_name=None):
 _ROOT_GLB = None
 
 
-def export_subtree_glb(export_dir, name, roots, scene=None):
+def export_subtree_glb(export_dir, name, roots, scene=None, include_cameras=False):
     """把若干物体**及其全部子级**导出成一个独立的 .glb。
 
     ── 为什么角色必须有自己的 glb ──────────────────────────────────
@@ -8259,7 +9802,7 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
             pass
     for obj in scene.objects:
         obj.select_set(obj in wanted
-                       and not obj.get(PREVIEW_MARK)
+                       and not is_preview_object(obj)
                        and not is_collision_piece(obj))
 
     target_dir = os.path.join(export_dir, project.ART_DIR)
@@ -8278,7 +9821,7 @@ def export_subtree_glb(export_dir, name, roots, scene=None):
         "export_texcoords": True,
         "export_normals": True,
         # 相机灯光由 Environment 脚本 / 主场景负责,角色 glb 里不要
-        "export_cameras": False,
+        "export_cameras": include_cameras,
         "export_lights": False,
         "export_extras": True,
     }
@@ -8390,7 +9933,7 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
 
     environment, env_files, _camera_name = build_environment_nodes(
         scene, not dimension_2d, skip=glb_info, scene_name=model_name,
-        material_files=material_files)
+        material_files=material_files, material_only=not set_as_main)
     camera_count = len(glb_info.get("cameras", ()))
     light_count = len(glb_info.get("lights", ()))
 

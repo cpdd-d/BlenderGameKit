@@ -247,7 +247,7 @@ def build_bpy_module():
     # 所以给个空基类就够了 —— 缺了它模块 import 就会在 class 语句上炸掉
     # (project.py 定义 AddonPreferences 时踩过)。
     for name in ("AddonPreferences", "Panel", "Menu", "Operator", "PropertyGroup",
-                 "Header", "UIList", "KeyingSetInfo", "RenderEngine"):
+                 "Header", "UIList", "KeyingSetInfo", "RenderEngine", "Object"):
         setattr(bpy_types, name, type(name, (), {}))
 
     for name in (

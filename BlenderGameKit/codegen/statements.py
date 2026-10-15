@@ -41,13 +41,41 @@ def _stmt_set_position(ctx, node, indent):
 
 @stmt_node("GKNodeMouseMode")
 def _stmt_mouse_mode(ctx, node, indent):
-    """鼠标模式:第一人称锁鼠标 / 菜单放出来。"""
+    """鼠标模式:第一人称锁鼠标 / 菜单放出来。
+
+    ── 为什么"锁定"要加一条上帝视角守卫(第 124 轮,真机抓到)──────────
+    `Input.mouse_mode` 是**全局**状态。这张图里那句"每物理帧锁鼠标"
+    (第一人称视角的标准写法)会**每帧**把模式写回去 —— 于是游戏里按 Tab
+    切到上帝机后,上帝机刚设好的"放鼠标"下一物理帧就被覆盖,表现是
+    "上帝机里鼠标转不了视角 / 光标还在窗口里乱跑"。
+    所以:锁定(CAPTURED/CONFINED)在上帝视角期间**整个跳过**;
+    VISIBLE / HIDDEN 照旧执行(那两句是"要看得见鼠标",和上帝机不冲突,
+    而且暂停菜单、界面都靠它们)。
+    ⚠ 守卫只在图里**真的开了上帝机**时才生成(见 god_camera_enabled)——
+    没开上帝机的老图产物逐字不变。
+    """
     mode = {
         "VISIBLE": "MOUSE_MODE_VISIBLE",
         "HIDDEN": "MOUSE_MODE_HIDDEN",
         "CAPTURED": "MOUSE_MODE_CAPTURED",
         "CONFINED": "MOUSE_MODE_CONFINED",
     }.get(str(getattr(node, "gk_mode", "CAPTURED")), "MOUSE_MODE_CAPTURED")
+    if (mode in ("MOUSE_MODE_CAPTURED", "MOUSE_MODE_CONFINED")
+            and getattr(ctx, "god_camera_enabled", False)):
+        # ⚠ 这里**不要** `declare_var("_gk_god_cam", ...)`:那个名字是
+        #    **环境脚本**里的成员变量(上帝机自己那台相机),角色脚本里
+        #    根本不用它。声明一个没用到的变量事小,撞类型事大(同一个图里
+        #    两处按不同类型声明同名成员 = Godot 报类型冲突)。
+        #    我们只需要 `_gk_god_camera_active()` 这个**函数**,见下面那行。
+        #
+        # ⚠ 必须登记 `need_god_guard`:生成器只在它为真时才把
+        #    `_gk_god_camera_active()` 的**定义**写出去 —— 只调用不定义 =
+        #    Godot 报 "Function _gk_god_camera_active() not found in base self",
+        #    整个脚本加载不了。
+        ctx.need_god_guard = True
+        ctx.add_line(indent, "if not _gk_god_camera_active():")
+        ctx.add_line(indent + 1, f"Input.mouse_mode = Input.{mode}")
+        return
     ctx.add_line(indent, f"Input.mouse_mode = Input.{mode}")
 
 
@@ -1466,7 +1494,7 @@ def _quality_helper(ctx):
     lines.extend([
         "    # ③ 阴影:每盏灯 + 阴影图大小 / 软阴影质量(0 = 全关)",
         "    var _gk_shadow_on := atlas > 0",
-        "    var _gk_q_stack: Array = [get_tree().current_scene]",
+        "    var _gk_q_stack: Array = [get_tree().root]",
         "    while not _gk_q_stack.is_empty():",
         "        var _gk_q_cur: Node = _gk_q_stack.pop_back()",
         "        if _gk_q_cur is Light3D:",
@@ -1978,8 +2006,12 @@ def _stmt_change_scene(ctx, node, indent):
         ctx.warn(f"『场景_切换关卡』的目标『{path}』不是 res:// 路径 —— "
                  f"Godot 的 change_scene_to_file 只认 res:// 或绝对路径,"
                  f"建议改成 res://scenes/xxx.tscn")
-    ctx.add_line(indent, f"get_tree().call_deferred(\"change_scene_to_file\", "
-                         f"{gd_string(path)})")
+    manager = ctx.new_temp("world")
+    ctx.add_line(indent, f'var {manager} = get_node_or_null("/root/GkWorld")')
+    ctx.add_line(indent, f"if {manager} != null:")
+    ctx.add_line(indent + 1, f'{manager}.call_deferred("change_level", {gd_string(path)})')
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1, f'get_tree().call_deferred("change_scene_to_file", {gd_string(path)})')
 
 
 @stmt_node("GKNodeFunctionDefine")
@@ -2301,8 +2333,13 @@ def _link_type(socket):
     线那头是什么引脚其实**是知道的**(常量_布尔 的输出就是 NodeSocketBool),
     照着它声明类型即可,不用猜。
     """
-    links = getattr(socket, "links", ()) or ()
-    for link in links:
+    from .graph import upstream
+    try:
+        link = upstream(socket)
+    except ValueError as exc:
+        from .context import CodegenAbort
+        raise CodegenAbort(str(exc)) from exc
+    if link is not None:
         from_socket = getattr(link, "from_socket", None)
         kind = (getattr(from_socket, "bl_idname", "")
                 or getattr(from_socket, "type", ""))
@@ -2759,13 +2796,28 @@ def _stmt_wait(ctx, node, indent):
     `_active` 那个断环保护挡不住它 —— 第二次进来时第一次已经出栈了。
 
     也不需要担心"等待之后没往下走":走不走由 `emit_statement` 统一负责。
+
+    ── 默认值必须是"**暂停时也停下来**"(第 125 轮用户实测 bug)──────────
+    用户原话:"在最后一关按ESC暂停时，它还会切换关卡，但我要求的上帝机是
+    全局控制暂停的，所以这是一个BUG。"
+    根因在 Godot 的默认参数上:`SceneTree.create_timer()` 的第三位
+    `process_always` **默认 true** —— 也就是**暂停时计时器照走**。
+    结局那条链最后是
+        await get_tree().create_timer(4.0).timeout   # 停留 4 秒
+        GkWorld.change_level("大堂")
+    于是:按 Esc 暂停 -> 玩家看着冻结的画面 -> 4 秒一到,后台把关卡切了,
+    暂停菜单还开着,人已经在大堂。**暂停根本没冻住它**。
+    现在默认写成 `process_always = false`(暂停时也停),只有用户显式勾了
+    『使用真实时间』才沿用旧行为(那一位的说明本来就写着"忽略引擎暂停" ——
+    语义没变,变的是**默认**该选哪边:暂停就该真的停)。
     """
     seconds = ctx.input_number(node, "秒", "1.0")
     use_process = bool(getattr(node, "gk_use_process", False))
     if use_process:
+        # 勾了 = 忽略暂停(真实时间):第 4 位 true 是 `ignore_time_scale`
         ctx.add_line(indent, f"await get_tree().create_timer({seconds}, true, false, true).timeout")
     else:
-        ctx.add_line(indent, f"await get_tree().create_timer({seconds}).timeout")
+        ctx.add_line(indent, f"await get_tree().create_timer({seconds}, false).timeout")
 
 
 # ==========================================================================
@@ -2793,3 +2845,191 @@ def _stmt_set_light(ctx, node, indent):
     ctx.need_light_helper = True
     ctx.add_line(indent, f"_gk_set_light(self, {light}, {on}, {energy}, "
                          f"{color_text})")
+
+
+# ==========================================================================
+# 玩家偏好(跨关卡,第一百一十三轮)—— autoload GkPlayerPrefs
+# ==========================================================================
+def _pref_literal(node, prefix):
+    """按『类型』选择拿未连线时的字面量(prefix = gk_value / gk_default)。"""
+    kind = str(getattr(node, "gk_kind", "TEXT") or "TEXT")
+    if kind == "NUMBER":
+        try:
+            return gd_number(float(getattr(node, f"{prefix}_number", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return gd_number(0.0)
+    if kind == "BOOL":
+        return "true" if bool(getattr(node, f"{prefix}_bool", False)) else "false"
+    return gd_string(str(getattr(node, f"{prefix}_text", "") or ""))
+
+
+@stmt_node("GKNodePrefSave")
+def _stmt_pref_save(ctx, node, indent):
+    """『偏好_记住』:把一个值写进 GkPlayerPrefs(切关卡不丢,可落盘)。"""
+    key = str(getattr(node, "gk_pref_key", "") or "").strip()
+    if not key:
+        ctx.warn("『偏好_记住』没填『键』——这句什么都不会存;"
+                 "『偏好_取回』也靠同一个键才能读到")
+        return
+    ctx.need_player_prefs = True
+    socket = ctx._socket(node, "值")
+    if socket is not None and getattr(socket, "is_linked", False):
+        value_expr = ctx.expr_of(socket)
+    else:
+        value_expr = _pref_literal(node, "gk_value")
+    ctx.add_line(indent, f"GkPlayerPrefs.put({gd_string(key)}, {value_expr})")
+    if bool(getattr(node, "gk_save_disk", True)):
+        ctx.add_line(indent, "GkPlayerPrefs.save()")
+
+# ==========================================================================
+# 『环境_应用预设』(第一百一十三轮)
+# ==========================================================================
+_ENV_PRESET_HELPER_LINES = (
+    "    # 按名字把一整套环境氛围 + 卡通风格切过来(参数表内联在调用点)。",
+    "    var _gk_scene := get_tree().current_scene",
+    "    if _gk_scene == null:",
+    "        return",
+    "    var _gk_env := _gk_scene.get_node_or_null(\"WorldEnvironment\") as WorldEnvironment",
+    "    if _gk_env != null and _gk_env.environment != null:",
+    "        var e := _gk_env.environment",
+    "        e.background_mode = data.get(\"bg_mode\", 1)",
+    "        e.background_color = data.get(\"bg\", Color(0.05, 0.06, 0.10, 1.0))",
+    "        e.ambient_light_color = data.get(\"amb\", Color(0.55, 0.62, 0.80, 1.0))",
+    "        e.ambient_light_energy = data.get(\"amb_e\", 0.3)",
+    "        e.fog_enabled = data.get(\"fog\", false)",
+    "        e.fog_light_color = data.get(\"fog_c\", Color(0.30, 0.34, 0.42, 1.0))",
+    "        e.fog_density = data.get(\"fog_d\", 0.02)",
+    "        e.glow_enabled = data.get(\"glow\", false)",
+    "        e.glow_intensity = data.get(\"glow_i\", 0.8)",
+    "        e.glow_bloom = data.get(\"glow_b\", 0.1)",
+    "        e.adjustment_enabled = data.get(\"adjust\", false)",
+    "        e.adjustment_brightness = data.get(\"br\", 1.0)",
+    "        e.adjustment_contrast = data.get(\"ct\", 1.0)",
+    "        e.adjustment_saturation = data.get(\"sat\", 1.0)",
+    "    # 卡通风格:全局覆盖场景里所有 toon 材质(第一百一十三轮大蓝图)",
+    "    if data.has(\"shadow_step\"):",
+    "        var _gk_stack: Array = [_gk_scene]",
+    "        while not _gk_stack.is_empty():",
+    "            var _gk_cur: Node = _gk_stack.pop_back()",
+    "            if _gk_cur is MeshInstance3D:",
+    "                var _gk_mi := _gk_cur as MeshInstance3D",
+    "                var _gk_mat := _gk_mi.material_override",
+    "                if _gk_mat is ShaderMaterial and _gk_mat.shader != null and \"gk_toon\" in _gk_mat.shader.resource_path:",
+    "                    _gk_mat.set_shader_parameter(\"shadow_step\", data.get(\"shadow_step\", 0.1))",
+    "                    _gk_mat.set_shader_parameter(\"shadow_tint\", data.get(\"shadow_tint\", Color(0.706, 0.627, 0.902, 1.0)))",
+    "                    _gk_mat.set_shader_parameter(\"three_tone\", data.get(\"three_tone\", 0.0))",
+    "                    _gk_mat.set_shader_parameter(\"rim_amount\", data.get(\"rim\", 0.0))",
+    "                    _gk_mat.set_shader_parameter(\"specular_amount\", data.get(\"specular\", 0.0))",
+    "            for _gk_child in _gk_cur.get_children():",
+    "                _gk_stack.append(_gk_child)",
+)
+
+
+def _env_preset_helper(ctx):
+    """生成(或复用)环境预设 helper,返回函数名。"""
+    name = getattr(ctx, "_gk_env_preset_fn", "")
+    if name:
+        return name
+    name = ctx.declare_func_name("_gk_env_preset_apply")
+    ctx._gk_env_preset_fn = name
+    ctx.extra_sections.append({
+        "signature": f"func {name}(data: Dictionary) -> void:",
+        "lines": list(_ENV_PRESET_HELPER_LINES),
+        "empty_body": "    pass",
+        "separator": True,
+    })
+    return name
+
+
+def _resolve_env_preset(ctx, raw):
+    """按名字找预设参数:先查文件级预设库,再查内置;都找不到给 None + 告警。"""
+    raw = str(raw or "").strip()
+    if not raw:
+        ctx.warn("『环境_应用预设』没填『预设名』——这句什么都不会做")
+        return None
+    # 文件级预设库(第一百一十五轮):跨场景共享,不再扫"当前场景"的预设。
+    # 延迟导入躲开 codegen<->properties 的循环。
+    try:
+        import bpy
+
+        from ..properties import env_preset_library
+
+        library = env_preset_library()
+        for preset in getattr(library, "env_presets", ()) or ():
+            if str(getattr(preset, "preset_name", "")) == raw:
+                return {
+                    "bg_mode": 2 if str(getattr(preset, "p_background",
+                                                "COLOR")) == "SKY" else 1,
+                    "bg": tuple(getattr(preset, "p_bg_color")[:3]),
+                    "amb": tuple(getattr(preset, "p_ambient_color")[:3]),
+                    "amb_e": float(getattr(preset, "p_ambient_energy", 0.3)),
+                    "fog": bool(getattr(preset, "p_fog", False)),
+                    "fog_c": tuple(getattr(preset, "p_fog_color")[:3]),
+                    "fog_d": float(getattr(preset, "p_fog_density", 0.02)),
+                    "glow": bool(getattr(preset, "p_glow", False)),
+                    "glow_i": float(getattr(preset, "p_glow_intensity", 0.8)),
+                    "glow_b": float(getattr(preset, "p_glow_bloom", 0.1)),
+                    "adjust": bool(getattr(preset, "p_adjust", False)),
+                    "br": float(getattr(preset, "p_brightness", 1.0)),
+                    "ct": float(getattr(preset, "p_contrast", 1.0)),
+                    "sat": float(getattr(preset, "p_saturation", 1.0)),
+                    # 卡通风格(第一百一十三轮大蓝图):全局 shader 风格
+                    "shadow_step": float(getattr(
+                        preset, "p_style_shadow_step", 0.1)),
+                    "shadow_tint": tuple(
+                        getattr(preset, "p_style_shadow_tint")[:3]),
+                    "three_tone": float(getattr(
+                        preset, "p_style_three_tone", 0.0)),
+                    "rim": float(getattr(preset, "p_style_rim", 0.0)),
+                    "specular": float(getattr(
+                        preset, "p_style_specular", 0.0)),
+                }
+    except Exception:                                     # noqa: BLE001
+        pass
+    from ..nodes._common import ENV_PRESET_BUILTINS, ENV_PRESET_NAMES
+    if raw in ENV_PRESET_BUILTINS:
+        return ENV_PRESET_BUILTINS[raw]
+    # 第 123 轮:提示语里的名单也从唯一真值源取 —— 以前这里写死了
+    # "恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜",加了卡通二次元三档之后
+    # 用户按提示填「卡通日间」会被判成找不到(而它明明在下拉里)。
+    ctx.warn(f"『环境_应用预设』找不到预设『{raw}』—— 在『游戏环境设置』里"
+             f"存一个,或用内置名:" + " / ".join(ENV_PRESET_NAMES))
+    return None
+
+
+@stmt_node("GKNodeEnvPreset")
+def _stmt_env_preset(ctx, node, indent):
+    """『环境_应用预设』:生成一次 helper + 一行字典调用。"""
+    values = _resolve_env_preset(
+        ctx, str(getattr(node, "gk_preset", "") or ""))
+    if values is None:
+        return
+    helper = _env_preset_helper(ctx)
+    # 颜色 -> Color(r, g, b, 1.0);其余按 GDScript 字面量
+    def color(key):
+        r, g, b = (round(float(c), 4) for c in values[key])
+        return f"Color({r}, {g}, {b}, 1.0)"
+
+    parts = ", ".join([
+        f'\"bg_mode\": {int(values["bg_mode"])}',
+        f'\"bg\": {color("bg")}',
+        f'\"amb\": {color("amb")}',
+        f'\"amb_e\": {float(values["amb_e"])!r}',
+        f'\"fog\": {"true" if values["fog"] else "false"}',
+        f'\"fog_c\": {color("fog_c")}',
+        f'\"fog_d\": {float(values["fog_d"])!r}',
+        f'\"glow\": {"true" if values["glow"] else "false"}',
+        f'\"glow_i\": {float(values["glow_i"])!r}',
+        f'\"glow_b\": {float(values["glow_b"])!r}',
+        f'\"adjust\": {"true" if values["adjust"] else "false"}',
+        f'\"br\": {float(values["br"])!r}',
+        f'\"ct\": {float(values["ct"])!r}',
+        f'\"sat\": {float(values["sat"])!r}',
+        # 卡通风格(第一百一十三轮大蓝图)
+        f'\"shadow_step\": {float(values.get("shadow_step", 0.1))!r}',
+        f'\"shadow_tint\": {color("shadow_tint")}',
+        f'\"three_tone\": {float(values.get("three_tone", 0.0))!r}',
+        f'\"rim\": {float(values.get("rim", 0.0))!r}',
+        f'\"specular\": {float(values.get("specular", 0.0))!r}',
+    ])
+    ctx.add_line(indent, f'{helper}({{{parts}}})')

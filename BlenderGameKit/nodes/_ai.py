@@ -651,6 +651,27 @@ class GKNodeAiEnable(B.GKStatementNode):
         ("gk_debug_print", "bool", False, "打印状态变化",
          "勾上后每次切换状态都往 Godot 输出面板打一行,"
          "用来确认状态机到底有没有在跑"),
+        # ── 被上帝机暂停(第一百三十一轮:用户第 13 轮)──────────────────
+        # 用户原话:"第二关,在上帝机启用中,游戏AI还可以攻击我,应该设置
+        # 上帝机启用时全局暂停(冻结全局时间流速),按某个键如enter解除,
+        # 且此时靠近游戏AI按F键确实可以接管,但AI的移动逻辑等 和我的在
+        # 抢夺控制权(可以在游戏AI的侧边栏添加是否被上帝机暂停,默认启用,
+        # 不启用的话这可以在上帝视角观察世界运行)"。
+        #
+        # ── 为什么默认 **True** ────────────────────────────────────────
+        # 用户明确说了"默认启用"。上帝机是"停下来看看这一关做得对不对"的
+        # 工具 —— 飞着看的时候敌人还在追你、还在打你,就没法安静地检查。
+        # ⚠ 正因为默认是 True,**读属性时必须兜底成 True**:
+        #   老的 .blend 里这个节点是这轮之前建的,根本没有这个属性,
+        #   用 `getattr(node, "gk_pause_with_god", False)` 会让老工程悄悄
+        #   退回"上帝机里 AI 照跑"(用户报的就是这个)。见 codegen/ai.py。
+        #
+        # ── 什么时候该关掉它 ──────────────────────────────────────────
+        # 用户自己给了用途:"不启用的话这可以在上帝视角观察世界运行" ——
+        # 想从天上看着巡逻路线跑得对不对 / 敌人会不会撞墙,就取消勾选。
+        ("gk_pause_with_god", "bool", True, "被上帝机暂停",
+         "上帝机开着时这条 AI 停摆(默认);取消勾选 = 上帝视角里继续"
+         "观察它自己跑"),
     )
 
     def draw_buttons(self, context, layout):
@@ -667,6 +688,7 @@ class GKNodeAiEnable(B.GKStatementNode):
         row.label(text="作用在谁")
         B.draw_target_picker(self, row, "gk_target")
         layout.prop(self, "gk_debug_print", text="打印状态变化")
+        layout.prop(self, "gk_pause_with_god", text="被上帝机暂停")
         self._draw_tree_graph(layout)
 
     def _draw_tree_graph(self, layout):

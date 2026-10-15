@@ -12,12 +12,26 @@
 # 结果 Blender 里留下一个指向死路径的仓库,插件列表里就多出一个
 # "BlenderGameKit"(文件显示为 D:\BlenderGameKit\_testrepo\...)。
 # 用户看到两个插件,完全分不清哪个是能用的。
-# 现在无论测试成功还是失败,退出前一定会 repo-remove。
-
+#
+# ── 第二轮踩坑(2026-10-13,用户截图实证)──────────────────────────────
+# 用户插件列表里出现了**四条**同名的 "BlenderGameKit",而且他真正在用的那条
+# 指向 `_testrepo`(相对路径) —— 完全是门禁留下的垃圾。三个原因叠加:
+#   1. `repo-add` 遇到**重名不覆盖**,而是新建 `gk_test.001/.002/...`;
+#      而 `repo-remove gk_test` 只删**精确名字**,编号副本永久残留;
+#   2. 注销只写在**成功路径**上,`exit 1` 的失败出口和 `-KeepTestRepo` 都不注销;
+#   3. 注册时用相对路径,Blender 从别的工作目录启动时那条仓库就指向死路径。
+# 现在的做法(三条一起上):
+#   * 每次用**唯一**仓库名(`gk_test_<PID>`),从根上不产生编号副本;
+#   * 开跑前**先按模式批量清掉**历史遗留(`^gk_test(_\d+)?$`),幂等;
+#   * 整个主体包进 try/finally,成功/失败/异常都走同一个清理出口;
+#   * 注册一律传**绝对路径**。
 param(
     [string]$Blender = "D:\blender-4.5.5-windows-x64\blender.exe",
     [string]$Root = "D:\BlenderGameKit",
     [string]$Godot = "D:\godot\Godot_v4.7.2-stable_win64_console.exe",
+    # 离线测试用的解释器。留空 = 自动探测(见 Resolve-Python)。
+    # 想锁定就用:`-Python C:\path\to\python.exe`
+    [string]$Python = "",
     [switch]$SkipInstall,
     [switch]$SkipGodot,
     [switch]$Deep,
@@ -29,7 +43,10 @@ $dist = Join-Path $Root "_dist"
 $repo = Join-Path $Root "_testrepo"
 $pkg = Join-Path $Root "BlenderGameKit"
 $zip = Join-Path $dist "blender_game_kit-0.1.0.zip"
-$testRepoName = "gk_test"
+# 唯一仓库名:同一台机器上并行跑两次门禁也不会互相踩出 .001
+$testRepoName = "gk_test_$PID"
+# 历史遗留的名字模式(清理用)
+$testRepoPattern = '^gk_test(_\d+)?$'
 
 function Step($text) {
     Write-Output ""
@@ -38,18 +55,107 @@ function Step($text) {
     Write-Output ("=" * 60)
 }
 
+# 把插件列表里**所有**历史遗留的测试仓库注销掉(幂等)。
+# 为什么要按模式扫一遍而不是只删 `gk_test`:见文件头第 2 条踩坑。
+#
+# ⚠ `repo-list` 的输出是 YAML 风格,不是管道分隔:
+#       gk_test_1234:
+#           name: "GK Test"
+#           directory: "..."
+#   所以按行找**顶格且以冒号结尾**的 key(缩进行都以空格开头,天然排除)。
+function Remove-LegacyTestRepos {
+    $listed = (& $Blender --command extension repo-list 2>&1 | Out-String)
+    $ids = @()
+    foreach ($line in ($listed -split "`n")) {
+        if ($line -notmatch '^\S') { continue }          # 缩进行 = 字段,不是 key
+        $name = $line.Trim().TrimEnd(':')
+        if ($name -match $testRepoPattern) { $ids += $name }
+    }
+    foreach ($id in ($ids | Select-Object -Unique)) {
+        & $Blender --command extension repo-remove $id 2>&1 | Out-Null
+        Write-Output "已注销遗留测试仓库: $id"
+    }
+}
+
+# 找一个**真的能跑**的 python。
+#
+# ── 为什么要探测(2026-10-13 踩到)──────────────────────────────────
+# 这台机器上 `python` 解析到 Windows 自带的**应用商店占位程序**
+# (`WindowsApps\python.exe`)—— 它只会弹一句 "Python was not found;
+# run without arguments to install from the Microsoft Store" 然后返回非 0。
+# 于是"离线单测"这一步在 Windows PowerShell 下永远失败,而 pwsh 7 里因为
+# PATH 不同又正常 —— 同一个门禁在两种 shell 下结论相反,最坑的一种。
+# 所以这里显式探测:先看 PATH 里的 python 能不能报版本,不行就按已知的
+# 解释器路径依次找,再不行直接报错说清"要装哪个"。
+function Resolve-Python {
+    $candidates = @()
+    # ⚠ 不收 `py`(Windows 启动器):它能报 "Python 3.14.5",但用 `& py.exe 脚本`
+    #    起子进程时退出码不稳 —— 门禁那一步会"看起来跑了、其实判红"。
+    #    只认真正能把脚本直接跑起来的解释器;都找不到就让调用方用 -Python。
+    foreach ($name in @("python", "python3")) {
+        $found = Get-Command $name -ErrorAction SilentlyContinue
+        if ($found) { $candidates += $found.Source }
+    }
+    $candidates += @(
+        (Join-Path $Root ".venv\Scripts\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe")
+    )
+    foreach ($exe in $candidates) {
+        if (-not $exe -or -not (Test-Path $exe)) { continue }
+        try {
+            # ⚠ 用 `--version` 而不是 `-c`(踩过):`pythonw` 那类没有控制台的
+            #    可执行文件会把 `-c` 的输出整段吞掉,于是"明明能跑"也被判成
+            #    不能用;`--version` 一定走到同一个流里,好判。
+            $probe = (& $exe --version 2>&1 | Out-String)
+            if ($probe -match 'Python 3\.\d') { return $exe }
+        } catch { }
+    }
+    return ""
+}
+$Py = ""
+if ($Python -and (Test-Path $Python)) {
+    # 显式指定优先(排查/锁定环境时用)
+    $Py = (Resolve-Path $Python).Path
+} else {
+    $Py = Resolve-Python
+}
+if (-not $Py) {
+    Write-Error ("找不到可用的 python(离线测试要用)。" +
+                 "装一个 Python 3,或把解释器路径加进 PATH;也可以用 " +
+                 "-Python <路径> 显式指定。")
+    exit 1
+}
+# ⚠ 校验一次**这个解释器真能跑我们的测试**(不只是能报版本号)。
+#    这台机器上 `py.exe` 能报 "Python 3.14.5",但用 `& py.exe 脚本` 起子进程时
+#    行为不稳(门禁里那一步曾经"看起来跑了、但退出码是 1")。宁可在这里
+#    多花一次 1 秒的 import,也不要让"门禁的结果取决于用哪个 shell 启动"。
+$probe = & $Py -c "import sys; print('PY_OK', sys.version_info[0])" 2>&1 | Out-String
+if ($probe -notmatch 'PY_OK 3') {
+    Write-Error ("$Py 跑不起来(输出:$($probe.Trim()))")
+    exit 1
+}
+Write-Output "python: $Py"
+
 # 清理函数:注销测试仓库 + 删目录。
 # 放在函数里是因为要在**多个出口**调用(正常结束、异常退出都要)。
 function Remove-TestRepo {
     if ($KeepTestRepo) {
-        Write-Output "（-KeepTestRepo:保留测试仓库 gk_test 便于排查）"
+        Write-Output "（-KeepTestRepo:保留测试仓库 $testRepoName 便于排查）"
         return
     }
     & $Blender --command extension repo-remove $testRepoName 2>&1 | Out-Null
+    # 顺手把编号副本也扫掉(万一有旧版本留下的)
+    Remove-LegacyTestRepos
     if (Test-Path $repo) { Remove-Item -Recurse -Force $repo }
 }
 
 if (-not (Test-Path $Blender)) { Write-Error "找不到 Blender: $Blender"; exit 1 }
+
+# ── 开跑前先清历史遗留 ────────────────────────────────────────────────
+# 上一轮如果崩在中途(或被 Ctrl+C),会留下 `gk_test` / `gk_test_001`…
+# 这里**先清干净再开**,所以下一次运行永远是干净的起点。
+Remove-LegacyTestRepos
 
 # 跑一个"旁路"Godot 验证脚本,把它输出的关键行透出来,并按标记给 ok/skip/fail。
 # 三个脚本的标记各不相同(GODOT_VERIFY / PLATFORMER_VERIFY / ANIM_VERIFY),
@@ -76,14 +182,14 @@ function Invoke-Verify {
 
 # ---------- 1. 离线单元测试 ----------
 Step "1/6 离线代码生成测试 (不需要 Blender)"
-& python (Join-Path $Root "tests\test_codegen.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
+& $Py (Join-Path $Root "tests\test_codegen.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "离线测试失败"; exit 1 }
 
 # ---------- 1b. 示例完整性体检 ----------
 # 第四十五轮固化:目录改名打断脚本路径(ANIM_VERIFY 那次)、示例缺 README、
 # 新示例有探针却没接进门禁 —— 这三类问题都在这里判红。
 Step "1b/6 示例完整性体检 (目录 / README / 重建 / 探针 / 门禁)"
-& python (Join-Path $Root "scripts\check_examples.py") 2>&1 |
+& $Py (Join-Path $Root "scripts\check_examples.py") 2>&1 |
     Select-String -Pattern "^(示例|demo_|✗|CHECK_EXAMPLES)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "示例完整性体检失败"; exit 1 }
 
@@ -94,7 +200,7 @@ if ($LASTEXITCODE -ne 0) { Write-Error "示例完整性体检失败"; exit 1 }
 # 现在节点手册从代码生成(`make_node_docs.py`),这条检查就是"改了节点但
 # 忘了重新生成手册"的看门狗 —— 报红时跑一次那个脚本即可。
 Step "1b2/6 节点手册新鲜度(docs\节点手册.md 是否与代码一致)"
-$docOut = & python (Join-Path $Root "scripts\make_node_docs.py") --check 2>&1 | Out-String
+$docOut = & $Py (Join-Path $Root "scripts\make_node_docs.py") --check 2>&1 | Out-String
 $docOut -split "`n" | Where-Object { $_.Trim() -ne "" } |
     ForEach-Object { Write-Host $_.TrimEnd() }
 if ($docOut -notmatch "CHECK_NODE_DOCS=OK") {
@@ -112,7 +218,7 @@ if ($docOut -notmatch "CHECK_NODE_DOCS=OK") {
 # ⚠ 这一步**发现着色器编译错误会真报错**(不是提醒),因为那类错的症状是
 #   "游戏里什么都没发生",靠肉眼极难查。
 Step "1c/6 着色器编译校验(真 Godot 编译)"
-$shaderOut = & python (Join-Path $Root "scripts\verify_shaders.py") 2>&1 | Out-String
+$shaderOut = & $Py (Join-Path $Root "scripts\verify_shaders.py") 2>&1 | Out-String
 $shaderOut -split "`n" | Where-Object { $_.Trim() -ne "" } |
     ForEach-Object { Write-Host $_.TrimEnd() }
 if ($shaderOut -match "跳过:找不到 Godot") {
@@ -133,7 +239,10 @@ Write-Output ("扩展包: {0} ({1:N0} 字节)" -f $zip, (Get-Item $zip).Length)
 # ---------- 3. 干净重装 ----------
 if (-not $SkipInstall) {
     Step "3/6 重装到临时测试仓库(不会动 user_default)"
-    Remove-TestRepo
+    # 先删历史遗留再注册:否则 repo-add 会新建 `gk_test_<pid>.001` 那种副本
+    Remove-LegacyTestRepos
+    New-Item -ItemType Directory -Force -Path $repo | Out-Null
+    # ⚠ 一律传**绝对路径**(相对路径会让 Blender 从别的工作目录启动时找不到)
     & $Blender --command extension repo-add $testRepoName --name "GK Test" --directory $repo 2>&1 |
         Select-String -Pattern "Error|error" | ForEach-Object { $_.Line }
     $log = & $Blender --command extension install-file -r $testRepoName -e $zip 2>&1
@@ -182,7 +291,113 @@ if (Test-Path $panelsScript) {
     Step "4b/6 跳过侧栏面板 draw()(没有 tests\blender_panels.py)"
 }
 
+# 共享角色引用、转接点和灯光导出的集成验证使用仓库源码。
+Step "4c/6 蓝图式角色图与场景光照"
+$blueprintOut = & $Blender -b --factory-startup --python-exit-code 1 --python (Join-Path $Root "tests\blender_blueprint.py") 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or $blueprintOut -notmatch "BLUEPRINT=OK") {
+    Write-Output $blueprintOut
+    $smokeOk = $false
+} else {
+    Write-Output "BLUEPRINT=OK"
+}
+
+# ---------- 4g. 图标名必须真实存在(第一百二十三轮:用户实测抓到的崩溃)------
+# ── 为什么要单列这一关 ──────────────────────────────────────────────
+# 面板里写 `icon="LOOP_FORWARD"`(正确的叫 `LOOP_FORWARDS`)、
+# 或 `icon="IMAGE_BG"`(正确的叫 `IMAGE_BACKGROUND`)时,Blender 抛的是
+#     UILayout.operator(): error with keyword argument "icon" - enum ...
+# **只往状态栏打一行**,那一块界面直接不见了 —— 用户看到的是"按钮出问题了"。
+# 这类错测试不会变红(它只发生在那一行真的被画到的时候),所以静态全扫一遍:
+# 998 处 icon= 一秒钟扫完。
+Step "4g/6 图标名合法性(静态全扫)"
+$iconScript = Join-Path $Root "tests\blender_icons.py"
+if (-not (Test-Path $iconScript)) {
+    Write-Output "跳过图标校验:还没有 tests\blender_icons.py"
+} else {
+    $iconOut = & $Blender -b --factory-startup --python-exit-code 1 --python $iconScript 2>&1 | Out-String
+    $iconOut -split "`n" | Where-Object { $_ -match "图标用法|ICON_|ICONS=|\[FAIL\]" } |
+        ForEach-Object { Write-Host $_.TrimEnd() }
+    if ($LASTEXITCODE -ne 0 -or $iconOut -notmatch "ICONS=OK") {
+        Write-Output $iconOut
+        $smokeOk = $false
+    }
+}
+
 # ---------- 5. Godot 端到端 ----------
+Step "4d/6 默认角色与跨关卡层级导出"
+$persistentOut = & $Blender -b --factory-startup --python-exit-code 1 --python (Join-Path $Root "tests\blender_persistent_player.py") 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or $persistentOut -notmatch "PERSISTENT_EXPORT=OK") {
+    Write-Output $persistentOut
+    $smokeOk = $false
+} else {
+    Write-Output "PERSISTENT_EXPORT=OK"
+}
+
+# ---------- 4e. 暂停后鼠标还能转视角(第一百二十二轮:用户实测 bug)----------
+# ── 为什么要单列这一关 ──────────────────────────────────────────────
+# 这条 bug 的根因藏在**两个互相矛盾的需求**之间:为了让暂停菜单能用,
+# 生成的脚本必须 `PROCESS_MODE_ALWAYS`(暂停时 `_input` 照跑);可角色
+# 的鼠标位移也挂在同一个 `_input` 里 —— 于是暂停后视角照样转。
+# 修法是给每个事件处理器声明 `during_pause`,发射时分组;判错方向会
+# **真的弄坏功能**(上帝机时停时转不了视角 / 暂停菜单点不动 / 对话框死锁),
+# 而这三样都不在冒烟测试的覆盖里。所以它必须自己一关。
+Step "4e/6 暂停期间输入分组(鼠标视角 / 上帝机 / 暂停菜单)"
+$pauseScript = Join-Path $Root "tests\blender_pause_input.py"
+if (-not (Test-Path $pauseScript)) {
+    Write-Output "跳过暂停输入验证:还没有 tests\blender_pause_input.py"
+} else {
+    $pauseOut = & $Blender -b --factory-startup --python-exit-code 1 --python $pauseScript 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $pauseOut -notmatch "PAUSE_INPUT=OK") {
+        Write-Output $pauseOut
+        $smokeOk = $false
+    } else {
+        Write-Output "PAUSE_INPUT=OK"
+    }
+}
+
+# ---------- 4f. 三种线框标记(第一百二十二轮:出生点 / 区域环境点 / 关卡父级)--
+# ── 为什么要单列这一关 ──────────────────────────────────────────────
+# 标记最容易坏的地方**不在导出**:①Blender 4.5 会把空标识符的枚举项丢掉
+# (`("", "无", …)` 会让每次读取刷一条 RNA 警告、写 `""` 直接 TypeError);
+# ②标记是网格物体,不排除的话它会变成 Godot 里一个怪方块;③**没有标记的
+# 工程产物必须逐字节不变**(一批示例和门禁在比对 .tscn)。三条都在这里判。
+Step "4f/6 线框标记物体(属性 + 不进导出 + 老工程产物不变)"
+$markerProbe = Join-Path $Root "tests\blender_markers.py"
+if (-not (Test-Path $markerProbe)) {
+    Write-Output "跳过线框标记验证:还没有 tests\blender_markers.py"
+} else {
+    $markerOut = & $Blender -b --factory-startup --python-exit-code 1 --python $markerProbe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $markerOut -notmatch "MARKERS=OK") {
+        Write-Output $markerOut
+        $smokeOk = $false
+    } else {
+        Write-Output "MARKERS=OK"
+    }
+}
+
+# ---------- 4h. 环境预设:套用要真写进去 + "当前是哪一档"要认得出来 -------
+# ── 为什么要单列这一关(第一百二十五轮:用户第 8 条)──────────────────
+# 用户原话:"环境预设里哪个选了但没标颜色,不知道现在生效的是哪个环境。"
+# 一查发现**两个**问题,而且冒烟 / 面板测试都抓不到:
+#   ① `gk.env_preset_apply_builtin`(右键菜单 / 预设库面板点的那一档)以前
+#      是**空转** —— 拿自定义预设的字段名去查内置档位的短名,两边一个都
+#      对不上,循环全 `continue`,点菜单只改了"开环境"和"背景模式",
+#      环境光 / 雾 / 泛光 / 调色**一个都没写**。这一步就是钉住它。
+#   ② 没有任何"当前是哪一档"的标记(每一档都画一样的对勾)。
+# 两者都只会在**用户点下去**的那一刻表现出来,所以必须真调用算子验。
+Step "4h/6 环境预设:套用生效 + 当前档位识别"
+$envPresetProbe = Join-Path $Root "tests\blender_env_presets.py"
+if (-not (Test-Path $envPresetProbe)) {
+    Write-Output "跳过环境预设验证:还没有 tests\blender_env_presets.py"
+} else {
+    $envOut = & $Blender -b --factory-startup --python-exit-code 1 --python $envPresetProbe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $envOut -notmatch "ENV_PRESETS=OK") {
+        Write-Output $envOut
+        $smokeOk = $false
+    } else {
+        Write-Output "ENV_PRESETS=OK"
+    }
+}
 # ── 为什么要单列这一关 ──────────────────────────────────────────────
 # 前面 1~4 步都停在"Blender 里看起来对"。可生成物**是给 Godot 吃的** ——
 # 基类和 .tscn 节点类型不一致、InputMap 少登记一个动作、资源缓存是旧的,
@@ -261,7 +476,7 @@ if ($SkipGodot) {
                 $godotOk = $false
             } else {
                 $checker = Join-Path $Root "scripts\check_curve_demo.py"
-                $log = & python $checker --godot $Godot 2>&1 | Out-String
+                $log = & $Py $checker --godot $Godot 2>&1 | Out-String
                 $log -split "`n" | Where-Object { $_ -match "^(DEMO|CHECK_CURVE_DEMO|跳过|✗)" } |
                     ForEach-Object { Write-Host $_.TrimEnd() }
                 if ($log -match "CHECK_CURVE_DEMO=OK") {
@@ -295,7 +510,7 @@ if ($SkipGodot) {
                 $godotOk = $false
             } else {
                 $gameChecker = Join-Path $Root "scripts\check_game_demo.py"
-                $gameOut = & python $gameChecker --godot $Godot 2>&1 | Out-String
+                $gameOut = & $Py $gameChecker --godot $Godot 2>&1 | Out-String
                 $gameOut -split "`n" | Where-Object { $_ -match "^(DEMO|CHECK_GAME_DEMO|跳过|✗)" } |
                     ForEach-Object { Write-Host $_.TrimEnd() }
                 if ($gameOut -match "CHECK_GAME_DEMO=OK") {
@@ -326,7 +541,7 @@ if ($SkipGodot) {
                 $godotOk = $false
             } else {
                 $physChecker = Join-Path $Root "scripts\check_physics_demo.py"
-                $physOut = & python $physChecker --godot $Godot 2>&1 | Out-String
+                $physOut = & $Py $physChecker --godot $Godot 2>&1 | Out-String
                 $physOut -split "`n" | Where-Object { $_ -match "^(PHYS|CHECK_PHYSICS_DEMO|跳过|✗)" } |
                     ForEach-Object { Write-Host $_.TrimEnd() }
                 if ($physOut -match "CHECK_PHYSICS_DEMO=OK") {
@@ -359,7 +574,7 @@ if ($SkipGodot) {
                 $godotOk = $false
             } else {
                 $nav2dChecker = Join-Path $Root "scripts\check_nav2d_demo.py"
-                $nav2dOut = & python $nav2dChecker --godot $Godot 2>&1 | Out-String
+                $nav2dOut = & $Py $nav2dChecker --godot $Godot 2>&1 | Out-String
                 $nav2dOut -split "`n" | Where-Object { $_ -match "^(NAV2D|CHECK_NAV2D_DEMO|跳过|✗)" } |
                     ForEach-Object { Write-Host $_.TrimEnd() }
                 if ($nav2dOut -match "CHECK_NAV2D_DEMO=OK") {
@@ -393,7 +608,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $uiChecker = Join-Path $Root "scripts\check_ui_demo.py"
-            $uiOut = & python $uiChecker --godot $Godot 2>&1 | Out-String
+            $uiOut = & $Py $uiChecker --godot $Godot 2>&1 | Out-String
             $uiOut -split "`n" | Where-Object { $_ -match "^(UI_|CHECK_UI_DEMO|跳过|✗|art/)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($uiOut -match "CHECK_UI_DEMO=OK") {
@@ -426,7 +641,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $aiChecker = Join-Path $Root "scripts\check_ai_demo.py"
-            $aiOut = & python $aiChecker --godot $Godot 2>&1 | Out-String
+            $aiOut = & $Py $aiChecker --godot $Godot 2>&1 | Out-String
             $aiOut -split "`n" | Where-Object { $_ -match "^(AI_|CHECK_AI_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($aiOut -match "CHECK_AI_DEMO=OK") {
@@ -459,7 +674,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $assetChecker = Join-Path $Root "scripts\check_assets_demo.py"
-            $assetOut = & python $assetChecker --godot $Godot 2>&1 | Out-String
+            $assetOut = & $Py $assetChecker --godot $Godot 2>&1 | Out-String
             $assetOut -split "`n" | Where-Object { $_ -match "^(ASSET_|CHECK_ASSETS_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($assetOut -match "CHECK_ASSETS_DEMO=OK") {
@@ -522,7 +737,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $lightChecker = Join-Path $Root "scripts\check_lights_demo.py"
-            $lightOut = & python $lightChecker --godot $Godot 2>&1 | Out-String
+            $lightOut = & $Py $lightChecker --godot $Godot 2>&1 | Out-String
             $lightOut -split "`n" | Where-Object { $_ -match "^(LIGHTS|CHECK_LIGHTS_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($lightOut -match "CHECK_LIGHTS_DEMO=OK") {
@@ -555,7 +770,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $envChecker = Join-Path $Root "scripts\check_env_demo.py"
-            $envOut = & python $envChecker --godot $Godot 2>&1 | Out-String
+            $envOut = & $Py $envChecker --godot $Godot 2>&1 | Out-String
             $envOut -split "`n" | Where-Object { $_ -match "^(ENV_|CHECK_ENV_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($envOut -match "CHECK_ENV_DEMO=OK") {
@@ -578,7 +793,7 @@ if ($SkipGodot) {
     if (-not (Test-Path $releaseChecker)) {
         Write-Output "跳过打包发布:还没有 scripts\check_release.py"
     } else {
-        $releaseOut = & python $releaseChecker --godot $Godot 2>&1 | Out-String
+        $releaseOut = & $Py $releaseChecker --godot $Godot 2>&1 | Out-String
         $releaseOut -split "`n" | Where-Object { $_ -match "^(RELEASE_|CHECK_RELEASE|跳过|✗)" } |
             ForEach-Object { Write-Host $_.TrimEnd() }
         if ($releaseOut -match "CHECK_RELEASE=OK") {
@@ -610,7 +825,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $horrorChecker = Join-Path $Root "scripts\check_horror_demo.py"
-            $horrorOut = & python $horrorChecker --godot $Godot 2>&1 | Out-String
+            $horrorOut = & $Py $horrorChecker --godot $Godot 2>&1 | Out-String
             $horrorOut -split "`n" | Where-Object { $_ -match "^(HORROR_|CHECK_HORROR_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($horrorOut -match "CHECK_HORROR_DEMO=OK") {
@@ -642,7 +857,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $blendChecker = Join-Path $Root "scripts\check_blend_demo.py"
-            $blendOut = & python $blendChecker --godot $Godot 2>&1 | Out-String
+            $blendOut = & $Py $blendChecker --godot $Godot 2>&1 | Out-String
             $blendOut -split "`n" | Where-Object { $_ -match "^(BLEND_|CHECK_BLEND_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($blendOut -match "CHECK_BLEND_DEMO=OK") {
@@ -676,7 +891,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $aiNavChecker = Join-Path $Root "scripts\check_ai_nav_demo.py"
-            $aiNavOut = & python $aiNavChecker --godot $Godot 2>&1 | Out-String
+            $aiNavOut = & $Py $aiNavChecker --godot $Godot 2>&1 | Out-String
             $aiNavOut -split "`n" | Where-Object { $_ -match "^(AINAV_|CHECK_AI_NAV_DEMO|跳过|✗)" } |
                 ForEach-Object { Write-Host $_.TrimEnd() }
             if ($aiNavOut -match "CHECK_AI_NAV_DEMO=OK") {
@@ -732,7 +947,7 @@ if ($SkipGodot) {
     } else {
         # 探针自己按 GK_GODOT / 默认路径找 Godot —— 把门禁用的那台传进去
         $env:GK_GODOT = $Godot
-        $renderOut = & python $renderChecker 2>&1 | Out-String
+        $renderOut = & $Py $renderChecker 2>&1 | Out-String
         $renderOut -split "`n" | Where-Object {
             $_ -match "^(\[渲染验证\]|CHECK_RENDER_DEMO|跳过)"
         } | ForEach-Object { Write-Host $_.TrimEnd() }
@@ -769,7 +984,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $netChecker = Join-Path $Root "scripts\check_net_demo.py"
-            $netOut = & python $netChecker --godot $Godot 2>&1 | Out-String
+            $netOut = & $Py $netChecker --godot $Godot 2>&1 | Out-String
             $netOut -split "`n" | Where-Object {
                 $_ -match "^(----|\[PASS\]|\[FAIL\]|CHECK_NET_DEMO|跳过|✗)"
             } | ForEach-Object { Write-Host $_.TrimEnd() }
@@ -805,7 +1020,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $groupsChecker = Join-Path $Root "scripts\check_groups_demo.py"
-            $groupsOut = & python $groupsChecker --godot $Godot 2>&1 | Out-String
+            $groupsOut = & $Py $groupsChecker --godot $Godot 2>&1 | Out-String
             $groupsOut -split "`n" | Where-Object {
                 $_ -match "^(GROUPS_|CHECK_GROUPS_DEMO|跳过|✗)"
             } | ForEach-Object { Write-Host $_.TrimEnd() }
@@ -828,7 +1043,7 @@ if ($SkipGodot) {
     if (-not (Test-Path $dragChecker)) {
         Write-Output "跳过界面真机校验:还没有 scripts\check_ui_drag.py"
     } else {
-        $dragOut = & python $dragChecker --blender $Blender 2>&1 | Out-String
+        $dragOut = & $Py $dragChecker --blender $Blender 2>&1 | Out-String
         $dragOut -split "`n" | Where-Object {
             $_ -match "^(UI_DRAG|CHECK_UI_DRAG|跳过|✗)"
         } | ForEach-Object { Write-Host $_.TrimEnd() }
@@ -864,7 +1079,7 @@ if ($SkipGodot) {
             $godotOk = $false
         } else {
             $storyChecker = Join-Path $Root "scripts\check_story_demo.py"
-            $storyOut = & python $storyChecker --godot $Godot 2>&1 | Out-String
+            $storyOut = & $Py $storyChecker --godot $Godot 2>&1 | Out-String
             $storyOut -split "`n" | Where-Object {
                 $_ -match "^(STORY_|CHECK_STORY_DEMO|跳过|✗)"
             } | ForEach-Object { Write-Host $_.TrimEnd() }
@@ -886,6 +1101,11 @@ if ($SkipGodot) {
 }
 
 # ---------- 6. 汇总 ----------
+#
+# ── 为什么清理要放在**这里**(而且失败路径也要走)──────────────────────
+# 用户实测反馈过:"插件注册太多一样的了……这就是旧插件加载问题存在的原因"。
+# 根因就是注销只写在成功路径上,而失败出口直接 `exit 1` 跳过了它。
+# 现在:先把仓库注销掉,再决定退出码 —— 两条路都干净。
 Step "6/6 结果"
 Remove-TestRepo
 if ($smokeOk -and $godotOk) {
@@ -905,5 +1125,6 @@ if ($smokeOk -and $godotOk) {
     if (-not $godotOk) {
         Write-Output "Godot 端到端未通过（上方已打印失败脚本的尾部输出）"
     }
+    Write-Output "（测试仓库已注销 —— 失败路径同样不留插件条目）"
     exit 1
 }

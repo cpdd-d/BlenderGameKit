@@ -431,6 +431,16 @@ class GKNodeCameraSpringArm(B.GKStatementNode):
         ("gk_collision", "bool", True, "碰撞检测",
          "撞到墙就把杆子缩短(关掉会穿墙,除非你确定场景里没东西)"),
         ("gk_radius", "float", 0.3, "碰撞半径", "留一点余量,免得贴脸"),
+        # ── 最短臂长(第 126 轮:用户"有时跳跃会穿模")──────────────────
+        # 撞得再近,相机也不会比这个数更靠近枢轴。
+        # 默认 0.2 = 老行为(没改这张图的产物**逐字不变**)。
+        # 什么时候该调大:角色**原点在脚底**、枢轴正好在胸口时,0.2 米就是
+        # "相机钻进胸腔里"。调到 0.6 左右能让开身体 —— 但墙比它近时相机
+        # 只能去贴墙(会切墙),所以别调过头。真机数字见 codegen/camera.py。
+        ("gk_min_arm", "float", 0.2, "最短臂长",
+         "相机离枢轴最近能到多少米(兜底)。0.2 = 老行为;角色原点在脚底"
+         "(枢轴在胸口)时调到 0.6 左右,否则贴墙时相机会钻进身体里\n"
+         "⚠ 墙比这个数还近时,相机只能贴墙(会切墙)—— 别调过头"),
         ("gk_lag", "float", 8.0, "位置平滑", "越大越跟手;0 = 硬跟(会有点抖)"),
         ("gk_lag_trans", "enum", "LINEAR", "跟随曲线",
          "位置平滑的速度曲线:线性 = 老行为;回弹档会让相机过冲一点(弹簧感)",
@@ -479,6 +489,8 @@ class GKNodeCameraSpringArm(B.GKStatementNode):
         row.prop(self, "gk_lag_rot", text="旋转平滑")
         row = layout.row(align=True)
         row.prop(self, "gk_radius", text="碰撞半径")
+        # 最短臂长和碰撞半径是一对:一个管"别贴脸",一个管"别钻进身体"
+        row.prop(self, "gk_min_arm", text="最短臂长")
         layout.label(text="位置平滑的曲线(线性 = 和以前一样):",
                      icon="IPO_EASE_IN_OUT")
         row = layout.row(align=True)
@@ -883,7 +895,9 @@ class GKNodePlaySound(B.GKStatementNode):
               "勾上『循环』= 一直响的**循环音效**(引擎声 / 风声 / 火堆)。\n"
               "循环音不会自己销毁(它永远不\"播完\"),用『音效_停止』填同一个"
               "『名字』来停它;同名再播一次会先停掉旧的(不会叠)。"
-              "『名字』留空 = 用卡片名。")
+              "『名字』留空 = 用卡片名。\n"
+              "『音频路径』填 `res://...` 或**磁盘上的音频文件** —— 本地文件"
+              "导出时会自动复制进工程的 `audio/`(不用自己拷)。")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(TEXT, "音频路径", "res://art/jump.wav"),
@@ -896,7 +910,8 @@ class GKNodePlaySound(B.GKStatementNode):
         "音高": "gk_pitch",
     }
     gk_prop_defs = (
-        ("gk_path", "string", "res://art/jump.wav", "音频路径", "res:// 开头的音频文件"),
+        ("gk_path", "string", "res://art/jump.wav", "音频路径",
+         "res:// 路径,或本地音频文件(本地文件导出时会复制进工程的 audio/)"),
         ("gk_volume", "float", 0.0, "音量", "分贝，0 为原始音量，-6 约减半"),
         ("gk_pitch", "float", 1.0, "音高", "1.0 原速，>1 更尖更快"),
         ("gk_2d", "bool", True, "2D 音效", "勾上=按距离衰减(3D 项目取消勾选)"),
@@ -946,7 +961,8 @@ class GKNodePlayMusic(B.GKStatementNode):
     )
     gk_input_props = {"音频路径": "gk_path", "音量": "gk_volume"}
     gk_prop_defs = (
-        ("gk_path", "string", "res://art/bgm.ogg", "音频路径", "res:// 开头的音频文件"),
+        ("gk_path", "string", "res://art/bgm.ogg", "音频路径",
+         "res:// 路径,或本地音频文件(本地文件导出时会复制进工程的 audio/)"),
         ("gk_volume", "float", -6.0, "音量", "分贝，0 为原始音量"),
         ("gk_fade", "float", 0.5, "淡入秒数", "0 表示直接开始"),
         ("gk_loop", "bool", True, "循环", "播完接着放(背景音乐一般都要)"),
@@ -2813,6 +2829,51 @@ class GKNodeUiApplyDesign(B.GKStatementNode):
         layout.label(text=f"会建出 {len(widgets)} 个控件:{head}", icon="CHECKMARK")
 
 
+# ── 主界面(第一百一十二轮)───────────────────────────────────────────
+# 用户:"在游戏界面那里设置一个主界面:无论在什么场景,什么事件中,
+# 都会生效的";玩法图侧只需要"类似蓝图的『添加到视口』布尔为真"。
+#
+# 于是玩法图侧的『界面』只剩两个"接口"节点:
+#   * 『界面_套用设计』 —— 把一张设计图**在这个场景里**建出来;
+#   * 『界面_主界面』   —— 显示 / 收起**跨场景常驻**的主界面(本节点)。
+# 界面自己的内容与行为(按钮点击 / Esc 暂停 / 对话框…)**写进设计图**,
+# 不再往玩法图里拖 —— 这样一份界面不会被每个场景各画一遍。
+@N
+class GKNodeUiMain(B.GKStatementNode):
+    bl_idname = "GKNodeUiMain"
+    bl_label = "界面_主界面"
+    bl_icon = "WINDOW"
+    gk_category = "界面"
+    gk_doc = ("显示 / 收起**主界面**(在『游戏界面』设计图里勾了『主界面』的"
+              "那一张)。\n"
+              "── 主界面和普通界面有什么不一样 ──\n"
+              "主界面在游戏启动时建好、**切关卡也不消失**(导出成 Godot 的"
+              "autoload):常驻的 HUD / 暂停菜单 / 按键提示放这里一份就够,"
+              "不用每一关各搭一遍。\n"
+              "── 界面的内容与行为写到哪 ──\n"
+              "控件摆在设计图里;按钮点击 / Esc 暂停这些**也写成设计图里的"
+              "节点**(没有从别处接进来的语句 = 界面建好后执行一次的"
+              "行为)。玩法图这边只保留这个『显示 / 收起』的布尔开关 —— "
+              "对应蓝图里『Add to Viewport + 布尔』的用法。\n"
+              "── 没有主界面时 ──\n"
+              "运行时会警告一次并跳过(去『游戏界面』面板勾一张『主界面』)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(BOOL, "显示", True),
+    )
+    gk_input_props = {"显示": "gk_show"}
+    gk_prop_defs = (
+        ("gk_show", "bool", True, "显示",
+         "勾上 = 画出主界面;取消 = 把主界面整层收起来(内容都还在,只是不显示)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_show",
+                    text="显示主界面" if self.gk_show else "收起主界面",
+                    toggle=True, icon="WINDOW")
+
+
 @N
 class GKNodeUiOnClick(B.GKStatementNode):
     bl_idname = "GKNodeUiOnClick"
@@ -2845,6 +2906,26 @@ class GKNodeUiOnClick(B.GKStatementNode):
         layout.label(text="点了就走『点击』出口", icon="FORWARD")
 
 
+@N
+class GKNodeUiOnValueChanged(B.GKStatementNode):
+    bl_idname = "GKNodeUiOnValueChanged"
+    bl_label = "界面_值变化"
+    bl_icon = "DRIVER"
+    gk_category = "界面"
+    gk_doc = ("给『游戏界面』设计图里的滑块接玩法逻辑。滑块仍然只摆在"
+              "设计图,逻辑图通过这个接口读取每次拖动的新值。")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "控件名", ""),)
+    gk_input_props = {"控件名": "gk_widget"}
+    gk_prop_defs = (("gk_widget", "string", "", "控件名",
+                     "设计图里的『界面_滑块』节点名"),)
+    gk_outputs = (S.pin(FLOW, "变了"), S.pin(FLOAT, "值", 0.0))
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="", icon="DRIVER")
+        layout.label(text="拖动后走『变了』出口", icon="FORWARD")
+
+
 # ── 哪些节点算"控件构建"(设计图里该建什么由它决定)──────────────────
 # 判据:**这个节点会建出一个控件**。动作类(隐藏/设置/飘字/缓动/对话框/
 # 列表_填充/暂停游戏/设焦点/取文字)只管"运行时改已有控件",不进设计图 ——
@@ -2871,32 +2952,106 @@ _UI_MUTEX_PROP = ("gk_mutex_group", "string", "", "互斥组",
                   "同组的控件只留一个开着:别人打开自己时,自动收起同组的"
                   "其他成员(留空 = 不参与)")
 
+# ── 所有控件共用的『过场界面』一格(第一百二十六轮)─────────────────
+# 用户原话:"有时点快了,就会有这样的情况,那么在如ESC菜单出现时就立刻隐藏
+# 旧的界面,或者添加模糊背景" —— 配图是章节卡「第一章:门厅」糊在暂停面板的
+# "继续游戏"上。钩上这一格 = 这个控件算"过场":暂停菜单弹出来时先收起来,
+# 继续游戏时**原样还原**(暂停前藏着的,继续后还是藏着的)。
+#
+# 谁该钩:章节卡 / 字幕 / 飘在黑屏上的大字 / 过场题字;谁**不该**钩:
+# 血条、电量、目标、按键提示这类"玩家暂停时仍要看"的 HUD —— 收了它们
+# 等于把 HUD 藏了(用户明确说"别把用户正常该看到的 HUD 一起藏了")。
+#
+# 挂在屏幕**正中**的文字不用钩也会被算成过场(见 codegen.services
+# 的 `_ui_looks_transient`):那是几何事实,不靠名字猜。
+_UI_TRANSIENT_PROP = ("gk_transient", "bool", False, "过场界面",
+                      "暂停菜单弹出时先把它收起来(继续游戏时原样恢复)。"
+                      "挂在屏幕正中的文字默认就算过场;角落里的 HUD "
+                      "(血条 / 电量 / 目标)不要钩")
+
 
 def _ui_mutex_card_row(node, layout):
     """控件卡片收尾那行『互斥组』(滑块 / 下拉 / 复选框…都画它)。"""
     layout.prop(node, "gk_mutex_group", text="互斥组", icon="DOT")
 
 
+def _ui_transient_card_row(node, layout):
+    """控件卡片收尾那行『过场界面』(第一百二十六轮,暂停时给菜单让位)。"""
+    layout.prop(node, "gk_transient", text="过场界面", icon="HIDE_ON")
+
+
 def _wrap_ui_card_draw(original):
-    """给控件的 draw_buttons 尾巴上加一行『互斥组』。"""
+    """给控件的 draw_buttons 尾巴上加两行:『过场界面』+『互斥组』。"""
     def draw_buttons(self, context, layout):
         original(self, context, layout)
+        _ui_transient_card_row(self, layout)
         _ui_mutex_card_row(self, layout)
     return draw_buttons
 
 
 for _cls in CLASSES:
     if _cls.bl_idname in UI_DESIGN_BUILDER_NODES:
-        # 两棵树都能放(老图一字不变,设计图也能摆)—— 用户第 40 轮选的
+        # 控件布局只在『游戏界面』图里编辑;游戏逻辑图通过
+        # 『界面_套用设计』和运行时控件接口引用它。
         _cls.gk_tree_type = UI_TREES
         # 『界面_套用设计』按这个标记挑节点,见 codegen.services._ui_design_nodes
         _cls.gk_ui_builder = True
-        _cls.gk_prop_defs = tuple(_cls.gk_prop_defs) + (_UI_MUTEX_PROP,)
+        _cls.gk_prop_defs = tuple(_cls.gk_prop_defs) + (
+            _UI_MUTEX_PROP, _UI_TRANSIENT_PROP)
         B.materialize_props(_cls)
         # 自定义过 draw_buttons 的补一行;没自定义的走基类"自动画属性"那条路
         # (新加的属性在 gk_prop_defs 里,基类会自己把它画出来,别画两遍)
         if "draw_buttons" in _cls.__dict__:
             _cls.draw_buttons = _wrap_ui_card_draw(_cls.draw_buttons)
+
+
+# ── 界面节点搬家:玩法图 → 『游戏界面』(第一百一十二轮)────────────────
+# 用户原话:"把在游戏逻辑的右键菜单的界面逻辑删了,然后在游戏界面重构,
+# 只需要在游戏逻辑中的类似虚幻蓝图的『添加到视口』布尔为真等才在主屏幕
+# 绘制界面,这样就不用绘制多个重复 UI 了"。
+#
+# ── 怎么"搬"的:**菜单藏掉、poll 放行**(两层,别合成一层)──────────
+# 直接把这批节点的 gk_tree_type 改成"只许设计图"会把**老脚本打断** ——
+# 示例的生成脚本(make_ui_demo / make_game_demo…)还在往玩法图里
+# `nodes.new()` 摆它们(代码直连,不过菜单),poll 一拦,示例重建直接失败
+# (实测踩过:"无法将 'GKNodeUiPauseGame' 类型的节点添加到节点树
+#  '走廊逻辑' 中")。所以:
+#   * `gk_menu_hidden_trees` —— **菜单里**不再出现在玩法图(用户要的"删了");
+#   * `gk_tree_type`         —— 两棵树都能放(老图能改、脚本能重建)。
+# 见 properties.node_menu_allowed。
+#
+# ── 三条线(一眼能背下来)────────────────────────────────────────
+#   ① 界面**自己的行为** → 设计图专属(菜单层):按键暂停(Esc)、按钮/滑块
+#      绑定、缓动、皮肤、列表填充。它们以前住在玩法图里,于是"HUD / 暂停
+#      菜单 / 设置页"每关各写一份绑定 —— 重复 UI 的一半来源。
+#   ② 运行时**控件接口**(设置 / 显隐 / 取文字 / 设焦点)→ **两棵树都能放**
+#      (菜单里也在):界面的行为要在设计图里用它们;游戏逻辑更新 HUD
+#      (钥匙数 / 电量)也要用它们。两边都是真话,就不搬家。
+#   ③ 玩法图侧保留:『界面_套用设计』(在某个场景里把设计图建出来 =
+#      蓝图的 Create Widget + Add to Viewport)、『界面_主界面』(跨场景
+#      常驻那份的显示 / 收起开关,布尔)、以及剧情对话那一族(对话框 /
+#      选择 / 字幕 / 历史 —— 玩法在驱动它们)。
+#
+# 例外:**『界面_飘字』留在玩法图** —— 它跟的是"场景里的物体"
+# (金币头顶冒 +1),不是界面控件,摆进设计图反而没意义。
+UI_TREE_RUNTIME_NODES = (
+    "GKNodeUiPauseGame", "GKNodeUiOnClick", "GKNodeUiOnValueChanged",
+    "GKNodeUiTween", "GKNodeUiSkin", "GKNodeUiListFill",
+)
+
+# 运行时控件接口 —— 两棵树都能放(见上面 ②)
+UI_TREE_INTERFACE_NODES = (
+    "GKNodeUiSet", "GKNodeUiHide", "GKNodeUiReadText", "GKNodeUiFocus",
+)
+
+for _cls in CLASSES:
+    if _cls.bl_idname in UI_TREE_RUNTIME_NODES:
+        # 两棵树都能放(poll 放行),只是**玩法图的菜单里不再列** ——
+        # 界面自己的行为请去『游戏界面』写。
+        _cls.gk_tree_type = ("GKGameLogicTree", "GKUiDesignTree")
+        _cls.gk_menu_hidden_trees = ("GKGameLogicTree",)
+    elif _cls.bl_idname in UI_TREE_INTERFACE_NODES:
+        _cls.gk_tree_type = ("GKGameLogicTree", "GKUiDesignTree")
 
 
 # ==========================================================================
@@ -3288,3 +3443,31 @@ class GKNodeSetLight(B.GKStatementNode):
         row.prop(self, "gk_set_color", text="颜色", toggle=True)
         if self.gk_set_color:
             layout.prop(self, "gk_color", text="")
+
+# ==========================================================================
+# 『环境_应用预设』(第一百一十三轮)
+# ==========================================================================
+# 用户:"添加游戏环境节点系统……还可以添加预设"。预设存在场景的
+# 『环境与后处理』卡上(侧栏里存 / 应用),这个节点在玩法图里按名字
+# 切换 —— 开手电时进"恐怖夜"、点篝火切回"黄昏"这类。
+@N
+class GKNodeEnvPreset(B.GKStatementNode):
+    bl_idname = "GKNodeEnvPreset"
+    bl_label = "环境_应用预设"
+    bl_icon = "WORLD"
+    gk_category = "氛围"
+    gk_doc = ("把一整套环境氛围(背景 / 环境光 / 雾 / 泛光 / 色调)按名字切过来。\n"
+              "名字来源:『游戏环境设置』卡里存的预设(存为预设),或者内置那几档"
+              "(卡通二次元:卡通日间 / 卡通黄昏 / 卡通夜晚;"
+              "氛围:恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜)。\n"
+              "⚠ 这一关要先勾『环境与后处理』—— 没有环境就没有可切的东西")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_preset", "string", "卡通日间", "预设名",
+         "『游戏环境设置』里存的预设名,或内置名"
+         "(卡通日间 / 卡通黄昏 / 卡通夜晚 / 恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_preset", text="预设名")

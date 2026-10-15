@@ -3,6 +3,7 @@
 import bpy
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
@@ -12,6 +13,9 @@ from bpy.props import (
 )
 
 from . import codegen
+# 线框标记物体(第一百二十四轮):三种标记的 kind / 中文标签 / 说明
+# 只在 markers.KINDS 里定义一份,这里的下拉直接引它 —— 免得三处各写一份
+from . import markers
 from .nodes import nodes as node_lib
 from .nodes.node_base import node_candidates
 
@@ -125,7 +129,8 @@ def base_class_mismatches(scene, dimension="3"):
         if getattr(obj, "type", "") != "MESH":
             continue
         physics = getattr(obj, "gk_physics", None)
-        if physics is None or not getattr(physics, "enabled", True):
+        if (physics is None or not getattr(physics, "enabled", True)
+                or not getattr(physics, "script_target", False)):
             continue
         actual = resolve_base_class(scene, obj, physics, dimension)
         if actual != chosen:
@@ -192,6 +197,11 @@ def _on_physics_changed(self, context):
         hook(self, context)
     except Exception:
         pass
+
+
+class GKLogicBinding(bpy.types.PropertyGroup):
+    binding_name: StringProperty(name="引用名", default="引用")
+    target: PointerProperty(name="场景物体", type=bpy.types.Object)
 
 
 class GKObjectSettings(bpy.types.PropertyGroup):
@@ -417,6 +427,19 @@ class GKObjectSettings(bpy.types.PropertyGroup):
         description="把节点图导出的脚本挂到这个物体上",
         default=False,
     )
+    # ── 角色逻辑图(第一百一十九轮:区分世界/角色/关卡逻辑)────────────
+    # 勾了『挂游戏逻辑脚本』的物体,可以再指定一张**它自己的**逻辑图
+    # (角色控制 / 敌人 AI 这类"跟着这个物体走"的逻辑)。留空 = 不单独挂,
+    # 逻辑都走场景那张图(老行为)。填了 = 这张图导出成独立脚本挂到这个
+    # 物体上,和场景图(关卡/世界逻辑)分开。
+    logic_tree: StringProperty(
+        name="角色逻辑图",
+        description=("这张物体**自己的**逻辑图(角色控制/敌人行为等)。"
+                     "留空 = 不单独挂,逻辑走场景那张图。"
+                     "填了 = 独立脚本挂到这个物体上"),
+        default="",
+    )
+    logic_bindings: CollectionProperty(type=GKLogicBinding, name="角色引用")
     # ── 静态资产(用户 2026-10-05 第十四轮:"游戏静态资产设计")─────────
     # 一个模型只导一次,场景里可以摆很多份:填同一个『资产名』的物体
     # 属于同一个资产;**本体**(不勾"作为实例")负责定义模型,
@@ -478,6 +501,86 @@ class GKObjectSettings(bpy.types.PropertyGroup):
         default=0.0,
         soft_min=0.0,
         soft_max=200.0,
+    )
+
+    # ── 线框标记物体(第一百二十四轮)────────────────────────────────
+    # 用户原话:"出生点 / 区域环境点 / 关卡父级这种,做成视口里看得见的
+    # 线框标记物体,属性挂在物体属性里,别塞进游戏逻辑侧栏。"
+    #
+    # 为什么放在**物体属性**(GKObjectSettings)而不是场景设置里
+    # --------------------------------------------------------
+    # 标记是"某个物体是什么身份",和碰撞形状 / 刚体质量同一类:选中谁就改谁。
+    # 放进侧栏的场景设置就得"先选物体 → 再去另一个面板填",而且一个场景
+    # 只能有一个出生点、区域却可以有几十个 —— 场景级的容器装不下。
+    #
+    # ── 为什么是两个属性名(都是真属性,互相同步)───────────────────
+    # `gk_marker_kind` 是 ui.py 的面板 / 建标记算子正在读写的名字;
+    # `marker_kind` 是 task 描述里的名字。两个都得可读可写,靠 update
+    # 回调互相同步(markers.sync_update),不引入第二个真值源。
+    #
+    # ⚠ "无" 的标识符是 NONE,不是空字符串:Blender 4.5 会把
+    #   ("", "无", …) 这一项从标识符表里丢掉 —— 读默认值每读一次刷一条
+    #   `pyrna_enum_to_py: current value '0' matches no enum`,写回空串直接
+    #   `TypeError: enum "" not found`(探针实测)。markers.kind_of() 会把
+    #   NONE 统一归成 ""。
+    #
+    # 老 .blend 兼容:这几个属性都是**新加的**,读的时候一律
+    # `markers.kind_of(obj)` / `getattr(physics, "...", 默认)`;旧文件里
+    # 那些属于另一个包路径设置类的物体上没有它们,不这样写会直接抛异常。
+    gk_marker_kind: EnumProperty(
+        name="标记类型",
+        description=("把这个物体当成一种『标记』:\n"
+                     "玩家出生点 / 区域环境点 / 关卡父级。\n"
+                     "标记物体本身不进 Godot 的几何(线框只是给你看着摆位),"
+                     "它产生的是出生点节点 / 区域触发器 / 分组节点"),
+        items=markers.enum_items(),
+        default=markers.NONE_VALUE,
+        update=markers.sync_update(markers.MARKER_PROPERTY,
+                                   markers.MARKER_PROPERTY_ALIAS),
+    )
+    marker_kind: EnumProperty(
+        name="标记类型(别名)",
+        description="和『标记类型』是同一个东西(task 描述里的名字)",
+        items=markers.enum_items(),
+        default=markers.NONE_VALUE,
+        update=markers.sync_update(markers.MARKER_PROPERTY_ALIAS,
+                                   markers.MARKER_PROPERTY),
+        options={"HIDDEN"},
+    )
+    env_preset: StringProperty(
+        name="环境预设",
+        description=("『区域环境点』走进来要切的那套氛围的名字。\n"
+                     "先在内置名里挑:恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜;\n"
+                     "也可以用侧栏环境卡里存过的预设名。留空 = 不生成这片区域"),
+        default="",
+    )
+    env_restore: BoolProperty(
+        name="离开还原",
+        description=("走出这片区域时把氛围还原成进来之前的样子(默认开)。\n"
+                     "关掉 = 这片区域**永久**改掉氛围"
+                     "(剧情里『走进雾里就再也散不掉』那种)"),
+        default=True,
+    )
+    env_fade: FloatProperty(
+        name="过渡秒",
+        description=("切换到这套氛围用多少秒过渡(0 = 立刻切)。\n"
+                     "暂停时过渡也会继续跑完(不会卡在半路)"),
+        default=0.35,
+        min=0.0,
+        max=markers.MAX_ZONE_FADE,
+        soft_max=2.0,
+    )
+    zone_fit_axis: EnumProperty(
+        name="范围轴",
+        description=("『适应所选』按钮按哪几个轴对齐(只影响摆位按钮,\n"
+                     "不影响导出 —— 导出用的是世界包围盒)"),
+        items=(
+            ("XYZ", "XYZ(整盒)", "三个轴都按选中物体对齐 —— 最常用"),
+            ("XY", "XY(只按底面)", "高度保持原样,只对齐平面范围"),
+            ("XZ", "XZ", "只对齐 X / Z 两个轴"),
+            ("YZ", "YZ", "只对齐 Y / Z 两个轴"),
+        ),
+        default="XYZ",
     )
 
 
@@ -667,6 +770,103 @@ class GKObjectFx(bpy.types.PropertyGroup):
     )
 
 
+def _env_preset_items(self, context):
+    """『预设』下拉的动态选项:文件里存的预设 + 内置那几档(带 ★)。
+
+    ⚠ identifier 必须是 **ASCII**(Blender 枚举的硬性要求)—— 内置预设的
+    名字是中文,所以 identifier 用 `builtin_序号`,中文名放 label。之前写成
+    `builtin:恐怖夜`(含中文)会导致 EnumProperty 内部 UTF-8 解码崩溃
+    (UnicodeDecodeError)。
+
+    第 123 轮:名单**不再写在这里** —— 从 `nodes._common.ENV_PRESET_BUILTINS`
+    取(那是唯一真值源)。以前这里、`statements.py` 的报错文案、节点的默认值
+    各写一份中文名单,加一档"卡通二次元"就要改三处,漏一处就变成
+    "下拉里有、节点说找不到"。
+    """
+    from .nodes._common import ENV_PRESET_ANIME, ENV_PRESET_HORROR
+
+    items = []
+    for index, preset in enumerate(getattr(self, "env_presets", ()) or ()):
+        items.append((str(index), str(getattr(preset, "preset_name", "?")),
+                      "本文件里存的预设"))
+    # 二次元三档排前面(第 123 轮:它们是**推荐**的那一组),
+    # 恐怖系跟在后面 —— 顺序 = 常用程度,不是字母序。
+    for index, name in enumerate(ENV_PRESET_ANIME + ENV_PRESET_HORROR):
+        hint = "内置 · 卡通二次元" if name in ENV_PRESET_ANIME else "内置 · 氛围"
+        items.append((f"builtin_{index}", f"★ {name}", hint))
+    return items
+
+
+def builtin_env_preset_names():
+    """内置预设名(第 123 轮收口:唯一真值源仍是 `nodes._common`)。
+
+    保留这个**函数**而不是模块级常量:properties 在导入期就会 import
+    `nodes`(见文件头的 `from .nodes import nodes as node_lib`),
+    模块级再去取一次容易踩循环导入 —— 这里每次现取,零风险。
+    """
+    from .nodes._common import ENV_PRESET_NAMES
+    return ENV_PRESET_NAMES
+
+
+class GKEnvPreset(bpy.types.PropertyGroup):
+    """一个命名环境预设(第一百一十三轮)。
+
+    预设 = 一整套 背景色 / 环境光 / 雾 / 泛光 / 色调 参数的快照:
+      * Blender 侧:『环境与后处理』卡里一键应用(所见即所得地调,
+        调好了存快照);
+      * 游戏里:新节点『环境_应用预设』在玩法图里随时切换。
+    不带 tonemap —— 色调映射是"整局观感",不该被一关内切换。
+    """
+
+    preset_name: StringProperty(
+        name="预设名", default="新预设",
+        description="『环境_应用预设』节点里填的就是这个名字")
+    p_background: EnumProperty(
+        name="背景", items=ENV_BACKGROUNDS, default="COLOR")
+    p_bg_color: FloatVectorProperty(
+        name="背景色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.05, 0.06, 0.10, 1.0))
+    p_ambient_color: FloatVectorProperty(
+        name="环境光颜色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.55, 0.62, 0.80, 1.0))
+    p_ambient_energy: FloatProperty(
+        name="环境光强度", default=0.3, min=0.0, soft_max=4.0)
+    p_fog: BoolProperty(name="雾", default=False)
+    p_fog_color: FloatVectorProperty(
+        name="雾颜色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.30, 0.34, 0.42, 1.0))
+    p_fog_density: FloatProperty(
+        name="雾浓度", default=0.02, min=0.0, soft_max=1.0)
+    p_glow: BoolProperty(name="泛光", default=False)
+    p_glow_intensity: FloatProperty(
+        name="泛光强度", default=0.8, min=0.0, soft_max=4.0)
+    p_glow_bloom: FloatProperty(
+        name="泛光溢出", default=0.1, min=0.0, soft_max=1.0)
+    p_adjust: BoolProperty(name="色调调整", default=False)
+    p_brightness: FloatProperty(name="亮度", default=1.0, min=0.0, soft_max=2.0)
+    p_contrast: FloatProperty(name="对比度", default=1.0, min=0.0, soft_max=2.0)
+    p_saturation: FloatProperty(name="饱和度", default=1.0, min=0.0, soft_max=2.0)
+    # ── 卡通风格(第一百一十三轮:环境系统大蓝图)────────────────────
+    # 这些是**全局 shader 风格**参数,运行时对场景里所有 toon 材质生效。
+    # 对应 gk_toon.gdshader 的同名 uniform,值语义见 npr_preview.PARAM_MAP。
+    p_style_shadow_step: FloatProperty(
+        name="明暗分界", default=0.1, min=-1.0, max=1.0,
+        description="卡通明暗的分界线(0 = 正对光时一半亮一半暗)")
+    p_style_shadow_tint: FloatVectorProperty(
+        name="阴影色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.706, 0.627, 0.902, 1.0),
+        description="暗部染上的颜色(偏冷紫 = 常见二次元暗部)")
+    p_style_three_tone: FloatProperty(
+        name="三段明暗", default=0.0, min=0.0, max=1.0,
+        description="0 = 两段明暗;往上加第三段(高光/过渡层)")
+    p_style_rim: FloatProperty(
+        name="边缘光", default=0.0, min=0.0, max=4.0,
+        description="物体轮廓的一圈光(0 = 关)")
+    p_style_specular: FloatProperty(
+        name="高光", default=0.0, min=0.0, max=4.0,
+        description="表面高光强度(0 = 关)")
+
+
 class GKSceneSettings(bpy.types.PropertyGroup):
     """挂在 Scene 上的导出设置。"""
 
@@ -824,6 +1024,10 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="游戏默认用哪台相机;留空 = 跟着 Blender 视口的当前相机",
         default="",
     )
+    player_spawn: PointerProperty(
+        type=bpy.types.Object, name="玩家出生点",
+        description="切换到本关时，将默认角色及其子对象移动到此物体的位置和朝向；推荐使用空物体。未设置时沿用默认角色的初始变换",
+    )
 
     # ── 寻路 / 导航网格(第三十四轮)──────────────────────────────────
     # 用户选的方向:"寻路 / 避障 —— 敌人会绕墙追你"。
@@ -851,6 +1055,39 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         name="爬坡上限", default=45.0, min=0.0, max=89.0,
         description=("能爬多陡的坡(度)—— 比这陡的地方不算可走。"
                      "斜坡要接进寻路就把它调到大于斜坡的角度"))
+
+    # ── AI 视线遮挡(第一百二十六轮:用户第 1 条"AI 遮挡射线")────────────
+    # 用户原话:"1. AI 遮挡射线"。
+    #
+    # ── 修的是什么 ──────────────────────────────────────────────────
+    # 『AI_看得见』以前只看 **距离 + 躲藏区 + 视野角**,**完全不看中间有没有
+    # 东西挡着** —— 真机实测(4.7.2):把玩家放到 6 米高的『走廊墙北』外面,
+    # 怪物到玩家的连线上射线命中的就是那堵墙,
+    # `_gk_ai_can_see_3d(..., dist=100, angle=0)` 仍然返回 `true`。
+    # 也就是**隔着墙能看见**,潜行玩法直接失效。
+    #
+    # ── 为什么挂在场景上、而不是挂在『AI_看得见』节点上 ──────────────
+    # "这一关的墙挡不挡视线"是**关卡级**的事实(同一关里所有敌人共用),
+    # 和『寻路』同一个性质 —— 所以跟 `nav_enabled` 并排放,而不是让用户在
+    # 每个敌人节点上各勾一遍(勾漏一个就等于那一个还是千里眼)。
+    #
+    # ── 为什么默认 **开** ───────────────────────────────────────────
+    # 用户的诉求就是"要能挡"(潜行是这批需求的玩法目标)。默认关的话,
+    # 用户得先自己找到这个开关才有效果,等于没修。
+    # ⚠ 影响面(已知,如实写在报告里):
+    #   * 生成物变了 —— 勾了的老工程会**多出一段射线代码**。不勾的工程
+    #     生成结果**逐字不变**(仓库里有一堆比对历史产物的断言);
+    #   * 视线会被**任何**静态碰撞挡住 —— 包括示例里当路标用的实心
+    #     `巡逻点甲/乙/丙`(胶囊,y≈1.0,正好在眼高线上)。这类"看不见的
+    #     路标"以前不影响任何判定,现在会挡视线;
+    #   * 高度按人形角色定(眼 1.4 米 / 胸口 1.0 米,见 codegen/ai.py):
+    #     矮怪或巨型怪要自己改生成体里那两个常量。
+    ai_sight_occluded: BoolProperty(
+        name="AI 视线遮挡", default=True,
+        description=("敌人的『AI_看得见』会被墙 / 障碍物挡住:从敌人的眼睛到"
+                     "目标打一条射线,中间有静态碰撞就判看不见。\n"
+                     "关掉 = 退回旧行为(只看距离 / 视野角 / 躲藏区,隔墙也能看见)\n"
+                     "⚠ 关掉后生成结果逐字不变,老工程可以按需退回"))
 
     # ── 运行日志(用户第 29 轮:"角色在掉落,鼠标没反应,其他大概也有问题")──
     # 打开后,生成的脚本**每秒**在 Godot 控制台打一行:
@@ -950,7 +1187,7 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     # 想要"转太阳、阴影跟着转"的效果再打开。
     toon_follow_light: BoolProperty(
         name="卡通跟随场景光照", default=False,
-        description="卡通材质是否跟着场景里的平行光画明暗(关掉 = 全平涂)")
+        description="使用场景中的太阳、点光和聚光灯，接收真实阴影和距离衰减；关闭使用固定卡通光照")
 
     # ── 环境与后处理(第四十九轮:阶段②环境与后处理)────────────────────
     # 给这一关挂一个 WorldEnvironment + Environment 资源:背景 / 环境光 /
@@ -990,6 +1227,17 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     env_glow: BoolProperty(
         name="泛光", default=False,
         description="亮的地方往外溢光 —— 灯 / 手电筒 / 火光'毛'起来")
+    env_ssao: BoolProperty(
+        name="接触阴影 (SSAO)", default=False,
+        description="增强墙角、地面接触处的遮蔽；需要 Godot Forward+ 渲染器")
+    env_ssil: BoolProperty(
+        name="间接补光 (SSIL)", default=False,
+        description="使用屏幕内的光照信息补充暗部层次；需要 Godot Forward+ 渲染器")
+    render_quality: EnumProperty(
+        name="启动画质", default="KEEP",
+        items=(("KEEP", "沿用工程", "保留 Godot 工程的渲染设置"),
+               ("HIGH", "高画质", "原生分辨率、4x 抗锯齿、4096 阴影图和高质量软阴影")),
+    )
     env_glow_intensity: FloatProperty(
         name="泛光强度", default=0.8, min=0.0, soft_max=4.0)
     env_glow_bloom: FloatProperty(
@@ -1006,6 +1254,38 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         name="对比度", default=1.0, min=0.0, soft_max=2.0)
     env_saturation: FloatProperty(
         name="饱和度", default=1.0, min=0.0, soft_max=2.0)
+
+    # ── 全局卡通风格(第一百一十五轮:环境系统大蓝图阶段 B)────────────
+    # 场景级 shader 风格:导出时作为**默认**写进没调过参数的材质 .tres
+    # (等于"整关一键定风格",不用逐材质调)。这些值对应 gk_toon.gdshader
+    # 的同名 uniform,语义见 npr_preview.PARAM_MAP。关着 = 老默认值,
+    # 老项目产物一字不变。
+    style_enabled: BoolProperty(
+        name="全局卡通风格", default=False,
+        description="给整关定一套卡通风格(色阶 / 阴影色 / 边缘光 / 高光)。"
+                    "导出时作为默认写进材质,不用逐材质调")
+    style_shadow_step: FloatProperty(
+        name="明暗分界", default=0.1, min=-1.0, max=1.0)
+    style_shadow_tint: FloatVectorProperty(
+        name="阴影色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.706, 0.627, 0.902, 1.0))
+    style_three_tone: FloatProperty(
+        name="三段明暗", default=0.0, min=0.0, max=1.0)
+    style_rim: FloatProperty(
+        name="边缘光", default=0.0, min=0.0, max=4.0)
+    style_specular: FloatProperty(
+        name="高光", default=0.0, min=0.0, max=4.0)
+
+    # ── 环境预设(第一百一十三轮)───────────────────────────────────
+    # 每个场景一份预设表:侧栏环境卡里存 / 应用;游戏里用
+    # 『环境_应用预设』节点按名字切换。
+    env_presets: CollectionProperty(type=GKEnvPreset)
+    env_preset_pick: EnumProperty(
+        name="预设", items=_env_preset_items,
+        description="选一个预设(应用后才写进上面的设置)")
+    env_preset_new_name: StringProperty(
+        name="存为预设", default="我的氛围",
+        description="把当前『环境与后处理』的一套值存成这个名字的预设")
 
     output_dir: StringProperty(
         name="导出目录",
@@ -1548,18 +1828,29 @@ def node_fits_tree(cls, tree_type):
     return tree_type in node_tree_kinds(cls)
 
 
-def node_menu_entries():
-    """按分类整理所有节点，供"添加节点"菜单使用。"""
-    grouped = {}
-    for cls in node_lib.ALL_CLASSES:
-        grouped.setdefault(cls.gk_category, []).append(cls)
-    ordered = []
-    for category in node_lib.CATEGORY_ORDER:
-        if category in grouped:
-            ordered.append((category, grouped.pop(category)))
-    for category, items in grouped.items():
-        ordered.append((category, items))
-    return ordered
+def node_menu_allowed(cls, tree_type):
+    """这个节点**菜单里**能不能列进 tree_type 那种树(第一百一十二轮)。
+
+    ── 为什么和 `node_fits_tree`(poll)分开 ─────────────────────────
+    用户要求"把在游戏逻辑的右键菜单的界面逻辑删了"(界面自己的行为搬进
+    『游戏界面』)。如果直接改 `gk_tree_type` 让 poll 也拦下,会把**老脚本**
+    打断 —— 示例的生成脚本还在往玩法图里 `nodes.new()` 摆这些节点
+    (代码直连、不过菜单),poll 一拦,示例重建直接失败(实测踩过:
+    "无法将 'GKNodeUiPauseGame' 类型的节点添加到节点树 '走廊逻辑' 中")。
+
+    所以拆成两层,各管各的:
+      * **菜单**(用户看到的,本函数):藏着不列 —— 新图按新架构走;
+      * **poll**(能不能放):照旧允许 —— 老图能编辑、脚本能重建。
+    和 `gk_hidden`(整张菜单都不列)是同一种"温和引导"的思路。
+    """
+    if getattr(cls, "gk_category", "") == "动画(旧)":
+        return False
+    if not node_fits_tree(cls, tree_type):
+        return False
+    hidden = getattr(cls, "gk_menu_hidden_trees", ())
+    if isinstance(hidden, str):
+        hidden = (hidden,)
+    return tree_type not in hidden
 
 
 def node_menu_entries(tree_type=None):
@@ -1573,16 +1864,20 @@ def node_menu_entries(tree_type=None):
     for cls in node_lib.ALL_CLASSES:
         # 隐藏的节点不出现在"添加节点"菜单里,但仍然能加载/生成代码。
         # 用来做"旧版保留但不推荐"——删掉的话已有的图会打不开。
-        if getattr(cls, "gk_hidden", False):
+        if getattr(cls, "gk_hidden", False) or cls.gk_category == "动画(旧)":
             continue
         if tree_type is not None:
             # gk_tree_type 允许是**元组**(两张树里都能用的节点,比如
             # 逻辑_布尔运算 —— 动画转场条件也要拼组合判断)。见 node_fits_tree
-            if not node_fits_tree(cls, tree_type):
+            # ⚠ 菜单用 `node_menu_allowed`:它在 "能放" 之上再叠一层
+            #   "菜单里不列"(第一百一十二轮,界面节点搬家用的温和引导)。
+            if not node_menu_allowed(cls, tree_type):
                 continue
-        grouped.setdefault(cls.gk_category, []).append(cls)
+        category = next((name for name, categories in node_lib.MENU_GROUPS.items()
+                         if cls.gk_category in categories), cls.gk_category)
+        grouped.setdefault(category, []).append(cls)
     ordered = []
-    for category in node_lib.CATEGORY_ORDER:
+    for category in tuple(node_lib.MENU_GROUPS) + node_lib.CATEGORY_ORDER:
         if category in grouped:
             ordered.append((category, grouped.pop(category)))
     for category, items in grouped.items():
@@ -1602,13 +1897,17 @@ def node_menu_tree(tree_type=None):
     """
     result = []
     for category, classes in node_menu_entries(tree_type):
-        order = node_lib.SUBCATEGORY_ORDER.get(category)
+        source_categories = node_lib.MENU_GROUPS.get(category, (category,))
+        merged = len(source_categories) > 1 and category != "输入"
+        order = (source_categories if merged else
+                 node_lib.SUBCATEGORY_ORDER.get(source_categories[0]))
         if not order:
             result.append((category, None))
             continue
         buckets = {}
         for cls in classes:
-            sub = node_lib.SUBCATEGORY_OF.get(cls.bl_idname, "其它")
+            sub = (cls.gk_category if merged else
+                   node_lib.SUBCATEGORY_OF.get(cls.bl_idname, "其它"))
             buckets.setdefault(sub, []).append(cls)
         subs = []
         for sub in order:
@@ -1816,9 +2115,54 @@ def default_output_dir():
 
 # 注册顺序很关键:PointerProperty 引用 PropertyGroup 时，PropertyGroup
 # 必须已经注册，否则挂到 Scene / Object 上会报 "missing bl_rna attribute"。
+class GKEnvLibraryTree(bpy.types.NodeTree):
+    """环境预设库 —— 文件级(跨场景)共享的命名预设容器(第一百一十五轮)。
+
+    预设原来挂在**每个场景**的 gk_settings.env_presets 上,多关卡时每关
+    一份、互不相通(关卡1 存的"恐怖夜"在关卡2 里看不到)。现在统一收到
+    这张**隐藏的树**里 —— 和"动画变量挂动画树"同一个道理:NodeTree 是
+    文件里唯一的"跨场景持久数据块"(bpy.data.node_groups)。
+
+    它不进节点图列表、不放任何节点、也不是一张可编辑的图 —— 只是预设的
+    存放处。编辑 / 应用 / 保存的 UI 在『显示_环境氛围』卡上,按
+    `env_preset_library()` 找到这一张。
+    """
+
+    bl_idname = "GKEnvLibraryTree"
+    bl_label = "环境预设库"
+    bl_icon = "BOOKMARKS"
+    bl_description = ("BlenderGameKit 的环境预设库 —— 跨场景共享的"
+                      "命名预设(数据容器,编辑在『显示_环境氛围』卡)")
+
+    env_presets: CollectionProperty(type=GKEnvPreset)
+    env_preset_pick: EnumProperty(
+        name="预设", items=_env_preset_items,
+        description="选一个预设(应用后才写进上面的设置)")
+    env_preset_new_name: StringProperty(
+        name="存为预设", default="我的氛围",
+        description="把当前『环境与后处理』的一套值存成这个名字的预设")
+
+
+def env_preset_library():
+    """当前文件的环境预设库树(没有就建一张);跨场景共享。
+
+    ── 为什么用一张树(而不是继续挂场景)────────────────────────────
+    预设是"项目的风格资产",本该多关卡共用。NodeTree 是文件里唯一的
+    跨场景持久数据块,和动画变量 / 主界面开关同一个存法。fake_user
+    保证没人引用它时也不会被 Blender 存盘时丢掉(和 AI 图同一个坑)。
+    """
+    for group in bpy.data.node_groups:
+        if getattr(group, "bl_idname", "") == "GKEnvLibraryTree":
+            return group
+    tree = bpy.data.node_groups.new("环境预设库", "GKEnvLibraryTree")
+    tree.use_fake_user = True
+    return tree
+
+
 #
 # 注意:这几个 PropertyGroup 只在这里**注册类**;真正挂到
 # Scene.gk_settings / Object.gk_physics 上的动作在
 # __init__.register() 里做 —— 那边能保证"所有类都注册完了"再挂。
-GK_CLASSES = (GKSceneSettings, GKObjectSettings, GKObjectFx, GKAnimVariable,
-              GKLogicPort, GKLogicVariable, GKLogicFunction)
+GK_CLASSES = (GKEnvPreset, GKEnvLibraryTree, GKSceneSettings, GKLogicBinding,
+              GKObjectSettings, GKObjectFx, GKAnimVariable, GKLogicPort,
+              GKLogicVariable, GKLogicFunction)

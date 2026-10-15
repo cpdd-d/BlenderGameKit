@@ -25,6 +25,8 @@
 会**先扫出来**定基类,否则生成完才发现"这个基类没有 velocity"就晚了。
 """
 
+import contextlib
+
 from ..nodes.node_base import (TARGET_SELF, gd_string, snake_case)
 from ..nodes import nodes as node_lib
 
@@ -761,8 +763,143 @@ def _emit_ai_transitions(ctx, indent, machine):
         ctx.add_line(indent, "pass")
 
 
+@contextlib.contextmanager
+def _indented_guard(ctx, indent, condition):
+    """把接下来写的整段代码包进 `if <condition>:` 里。
+
+    ── 为什么用 `ctx.sink.extra_indent`,而不是把 `indent` 传下去 ──────
+    AI 状态机那一段(`_emit_ai_graph` → `_emit_ai_behavior` →
+    `_emit_ai_transitions`)内部有**多层嵌套块**,缩进是层层算出来的
+    (`indent + 1` / `indent + 2`),调用点很多。逐个调用点 +1 迟早会漏一个
+    (漏掉的那一行就掉到守卫外面,而且生成物语法完全正确、极难发现)。
+
+    `_Statements.extra_indent` 是**整段统一加一层**的现成机制 —— 它就是为
+    "把已经生成好的一段整体嵌进去"准备的(见 context.py 的 `_Statements`)。
+    这里只要在写这段的时候把它 +1,里面**所有** `add_line` 不管本来几层,
+    都整体落进守卫块里 —— 一个都不用改。
+
+    ── 缩进账(⚠ 我第一版就是这里写错,`if` 和块体写成了同一层)──────
+    `extra_indent` 是**无条件**加在每一行上的,所以:
+        守卫行     要写在 `indent` 层   -> 此刻不能吃 extra_indent
+        块体行     要写在 `indent + 1`  -> 此刻要吃 +1
+
+    做法:**先写守卫行(此时 extra_indent 还是 0),再加 1 再 yield。**
+    这样守卫行在 indent 层、块体在 indent+1 层,天然差一层。
+    (我第一版是"先 +1 再写守卫行、守卫行传 indent-1 去抵消",能凑对但
+     容易看晕 —— 而且以后谁把 `indent` 改成别的层数就会错,所以改成
+     现在这种"先写后加"的写法。)
+
+    ⚠ 开关挂在**当前 sink**上(`ctx.sink`),不是 ctx —— 所以用上下文管理器
+    保证一定还回去:不还的话**后面所有**代码(别的机器、别的函数段)都会被
+    多缩进一层,Godot 直接报 Parse Error。
+    """
+    sink = ctx.sink
+    ctx.add_line(indent, f"if {condition}:")
+    sink.extra_indent += 1
+    try:
+        yield
+    finally:
+        sink.extra_indent -= 1
+
+
 def _emit_ai_graph(ctx, indent, machine):
     """把一台 AI 状态机生成到 _physics_process:先行为,后转场。"""
+    # ── 被上帝机暂停(第一百三十一轮:用户第 13 轮)────────────────────
+    # 用户原话:"第二关,在上帝机启用中,游戏AI还可以攻击我,应该设置上帝机
+    # 启用时全局暂停(冻结全局时间流速)… 且此时靠近游戏AI按F键确实可以接管,
+    # 但AI的移动逻辑等 和我的在抢夺控制权(可以在游戏AI的侧边栏添加是否被
+    # 上帝机暂停,默认启用,不启用的话这可以在上帝视角观察世界运行)"。
+    #
+    # ── 为什么整段包起来 ──────────────────────────────────────────
+    # 用户的问题是"上帝机里 AI 还在攻击我 / 附身之后跟我在抢控制权"。
+    # 只停"转场"不够(行为还在每帧写 velocity),只停"行为"也不够(转场还会
+    # 切状态、『进入时』还会放攻击特效)。所以**行为 + 转场 + 对外布尔输出**
+    # 一起停 —— 停的是"这条 AI 的心跳",而不只是它的一部分。
+    #
+    # ── ⚠ 两个必须守住的前提 ───────────────────────────────────────
+    # 1) **必须登记 `ctx.need_god_guard`** —— 生成器只在它为真时把
+    #    `_gk_god_camera_active()` 的**定义**写出去;只调用不定义 =
+    #    Godot 报 "Function _gk_god_camera_active() not found in base self",
+    #    整个脚本加载不了(这个坑仓库里踩过,见 statements.py 那两行)。
+    # 2) 只在**这一关真的导了上帝机**时才加守卫(`ctx.god_camera_enabled`)。
+    #    没导上帝机 = `_gk_god_camera_active()` 根本不存在,加了就编译不过;
+    #    而且没上帝机的老工程生成结果**逐字不变**(仓库一直守这条)。
+    #
+    # ⚠ 顺序上的坑:生成器发射 `_gk_god_camera_active()` 定义的那一处
+    #   (generator.py `if god_camera_enabled or need_god_guard`)跑在**遍历
+    #   节点之前**,而我们这里是之后才登记 —— 所以**不能**只靠
+    #   `need_god_guard`。这里用 `god_camera_enabled` 当门,就没这个问题
+    #   (导了上帝机的工程本来就会发射那个定义)。
+    #
+    # ⚠ `ctx.dim == 3`:上帝机是**3D 独有**的概念(它那台相机是 Camera3D,
+    #   判据是 `get_viewport().get_camera_3d()`)。2D 工程即使设置里误勾了
+    #   『上帝摄像机』,2D 脚本里也不该出现这条守卫:
+    #     * `_gk_god_camera_active()` 在 2D 里**永远返回 false**,守卫是死代码;
+    #     * `if X is CharacterBody3D` 在 `CharacterBody2D` 脚本里是**类型错**;
+    #   而且这样一来,**2D 工程生成结果逐字不变**(我这轮没打算动 2D)。
+    guard = (bool(machine.get("pause_with_god", True))
+             and bool(getattr(ctx, "god_camera_enabled", False))
+             and int(getattr(ctx, "dim", 3) or 3) == 3)
+    if guard:
+        ctx.need_god_guard = True
+        # ── 附身优先(第一百三十一轮用户第 13 轮后半句)────────────────
+        # 用户原话:"靠近游戏AI按F键确实可以接管,但AI的移动逻辑等 和我的
+        # 在抢夺控制权"。
+        #
+        # ── 为什么不能只靠 `_gk_god_camera_active()` ─────────────────
+        # 那条只说明"现在看的是上帝机",说明不了"**这一具**身体正被人接管"。
+        # 两者真会分开:主线程这轮让进上帝机 = `get_tree().paused = true`,
+        # 玩家按 Enter **解冻**之后上帝机还开着(`_gk_god_camera_active()`
+        # 仍为真),但"附身"和"AI 自己跑"在这个窗口里是两件事 ——
+        # 尤其被附身的角色若被设成 `PROCESS_MODE_ALWAYS`(冻结期间还要能动),
+        # 它自己脚本里的 AI 会跟着活过来,继续写 velocity 和玩家抢。
+        #
+        # ── 组名是**契约** ────────────────────────────────────────────
+        # `gk_god_possessed` 和 `asset_export._gk_god_possess_begin/release`
+        # 里那两行是**一对**(和 `gk_god_camera` / `gk_hide_spot` 同一个做法)。
+        # 改一边忘了另一边,测试当场红。
+        #
+        # ⚠ 用 `machine["self"]`(= AI 实际控制的那个角色体),不是 `self`:
+        #   脚本可能挂在**场景根**上(走廊那关就是),`self` 不是 CharacterBody。
+        body = machine.get("self") or "self"
+        condition = ("not _gk_god_camera_active()"
+                     f' and not ({body}).is_in_group("gk_god_possessed")')
+        with _indented_guard(ctx, indent, condition):
+            _emit_ai_graph_body(ctx, indent, machine, hold_velocity=True)
+        return
+    _emit_ai_graph_body(ctx, indent, machine)
+
+
+def _emit_ai_graph_body(ctx, indent, machine, hold_velocity=False):
+    """`_emit_ai_graph` 的本体(和守卫拆开,免得守卫那一段把缩进算乱)。
+
+    `hold_velocity` = 停摆期间要不要顺手把水平速度按住。**缩进全部在这里
+    算**(不放进 `_indented_guard` 里手写)是我第一版踩的坑:在守卫块里
+    手写 `indent + 1` 会被 `extra_indent` 再加一层,嵌套的
+    `if ... is CharacterBody3D:` 就和它的块体缩进一样了。
+    """
+    if hold_velocity:
+        # ── 停摆时把速度**按住**(不然就是用户说的"抢夺控制权")────────
+        # 上帝机附身时是**环境脚本**每帧替角色写 velocity 再
+        # `move_and_slide()`(见 asset_export._gk_god_possess_tick);
+        # AI 的行为代码是同一套写法。光"不执行 AI"不够:velocity 是**成员
+        # 变量**,上一帧 AI 写的值会留在里面 —— 附身那一刻角色会带着
+        # "AI 最后一帧的速度"继续滑,而附身的 tick 每帧还会
+        # `move_and_slide()` 一次,看起来就是 AI 在跟你抢方向。
+        # 所以停摆的同一帧顺手把**水平**速度清零(垂直留着交给重力,
+        # 免得停摆时悬在半空)。
+        #
+        # ⚠ 必须用 `machine["self"]`(AI 控制的那个角色体),**不能**用
+        #   `self` —— 踩过的坑(第 131 轮真机):走廊这关的脚本是挂在
+        #   **场景根**上的(`extends Node3D`),`self` 根本不是 CharacterBody3D,
+        #   于是 `if self is CharacterBody3D:` 永远为假、速度一次都没被按住,
+        #   而位置看起来又是"冻住了"(行为整段没跑)—— 表现为
+        #   "位置 0 位移、速度却还是 4.399"这种自相矛盾的读数。
+        target = machine.get("self") or "self"
+        ctx.add_line(indent, f"if {target} is CharacterBody3D:")
+        body = f"({target} as CharacterBody3D)"
+        ctx.add_line(indent + 1, f"{body}.velocity.x = 0.0")
+        ctx.add_line(indent + 1, f"{body}.velocity.z = 0.0")
     emitted = 0
     for state in machine["graph"]["states"]:
         name = node_lib.ai_state_name(state)
@@ -943,6 +1080,15 @@ def _stmt_ai_enable(ctx, node, indent):
         "var": var_name,
         "self": target,
         "debug": bool(getattr(node, "gk_debug_print", False)),
+        # ── 被上帝机暂停(第一百三十一轮:用户第 13 轮)────────────────
+        # 用户原话:"第二关,在上帝机启用中,游戏AI还可以攻击我 … (可以在
+        # 游戏AI的侧边栏添加是否被上帝机暂停,默认启用,不启用的话这可以在
+        # 上帝视角观察世界运行)"。
+        #
+        # ⚠ 兜底必须是 **True**(不是 False):老的 .blend 里这个节点是这轮
+        #   之前建的,读不到 `gk_pause_with_god` —— 用 False 兜底的话老工程
+        #   会悄悄退回"上帝机里 AI 照跑",那正是用户报的毛病。
+        "pause_with_god": bool(getattr(node, "gk_pause_with_god", True)),
         "flip": flip_var,
         "wp_index": wp_index,
         "wp_dir": wp_dir,
@@ -1044,6 +1190,54 @@ def _ensure_ai_see_helper(ctx):
             "        if _hide is Area3D and target is PhysicsBody3D:",
             "            if (_hide as Area3D).overlaps_body(target as PhysicsBody3D):",
             "                return false",
+        ]
+        # ── 遮挡射线(第一百二十六轮:用户第 1 条"AI 遮挡射线")──────────
+        # 用户原话:"1. AI 遮挡射线"。
+        # 之前这里只看 距离 + 躲藏区 + 视野角 —— **隔着墙照样看得见**:
+        # 真机实测(4.7.2)把玩家放到 6 米高的『走廊墙北』外面,怪物到玩家
+        # 的连线上射线命中的就是那堵墙,`_gk_ai_can_see_3d(dist=100, angle=0)`
+        # 仍然返回 true。
+        #
+        # ── 三个必须做对的地方(全是实测踩出来的)────────────────────
+        # 1) **必须排除双方自己**:不排除的话射线第一个命中的就是观察者
+        #    自己的碰撞代理(或目标的),结果"永远看不见"。注意示例走廊里
+        #    『怪物』**本身就在 `Colliders/` 下**、和节点同位置,所以除了
+        #    节点自己的 RID,还得把子节点里的碰撞体也排除掉。
+        # 2) **不能用节点原点打射线**:角色原点常在脚底/中心,从脚底平打
+        #    会被**地板**挡住(实测:地板是一块 48x0.4x14 的盒子)。
+        #    所以观察者从"眼睛"(原点 +1.4 米)、目标打"胸口"(+1.0 米)。
+        #    ⚠ 这两个高度是**按人形角色**定的;矮怪 / 巨型怪要自己在导出后
+        #      改生成体里的 `_gk_eye_h` / `_gk_chest_h`(故意留成命名常量,
+        #      方便改,而不是散在表达式里)。
+        # 3) `intersect_ray` 返回**空** = 没有东西挡住 = 看得见;非空 = 挡住。
+        #
+        # ⚠ 这个块**只在勾了场景设置『AI 视线遮挡』时才生成**
+        #   (默认勾上)。不勾的老工程生成结果**逐字不变** —— 仓库里有一堆
+        #   比对历史产物的断言。
+        if bool(getattr(ctx, "ai_sight_occluded", False)):
+            body += [
+                "    # 眼睛 -> 胸口 打一条射线,中间被静态碰撞挡住就看不见",
+                "    var _gk_eye_h := 1.4      # 观察者的眼睛在原点上方多高(米)",
+                "    var _gk_chest_h := 1.0    # 打目标的胸口,不是原点(打原点会被地板挡)",
+                "    var _gk_from: Vector3 = "
+                f"{reader}(watcher) + Vector3(0.0, _gk_eye_h, 0.0)",
+                "    var _gk_to: Vector3 = "
+                f"{reader}(target) + Vector3(0.0, _gk_chest_h, 0.0)",
+                "    var _gk_exclude: Array[RID] = []",
+                # 节点自己 + 它子孙里的碰撞体(角色的碰撞代理常挂在子节点上)
+                "    for _gk_node in [watcher, target]:",
+                "        if _gk_node is CollisionObject3D:",
+                "            _gk_exclude.append((_gk_node as CollisionObject3D).get_rid())",
+                "        for _gk_child in _gk_node.find_children(\"*\", \"CollisionObject3D\", true, false):",
+                "            _gk_exclude.append((_gk_child as CollisionObject3D).get_rid())",
+                "    var _gk_space := "
+                "(watcher as Node3D).get_world_3d().direct_space_state",
+                "    var _gk_query := PhysicsRayQueryParameters3D.create("
+                "_gk_from, _gk_to, 0xFFFFFFFF, _gk_exclude)",
+                "    if not _gk_space.intersect_ray(_gk_query).is_empty():",
+                "        return false",
+            ]
+        body += [
             "    if angle_deg <= 0.0 or angle_deg >= 360.0:",
             "        return true",
             "    if watcher is not Node3D:",

@@ -348,7 +348,7 @@ def items_of(report, level):
 def report_text(report):
     """整份报告的纯文本(『复制报告』用):粘给谁都能看懂。"""
     if not report:
-        return "(还没有导出过 —— 先点『导出为 Godot 脚本』)"
+        return "(还没有导出过 —— 先点『导出到 Godot』)"
     lines = []
     state = "成功" if report.get("ok") else "失败"
     lines.append(f"=== BlenderGameKit 导出报告({state})===")

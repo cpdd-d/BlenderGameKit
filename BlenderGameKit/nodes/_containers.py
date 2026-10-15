@@ -446,6 +446,10 @@ class GKNodeComment(B.GKEventNode):
     gk_is_comment = True
     gk_outputs = ()
     gk_prop_defs = (("gk_text", "string", "在这里写备注", "备注", ""),)
+    # 注释框在**有执行流**的图里都能放(玩法 / AI / 动画)—— 第一百一十八轮
+    # 用户想在 AI 图里写"转场成环 = 正常循环"的说明被 poll 拦下。
+    # 设计图(界面)不放:控件图没有"备注"语义,行为根也不该混进控件。
+    gk_tree_type = ("GKGameLogicTree", "GKGameAiTree", "GKAnimationTree")
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_text", text="")

@@ -124,6 +124,29 @@ def _scene_settings(context):
     return getattr(scene, "gk_settings", None) if scene is not None else None
 
 
+def _env_preset_library():
+    """文件级环境预设库树(延迟导入,躲开 nodes<->properties 的循环)。"""
+    from .. import properties
+
+    return properties.env_preset_library()
+
+
+def _picked_preset(library):
+    """『预设』下拉当前选中的那个预设条目;选的是内置或没选返回 None。
+
+    library 是 `env_preset_library()` 返回的预设库树(文件级共享,第一百一
+    十五轮)。旧版本挂在场景 gk_settings 上,现在统一走这张库。
+    """
+    if library is None:
+        return None
+    pick = str(getattr(library, "env_preset_pick", "") or "")
+    if not pick.isdigit():
+        return None
+    presets = getattr(library, "env_presets", ()) or ()
+    index = int(pick)
+    return presets[index] if 0 <= index < len(presets) else None
+
+
 @N
 class GKNodeDisplayCollision(B.GKStatementNode):
     bl_idname = "GKNodeDisplayCollision"
@@ -232,6 +255,24 @@ class GKNodeDisplayStyle(B.GKStatementNode):
         else:
             layout.label(text="按 Blender 原样导出 PBR(核对细节用)", icon="INFO")
 
+        # ── 全局卡通风格(第一百一十五轮阶段 B)──────────────────────
+        # 场景级风格:导出时作为**默认**写进没调过参数的材质(整关一键
+        # 定风格)。运行时『环境_应用预设』仍可整套覆盖。
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(settings, "style_enabled", toggle=True, icon="MATERIAL")
+        if bool(getattr(settings, "style_enabled", False)):
+            srow = box.row(align=True)
+            srow.prop(settings, "style_shadow_step", text="明暗分界")
+            srow.prop(settings, "style_three_tone", text="三段")
+            box.prop(settings, "style_shadow_tint", text="阴影色")
+            srow = box.row(align=True)
+            srow.prop(settings, "style_rim", text="边缘光")
+            srow.prop(settings, "style_specular", text="高光")
+            box.label(text="导出时作为整关材质的默认风格", icon="INFO")
+        else:
+            box.label(text="关着 = 老默认风格(不改任何材质)", icon="INFO")
+
 
 @N
 class GKNodeDisplayPreview(B.GKStatementNode):
@@ -275,14 +316,20 @@ class GKNodeDisplayPreview(B.GKStatementNode):
 @N
 class GKNodeDisplayEnvironment(B.GKStatementNode):
     bl_idname = "GKNodeDisplayEnvironment"
-    bl_label = "显示_环境氛围"
+    # ── 第 123 轮改名:『显示_环境氛围』→『游戏环境设置』(用户原话)─────
+    # "现在的环境渲染成了『中世纪』的风格了……并且把环境预设改成
+    #  游戏环境设置这样"
+    # 改的是**标签**,`bl_idname` / 字段名一个字没动 —— 老 .blend 里的
+    # 节点和值原样有效(改 idname 会让老工程整节点失效,那是数据迁移的活,
+    # 收益为零)。
+    bl_label = "游戏环境设置"
     bl_icon = "WORLD"
     gk_category = "显示设置"
     gk_tree_type = "GKDisplayTree"
     gk_inputs = ()
     gk_outputs = ()
-    gk_doc = ("**环境与后处理**(第四十九轮:阶段②)—— 给这一关挂一个 "
-              "WorldEnvironment。\n"
+    gk_doc = ("**游戏环境设置**(第四十九轮建卡 / 第 123 轮改名合并)—— "
+              "给这一关挂一个 WorldEnvironment,并从这里选整套氛围。\n"
               "『环境与后处理』总开关:关着 = 产物里连节点都不多一个"
               "(老工程导出结果一字不变)。\n"
               "开着才能设这几样(卡上改 = 导出**立刻**按新值走,不用点应用):\n"
@@ -292,7 +339,14 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
               "* **雾**:体积雾 —— 恐怖片『空气感』的主力;颜色 + 浓度;\n"
               "* **泛光**:亮的地方往外溢光(灯 / 手电筒 / 火光毛起来)+ 强度 / 溢出;\n"
               "* **色调**:色调映射(线性 / Reinhard / Filmic / ACES)+ 可选调色\n"
-              "  (亮度 / 对比度 / 饱和度)。\n"
+              "  (亮度 / 对比度 / 饱和度);\n"
+              "* **预设**(卡下半部分):「卡通二次元」三档(卡通日间 / 卡通黄昏 /\n"
+              "  卡通夜晚)+ 氛围四档(恐怖夜 / 明亮白天 / 黄昏 / 浓雾夜),\n"
+              "  一键套整套;自己调的也能存成命名预设,游戏里用\n"
+              "  『环境_应用预设』节点按名字切。\n"
+              "⚠ 想要**卡通二次元**而不是写实奇幻观感,关键在预设里的三件事:\n"
+              "  环境光强度别低于 ~0.6(暗部不许死黑)、阴影色用**冷色相**\n"
+              "  (暖棕暗部立刻变『中世纪』)、饱和度 1.15 以上。\n"
               "⚠ Godot 的 Environment **没有**内置暗角(vignette),暗角要靠\n"
               "后处理着色器 —— 留到氛围套件那一轮。\n"
               "⚠ 只对 **3D 项目**有效(WorldEnvironment 是 3D 的东西);\n"
@@ -313,41 +367,120 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
                          icon="ERROR")
             return
 
+        # ── 环境预设(第一百一十三轮 / 第一百一十五轮:文件级共享)────
+        # 存快照 / 一键应用;游戏里用『环境_应用预设』节点按名字切。
+        # 预设存在文件级『环境预设库』树里 —— 多关卡共用同一套。
+        #
+        # ── 第 123 轮:把它提到这一盒的**最前面**,并分组显示 ────────────
+        # 用户原话:"把环境预设改成游戏环境设置这样"。他的意思不是改个名,
+        # 而是**这里应该是进来就能套整套氛围的地方** —— 以前它压在
+        # 背景/雾/泛光/色调五组参数下面,得先滚半天才看见,于是"想要二次元"
+        # 的人一直在手调单参数(调出来的就是那个『中世纪』观感)。
+        # 现在顺序反过来:先挑整套预设,不满意再往下手调细节。
+        library = _env_preset_library()
         box = layout.box()
-        box.label(text="背景", icon="IMAGE_BG")
+        box.label(text="环境预设(选一套 = 整套氛围,跨场景共享)",
+                  icon="BOOKMARKS")
+        row = box.row(align=True)
+        row.prop(library, "env_preset_pick", text="")
+        row.operator("gk.env_preset_apply", text="应用", icon="CHECKMARK")
+        # 二次元那三档单独提一行说清"这就是动画观感" —— 名字在中文里
+        # 看不太出差别(卡通日间 vs 明亮白天),一句话省掉一次试错。
+        box.label(text="★ 卡通日间 / 卡通黄昏 / 卡通夜晚 = 动画赛璐璐观感",
+                  icon="INFO")
+        box.label(text="想要二次元:先应用这三档之一,再按需要微调下面",
+                  icon="CHECKMARK")
+        row = box.row(align=True)
+        row.prop(library, "env_preset_new_name", text="")
+        row.operator("gk.env_preset_save", text="存为预设", icon="ADD")
+        box.operator("gk.env_preset_remove", text="删除选中的预设", icon="X")
+
+        # ── 卡通风格(第一百一十三轮:环境系统大蓝图)────────────────
+        # 预设里额外带一份**全局 shader 风格**:运行时应用预设会把这些值
+        # 覆盖到场景里所有 toon 材质。选中一个自己存的预设就能在这儿调。
+        picked = _picked_preset(library)
+        if picked is not None:
+            style_box = box.box()
+            style_box.label(text="卡通风格(运行时覆盖所有材质)", icon="MATERIAL")
+            srow = style_box.row(align=True)
+            srow.prop(picked, "p_style_shadow_step", text="明暗分界")
+            srow.prop(picked, "p_style_three_tone", text="三段")
+            style_box.prop(picked, "p_style_shadow_tint", text="阴影色")
+            srow = style_box.row(align=True)
+            srow.prop(picked, "p_style_rim", text="边缘光")
+            srow.prop(picked, "p_style_specular", text="高光")
+            style_box.label(text="阴影色用冷色相 —— 暖棕暗部会变写实奇幻",
+                            icon="INFO")
+        else:
+            box.label(text="选一个自己存的预设,就能给它配一套卡通风格",
+                      icon="INFO")
+
+        # ── 逐项微调(背景 / 环境光 / 雾 / 泛光 / 色调)────────────────
+        # 第 123 轮:从"开头"挪到"预设之后" —— 先挑整套,再动细节。
+        detail = layout.box()
+        detail.label(text="逐项微调(挑了预设之后再用)", icon="OPTIONS")
+
+        box = detail.box()
+        # ⚠ `IMAGE_BG` 不存在(第 123 轮用户实测抓到的崩溃):
+        #     UILayout.operator(): error with keyword argument "icon" - enum ...
+        # 正确的名字是 `IMAGE_BACKGROUND`。图标名写错的症状很隐蔽 ——
+        # 只往状态栏打一行 traceback,整个卡片直接不画。
+        # 批量自查工具见 `.audit\check_icons_all.py`。
+        box.label(text="背景", icon="IMAGE_BACKGROUND")
         row = box.row(align=True)
         row.prop(settings, "env_background", expand=True)
         row = box.row(align=True)
         row.prop(settings, "env_bg_color", text="")
+        row.operator("gk.env_from_world", text="", icon="WORLD")
 
-        box = layout.box()
+        box = detail.box()
         box.label(text="环境光(全局补光)", icon="LIGHT")
         row = box.row(align=True)
         row.prop(settings, "env_ambient_color", text="")
         row.prop(settings, "env_ambient_energy", text="强度")
+        box.operator("gk.env_from_light", text="从场景主灯取颜色",
+                     icon="LIGHT_SUN")
+        if float(getattr(settings, "env_ambient_energy", 0.0)) < 0.6:
+            box.label(text="低于 0.6 暗部会发死 —— 二次元一般 0.6~1.0",
+                      icon="ERROR")
 
-        box = layout.box()
+        box = detail.box()
         row = box.row(align=True)
         row.prop(settings, "env_fog", toggle=True, icon="MOD_FLUID")
         if bool(getattr(settings, "env_fog", False)):
             row.prop(settings, "env_fog_color", text="")
             box.prop(settings, "env_fog_density", text="浓度")
+            # 雾色偏暖 + 浓度高 = 那种"土黄的中世纪空气感"(用户实测的那张图)。
+            fog_c = tuple(getattr(settings, "env_fog_color", (0.3, 0.34, 0.42, 1.0)))
+            if len(fog_c) >= 3 and fog_c[0] > fog_c[2] + 0.05 and \
+                    float(getattr(settings, "env_fog_density", 0.0)) > 0.02:
+                box.label(text="雾色偏暖且浓 = 写实奇幻观感;二次元用冷色/薄雾",
+                          icon="ERROR")
 
-        box = layout.box()
+        box = detail.box()
         row = box.row(align=True)
         row.prop(settings, "env_glow", toggle=True, icon="LIGHT_SUN")
         if bool(getattr(settings, "env_glow", False)):
             box.prop(settings, "env_glow_intensity", text="强度")
             box.prop(settings, "env_glow_bloom", text="溢出")
 
-        box = layout.box()
+        box = detail.box()
         box.prop(settings, "env_tonemap", text="色调映射")
+        box.label(text="ACES 会把颜色压灰;二次元一般用 Linear",
+                  icon="INFO") if str(getattr(settings, "env_tonemap", "")) == "ACES" else None
+        box.prop(settings, "render_quality")
+        row = box.row(align=True)
+        row.prop(settings, "env_ssao")
+        row.prop(settings, "env_ssil")
         row = box.row(align=True)
         row.prop(settings, "env_adjust", toggle=True, icon="COLOR")
         if bool(getattr(settings, "env_adjust", False)):
             box.prop(settings, "env_brightness", text="亮度")
             box.prop(settings, "env_contrast", text="对比度")
             box.prop(settings, "env_saturation", text="饱和度")
+            if float(getattr(settings, "env_saturation", 1.0)) < 1.1:
+                box.label(text="二次元建议饱和度 ≥ 1.15(颜色要够艳)",
+                          icon="INFO")
 
         layout.label(text="改这里 = 导出立刻生效,不用点应用", icon="CHECKMARK")
         layout.label(text="暗角(Godot 无内置)留到氛围套件那轮", icon="INFO")

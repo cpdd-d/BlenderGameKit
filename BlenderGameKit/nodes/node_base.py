@@ -228,6 +228,16 @@ def node_items_for(node, prop="gk_target"):
     """
     tree = getattr(node, "id_data", None)
     items = list(node_candidates(tree, prop))
+    if bpy is not None and tree is not None:
+        slots = set()
+        for obj in getattr(getattr(bpy, "data", None), "objects", ()):
+            physics = getattr(obj, "gk_physics", None)
+            if getattr(physics, "logic_tree", "") == tree.name:
+                slots.update(item.binding_name for item in
+                             getattr(physics, "logic_bindings", ()))
+        for slot in sorted(slots):
+            items.append(("@" + slot, "角色引用 · " + slot,
+                          "使用当前角色物体上绑定的对象", "LINKED", len(items)))
     current = getattr(node, prop, None)
     if current in AUTO_LABELS:
         items.insert(1, (current, AUTO_LABELS[current], "不指定具体节点，用约定路径", "AUTO", 1))
@@ -601,6 +611,10 @@ if _USE_BPY_BASE:
         gk_data_only = False
         # 从"添加节点"菜单里隐藏 —— 旧版节点保留兼容用(见 node_menu_entries)
         gk_hidden = False
+        # **按树类型**藏菜单(第一百一十二轮):能放(poll 放行)但这几张
+        # 树的菜单里不列 —— 界面节点搬家用的温和引导,见
+        # properties.node_menu_allowed 的说明。
+        gk_menu_hidden_trees = ()
         # 这个节点属于哪种节点树。默认游戏逻辑树;
         # 动画系统节点设成 "GKAnimationTree" —— 两套节点不该互相污染菜单。
         #
@@ -800,6 +814,10 @@ else:
         gk_data_only = False
         # 从"添加节点"菜单里隐藏 —— 旧版节点保留兼容用(见 node_menu_entries)
         gk_hidden = False
+        # **按树类型**藏菜单(第一百一十二轮):能放(poll 放行)但这几张
+        # 树的菜单里不列 —— 界面节点搬家用的温和引导,见
+        # properties.node_menu_allowed 的说明。
+        gk_menu_hidden_trees = ()
 
         def __init__(self):
             self.name = type(self).bl_label

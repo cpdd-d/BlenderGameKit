@@ -668,14 +668,19 @@ def main():
         gap_cd = gap_tree.nodes.new("GKNodeCooldown")
         gap_cd.name = "受伤冷却"
         gap_num = gap_tree.nodes.new("GKNodeNumberText")
-        gap_hud = gap_tree.nodes.new("GKNodeUiText")
+        # 『界面_文本』是**控件** —— 只属于『游戏界面』设计图(节点 poll 把关);
+        # 玩法图这侧改用『界面_套用设计』把它建出来(顺手把这条链也验了)。
+        gap_design = bpy.data.node_groups.new("常用件界面", "GKUiDesignTree")
+        gap_hud = gap_design.nodes.new("GKNodeUiText")
+        gap_hud.name = "金币文字"
         gap_hud.gk_text = "金币"
+        gap_apply = gap_tree.nodes.new("GKNodeUiApplyDesign")
+        gap_apply.gk_design = gap_design.name
         for link_pair in (
                 (gap_physics, "执行", gap_chase, "执行"),
                 (gap_chase, "完成", gap_add, "执行"),
                 (gap_add, "完成", gap_cd, "执行"),
-                (gap_cd, "可以", gap_hud, "执行"),
-                (gap_num, "文字", gap_hud, "文字")):
+                (gap_cd, "可以", gap_apply, "执行")):
             gap_tree.links.new(link_pair[0].outputs[link_pair[1]],
                                link_pair[2].inputs[link_pair[3]])
         gap_inputs = [s.name for s in gap_chase.inputs]
@@ -691,14 +696,15 @@ def main():
             "dimension": "3", "base_class": "CharacterBody3D",
             "export_tunables": True,
         })
-        check("常用件:生成代码(追人 / 加减 / 冷却 / 数字文字)",
+        check("常用件:生成代码(追人 / 加减 / 冷却 / 建界面)",
               ".velocity = " in gap_code
               and "move_and_slide()" in gap_code
               and "金币数 = int((金币数 + 1.0))" in gap_code
               and "Time.get_ticks_msec() - _gk_cd_ticks" in gap_code
-              and "_gk_num_text(" in gap_code)
+              and "_gk_ui_金币文字 = " in gap_code)
         check("常用件:无告警", not gap_warnings, str(gap_warnings))
         bpy.data.node_groups.remove(gap_tree)
+        bpy.data.node_groups.remove(gap_design)
     except Exception as exc:
         check("常用件", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
@@ -819,24 +825,30 @@ def main():
     # 六个新节点的注册(bl_icon 写错会让整个类注册失败)+ 建图出一次代码。
     # 选图片的算子在真 Blender 里也要能调起来(枚举里得真有图片)。
     try:
-        r37_tree = bpy.data.node_groups.new("界面冒烟", "GKGameLogicTree")
-        r37_ready = r37_tree.nodes.new("GKNodeOnReady")
-        r37_panel = r37_tree.nodes.new("GKNodeUiPanel")
+        # 第一百一十二轮:控件(面板 / 图片 / 文本 / 按钮)摆进**设计图**,
+        # 玩法图放着行为(套用 / 暂停 / 对话框 / 改控件)—— 各回各家。
+        r37_design = bpy.data.node_groups.new("界面冒烟设计", "GKUiDesignTree")
+        r37_panel = r37_design.nodes.new("GKNodeUiPanel")
         r37_panel.name = "暂停菜单"
         r37_panel.gk_align = "CENTER"
         r37_panel.gk_start_hidden = True
         # 用前面粒子那一段建的"火光贴图"当界面图片(工程里确实有这张图)
-        r37_image = r37_tree.nodes.new("GKNodeUiImage")
+        r37_image = r37_design.nodes.new("GKNodeUiImage")
         r37_image.name = "徽标"
         r37_image.gk_image = "火光贴图"
         r37_image.gk_width = 64.0
         r37_image.gk_parent_widget = "暂停菜单"
-        r37_text = r37_tree.nodes.new("GKNodeUiText")
+        r37_text = r37_design.nodes.new("GKNodeUiText")
         r37_text.name = "提示"
         r37_text.gk_align = "BOTTOM_CENTER"
-        r37_button = r37_tree.nodes.new("GKNodeUiButton")
+        r37_button = r37_design.nodes.new("GKNodeUiButton")
         r37_button.name = "继续按钮"
         r37_button.gk_parent_widget = "暂停菜单"
+
+        r37_tree = bpy.data.node_groups.new("界面冒烟", "GKGameLogicTree")
+        r37_ready = r37_tree.nodes.new("GKNodeOnReady")
+        r37_apply = r37_tree.nodes.new("GKNodeUiApplyDesign")
+        r37_apply.gk_design = r37_design.name
         r37_pause = r37_tree.nodes.new("GKNodeUiPauseGame")
         r37_pause.name = "暂停热键"
         r37_pause.gk_pause = False
@@ -851,11 +863,8 @@ def main():
         r37_set.gk_set_text = True
         r37_set.gk_text = "好了"
         for link_pair in (
-                (r37_ready, "执行", r37_panel, "执行"),
-                (r37_panel, "完成", r37_image, "执行"),
-                (r37_image, "完成", r37_text, "执行"),
-                (r37_text, "完成", r37_button, "执行"),
-                (r37_button, "完成", r37_pause, "执行"),
+                (r37_ready, "执行", r37_apply, "执行"),
+                (r37_apply, "完成", r37_pause, "执行"),
                 (r37_pause, "完成", r37_dialog, "执行"),
                 (r37_dialog, "完成", r37_set, "执行")):
             r37_tree.links.new(link_pair[0].outputs[link_pair[1]],
@@ -884,6 +893,7 @@ def main():
         check("UI:『选图片』算子列得出图片",
               any(item[0] == "火光贴图" for item in r37_items), str(r37_items)[:120])
         bpy.data.node_groups.remove(r37_tree)
+        bpy.data.node_groups.remove(r37_design)
     except Exception as exc:
         check("UI 第一版", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
@@ -895,51 +905,56 @@ def main():
     #      跳过写死的 X / Y,尺寸走 custom_minimum_size(真 Godot 实测);
     #   ② 输入框的『提交』出口走 text_submitted 独立回调,不在主流程里。
     try:
-        r38_tree = bpy.data.node_groups.new("界面二冒烟", "GKGameLogicTree")
-        r38_ready = r38_tree.nodes.new("GKNodeOnReady")
-        r38_list = r38_tree.nodes.new("GKNodeUiList")
+        # 第一百一十二轮:控件 + 界面行为都在**设计图**里(行为 = 没从别处
+        # 接进来的顶层语句 + 信号链);玩法图只剩『界面_套用设计』。
+        r38_design = bpy.data.node_groups.new("界面二冒烟设计", "GKUiDesignTree")
+        r38_list = r38_design.nodes.new("GKNodeUiList")
         r38_list.name = "存档列表"
-        r38_slot = r38_tree.nodes.new("GKNodeUiButton")
+        r38_slot = r38_design.nodes.new("GKNodeUiButton")
         r38_slot.name = "存档槽一"
         r38_slot.gk_parent_widget = "存档列表"
         r38_slot.gk_x = 99.0
         r38_slot.gk_y = 99.0
-        r38_fill = r38_tree.nodes.new("GKNodeUiListFill")
+        r38_fill = r38_design.nodes.new("GKNodeUiListFill")
         r38_fill.name = "填日志"
         r38_fill.gk_list = "存档列表"
         r38_fill.gk_text = "第一行|第二行"
-        r38_patch = r38_tree.nodes.new("GKNodeUiNinePatch")
+        r38_patch = r38_design.nodes.new("GKNodeUiNinePatch")
         r38_patch.name = "标题条"
         r38_patch.gk_image = "火光贴图"
         r38_patch.gk_slice = 16
-        r38_input = r38_tree.nodes.new("GKNodeUiInput")
+        r38_input = r38_design.nodes.new("GKNodeUiInput")
         r38_input.name = "昵称"
         r38_input.gk_placeholder = "输入昵称"
-        r38_tween = r38_tree.nodes.new("GKNodeUiTween")
+        r38_tween = r38_design.nodes.new("GKNodeUiTween")
         r38_tween.name = "淡入"
         r38_tween.gk_widget = "标题条"
-        r38_read = r38_tree.nodes.new("GKNodeUiReadText")
+        r38_read = r38_design.nodes.new("GKNodeUiReadText")
         r38_read.name = "读昵称"
         r38_read.gk_widget = "昵称"
-        r38_focus = r38_tree.nodes.new("GKNodeUiFocus")
+        r38_focus = r38_design.nodes.new("GKNodeUiFocus")
         r38_focus.name = "聚焦"
         r38_focus.gk_widget = "存档槽一"
-        r38_print = r38_tree.nodes.new("GKNodePrint")
-        r38_print.name = "提交打印"
-        r38_print.gk_text = "提交了"
+        # 『提交』的落点也得是设计图里能干的事(打印是玩法图节点):
+        # 把读到昵称写进标题条的字里。
+        r38_set = r38_design.nodes.new("GKNodeUiSet")
+        r38_set.name = "提交落点"
+        r38_set.gk_widget = "标题条"
+        r38_set.gk_set_text = True
         for link_pair in (
-                (r38_ready, "执行", r38_list, "执行"),
-                (r38_list, "完成", r38_slot, "执行"),
-                (r38_slot, "完成", r38_fill, "执行"),
-                (r38_fill, "完成", r38_patch, "执行"),
-                (r38_patch, "完成", r38_input, "执行"),
-                (r38_input, "提交", r38_print, "执行"),
-                (r38_input, "完成", r38_tween, "执行"),
-                (r38_tween, "完成", r38_focus, "执行")):
-            r38_tree.links.new(link_pair[0].outputs[link_pair[1]],
-                               link_pair[2].inputs[link_pair[3]])
-        # 取文字是表达式节点(没有执行口),接到打印的『内容』上
-        r38_tree.links.new(r38_read.outputs["文字"], r38_print.inputs["内容"])
+                (r38_fill, "完成", r38_tween, "执行"),
+                (r38_tween, "完成", r38_focus, "执行"),
+                (r38_input, "提交", r38_set, "执行")):
+            r38_design.links.new(link_pair[0].outputs[link_pair[1]],
+                                 link_pair[2].inputs[link_pair[3]])
+        # 取文字是表达式节点(没有执行口),接到"提交落点"的『文字』上
+        r38_design.links.new(r38_read.outputs["文字"], r38_set.inputs["文字"])
+
+        r38_tree = bpy.data.node_groups.new("界面二冒烟", "GKGameLogicTree")
+        r38_ready = r38_tree.nodes.new("GKNodeOnReady")
+        r38_apply = r38_tree.nodes.new("GKNodeUiApplyDesign")
+        r38_apply.gk_design = r38_design.name
+        r38_tree.links.new(r38_ready.outputs["执行"], r38_apply.inputs["执行"])
         check("UI2:『界面_输入框』出口是『完成』+『提交』",
               [socket.name for socket in r38_input.outputs] == ["完成", "提交"],
               str([socket.name for socket in r38_input.outputs]))
@@ -960,15 +975,16 @@ def main():
               and '_gk_widget_text("昵称")' in r38_code
               and '_gk_find_widget("存档槽一")' in r38_code
               and ".grab_focus()" in r38_code)
-        # 『提交』出口的链(打印『取文字』的结果)必须在独立回调函数里 ——
+        # 『提交』出口的链(读昵称 -> 写进标题条)必须在独立回调函数里 ——
         # 在 _ready 之后、且落在 gk_on_昵称_submit 的函数体里
         r38_submit_at = r38_code.find("func gk_on_昵称_submit")
         check("UI2:输入框回车走独立回调(提交链不在主流程)",
               "text_submitted.connect(gk_on_昵称_submit)" in r38_code
               and r38_submit_at > r38_code.find("func _ready")
-              and 'print(_gk_widget_text("昵称"))' in r38_code[r38_submit_at:])
+              and '_gk_widget_text("昵称")' in r38_code[r38_submit_at:])
         check("UI2:无告警", not r38_warnings, str(r38_warnings))
         bpy.data.node_groups.remove(r38_tree)
+        bpy.data.node_groups.remove(r38_design)
     except Exception as exc:
         check("UI 第二版", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
@@ -1048,17 +1064,25 @@ def main():
         r40_menu.name = "冒烟菜单"
         r40_menu.gk_width = 400.0
         r40_menu.gk_height = 300.0
-        # 动作节点连**塞**都塞不进设计图 —— 节点基类的 poll 按树类型把关,
-        # 菜单过滤之外还有这一层兜底。
+        # ── 第一百一十二轮:界面行为搬家(菜单层把关,poll 放行)────────
+        # 『界面_按钮点击』这类"界面自己的行为"从**玩法图菜单**里撤掉
+        # (新图去设计图写);但 poll 照旧放行 —— 老图能编辑、脚本能重建。
+        # ⚠ 走 module_name(冒烟里插件是在 bl_ext.* 命名空间下加载的,
+        #   直接 `from BlenderGameKit import …` 会 ModuleNotFoundError)
+        _props = import_module(f"{module_name}.properties")
+        check("界面:行为节点从玩法图菜单里撤了(菜单层把关)",
+              not _props.node_menu_allowed(node_lib.GKNodeUiOnClick,
+                                           "GKGameLogicTree")
+              and _props.node_menu_allowed(node_lib.GKNodeUiOnClick,
+                                           "GKUiDesignTree"))
+        # 而设计图里现在**能**放行为 —— 界面的自带行为(塞一个试试)
         r40_before = len(r40_design.nodes)
-        try:
-            r40_design.nodes.new("GKNodeUiHide")
-            r40_blocked = False
-        except RuntimeError:
-            r40_blocked = True
-        check("界面:动作节点进不了设计图(Blender 侧也把关)",
-              r40_blocked and len(r40_design.nodes) == r40_before,
-              f"blocked={r40_blocked} nodes={len(r40_design.nodes)}")
+        r40_hide = r40_design.nodes.new("GKNodeUiHide")
+        r40_hide.name = "冒烟隐藏"
+        r40_hide.gk_widget = "冒烟菜单"
+        r40_hide.gk_visible = False
+        check("界面:行为节点能进设计图(界面自带行为)",
+              len(r40_design.nodes) == r40_before + 1)
 
         r40_tree = bpy.data.node_groups.new("界面玩法冒烟40", "GKGameLogicTree")
         r40_ready = r40_tree.nodes.new("GKNodeOnReady")
@@ -2511,7 +2535,15 @@ def main():
                     "gk.toggle_group", "gk.character_preset",
                     # 变量 / 函数改名 + 资产改名(第八十九轮:I 组 27+28)
                     "gk.func_rename", "gk.logic_var_rename",
-                    "gk.asset_rename"):
+                    "gk.asset_rename",
+                    # 统一导出(第 122 轮):脚本 + 模型 + 材质 + 场景一次导完。
+                    # 老的 gk.export_script / gk.export_assets 上面已经验过,
+                    # 它们**必须继续可用**(F5 快捷键和 AI 动作表都在用)。
+                    "gk.export_godot",
+                    # 三种线框标记物体(第 122 轮:玩家出生点 / 区域环境点 /
+                    # 关卡父级)—— 属性在物体属性面板里,算子在这里验注册。
+                    "gk.add_marker", "gk.fit_marker", "gk.level_children",
+                    "gk.delete_marker", "gk.infer_default_player"):
         check(f"算子已注册 {op_name}", hasattr(bpy.ops, op_name.split(".")[0])
               and op_name.split(".")[1] in dir(getattr(bpy.ops, op_name.split(".")[0])))
 
@@ -3344,12 +3376,18 @@ def main():
     props_module = __import__(f"{module_name}.properties", fromlist=["node_menu_tree"])
     menu_tree = list(props_module.node_menu_tree(None))
     groups = {category: subs for category, subs in menu_tree}
+    # ── 分类名跟着第一百一十轮那次"33 个分类合并成 13 个"的重排走 ──────
+    # 上一轮(GPT 优化)把 `运算` 并进了 `数学与逻辑`、`流程`+`定时` 并进了
+    # `流程控制`,并保留了原本的二级分组。这两条断言当时没跟着改 ——
+    # 但那时门禁跑的是 `_testrepo` 里的**旧快照**,所以一直"绿"着。
+    # 第 122 轮把快照重建之后才暴露出来(实测:HEAD 的分类名是 `运算`,
+    # 工作树是 `数学与逻辑`)。判据一个字没松:分组和二级目录都还要在。
     input_subs = [name for name, _classes in (groups.get("输入") or [])]
     check("『输入』分成了 键盘 / 鼠标 / 手柄 / 触屏",
           all(want in input_subs for want in ("键盘", "鼠标", "手柄", "触屏")),
           str(input_subs))
-    calc_subs = [name for name, _classes in (groups.get("运算") or [])]
-    check("『运算』分成了 常量 / 数学 / 向量 / 逻辑 / 转换",
+    calc_subs = [name for name, _classes in (groups.get("数学与逻辑") or [])]
+    check("『数学与逻辑』分成了 常量 / 数学 / 向量 / 逻辑 / 转换",
           all(want in calc_subs for want in ("常量", "数学", "向量", "逻辑", "转换")),
           str(calc_subs))
     mouse_nodes = dict(groups.get("输入") or []).get("鼠标", [])
@@ -4602,7 +4640,21 @@ def main():
               "GKNodeUiTextEdit" in ui_nodes.UI_DESIGN_BUILDER_NODES)
 
         # ── 一张全开的图:生成物逐条对 ────────────────────────────────
+        # 第一百一十二轮:控件 + 界面行为(皮肤 / 按钮 / 输入框)摆进
+        # **设计图**;玩法图放剧情/音效这些玩法节点 + 『界面_套用设计』。
+        r81_design = bpy.data.node_groups.new("界面收尾81设计", "GKUiDesignTree")
+
+        def r81_dadd(kind, name, **props):
+            node = r81_design.nodes.new(kind)
+            node.name = name
+            for key, value in props.items():
+                setattr(node, key, value)
+            return node
+
         r81_logic = bpy.data.node_groups.new("界面收尾81", "GKGameLogicTree")
+        r81_event = r81_logic.nodes.new("GKNodeOnReady")
+        r81_apply = r81_logic.nodes.new("GKNodeUiApplyDesign")
+        r81_apply.gk_design = r81_design.name
 
         def r81_add(kind, name, **props):
             node = r81_logic.nodes.new(kind)
@@ -4611,12 +4663,11 @@ def main():
                 setattr(node, key, value)
             return node
 
-        r81_event = r81_logic.nodes.new("GKNodeOnReady")
-        r81_skin_node = r81_add("GKNodeUiSkin", "皮肤", gk_font_size=22)
-        r81_button = r81_add("GKNodeUiButton", "开始", gk_text="开始",
-                             gk_click_sound="res://art/click.wav")
-        r81_input = r81_add("GKNodeUiInput", "昵称", gk_ime=True)
-        r81_chat = r81_add("GKNodeUiTextEdit", "聊天框")
+        r81_skin_node = r81_dadd("GKNodeUiSkin", "皮肤", gk_font_size=22)
+        r81_button = r81_dadd("GKNodeUiButton", "开始", gk_text="开始",
+                              gk_click_sound="res://art/click.wav")
+        r81_input = r81_dadd("GKNodeUiInput", "昵称", gk_ime=True)
+        r81_chat = r81_dadd("GKNodeUiTextEdit", "聊天框")
         r81_sub = r81_add("GKNodeUiSubtitle", "旁白", gk_text="旁白",
                           gk_image="res://art/立绘.png")
         r81_hist = r81_add("GKNodeDialogHistory", "回顾",
@@ -4625,11 +4676,12 @@ def main():
                             gk_path="res://art/engine.wav", gk_loop=True,
                             gk_name="引擎")
         r81_stop = r81_add("GKNodeStopSound", "停引擎", gk_name="引擎")
-        r81_logic.links.new(r81_event.outputs["执行"], r81_skin_node.inputs["执行"])
+        r81_logic.links.new(r81_event.outputs["执行"], r81_apply.inputs["执行"])
         for r81_prev, r81_next in ((r81_skin_node, r81_button),
                                    (r81_button, r81_input),
-                                   (r81_input, r81_chat),
-                                   (r81_chat, r81_sub),
+                                   (r81_input, r81_chat)):
+            r81_design.links.new(r81_prev.outputs["完成"], r81_next.inputs["执行"])
+        for r81_prev, r81_next in ((r81_apply, r81_sub),
                                    (r81_sub, r81_hist),
                                    (r81_hist, r81_sound),
                                    (r81_sound, r81_stop)):
@@ -4661,10 +4713,13 @@ def main():
 
         # 没填的老用法:皮肤 / 循环 / IME 一个字眼都不该出现
         r81_plain = bpy.data.node_groups.new("老界面81", "GKGameLogicTree")
-        r81_pe = r81_plain.nodes.new("GKNodeOnReady")
-        r81_pb = r81_plain.nodes.new("GKNodeUiButton")
+        r81_pdesign = bpy.data.node_groups.new("老界面81设计", "GKUiDesignTree")
+        r81_pb = r81_pdesign.nodes.new("GKNodeUiButton")
         r81_pb.name = "按钮"
-        r81_plain.links.new(r81_pe.outputs["执行"], r81_pb.inputs["执行"])
+        r81_pe = r81_plain.nodes.new("GKNodeOnReady")
+        r81_papply = r81_plain.nodes.new("GKNodeUiApplyDesign")
+        r81_papply.gk_design = r81_pdesign.name
+        r81_plain.links.new(r81_pe.outputs["执行"], r81_papply.inputs["执行"])
         r81_plain_code, _r81_pw = codegen.generate(
             r81_plain, {"dimension": "3", "base_class": "CharacterBody3D"})
         check("老图不变:没填的图里没有主题 / 循环 / 输入法",
@@ -4684,7 +4739,9 @@ def main():
               "音效卡都画得完", not r81_draw_error, r81_draw_error)
 
         bpy.data.node_groups.remove(r81_plain)
+        bpy.data.node_groups.remove(r81_pdesign)
         bpy.data.node_groups.remove(r81_logic)
+        bpy.data.node_groups.remove(r81_design)
     except Exception as exc:
         check("第八十一轮(界面收尾:皮肤 / 多行框 / 立绘 / 历史 / 循环)",
               False, f"{type(exc).__name__}: {exc}")
@@ -6144,13 +6201,14 @@ def main():
     # **行为**由界面示例的探针在真 Godot 里查(见 check_ui_demo.py:
     # 滑块数值字跟着变 / 下拉两种样式 / 复选框 / 互斥组与置顶)。
     try:
-        r104_tree = bpy.data.node_groups.new("三件套冒烟104", "GKGameLogicTree")
-        r104_ready = r104_tree.nodes.new("GKNodeOnReady")
-        r104_panel = r104_tree.nodes.new("GKNodeUiPanel")
+        # 第一百一十二轮:控件 + 界面行为(含判断)都进**设计图**;
+        # 玩法图只剩『界面_套用设计』。
+        r104_design = bpy.data.node_groups.new("三件套冒烟104设计", "GKUiDesignTree")
+        r104_panel = r104_design.nodes.new("GKNodeUiPanel")
         r104_panel.name = "设置面板"
         r104_panel.gk_mutex_group = "侧栏面板"
         r104_panel.gk_start_hidden = True
-        r104_slider = r104_tree.nodes.new("GKNodeUiSlider")
+        r104_slider = r104_design.nodes.new("GKNodeUiSlider")
         r104_slider.name = "音量滑块"
         r104_slider.gk_min = -40.0
         r104_slider.gk_max = 0.0
@@ -6158,44 +6216,48 @@ def main():
         r104_slider.gk_label = "音量"
         r104_slider.gk_suffix = " dB"
         r104_slider.gk_parent_widget = "设置面板"
-        r104_pick = r104_tree.nodes.new("GKNodeUiDropdown")
+        r104_pick = r104_design.nodes.new("GKNodeUiDropdown")
         r104_pick.name = "画质选择"
         r104_pick.gk_items = "低|中|高"
         r104_pick.gk_style = "NATIVE"
         r104_pick.gk_index = 3
-        r104_arrows = r104_tree.nodes.new("GKNodeUiDropdown")
+        r104_arrows = r104_design.nodes.new("GKNodeUiDropdown")
         r104_arrows.name = "难度选择"
         r104_arrows.gk_style = "ARROWS"
-        r104_box = r104_tree.nodes.new("GKNodeUiCheckbox")
+        r104_box = r104_design.nodes.new("GKNodeUiCheckbox")
         r104_box.name = "静音"
         r104_box.gk_checked = True
         r104_box.gk_style = "SWITCH"
-        r104_hide = r104_tree.nodes.new("GKNodeUiHide")
+        r104_hide = r104_design.nodes.new("GKNodeUiHide")
         r104_hide.name = "开设置"
         r104_hide.gk_widget = "设置面板"
         r104_hide.gk_visible = True
         r104_hide.gk_raise = True
-        r104_bus = r104_tree.nodes.new("GKNodeBusVolume")
+        r104_bus = r104_design.nodes.new("GKNodeBusVolume")
         r104_bus.gk_fade = 0.0
-        r104_switch = r104_tree.nodes.new("GKNodeSwitch")
+        r104_switch = r104_design.nodes.new("GKNodeSwitch")
         r104_switch.gk_case_count = 4
-        r104_apply = r104_tree.nodes.new("GKNodeQualitySet")
-        r104_branch = r104_tree.nodes.new("GKNodeBranch")
-        r104_tree.links.new(r104_ready.outputs["执行"], r104_panel.inputs["执行"])
-        r104_tree.links.new(r104_panel.outputs["完成"], r104_slider.inputs["执行"])
-        r104_tree.links.new(r104_slider.outputs["完成"], r104_pick.inputs["执行"])
-        r104_tree.links.new(r104_pick.outputs["完成"], r104_arrows.inputs["执行"])
-        r104_tree.links.new(r104_arrows.outputs["完成"], r104_box.inputs["执行"])
-        r104_tree.links.new(r104_box.outputs["完成"], r104_hide.inputs["执行"])
-        r104_tree.links.new(r104_slider.outputs["变了"], r104_bus.inputs["执行"])
-        r104_tree.links.new(r104_slider.outputs["值"], r104_bus.inputs["目标音量"])
-        r104_tree.links.new(r104_pick.outputs["选了"], r104_switch.inputs["执行"])
-        r104_tree.links.new(r104_pick.outputs["选了第几个"],
-                            r104_switch.inputs["值"])
-        r104_tree.links.new(r104_switch.outputs["1"], r104_apply.inputs["执行"])
+        r104_apply = r104_design.nodes.new("GKNodeQualitySet")
+        r104_branch = r104_design.nodes.new("GKNodeBranch")
+        r104_tree = bpy.data.node_groups.new("三件套冒烟104", "GKGameLogicTree")
+        r104_ready = r104_tree.nodes.new("GKNodeOnReady")
+        r104_root = r104_tree.nodes.new("GKNodeUiApplyDesign")
+        r104_root.gk_design = r104_design.name
+        r104_tree.links.new(r104_ready.outputs["执行"], r104_root.inputs["执行"])
+        r104_design.links.new(r104_panel.outputs["完成"], r104_slider.inputs["执行"])
+        r104_design.links.new(r104_slider.outputs["完成"], r104_pick.inputs["执行"])
+        r104_design.links.new(r104_pick.outputs["完成"], r104_arrows.inputs["执行"])
+        r104_design.links.new(r104_arrows.outputs["完成"], r104_box.inputs["执行"])
+        r104_design.links.new(r104_box.outputs["完成"], r104_hide.inputs["执行"])
+        r104_design.links.new(r104_slider.outputs["变了"], r104_bus.inputs["执行"])
+        r104_design.links.new(r104_slider.outputs["值"], r104_bus.inputs["目标音量"])
+        r104_design.links.new(r104_pick.outputs["选了"], r104_switch.inputs["执行"])
+        r104_design.links.new(r104_pick.outputs["选了第几个"],
+                              r104_switch.inputs["值"])
+        r104_design.links.new(r104_switch.outputs["1"], r104_apply.inputs["执行"])
         # 复选框的『勾了吗』也接一条(不然那个读值辅助函数"没用到不生成")
-        r104_tree.links.new(r104_box.outputs["改了"], r104_branch.inputs["执行"])
-        r104_tree.links.new(r104_box.outputs["勾了吗"], r104_branch.inputs["条件"])
+        r104_design.links.new(r104_box.outputs["改了"], r104_branch.inputs["执行"])
+        r104_design.links.new(r104_box.outputs["勾了吗"], r104_branch.inputs["条件"])
         r104_code, r104_warn = codegen.generate(r104_tree, {
             "dimension": "3", "base_class": "CharacterBody3D",
             "export_tunables": True,
@@ -6273,6 +6335,7 @@ def main():
               str(r104_missing))
 
         bpy.data.node_groups.remove(r104_tree)
+        bpy.data.node_groups.remove(r104_design)
     except Exception as exc:
         check("第一百零四轮(设置面板三件套)", False,
               f"{type(exc).__name__}: {exc}")
@@ -6284,34 +6347,40 @@ def main():
     # **行为**由界面示例的探针在真 Godot 里查(见 check_ui_demo.py:
     # 模态遮挡 + 点外面关 + 对照组 / 首焦点 + 方向键 / 皮肤补齐)。
     try:
-        r105_tree = bpy.data.node_groups.new("界面收口冒烟105", "GKGameLogicTree")
-        r105_ready = r105_tree.nodes.new("GKNodeOnReady")
-        r105_menu = r105_tree.nodes.new("GKNodeUiPanel")
+        # 第一百一十二轮:控件 + 界面行为都进设计图;玩法图只放『界面_套用设计』。
+        r105_design = bpy.data.node_groups.new("界面收口冒烟105设计",
+                                               "GKUiDesignTree")
+        r105_menu = r105_design.nodes.new("GKNodeUiPanel")
         r105_menu.name = "暂停菜单"
         r105_menu.gk_focus_first = True
-        r105_modal = r105_tree.nodes.new("GKNodeUiPanel")
+        r105_modal = r105_design.nodes.new("GKNodeUiPanel")
         r105_modal.name = "模态框"
         r105_modal.gk_block_click = True
         r105_modal.gk_close_outside = True
-        r105_button = r105_tree.nodes.new("GKNodeUiButton")
+        r105_button = r105_design.nodes.new("GKNodeUiButton")
         r105_button.name = "穿透按钮"
-        r105_slider = r105_tree.nodes.new("GKNodeUiSlider")
+        r105_slider = r105_design.nodes.new("GKNodeUiSlider")
         r105_slider.name = "音量滑块"
         r105_slider.gk_x = 28.0
         r105_slider.gk_y = 70.0
-        r105_skin = r105_tree.nodes.new("GKNodeUiSkin")
-        r105_pause = r105_tree.nodes.new("GKNodeUiPauseGame")
+        r105_skin = r105_design.nodes.new("GKNodeUiSkin")
+        r105_pause = r105_design.nodes.new("GKNodeUiPauseGame")
         r105_pause.gk_pause = True
         r105_pause.gk_menu = "暂停菜单"
         r105_pause.gk_hotkey = True
-        r105_tree.links.new(r105_ready.outputs["执行"], r105_menu.inputs["执行"])
-        r105_tree.links.new(r105_menu.outputs["完成"], r105_modal.inputs["执行"])
-        r105_tree.links.new(r105_modal.outputs["完成"],
-                            r105_button.inputs["执行"])
-        r105_tree.links.new(r105_button.outputs["完成"],
-                            r105_slider.inputs["执行"])
-        r105_tree.links.new(r105_slider.outputs["完成"], r105_skin.inputs["执行"])
-        r105_tree.links.new(r105_skin.outputs["完成"], r105_pause.inputs["执行"])
+        r105_tree = bpy.data.node_groups.new("界面收口冒烟105", "GKGameLogicTree")
+        r105_ready = r105_tree.nodes.new("GKNodeOnReady")
+        r105_root = r105_tree.nodes.new("GKNodeUiApplyDesign")
+        r105_root.gk_design = r105_design.name
+        r105_tree.links.new(r105_ready.outputs["执行"], r105_root.inputs["执行"])
+        r105_design.links.new(r105_menu.outputs["完成"], r105_modal.inputs["执行"])
+        r105_design.links.new(r105_modal.outputs["完成"],
+                              r105_button.inputs["执行"])
+        r105_design.links.new(r105_button.outputs["完成"],
+                              r105_slider.inputs["执行"])
+        r105_design.links.new(r105_slider.outputs["完成"],
+                              r105_skin.inputs["执行"])
+        r105_design.links.new(r105_skin.outputs["完成"], r105_pause.inputs["执行"])
         r105_code, r105_warn = codegen.generate(r105_tree, {
             "dimension": "3", "base_class": "CharacterBody3D",
             "export_tunables": True,
@@ -6377,6 +6446,7 @@ def main():
         check("第一百零五轮:六张卡片都能画完", r105_draw_ok, r105_draw_error)
 
         bpy.data.node_groups.remove(r105_tree)
+        bpy.data.node_groups.remove(r105_design)
     except Exception as exc:
         check("第一百零五轮(界面收口)", False,
               f"{type(exc).__name__}: {exc}")
@@ -6387,35 +6457,43 @@ def main():
     # 都在、卡片画得完。**行为**由界面示例的探针在真 Godot 里查
     # (见 check_ui_demo.py:行是按钮 + 只有被点的那行亮着 + 『第几行』写进得分)。
     try:
-        r106_tree = bpy.data.node_groups.new("能点列表冒烟106", "GKGameLogicTree")
-        r106_ready = r106_tree.nodes.new("GKNodeOnReady")
-        r106_list = r106_tree.nodes.new("GKNodeUiList")
+        # 第一百一十二轮:控件 + 界面行为都进设计图(『流程_转换』这类
+        # 取值节点现在设计图里也能用 —— 界面就地判断的基本材料)。
+        r106_design = bpy.data.node_groups.new("能点列表冒烟106设计",
+                                               "GKUiDesignTree")
+        r106_list = r106_design.nodes.new("GKNodeUiList")
         r106_list.name = "日志列表"
-        r106_fill = r106_tree.nodes.new("GKNodeUiListFill")
+        r106_fill = r106_design.nodes.new("GKNodeUiListFill")
         r106_fill.name = "填日志"
         r106_fill.gk_list = "日志列表"
         r106_fill.gk_text = "甲|乙|丙"
         r106_fill.gk_clickable = True
-        r106_setter = r106_tree.nodes.new("GKNodeUiSet")
+        r106_setter = r106_design.nodes.new("GKNodeUiSet")
         r106_setter.gk_widget = "分数"
         r106_setter.gk_set_text = True
-        r106_to_text = r106_tree.nodes.new("GKNodeConvert")
+        r106_to_text = r106_design.nodes.new("GKNodeConvert")
         r106_to_text.gk_to = "String"
-        r106_plain = r106_tree.nodes.new("GKNodeUiList")
+        r106_plain = r106_design.nodes.new("GKNodeUiList")
         r106_plain.name = "日志列表2"
-        r106_plain_fill = r106_tree.nodes.new("GKNodeUiListFill")
+        r106_plain_fill = r106_design.nodes.new("GKNodeUiListFill")
         r106_plain_fill.gk_list = "日志列表2"
         r106_plain_fill.gk_text = "甲|乙"
-        r106_tree.links.new(r106_ready.outputs["执行"], r106_list.inputs["执行"])
-        r106_tree.links.new(r106_list.outputs["完成"], r106_fill.inputs["执行"])
-        r106_tree.links.new(r106_fill.outputs["完成"], r106_plain.inputs["执行"])
-        r106_tree.links.new(r106_plain.outputs["完成"],
-                            r106_plain_fill.inputs["执行"])
-        r106_tree.links.new(r106_fill.outputs["点行"], r106_setter.inputs["执行"])
-        r106_tree.links.new(r106_fill.outputs["第几行"],
-                            r106_to_text.inputs["输入"])
-        r106_tree.links.new(r106_to_text.outputs["输出"],
-                            r106_setter.inputs["文字"])
+        r106_tree = bpy.data.node_groups.new("能点列表冒烟106", "GKGameLogicTree")
+        r106_ready = r106_tree.nodes.new("GKNodeOnReady")
+        r106_root = r106_tree.nodes.new("GKNodeUiApplyDesign")
+        r106_root.gk_design = r106_design.name
+        r106_tree.links.new(r106_ready.outputs["执行"], r106_root.inputs["执行"])
+        r106_design.links.new(r106_list.outputs["完成"], r106_fill.inputs["执行"])
+        r106_design.links.new(r106_fill.outputs["完成"],
+                              r106_plain.inputs["执行"])
+        r106_design.links.new(r106_plain.outputs["完成"],
+                              r106_plain_fill.inputs["执行"])
+        r106_design.links.new(r106_fill.outputs["点行"],
+                              r106_setter.inputs["执行"])
+        r106_design.links.new(r106_fill.outputs["第几行"],
+                              r106_to_text.inputs["输入"])
+        r106_design.links.new(r106_to_text.outputs["输出"],
+                              r106_setter.inputs["文字"])
         r106_code, r106_warn = codegen.generate(r106_tree, {
             "dimension": "3", "base_class": "CharacterBody3D",
             "export_tunables": True,
@@ -6460,6 +6538,7 @@ def main():
         check("能点列表:三张卡片都能画完", r106_draw_ok, r106_draw_error)
 
         bpy.data.node_groups.remove(r106_tree)
+        bpy.data.node_groups.remove(r106_design)
     except Exception as exc:
         check("第一百零六轮 A(能点的列表)", False,
               f"{type(exc).__name__}: {exc}")

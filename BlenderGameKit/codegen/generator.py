@@ -2,7 +2,8 @@
 
 from ..nodes.node_base import (TARGET_SELF, gd_node_path, gd_string,
                                safe_function_name, snake_case)
-from ..nodes.nodes import (ANIM_CATEGORY_NAMES, action_category, node_key,
+from ..nodes.nodes import (ANIM_CATEGORY_NAMES, MAIN_UI_AUTOLOAD,
+                           action_category, main_ui_design_tree, node_key,
                            parse_transitions, transition_pin_name)
 
 from .literals import (EVENT_KINDS, TRIGGER_KINDS, _BANNER, gd_class_name,
@@ -15,9 +16,11 @@ from .ai import _emit_ai_graph
 from .camera import _path_name
 from .services import (_FILTER_SHADER_CONST, _GD_FILTER_SHADER,
                        _GD_VIGNETTE_SHADER, _SAVE_SALT, _SAVE_SALT_CONST,
-                       _VIGNETTE_SHADER_CONST)
+                       _VIGNETTE_SHADER_CONST, _emit_design_into,
+                       _ui_looks_transient, _ui_root)
 from .network import emit_network
 from .context import GenContext
+from .graph import position_key
 
 
 
@@ -59,12 +62,43 @@ class Generator:
         # 不再进角色脚本 —— 这样没有角色的场景也能飞着看。
         self.ctx.god_camera_enabled = bool(self.options.get("god_camera", False))
 
-        events = self._collect_events()
-        if not events:
+        # ── 主界面模式(第一百一十二轮)────────────────────────────────
+        # 『主界面』不走事件那套:整张设计图(控件 + 自带行为)就是
+        # `_ready` 的内容 —— 它由导出的 autoload 在游戏启动时建一次,
+        # 之后切关卡也不重建。除"事件收集"之外的全部环节(helper 发射、
+        # process/physics 挂钩、组装)与普通生成**完全共用同一份代码**,
+        # 所以暂停热键 / 对话框输入这些事情在 autoload 里同样成立。
+        ui_main = bool(self.options.get("ui_main", False))
+        # ── 主界面脚本要单独说明自己的身份(第一百二十六轮)──────────────
+        # 用户报:"ESC 菜单出现时旧的界面还压在上面"(配图:章节卡「第一章:
+        # 门厅」糊在暂停面板的"继续游戏"上)。真机量出来的原因之一:
+        # 主界面那份 CanvasLayer 是**后加进 /root 的**(autoload 的树位置
+        # 排在关卡前面,但层号同为 10)—— 层号相同时由树序决定,于是关卡
+        # 自己那份 GKUI 画在主界面**之上**,暂停菜单挪到最前也跨不过去
+        # (move_to_front 只管同一个父节点下的兄弟)。所以主界面这份要
+        # 单独抬到 layer 20:面板 + 压暗底一起盖住关卡自己的界面。
+        # 层号 20 是算过的:必须**大于**普通界面(10),又要**小于**屏幕
+        # 滤镜(90)/ 暗角(92)/ 闪白转场(100)—— 那些是"盖住一切"的全屏效果。
+        self.ctx.is_main_ui = ui_main
+        events = [] if ui_main else self._collect_events()
+        if not events and not ui_main:
             self.ctx.warn("节点树里没有任何事件节点，生成的脚本不会做任何事。"
                           "请从『每当_准备』或『每当_物理帧』开始连线。")
 
         self._prepass(events)
+
+        # 每生成完一段就记下它占了 ctx.lines 的哪几行，供 _assemble 精确拼接
+        sections = []
+        if ui_main:
+            # ⚠ 顺序要紧:`_emit_ui_main_sections()` **里面**就去遍历设计图了,
+            #   所以"要不要压暗底"的标志得等它跑完才是最终值 —— 底座的
+            #   函数定义在这之后补,而"初始化调用"在那之前就写进 `_ready()`。
+            #   主界面没有『界面_暂停游戏』(填了菜单控件)时:底照建(它默认
+            #   隐藏,一个 ColorRect 而已),但没人会去点亮它 —— 不额外写
+            #   "删掉刚才那行"的逆向代码,少一处会漂的地方。
+            sections.extend(self._emit_ui_main_sections())
+            if self.ctx.need_pause_dim:
+                sections.extend(self._emit_pause_dim())
 
         # 同类事件合并成一个函数
         grouped = {}
@@ -78,11 +112,8 @@ class Generator:
         def sort_key(item):
             name, nodes = item
             rank = {"_ready": 0, "_process": 1, "_physics_process": 2, "_input": 3}.get(name, 9)
-            nodes.sort(key=lambda n: (getattr(n, "gk_order", 0) or 0, n.location[1], n.location[0]))
+            nodes.sort(key=lambda n: (getattr(n, "gk_order", 0) or 0, *position_key(n)))
             return rank
-
-        # 每生成完一段就记下它占了 ctx.lines 的哪几行，供 _assemble 精确拼接
-        sections = []
 
         for func_name, nodes in sorted(grouped.items(), key=sort_key):
             first = nodes[0]
@@ -271,8 +302,36 @@ class Generator:
         # 不了视角")。现在上帝机由**环境脚本**生成(每张 .tscn 都有),
         # 角色脚本这边只留一条守卫:上帝视角期间把移动 / 跳跃 / 鼠标视角
         # 让出去(见 _emit_god_guard_helper)。
-        if getattr(self.ctx, "god_camera_enabled", False):
+        # 角色脚本要用到守卫时**必须**把定义写出去 —— 判断条件除了
+        # "这一关导了上帝机"(god_camera_enabled),还有"图里真的调了它"
+        # (need_god_guard,第 124 轮:`显示_鼠标模式` 的锁鼠标那两句会包一层
+        # `if not _gk_god_camera_active():`)。只调用不定义 = Godot 报
+        # "Function _gk_god_camera_active() not found in base self",整个
+        # 脚本加载不了。
+        # ── ★ 上帝机守卫只在 **3D** 里生成(第 131 轮,队友查边界时挖到)──
+        # 上帝机是**3D 独有**的:它整段逻辑围着 `Camera3D` / 上帝摄像机转,
+        # 而 2D 工程里根本没有"3D 相机"这个概念。
+        # 可这道门原来**不看维度** —— 2D 工程只要在设置里勾了『上帝摄像机』,
+        # 生成的脚本就会带上 `get_viewport().get_camera_3d()`(一个 3D-only API)
+        # 和一个永远返回 false 的守卫。
+        # 证据(队友给的,2D 图里**只放一个『打印』、没有任何 AI 节点**):
+        #     `_gk_god_camera_active` 定义 : 出现
+        #     用了 get_camera_3d()        : 出现
+        # 也就是说这不是"有没有 AI"的问题,是**门本身漏了维度**。
+        # ⚠ 只在 3D 里生成之后,2D 工程产物**逐字回到旧行为**(多一个字节都算回归)。
+        #   3D 侧一个字不变 —— 队友的 AI 守卫挂在 `god_camera_enabled` 上,
+        #   3D 里它仍然为真,不受影响(他还额外加了维度门做双保险)。
+        if int(getattr(self.ctx, "dim", 3) or 3) == 3 and (
+                getattr(self.ctx, "god_camera_enabled", False)
+                or getattr(self.ctx, "need_god_guard", False)):
             self._emit_god_guard_helper(sections)
+        # ── 第一人称枢轴夹取(第 129 轮:用户"第一人称还会触发穿模")────────
+        # 只在**图里真有第一人称弹簧臂**时才生成 —— 没有第一人称的工程
+        # 一个字节都不多(这条规矩这个仓库一直守着)。
+        if getattr(self.ctx, "need_pivot_clamp", False):
+            self.ctx.declare_var("_gk_half_up_cache", "float", initial="0.0")
+            self.ctx.declare_var("_gk_half_up_ready", "bool", initial="false")
+            self._emit_body_half_up_helper(sections)
         if getattr(self.ctx, "need_camera_query_helper", False):
             self._emit_fly_camera(sections)
         # ---- 2D 兜底相机(第四十六轮)──────────────────────────────────
@@ -324,7 +383,45 @@ class Generator:
                 for text in hook_lines:
                     target_section["lines"].append(("    " + text) if text else "")
 
+        # 对话/选择会把世界暂停,但它们仍需要在宿主脚本的 `_input` 里
+        # 接收回车、数字键和鼠标点击。让宿主 ALWAYS 处理输入,再在游戏逻辑
+        # 的 process/physics 回调入口主动停住世界行为;这样不会出现
+        # "鼠标能看见、文字/选择永远等不到输入"的半暂停状态。
+        # 对话 / 选择本身会在暂停树里等待输入。宿主必须保持 ALWAYS，
+        # 否则鼠标事件和 process_frame await 都会在暂停后失去接收者。
+        if (self.ctx.need_pause_helpers or self.ctx.need_dialog_helpers
+                or self.ctx.need_choice_helpers):
+            self._append_block(
+                sections, "_ready", "func _ready() -> void:",
+                ["    process_mode = Node.PROCESS_MODE_ALWAYS"],
+                at_front=True)
+            for func_name in ("_process", "_physics_process"):
+                section = self._section_for(sections, func_name)
+                if section is not None:
+                    section["lines"][0:0] = [
+                        "    if get_tree().paused:",
+                        "        return",
+                    ]
+
         # ---- 触屏拖动:需要往 _input(event) 里挂事件累积 ----
+        #
+        # ── 为什么 `_input` 里要按 `during_pause` 分两组(用户实测 bug,
+        #    2026-10-13:"暂停游戏后鼠标还存在控制视角旋转")──────────────
+        # 上面那段给 `_ready` 强行设了 `process_mode = PROCESS_MODE_ALWAYS`
+        # —— 不这样的话"暂停之后按 Esc 解冻"和"暂停里弹的对白"都收不到
+        # 输入。但 ALWAYS 是**整个节点**的属性:`_process` /
+        # `_physics_process` 还能在函数入口用 `if get_tree().paused: return`
+        # 挡住,`_input` 一直没挡 —— 于是暂停期间鼠标位移照样往
+        # `_gk_mouse_delta` 里攒,视角跟着转。
+        # 解法:处理器登记时各自声明 `during_pause`(见
+        # context.register_input_handler),这里分两组发射:
+        #   * `during_pause=True`  -> **无条件调用**(暂停界面自己的交互:
+        #     点外面关面板 / 对话框 / 对话历史 / 选择框,以及上帝机);
+        #   * `during_pause=False` -> 包进"当前没暂停"的守卫里(角色玩法
+        #     输入:鼠标视角 / 滚轮 / 触屏拖动)。
+        # ⚠ 两边都为空时**根本不生成 `_input`**(老行为:没有处理器就没有
+        #   这个函数);`get_tree() == null` 要算"没暂停"—— 那种时刻节点
+        #   还没进树,按老样子调用一次最安全。
         if self.ctx._input_handlers:
             target_section = None
             for section in sections:
@@ -339,9 +436,28 @@ class Generator:
                     "separator": True,
                 }
                 sections.append(target_section)
-            for func_name, reset in [(item[0], item[1])
-                                     for item in self.ctx._input_handlers]:
-                target_section["lines"].append(f"    {func_name}(event)")
+
+            def _during_pause(item):
+                # 老的三元组(理论上不存在了)按"暂停期间不跑"处理:
+                # 宁可多挡一层,也不要漏掉玩法输入。
+                return bool(item[3]) if len(item) > 3 else False
+
+            always_calls = [item[0] for item in self.ctx._input_handlers
+                            if _during_pause(item)]
+            paused_calls = [item[0] for item in self.ctx._input_handlers
+                            if not _during_pause(item)]
+            if always_calls:
+                target_section["lines"].append(
+                    "    # 暂停期间照跑:暂停界面自己的交互 / 上帝机")
+                for func_name in always_calls:
+                    target_section["lines"].append(f"    {func_name}(event)")
+            if paused_calls:
+                target_section["lines"].append(
+                    "    # 暂停期间不跑:角色玩法输入(视角 / 滚轮 / 触屏)")
+                target_section["lines"].append(
+                    "    if get_tree() == null or not get_tree().paused:")
+                for func_name in paused_calls:
+                    target_section["lines"].append(f"        {func_name}(event)")
 
         # ---- 相机解析(类型统一,不用嵌套三元)----
         if getattr(self.ctx, "need_resolve_camera", False):
@@ -495,7 +611,7 @@ class Generator:
                     "        return",
                     "    var root: Node = host",
                     "    if host != null and host.is_inside_tree():",
-                    "        var scene := host.get_tree().current_scene",
+                    "        var scene := host.get_tree().root",
                     "        if scene != null:",
                     "            root = scene",
                     "    if root == null:",
@@ -578,8 +694,6 @@ class Generator:
             ctx = self.ctx
             cam = ctx.declare_var("_gk_cam_query", "Node")
             lines = ctx.new_section()
-            ctx.add_line(1, f"if {cam} != null and is_instance_valid({cam}):")
-            ctx.add_line(2, f"return {cam}")
             ctx.add_line(1, f"{cam} = get_viewport().get_camera_3d()")
             ctx.add_line(1, f"if {cam} == null:")
             ctx.add_line(2, f"{cam} = get_viewport().get_camera_2d()")
@@ -1044,17 +1158,41 @@ class Generator:
 
         # ---- 界面容器辅助函数 ----
         if self.ctx.need_ui_helpers:
+            # A role can update a permanent HUD without creating any local widgets.
+            self.ctx.declare_var("_gk_ui_layer", "CanvasLayer")
+            self.ctx.declare_var("_gk_ui_root", "Control")
+            # ── 层号:主界面 20 / 普通界面 10(第一百二十六轮)──────────────
+            # 真机量过(`.audit/ui_overlay_probe`,Godot 4.7.2):关卡的 GKUI
+            # 和主界面的 GKUI **都是 layer 10**,而 layer 相同时由 /root 里的
+            # 树序决定先后 —— 主界面那份排在前面,于是它整个被关卡的界面
+            # **画在下面**。这就是"按 Esc 弹出的暂停面板被章节卡压住"的根:
+            # `_gk_ui_raise()` 的 `move_to_front()` 只在**同一个父节点**的
+            # 兄弟之间挪,跨 CanvasLayer 一步都迈不出去。
+            # 主界面是"跨场景常驻的那一层",本来就该盖在关卡界面之上,所以
+            # 它单独抬到 20;仍低于屏幕滤镜(90)/ 暗角(92)/ 闪白转场(100)。
+            if getattr(self.ctx, "is_main_ui", False):
+                ui_layer_expr = "20"
+            else:
+                ui_layer_expr = "10"
             sections.append({
                 "signature": "func _gk_ensure_ui(host: Node) -> void:",
                 "lines": [
                     "    if _gk_ui_layer == null:",
                     "        _gk_ui_layer = CanvasLayer.new()",
                     "        _gk_ui_layer.name = \"GKUI\"",
-                    # layer 10 = 盖在游戏画面上，但低于屏幕闪白(layer 100)
-                    "        _gk_ui_layer.layer = 10",
+                    # layer 10 = 盖在游戏画面上，但低于屏幕闪白(layer 100);
+                    # 主界面那份 20 = 还要盖住关卡自己的界面(见 above)
+                    f"        _gk_ui_layer.layer = {ui_layer_expr}",
+                    # 对话/选择会在暂停树里显示,而按钮还必须继续收 GUI 输入。
+                    # CanvasLayer 本身不参与暂停,但它的 Control 子树默认会
+                    # 继承宿主的 PAUSABLE 模式;暂停后文字 tween 和焦点更新就
+                    # 会一起停住,出现"鼠标可见、面板空白"。UI 是模态界面,
+                    # 明确设为 ALWAYS,不依赖场景树的父节点模式。
+                    "        _gk_ui_layer.process_mode = Node.PROCESS_MODE_ALWAYS",
                     "        host.add_child(_gk_ui_layer)",
                     "        _gk_ui_root = Control.new()",
                     "        _gk_ui_root.name = \"Root\"",
+                    "        _gk_ui_root.process_mode = Node.PROCESS_MODE_ALWAYS",
                     "        _gk_ui_root.set_anchors_preset(Control.PRESET_FULL_RECT)",
                     "        _gk_ui_root.mouse_filter = Control.MOUSE_FILTER_IGNORE",
                     "        _gk_ui_layer.add_child(_gk_ui_root)",
@@ -1304,18 +1442,43 @@ class Generator:
                     "empty_body": "    pass",
                     "separator": True,
                 })
-            sections.append({
-                # 不带 host 参数:它从来没被用过,而 Godot 会把
-                # "参数没用上" 报成 UNUSED_PARAMETER(调试器里一条错误)。
-                "signature": "func _gk_find_widget(widget_name: String) -> Control:",
-                "lines": [
+            # ── 有『主界面』时,查找多一条兜底(第一百一十二轮)────────
+            # 主界面(跨场景常驻的 autoload)里的控件**按名字也能找到** ——
+            # 所以『界面_设置』『界面_隐藏控件』这些无论写在哪个场景里,
+            # 都能指到主界面里的一块面板(`暂停菜单` 就只有一个了)。
+            # 本场景的界面优先(先查自己的 `_gk_ui_layer`)。
+            #
+            # ⚠ 没有主界面的工程**保持原样逐字不变**(老图生成结果钉着)——
+            #   所以这里按"工程里有没有勾主界面"分两条文本。
+            if main_ui_design_tree() is not None:
+                find_lines = [
+                    "    if _gk_ui_layer != null:",
+                    "        var found := _gk_ui_layer.find_child(widget_name, true, false)",
+                    "        if found is Control:",
+                    "            return found",
+                    "    # 主界面(跨场景常驻)里的控件也按名字能找",
+                    "    var main_ui: Node = get_node_or_null("
+                    f'"/root/{MAIN_UI_AUTOLOAD}")',
+                    "    if main_ui != null and main_ui != self:",
+                    "        var hit := main_ui.find_child(widget_name, true, false)",
+                    "        if hit is Control:",
+                    "            return hit",
+                    "    return null",
+                ]
+            else:
+                find_lines = [
                     "    if _gk_ui_layer == null:",
                     "        return null",
                     "    var found := _gk_ui_layer.find_child(widget_name, true, false)",
                     "    if found is Control:",
                     "        return found",
                     "    return null",
-                ],
+                ]
+            sections.append({
+                # 不带 host 参数:它从来没被用过,而 Godot 会把
+                # "参数没用上" 报成 UNUSED_PARAMETER(调试器里一条错误)。
+                "signature": "func _gk_find_widget(widget_name: String) -> Control:",
+                "lines": find_lines,
                 "empty_body": "    pass",
                 "separator": True,
             })
@@ -1325,6 +1488,16 @@ class Generator:
         # 挂在 `get_tree().process_frame` 信号上的回调**不受暂停影响**
         # (信号是直接的方法调用,不走"节点的每帧处理"),这是唯一能在
         # 暂停期间读到 Esc 的活口。真 Godot 探针验过:暂停 -> Esc -> 解冻。
+        #
+        # ── 第一百二十六轮(P1):暂停时"旧界面让位"(用户原话)──────────
+        # 用户:"有时点快了,就会有这样的情况,那么在如ESC菜单出现时就立刻
+        # 隐藏旧的界面,或者添加模糊背景" —— 配图里章节卡「第一章:门厅」
+        # 糊在暂停面板的"继续游戏"上。两件事一起做:
+        #   ① 主界面那一层抬到 layer 20(见 _gk_ensure_ui 里的说明)+
+        #      菜单 `move_to_front()`:菜单**永远在最上层**(跨 CanvasLayer
+        #      光靠 move_to_front 跨不过去,所以两层都得动);
+        #   ② 过场控件按 `gk_ui_transient` 组整批收起、继续游戏时**原样
+        #      还原**(`_gk_hide_transient`),再配一块半透明压暗底。
         if self.ctx.need_pause_helpers:
             # Esc 监听只在真的勾了『Esc 也能开关』时才生成 —— 没勾的图里
             # 那两个函数是死代码(『界面_暂停游戏』本体只需要 _gk_apply_pause)
@@ -1369,8 +1542,36 @@ class Generator:
                 "        elif _gk_pause_mouse_was >= 0:",
                 "            Input.mouse_mode = _gk_pause_mouse_was as Input.MouseMode",
                 "            _gk_pause_mouse_was = -1",
+            ]
+            # ── 过场控件让位 + 压暗底(第一百二十六轮)────────────────────
+            # 让位那一段**按"菜单在不在"分两半**,别写成一个 `paused` 三元:
+            #   * 暂停菜单是可空的(`_gk_find_widget` 查不到时只 push_warning),
+            #     那种情况下压根没弹出过菜单,也就没有"过场控件被收起来"这回事;
+            #   * 所以"恢复"要**先确认菜单真的存在**再还 —— 无条件还原会在
+            #     "菜单控件名字填错"的工程里把本该藏着的过场控件亮出来
+            #     (章节卡淡出之后又冒出来)。收起/还原两边都靠 `paused` 分流,
+            #     同一个函数里成对出现,不会有"收了不还"的中间态。
+            if getattr(self.ctx, "_pause_transient", False):
+                if self.ctx.need_transient_helper:
+                    pause_lines += [
+                        "    if paused:",
+                        "        _gk_hide_transient(true)",
+                        "    else:",
+                        "        var has_menu := false",
+                        "        if menu != \"\":",
+                        "            has_menu = _gk_find_widget(menu) != null",
+                        "        if has_menu:",
+                        "            _gk_hide_transient(false)",
+                    ]
+                if self.ctx.need_pause_dim:
+                    pause_lines += [
+                        "    if _gk_pause_dim != null:",
+                        "        _gk_pause_dim.visible = paused",
+                    ]
+            pause_lines += [
+                "    var widget: Control = null",
                 "    if menu != \"\":",
-                "        var widget := _gk_find_widget(menu)",
+                "        widget = _gk_find_widget(menu)",
                 "        if widget != null:",
                 "            widget.visible = paused",
             ]
@@ -1393,6 +1594,45 @@ class Generator:
                 "empty_body": "    pass",
                 "separator": True,
             })
+            # ── 过场控件让位(第一百二十六轮,P1)────────────────────────
+            # 用户原话:"有时点快了……那么在如ESC菜单出现时就立刻隐藏旧的
+            # 界面" —— 配图是章节卡压在暂停面板上。
+            # 收起一批、继续时**原样还原**:用 stash 记住"收起之前各自可不
+            # 可见" —— 直接 `visible = true` 会把本来该藏着的控件亮出来
+            # (比如已经淡出过的章节卡,继续游戏后反而冒出来)。
+            if self.ctx.need_transient_helper:
+                # 还原账本:[暂停前各自可不可见],按组里同一个遍历顺序存 /
+                # 读回去。不存就只能一律 `visible = true`,把"本来就该藏着的
+                # 过场控件"亮出来(章节卡已经淡出过,继续游戏后又冒出来)。
+                self.ctx.declare_var("_gk_transient_hidden", "Array",
+                                     initial="[]")
+                sections.append({
+                    "signature": "func _gk_hide_transient(hide: bool) -> void:",
+                    "lines": [
+                        "    # 按 Godot 组整批收 / 放 —— 组名由生成器写进控件创建处",
+                        "    # (见 services.UI_TRANSIENT_GROUP),不靠控件的名字猜。",
+                        "    var found := get_tree().get_nodes_in_group(\"gk_ui_transient\")",
+                        "    if hide:",
+                        "        _gk_transient_hidden.clear()",
+                        "        for item in found:",
+                        "            if not (item is CanvasItem):",
+                        "                continue",
+                        "            var canvas := item as CanvasItem",
+                        "            _gk_transient_hidden.append(canvas.visible)",
+                        "            canvas.visible = false",
+                        "    else:",
+                        "        var index := 0",
+                        "        for item in found:",
+                        "            if not (item is CanvasItem):",
+                        "                continue",
+                        "            if index < _gk_transient_hidden.size():",
+                        "                (item as CanvasItem).visible = _gk_transient_hidden[index]",
+                        "            index += 1",
+                        "        _gk_transient_hidden.clear()",
+                    ],
+                    "empty_body": "    pass",
+                    "separator": True,
+                })
 
         # ---- 对话框(第三十七轮)----------------------------------------
         if self.ctx.need_dialog_helpers:
@@ -1418,7 +1658,10 @@ class Generator:
                     "        box.border_color = Color(1.0, 1.0, 1.0, 0.25)",
                     "        _gk_dialog_panel.add_theme_stylebox_override(\"panel\", box)",
                     # 面板不吃鼠标:点哪里都算"下一句",别被面板本身拦掉
-                    "        _gk_dialog_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    # 面板本身接收鼠标点击，保证暂停时点击对白区域也能推进；
+                    # 文字和立绘子节点仍忽略鼠标，不会遮住面板事件。
+                    "        _gk_dialog_panel.mouse_filter = Control.MOUSE_FILTER_STOP",
+                    "        _gk_dialog_panel.gui_input.connect(_gk_dialog_gui_input)",
                     "        _gk_ui_root.add_child(_gk_dialog_panel)",
                     "        _gk_dialog_name = Label.new()",
                     "        _gk_dialog_name.name = \"说话人\"",
@@ -1467,6 +1710,14 @@ class Generator:
                     "    _gk_dialog_blip_step = 0",
                     "    if speed > 0.0 and count > 0:",
                     "        _gk_dialog_tween = _gk_dialog_panel.create_tween()",
+                    # ⚠ 逐字冒出的 tween 必须**暂停时也照跑**(第一百一十轮真机抓到):
+                    #   对话/选择是配合『界面_暂停游戏』用的(暂停世界 + 放出鼠标),
+                    #   而 tween 默认 `TWEEN_PAUSE_BOUND` —— 绑在暂停树里的节点上
+                    #   就一起冻住,`visible_characters` 永远停在 0,玩家看到的是
+                    #   **一个空面板**("文字消失了,鼠标还在")。真机截图复现过;
+                    #   无头探针看不到,是因为探针自己挂在 PROCESS_MODE_ALWAYS 下,
+                    #   把整个关卡也带成了"暂停也跑"。
+                    "        _gk_dialog_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)",
                     "        if _gk_dialog_blip != \"\":",
                     "            # 有打字音:走 tween_method,每帧自己推进『已显示几个字』",
                     "            # 并『每 N 个字』响一声(属性 tween 插不进回调)",
@@ -1553,6 +1804,14 @@ class Generator:
                 "empty_body": "    pass",
                 "separator": True,
             })
+            sections.append({
+                "signature": "func _gk_dialog_gui_input(event: InputEvent) -> void:",
+                "lines": [
+                    "    if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:",
+                    "        _gk_dialog_clicked = true",
+                ],
+                "empty_body": "    pass",
+            })
 
         # ---- 字幕行(第六十四轮:"字幕行 / 打字机音效")------------------
         # 复用对话框那块面板,但**不等玩家点**:飘出来之后立刻返回,
@@ -1572,7 +1831,10 @@ class Generator:
                     "    _gk_dialog_show(host, speaker, body, speed, portrait, width, height, margin)",
                     "    _gk_sub_token += 1",
                     "    var token := _gk_sub_token",
-                    "    var timer := host.get_tree().create_timer(maxf(seconds, 0.05))",
+                    # ⚠ 第二个实参 `process_always=false`:暂停时字幕定时器也要停。
+                    #   默认值 true 会让"暂停中字幕自己消失"(用户第 125 轮
+                    #   报的那条类问题:暂停没有真的冻住所有东西)。
+                    "    var timer := host.get_tree().create_timer(maxf(seconds, 0.05), false)",
                     "    timer.timeout.connect(func() -> void:",
                     "        if token != _gk_sub_token:",
                     "            return      # 已经有新的一句顶掉了,别关",
@@ -1799,13 +2061,24 @@ class Generator:
                     "    _gk_choice_panel.set_anchors_and_offsets_preset(",
                     "        Control.PRESET_CENTER_BOTTOM, Control.PRESET_MODE_KEEP_SIZE, margin)",
                     "    var pad := 22.0",
-                    "    _gk_choice_question.text = question",
+                    # 问题标题也给出键盘入口;只在选项存在时拼接,避免空选项
+                    # 的自定义对话出现误导提示。
+                    "    _gk_choice_question.text = question + (\" (按 1-%d 选择)\" % options.size() if not options.is_empty() else \"\")",
                     # 问题也逐字冒出来(和对话框同一种手感);按钮**立刻**可点,
                     # 玩家不等它打完就能选 —— 打字只是好看,不挡操作。
+                    # ⚠ 这条 tween 必须**暂停时也照跑**(第一百一十轮真机抓到):
+                    #   选择框是配合『界面_暂停游戏』用的(暂停世界 + 放出鼠标,
+                    #   玩家才能点),而 tween 默认 `TWEEN_PAUSE_BOUND` —— 绑在
+                    #   暂停树里的节点上就一起冻住,`visible_characters` 永远停在
+                    #   0,玩家看到的是**一个空面板**(文字"消失"了)。
+                    #   真机截图复现过;无头探针看不到是因为探针自己挂在
+                    #   PROCESS_MODE_ALWAYS 下,把整个关卡也带成了"暂停也跑"。
                     "    _gk_choice_question.visible_characters = 0",
-                    "    var chars := question.length()",
+                    "    var chars := _gk_choice_question.text.length()",
                     "    if speed > 0.0 and chars > 0:",
-                    "        _gk_choice_question.create_tween().tween_property(",
+                    "        var _gk_q_tween := _gk_choice_question.create_tween()",
+                    "        _gk_q_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)",
+                    "        _gk_q_tween.tween_property(",
                     "            _gk_choice_question, \"visible_characters\", chars, float(chars) / speed)",
                     "    else:",
                     "        _gk_choice_question.visible_characters = -1",
@@ -1817,7 +2090,12 @@ class Generator:
                     "        var button := Button.new()",
                     # 名字带序号:探针 / 调试面板能按名字找到第几个选项
                     "        button.name = \"选择%d\" % (index + 1)",
-                    "        button.text = str(options[index])",
+                    # 按钮上把**键盘数字键**写出来(第一百一十轮):
+                    # 选项本来就能按 1~6 选(见 _gk_choice_input_event),可卡片上
+                    # 只写"往前跑",玩家根本不知道有键盘这条路 —— 用户实测原话
+                    # "部分提示没有按键显示…按1,2键进行选择对话"。数字 + 点号
+                    # 是"按 1 选第一个"最省字的写法。
+                    "        button.text = str(index + 1) + \". \" + str(options[index])",
                     "        button.custom_minimum_size = Vector2(0.0, 38.0)",
                     "        button.mouse_filter = Control.MOUSE_FILTER_STOP",
                     "        button.pressed.connect(_gk_choice_pick.bind(index + 1))",
@@ -2244,15 +2522,14 @@ class Generator:
         for node in self._nodes():
             if getattr(node, "gk_is_event", False) and not getattr(node, "gk_is_comment", False):
                 result.append(node)
-        result.sort(key=lambda n: (n.location[1], n.location[0]))
+        result.sort(key=position_key)
         return result
 
     def _nodes(self):
         nodes = getattr(self.tree, "nodes", ())
         result = list(nodes)
         # 让输出稳定:按 y 再按 x
-        result.sort(key=lambda n: (getattr(n, "location", (0.0, 0.0))[1],
-                                   getattr(n, "location", (0.0, 0.0))[0]))
+        result.sort(key=position_key)
         return result
 
     def _delta_missing(self, node):
@@ -2272,6 +2549,22 @@ class Generator:
     def _prepass(self, events):
         """不执行、只收集:信号声明、只读变量。"""
         params = self._declared_param_names()
+        # ── 过场控件要在**发射任何代码之前**就数清楚(第一百二十六轮)────
+        # 为什么必须提前扫:`_gk_apply_pause()` 里那句 `_gk_hide_transient(...)`
+        # 跟"这张图里有没有过场控件"绑定,而它**可能比控件节点先生成**
+        # ——『界面_暂停游戏』(Esc 热键)在示例里排在设计图上半部分,控件
+        # 排在下半部分,谁先谁后由画布 Y 决定。发射到那儿才发现没有 helper,
+        # 那句话就漏了(实测:走廊那关真的漏过,`_gk_apply_pause` 里少一行)。
+        for node in self._nodes():
+            if _ui_looks_transient(node) or bool(getattr(node, "gk_transient", False)):
+                self.ctx.need_transient_helper = True
+        # 设计图里建的控件也算(『界面_套用设计』把设计图建进这个场景时,
+        # 那些控件的组登记就写在本脚本里)
+        for tree in (getattr(self.ctx, "_gk_ui_design_trees", ()) or ()):
+            for node in (getattr(tree, "nodes", ()) or ()):
+                if (_ui_looks_transient(node)
+                        or bool(getattr(node, "gk_transient", False))):
+                    self.ctx.need_transient_helper = True
         for node in self._nodes():
             if node.bl_idname == "GKNodeEmitSignal" and getattr(node, "gk_signal_declare", True):
                 name = snake_case(getattr(node, "gk_signal_name", "signal_name"), "signal_name")
@@ -2323,6 +2616,99 @@ class Generator:
             return
         for target, entry in _next_nodes(node, "执行"):
             _emit_body(self.ctx, target, indent, entry=entry)
+
+    # ---- 主界面模式(第一百一十二轮)----
+    def _emit_ui_main_sections(self):
+        """主界面模式的语句:`_ready` = 建控件 + 界面自带行为 + 一对接口。
+
+        `show_main(on)` 是玩法图『界面_主界面』节点调的那面接口
+        (显示 / 收起整层);`main_shown()` 给"现在画着没"的查询。
+        界面的行为(按钮回调 / Esc 暂停…)在 `_emit_design_into` 里
+        按"设计图的顶层语句"发射 —— 和『界面_套用设计』走同一条路,
+        区别只是这份在 autoload 里跑,全局生效。
+        """
+        self.ctx.need_ui_helpers = True
+        lines = self.ctx.new_section()
+        _ui_root(self.ctx, 1)
+        _emit_design_into(self.ctx, self.tree, 1)
+        # ── 压暗底:调用写在**设计图遍历之后**(第一百二十六轮)──────────
+        # ⚠ 顺序踩过坑,别挪回前面去:这块底只在"设计图里有『界面_暂停游戏』
+        #   且填了菜单控件"时才需要,而那个标志(need_pause_dim)是**遍历设计图
+        #   时**才置上的 —— 写在前面的条件判断拿到的永远是 False,函数定义
+        #   却照生成(生成到 _gk_apply_pause 时标志已经是 True),真机表现是
+        #   `_gk_pause_dim` 永远 null、压暗底一块都看不见(探针 P1_DIM 抓到的)。
+        # 放在后面就与控件顺序无关了:`_gk_pause_dim_init()` 自己用
+        # `move_child(..., 0)` 把它提到根部第一个孩子 = 同层最底,菜单由
+        # `_gk_ui_raise()` 挪到最上层,正好"先压暗、再画面板"。
+        self.ctx.declare_var("_gk_pause_dim", "ColorRect")
+        lines.add(1, "_gk_pause_dim_init()")
+        return [
+            {
+                "signature": "func _ready() -> void:",
+                "lines": list(lines.lines),
+                "empty_body": "    pass",
+            },
+            {
+                "signature": "func show_main(on: bool = true) -> void:",
+                "lines": [
+                    "    # 玩法图『界面_主界面』调的就是它(显示 / 收起整层)",
+                    "    if _gk_ui_layer != null:",
+                    "        _gk_ui_layer.visible = on",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            },
+            {
+                "signature": "func main_shown() -> bool:",
+                "lines": [
+                    "    return _gk_ui_layer != null and _gk_ui_layer.visible",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            },
+        ]
+
+    # ---- 暂停时的压暗底(第一百二十六轮)----
+    def _emit_pause_dim(self):
+        """主界面里那块全屏压暗底:暂停菜单弹出来时把游戏画面压暗一层。
+
+        ── 为什么是 `ColorRect` + 半透明黑,不是模糊 ────────────────────
+        用户原话:"在如ESC菜单出现时就立刻隐藏旧的界面,**或者添加模糊背景**"。
+        Godot 4 里"模糊背景"要 `BackBufferCopy` + 屏幕纹理着色器(采样
+        `hint_screen_texture` 再做多次高斯),代价是每帧一次全屏采样 ——
+        而这块底**只在暂停时可见**,本质是"把后面的东西压下去",半透明黑
+        已经达成目的,也**不会和『屏幕_滤镜』(layer 90)/『屏幕_暗角』
+        (layer 92)抢同一张后备缓冲**。所以这里取轻的那条路:一个 ColorRect。
+        以后真要做磨砂玻璃,替换这一个节点的材质即可,接口不用动。
+
+        ── 为什么"作为根的第一个孩子"= 在最底层 ────────────────────────
+        同一个 CanvasLayer 里的 Control 按**兄弟顺序**画(后加的画在上面),
+        所以压暗底必须是 `_gk_ui_root` 的第一个孩子;暂停菜单由
+        `_gk_ui_raise()` 的 `move_to_front()` 挪到最后一个孩子,永远压在
+        这块底上面 —— "先压暗、再画面板",不会反过来把面板也压暗。
+        """
+        self.ctx.declare_var("_gk_pause_dim", "ColorRect")
+        return [{
+            "signature": "func _gk_pause_dim_init() -> void:",
+            "lines": [
+                "    if _gk_pause_dim != null or _gk_ui_root == null:",
+                "        return",
+                "    # 半透明黑 = 压暗背景(不是全遮:玩家还要看得见自己停在哪)",
+                "    _gk_pause_dim = ColorRect.new()",
+                '    _gk_pause_dim.name = "暂停压暗"',
+                "    _gk_pause_dim.color = Color(0.0, 0.0, 0.0, 0.45)",
+                "    _gk_pause_dim.set_anchors_preset(Control.PRESET_FULL_RECT)",
+                "    # 不吃鼠标:菜单照点,也不会挡住游戏里的点击判定",
+                "    _gk_pause_dim.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                "    _gk_pause_dim.visible = false",
+                "    _gk_ui_root.add_child(_gk_pause_dim)",
+                "    # 提到根的第一个孩子 = 同层最底(见函数说明):菜单等会儿还会",
+                "    # 被 move_to_front 挪到最后,正好压在它上面",
+                "    _gk_ui_root.move_child(_gk_pause_dim, 0)",
+            ],
+            "empty_body": "    pass",
+            "separator": True,
+        }]
 
     # ---- 组装 ----
     @staticmethod
@@ -2394,6 +2780,81 @@ class Generator:
                                "    # 视口当前相机是上帝摄像机(环境脚本造的,进了 gk_god_camera 组)",
                                "    var cam := get_viewport().get_camera_3d()",
                                "    return cam != null and cam.is_in_group(\"gk_god_camera\")",
+                           ])
+
+    def _emit_body_half_up_helper(self, sections):
+        """"这个角色的碰撞体从原点往上有多高" —— 第一人称枢轴要用它夹一次。
+
+        ── 为什么需要(第 129 轮:用户"第一人称还会触发穿模（幅度变小了）")──
+        真机量到的链条(第三关方块顶跳,113 帧):
+            第一人称枢轴 = 玩家原点 + **1.55**,而胶囊 `r=0.5 h=1.8`
+            沿 y 只到 **+0.9** -> 眼睛恒定在**头顶上方 0.65 米**:
+                相机高出胶囊顶 = **+0.6500 恒定**
+                比 near(0.1) 更近 = **5 帧**,最坏 **0.0066 米**
+                相机在实心体里的帧 = **10 帧**(撞天花板)
+            而玩家胶囊中心到最近表面始终 0.9~1.47 —— **身体在外面,眼睛伸出去**。
+
+        为什么 `1.55` 会错:`1.55` 是**按"原点在脚底"**写的(1.8 米的人,
+        眼睛离地 1.55 是标准写法)。这个角色的原点在**身体中心**,同一串
+        数字就把眼睛顶到离地 2.45 米 —— 水平方向还有胶囊拦着(相机只在
+        轴线外 0.25 米,胶囊半径 0.5),**竖直方向完全裸奔**。
+
+        这里返回"碰撞形状**上沿**在角色本地上方多少"(沿角色自己的竖直轴):
+          * 原点在**中心** -> 约 0.9  -> 1.55 被夹回身体里;
+          * 原点在**脚底** -> 约 1.8  -> 1.55 合法,不动。
+        两种原点约定**同一个属性值都对**,用户不用猜该填多少。
+
+        ⚠ 返回 0.0 = "量不到" —— 调用方**不夹**(保持老行为)。
+          拿不到形状就乱夹会把老工程改坏。
+        ⚠ 结果缓存在成员变量里:碰撞形状运行时不会变形,每帧扫一遍白费性能。
+        """
+        if getattr(self, "_half_up_emitted", False):
+            return
+        self._half_up_emitted = True
+        self._append_block(sections, "_gk_body_half_up",
+                           "func _gk_body_half_up(body: Node3D) -> float:",
+                           [
+                               "    # 量不到就返回 0.0(调用方据此跳过夹取,保持老行为)",
+                               "    if body == null:",
+                               "        return 0.0",
+                               "    if _gk_half_up_ready:",
+                               "        return _gk_half_up_cache",
+                               "    _gk_half_up_ready = true",
+                               "    var best := 0.0",
+                               "    for found in body.find_children(\"*\", \"CollisionShape3D\", true, false):",
+                               "        var cs := found as CollisionShape3D",
+                               "        if cs == null or cs.shape == null:",
+                               "            continue",
+                               "        # 形状在**角色本地**的竖直范围:把形状中心换算成角色局部坐标",
+                               "        var centre: Vector3 = body.to_local(cs.global_position)",
+                               "        var half := 0.0",
+                               "        var span := 0.0",
+                               "        if cs.shape is CapsuleShape3D:",
+                               "            span = (cs.shape as CapsuleShape3D).height",
+                               "            half = span * 0.5",
+                               "        elif cs.shape is BoxShape3D:",
+                               "            span = (cs.shape as BoxShape3D).size.y",
+                               "            half = span * 0.5",
+                               "        elif cs.shape is SphereShape3D:",
+                               "            span = (cs.shape as SphereShape3D).radius * 2.0",
+                               "            half = span * 0.5",
+                               "        elif cs.shape is CylinderShape3D:",
+                               "            span = (cs.shape as CylinderShape3D).height",
+                               "            half = span * 0.5",
+                               "        else:",
+                               "            continue",
+                               "        # ⚠ 用**形状自己的**竖直轴:节点可能被转了 90°",
+                               "        #   (躺着的碰撞盒)。投影到形状本地 y 上才算对。",
+                               "        var up: Vector3 = cs.global_transform.basis.y",
+                               "        if up.length_squared() < 1e-8:",
+                               "            up = Vector3.UP",
+                               "        var reach := absf(up.normalized().dot(body.global_transform.basis.y))",
+                               "        if reach < 0.05:",
+                               "            reach = 0.05          # 形状几乎横躺:至少算它自己的厚度",
+                               "        var top: float = centre.y + half * reach",
+                               "        best = maxf(best, top)",
+                               "    _gk_half_up_cache = best",
+                               "    return best",
                            ])
 
     def _emit_nav_helpers(self, sections):
@@ -2603,6 +3064,13 @@ class Generator:
         look_var = ctx.declare_var("_gk_fly_look", "Vector2")
         ctx.register_input_handler(
             "_gk_fly_mouse_event", reset=False,
+            # 暂停期间**照跑**(during_pause=True):这台兜底观察机属于
+            # 上帝机那一族的"调试 / 观察"机位 —— 它的设计目的就是
+            # "停住画面绕着看细节"(见 asset_export 里时停那段说明,
+            # 环境脚本的上帝机按 T 冻住世界后还要能转视角)。跟着一起停掉
+            # 就等于"冻住之后连看都看不了"。它的消费端 `_gk_fly_update`
+            # 自带"不在当前那台就丢弃"的守卫,多攒一点不会串到玩家视角上。
+            during_pause=True,
             body=[
                 "    if event is InputEventMouseMotion:",
                 f"        {look_var} += event.relative",

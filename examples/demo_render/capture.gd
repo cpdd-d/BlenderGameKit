@@ -118,6 +118,49 @@ func _apply_light_angle(degrees: float) -> void:
 	var fill := get_node_or_null("RimLight")
 	if fill:
 		fill.light_energy = 0.0 if behind else 0.16
+	_push_light_dir()
+
+
+## 把当前主光方向写进**所有**卡通材质的 `light_dir`。
+##
+## ── 为什么必须手动推(第 125 轮:调面部 SDF 时抓到的)────────────────
+## `gk_toon.gdshader` 是 **unshaded** —— Godot 的光照阶段整个被跳过,
+## 它**根本不读场景里的 DirectionalLight3D**,明暗完全由 `light_dir`
+## 这个 uniform 决定。
+## 这个 demo 一直只转 `KeyLight`(真灯)而**从没写过 light_dir**,
+## 于是:转灯 -> 球体的明暗分界线**纹丝不动**(用的是 shader 里的默认值),
+## 面部 SDF 自然也跟着不动 —— "扫光验证"其实什么都没验到。
+## 真机数字:`GK_SWEEP` 四个角的 `lit=` 计数**一模一样(4177)**,
+## 只有 `dark=` 在变(那是 RimLight 的 energy 在变)。
+##
+## 正确做法(游戏里由 gk_environment.gd 做,见那里同名常量):
+## 方向光的世界朝向 = 它的**前向**(-Z 轴)取反,归一化后写进 uniform。
+func _push_light_dir() -> void:
+	if _key_light == null:
+		return
+	var dir := -_key_light.global_transform.basis.z
+	dir = dir.normalized()
+	for node in _toon_meshes():
+		var material := (node as MeshInstance3D).material_override
+		if material is ShaderMaterial:
+			(material as ShaderMaterial).set_shader_parameter("light_dir", dir)
+			# 描边那一趟也吃同一份光,不然轮廓内的明暗对不上
+			var next_pass := (material as ShaderMaterial).next_pass
+			if next_pass is ShaderMaterial and (next_pass as ShaderMaterial).shader != null:
+				(next_pass as ShaderMaterial).set_shader_parameter("light_dir", dir)
+
+
+## 场景里所有用卡通材质的网格(含 floor / 球体 / 脸 / 角色)。
+func _toon_meshes() -> Array:
+	var out: Array = []
+	var stack: Array = [self]
+	while not stack.is_empty():
+		var node: Node = stack.pop_back()
+		if node is MeshInstance3D and (node as MeshInstance3D).material_override is ShaderMaterial:
+			out.append(node)
+		for child in node.get_children():
+			stack.append(child)
+	return out
 
 
 func _capture(path: String) -> void:

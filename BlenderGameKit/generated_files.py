@@ -360,6 +360,21 @@ def remove_files(directory, relatives):
         except OSError:
             continue
         deleted.append(rel)
+        # ── 顺带收走 Godot 生成的旁挂文件(第一百一十一轮,真机抓到的)────
+        #   * `xx.gd`   -> `xx.gd.uid`  (Godot 4.4+ 给每个脚本写一个)
+        #   * `xx.wav`  -> `xx.wav.import`(导入器写;glb / png 同理)
+        # 主文件被我们删掉之后,这些旁挂文件会**留在原地**:没有主人的 uid
+        # 可能让旧脚本的全局类名被重新捡回来(症状 `Class "X" hides a
+        # global script class`),没有主人的 .import 则是一堆"指向空气"的
+        # 条目。只删**刚被我们删掉的那个文件**的旁挂,别人的一律不碰。
+        for suffix in (".uid", ".import"):
+            orphan = full + suffix
+            if os.path.isfile(orphan):
+                try:
+                    os.remove(orphan)
+                    deleted.append(f"{rel}{suffix}")
+                except OSError:
+                    pass
     return deleted
 
 

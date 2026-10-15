@@ -226,7 +226,7 @@ def open_in_godot(directory, context=None, editor=True):
         scene = main_scene(directory)
         if not scene:
             return False, ("项目还没有主场景,直接运行会失败。\n"
-                           "请先在 Blender 里『导出为 Godot 脚本』并勾选"
+                           "请先在 Blender 里『导出到 Godot』并勾选"
                            "『同时生成示例场景』,然后重试")
         if not os.path.isfile(os.path.join(directory,
                                            scene.replace("res://", ""))):

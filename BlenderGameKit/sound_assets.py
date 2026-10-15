@@ -53,6 +53,30 @@ def sound_res_path(local_path):
     return f"res://{AUDIO_DIR}/{sound_file_name(local_path)}"
 
 
+def resolve_clip(path):
+    """节点上的『音频路径』-> **(脚本里写的路径, 要复制的本地文件)**。
+
+    ── 为什么节点也要认本地路径(第一百一十一轮,真机报错逼出来的)──────
+    『音效_播放』以前只认 `res://` 字面量:文件得用户自己拷进工程。示例
+    (恐怖闯关)是脚本直接把 wav 写进**它自己那个工程**的 audio/ —— 于是
+    一旦导出目标换成别的工程(用户的 F5 默认目标就是 `game_godot`),
+    脚本里那几条 `res://audio/pickup.wav` 就指向空气:运行起来刷屏
+    "Resource file not found",音效一声不响。
+
+    现在和『资产_声音卡』/ 场景 BGM 走**同一条复制管线**:
+      * `res://...`   -> 原样返回(用户自己管的文件,不动);
+      * 磁盘路径且是音频文件 -> 换成 `res://audio/<名字_摘要>.wav`,
+        第二个返回值是那个本地文件,导出时会被复制进工程的 audio/;
+      * 其它(空串 / 不是音频) -> 原样返回,不复制。
+    """
+    text = str(path or "").strip()
+    if not text or text.startswith("res://"):
+        return text, ""
+    if not is_sound_file(text):
+        return text, ""
+    return sound_res_path(text), text
+
+
 def sound_files(directory, cards):
     """这次导出要带进项目的音频:**(显示名, 本地路径, 目标路径, res://)**。
 

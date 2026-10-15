@@ -90,15 +90,11 @@ def blend_name():
 
 
 def safe_project_name(text, fallback="game"):
-    """把 .blend 文件名转成安全的项目名。
-
-    Godot 的 project.godot 里 config/name 可以放中文,但**目录名**用中文在
-    跨平台(尤其是 Windows + 命令行工具)时容易出问题,所以统一压成
-    字母数字下划线。中文名会被压成空,这时用回退名。
-    """
-    name = re.sub(r"[^0-9A-Za-z_\-]", "_", text or "").strip("_")
+    """保留文件名中的 Unicode 字母和数字，避免中文项目互相撞名。"""
+    name = "".join(char if char.isalnum() or char in "_-" else "_"
+                   for char in (text or "")).strip("_")
     name = re.sub(r"_{2,}", "_", name)
-    if len(name) < 2 or name.lower() in {"con", "prn", "aux", "nul"}:
+    if not name or re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])", name):
         return fallback
     return name
 

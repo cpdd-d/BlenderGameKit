@@ -311,10 +311,10 @@ def main():
         check("Godot 路径存在", os.path.isfile(found), found)
 
     # ---- 8. 名称安全化 ----
-    check("中文名压成回退名", project.safe_project_name("我的游戏") == "game",
+    check("中文名保留", project.safe_project_name("我的游戏") == "我的游戏",
           project.safe_project_name("我的游戏"))
     check("英文名保留", project.safe_project_name("MyGame") == "MyGame")
-    check("混合名保留英文", project.safe_project_name("角色_Hero") == "Hero",
+    check("混合名完整保留", project.safe_project_name("角色_Hero") == "角色_Hero",
           project.safe_project_name("角色_Hero"))
     check("Windows 保留名被替换",
           project.safe_project_name("con") == "game", project.safe_project_name("con"))

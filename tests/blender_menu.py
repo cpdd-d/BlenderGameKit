@@ -10,6 +10,8 @@
 """
 
 import sys
+import os
+from types import SimpleNamespace
 import traceback
 from importlib import import_module
 
@@ -27,6 +29,10 @@ def check(name, condition, detail=""):
 
 
 def find_addon():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, root)
+    if os.path.isfile(os.path.join(root, "BlenderGameKit", "__init__.py")):
+        return "BlenderGameKit"
     for module in addon_utils.modules():
         if "blender_game_kit" in getattr(module, "__name__", ""):
             return module.__name__
@@ -87,6 +93,7 @@ def main():
 
         def operator(self, idname, text=None, icon=None):
             self.calls.append(("operator", idname, text))
+            return SimpleNamespace()
 
         def row(self, align=False):
             return self
@@ -139,9 +146,22 @@ def main():
     ui._draw_context_menu(holder, _Ctx("GKGameLogicTree"))
     calls = holder.layout.calls
     print(f"    右键条目数: {len(calls)}")
-    check("右键里有搜索入口", _has_operator(calls, "gk.find_node"), str(calls))
-    check("右键里有最近使用", expected_recent in {
-        c[1] for c in calls if isinstance(c, tuple) and c[0] == "menu"}, str(calls))
+    # 2026-10-04 起,搜索 / 最近使用收进了顶部的『搜索与常用』子菜单
+    # (右键菜单收成"一项置顶 + 分类平铺")—— 断言分两步:顶层有那个
+    # 子菜单;子菜单里有搜索入口和最近使用。
+    check("右键里有『搜索与常用』子菜单",
+          _has_menu(calls, ui._menu_name("搜索与常用")), str(calls))
+    top_holder = _Holder()
+    ui._make_top_menu().draw(top_holder, _Ctx("GKGameLogicTree"))
+    top_calls = top_holder.layout.calls
+    check("右键顶层有搜索入口",
+          _has_operator(calls, "gk.find_node"), str(calls))
+    categories = props_mod.node_menu_entries("GKGameLogicTree")
+    check("游戏逻辑分类压缩到十项", len(categories) == 10, str(categories))
+    check("菜单标识没有碰撞", len({cls.bl_idname for cls in ui.CATEGORY_MENUS})
+          == len(ui.CATEGORY_MENUS))
+    check("『搜索与常用』里有最近使用",
+          _has_menu(top_calls, expected_recent), str(top_calls))
     check("右键里有分类入口",
           any(isinstance(c, tuple) and c[0] == "menu" for c in calls), str(calls))
 

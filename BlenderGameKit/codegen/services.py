@@ -2,11 +2,13 @@
 
 from ..nodes.node_base import TARGET_SELF, gd_node_path, gd_string, snake_case
 from ..nodes import nodes as node_lib
+from .. import sound_assets
 
 from .literals import gd_literal, gd_number
 from .registry import (STMT_HANDLERS, _chain, _next_nodes, expr_node,
-                       stmt_node)
+                       multi_output, stmt_node)
 from .statements import _tunable_number
+from .graph import position_key
 
 
 
@@ -14,6 +16,30 @@ from .statements import _tunable_number
 # ==========================================================================
 # 音效
 # ==========================================================================
+def _audio_clip_expr(ctx, node, socket_name="音频路径"):
+    """音效类节点的『音频路径』-> 脚本里的表达式。
+
+    ── 本地素材在这里"换名字"(第一百一十一轮)──────────────────────
+    路径填的是磁盘文件时,导出会把它复制进工程的 `audio/`(见
+    `sound_assets.resolve_clip` 与 exporter 的收集);脚本里必须写
+    **复制后**的那个 res:// 名字,否则运行起来找不到文件。
+    引脚被**连线**时路径是运行时才算出来的,导出侧管不了 —— 原样返回,
+    用户自己保证文件在工程里。
+    """
+    socket = ctx._socket(node, socket_name)
+    if socket is not None and getattr(socket, "is_linked", False):
+        return ctx.expr_of(socket)
+    # ⚠ 先读 `gk_path` 属性,再退回引脚默认值:『惊吓_事件』的『音效』
+    #   引脚**没有** gk_input_props 映射(它只有属性),直接问 input_value
+    #   会拿到空串 —— 于是本地路径的原样改写反而把路径丢了(离线测试抓到的)。
+    raw = str(getattr(node, "gk_path", "") or "")
+    if not raw:
+        value = node.input_value(ctx, socket_name, None)
+        raw = value if isinstance(value, str) else ""
+    script_path, _local = sound_assets.resolve_clip(raw)
+    return gd_string(script_path)
+
+
 def _audio_player_type(node):
     """2D 还是普通音频播放器。3D 项目里用户会取消勾选『2D 音效』。"""
     return "AudioStreamPlayer2D" if getattr(node, "gk_2d", True) else "AudioStreamPlayer"
@@ -71,7 +97,7 @@ def _stmt_play_sound(ctx, node, indent):
     (名字 -> 播放器),用『音效_停止』填同一个名字来停;
     同名再播一次会先停掉旧的,不会越叠越多。
     """
-    path = ctx.input_string(node, "音频路径", "")
+    path = _audio_clip_expr(ctx, node)
     volume = _tunable_number(ctx, node, "音量", "0.0", "sfx_volume")
     pitch = _tunable_number(ctx, node, "音高", "1.0", "sfx_pitch")
     player_type = _audio_player_type(node)
@@ -116,7 +142,7 @@ def _stmt_play_sound(ctx, node, indent):
 @stmt_node("GKNodePlayMusic")
 def _stmt_play_music(ctx, node, indent):
     """背景音乐:只保留一个播放器，切曲目时先停旧的。"""
-    path = ctx.input_string(node, "音频路径", "")
+    path = _audio_clip_expr(ctx, node)
     volume = gd_number(getattr(node, "gk_volume", -6.0))
     fade = gd_number(getattr(node, "gk_fade", 0.5))
     loop = bool(getattr(node, "gk_loop", True))
@@ -295,6 +321,8 @@ def _stmt_heartbeat(ctx, node, indent):
         ctx.warn("『氛围_心跳』没填『心跳音效』—— 它不会发出声音"
                  "(可以先不填,等有素材了再补)")
         return
+    # 本地素材导出时会复制进 audio/ —— 脚本里写复制后的 res:// 名字
+    path_raw = sound_assets.resolve_clip(path_raw)[0]
 
     player = ctx.declare_var("_gk_heart_player", "AudioStreamPlayer")
     timer = ctx.declare_var("_gk_heart_timer", "float")
@@ -375,7 +403,8 @@ def _stmt_scare(ctx, node, indent):
     path_raw = str(getattr(node, "gk_path", "") or "").strip()
     if not linked and not path_raw:
         return
-    path = ctx.expr_of(socket) if linked else gd_string(path_raw)
+    path = (ctx.expr_of(socket) if linked
+            else _audio_clip_expr(ctx, node, "音效"))
     volume = _tunable_number(ctx, node, "音量",
                              gd_number(getattr(node, "gk_volume", 0.0)), "scare_volume")
     stream = ctx.new_temp("scare_stream")
@@ -737,6 +766,41 @@ def _ui_place(ctx, indent, widget, node, def_x, def_y, size_mode="keep"):
                  f"Control.{UI_ALIGN_PRESETS[align]}, {mode}, {margin})")
 
 
+# ── 『过场类』控件的组名(第一百二十六轮:P1「暂停菜单被旧界面压住」)────
+# 用户原话:"有时点快了,就会有这样的情况,那么在如ESC菜单出现时就立刻隐藏
+# 旧的界面,或者添加模糊背景" —— 配图是章节卡「第一章:门厅」压在暂停面板上。
+#
+# 所以"哪些控件要被暂停菜单让位"这件事**只在生成器里定一次**:建控件时按
+# 这个组名挂进 Godot 组,暂停时 `_gk_apply_pause` 按组整批收起来(见
+# generator._emit_pause_helpers 里的 `_gk_hide_transient`)。
+#
+# 为什么不按名字硬编码("章节卡" / "字幕"):控件的**名字是用户起的**,
+# 中文名更是随便改;按名字写死在生成器里,换个工程就失效。
+UI_TRANSIENT_GROUP = "gk_ui_transient"
+
+
+def _ui_looks_transient(node):
+    """没勾『过场界面』时的**自动判定**:直接挂在屏幕正中的文字算过场。
+
+    判据只取结构事实,不取控件名字(用户随便起,中文名尤其):
+      * 是**文字**节点 —— 进度条 / 按钮 / 面板即便居中,也多半是玩家要
+        操作的东西(主菜单按钮、暂停面板本身),收起来反而害人;
+      * 『对齐』不是左上 —— 居中的大字才和大字号暂停面板抢同一块位置;
+      * **没填『父控件』** —— 挂在面板里的居中文字是那块面板的**标题**,
+        面板自己会被暂停菜单让位,标题跟着让位就变成"暂停面板没有标题"
+        (实测:暂停菜单的『暂停标题』是 TOP_CENTER 且挂在面板下,这一条
+         不加就把它也收起来了)。
+
+    ⚠ 老图**行为不变**:没勾『过场界面』又没居中的控件一个字都不多生成,
+      自动判定只是让"本来就该让位的居中大字"不必再去手动勾一次。
+    """
+    if getattr(node, "bl_idname", "") not in ("GKNodeUiText", "GKNodeUiSubtitle"):
+        return False
+    if str(getattr(node, "gk_parent_widget", "") or "").strip():
+        return False
+    return str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT") != "TOP_LEFT"
+
+
 def _ui_add_to(ctx, indent, widget, node, root, after=None):
     """把控件挂到父亲下面 —— 『父控件』留空 = 直接挂界面根。
 
@@ -758,6 +822,18 @@ def _ui_add_to(ctx, indent, widget, node, root, after=None):
     if group:
         ctx.add_line(indent,
                      f"{widget}.add_to_group({gd_string('gk_ui_mutex_' + group)})")
+    # ── 过场类控件:挂进 `gk_ui_transient` 组(第一百二十六轮)──────────
+    # 见 UI_TRANSIENT_GROUP 的说明。两个来源:
+    #   ① 用户/生成脚本在控件卡上显式勾了『过场界面』;
+    #   ② 悬在屏幕正中的文字**默认**算过场(章节卡「第一章:门厅」、
+    #      中央提示) —— 它和大字号的暂停面板抢的是同一块位置,叠起来就是
+    #      用户截图里那团糊字。角落里的 HUD(目标 / 钥匙 / 电量 / 按键提示)
+    #      是玩家暂停时**仍该看到**的,一个都不能进这个组。
+    # 用『对齐』而不是控件名字判断,是因为名字由用户随便起(中文名尤其),
+    # 写死名字换个工程就失效;而"挂屏幕正中"这个几何事实是稳的。
+    if bool(getattr(node, "gk_transient", False)) or _ui_looks_transient(node):
+        ctx.need_transient_helper = True
+        ctx.add_line(indent, f"{widget}.add_to_group({gd_string(UI_TRANSIENT_GROUP)})")
     after = list(after or [])
     parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
     if not parent_name:
@@ -1116,7 +1192,11 @@ def _stmt_ui_panel(ctx, node, indent):
     if close_outside:
         ctx.add_line(indent + 1,
                      f"{widget}.add_to_group(\"gk_ui_close_outside\")")
-        ctx.register_input_handler("gk_ui_close_outside_input", reset=False, body=[
+        # 暂停期间**照跑**(during_pause=True):它服务的是面板自己 ——
+        # 点面板外面把它收起来。暂停菜单 / 设置页恰恰就是弹在暂停树里的,
+        # 停掉它等于"菜单点外面关不掉"(Esc 之外没有第二条退路)。
+        ctx.register_input_handler("gk_ui_close_outside_input", reset=False,
+                                   during_pause=True, body=[
             "    if not (event is InputEventMouseButton):",
             "        return",
             "    var click := event as InputEventMouseButton",
@@ -1238,6 +1318,17 @@ def _stmt_ui_pause(ctx, node, indent):
         # 菜单卡上填了『互斥组』的话,同组的面板一起收起来(见 _gk_ui_raise)。
         ctx.need_raise_helper = True
         ctx._pause_menu_raise = True
+        # 第一百二十六轮(P1:章节卡压在暂停面板上,用户原话"ESC菜单出现时
+        # 就立刻隐藏旧的界面,或者添加模糊背景"):
+        #   * `_pause_transient` —— 弹菜单时按组收起过场控件、恢复时原样还回去;
+        #   * `_pause_dim`       —— 主界面里那块压暗底(半透明黑)要跟着显隐。
+        # 两个都只在**真填了菜单控件**时才要:没菜单就没有"压在菜单上的旧界面"
+        # 这回事,生成了也是死代码。
+        ctx._pause_transient = True
+        if getattr(ctx, "is_main_ui", False):
+            # 压暗底是主界面自己的东西(菜单住在主界面的 CanvasLayer 里)——
+            # 只有生成主界面那份脚本时才需要这块底色。
+            ctx.need_pause_dim = True
     action = "true" if paused else "false"
     mouse_literal = "true" if mouse else "false"
     ctx.add_line(indent, f"_gk_apply_pause({action}, {gd_string(menu)}, {mouse_literal})")
@@ -1353,8 +1444,12 @@ def _stmt_ui_dialog(ctx, node, indent):
     # (第六十四轮统一到 _declare_dialog_runtime —— 字幕、历史也要用其中几个,
     #  分开声明会漏,漏了就是"变量没声明"的 Parse Error)。
     _declare_dialog_runtime(ctx)
+    # 暂停期间**照跑**(during_pause=True):对话框本身就是"在暂停树上等
+    # 玩家点一下"的(宿主脚本设 ALWAYS 就是为了它,见 generator.generate
+    # 里那段说明)。设成 False 的话"暂停里弹的对白"永远等不到输入 ——
+    # 那不是少个功能,是**卡死**(while await 一直转)。
     ctx.register_input_handler(
-        "gk_dialog_input_event", reset=False, body=[
+        "gk_dialog_input_event", reset=False, during_pause=True, body=[
             "    if _gk_dialog_panel == null or not _gk_dialog_panel.visible:",
             "        return",
             "    if event is InputEventMouseButton and event.pressed "
@@ -1449,7 +1544,11 @@ def _stmt_dialog_history(ctx, node, indent):
         ctx.need_dialog_helpers = True
     # 点按采集要在**节点遍历阶段**登记(见 _stmt_ui_dialog 的说明:
     # `_input` 的派发行比辅助函数先拼好)
-    ctx.register_input_handler("gk_history_input_event", reset=False, body=[
+    # 暂停期间**照跑**(during_pause=True):和对话框同一条命 ——
+    # 历史面板也是 `while await` 等玩家看完再继续;暂停里翻回顾面板时
+    # 停掉它,玩家就永远关不掉那块面板。
+    ctx.register_input_handler("gk_history_input_event", reset=False,
+                               during_pause=True, body=[
         "    if _gk_history_panel == null or not _gk_history_panel.visible:",
         "        return",
         "    if event is InputEventMouseButton and event.pressed "
@@ -1533,7 +1632,11 @@ def _stmt_ui_choice(ctx, node, indent):
     ctx.declare_var("_gk_choice_question", "Label")
     ctx.declare_var("_gk_choice_box", "VBoxContainer")
     ctx.declare_var("_gk_choice_picked", "int", initial="-1")
-    ctx.register_input_handler("gk_choice_input_event", reset=False, body=[
+    # 暂停期间**照跑**(during_pause=True):『对话_选择』也是在暂停树上
+    # 等按钮 / 数字键的(`while _gk_choice_picked < 0: await`),而且选择框
+    # 本来就是配暂停用的 —— 停掉它就等于"选了界面点不动、剧情卡住"。
+    ctx.register_input_handler("gk_choice_input_event", reset=False,
+                               during_pause=True, body=[
         "    if _gk_choice_panel == null or not _gk_choice_panel.visible:",
         "        return",
         "    if not (event is InputEventKey) or not event.pressed or event.echo:",
@@ -2461,9 +2564,115 @@ def _register_ui_design_tree(ctx, tree):
         trees.append(tree)
 
 
+def _design_behavior_roots(tree):
+    """设计图里的"顶层行为"语句(第一百一十二轮)。
+
+    判据:**没有任何连线指向它**的语句节点 —— 界面的自带行为。
+    摆进设计图的『界面_按钮点击』『界面_暂停游戏』『界面_设置』这些,
+    没有从别处接进来 = 界面建好后执行一次(热键挂上、按钮接上、
+    初始显隐设好…)。
+
+    ── 为什么不是"看『执行』入线"──
+    按钮卡上的『点击』出口、滑块『变了』出口这些**信号链**是另一回事:
+    从按钮连出去的那串节点有连线指向它(来自按钮的信号出口),会自动
+    被排除在"顶层"之外 —— 它们由各自信号的回调负责执行。
+    只看『执行』入线的话,信号链的第一个节点也会被当成顶层,执行两遍。
+
+    排序按画布位置(y 再 x)—— 和事件/语句的次序规矩一致:图上排在上面的
+    先执行,用户能摆布顺序。
+    """
+    builders = _ui_builder_idnames()
+    targeted = set()
+    for link in (getattr(tree, "links", ()) or ()):
+        to_node = getattr(link, "to_node", None)
+        if to_node is not None:
+            targeted.add(str(getattr(to_node, "name", "")))
+    roots = []
+    for node in (getattr(tree, "nodes", ()) or ()):
+        bl_idname = getattr(node, "bl_idname", "")
+        if bl_idname in builders:
+            continue                       # 控件由构建器单独发射(排过序)
+        if bl_idname not in STMT_HANDLERS:
+            continue                       # 取值节点 / 备注没有"执行"语义
+        if getattr(node, "gk_is_comment", False):
+            continue
+        if str(getattr(node, "name", "")) in targeted:
+            continue
+        roots.append(node)
+    roots.sort(key=position_key)
+    return roots
+
+
+def _emit_design_into(ctx, tree, indent):
+    """把一张设计图**实例化**进当前脚本:控件 + 界面自带的行为。
+
+    ── 行为是什么、从哪来(第一百一十二轮)───────────────────────────
+    用户:"把在游戏逻辑里的界面逻辑搬进游戏界面"。于是设计图不只管
+    "长什么样":图里那些没有从别处接进来的语句(见 `_design_behavior_roots`)
+    会在**这个界面的上下文里**执行一次 ——
+      * 『界面_套用设计』把它建出来时:行为跟着这段执行(单关界面);
+      * 『主界面』(勾了 gk_main_ui 的那张)由导出的 autoload 建出来时:
+        行为在全局执行一次(所以 Esc 暂停这类"每关都要有"的放它)。
+    按钮『点击』/ 滑块『变了』出口仍然是回调(信号链,不是顶层)。
+
+    ── 链也要走(第一百一十二轮补,冒烟抓到的)────────────────────────
+    图里"控件_完成 → 下一个节点"这种**执行链**和玩法图里是同一个语义:
+    建完这个接着往下。以前 apply 只逐个调构建器、不走链 —— 因为链都画在
+    玩法图里,由**那边**的遍历器走;链搬进设计图之后这里必须自己走,
+    否则"滑块_完成 → 皮肤 → 暂停热键"整整一截静默消失(冒烟实测:
+    Theme 一个都没生成)。
+
+    ⚠ 老图零变化:老设计图里一个行为节点、一条链都没有 -> 这里只发射
+    控件,生成的代码和以前**逐字一样**(有测试钉着)。
+    """
+    widgets = _ui_design_nodes(tree)
+    _register_ui_design_tree(ctx, tree)
+    builders = _ui_builder_idnames()
+    visited = set()
+
+    def _visit(node):
+        key = str(getattr(node, "name", ""))
+        if key in visited:
+            return
+        visited.add(key)
+        if getattr(node, "bl_idname", "") in builders:
+            handler = STMT_HANDLERS.get(getattr(node, "bl_idname", ""))
+            if handler is not None:
+                handler(ctx, node, indent)
+            # 控件的『完成』接的东西接着执行(链语义,和玩法图一致)
+            _chain(ctx, node, indent, "完成")
+        else:
+            ctx.emit_statement(node, indent)
+
+    # 外层执行栈要**保住**:『界面_按钮』的发射器生成点击回调时会
+    # `_active.clear()`(那边是故意"换一个执行上下文"),不还原的话
+    # 外层链路的回路保护就没了。
+    saved_active = set(ctx._active)
+    # ① 控件:父先子后(布局约定就靠这个顺序),顺链走
+    for widget in _ui_design_order(widgets):
+        ctx._active.clear()
+        _visit(widget)
+    ctx._active.clear()
+    ctx._active.update(saved_active)
+    # ---- 界面自带的行为 ----
+    stack = getattr(ctx, "_gk_design_stack", None)
+    if stack is None:
+        stack = []
+        ctx._gk_design_stack = stack
+    for node in _design_behavior_roots(tree):
+        if getattr(node, "bl_idname", "") == "GKNodeUiApplyDesign":
+            # 设计图里嵌『套用设计』= 套娃。菜单里放不进来,手滑连脚本
+            # 也摆得进 —— 这里挡掉并说清楚,别让它无限递归。
+            ctx.warn("设计图里不能放『界面_套用设计』(会无限套娃)—— "
+                     "这个节点被跳过了;要在别的图里用它,去玩法图")
+            continue
+        ctx._active.clear()
+        _visit(node)
+
+
 @stmt_node("GKNodeUiApplyDesign")
 def _stmt_ui_apply_design(ctx, node, indent):
-    """『界面_套用设计』:把设计图里摆好的控件一次性建出来。"""
+    """『界面_套用设计』:把设计图里摆好的控件(和自带行为)一次性建出来。"""
     raw = str(getattr(node, "gk_design", "") or "").strip()
     tree = node_lib.find_ui_design_tree(raw)
     if tree is None:
@@ -2472,22 +2681,51 @@ def _stmt_ui_apply_design(ctx, node, indent):
                  f"『游戏界面』面板里点『打开/新建界面设计图』建一张")
         return
     widgets = _ui_design_nodes(tree)
-    if not widgets:
+    if not widgets and not _design_behavior_roots(tree):
         ctx.warn(f"设计图『{tree.name}』里没有控件(文本 / 按钮 / 面板 / 列表…),"
                  f"这一句什么都不会建 —— 切到『游戏界面』那张图摆几个控件")
         return
-    _register_ui_design_tree(ctx, tree)
-    # 外层执行栈要**保住**:『界面_按钮』的发射器生成点击回调时会
-    # `_active.clear()`(那边是故意"换一个执行上下文"),不还原的话
-    # 外层链路的回路保护就没了。
-    saved_active = set(ctx._active)
-    for widget in _ui_design_order(widgets):
-        handler = STMT_HANDLERS.get(getattr(widget, "bl_idname", ""))
-        if handler is None:                               # pragma: no cover
-            continue
-        handler(ctx, widget, indent)
-    ctx._active.clear()
-    ctx._active.update(saved_active)
+    # 递归守卫:同一个设计图套自己(直接 / 间接)时只发一次
+    stack = getattr(ctx, "_gk_design_stack", None)
+    if stack is None:
+        stack = []
+        ctx._gk_design_stack = stack
+    if any(item is tree for item in stack):
+        ctx.warn(f"设计图『{tree.name}』套用了自己(循环),这一句被跳过了")
+        return
+    stack.append(tree)
+    try:
+        _emit_design_into(ctx, tree, indent)
+    finally:
+        stack.pop()
+    # 把"这张图自带行为"讲给导出报告 —— 用户切到设计图里看不见执行顺序,
+    # 报告里点一句"会在套用这里一并执行",排查时少走一步。
+    roots = _design_behavior_roots(tree)
+    if roots:
+        ctx.note(f"设计图『{tree.name}』自带 {len(roots)} 条界面行为"
+                 f"(界面的按钮点击 / 热键…),会在这里一并执行")
+
+
+@stmt_node("GKNodeUiMain")
+def _stmt_ui_main(ctx, node, indent):
+    """『界面_主界面』:显示 / 收起跨场景常驻的主界面(第一百一十二轮)。
+
+    找的是导出的 autoload(`/root/` + `MAIN_UI_AUTOLOAD`,见 asset_export
+    写的那份 gk_main_ui.gd)。没有主界面时运行期警告一次并跳过 ——
+    玩法图里这个节点是"接口",不该因为没有主界面而让整段脚本报错
+    (Godot 里找不到节点会直接中断,那种错误很难往"界面没勾主界面"上想)。
+    """
+    show = ctx.input_bool_expr(node, "显示", "true")
+    var = ctx.new_temp("main_ui")
+    ctx.add_line(indent,
+                 f'var {var}: Node = get_node_or_null("/root/'
+                 f'{node_lib.MAIN_UI_AUTOLOAD}")')
+    ctx.add_line(indent, f"if {var} != null:")
+    ctx.add_line(indent + 1, f"{var}.show_main({show})")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1,
+                 'push_warning("没有主界面 —— 去『游戏界面』面板勾一张'
+                 '『主界面(所有场景常驻)』,重新导出后才会生成它")')
 
 
 def _ui_signal_section(ctx, node, handler, output="点击", signature=None):
@@ -2543,6 +2781,37 @@ def _stmt_ui_on_click(ctx, node, indent):
                  f'push_warning("找不到按钮『{widget_name}』:先确认设计图里摆了'
                  f'它,并且之前已经『界面_套用设计』")')
     _ui_signal_section(ctx, node, handler)
+
+
+@stmt_node("GKNodeUiOnValueChanged")
+def _stmt_ui_on_value_changed(ctx, node, indent):
+    """逻辑图接口:监听设计图滑块的 value_changed 信号。"""
+    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    if not widget_name:
+        ctx.warn(f"『{node.bl_label}』没有填控件名,这一句被跳过了")
+        return
+    ctx.need_ui_helpers = True
+    handler = ctx.declare_func_name(
+        f"gk_on_{snake_case(widget_name, 'value')}_changed",
+        key=node_lib.node_key(node))
+    var = ctx.new_temp("value_widget")
+    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"if {var} != null:")
+    ctx.add_line(indent + 1, "var _range: Range = null")
+    ctx.add_line(indent + 1, f"for _child in {var}.get_children():")
+    ctx.add_line(indent + 2, "if _child is Range:")
+    ctx.add_line(indent + 3, "_range = _child as Range")
+    ctx.add_line(indent + 3, "break")
+    ctx.add_line(indent + 1, "if _range != null and not _range.value_changed.is_connected(" + handler + "):")
+    ctx.add_line(indent + 2, f"_range.value_changed.connect({handler})")
+    _ui_signal_section(ctx, node, handler, output="变了",
+                       signature=f"func {handler}(_value: float) -> void:")
+
+
+@multi_output("GKNodeUiOnValueChanged")
+def _expr_ui_on_value_changed(ctx, node):
+    """值输出只在信号回调内使用,由生成器绑定为当前回调参数。"""
+    return {"值": "_value"}
 
 
 @stmt_node("GKNodeFloatText")

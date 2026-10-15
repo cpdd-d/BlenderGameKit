@@ -1,0 +1,14 @@
+; 第 126 轮 task B:射线 / 触发区语义探针(Godot 4.7.2 真机)
+; 只回答"弹簧臂那条 intersect_ray 认不认 Area3D"和"触发区玩家站不站得住"
+
+config_version=5
+
+[application]
+
+config/name="camclip_ray"
+run/main_scene="res://ray_probe.tscn"
+config/features=PackedStringArray("4.7")
+
+[physics]
+
+common/physics_ticks_per_second=60

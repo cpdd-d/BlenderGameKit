@@ -11,7 +11,7 @@
     ui.py            侧栏面板与菜单
 
 用法:节点编辑器里新建『游戏逻辑』节点树，从『每当_准备』这类事件节点开始
-连线，然后按 N 打开侧栏点『导出为 Godot 脚本』。
+连线，然后按 N 打开侧栏点『导出到 Godot』(脚本 + 模型 + 材质 + 场景一次导完)。
 """
 
 bl_info = {
@@ -51,6 +51,12 @@ _SUBMODULES = (
     "project.scene",
     "project.addon_prefs",
     "project",
+    # 三种线框标记物体(第 122 轮:玩家出生点 / 区域环境点 / 关卡父级)。
+    # 排在这里的理由:它是**纯工具层**(常量 + 从物体上读属性),
+    # properties(加 gk_marker_kind 属性时要用 KINDS)、persistent_player
+    # (找出生点)、asset_export(把标记从导出里剔掉 / 导出成 Area3D)
+    # 三处都要用它,所以必须在它们**之前**。
+    "markers",
     "properties",
     # 预设(一键生成第三人称角色):纯节点/连线逻辑,离线也能 import
     "presets",

@@ -17,6 +17,8 @@
 `generate_result()` 统一摊平成字符串。
 """
 
+import inspect
+
 from ..models import Diagnostic
 
 # 只有 CharacterBody 才有 move_and_slide / is_on_floor。
@@ -138,6 +140,46 @@ def _check_display_switch(tree, warnings):
     ))
 
 
+_SUSPENDING_NODES = {"GKNodeWait", "GKNodeUiDialog", "GKNodeUiChoice"}
+
+
+def _check_suspending_flow_fanout(tree, warnings):
+    """An awaited branch makes sibling execution order difficult to reason about."""
+    for node in getattr(tree, "nodes", ()) or ():
+        for socket in getattr(node, "outputs", ()) or ():
+            if getattr(socket, "bl_idname", "") != "GKSocketFlow":
+                continue
+            links = list(getattr(socket, "links", ()) or ())
+            if len(links) < 2:
+                continue
+            pending = [getattr(link, "to_node", None) for link in links]
+            seen = set()
+            suspends = False
+            while pending:
+                current = pending.pop()
+                if current is None:
+                    continue
+                key = (getattr(current, "as_pointer", lambda: id(current))())
+                if key in seen:
+                    continue
+                seen.add(key)
+                if getattr(current, "bl_idname", "") in _SUSPENDING_NODES:
+                    suspends = True
+                    break
+                for output in getattr(current, "outputs", ()) or ():
+                    if getattr(output, "bl_idname", "") == "GKSocketFlow":
+                        pending.extend(getattr(link, "to_node", None)
+                                       for link in getattr(output, "links", ()) or ())
+            if suspends:
+                name = str(getattr(node, "name", "") or "?")
+                warnings.append(Diagnostic(
+                    level="warning", code="SUSPENDING_FLOW_FANOUT",
+                    message=f"『{name}』的『{socket.name}』连接了多条执行链，其中有等待节点；执行顺序依赖节点位置。",
+                    hint="接一个『序列』节点，用编号出口明确初始化与等待链的顺序；把等待链放在最后。",
+                    node_name=name,
+                ))
+
+
 def required_base_class(tree, options=None):
     """扫一遍节点图,返回 (需要的基类, 为什么) —— 不需要就 (None, "")。
 
@@ -171,7 +213,14 @@ def required_base_class(tree, options=None):
             if need is None:
                 continue
             if callable(need):
-                result = need(dim)
+                # need 回调有两种签名:老的是 `need(dim)`,新的是 `need(dim, node)`
+                # (要看节点属性才能判断的,比如 AI 启用的『作用在谁』)。
+                # 按参数个数挑,别硬塞 —— 硬塞会 TypeError。
+                try:
+                    nparams = len(inspect.signature(need).parameters)
+                except (TypeError, ValueError):
+                    nparams = 1
+                result = need(dim, node) if nparams >= 2 else need(dim)
             else:
                 result = need
             if result:
@@ -194,13 +243,16 @@ _BASE_CLASS_NEEDS = {
                                      else "CharacterBody3D"),
     "GKNodeJump": lambda dim: ("CharacterBody2D" if dim == "2"
                                else "CharacterBody3D"),
-    # ── AI 图(第四十一轮)───────────────────────────────────────────
-    # 『AI_状态』的行为(巡逻 / 追击 / 逃跑…)生成 velocity + move_and_slide;
-    # 『AI_启用』是整张图的入口,同样要求作用物体是角色体 ——
-    # 不先扫出来的话,『AI_启用』的『作用在谁』会被 @onready 成 Node,
-    # 生成完才发现 `.velocity` 不存在,Godot 直接拒绝整个脚本。
-    "GKNodeAiState": lambda dim: ("CharacterBody2D" if dim == "2"
-                                  else "CharacterBody3D"),
-    "GKNodeAiEnable": lambda dim: ("CharacterBody2D" if dim == "2"
-                                   else "CharacterBody3D"),
+    # ── AI 启用(第四十一轮)─────────────────────────────────────────
+    # 第一百二十轮修正:AI 代码操作的是**目标物体**(velocity/move_and_slide
+    # 作用在『作用在谁』上,它自己就是 CharacterBody)。只有『作用在谁』
+    # 留空 / 是宿主自己时,宿主脚本才需要 CharacterBody 能力 ——
+    # 否则(目标是独立怪物)宿主不该被抬成 CharacterBody,否则关卡图挂
+    # 场景根(Node3D)会 extends 对不上节点类型、整个关卡逻辑加载失败。
+    # ⚠ GKNodeAiState 在 AI 树里,不在这张表 —— AI 状态节点只描述行为,
+    #   真正"谁来跑"由『AI_启用』的『作用在谁』决定,不能据此抬宿主基类。
+    "GKNodeAiEnable": lambda dim, node: (
+        ("CharacterBody2D" if dim == "2" else "CharacterBody3D")
+        if str(getattr(node, "gk_target", "") or "") in ("", "__self__")
+        else None),
 }

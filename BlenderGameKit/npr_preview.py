@@ -885,6 +885,23 @@ def has_param(material, name):
             or material.get(name) is not None)
 
 
+def has_any_param(material):
+    """材质上有没有**任何一个** NPR 参数(用户调过就算)。
+
+    导出侧用它判断"这个材质要不要走完整导出"(第一百一十三轮):用户只要
+    在侧栏『卡通材质』里动过任何一个风格参数(色阶 / 阴影色 / rim / 高光
+    / 三段明暗…),材质上就会留下对应的自定义属性 —— 这些材质必须走
+    write_npr_material 把调过的值**真正**写进 .tres。以前只看
+    `specular_amount` 一个键,用户只调了明暗分界的话风格就静默丢失。
+    """
+    if material is None:
+        return False
+    for name, _uniform, _kind, _default, _label in PARAM_MAP:
+        if has_param(material, name):
+            return True
+    return False
+
+
 def migrate_keys(material):
     """把材质上旧的**英文键**改成中文键。返回迁移了几个。
 

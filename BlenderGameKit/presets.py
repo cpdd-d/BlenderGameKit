@@ -501,6 +501,7 @@ def create_character_preset(scene, character=None, **overrides):
     # 3) 逻辑树
     logic_tree = bpy.data.node_groups.new(str(params["logic_name"]),
                                          "GKGameLogicTree")
+    logic_tree.gk_scope = "ROLE"
     logic_tree.use_fake_user = True
     notes.append("逻辑树:" + build_logic_tree(logic_tree, params))
 
@@ -517,10 +518,9 @@ def create_character_preset(scene, character=None, **overrides):
         _set("dimension", "3")
         _set("base_class", "CharacterBody3D")
         _set("class_name", str(params["class_name"]))
-        _set("logic_tree", logic_tree.name)
         if params["with_god_camera"]:
             _set("god_camera", True)
-        notes.append("场景设置:3D / CharacterBody3D / 逻辑图 = " + logic_tree.name)
+        notes.append("角色逻辑图 = " + logic_tree.name)
 
     # 5) 物体设置:物理类型 + 挂脚本
     if character is not None:
@@ -528,7 +528,8 @@ def create_character_preset(scene, character=None, **overrides):
         if physics is not None:
             for attr, value in (("enabled", True), ("dimension", "3"),
                                 ("body_type", "CharacterBody3D"),
-                                ("script_target", True)):
+                                ("script_target", True),
+                                ("logic_tree", logic_tree.name)):
                 if hasattr(physics, attr):
                     try:
                         setattr(physics, attr, value)

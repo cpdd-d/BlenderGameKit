@@ -10,6 +10,7 @@ from ..nodes import nodes as node_lib
 
 from .literals import EVENT_PARAM_NAMES, _coerce_text_to_literal, _gd_vector_ctor, gd_literal, gd_node_type, gd_number, gd_vector
 from .registry import EXPR_HANDLERS, STMT_HANDLERS, _chain, expression_for_output
+from .graph import upstream
 
 
 
@@ -60,6 +61,16 @@ class GenContext:
         # 由 Generator.generate 按 options 覆盖 —— 『移动_寻路』靠它决定
         # "绕路走"还是"退化成直线走"(没烤网格时不该站着不动)。
         self.nav_enabled = bool(self.options.get("nav_enabled", False))
+        # ── AI 视线遮挡(第一百二十六轮:用户第 1 条"AI 遮挡射线")──────────
+        # 『AI_看得见』生成的 `_gk_ai_can_see_3d` 要不要多打一条遮挡射线
+        # (被墙挡住就判看不见)。由 exporter 从场景设置
+        # `gk_settings.ai_sight_occluded` 塞进 options。
+        #
+        # ⚠ 这里的兜底是 **True**(和 nav_enabled 的 False 不同),因为
+        #   用户的诉求就是"要能挡"、属性默认也是开。**不勾**这个设置的
+        #   工程走 options 里的 False,生成结果逐字不变。
+        self.ai_sight_occluded = bool(
+            self.options.get("ai_sight_occluded", True))
 
         self.signals = []          # 要声明的 signal 名
         self.vars = {}             # 变量名 -> 类型
@@ -248,6 +259,24 @@ class GenContext:
         # 『界面_隐藏控件』勾了『置顶』:生成 `_gk_ui_raise()`
         # (挪到最上层 + 收起同互斥组的其他面板)
         self.need_raise_helper = False
+        # ── 暂停菜单的"过场界面让位"三件套(第一百二十六轮)────────────
+        # 用户原话:"有时点快了……在如ESC菜单出现时就立刻隐藏旧的界面,
+        # 或者添加模糊背景" —— 配图是章节卡压在暂停面板上。
+        #   * need_transient_helper —— 生成 `_gk_hide_transient()`:
+        #     按 `gk_ui_transient` 组收起过场控件(章节卡 / 居中提示 …),
+        #     恢复时**原样还原**(暂停前就藏着的,继续游戏后仍然是藏着的);
+        #   * need_pause_dim —— 主界面里生成那块全屏压暗底 `_gk_pause_dim`
+        #     (Godot 4 里"半透明黑"最省:一个 ColorRect,不写着色器、
+        #      不复制后备缓冲;模糊留着以后真需要再说);
+        #   * _pause_transient —— 『界面_暂停游戏』**填了菜单控件**才算:
+        #     没菜单就不会有"旧界面压住菜单"这回事。
+        self.need_transient_helper = False
+        self.need_pause_dim = False
+        self._pause_transient = False
+        # `_gk_hide_transient()` 的还原账本([暂停前各自可不可见])在生成
+        # 那个函数时才声明变量 —— 见 generator 里 `need_transient_helper`
+        # 那一段,那里是按"声明顺序 = 生成顺序"拼脚本的,提前在这里声明
+        # 会把它排到所有别的变量前面(顺序会漂)。
         # 面板勾了『打开时首焦点』(第一百零五轮):生成 `_gk_ui_focus_first()`
         # (显示时按"上->下、左->右"把能聚焦的控件串一条链,焦点给第一个)
         self.need_focus_first_helper = False
@@ -260,7 +289,10 @@ class GenContext:
         self.need_screen_vignette = False
         # 触屏拖动需要往 _input 里挂事件累积逻辑
         self.need_touch_drag = False
-        self._input_handlers = []   # [(函数名, 松手是否清零)]
+        # [(函数名, 松手是否清零, 函数体, 暂停期间是否还跑)]
+        # 最后一项见 register_input_handler 的说明:本脚本可能是
+        # PROCESS_MODE_ALWAYS,`_input` 在暂停期间照跑,必须逐个处理器把关。
+        self._input_handlers = []
         # 节点图自己"生出来"的函数(比如按钮的点击回调)。
         # 它们不属于事件，需要在 generate() 里单独拼进最终脚本。
         self.extra_sections = []
@@ -760,7 +792,8 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         self._func_owners[name] = key
         return name
 
-    def register_input_handler(self, func_name, reset=False, body=None):
+    def register_input_handler(self, func_name, reset=False, body=None,
+                               during_pause=False):
         """登记一个要挂进 `_input(event)` 的回调。
 
         ── 为什么要 `body`(踩过的坑,2026-10-03)──────────────────────
@@ -772,8 +805,22 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             Parse Error: Function "_gk_mouse_wheel_event" has the same
             name as a previously declared function.
         现在函数体跟着登记一起带过来,发射时照抄,谁登记的谁的体。
+
+        ── 为什么要 `during_pause`(用户实测 bug,2026-10-13)──────────
+        图里用到暂停 / 对话框 / 选择时,本脚本的 `_ready` 会被设成
+        `process_mode = Node.PROCESS_MODE_ALWAYS`(见 generator.generate
+        里那段说明)—— 那是"暂停之后还能读 Esc 解冻 / 暂停里还能点对白"
+        的唯一活口。代价是**整个 `_input(event)` 在暂停期间照跑**:
+        『鼠标_移动量』这类累积型处理器会把暂停期间的鼠标位移照攒不误
+        (用户实测:"在暂停游戏后鼠标还存在控制视角旋转的BUG")。
+        所以每个处理器登记时必须自报"暂停期间还跑不跑":
+          * `False`(默认)= 角色玩法输入(视角 / 滚轮 / 触屏),暂停即失效;
+          * `True` = 暂停界面自己的交互(点外面关面板 / 对话框 / 历史 /
+            选择)与上帝机那一族(时停里还要能转视角)。
+        发射时按这一项分两组,见 generator.generate() 里 `_input` 那段。
         """
-        entry = (func_name, bool(reset), list(body or []))
+        entry = (func_name, bool(reset), list(body or []),
+                 bool(during_pause))
         if entry not in self._input_handlers:
             self._input_handlers.append(entry)
         return func_name
@@ -791,7 +838,10 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             return "null"
         link = None
         if getattr(socket, "is_linked", False):
-            link = next(iter(socket.links), None)
+            try:
+                link = upstream(socket)
+            except ValueError as exc:
+                raise CodegenAbort(str(exc)) from exc
         if link is not None:
             # 关键:把**上游输出引脚的名字**传给表达式求值，
             # 多输出节点(向量拆分)才能定位到正确的分量
@@ -991,7 +1041,10 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         """判断上游给的是标量还是向量。"""
         if not getattr(socket, "is_linked", False):
             return False
-        link = next(iter(socket.links), None)
+        try:
+            link = upstream(socket)
+        except ValueError as exc:
+            raise CodegenAbort(str(exc)) from exc
         if link is None:
             return False
         source = getattr(link, "from_socket", None)
@@ -1072,6 +1125,12 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         raw = getattr(node, prop, TARGET_SELF) or TARGET_SELF
         if raw == TARGET_SELF:
             return "self"
+        if raw.startswith("@"):
+            binding = raw[1:]
+            target = self.options.get("reference_bindings", {}).get(binding)
+            if not target:
+                raise CodegenAbort(f"角色引用『{binding}』未绑定，请在角色物体的『角色引用』里选择场景物体")
+            raw = target
         if node_type:
             return self.add_onready(f"{hint}_{raw}", gd_node_path(raw),
                                     hint=f"type:{node_type}")

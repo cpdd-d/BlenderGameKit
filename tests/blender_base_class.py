@@ -115,6 +115,13 @@ def main():
     print("4. 手选冲突时能报出来")
     print("=" * 72)
     settings.base_class = "StaticBody3D"    # 和 Area3D 节点冲突
+    # 只有脚本实际挂载的节点需要匹配 extends。普通静态地形即使启用碰撞,
+    # 也没有挂角色脚本,不应产生误报警告。
+    box.gk_physics.script_target = False
+    check("未挂脚本的对象不会报警",
+          not props.base_class_mismatches(scene, "3"),
+          str(props.base_class_mismatches(scene, "3")))
+    box.gk_physics.script_target = True
     clashes = props.base_class_mismatches(scene, "3")
     print(f"    检测到 {len(clashes)} 个冲突: {clashes}")
     check("检测到冲突", len(clashes) >= 1, str(clashes))

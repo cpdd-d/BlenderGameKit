@@ -13,6 +13,7 @@
 """
 
 import sys
+import os
 import traceback
 from importlib import import_module
 
@@ -37,6 +38,10 @@ def find_addon():
     for module in addon_utils.modules():
         if "blender_game_kit" in getattr(module, "__name__", ""):
             return module.__name__
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.isfile(os.path.join(root, "BlenderGameKit", "__init__.py")):
+        sys.path.insert(0, root)
+        return "BlenderGameKit"
     return None
 
 
@@ -112,8 +117,19 @@ def main():
     module_name = find_addon()
     if not check("找到插件", module_name, "未安装"):
         return 1
-    addon_utils.enable(module_name, default_set=True, persistent=True)
+    if module_name == "BlenderGameKit":
+        import_module(module_name).register()
+    else:
+        addon_utils.enable(module_name, default_set=True, persistent=True)
     ui = import_module(f"{module_name}.ui")
+    for key in ("more_tools", "project", "tree_list", "logic_ports",
+                "variables", "functions", "groups", "preset_box",
+                "script_carrier", "scene_assets", "world",
+                # 第 122 轮:两块导出盒子并成一块『导出到 Godot』,
+                # 侧栏的『打包设置』也搬进了原生菜单 —— 键跟着换。
+                "export_godot", "export_report",
+                "advisor", "vargroup:", "varrefs:"):
+        ui._OPEN_SECTIONS[key] = True
 
     scene = bpy.context.scene
     for obj in list(scene.objects):
@@ -248,7 +264,7 @@ def main():
             # 碰撞线框那几个按钮第四十二轮搬到『游戏显示』图里了,
             # 物体面板现在常驻的是"再加一份实例"(静态资产)。
             ("GK_PT_ObjectPhysics", cube, ("gk.add_asset_instance",)),
-            ("GK_PT_Main", cube, ("gk.open_godot", "gk.export_assets")),
+            ("GK_PT_Main", cube, ("gk.open_godot", "gk.export_godot")),
             # 观感面板要有开关和还原两个按钮
             ("GK_PT_GodotLook", cube,
              ("gk.match_godot_look", "gk.restore_look", "gk.open_glossary")),
@@ -389,7 +405,7 @@ def main():
               and ("张图" in texts or "还没有节点图" in texts),
               texts[:300])
         check("『逻辑信息』盒子没把侧栏画崩(其它按钮还在)",
-              "gk.export_script" in layout.operator_names,
+              "gk.export_godot" in layout.operator_names,
               str(sorted(set(layout.operator_names)))[:200])
         ui._OPEN_SECTIONS.pop("logic_info", None)
     except Exception as exc:
@@ -526,31 +542,55 @@ def main():
         check("『显示_效果开关』卡片", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
-    # ---- 6c. 『打包设置』盒子(第六十八轮)----
+    # ---- 6c. 『打包游戏(GK)』菜单(第六十八轮建盒 / 第 122 轮搬进原生菜单)----
     #
     # ── 为什么单列 ──────────────────────────────────────────────────
-    # 这个盒子里是 5 个平台开关 + 3 个文本框 + 一个打包按钮,全靠
+    # 这段是 5 个平台开关 + 3 个文本框 + 一个打包按钮,全靠
     # `layout.prop(settings, ...)` 画出来。属性名写错(或者场景设置拿不到)
     # 就是**整块画不出来** —— 冒烟那层只验"打包算子跑得通",看不见画的事。
+    #
+    # ── 第 122 轮为什么从"侧栏盒子"改成"菜单"────────────────────────
+    # 用户原话:"打包设置移动到 blender 原生的导出里"。盒子删了、
+    # 断言的对象换成 `GK_MT_ExportPackage.draw` —— 判据一个字没松:
+    # 平台标签、应用名/版本/包名、打包按钮都必须在**真画一次**里出现。
     print("=" * 72)
-    print("6c. 『打包设置』盒子")
+    print("6c. 『打包游戏(GK)』菜单(文件 → 导出)")
     print("=" * 72)
     try:
-        panel = getattr(ui, "GK_PT_Main", None)
+        menu_class = getattr(ui, "GK_MT_ExportPackage", None)
+        if not check("GK_MT_ExportPackage 存在", menu_class is not None):
+            raise RuntimeError("菜单类找不到")
+        check("GK_MT_ExportPackage 已注册(Blender 认得它)",
+              hasattr(menu_class, "bl_rna"))
         layout = RecordingLayout()
         holder = type("P", (), {"layout": layout})()
-        panel.draw(holder, FakeContext(cube, scene))
+        menu_class.draw(holder, FakeContext(cube, scene))
         names = list(layout.operator_names)
-        check("『打包设置』盒子画出了『开始打包』",
+        check("『打包游戏(GK)』菜单画出了『开始打包』",
               "gk.export_release" in names, str(sorted(set(names))))
         texts = " ".join(str(item) for item in layout.texts)
         labels = [ui.packaging.PLATFORMS[key]["label"]
                   for key in ui.packaging.PLATFORM_ORDER]
-        check("『打包设置』盒子列出了 5 个平台",
+        check("『打包游戏(GK)』菜单列出了 5 个平台",
               all(label in texts for label in labels),
               str([label for label in labels if label not in texts]))
+        # 应用名 / 版本 / 安卓包名三个文本框:draw 是 `prop(settings, 名字)`,
+        # 名字写错在 Blender 里是**静默**跳过(那一行直接不见)。
+        prop_names = [call for call in layout.calls if call == "prop"]
+        check("『打包游戏(GK)』菜单画了参数行(应用名/版本/包名)",
+              len(prop_names) >= 8,
+              f"prop 调用 {len(prop_names)} 次(5 平台 + 3 参数 = 8)")
+        # 侧栏那一块必须**真的没了** —— 否则用户会在两处看到打包设置
+        check("侧栏不再出现『打包设置』盒子",
+              not hasattr(ui, "_draw_packaging_box"))
+        # 钩子挂在原生的 文件 → 导出 上(append,不能把官方导出项顶掉)
+        hooked = [func for func in (ui._menu_draw_funcs(
+            __import__("bpy").types.TOPBAR_MT_file_export) or [])
+            if getattr(func, ui._GK_MENU_HOOK, False)]
+        check("文件 → 导出 挂上了本插件的子菜单", len(hooked) == 1,
+              f"带标记的回调 {len(hooked)} 个")
     except Exception as exc:
-        check("『打包设置』盒子", False, f"{type(exc).__name__}: {exc}")
+        check("『打包游戏(GK)』菜单", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 6d. 『变量』『函数』两块的新判据(第八十九轮:I 组 27)----
@@ -883,9 +923,9 @@ def main():
             texts = " ".join(str(item) for item in layout.texts)
             check("界面面板:画出了『拖动摆放控件』按钮",
                   "gk.ui_drag_widget" in ops_drawn, str(ops_drawn))
-            check("界面面板:『从 0 到 1』五步引导都在",
+            check("界面面板:『从 0 到 1』引导都在",
                   "从 0 到 1" in texts and "① 定屏幕" in texts
-                  and "⑤ 验收" in texts, texts[:260])
+                  and "⑥ 验收" in texts, texts[:260])
             check("界面面板:控件清单还在(父 → 子)",
                   "面板冒烟标题" in texts, texts[:260])
         bpy.data.node_groups.remove(design)
@@ -902,7 +942,10 @@ def main():
     print("6i. 『界面_面板』卡片(挡住点击 / 点外面关 / 首焦点)")
     print("=" * 72)
     try:
-        tree = bpy.data.node_groups.new("面板冒烟界面105", "GKGameLogicTree")
+        # 第一百一十二轮:控件构建节点只属于『游戏界面』设计图(一直如此),
+        # 以前这里用 GKGameLogicTree 建,节点根本放不进去(这条断言是坏的);
+        # 顺手改对成设计图。
+        tree = bpy.data.node_groups.new("面板冒烟界面105", "GKUiDesignTree")
         panel_card = tree.nodes.new("GKNodeUiPanel")
         card_error = ""
         try:
@@ -969,7 +1012,9 @@ def main():
     print("6k. 『界面_列表_填充』卡片(每行可点)")
     print("=" * 72)
     try:
-        tree = bpy.data.node_groups.new("面板冒烟列表106", "GKGameLogicTree")
+        # 第一百一十二轮:『界面_列表_填充』是界面行为节点,只属于设计图;
+        # 这里对应用设计树建(以前用 GKGameLogicTree,节点放不进去)。
+        tree = bpy.data.node_groups.new("面板冒烟列表106", "GKUiDesignTree")
         fill_card = tree.nodes.new("GKNodeUiListFill")
         card_error = ""
         try:
@@ -1022,7 +1067,10 @@ def main():
     check(f"面板画的 {len(drawn)} 个按钮都是已注册算子", not bad_ops,
           ", ".join(bad_ops))
 
-    addon_utils.disable(module_name, default_set=True)
+    if module_name == "BlenderGameKit":
+        import_module(module_name).unregister()
+    else:
+        addon_utils.disable(module_name, default_set=True)
     return 0
 
 try:

@@ -34,9 +34,9 @@ from .. import gk_sockets as S
 # **纯取值**(没有执行流、随时求值都安全)的节点整类开放给动画树。
 BOTH_TREES = ("GKGameLogicTree", "GKAnimationTree")
 
-# 界面"控件构建"节点的归属(第四十轮):玩法图里照旧能放(老图一字不变),
-# 另外也能放进『游戏界面』设计图 —— 用户选的"两棵树都能放"。
-UI_TREES = ("GKGameLogicTree", "GKUiDesignTree")
+# 界面控件构建节点只属于『游戏界面』设计图。游戏逻辑树通过
+# 『界面_套用设计』创建它们，并通过运行时控件节点控制和响应。
+UI_TREES = ("GKUiDesignTree",)
 
 
 # ==========================================================================
@@ -265,6 +265,56 @@ def find_ui_design_tree(name=""):
         if wanted and str(getattr(group, "name", "")) == wanted:
             return group
     return first if not wanted else None
+
+
+def main_ui_design_tree():
+    """文件里勾了『主界面』的设计图(没有就 None;勾了多张取**第一张**)。
+
+    ── 『主界面』是什么(第一百一十二轮)────────────────────────────
+    跨场景常驻的那一份界面:导出时单独生成 `scripts/gk_main_ui.gd`
+    并注册成 Godot autoload —— 开局建一次、**切关卡不消失**。
+    所以它同时是"不用每关各画一份重复界面"的落点。
+
+    勾多张时导出侧会告警并只用第一张 —— 两份"常驻主界面"叠在一起
+    没有任何合理语义(取第一张 = 文件里的先后顺序,稳定可预期)。
+    """
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return None
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return None
+    for group in groups:
+        if getattr(group, "bl_idname", "") != "GKUiDesignTree":
+            continue
+        if bool(getattr(group, "gk_main_ui", False)):
+            return group
+    return None
+
+
+def main_ui_design_trees():
+    """勾了『主界面』的全部设计图(导出侧靠它出"勾了多张"的告警)。"""
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return []
+    data = getattr(bpy, "data", None)
+    groups = getattr(data, "node_groups", None)
+    if groups is None:
+        return []
+    return [group for group in groups
+            if getattr(group, "bl_idname", "") == "GKUiDesignTree"
+            and bool(getattr(group, "gk_main_ui", False))]
+
+
+# ── 『主界面』的导出名字(第一百一十二轮,两处必须一致)──────────────
+# 生成侧(codegen 里『界面_主界面』拼 `show_main(...)` 的查找路径)和
+# 导出侧(asset_export 写脚本文件 + 注册 [autoload])都读这里的常量 ——
+# 一边改名另一边忘了,表现是"节点点了没反应",很难查。
+MAIN_UI_AUTOLOAD = "GkMainUi"          # Godot autoload 名 = /root/GkMainUi
+MAIN_UI_SCRIPT = "gk_main_ui.gd"       # 落盘到 scripts/ 的文件名
 
 
 # ==========================================================================
@@ -1377,3 +1427,112 @@ def N(cls):
     """登记节点类并物化它的声明式属性。"""
     CLASSES.append(finalize(cls))
     return cls
+
+# ── 环境预设:内置七项(第一百一十三轮;第 123 轮补二次元三档)────────
+# 值是 Godot 端语义(Color 三元组 / 能量 / 密度),和场景设置卡的
+# env_* 一一对应。bg_mode: 1 = COLOR(纯色), 2 = SKY(程序化天空)。
+#
+# ── 为什么前三个是"卡通二次元"三档(用户实测反馈)──────────────────
+# 用户原话:"现在的环境渲染成了『中世纪』的风格了,但我想要的是卡通二次元"。
+# 病根是**亮部被压暗 + 阴影色调偏土**:暗部一旦掉到棕灰,画面立刻变成
+# 写实奇幻(中世纪酒馆),而二次元要的是"亮部干净、暗部有色相、对比干脆"。
+# 所以这三档的配方和恐怖系**明确分开**:
+#   * `amb_e` 抬到 0.65~0.95(恐怖系只有 0.09~0.22)—— 暗部不许死黑;
+#   * `shadow_tint` 一律**冷色相**(青蓝 / 蓝紫),不许用暖棕 ——
+#     暖棕暗部就是"中世纪"的直接来源;
+#   * `sat` 1.10~1.25、`ct` 1.05~1.12 —— 颜色更艳、明暗边界更硬;
+#   * `br` 1.05 起 —— 高调(high-key),这是动画赛璐璐的曝光习惯;
+#   * `rim` 给一点点(0.12~0.35)—— 轮廓光让角色从背景里"浮"出来,
+#     这是日式动画最标志性的一笔。⚠ 别贪多:rim 在 shader 里是
+#     **EMISSION 加法项**(见第一百一十七轮的标定注释),0.5 以上整关发灰。
+# 恐怖系三项(恐怖夜 / 黄昏 / 浓雾夜)的数值**一个字没动** —— 老工程
+# 与恐怖示例的观感不能因为这次调色而变。
+ENV_PRESET_BUILTINS = {
+    # ── ① 卡通二次元:日间(默认推荐)────────────────────────────────
+    # ── 第 124 轮:改成"接近原神那套"的配方(用户:"可以渲染成原神那样的
+    #    画面吗,现在的画质感觉上不是很好看(二次元视角下)")────────────
+    # 上一版用 SKY 背景 + 环境光 0.90,渲出来**过曝发白**(用户截图里整屏
+    # 米白、明暗层次糊掉)。原神那套的观感其实是三件事:
+    #   * **背景是干净的淡蓝**(不是白)—— 用纯色背景,别用程序化天空
+    #     (天空 + 高环境光会把画面糊成一片白);
+    #   * **环境光适中(0.45~0.6)+ 冷色暗部** —— 亮部留得住、暗部有颜色,
+    #     明暗才是"两段/三段"的赛璐璐,而不是渐变糊;
+    #   * **饱和度 1.2 左右 + 对比 1.08** —— 颜色干净、边界干脆。
+    # 另外"原神感"还有一半在**模型与贴图上**(硬边高光、面部专用着色、
+    # 描边),那些不是这几个数字能给的;预设只能把"光与色"这一段做对。
+    "卡通日间": {
+        "bg_mode": 1, "bg": (0.34, 0.48, 0.72),
+        "amb": (0.68, 0.78, 0.96), "amb_e": 0.50,
+        "fog": False, "fog_c": (0.55, 0.66, 0.85), "fog_d": 0.003,
+        "glow": True, "glow_i": 0.35, "glow_b": 0.03,
+        "adjust": True, "br": 1.02, "ct": 1.08, "sat": 1.22,
+        "shadow_step": 0.06, "shadow_tint": (0.58, 0.66, 0.92),
+        "three_tone": 0.55, "rim": 0.20, "specular": 0.0,
+    },
+    # ── ② 卡通二次元:黄昏(暖光 + 冷影,动画里最常见的"放学后")────
+    "卡通黄昏": {
+        "bg_mode": 1, "bg": (0.62, 0.42, 0.42),
+        "amb": (0.80, 0.62, 0.60), "amb_e": 0.45,
+        "fog": True, "fog_c": (0.72, 0.52, 0.50), "fog_d": 0.008,
+        "glow": True, "glow_i": 0.60, "glow_b": 0.06,
+        "adjust": True, "br": 1.02, "ct": 1.09, "sat": 1.25,
+        "shadow_step": 0.08, "shadow_tint": (0.44, 0.44, 0.82),
+        "three_tone": 0.50, "rim": 0.25, "specular": 0.0,
+    },
+    # ── ③ 卡通二次元:夜晚 / 教室(亮部不脏、暗部偏蓝紫)────────────
+    "卡通夜晚": {
+        "bg_mode": 1, "bg": (0.10, 0.13, 0.26),
+        "amb": (0.46, 0.54, 0.86), "amb_e": 0.42,
+        "fog": True, "fog_c": (0.24, 0.28, 0.48), "fog_d": 0.008,
+        "glow": True, "glow_i": 0.85, "glow_b": 0.07,
+        "adjust": True, "br": 1.03, "ct": 1.08, "sat": 1.22,
+        "shadow_step": 0.10, "shadow_tint": (0.40, 0.42, 0.78),
+        "three_tone": 0.45, "rim": 0.28, "specular": 0.0,
+    },
+    # ── 以下三项是恐怖系(数值不动,老工程观感不变)─────────────────
+    "恐怖夜": {
+        "bg_mode": 1, "bg": (0.015, 0.02, 0.045),
+        "amb": (0.16, 0.20, 0.34), "amb_e": 0.10,
+        "fog": True, "fog_c": (0.09, 0.11, 0.17), "fog_d": 0.055,
+        "glow": True, "glow_i": 0.9, "glow_b": 0.12,
+        "adjust": True, "br": 0.95, "ct": 1.12, "sat": 0.82,
+        "shadow_step": 0.18, "shadow_tint": (0.30, 0.26, 0.48),
+        "three_tone": 0.0, "rim": 0.0, "specular": 0.0,
+    },
+    "明亮白天": {
+        "bg_mode": 2, "bg": (0.55, 0.72, 0.95),
+        "amb": (0.85, 0.88, 0.95), "amb_e": 0.8,
+        "fog": False, "fog_c": (0.75, 0.80, 0.90), "fog_d": 0.005,
+        "glow": False, "glow_i": 0.5, "glow_b": 0.05,
+        "adjust": False, "br": 1.0, "ct": 1.0, "sat": 1.0,
+        "shadow_step": 0.05, "shadow_tint": (0.66, 0.70, 0.90),
+        "three_tone": 0.0, "rim": 0.0, "specular": 0.0,
+    },
+    "黄昏": {
+        "bg_mode": 2, "bg": (0.90, 0.55, 0.30),
+        "amb": (0.85, 0.60, 0.42), "amb_e": 0.45,
+        "fog": True, "fog_c": (0.80, 0.55, 0.38), "fog_d": 0.02,
+        "glow": True, "glow_i": 1.1, "glow_b": 0.15,
+        "adjust": True, "br": 1.0, "ct": 1.05, "sat": 1.10,
+        "shadow_step": 0.10, "shadow_tint": (0.52, 0.32, 0.28),
+        "three_tone": 0.0, "rim": 0.0, "specular": 0.0,
+    },
+    "浓雾夜": {
+        "bg_mode": 1, "bg": (0.04, 0.05, 0.07),
+        "amb": (0.30, 0.33, 0.40), "amb_e": 0.18,
+        "fog": True, "fog_c": (0.13, 0.15, 0.19), "fog_d": 0.12,
+        "glow": False, "glow_i": 0.6, "glow_b": 0.08,
+        "adjust": True, "br": 0.92, "ct": 1.05, "sat": 0.75,
+        "shadow_step": 0.16, "shadow_tint": (0.26, 0.28, 0.34),
+        "three_tone": 0.0, "rim": 0.0, "specular": 0.0,
+    },
+}
+
+# 内置预设名(顺序即下拉顺序;identifier 按它的下标生成)。
+# ⚠ **单一定义源**:properties 的下拉、『环境_应用预设』节点的默认值 /
+#   提示语都从这里取 —— 以前这三处各写一份中文名单,加一档就要改三处,
+#   漏一处就成了"下拉里有、节点说找不到"(第 123 轮收口)。
+ENV_PRESET_NAMES = tuple(ENV_PRESET_BUILTINS.keys())
+# 「卡通二次元」那三档(给 UI 分组显示用)
+ENV_PRESET_ANIME = ("卡通日间", "卡通黄昏", "卡通夜晚")
+ENV_PRESET_HORROR = ("恐怖夜", "明亮白天", "黄昏", "浓雾夜")

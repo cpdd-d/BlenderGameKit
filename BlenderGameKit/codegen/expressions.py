@@ -682,6 +682,18 @@ def _expr_key(ctx, node):
                   or str(getattr(node, "gk_action", "jump")))
     const = ctx.add_action(action, getattr(node, "gk_key", ""))
     trigger = str(getattr(node, "gk_trigger", "PRESSED"))
+    # 修饰键在 Windows 上经常不会以普通 action 状态送到 Godot(尤其当
+    # 鼠标处于 CAPTURED 时)。Alt 是系统级修饰键,直接查物理键状态更可靠;
+    # 输入映射仍然照常写出,这样项目设置和旧图仍可追踪这条动作。
+    raw_key = str(getattr(node, "gk_key", "") or "").upper()
+    if raw_key in {"LEFT_ALT", "RIGHT_ALT", "ALT"}:
+        if trigger == "PRESSED":
+            return "Input.is_key_pressed(KEY_ALT)"
+        # Godot's just-pressed/released edge state remains useful for one-shot
+        # Alt nodes; only the held-state path needs the physical-key fallback.
+        func = {"JUST": "is_action_just_pressed",
+                "RELEASED": "is_action_just_released"}[trigger]
+        return f"Input.{func}({const})"
     func = {
         "PRESSED": "is_action_pressed",
         "JUST": "is_action_just_pressed",
@@ -757,7 +769,13 @@ def _expr_mouse_wheel(ctx, node):
     if handler not in made:
         made.add(handler)
         # 函数体跟着登记一起带过去 —— 见 register_input_handler 的说明
-        ctx.register_input_handler(handler, reset=False, body=[
+        ctx.register_input_handler(handler, reset=False,
+                                   # 暂停期间**不跑**:滚轮在这套图里是玩法
+                                   # 输入(切武器 / 缩放视野那一类)。暂停菜单
+                                   # 自己的滚动由 Godot 的 ScrollContainer
+                                   # 处理,不走这里 —— 挡掉它不会让菜单点不动。
+                                   during_pause=False,
+                                   body=[
             "    if event is InputEventMouseButton and event.pressed:",
             "        if event.button_index == MOUSE_BUTTON_WHEEL_UP:",
             f"            {var} += 1.0",
@@ -839,6 +857,11 @@ def ensure_mouse_delta(ctx):
     ctx.register_input_handler(
         "_gk_mouse_motion_event",
         reset=False,
+        # 暂停期间**不跑**(during_pause=False):这是角色玩法输入 ——
+        # 图里拿它转视角 / 转朝向。用户的实测 bug 正是它:本脚本在用了
+        # 暂停 / 对话节点时是 PROCESS_MODE_ALWAYS,`_input` 暂停期间照跑,
+        # 鼠标位移被一路攒进 `_gk_mouse_delta`(见 register_input_handler)。
+        during_pause=False,
         # 第一行必须自带缩进(踩过:顶格会让 Godot 报
         # "Expected indented block after function declaration")
         body=[
@@ -1295,7 +1318,10 @@ def _expr_touch_drag(ctx, node):
             "        if not (event as InputEventScreenTouch).pressed:",
             "            _gk_touch_drag = Vector2.ZERO",
         ]
-    ctx.register_input_handler(handler, reset=reset, body=body)
+    # 暂停期间**不跑**(during_pause=False):触屏拖动 = 虚拟摇杆那类
+    # 角色玩法输入,暂停了就不该再推着角色走(和鼠标视角同一类)。
+    ctx.register_input_handler(handler, reset=reset, during_pause=False,
+                               body=body)
 
     # 每帧用完就清零。放在 process_hooks 里，会追加到 _process 末尾，
     # 保证"本帧已经读过它"之后才清。
@@ -1304,3 +1330,32 @@ def _expr_touch_drag(ctx, node):
         ctx.process_hooks[hook_key] = [f"{vec_var} = Vector2.ZERO"]
 
     return f"{vec_var}.limit_length({limit}) * {scale}"
+
+
+# ==========================================================================
+# 玩家偏好(跨关卡,第一百一十三轮)—— autoload GkPlayerPrefs
+# ==========================================================================
+@multi_output("GKNodePrefLoad")
+def _expr_pref_load(ctx, node):
+    """『偏好_取回』:读 GkPlayerPrefs 里的值 + 『有没有』(第一次玩没存过)。"""
+    from .literals import gd_string as _gs
+    key = str(getattr(node, "gk_pref_key", "") or "").strip()
+    if not key:
+        ctx.warn("『偏好_取回』没填『键』——永远读到『默认』;"
+                 "填上和『偏好_记住』同一个键")
+        return {"值": "null", "有没有": "false"}
+    ctx.need_player_prefs = True
+    kind = str(getattr(node, "gk_kind", "TEXT") or "TEXT")
+    if kind == "NUMBER":
+        try:
+            default = gd_number(float(getattr(node, "gk_default_number", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            default = gd_number(0.0)
+    elif kind == "BOOL":
+        default = "true" if bool(getattr(node, "gk_default_bool", False)) else "false"
+    else:
+        default = _gs(str(getattr(node, "gk_default_text", "") or ""))
+    return {
+        "值": f"GkPlayerPrefs.get_pref({_gs(key)}, {default})",
+        "有没有": f"GkPlayerPrefs.has_pref({_gs(key)})",
+    }

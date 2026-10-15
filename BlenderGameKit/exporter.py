@@ -61,6 +61,7 @@ def build_settings(scene):
         return settings
 
     settings.update({
+        "reference_bindings": object_reference_bindings(script_target_object(scene), scene),
         "dimension": getattr(props, "dimension", "3"),
         "base_class": resolve_base_class(scene),
         "class_name": getattr(props, "class_name", ""),
@@ -81,6 +82,11 @@ def build_settings(scene):
         # ⚠ 以前这里把 2D 强按成"没勾"—— 现在 2D 也烤导航多边形了,
         #   再按掉的话 2D 场景永远走直线(哪怕 .tscn 里真有导航区)。
         "nav_enabled": bool(getattr(props, "nav_enabled", False)),
+        # ── AI 视线遮挡(第一百二十六轮:用户第 1 条"AI 遮挡射线")──────────
+        # 『AI_看得见』要不要从眼睛往目标打一条射线、被墙挡住就判看不见。
+        # 场景级(和寻路同一个性质:"这一关的墙挡不挡视线"是关卡事实)。
+        # 默认 True = 用户要的"要能挡";关掉则生成结果逐字不变。
+        "ai_sight_occluded": bool(getattr(props, "ai_sight_occluded", True)),
         # ── 导出瘦身开关(第一百零六轮 B)────────────────────────────
         # 场景属性 -> 设置字典。键名统一取"取反后的动作"(`no_*`),
         # 导出侧(asset_export._slim_gltf_kwargs)照它决定要不要关参数。
@@ -122,6 +128,26 @@ def build_settings(scene):
     return settings
 
 
+def object_reference_bindings(obj, scene=None):
+    """Resolve the instance's named references without changing the shared graph."""
+    bindings = getattr(getattr(obj, "gk_physics", None), "logic_bindings", ())
+    result = {}
+    seen = set()
+    for item in bindings:
+        name = item.binding_name.strip()
+        if not name:
+            continue
+        if name in seen:
+            raise codegen.CodegenAbort(f"角色引用『{name}』重复，请使用不同的引用名")
+        seen.add(name)
+        if item.target is None:
+            continue
+        if scene is not None and item.target.name not in scene.objects:
+            raise codegen.CodegenAbort(f"角色引用『{name}』的对象不在当前关卡『{scene.name}』中")
+        result[name] = item.target.name
+    return result
+
+
 def resolve_main_camera(scene):
     """算出"主相机"是谁(用户第 25 轮)。
 
@@ -143,10 +169,40 @@ def resolve_main_camera(scene):
                if getattr(o, "type", "") == "CAMERA"]
     if cameras:
         return cameras[0], f"自动(场景里第一台;共 {len(cameras)} 台)"
+    from .persistent_player import default_player
+    player = default_player()
+    if player is not None:
+        cameras = [o for o in player.children_recursive if o.type == "CAMERA"]
+        if cameras:
+            return cameras[0].name, "世界默认角色的相机"
     return "", "场景里没有相机(运行时造一台自由飞行观察机)"
 
 
-def game_logic_trees():
+def logic_tree_scope(tree):
+    """Classify legacy trees from their bindings until the user chooses a scope."""
+    if getattr(tree, "bl_idname", "") != "GKGameLogicTree":
+        return ""
+    is_set = getattr(tree, "is_property_set", None)
+    if callable(is_set) and is_set("gk_scope"):
+        return str(getattr(tree, "gk_scope", "LEVEL"))
+    try:
+        import bpy
+        scenes = getattr(bpy.data, "scenes", ())
+    except Exception:
+        return "LEVEL"
+    for scene in scenes:
+        if str(getattr(getattr(scene, "gk_settings", None),
+                       "logic_tree", "") or "") == tree.name:
+            return "LEVEL"
+    for scene in scenes:
+        for obj in getattr(scene, "objects", ()):
+            if str(getattr(getattr(obj, "gk_physics", None),
+                           "logic_tree", "") or "") == tree.name:
+                return "ROLE"
+    return "LEVEL"
+
+
+def game_logic_trees(scope=None):
     """整个 .blend 里的『游戏逻辑』节点图,按名字排序。
 
     离线(桩 bpy)环境里拿不到 bpy.data -> 返回空表,由调用方兜底。
@@ -159,7 +215,8 @@ def game_logic_trees():
     if groups is None:
         return []
     return sorted((g for g in groups
-                   if getattr(g, "bl_idname", "") == "GKGameLogicTree"),
+                   if getattr(g, "bl_idname", "") == "GKGameLogicTree"
+                   and (scope is None or logic_tree_scope(g) == scope)),
                   key=lambda g: getattr(g, "name", ""))
 
 
@@ -188,9 +245,11 @@ def resolve_scene_tree(scene):
             return None, "离线环境取不到节点图"
         tree = bpy.data.node_groups.get(wanted)
         if tree is not None and getattr(tree, "bl_idname", "") == "GKGameLogicTree":
+            if logic_tree_scope(tree) == "ROLE":
+                return None, f"『{wanted}』是角色逻辑图，不能作为场景的关卡逻辑图"
             return tree, "场景设置里指定的逻辑图"
         return None, f"场景设置里指定的『{wanted}』不存在(或不是游戏逻辑图)"
-    trees = game_logic_trees()
+    trees = game_logic_trees("LEVEL")
     if len(trees) == 1:
         return trees[0], "只有一棵游戏逻辑图,自动使用"
     if not trees:
@@ -239,6 +298,58 @@ def script_targets(scene):
         if getattr(physics, "script_target", False):
             found.append(obj)
     return found
+
+
+def object_logic_trees(scene):
+    """勾了脚本挂载、又填了『角色逻辑图』的物体 -> [(物体, 逻辑图, 说明)]。
+
+    这是"角色逻辑"的宿主(第一百一十九轮:区分世界/角色/关卡逻辑)——每个
+    填了 logic_tree 的物体各导一份独立脚本挂自己,和场景图(关卡/世界逻辑)
+    分开。图不存在 / 不是逻辑图时树为 None,说明里讲清原因。
+    """
+    out = []
+    if scene is None:
+        return out
+    try:
+        targets = script_targets(scene)
+    except Exception:                                     # noqa: BLE001
+        # 离线桩环境(SimpleNamespace)没有 objects —— 返回空,不因"收集"崩掉导出
+        return out
+    # 世界设置的『默认角色』(第一百二十一轮):物体没指定『角色逻辑图』时
+    # 套这张 —— 像虚幻的 Default Pawn Class,一张玩家图全项目复用。
+    default_char = None
+    try:
+        from .ui import world_settings
+        default_char = getattr(world_settings(), "default_character", None)
+    except Exception:                                     # noqa: BLE001
+        default_char = None
+    for obj in targets:
+        from .persistent_player import owns
+        if owns(obj):
+            continue
+        physics = getattr(obj, "gk_physics", None)
+        wanted = str(getattr(physics, "logic_tree", "") or "").strip()
+        if not wanted and default_char is not None:
+            wanted = str(getattr(default_char, "name", "") or "").strip()
+        if not wanted:
+            continue
+        tree = None
+        reason = f"物体『{obj.name}』的角色逻辑图"
+        try:
+            import bpy
+        except Exception:                                 # noqa: BLE001
+            out.append((obj, None, "离线环境取不到节点图"))
+            continue
+        tree = bpy.data.node_groups.get(wanted)
+        if tree is None or getattr(tree, "bl_idname", "") != "GKGameLogicTree":
+            out.append((obj, None, f"『{obj.name}』指定的『{wanted}』不存在"
+                                   f"(或不是游戏逻辑图)"))
+            continue
+        if logic_tree_scope(tree) == "LEVEL":
+            out.append((obj, None, f"『{wanted}』是关卡逻辑图，不能挂到角色物体上"))
+            continue
+        out.append((obj, tree, reason))
+    return out
 
 
 def resolve_base_class(scene):
@@ -639,6 +750,29 @@ def _sound_asset_cards():
         return []
 
 
+def _node_clip_cards(tree):
+    """节点里填的**本地音频素材** -> 声音卡形状的条目:`[(卡片名, 本地路径)]`。
+
+    ── 为什么在导出侧找,而不是让 codegen 记账(第一百一十一轮)──────
+    codegen 只管"脚本里写什么";**带文件**是导出这一步的事(和曲线、
+    声音卡同一个分工)。两边唯一的约定是 `sound_assets.resolve_clip`
+    (脚本侧)与 `sound_file_name`(复制侧)—— 同一个函数算同一个名字。
+
+    `gk_path` 在别的节点上是**曲线名**(相机沿曲线),所以这里用
+    "看起来像音频文件"当闸门(见 resolve_clip):不是音频一律不收。
+    """
+    cards = []
+    seen = set()
+    for node in getattr(tree, "nodes", ()) or ():
+        raw = str(getattr(node, "gk_path", "") or "").strip()
+        _script_path, local = sound_assets.resolve_clip(raw)
+        if not local or local in seen:
+            continue
+        seen.add(local)
+        cards.append((str(getattr(node, "name", "") or "音效"), local))
+    return cards
+
+
 def export_tree(tree, settings=None, write_scene=None):
     """导出节点树，返回一个结果字典(给 UI 用)。
 
@@ -759,7 +893,12 @@ def export_tree(tree, settings=None, write_scene=None):
     # 『游戏资产』图的『资产_声音卡』挑好的本地文件,导出时复制进项目的
     # audio/ —— 音效节点里写死的 `res://audio/...` 才找得到东西。
     # 和曲线同一条思路:脚本引用什么,这一步就得把什么带上。
-    sound_cards = _sound_asset_cards()
+    # ── 第一百一十一轮:音效节点上填的**本地路径**也算数 ─────────────
+    # 以前只有资产图里的声音卡会被复制,节点上的『音频路径』必须自己
+    # 是 `res://`。示例导出到别的工程时就漏了文件(真机刷屏
+    # "Resource file not found")。现在节点引用什么,这里就带什么 ——
+    # 名字两边都走 `sound_assets.resolve_clip` / `sound_file_name`,算得一致。
+    sound_cards = _sound_asset_cards() + _node_clip_cards(tree)
     planned_sounds = [
         f"{sound_assets.AUDIO_DIR}/{os.path.basename(target)}"
         for _name, _path, target, _res

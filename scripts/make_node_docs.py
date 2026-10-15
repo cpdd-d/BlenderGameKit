@@ -23,6 +23,28 @@ import argparse
 import os
 import sys
 
+
+def _safe_print(text):
+    """打印,**打不出来也不能让脚本崩**。
+
+    ── 为什么需要(第 131 轮真机踩到)────────────────────────────────
+    门禁在 Windows PowerShell 5.1 下跑,控制台默认是 **GBK**。脚本里那两行
+    "✗ ..." 用了一个 GBK 编不出来的字符(`\\u2717`),于是**校验失败时**打印
+    那一步直接抛 `UnicodeEncodeError` ——
+    结果是**报错信息本身被吞掉**,门禁只看到一串 Traceback 和
+    "节点手册过期",完全看不到"哪一步对不上"。
+    最气人的地方:它只在**该报错的时候**崩,也就是最需要看到提示的时候。
+    修法:打印统一走这里,编不出来就把打不出的字符换成 `?`(用 errors="replace"),
+    保证"报错信息一定能出来"。
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        sys.stdout.write(text.encode(encoding, "replace").decode(encoding,
+                                                                "replace")
+                         + "\n")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 # gk_stub 住在 tests/ 里(离线单测那套打桩)—— 借过来用,不复制一份

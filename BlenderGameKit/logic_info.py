@@ -110,7 +110,8 @@ def checkup(facts):
                                   f"({names}) —— 只留一个"))
         if facts.get("uses_pathfinding") and not facts.get("nav_enabled"):
             rows.append(("info", "图里用了寻路,但场景的『寻路』关着 —— "
-                                 "会退化成直线走(在『导出为 Godot 脚本』里打开)"))
+                                 "会退化成直线走(在 AI 图里右键 -> "
+                                 "『寻路(GK)』里打开)"))
         written = {str(n) for n in (facts.get("written_ports") or ())}
         for name in (facts.get("declared_ports") or ()):
             name = str(name)

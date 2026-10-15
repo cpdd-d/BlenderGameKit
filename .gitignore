@@ -25,6 +25,8 @@ _testrepo/
 # Local scratch
 .audit/
 *.log
+# AI 助手的工作记忆(不是项目内容,只是本地会话记录)——别让它进公共仓库
+.workbuddy/
 
 # ── 导出产物:examples/ 下面那些 *_godot/ 是**跑一次就生成**的东西 ──────
 # 里面的 .glb / .import / .uid / trés 全是导出器写的,提交它们会:
