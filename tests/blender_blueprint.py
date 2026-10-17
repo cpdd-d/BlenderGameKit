@@ -101,6 +101,10 @@ def main():
         assert os.path.isfile(os.path.join(directory, 'shaders', 'gk_toon_lit_cull.gdshader'))
 
     scene.gk_settings.env_enabled = True
+    # ⚠ 卡通材质是 unshaded,Godot 里本来就不吃环境光 —— 所以预览把环境光
+    #   放进了临时漫反射材质,世界那边给 0(见 godot_look.apply 里那段)。
+    #   想验"世界带环境光"这条,得先把卡通材质关掉(走 lit 那条路)。
+    scene.gk_settings.toon_materials = False
     scene.gk_settings.env_ambient_energy = 0.2
     godot_look.apply(scene)
     first_world = scene.world

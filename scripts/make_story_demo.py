@@ -267,6 +267,19 @@ _ENV_TO_PRESET = (
     ("p_glow_bloom", "env_glow_bloom"), ("p_adjust", "env_adjust"),
     ("p_brightness", "env_brightness"), ("p_contrast", "env_contrast"),
     ("p_saturation", "env_saturation"),
+    # ── 第 124 轮:9 个高影响键(和 ui._ENV_PRESET_FIELDS 一一对应)──────
+    # 漏掉的话,『存为预设』不会把雾亮度 / 泛光门槛这些值存进去 ——
+    # 用户切一圈预设回来,自己调过的值就静默回到出厂(和 ui 那边表里
+    # "表里少一项值就静默不进去"是同一条坑)。
+    ("p_fog_sky_affect", "env_fog_sky_affect"),
+    ("p_fog_light_energy", "env_fog_light_energy"),
+    ("p_fog_aerial", "env_fog_aerial_perspective"),
+    ("p_glow_strength", "env_glow_strength"),
+    ("p_glow_threshold", "env_glow_threshold"),
+    ("p_glow_blend", "env_glow_blend"),
+    ("p_tonemap_exposure", "env_tonemap_exposure"),
+    ("p_tonemap_white", "env_tonemap_white"),
+    ("p_ambient_sky", "env_ambient_sky_contribution"),
 )
 _STYLE_TO_PRESET = (
     ("p_style_shadow_step", "style_shadow_step"),
@@ -308,6 +321,64 @@ def _save_env_presets(lobby, corridor, ending):
     log("已把三关氛围 + 卡通风格存进预设库:示例·卡通门厅 / 示例·卡通走廊 / 示例·卡通结局")
 
 
+def _build_post_graph(library):
+    """在『游戏环境与后期』图里连一条真实的后期链(用户要求"打开能看到效果")。
+
+    用户原话:"那继续吧,待会我打开看看真实的效果怎么样再跟你讨论" ——
+    光有卡片看不到东西,所以示例里连一条:
+        『环境_默认环境』-> 『环境_设置色调』-> 『环境_睁眼效果』
+    另外单独放一张『环境_屏幕位置』卡,接到色调卡上演示**局部调色**。
+
+    ── 三个取值都是"看得出来但不难看"─────────────────────────────
+      * 对比度 1.12 / 饱和度 1.15:轻微提味,一眼能看出后期在起作用;
+      * 色调往暖橙偏一点点(0.25):和走廊的冷蓝环境光形成对比,
+        正好演示"设置色调"是干什么的;
+      * 屏幕位置:暗角(圆形 + 内外反转),中心亮、四角压暗 ——
+        这是最常用的局部用法,也能立刻看出蒙版真的在生效。
+      * 睁眼:按用户选的设计,**只由逻辑触发**(不自动播),
+        所以这里 `gk_trigger` 保持默认 LOGIC。
+
+    重建要幂等:先把这张图清空(和预设那一列清空同一个道理)。
+    """
+    library.nodes.clear()
+    links = library.links
+
+    start = library.nodes.new("GKNodeEnvDefault")
+    start.location = (-420, 0)
+
+    grade = library.nodes.new("GKNodeEnvGrade")
+    grade.location = (-120, 0)
+    grade.gk_brightness = 1.04
+    grade.gk_contrast = 1.12
+    grade.gk_saturation = 1.15
+    grade.gk_tint = (1.0, 0.86, 0.72, 1.0)      # 暖橙
+    grade.gk_tint_amount = 0.25
+
+    mask = library.nodes.new("GKNodeScreenPos")
+    mask.location = (-120, -260)
+    mask.gk_round = True
+    mask.gk_radius = 0.62
+    mask.gk_feather = 0.28
+    mask.gk_invert = True                        # 反转 = 暗角
+
+    eye = library.nodes.new("GKNodeEyeOpen")
+    eye.location = (180, 0)
+    # ── 为什么示例选『进关卡自动播』(用户 2026-10-16)──────────────────
+    # 卡片的**默认**是『逻辑触发』(用户拍板的设计,只由『后期_播放睁眼』调),
+    # 但示例里没有任何节点去调它 —— 于是"图里配了效果、进游戏什么也看不到",
+    # 用户的原话就是"游戏环境与后期的节点图逻辑并未在游戏中生效"。
+    # 示例是给人看的:改成进关卡自动播,一进大厅就能看到眼皮张开。
+    eye.gk_trigger = "AUTO"
+    eye.gk_duration = 1.6
+    eye.gk_slit = 0.06
+    eye.gk_hold = 0.0
+
+    links.new(start.outputs["执行"], grade.inputs["执行"])
+    links.new(grade.outputs["完成"], eye.inputs["执行"])
+    links.new(mask.outputs["屏幕位置"], grade.inputs["屏幕位置"])
+    log("已连好『游戏环境与后期』图:默认环境 -> 设置色调(带暗角蒙版)-> 睁眼效果")
+
+
 # ── 三关的环境氛围(都走『游戏环境设置』那张卡的字段)──────────────────
 # ── 第 123 轮:整体改配成**卡通二次元**观感(用户实测反馈)─────────────
 # 用户原话:"现在的环境渲染成了『中世纪』的风格了,但我想要的是卡通二次元"。
@@ -334,55 +405,96 @@ ENV_LOBBY = (
     # 背景色:暖灰蓝的"室内" —— 原来的 (0.045,0.05,0.075) 太黑,
     # 二次元里背光处应该是**有颜色的暗**,不是黑。
     ("env_bg_color", (0.16, 0.18, 0.26, 1.0)),
-    ("env_ambient_color", (0.62, 0.68, 0.88, 1.0)),
-    ("env_ambient_energy", 0.85),
+    # ── 第 124 轮:环境光 0.85 -> 0.34(和走廊同一条实测结论)──────────
+    # 环境光高于灯 = 画面被一层平光洗白、明暗层次糊掉。大堂有吊灯 + 手电筒,
+    # 环境光退到"只负责暗部色相"的位置,明暗交给灯画。
+    ("env_ambient_color", (0.60, 0.66, 0.90, 1.0)),
+    ("env_ambient_energy", 0.34),
     ("env_fog", True),
     ("env_fog_color", (0.42, 0.48, 0.66, 1.0)),
     ("env_fog_density", 0.008),
+    # ── 第 124 轮:雾色**不许**盖掉背景色(显式设 0)──────────────────
+    # Godot 出厂值是 1.0:雾色会把背景整个换掉。真机实测(走廊)那一步
+    # 让整帧从 0.3803 掉到 0.3460 —— 也就是"取色器上挑的背景色在游戏里
+    # 根本看不见",而 Blender 预览(雾是独立体积盒子、不盖世界底色)是看得见的,
+    # 这正是"预览和运行对不上"的一半。
+    # ⚠ 这个值**必须显式写**:字段默认留 1.0(= Godot 出厂),因为一刀切成 0
+    #   会把恐怖示例整帧压暗 70%(见 properties.py 那段说明)。示例是"作者
+    #   明确要的观感",所以在这里点明。
+    ("env_fog_sky_affect", 0.0),
+    ("env_fog_light_energy", 0.60),
     ("env_glow", True),
     ("env_glow_intensity", 0.6),
     ("env_glow_bloom", 0.08),
+    ("env_glow_threshold", 0.90),
+    ("env_glow_strength", 1.3),
     # ⚠ LINEAR 不是 ACES:ACES 会把颜色压灰,是"中世纪感"的一半来源。
     ("env_tonemap", "LINEAR"),
     ("env_adjust", True),
     ("env_brightness", 1.06),
-    ("env_contrast", 1.06),
+    ("env_contrast", 1.08),
     ("env_saturation", 1.18),
 )
 ENV_CORRIDOR = (
     ("env_enabled", True),
     ("env_background", "COLOR"),
     ("env_bg_color", (0.07, 0.09, 0.17, 1.0)),
-    ("env_ambient_color", (0.48, 0.55, 0.86, 1.0)),
-    ("env_ambient_energy", 0.78),
+    # ── 第 124 轮:环境光 0.78 -> 0.30(用户:"优化运行画面的显示")────────
+    # 真机实测(走廊,第一人称实际游玩机位,帧均值亮度):
+    #   * 关掉 7 盏导出的壁灯 -> 整帧**一个像素都不变**(gain 0.0000):
+    #     环境光 0.78 把灯全压没了,画面是一层平蓝的"洗白"(sd 只有 0.092);
+    #   * 环境光 0.78 -> 0 时灯才开始起作用(gain 0.0205),但仍偏弱;
+    #   * 降到 0.28 + 灯 10.0 + 射程 28 米 -> 灯 gain 0.164,对比度 sd 0.092 -> 0.163。
+    # 二次元要看得出**明暗两段**,而"环境光压过灯"出来的是一段 —— 所以这里
+    # 把环境光降到"暗部不死黑(它仍然有色相)"的量级,把明暗交给壁灯去画。
+    # ⚠ 不能再往下压:第 123 轮用户的诉求是"暗部要**有颜色的暗**,不是黑",
+    #   0.28 是"暗部仍有冷紫色相"的下限(再低墙裙和角落就糊成一团黑)。
+    ("env_ambient_color", (0.42, 0.48, 0.78, 1.0)),
+    ("env_ambient_energy", 0.28),
     ("env_fog", True),
     ("env_fog_color", (0.26, 0.31, 0.52, 1.0)),
-    ("env_fog_density", 0.022),
+    ("env_fog_density", 0.014),
+    # 雾色不许盖掉背景色(见 ENV_LOBBY 里那段说明:默认留 1.0,Godot 出厂行为)
+    ("env_fog_sky_affect", 0.0),
+    # 雾亮度 0.55:雾色本身是亮的蓝灰(0.26,0.31,0.52),原样铺过去等于给
+    # 整条走廊加一层"牛奶"(实测关雾 0.2551 vs 开雾 0.3547)。压到 0.55 之后
+    # 雾还是看得见(远处发白),但不再主导画面亮度。
+    ("env_fog_light_energy", 0.55),
     ("env_glow", True),
     ("env_glow_intensity", 0.95),
     ("env_glow_bloom", 0.14),
+    # 泛光的真扳机是门槛 + 力度,不是 intensity:实测门槛停在 Godot 出厂值
+    # 1.0 时,开/关泛光整帧只差 0.0044(等于没有);打到 0.85 + 力度 1.6
+    # 之后壁灯 / 灯罩真的"毛"起来(这才是恐怖走廊要的那点光晕)。
+    ("env_glow_threshold", 0.85),
+    ("env_glow_strength", 1.6),
     ("env_tonemap", "LINEAR"),
     ("env_adjust", True),
     ("env_brightness", 1.04),
-    ("env_contrast", 1.08),
-    ("env_saturation", 1.16),
+    ("env_contrast", 1.10),
+    ("env_saturation", 1.18),
 )
 ENV_ENDING = (
     ("env_enabled", True),
     ("env_background", "COLOR"),
     ("env_bg_color", (0.10, 0.10, 0.20, 1.0)),
-    ("env_ambient_color", (0.56, 0.56, 0.88, 1.0)),
-    ("env_ambient_energy", 0.80),
+    # 同上:环境光 0.80 -> 0.32,把明暗让给结局灯(小房间,一盏灯铺得满)
+    ("env_ambient_color", (0.50, 0.52, 0.82, 1.0)),
+    ("env_ambient_energy", 0.32),
     ("env_fog", True),
     ("env_fog_color", (0.34, 0.33, 0.56, 1.0)),
     ("env_fog_density", 0.010),
+    ("env_fog_sky_affect", 0.0),
+    ("env_fog_light_energy", 0.55),
     ("env_glow", True),
     ("env_glow_intensity", 0.80),
     ("env_glow_bloom", 0.12),
+    ("env_glow_threshold", 0.85),
+    ("env_glow_strength", 1.4),
     ("env_tonemap", "LINEAR"),
     ("env_adjust", True),
     ("env_brightness", 1.05),
-    ("env_contrast", 1.07),
+    ("env_contrast", 1.09),
     ("env_saturation", 1.20),
 )
 
@@ -1434,66 +1546,11 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
     save = _add(logic, "GKNodeSaveWrite", "走廊存档", -620.0, 700.0,
                 gk_slot="story", gk_save_verify=True)
 
-    # ---- 开场:旁白 + 主角两句 + 剧情选择 ----
-    # ⚠ 对话框是**阻塞**的(await 等玩家点)。开场先把世界暂停 + 鼠标放出
-    #   (『开局选单态』,照 demo_ui):不然玩家鼠标还是 CAPTURED 锁着,点不到
-    #   选择按钮;选完再继续世界 + 锁回鼠标(见下面『合流函数』)。
-    startup = _add(logic, "GKNodeUiPauseGame", "开局选单态", -540.0, 1900.0,
-                   gk_pause=True, gk_show_mouse=True, gk_menu="",
-                   gk_hotkey=False)
-    d1 = _add(logic, "GKNodeUiDialog", "旁白", -300.0, 1900.0,
-              gk_speaker="", gk_text="走廊很长,灯全灭了。", gk_speed=24.0)
-    d2 = _add(logic, "GKNodeUiDialog", "主角1", -60.0, 1900.0,
-              gk_speaker="我", gk_text="必须穿过去。", gk_speed=24.0)
-    d3 = _add(logic, "GKNodeUiDialog", "主角2", 180.0, 1900.0,
-              gk_speaker="我", gk_text="……那声音越来越近了。", gk_speed=24.0)
-    choice = _add(logic, "GKNodeUiChoice", "走廊选择", 420.0, 1900.0,
-                  gk_question="怎么办?", gk_option_count=2,
-                  gk_options="往前跑|先躲一下", gk_speed=24.0)
-    # 开场对话接在**章节卡链尾**(亮 3 秒 + 淡出之后才弹)。暂停菜单不在
-    # 这条链里了 —— 它在『主界面』(autoload)里,开局就已挂好 Esc 热键
-    # (第一百一十二轮)。选单态本身照旧:暂停世界 + 放鼠标给玩家点选。
-    _link(logic, card_end, "完成", startup, "执行")
-    _link(logic, startup, "完成", d1, "执行")
-    _link(logic, d1, "完成", d2, "执行")
-    _link(logic, d2, "完成", d3, "执行")
-    _link(logic, d3, "完成", choice, "执行")
-
-    # ---- 两条选择链 + 汇合 ----
-    # ⚠ Blender **一个执行输入引脚只允许一条线**,所以两个选项没法"直接插进
-    #   同一个节点"。这里的做法是:两条链各做自己的事(记下选了哪个),然后
-    #   **都调用同一个函数『走廊合流』** —— 那份共享后续只写一遍,第二条链
-    #   也不会断(硬性要求)。
-    merge_spec = logic.gk_funcs.add()
-    merge_spec.func_name = "走廊合流"
-    merge_spec.return_type = "void"
-    merge_spec.params = ""
-    merge_spec.comment = "两条选择链的汇合点(共享后续)"
-    merge_head = _add(logic, "GKNodeFunctionDefine", "合流函数", -60.0, 1300.0,
-                      gk_func_name="走廊合流")
-    shared = _add(logic, "GKNodeUiSubtitle", "合流字幕", 180.0, 1300.0,
-                  gk_text="穿过走廊 —— 别被它看见。", gk_seconds=3.0)
-    # 选完之后:继续世界 + 把鼠标锁回去(开场"选单态"的反向操作)
-    resume = _add(logic, "GKNodeUiPauseGame", "选完恢复", 420.0, 1300.0,
-                  gk_pause=False, gk_show_mouse=True, gk_menu="",
-                  gk_hotkey=False)
-    lock_mouse = _add(logic, "GKNodeMouseMode", "锁回鼠标", 660.0, 1300.0,
-                      gk_mode="CAPTURED")
-    _link(logic, merge_head, "执行", shared, "执行")
-    _link(logic, shared, "完成", resume, "执行")
-    _link(logic, resume, "完成", lock_mouse, "执行")
-
-    for number, pin in ((1, "选项1"), (2, "选项2")):
-        row = 1600.0 - number * 220.0
-        value = _add(logic, "GKNodeConstFloat", f"选择值{number}", 660.0, row,
-                     gk_value=float(number))
-        store = _add(logic, "GKNodeSetVar", f"记选择{number}", 900.0, row,
-                     gk_var_name=CHOICE_VAR)
-        call = _add(logic, "GKNodeFunctionCall", f"调用合流{number}",
-                    1380.0, row, gk_func_name="走廊合流")
-        _link(logic, value, "值", store, "值")
-        _link(logic, choice, pin, store, "执行")
-        _link(logic, store, "完成", call, "执行")
+    # ---- 开场:剧情那套已删(第一百三十九轮,用户第 2 条)----------
+    # 用户原话:"现在把所有的剧情选项与剧情显示给删了,只用修理画面与环境的,
+    # 这个留到下次。" 所以这里不再有旁白 / 剧情选择 / 合流函数 / 合流字幕,
+    # 也不再"开局冻结世界 + 放鼠标"(没有面板要点,世界就别冻)——
+    # 章节卡淡出之后这一关直接开跑(`card_end` 后面不再接东西)。
 
     # ---- 心跳 + 紧张度(每物理帧)----
     beat = _add(logic, "GKNodeOnPhysicsProcess", "物理帧(心跳)", -900.0,
@@ -1580,7 +1637,14 @@ def build_corridor_logic(scene, player, enemy, ai_tree, cabinets, player_name,
 # 第三关 结局 的逻辑
 # ==========================================================================
 def build_ending_logic(scene, player, cam_third, cam_first):
-    """结局:章节/HUD + 旁白 + 结局选择(两个结局各自存档 / 大字 / BGM 淡出)-> 回大堂。"""
+    """结局:章节/HUD + 暗角 + **冻住世界** + 两个明确出口(回开场 / 退出游戏)。
+
+    ── 第一百三十九轮:剧情那套先撤了(用户原话)──────────────────────
+    "现在把所有的剧情选项与剧情显示给删了,只用修理画面与环境的,这个留到
+    下次。" 所以旁白 / 结局选择 / 结局大字 / 两个结局分支的存档与 BGM 淡出
+    全部撤掉 —— 一进这一关就把世界冻住,直接给玩家两个出口按钮
+    (仍然是之前拍板的收尾:结局冻住世界 + 明确出口,不自动把玩家带走)。
+    """
     build_character(scene, player, "结局角色", "StoryEndingPlayer",
                     cam_third, cam_first)
     logic = bpy.data.node_groups.new("结局逻辑", "GKGameLogicTree")
@@ -1590,77 +1654,42 @@ def build_ending_logic(scene, player, cam_third, cam_first):
     ready.name = "每当_准备"
     scene.gk_settings.logic_tree = "结局逻辑"
     design = _new_story_ui_tree("结局界面")
-    _add(design, "GKNodeUiText", "结局大字", 1380.0, 1200.0,
-         gk_text="", gk_align="CENTER", gk_size=34,
-         gk_color=(0.95, 0.92, 0.80, 1.0))
-    hud_head, _hud, card_end = build_hud(logic, design, "终章:抉择",
-                                         "目标:做出你的选择")
-    # (暂停菜单 / 按键提示在『主界面』里)
+    hud_head, _hud, card_end = build_hud(logic, design, "终章:出口",
+                                         "目标:选一个出口")
 
     vig = _add(logic, "GKNodeScreenVignette", "结局暗角", -900.0, 800.0,
                gk_amount=0.60, gk_radius=0.50, gk_edge=0.35)
 
-    # 开场:暂停世界 + 放鼠标(不然结局选择点不到),选完再继续 + 锁回
-    startup = _add(logic, "GKNodeUiPauseGame", "开局选单态", -540.0, 1900.0,
-                   gk_pause=True, gk_show_mouse=True, gk_menu="",
-                   gk_hotkey=False)
-    d1 = _add(logic, "GKNodeUiDialog", "旁白", -300.0, 1900.0,
-              gk_speaker="", gk_text="出口就在前面。", gk_speed=24.0)
-    d2 = _add(logic, "GKNodeUiDialog", "主角", -60.0, 1900.0,
-              gk_speaker="我", gk_text="……她还在后面。", gk_speed=24.0)
-    choice = _add(logic, "GKNodeUiChoice", "结局选择", 180.0, 1900.0,
-                  gk_question="你要怎么做?", gk_option_count=2,
-                  gk_options="回头救她|独自逃出去", gk_speed=24.0)
-    # 和走廊同一个顺序讲究:开场对话接在**章节卡链尾**(淡出之后才弹)。
-    _link(logic, card_end, "完成", startup, "执行")
-    _link(logic, startup, "完成", d1, "执行")
-    _link(logic, d1, "完成", d2, "执行")
-    _link(logic, d2, "完成", choice, "执行")
+    # ── 冻住世界 + 放鼠标(两个按钮要能点)──────────────────────────
+    freeze = _add(logic, "GKNodeUiPauseGame", "结局冻住世界", -540.0, 1900.0,
+                  gk_pause=True, gk_show_mouse=True, gk_menu="",
+                  gk_hotkey=False)
+    hint = _add(logic, "GKNodeUiText", "结局提示", -300.0, 1900.0,
+                gk_text="点『回到开场』再玩一次,或点『退出游戏』",
+                gk_align="BOTTOM_CENTER", gk_margin=240.0, gk_size=20)
+    back_btn = _add(logic, "GKNodeUiButton", "回到开场", -60.0, 1740.0,
+                    gk_text="回到开场", gk_align="BOTTOM_CENTER",
+                    gk_margin=170.0, gk_width=200.0, gk_height=52.0)
+    quit_btn = _add(logic, "GKNodeUiButton", "退出游戏", -60.0, 1900.0,
+                    gk_text="退出游戏", gk_align="BOTTOM_CENTER",
+                    gk_margin=100.0, gk_width=200.0, gk_height=52.0)
+    back = _add(logic, "GKNodeChangeScene", "回大堂", 200.0, 1740.0,
+                gk_scene_path=LOBBY_RES)
+    quit_game = _add(logic, "GKNodeQuitGame", "退出", 200.0, 1900.0)
 
-    # 两个结局:每个选项先"继续世界 + 锁回鼠标",再走各自结局链(存档
-    # story_end + 记「结局」键 → 大字 → 总线淡出 → 停留 → 回大堂闭环)。
-    endings = ((1, "选项1", "回头救她"), (2, "选项2", "独自逃出去"))
-    for number, pin, label in endings:
-        row = 1600.0 - number * 320.0
-        resume = _add(logic, "GKNodeUiPauseGame", f"选完恢复{number}",
-                      420.0, row - 140.0, gk_pause=False, gk_show_mouse=True,
-                      gk_menu="", gk_hotkey=False)
-        lock_mouse = _add(logic, "GKNodeMouseMode", f"锁回鼠标{number}",
-                          420.0, row + 20.0, gk_mode="CAPTURED")
-        value = _add(logic, "GKNodeConstFloat", f"结局值{number}", 420.0, row,
-                     gk_value=float(number))
-        set_end = _add(logic, "GKNodeSetVar", f"记结局{number}", 660.0, row,
-                       gk_var_name="结局")
-        write = _add(logic, "GKNodeSaveSet", f"写结局{number}", 900.0, row,
-                     gk_key="结局")
-        save = _add(logic, "GKNodeSaveWrite", f"保存结局{number}", 1140.0, row,
-                    gk_slot="story_end", gk_save_verify=True)
-        text = _add(logic, "GKNodeUiSet", f"结局大字{number}", 1380.0, row,
-                    gk_widget="结局大字", gk_set_text=True,
-                    gk_text=f"结局:{label}")
-        fade = _add(logic, "GKNodeBusVolume", f"BGM淡出{number}", 1620.0, row,
-                    gk_bus="Master", gk_db=-60.0, gk_fade=3.0)
-        wait = _add(logic, "GKNodeWait", f"停留{number}", 1860.0, row)
-        wait.inputs["秒"].default_value = 4.0
-        back = _add(logic, "GKNodeChangeScene", f"回大堂{number}", 2100.0, row,
-                    gk_scene_path=LOBBY_RES)
-        _link(logic, value, "值", set_end, "值")
-        _link(logic, value, "值", write, "值")
-        _link(logic, choice, pin, resume, "执行")
-        _link(logic, resume, "完成", lock_mouse, "执行")
-        _link(logic, lock_mouse, "完成", set_end, "执行")
-        _link(logic, set_end, "完成", write, "执行")
-        _link(logic, write, "完成", save, "执行")
-        _link(logic, save, "完成", text, "执行")
-        _link(logic, text, "完成", fade, "执行")
-        _link(logic, fade, "完成", wait, "执行")
-        _link(logic, wait, "完成", back, "执行")
+    # 章节卡淡出 -> 冻住世界 -> 提示 -> 两个按钮
+    _link(logic, card_end, "完成", freeze, "执行")
+    _link(logic, freeze, "完成", hint, "执行")
+    _link(logic, hint, "完成", back_btn, "执行")
+    _link(logic, back_btn, "完成", quit_btn, "执行")
+    _link(logic, back_btn, "点击", back, "执行")
+    _link(logic, quit_btn, "点击", quit_game, "执行")
 
     _sequence(logic, ready, "结局开局顺序", -1150.0, 1100.0,
               (vig, hud_head))
     # (暂停菜单在『主界面』里;Alt 鼠标在角色图里)
-    log(f"{ENDING}逻辑:章节/HUD + 旁白/结局选择(2 结局:存档 story_end + "
-        f"「结局」键 + 大字 + BGM 淡出)-> 回 {LOBBY_RES}")
+    log(f"{ENDING}逻辑:章节/HUD + 暗角 + 冻住世界 + 出口按钮"
+        f"(回到开场 / 退出游戏);剧情选项与剧情显示已按用户要求撤掉")
     return logic
 
 
@@ -1812,6 +1841,13 @@ def main():
 
     # 把三关氛围 + 卡通风格存进预设库(第一百一十六轮:示范环境系统)
     _save_env_presets(lobby, corridor, ending)
+    # ── 第 125 轮:再连一条真实的后期链(用户:"打开看看真实的效果")──────
+    # ⚠ 必须在 `_save_env_presets` **之后** —— 它开头会
+    #   `library.env_presets.clear()`,但不清节点;反过来的话这里
+    #   `nodes.clear()` 之后预设还在,两边互不干扰。顺序写死是为了
+    #   以后有人调换时能一眼看出"谁清谁"。
+    from BlenderGameKit import properties as _props
+    _build_post_graph(_props.env_preset_library())
 
     directory = os.path.join(OUT_DIR, "恐怖闯关示例_godot")
     project.create_project(directory, title="恐怖闯关示例",

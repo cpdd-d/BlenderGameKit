@@ -1,4 +1,4 @@
-﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
+﻿﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
 #
 # 用法:
 #   pwsh -File scripts\build_and_test.ps1
@@ -302,6 +302,19 @@ if ($LASTEXITCODE -ne 0 -or $blueprintOut -notmatch "BLUEPRINT=OK") {
 }
 
 # ---------- 4g. 图标名必须真实存在(第一百二十三轮:用户实测抓到的崩溃)------
+# 预览必须真的改到像素，且临时灯光/材质不能污染保存和导出。
+Step "4i/6 Godot 观感:后期像素与灯光/材质还原"
+foreach ($previewProbe in @("blender_godot_look.py", "blender_godot_post.py",
+                            "blender_godot_lights.py", "blender_godot_material_preview.py",
+                            "blender_texture_identity.py")) {
+    $previewOutput = & $Blender -b --factory-startup --python-exit-code 1 --python (Join-Path $Root "tests/$previewProbe") 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $previewOutput -match "GODOT_LOOK=FAILED") {
+        Write-Output $previewOutput
+        $smokeOk = $false
+    } else {
+        Write-Output "$previewProbe OK"
+    }
+}
 # ── 为什么要单列这一关 ──────────────────────────────────────────────
 # 面板里写 `icon="LOOP_FORWARD"`(正确的叫 `LOOP_FORWARDS`)、
 # 或 `icon="IMAGE_BG"`(正确的叫 `IMAGE_BACKGROUND`)时,Blender 抛的是
@@ -321,6 +334,25 @@ if (-not (Test-Path $iconScript)) {
         Write-Output $iconOut
         $smokeOk = $false
     }
+}
+
+# ---------- 4j. 全新 .blend 工作流(第一百四十二轮)----------
+# 从零建一个场景 -> 加灯调色调 -> 预览 -> 建项目 -> 全量导出 -> 无头跑通。
+Step "4j/6 全新 .blend:预览 -> 导出 -> 运行"
+$freshScript = Join-Path $Root "scripts\check_fresh_project_workflow.py"
+if (Test-Path $freshScript) {
+    $env:GK_GODOT = $Godot
+    $freshOut = & $Blender -b --factory-startup --python-exit-code 1 --python $freshScript 2>&1 | Out-String
+    $freshOut -split "`n" | Where-Object { $_ -match "FRESH_PROJECT=|\[FAIL\]|预览图均值|结果:" } |
+        ForEach-Object { Write-Host $_.TrimEnd() }
+    if ($LASTEXITCODE -ne 0 -or $freshOut -notmatch "FRESH_PROJECT=OK") {
+        Write-Output $freshOut
+        $smokeOk = $false
+    } else {
+        Write-Output "FRESH_PROJECT=OK"
+    }
+} else {
+    Write-Output "跳过全新 .blend 工作流:还没有 scripts\check_fresh_project_workflow.py"
 }
 
 # ---------- 5. Godot 端到端 ----------
@@ -1090,6 +1122,29 @@ if ($SkipGodot) {
             } else {
                 $godotOk = $false
             }
+        }
+    }
+
+    # 5w. 昼夜循环 / 天空盒 / 太阳 / 云层(第一百三十三轮,待办清单②)——
+    #     在**真 Godot** 里跑:天空材质真的挂到 WorldEnvironment 上、太阳真的
+    #     按时刻转、跳到某时刻 / 暂停 / 云在飘。全是**运行期**的坑
+    #     (find_world_3d 拿到 null、Sky 没挂上、暂停时着色器的 TIME 照走),
+    #     静态扫字符串一个都发现不了,所以单列这一关。
+    Write-Output ""
+    $dayNightProbe = Join-Path $Root "scripts\check_daynight.py"
+    if (-not (Test-Path $dayNightProbe)) {
+        Write-Output "跳过昼夜验收:还没有 scripts\check_daynight.py"
+    } else {
+        $dnOut = & $Py $dayNightProbe --godot $Godot 2>&1 | Out-String
+        $dnOut -split "`n" | Where-Object {
+            $_ -match "^(DAYNIGHT |DAYNIGHT_ACCEPT|跳过)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($dnOut -match "DAYNIGHT_ACCEPT=OK") {
+            $godotRan += "昼夜循环"
+        } elseif ($dnOut -match "跳过") {
+            Write-Output "（昼夜循环跳过）"
+        } else {
+            $godotOk = $false
         }
     }
 

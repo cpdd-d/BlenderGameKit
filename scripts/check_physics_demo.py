@@ -50,6 +50,19 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gk_probe import find_logic_script  # noqa: E402
+
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_physics", "物理测试场_godot")
@@ -161,6 +174,7 @@ var vai_ready := false
 # 时停采样(第三十五轮)
 var vstop_on := false          # 按 T 之后 `tree.paused` 真的变真了吗
 var vstop_off := false         # 再按一下真的解冻了吗
+var vstop_alive := false       # 进来时本来就冻着 -> 第一下 T 能解开吗
 var vstop_fly := 0.0           # 冻住期间上帝机飞了多远(必须照飞)
 var vstop_world := 0.0         # 冻住期间世界动了多远(必须冻住)
 var vstop_plat := Vector3.ZERO
@@ -464,16 +478,37 @@ func _vehicle_step(delta: float) -> void:
 			# 上帝视角里按 T = 冻住世界。冻住之后**上帝机还得能飞**
 			# (环境脚本设了 PROCESS_MODE_ALWAYS —— 探针自己也设了,
 			# 见 _ready);世界那边(平台由时间轴推着走)必须**一动不动**。
-			# 这一段的顺序:T 冻 → 按 W 飞 0.4 秒 → 量三件事 → T 解冻。
-			vstop_plat = platform.global_position if platform != null else Vector3.ZERO
-			_send_key(KEY_T, true)
+			#
+			# ⚠ 顺序跟着"进上帝机本来就冻着"改过(第一百三十四轮):第一百三十一轮
+			#   起按 Tab 进上帝机 = `[GK] 上帝机:全局冻结`,所以 T 在这里是**开关**。
+			#   连按三下 = ① 解开 -> ② 冻上(量"冻住期间")-> ③ 再解开。
+			#   原来只按两下、还把"第二下之后"当成解冻 —— 量到的其实是**世界
+			#   活着**的那段窗口,于是 `stop=false/false frozen=2.1`(装置和方法
+			#   对不上,不是时停坏了)。
+			_send_key(KEY_T, true)        # ① 先解开(进来时就冻着)
 			vphase = 8
 			vtime = 0.0
 	elif vphase == 8:
 		if vtime >= 0.15:
 			_send_key(KEY_T, false)
+			vstop_alive = not get_tree().paused
+			vphase = 801
+			vtime = 0.0
+	# ⚠ "松开 ①" 和 "按下 ②" 必须**跨帧**(踩过的坑):环境脚本按帧读
+	#   `Input.is_key_pressed` 自己记边沿,同一帧里"松了又按"那次"松"它看不见 ——
+	#   第二次就被当成"按住不放"整个吞掉(实测:日志里只有一条『时停:关』,
+	#   后面那次『时停:开』要等到下一轮按键才出现,状态全错一格)。
+	elif vphase == 801:
+		if vtime >= 0.1:
+			_send_key(KEY_T, true)    # ② 冻上 -> 下面量"冻住期间"
+			vphase = 81
+			vtime = 0.0
+	elif vphase == 81:
+		if vtime >= 0.15:
+			_send_key(KEY_T, false)
 			vstop_on = get_tree().paused
 			vstop_cam = _god_camera_position()
+			vstop_plat = platform.global_position if platform != null else Vector3.ZERO
 			_send_key(KEY_W, true)        # 冻着也要能飞
 			vphase = 9
 			vtime = 0.0
@@ -483,7 +518,11 @@ func _vehicle_step(delta: float) -> void:
 			vstop_fly = vstop_cam.distance_to(_god_camera_position())
 			if platform != null:
 				vstop_world = vstop_plat.distance_to(platform.global_position)
-			_send_key(KEY_T, true)        # 解冻
+			vphase = 901
+			vtime = 0.0
+	elif vphase == 901:               # 同上:松手单独占一帧,再按 ③
+		if vtime >= 0.1:
+			_send_key(KEY_T, true)    # ③ 再解开
 			vphase = 10
 			vtime = 0.0
 	elif vphase == 10:
@@ -603,7 +642,7 @@ func _finish_vehicle() -> void:
 		and vyaw >= 0.3 and vyaw <= 1.2 and vgod_drift <= 0.2
 		and vpushed >= 0.5
 		and vai_pushed >= 1.0 and vai_max_speed <= 9.5
-		and vstop_on and vstop_off and vstop_fly >= 1.0
+		and vstop_alive and vstop_on and vstop_off and vstop_fly >= 1.0
 		and vstop_world <= 0.15)
 	station_time = -1.0
 	print("PHYS_vehicle ok=%s drove=%.2f ride_gap=%.2f back_gap=%.2f "
@@ -612,8 +651,8 @@ func _finish_vehicle() -> void:
 		% [vwalked, vdrift, vyaw, vgod_drift, vmeta]
 		+ " pushed=%.2f pushed_ai=%.2f ai_max_speed=%.2f"
 		% [vpushed, vai_pushed, vai_max_speed]
-		+ " stop=%s/%s fly=%.2f frozen=%.2f"
-		% [vstop_on, vstop_off, vstop_fly, vstop_world])
+		+ " stop=%s/%s alive=%s fly=%.2f frozen=%.2f"
+		% [vstop_on, vstop_off, vstop_alive, vstop_fly, vstop_world])
 
 
 func _start_station(index: int) -> void:
@@ -696,6 +735,7 @@ func _start_station(index: int) -> void:
 	vai_ready = false
 	vstop_on = false
 	vstop_off = false
+	vstop_alive = false
 	vstop_fly = 0.0
 	vstop_world = 0.0
 	plat_min_x = platform.global_position.x if platform != null else 0.0
@@ -940,7 +980,9 @@ def main():
         ok = False
 
     # ── 生成物层面的证据 ───────────────────────────────────────────
-    script_path = os.path.join(OUT, "scripts", "game_logic.gd")
+    # 逻辑图可能是关卡图也可能是**角色图**，导出名跟着变 —— 别写死文件名
+    # (详见 scripts/_gk_probe.py 的说明)
+    script_path = find_logic_script(OUT)
     if os.path.isfile(script_path):
         with open(script_path, "r", encoding="utf-8") as handle:
             code = handle.read()

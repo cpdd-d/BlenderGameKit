@@ -32,6 +32,16 @@ sys.path.insert(0, __file__.rsplit("scripts", 1)[0].rstrip("\\/"))
 from BlenderGameKit import advisor, advisor_tools  # noqa: E402
 
 
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
+
 def read_config():
     """从**插件偏好设置**里读 AI 配置。返回 (地址, 模型, Key)。
 

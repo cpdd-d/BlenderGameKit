@@ -1830,6 +1830,11 @@ class GKNodeUiPauseGame(B.GKStatementNode):
          "暂停时显示 / 继续时隐藏的控件名(留空 = 不自动显隐)"),
         ("gk_hotkey", "bool", True, "Esc 也能开关",
          "按 Esc 直接开关暂停(不用经过按钮);一遍图里只需要一个节点勾它"),
+        ("gk_resume_cooldown", "float", 1.0, "收起后冷却(秒)",
+         "暂停菜单收起后,**过场 / 剧情面板等几秒再放回来**(0 = 立刻放回)。\n"
+         "为什么默认 1 秒:玩家点『继续游戏』时鼠标往往正停在刚才那块地方,\n"
+         "面板立刻回来会被下一击顺手点掉(剧情选项 / 继续对话)。\n"
+         "多次开关菜单 = 多次重置冷却。"),
     )
     gk_outputs = (S.pin(FLOW, "完成"),)
 
@@ -2991,9 +2996,20 @@ def _wrap_ui_card_draw(original):
 
 for _cls in CLASSES:
     if _cls.bl_idname in UI_DESIGN_BUILDER_NODES:
-        # 控件布局只在『游戏界面』图里编辑;游戏逻辑图通过
+        # 控件布局**默认**在『游戏界面』图里编辑;游戏逻辑图通过
         # 『界面_套用设计』和运行时控件接口引用它。
+        #
+        # ⚠ poll(能不能放)必须**照旧放行玩法图** —— 见下面 ① 那条
+        # "菜单藏掉、poll 放行":第一百一十二轮把 `UI_TREES` 收窄成
+        # 只许设计图时,示例重建脚本当场被打断(实测:`make_horror_demo.py`
+        # 的『标题文字』直接被拒 —— "无法将 'GKNodeUiText' 类型的节点添加到
+        # 节点树 '标题逻辑' 中",整份恐怖示例重建不出来;`make_blend_demo` /
+        # `make_ai_nav_demo` 这些往玩法图摆控件的脚本同理)。
+        # 用户要的"界面逻辑从玩法图右键菜单里删掉"是**菜单**的事,由
+        # `gk_menu_hidden_trees` 负责;代码生成那边也一直支持老图
+        # (见 codegen/services.py 的 `_ui_design_nodes`)。
         _cls.gk_tree_type = UI_TREES
+        _cls.gk_menu_hidden_trees = ("GKGameLogicTree",)
         # 『界面_套用设计』按这个标记挑节点,见 codegen.services._ui_design_nodes
         _cls.gk_ui_builder = True
         _cls.gk_prop_defs = tuple(_cls.gk_prop_defs) + (

@@ -65,18 +65,66 @@ def find_godot():
     return shutil.which("godot")
 
 
-def make_scene(shader_names):
+def shader_kind(path):
+    """读一个 .gdshader 的 `shader_type`(决定它该怎么挂上去编译)。
+
+    ── 为什么需要分类型(第一百三十三轮)──────────────────────────────
+    天空盒着色器是 `shader_type sky` —— 它只能挂在
+    `WorldEnvironment -> Environment.sky -> Sky.sky_material` 上。
+    以前这里一律挂成 MeshInstance3D 的 `material_override`,天空着色器
+    那样挂会被 Godot 当成"用错了地方",编译信息里出现一堆和着色器本身
+    无关的报错(或者干脆不编译)—— 那这条校验对它就等于没做。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return "spatial"
+    match = re.search(r"^\s*shader_type\s+([a-z_]+)\s*;", text, re.MULTILINE)
+    return match.group(1) if match else "spatial"
+
+
+def make_scene(shader_names, kinds=None):
     """建一个引用所有待测着色器的场景。
 
     load_steps = ext_resource 数 + sub_resource 数 + 1
+
+    `kinds` 形如 {文件名: shader_type};`sky` 的那几个改挂到 WorldEnvironment
+    的天空上(见 `shader_kind` 的说明),其余的照旧当网格材质。
     """
+    kinds = kinds or {}
     ext_lines = []
     sub_lines = []
     node_lines = []
+    sky_index = 0
     for index, name in enumerate(shader_names):
         ext_lines.append(
             f'[ext_resource type="Shader" path="res://shaders/{name}" id="s{index}"]'
         )
+        if kinds.get(name) == "sky":
+            mat_id = f"skymat{sky_index}"
+            sky_id = f"gksky{sky_index}"
+            env_id = f"gkenv{sky_index}"
+            sky_index += 1
+            sub_lines.append(
+                f'[sub_resource type="ShaderMaterial" id="{mat_id}"]\n'
+                f'shader = ExtResource("s{index}")'
+            )
+            sub_lines.append(
+                f'[sub_resource type="Sky" id="{sky_id}"]\n'
+                f'sky_material = SubResource("{mat_id}")'
+            )
+            # background_mode = 2 是 Godot 的 BG_SKY(真机核对过的枚举值)
+            sub_lines.append(
+                f'[sub_resource type="Environment" id="{env_id}"]\n'
+                f'background_mode = 2\n'
+                f'sky = SubResource("{sky_id}")'
+            )
+            node_lines.append(
+                f'[node name="SkyWorld{sky_index}" type="WorldEnvironment" parent="."]\n'
+                f'environment = SubResource("{env_id}")'
+            )
+            continue
         sub_lines.append(
             f'[sub_resource type="ShaderMaterial" id="m{index}"]\n'
             f'shader = ExtResource("s{index}")'
@@ -164,21 +212,28 @@ def verify(argv):
             h.write(PROJECT_GODOT)
 
         names = []
+        kinds = {}
         for target in targets:
             name = os.path.basename(target)
             shutil.copy2(target, os.path.join(work, "shaders", name))
             names.append(name)
+            kinds[name] = shader_kind(target)
         for name, code in embedded:
             with open(os.path.join(work, "shaders", name), "w",
                       encoding="utf-8", newline="\n") as h:
                 h.write(code)
             names.append(name)
+            kinds[name] = "canvas_item"
         if embedded:
             print("内嵌着色器(写在 codegen/services.py 里):"
                   + "、".join(n for n, _ in embedded))
 
         with open(os.path.join(work, "main.tscn"), "w", encoding="utf-8", newline="\n") as h:
-            h.write(make_scene(names))
+            h.write(make_scene(names, kinds))
+        sky_names = [n for n in names if kinds.get(n) == "sky"]
+        if sky_names:
+            print("天空着色器(挂到 WorldEnvironment 的天空上):"
+                  + "、".join(sky_names))
 
         proc = subprocess.run(
             [godot, "--headless", "--path", work, "--import"],

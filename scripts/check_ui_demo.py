@@ -102,11 +102,21 @@
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+# ⚠ Windows 控制台默认 GBK,`✗`(U+2717)一打印就 UnicodeEncodeError ——
+#   于是**失败信息本身**被一段 Traceback 顶掉,门禁里看到的是"自查脚本崩了"
+#   而不是"哪一条不对"(第一百三十一轮在 `make_node_docs.py` 踩过同一个坑)。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -167,6 +177,20 @@ func _check_startup_resume() -> void:
 		" mouse=", Input.mouse_mode)
 
 
+## 『界面_设置』:血条被**每物理帧**刷成半透明(0.6)。
+##
+## ⚠ 为什么不能挤在 `_check_widgets()` 里(第一百三十四轮)────────────
+## 这个示例开局是"选单态" —— 世界是**暂停**的(`UI_STARTUP paused=true`),
+## 而角色的 `_physics_process` 在暂停期间整个停摆:那条"每帧刷透明度"的链
+## 一次都没跑过,控件当然还是 1.0。原来这条在阶段 0(0.35 秒)就断言,
+## 于是**必然假红**(真机复现:等世界解冻,alpha 立刻变 0.6)。
+## 现在放进"对话点完、世界刚解冻"那一阶段(阶段 3)看。
+func _check_set_alpha() -> void:
+	var bar := _widget("血条")
+	var alpha_ok := bar != null and absf(bar.modulate.a - 0.6) < 0.02
+	print("UI_SET ok=", alpha_ok, " alpha=", bar.modulate.a if bar != null else -1.0)
+
+
 func _physics_process(delta: float) -> void:
 	elapsed += delta
 	if phase == 0 and elapsed >= 0.35:
@@ -188,6 +212,8 @@ func _physics_process(delta: float) -> void:
 		phase = 4
 		_check_dialog_done()
 		_check_startup_resume()
+		# 世界刚解冻 -> 这时候才看得到"每物理帧刷透明度"的效果
+		_check_set_alpha()
 		# 对话结束后的那两步:输入框淡入 + 焦点交给它(都在 1.4 秒前跑完)
 		_check_focus_and_tween()
 		_send_key(KEY_ESCAPE, true)           # 按住 Esc(热键是每帧轮询的)
@@ -603,10 +629,8 @@ func _check_widgets() -> void:
 		center_note = "rect_center=" + str(rect_center) + " view_center=" + str(view_center)
 	print("UI_MENU_CENTER ok=", center_ok, " ", center_note)
 
-	# 界面_设置:血条被每物理帧刷成半透明(0.6)
-	var bar := _widget("血条")
-	var alpha_ok := bar != null and absf(bar.modulate.a - 0.6) < 0.02
-	print("UI_SET ok=", alpha_ok, " alpha=", bar.modulate.a if bar != null else -1.0)
+	# 界面_设置(血条透明度)那一条**不在这里看** —— 挪到 `_check_set_alpha()`,
+	# 等世界解冻之后再断言(原因写在那个函数上)
 
 	# ── 第四十轮:设计图(套用式)─────────────────────────────────
 	# 右上角 HUD 的三个控件**不在玩法图里**,是『界面_套用设计』从设计图
@@ -925,8 +949,12 @@ func _check_choice_shown() -> void:
 	var two := _widget("选择2")
 	var three := _widget("选择3")
 	var shown: bool = panel != null and panel.visible
+	# ⚠ 问题文字**不是逐字相等**:运行时会在后面接一句按键提示
+	#   (「(按 1-3 选择)」—— 第六十四轮起选项也能用数字键 1~6 选),
+	#   所以判据是"以示例里写的那句开头"(以前卡的是 `==`,一出提示就假红)。
+	var question_text: String = question.text if question != null else ""
 	var ok: bool = shown and question != null \\
-		and question.text == "你怎么做？" \\
+		and question_text.begins_with("你怎么做？") \\
 		and one != null and two != null and three != null
 	print("UI_CHOICE_SHOWN ok=", ok, " panel=", shown,
 		" question=", question.text if question != null else "<none>",
@@ -1340,8 +1368,22 @@ def main():
         ok = False
 
     # ── 生成物层面的证据 ────────────────────────────────────────────
-    script_path = os.path.join(OUT, "scripts", "game_logic.gd")
-    if os.path.isfile(script_path):
+    # ⚠ 别写死文件名(第一百三十四轮):这一关的逻辑图是**角色预设**建的
+    #   (界面行为也摆在它上面),导出名跟着"场景_角色"走 —— 单场景工程是
+    #   `game_logic_World_char.gd`(角色名是中文,压成 `char`)。
+    #   原来这里卡着 `scripts/game_logic.gd`,功能全对也照样红,而且红在
+    #   "没找到生成的脚本"这种看不出所以然的地方。
+    candidates = sorted(glob.glob(os.path.join(OUT, "scripts", "game_logic*.gd")))
+    script_path = ""
+    for path in candidates:
+        with open(path, "r", encoding="utf-8") as handle:
+            probe_code = handle.read()
+        if "_gk_apply_pause(" in probe_code:
+            script_path = path
+            break
+    if not script_path and candidates:
+        script_path = candidates[0]
+    if script_path and os.path.isfile(script_path):
         with open(script_path, "r", encoding="utf-8") as handle:
             code = handle.read()
         for needle, why in (
@@ -1433,9 +1475,13 @@ def main():
         # ---- 第四十六轮:选完之后"把鼠标锁回去"必须是**显式**的一句 ──
         # ⚠ 无头模式验不了 mouse_mode(设 CAPTURED 仍是 0),所以这一半
         #   用生成代码验;而且**顺序**要对:收起对话 -> 继续世界 -> 锁鼠标。
+        # ⚠ 中间允许多一行 `if not _gk_god_camera_active():`(第一百三十一轮
+        #   给鼠标模式加了上帝机守卫:上帝视角里不该抢光标)。原来那条正则
+        #   要求三行**紧挨**,于是加守卫那一刻就成了假红。
         if not re.search(
                 r"_gk_dialog_hide\(\)\s*\n\s*_gk_apply_pause\(false, \"\", true\)"
-                r"\s*\n\s*Input\.mouse_mode = Input\.MOUSE_MODE_CAPTURED", code):
+                r"\s*\n\s*(?:if not _gk_god_camera_active\(\):\s*\n\s*)?"
+                r"Input\.mouse_mode = Input\.MOUSE_MODE_CAPTURED", code):
             print("✗ 生成代码里没有『收起对话 -> 继续世界 -> 锁回鼠标』这一串"
                   "(开局选单态的收尾少了 / 顺序不对)")
             ok = False

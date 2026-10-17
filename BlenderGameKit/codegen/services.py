@@ -614,6 +614,134 @@ def _stmt_screen_flash(ctx, node, indent):
     ctx.add_line(indent, f"{tween_var}.tween_callback({rect_var}.queue_free)")
 
 
+@stmt_node("GKNodeEyeOpenPlay")
+def _stmt_eye_open_play(ctx, node, indent):
+    """『后期_播放睁眼』—— 让这一关的后期层播一次眼皮张开。
+
+    ── 为什么是"找组里的节点"而不是直接调用 ──────────────────────────
+    后期层是**环境脚本**建的(挂在场景根上,见 asset_export._post_block),
+    而这张卡在**角色/关卡的逻辑脚本**里 —— 两个脚本不是同一个节点。
+    环境脚本在 `_gk_post_ready()` 里把自己加进 `gk_post` 组,这里按组找,
+    和『相机_震动』按 `gk_camera` 组找相机是同一个套路
+    (不按节点名找:名字用户会改)。
+
+    ⚠ 找不到就**安静跳过**:逻辑图可能在还没建好后期层的那一帧就跑到了
+      这里(或者这个工程压根没画『游戏环境与后期』图)。报错会把
+      "没配后期"变成"游戏报错",那不是用户要的。
+    """
+    post_var = ctx.new_temp("post")
+    ctx.add_line(indent, "var %s := get_tree().get_first_node_in_group(\"gk_post\")"
+                 % post_var)
+    ctx.add_line(indent, "if %s != null and %s.has_method(\"_gk_post_play_eye\"):"
+                 % (post_var, post_var))
+    # 第一百三十七轮:『时长』引脚接上/填了就**盖过**卡上的持续时间
+    # (用户原话:"逻辑触发要加上逻辑节点引脚的")。
+    seconds = ctx.input_number(node, "时长", "")
+    if str(seconds).strip() in ("", "0", "0.0"):
+        ctx.add_line(indent + 1, "%s._gk_post_play_eye()" % post_var)
+    else:
+        ctx.add_line(indent + 1,
+                     "%s._gk_post_play_eye(float(%s))" % (post_var, seconds))
+
+
+@stmt_node("GKNodeDayNightSet")
+def _stmt_daynight_set(ctx, node, indent):
+    """『环境_昼夜设置』—— 改这一关的时间:跳时刻 / 暂停 / 继续 / 设流速。
+
+    ── 为什么是"找组里的节点"(和『后期_播放睁眼』同一个套路)──────────
+    昼夜循环跑在**环境脚本**上(挂在场景根,见 `asset_export._daynight_lines`),
+    而这张卡在角色 / 关卡的逻辑脚本里 —— 两个脚本不是同一个节点。
+    环境脚本在 `_gk_daynight_setup()` 里把自己加进 `gk_daynight` 组,
+    这里按组找(不按节点名找:名字用户会改)。
+
+    ⚠ 找不到就**安静跳过**:这一关可能压根没画『游戏环境与后期』图,
+      或者那一帧还没建好 —— 报错会把"没配昼夜"变成"游戏报错"。
+    """
+    action = str(getattr(node, "gk_action", "SET_TIME") or "SET_TIME")
+    target = ctx.new_temp("daynight")
+    ctx.add_line(indent, "var %s := get_tree().get_first_node_in_group(\"gk_daynight\")"
+                 % target)
+    ctx.add_line(indent, "if %s != null:" % target)
+    if action == "PAUSE":
+        ctx.add_line(indent + 1, "%s._gk_daynight_pause(true)" % target)
+    elif action == "RESUME":
+        ctx.add_line(indent + 1, "%s._gk_daynight_pause(false)" % target)
+    elif action == "SPEED":
+        value = _tunable_number(ctx, node, "值", "1.0", "daynight_speed")
+        ctx.add_line(indent + 1, "%s._gk_daynight_set_speed(%s)" % (target, value))
+    else:
+        value = _tunable_number(ctx, node, "值", "12.0", "daynight_hour")
+        ctx.add_line(indent + 1, "%s._gk_daynight_set_time(%s)" % (target, value))
+
+
+# ── 环境状态 <-> 逻辑图(第一百四十二轮)────────────────────────────
+# 这几张卡和『环境_昼夜设置』同一个套路:环境脚本在 `gk_env` 组里,
+# 逻辑卡按组找它、调公开方法(`_gk_env_*`)。找不到就安静跳过。
+def _env_target(ctx, indent):
+    """栽一个"这棵树上/这一关的环境脚本"临时变量,返回 (语句前缀, 变量名)。"""
+    target = ctx.new_temp("env")
+    ctx.add_line(indent, "var %s := get_tree().get_first_node_in_group(\"gk_env\")"
+                 % target)
+    return target
+
+
+@stmt_node("GKNodeEnvRead")
+def _stmt_env_read(ctx, node, indent):
+    """『环境_读取』—— 把环境状态读进一个变量(时间 / 档位 / 是否白天 / 夜晚度 / 天气)。"""
+    kind = str(getattr(node, "gk_read_kind", "HOUR") or "HOUR")
+    name = str(getattr(node, "gk_var_name", "") or "").strip() or "环境时间"
+    is_text = kind in ("STATE", "WEATHER")
+    var = ctx.declare_var(name, "String" if is_text else "float")
+    getter = {
+        "STATE": "_gk_env_get_state()",
+        "IS_DAY": "_gk_env_get_is_day()",
+        "NIGHT": "_gk_env_get_night()",
+        "WEATHER": "_gk_env_get_weather()",
+    }.get(kind, "_gk_env_get_hour()")
+    target = _env_target(ctx, indent)
+    ctx.add_line(indent, "if %s != null:" % target)
+    ctx.add_line(indent + 1, "%s = %s.%s" % (var, target, getter))
+
+
+@stmt_node("GKNodeEnvSetTime")
+def _stmt_env_set_time(ctx, node, indent):
+    """『环境_设置时间』—— 把这一关的时间跳到某个时刻。"""
+    value = _tunable_number(ctx, node, "时刻", "12.0", "env_hour")
+    target = _env_target(ctx, indent)
+    ctx.add_line(indent, "if %s != null:" % target)
+    ctx.add_line(indent + 1, "%s._gk_env_set_time(%s)" % (target, value))
+
+
+@stmt_node("GKNodeEnvSetSpeed")
+def _stmt_env_set_speed(ctx, node, indent):
+    """『环境_设置流速』—— 时间走多快(1 = 正常,0 = 停)。"""
+    value = _tunable_number(ctx, node, "倍速", "1.0", "env_speed")
+    target = _env_target(ctx, indent)
+    ctx.add_line(indent, "if %s != null:" % target)
+    ctx.add_line(indent + 1, "%s._gk_env_set_speed(%s)" % (target, value))
+
+
+@stmt_node("GKNodeEnvClock")
+def _stmt_env_clock(ctx, node, indent):
+    """『环境_暂停时钟』—— 暂停 / 继续这一关的时间。"""
+    action = str(getattr(node, "gk_clock_action", "PAUSE") or "PAUSE")
+    frozen = "true" if action == "PAUSE" else "false"
+    target = _env_target(ctx, indent)
+    ctx.add_line(indent, "if %s != null:" % target)
+    ctx.add_line(indent + 1, "%s._gk_env_pause_clock(%s)" % (target, frozen))
+
+
+@stmt_node("GKNodeEnvSetWeather")
+def _stmt_env_set_weather(ctx, node, indent):
+    """『环境_切换天气』—— 晴 / 阴 / 雨 / 雾,带过渡。"""
+    weather = str(getattr(node, "gk_weather_set", "RAINY") or "RAINY")
+    fade = float(getattr(node, "gk_weather_fade", 2.0) or 0.0)
+    target = _env_target(ctx, indent)
+    ctx.add_line(indent, "if %s != null:" % target)
+    ctx.add_line(indent + 1, '%s._gk_env_set_weather("%s", %s)'
+                 % (target, weather, max(0.0, fade)))
+
+
 @stmt_node("GKNodeScreenFade")
 def _stmt_screen_fade(ctx, node, indent):
     color = getattr(node, "gk_color", (0.0, 0.0, 0.0, 1.0))
@@ -777,6 +905,18 @@ def _ui_place(ctx, indent, widget, node, def_x, def_y, size_mode="keep"):
 # 为什么不按名字硬编码("章节卡" / "字幕"):控件的**名字是用户起的**,
 # 中文名更是随便改;按名字写死在生成器里,换个工程就失效。
 UI_TRANSIENT_GROUP = "gk_ui_transient"
+
+# ── 运行时才造出来的"故事面板"也要让位给暂停菜单(第一百三十四轮)────
+# 对话框 / 选择框 / 字幕(和对话框共用一块面板)/ 对话历史 这四块面板
+# **不是**用户摆的控件节点,而是 helper 在运行中 `Panel.new()` 造出来的 ——
+# `_ui_looks_transient()` 那种"按节点属性判定"的自动判定抓不到它们。
+# 于是就有了用户截图里那一幕:按 Esc 弹出暂停菜单,底下的**选择框还在**
+# (只是被压暗),而且界面根是 PROCESS_MODE_ALWAYS,点选项照样把剧情选下去
+# (用户原话:"暂停时也可以进行剧情选择,并且不会冻结时间")。
+# 修法:生成 helper 时把面板挂进 `gk_ui_transient` 组 —— 暂停时
+# `_gk_hide_transient(true)` 按组整批收起,继续游戏再原样还原。
+UI_STORY_PANEL_NODES = ("GKNodeUiDialog", "GKNodeUiChoice",
+                        "GKNodeUiSubtitle", "GKNodeDialogHistory")
 
 
 def _ui_looks_transient(node):
@@ -1293,6 +1433,35 @@ def _stmt_ui_pause(ctx, node, indent):
     hotkey = bool(getattr(node, "gk_hotkey", True))
     # 暂停状态的那几个成员变量(只声明一次;名字固定,同图共享)
     ctx.declare_var("_gk_pause_mouse_was", "int", initial="-1")
+    # ── 谁在冻世界(第一百三十四轮)────────────────────────────────
+    # 剧情(过场 / 对话 / 结局)和玩家按 Esc 开的暂停菜单**共用同一个
+    # `tree.paused`,必须分开记账,否则剧情冻着时按一下 Esc 就把剧情
+    # 解冻了(真机:剧情自己跑起来、选择框照样能点 —— 用户第 134 轮报的)。
+    # ⚠ 这一笔账挂在 **SceneTree 的 meta** 上,不是本脚本的成员变量:
+    #   冻世界的是**这一关的逻辑图**(它调 `_gk_apply_pause(true, "", ...)`),
+    #   而读 Esc 的往往是**主界面**那份脚本(跨场景常驻)。各记各的账就
+    #   等于没记 —— 主界面那份会以为"世界没冻",一按 Esc 把剧情解掉。
+    ctx.declare_var("_gk_pause_menu_open", "bool", initial="false")
+    # ── 光标这一套(第一百三十七轮)──────────────────────────────────
+    # 用户原话:"这是界面之间的显示关系,鼠标的显示冷却不应该加上去的,
+    # 它只有有界面才显示,没有就隐藏,除非按住 alt 键。"
+    # `_gk_mouse_wanted` = "这张图希望我们管光标"(节点上的『放出鼠标』),
+    # 默认 false:作者没要求就一个字都不改(老图行为不变)。
+    ctx.declare_var("_gk_mouse_wanted", "bool", initial="false")
+    # ── 收起菜单后"过场面板"的冷却(用户 2026-10-16 的建议)────────────
+    # 用户原话:"我建议是在打开 esc 后冷却几秒再显示剧情选项,这样就可以避免,
+    # 并且多次打开就多次重置冷却时间" —— 玩家点『继续游戏』时鼠标往往正停在
+    # 刚才那块地方,剧情面板立刻回来会被下一击顺手点掉(选到剧情选项 /
+    # 继续对话)。取**第一个**填这个值的节点(和 `_gk_pause_menu` 一个规矩)。
+    if not getattr(ctx, "_pause_cooldown_taken", False):
+        ctx._pause_cooldown_taken = True
+        try:
+            cooldown = float(getattr(node, "gk_resume_cooldown", 1.0))
+        except (TypeError, ValueError):
+            cooldown = 1.0
+        cooldown = max(0.0, min(30.0, cooldown))
+        ctx.declare_var("_gk_pause_resume_cooldown", "float",
+                        initial=gd_number(cooldown))
     if hotkey:
         # 监听用到的两个状态变量只在**勾了热键**时声明 —— 没勾时它们
         # 是没人读的成员变量(白占一行)

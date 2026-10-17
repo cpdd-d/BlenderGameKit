@@ -432,6 +432,17 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
         row = box.row(align=True)
         row.prop(settings, "env_bg_color", text="")
         row.operator("gk.env_from_world", text="", icon="WORLD")
+        # ── 天空参与环境光(第 124 轮:真机实测「纯色模式下不读」)────────
+        # 『天空参与环境光』= 环境光里天空占多少。Godot 只在**天空**背景模式
+        # 下读它 —— 纯色背景下实测完全无效(见 ENV_AMBIENT_SOURCES 那段真机
+        # 标定),所以纯色时把这一行灰掉:能调但没反应比看不见更让人困惑。
+        # 放在『背景』这一组里,因为"能不能用"取决于上面的背景模式。
+        sky_mode = str(getattr(settings, "env_background", "COLOR")) == "SKY"
+        row = box.row(align=True)
+        row.enabled = sky_mode
+        row.prop(settings, "env_ambient_sky_contribution", text="天空参与环境光")
+        box.label(text="只在天空模式下生效(Godot 在纯色模式下不读它)",
+                  icon="INFO") if not sky_mode else None
 
         box = detail.box()
         box.label(text="环境光(全局补光)", icon="LIGHT")
@@ -450,6 +461,23 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
         if bool(getattr(settings, "env_fog", False)):
             row.prop(settings, "env_fog_color", text="")
             box.prop(settings, "env_fog_density", text="浓度")
+            # ── 第 124 轮:雾的三个"够不着的旋钮"接上来 ────────────────
+            # 真机实测(示例走廊,帧均值亮度):雾开着的出厂画面 0.3803,
+            # 其中 `fog_sky_affect = 0` -> 0.3460、`fog_light_energy = 0.25`
+            # -> 0.2599。也就是说**雾亮度是仅次于密度的雾杠杆**,而它以前
+            # 在卡上根本没有位置 —— 导出器补了键,这里才够得着。
+            #
+            # 『雾盖背景』的默认值 = Godot 出厂值 1.0(**不替老工程改观感**:
+            # 实测一刀切成 0 会把恐怖示例整帧压暗 70%,而那个示例的背景本就
+            # 近黑)。推荐值是 0(背景色真的看得见、和 Blender 预览一致),
+            # 所以在下面标一行提示 —— 但不加警告图标:1.0 是 Godot 的出厂
+            # 行为,不是"填错了"。
+            box.prop(settings, "env_fog_sky_affect", text="雾盖背景")
+            box.label(text="0 = 背景色照常看得见(推荐,和预览一致);"
+                           "1 = 雾色整个盖住背景(Godot 出厂行为)",
+                      icon="INFO")
+            box.prop(settings, "env_fog_light_energy", text="雾亮度")
+            box.prop(settings, "env_fog_aerial_perspective", text="远景空气感")
             # 雾色偏暖 + 浓度高 = 那种"土黄的中世纪空气感"(用户实测的那张图)。
             fog_c = tuple(getattr(settings, "env_fog_color", (0.3, 0.34, 0.42, 1.0)))
             if len(fog_c) >= 3 and fog_c[0] > fog_c[2] + 0.05 and \
@@ -463,11 +491,39 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
         if bool(getattr(settings, "env_glow", False)):
             box.prop(settings, "env_glow_intensity", text="强度")
             box.prop(settings, "env_glow_bloom", text="溢出")
+            # ── 第 124 轮:泛光的**真扳机**接上来 ─────────────────────
+            # 实测:`glow_enabled=false` 只让整帧从 0.3803 掉到 0.3547 ——
+            # 泛光几乎是死的。因为 Godot 的门槛默认 1.0(只有超过白点的像素
+            # 才发光),而导出器以前**根本没写这两个键**。
+            # `glow_hdr_threshold=0 + glow_strength=3` 一开 -> 0.7247。
+            # 所以这两项要挨着、而且要提醒用户它们是**一对**:只动一个多半
+            # 看不出变化(用户的第一反应会是"泛光坏了")。
+            box.prop(settings, "env_glow_strength", text="泛光力度")
+            box.prop(settings, "env_glow_threshold", text="泛光门槛")
+            box.prop(settings, "env_glow_blend", text="泛光混合")
+            if float(getattr(settings, "env_glow_threshold", 1.0)) >= 0.99 and \
+                    float(getattr(settings, "env_glow_strength", 1.0)) <= 1.01:
+                box.label(text="力度 / 门槛都还在出厂值 —— 泛光几乎看不出来;"
+                               "门槛降到 0.6~0.9、力度拉到 2~3",
+                          icon="INFO")
 
         box = detail.box()
         box.prop(settings, "env_tonemap", text="色调映射")
         box.label(text="ACES 会把颜色压灰;二次元一般用 Linear",
                   icon="INFO") if str(getattr(settings, "env_tonemap", "")) == "ACES" else None
+        # ── 第 124 轮:曝光 / 白点(色调映射的两个"够不着的旋钮")────────
+        # `tonemap_exposure` 是**全局曝光倍率**(1.0 = 不变),导出器永远写它
+        # —— 任何模式下都有效,所以不加灰显。
+        # `tonemap_white` 只有**非 LINEAR** 才有意义:Godot 在 LINEAR 下直接
+        # 忽略白点(写了也不读)。所以线性时把这一行灰掉,而不是让用户调了
+        # 半天没反应再来问"为什么不动"。
+        box.prop(settings, "env_tonemap_exposure", text="曝光")
+        linear = str(getattr(settings, "env_tonemap", "LINEAR")) == "LINEAR"
+        row = box.row(align=True)
+        row.enabled = not linear
+        row.prop(settings, "env_tonemap_white", text="白点")
+        box.label(text="线性(Linear)下 Godot 不读白点 —— 换一种色调映射才有意义",
+                  icon="INFO") if linear else None
         box.prop(settings, "render_quality")
         row = box.row(align=True)
         row.prop(settings, "env_ssao")

@@ -23,6 +23,19 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gk_probe import find_logic_script  # noqa: E402
+
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_curve", "曲线时间轴示例_godot")
@@ -72,6 +85,13 @@ var dbg_text_ok := false
 
 
 func _ready() -> void:
+	# ⚠ 探针必须**暂停里照跑**(第一百三十四轮补):第一百三十一轮起,
+	#   进上帝机 = `get_tree().paused = true`(全局冻结)。探针默认
+	#   process_mode 是 Inherit,一按 Tab 连探针自己都被冻住 ——
+	#   表现是"跑到 4.6 秒就不动了",后面 Tab / X·B·Z / K·L·J / F1·F2
+	#   那一串断言全变成"没跑到"(真机复现:日志停在
+	#   `[GK] 上帝机: 全局冻结`,DEMO_RESULT 一行都没打)。
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	world = load("res://scenes/World.tscn").instantiate()
 	add_child(world)
 	for node in world.find_children("*", "", true, false):
@@ -526,7 +546,9 @@ def main():
               [line for line in text.splitlines() if "DEMO_ASSET" in line])
         ok = False
     # ── 粒子特效(需求 5,2026-10-05 第二十一轮)──────────────────────
-    script_path = os.path.join(OUT, "scripts", "game_logic.gd")
+    # 逻辑图可能是关卡图也可能是**角色图**，导出名跟着变 —— 别写死文件名
+    # (详见 scripts/_gk_probe.py 的说明)
+    script_path = find_logic_script(OUT)
     # ① 现象:三个发射器都在(GPU 火焰 / CPU 烟雾 / 一次性火花),
     #    火星勾了『不显示本体网格』-> 场景里不该有它的网格;
     if not re.search(r"DEMO_FX torch=true proc=true draw=true emitting=true "

@@ -285,12 +285,11 @@ def main():
         # 只测"不抛异常"不够:draw 半路 return 也不抛异常,但按钮同样没有。
         check(f"{class_name} 画出了按钮", button_count >= len(wanted),
               f"operator 调用次数={button_count},期望至少 {len(wanted)}")
-        # ── 第六十三轮:『预设』那个按钮**必须真的画出来** ─────────────
-        # 它以前是"画了,但算子在不在没人管" —— 结果算子忘了登记,
-        # Blender 静默跳过,盒子里只剩一行说明文字(用户:"显示得没意义")。
+        # ── 第一百三十九轮:预设盒删了(用户:"预设:全删了,计划在右键
+        #    菜单中添加")—— 这里反过来钉"侧栏里没有它",免得哪天又长回来。
         if class_name == "GK_PT_Main":
-            check("『预设』盒子的『生成第三人称角色』按钮画出来了",
-                  "gk.character_preset" in layout.operator_names,
+            check("『预设』按钮不在侧栏了(第一百三十九轮删的)",
+                  "gk.character_preset" not in layout.operator_names,
                   str(sorted(set(layout.operator_names))))
 
     # ---- 4. 『游戏显示』设置图的面板(第四十二轮)----
@@ -381,10 +380,73 @@ def main():
                 break
         check("两张音乐设置卡的 draw_buttons 都能画完", not card_error,
               card_error)
-        bpy.data.node_groups.remove(music)
-    except Exception as exc:
+    except Exception as exc:                              # noqa: BLE001
         check("『游戏音乐』面板", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
+    finally:
+        bpy.data.node_groups.remove(music)
+
+    # ---- 4c. 『游戏环境与后期』侧栏:关卡打勾 / 灯光倍率 / 一键贴近(第 137 轮)----
+    print("=" * 72)
+    print("4c. 『游戏环境与后期』侧栏(关卡打勾 + 灯光倍率 + 一键贴近运行)")
+    print("=" * 72)
+    panel = getattr(ui, "GK_PT_EnvLibrary", None)
+    env_tree = bpy.data.node_groups.new("面板冒烟环境137", "GKEnvLibraryTree")
+    try:
+        if panel is None:
+            check("GK_PT_EnvLibrary 存在", False, "类找不到")
+        else:
+            layout = RecordingLayout()
+            holder = type("P", (), {"layout": layout})()
+            panel.draw(holder, FakeNodeContext(cube, scene, env_tree))
+            names = sorted(set(layout.operator_names))
+            texts = " ".join(layout.texts)
+            # 用户第 ①③④ 条要的三样:关卡打勾、灯光倍率(搬家)、一键贴近
+            check("侧栏画出『要一起改的关卡(打勾)』",
+                  "要一起改的关卡(打勾)" in texts, texts[:300])
+            check("侧栏画出全选 / 全不选",
+                  "gk.look_pick_all" in names and "gk.look_pick_none" in names,
+                  str(names))
+            check("侧栏画出『套给勾选的关卡』",
+                  "gk.env_apply_to_checked" in names, str(names))
+            check("侧栏画出『一键贴近运行画面』",
+                  "gk.look_match_runtime" in names, str(names))
+            check("灯光倍率搬到这个侧栏了(倍率滑块在)",
+                  "倍率" in texts, texts[:300])
+            # 第一百三十八轮:快速调色 / 曝光组(用户第 ④ 条)
+            check("侧栏画出『快速调色 / 曝光』盒",
+                  "快速调色" in texts, texts[:400])
+            check("快速调色里有 色调映射 / 曝光 / 雾 / 泛光",
+                  all(word in texts for word in ("曝光", "雾", "泛光")),
+                  texts[:400])
+            settings = getattr(scene, "gk_settings", None)
+            check("场景设置里有 look_target(打勾用的字段)",
+                  settings is not None and hasattr(settings, "look_target"), "")
+            # 第一百三十八轮:逐灯『预览补偿』滑块(给灯光盒用)
+            lamp = bpy.data.objects.new(
+                "面板冒烟灯138", bpy.data.lights.new("面板冒烟灯数据138", "POINT"))
+            scene.collection.objects.link(lamp)
+            try:
+                layout2 = RecordingLayout()
+                holder2 = type("P", (), {"layout": layout2})()
+                panel.draw(holder2, FakeNodeContext(cube, scene, env_tree))
+                check("灯光盒里画出了『预览』补偿那一列",
+                      "预览" in layout2.texts, str(layout2.texts)[:400])
+                check("每盏灯都有 preview_scale 字段",
+                      hasattr(lamp.gk_light, "preview_scale"), "")
+            finally:
+                bpy.data.objects.remove(lamp, do_unlink=True)
+            # 新算子都注册上了
+            for name in ("look_pick_all", "look_pick_none",
+                         "env_apply_to_checked", "look_match_runtime",
+                         "light_preview_scale_reset"):
+                check(f"算子 gk.{name} 注册上了",
+                      hasattr(bpy.ops.gk, name), "")
+    except Exception as exc:                              # noqa: BLE001
+        check("『游戏环境与后期』侧栏", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+    finally:
+        bpy.data.node_groups.remove(env_tree)
 
     # ---- 4c. 『逻辑信息』盒子(第八十六轮:E 组 13)----
     # 默认收起 —— 强制展开,把"有事实 + 有体检"那条路真画一遍:
@@ -667,9 +729,14 @@ def main():
         panel = getattr(ui, "GK_PT_Main", None)
 
         def _draw_advisor():
+            # ⚠ 第一百三十九轮:『出问题了? / 项目顾问』**不再挂进侧栏**
+            #   (用户:"这个存在位置不太好,且 AI 的操作项目自由度差,全删了")。
+            #   所以这里直接调那个函数 —— 卡片本身还在,以后换个位置挂回去
+            #   时这段覆盖仍然有效。
             layout = RecordingLayout()
-            holder = type("P", (), {"layout": layout})()
-            panel.draw(holder, FakeContext(cube, scene))
+            # _draw_advisor_box 收的是 **layout**(不是面板 holder)
+            ui._draw_advisor_box(layout, FakeContext(cube, scene),
+                                 getattr(scene, "gk_settings", None))
             return layout
 
         # 一条建议:不该出现批量按钮(单条点它自己的『执行』就够了)
@@ -720,8 +787,8 @@ def main():
         draw_error = ""
         try:
             layout = RecordingLayout()
-            holder = type("P", (), {"layout": layout})()
-            panel.draw(holder, FakeContext(cube, scene))
+            ui._draw_advisor_box(layout, FakeContext(cube, scene),
+                                 getattr(scene, "gk_settings", None))
         except Exception as exc:                          # noqa: BLE001
             draw_error = f"{type(exc).__name__}: {exc}"
         texts = " ".join(str(item) for item in (layout.texts if layout else []))
@@ -827,79 +894,12 @@ def main():
         check("联机节点卡片(第一百轮)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
-    # ---- 6h. 『卡通材质』盒(第一百零一轮:高光贴图)----
-    # 盒子里有图片选择器 / 清除按钮 / 参数输入 + 一个"生成预览材质"按钮,
-    # 而且**分两条路**画(材质有没有高光参数)。属性名或算子名写错在
-    # Blender 里是当场抛异常、整块消失 —— 冒烟那层看不见画的事。
-    print("=" * 72)
-    print("6h. 『卡通材质』盒(第一百零一轮)")
-    print("=" * 72)
-    try:
-        npr_mod = import_module(f"{module_name}.npr_preview")
-        plain = bpy.data.materials.new("面板探针普通材质")
-        plain.use_nodes = True
-        toon = bpy.data.materials.new("面板探针高光材质")
-        toon.use_nodes = True
-        npr_mod.build_toon_material(toon.name, {"specular_amount": 0.8})
-        cube.data.materials.clear()
-        cube.data.materials.append(plain)
-        cube.data.materials.append(toon)
-        cube.active_material_index = 0
-
-        panel = getattr(ui, "GK_PT_Main", None)
-        obj_panel = getattr(ui, "GK_PT_ObjectPhysics", None)
-        check("GK_PT_ObjectPhysics 存在", obj_panel is not None)
-        layout = RecordingLayout()
-        holder = type("P", (), {"layout": layout})()
-        # ⚠ 用真面板:盒子挂在『游戏物理』面板上
-        obj_panel.draw(holder, FakeContext(cube, scene))
-        texts = " ".join(str(item) for item in layout.texts)
-        names = list(layout.operator_names)
-        check("『卡通材质』盒给两张贴图各画了一个图片选择器",
-              names.count("gk.pick_material_image") == 2, str(names))
-        check("还没填图时不画『清空』按钮(没东西可清)",
-              names.count("gk.clear_material_image") == 0, str(names))
-        check("『卡通材质』盒画出了『生成 / 刷新预览材质』",
-              "gk.rebuild_material_preview" in names)
-        check("『卡通材质』盒列出了两张贴图的槽位名和说明",
-              "高光形状贴图" in texts and "高光遮罩贴图" in texts
-              and "横向渐变" in texts and "白=留" in texts,
-              texts[:200])
-        check("当前材质是普通材质 -> 提示先建预览节点(不硬画读不到的属性)",
-              "还没建过预览节点" in texts, texts[-160:])
-
-        # 切到"有高光参数"的材质槽:参数输入行要画出来
-        cube.active_material_index = 1
-        layout = RecordingLayout()
-        holder = type("P", (), {"layout": layout})()
-        obj_panel.draw(holder, FakeContext(cube, scene))
-        texts = " ".join(str(item) for item in layout.texts)
-        check("切到有参数的材质 -> 画出高光参数行 + 刷新提示",
-              "高光强度" in texts and "高光大小" in texts
-              and "刷新预览材质" in texts,
-              texts[-200:])
-
-        # 填了一张贴图 -> 那一行多出『清空』按钮(只有有图的那行才有)
-        npr_mod.set_texture(toon, "specular_mask_texture", "面板探针图")
-        layout = RecordingLayout()
-        holder = type("P", (), {"layout": layout})()
-        obj_panel.draw(holder, FakeContext(cube, scene))
-        texts = " ".join(str(item) for item in layout.texts)
-        check("填了图的那一行画出『清空』按钮,另一行没有",
-              layout.operator_names.count("gk.clear_material_image") == 1,
-              str(layout.operator_names))
-        check("填了图之后画面上显示的是图片名",
-              "面板探针图" in texts, texts[-200:])
-        npr_mod.set_texture(toon, "specular_mask_texture", "")
-
-        check("『卡通材质』盒没把面板画崩(其它按钮还在)",
-              "gk.add_asset_instance" in layout.operator_names,
-              str(sorted(set(layout.operator_names)))[:200])
-        cube.data.materials.clear()
-    except Exception as exc:
-        check("『卡通材质』盒(第一百零一轮)", False,
-              f"{type(exc).__name__}: {exc}")
-        traceback.print_exc()
+    # ---- 6h. 『卡通材质』(高光)盒的测试已删除(第一百二十六轮)----
+    # 那一盒的**界面**被用户要求删掉了(原话:"物体属性的粒子与高光
+    # 都是之前做的但几乎没什么用,删了吧"),盒子没了,这 7 条自然
+    # 一起走。⚠ 只删了界面:材质上的高光属性、`npr_preview` 的贴图
+    # 读写、导出路径都还在 —— 所以这一节**不是**在测一个已删除的功能,
+    # 而是没有界面可测了。想恢复界面就从 git 历史取回那一盒。
 
     # ---- 第一百零三轮:界面设计图面板(拖动按钮 + 从 0 到 1 引导)------
     # 拖动按钮必须画出来(第 7 节还会自动验它是个真算子);引导那五行要
@@ -970,13 +970,12 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
-    # ---- 6j. 『导出设置』盒子的瘦身开关(第一百零六轮 B)----
-    # 这个盒子**默认收起**,新加的两个开关只在展开时才画 ——
-    # 属性名 / 参数写错在 Blender 里是当场抛异常、整个 GK_PT_Main 消失。
-    # 这里先把盒子展开再画一遍,顺带验 `text=` 的文字真画出来了
-    # (RecordingLayout 会把 text= 记进 texts)。
+    # ---- 6j. 『导出设置』盒**已删**(第一百三十九轮)----
+    # 用户原话:"导出设置:全删,理由同上(这些是默认行为)"。
+    # 这条改成"反过来钉":侧栏里不该再出现这两个开关与那句说明 ——
+    # 哪天有人把盒子加回来,这里会先红。
     print("=" * 72)
-    print("6j. 『导出设置』盒子(不导形态键 / 不导切线)")
+    print("6j. 『导出设置』盒已删(不该再画出来)")
     print("=" * 72)
     try:
         panel = getattr(ui, "GK_PT_Main", None)
@@ -993,12 +992,14 @@ def main():
             draw_error = f"{type(exc).__name__}: {exc}"
         finally:
             gk_settings.show_export_settings = previous
-        check("『导出设置』盒子加上两个瘦身开关后仍能画完", not draw_error,
+        check("精简后的侧栏仍能画完(GK_PT_Main 不抛异常)", not draw_error,
               draw_error)
         texts = " ".join(str(item) for item in (layout.texts if layout else []))
-        check("『导出设置』盒子画出了『不导形态键』", "不导形态键" in texts,
+        check("侧栏里没有『不导形态键』了", "不导形态键" not in texts,
               texts[:200])
-        check("『导出设置』盒子画出了『不导切线』", "不导切线" in texts,
+        check("侧栏里没有『不导切线』了", "不导切线" not in texts,
+              texts[:200])
+        check("侧栏里没有『导出设置』盒了", "导出设置" not in texts,
               texts[:200])
     except Exception as exc:
         check("『导出设置』盒子(第一百零六轮 B)", False,

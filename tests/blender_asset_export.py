@@ -168,8 +168,18 @@ def main():
         return 1
 
     # ---- 5. 复制着色器 ----
+    # ⚠ 别写死数量(这里原来是 `== 3`)。着色器会随功能增加 ——
+    #   第 125 轮就加了 `gk_post.gdshader`,写死的话每加一个都假红一次,
+    #   而"假红"最后会让人不再看这条测试。
+    #   真正的意图是"源目录里每一个 .gdshader 都被复制过去了",
+    #   所以判据改成**逐名对比源目录**,再单独钉一条"卡通着色器一定在里面"。
     shaders = asset_export.copy_shaders(out_dir)
-    check(f"复制 NPR 着色器 ({len(shaders)})", len(shaders) == 3, str(shaders))
+    source_dir = asset_export.shader_source_dir()
+    expected = sorted(n for n in os.listdir(source_dir) if n.endswith(".gdshader"))
+    copied = sorted(os.path.basename(path) for path in shaders)
+    check(f"复制 NPR 着色器 ({len(shaders)})", copied == expected,
+          f"复制了 {copied},源目录里是 {expected}")
+    check("卡通着色器一定复制了", "gk_toon.gdshader" in copied, str(copied))
 
     # ---- 6. 先导出一份脚本(模拟真实流程)----
     tree = bpy.data.node_groups.new("角色逻辑", "GKGameLogicTree")

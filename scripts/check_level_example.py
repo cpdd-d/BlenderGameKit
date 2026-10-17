@@ -27,6 +27,16 @@ import sys
 
 import bpy
 
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
@@ -223,6 +233,12 @@ var god_off := false
 
 
 func _ready() -> void:
+	# ⚠ 探针必须**暂停里照跑**(第一百三十四轮补):第一百三十一轮起,
+	#   进上帝机 = `get_tree().paused = true`(全局冻结)。探针默认
+	#   process_mode 是 Inherit,一按 Tab 整个世界(含探针自己)就停了 ——
+	#   表现是"探针跑到 phase 5 就不动了",后面三条断言全变成
+	#   "没找到那一行"。这不是游戏坏了,是探针被自己按的键冻住了。
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	world = load("res://scenes/关卡2.tscn").instantiate()
 	add_child(world)
 	var players := world.find_children("第二关角色", "CharacterBody3D", true, false)
@@ -357,6 +373,15 @@ var rounds := 0          # 0 = 还没找齐节点,1 = 报告过失败,2 = 找齐
 
 
 func _ready() -> void:
+	# 同上:上帝机会把整个世界冻住(第一百三十一轮),探针得照跑
+	process_mode = Node.PROCESS_MODE_ALWAYS
+	# ⚠ 光标必须是**捕获**状态(第一百三十四轮补):第一百三十轮起,上帝机
+	#   的转视角 / 滚轮缩放只在"光标被捕获"时生效(玩家按 Esc 开暂停菜单时
+	#   光标是自由的,那时候不该再转视角)。无头探针默认 `mouse_mode` 是
+	#   VISIBLE,于是滚轮被环境脚本**静默丢掉 + 清零** —— 表现是
+	#   `LEVEL_GOD_ZOOM ok=false before=75.0 after=75.0`(god=true,进得去,
+	#   就是缩不动)。真实游戏里进上帝机时光标本来就是捕获的,这里对齐它。
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	world = load("res://scenes/关卡1.tscn").instantiate()
 	add_child(world)
 
@@ -478,14 +503,21 @@ def _probe_line(text, prefix):
     return "没找到那一行"
 
 
-def _run_probe(stem, script_text, node_name, quit_after):
-    """把一份探针脚本塞进工程副本里无头跑一遍,返回 Godot 的输出。
+def _run_probe(stem, script_text, node_name, quit_after, windowed=False):
+    """把一份探针脚本塞进工程副本里跑一遍,返回 Godot 的输出。
 
     ── 两个探针共用这一段(第三十五轮抽出来的)──────────────────────
-    拷工程 → 写脚本 + 场景 → 把主场景临时指过去 → `--import` → 无头跑。
+    拷工程 → 写脚本 + 场景 → 把主场景临时指过去 → `--import` → 跑。
     坐电梯/开车那个(L2)和第二关那个(L2 的回归)走的是同一条流水线。
     找不到 Godot / 没导出过可玩工程时返回空串(调用方只打一句"跳过")——
     和别的自查脚本一个规矩:没有 Godot 不算失败。
+
+    ── `windowed`(第一百三十四轮补)─────────────────────────────────
+    默认 `--headless`(快,而且没有窗口弹出来)。可**无头模式下
+    `Input.mouse_mode` 设不进去**(DisplayServer 是 dummy,读回来永远是
+    VISIBLE),而第一百三十轮起上帝机的滚轮 / 转视角只在"光标被捕获"时
+    生效 —— 于是"滚轮缩放"那条断言在无头下**永远**测不到。
+    所以那条探针(probe3)要真窗口跑,和 `check_render_demo.py` 一个路子。
     """
     godot = os.environ.get("GK_GODOT", GODOT_DEFAULT)
     if not os.path.isdir(GAME_PROJECT_DIR):
@@ -494,6 +526,7 @@ def _run_probe(stem, script_text, node_name, quit_after):
     if not os.path.isfile(godot):
         print(f"[INFO] 找不到 Godot({godot})—— 运行时探针跳过")
         return ""
+    mode = [] if windowed else ["--headless"]
     if os.path.isdir(PROBE_DIR):
         shutil.rmtree(PROBE_DIR)
     shutil.copytree(GAME_PROJECT_DIR, PROBE_DIR,
@@ -516,12 +549,12 @@ def _run_probe(stem, script_text, node_name, quit_after):
     with open(project_file, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
 
-    subprocess.run([godot, "--headless", "--path", PROBE_DIR, "--import"],
+    subprocess.run([godot, *mode, "--path", PROBE_DIR, "--import"],
                    capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
     # ⚠ 无头模式主循环比物理快,`--quit-after` 数的是主循环次数:
     # 探针要等电梯 / 走一段路 / 切几次机位,给足余量。
-    run = subprocess.run([godot, "--headless", "--path", PROBE_DIR,
+    run = subprocess.run([godot, *mode, "--path", PROBE_DIR,
                           "--quit-after", str(quit_after)],
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
@@ -587,7 +620,11 @@ def run_god_probe():
     Tab 切进上帝机 -> 滚轮拉近(FOV 变小)-> F 附身 + W 让角色真的走 ->
     F 放开 -> Esc 退出游戏(靠 `[GK] ESC:退出游戏` 那条打印判定)。
     """
-    out = _run_probe("probe3", PROBE3_GD, "LevelGodProbe", 3000)
+    # ⚠ 这一份要**真窗口**(见 `_run_probe` 的 windowed 说明):上帝机的
+    #   滚轮 / 转视角按设计只在"光标被捕获"时生效,而无头模式里
+    #   `Input.mouse_mode` 根本设不进去。
+    out = _run_probe("probe3", PROBE3_GD, "LevelGodProbe", 3000,
+                     windowed=True)
     if not out:
         return []
     esc_quit = "[GK] ESC:退出游戏" in out
@@ -628,18 +665,34 @@ def main():
     check("第二关的角色『第二关角色』在场景里",
           "第二关角色" in names, str(sorted(names)))
 
-    # ---- 这个 .blend 里正好两个 Blender 场景,各指一棵逻辑图 ----
-    # "另一个关卡"必须是**真的 Blender 场景**(不是第二棵节点图),导出时
-    # 才会各出一张 .tscn。每个场景用哪棵逻辑图由它设置里的 logic_tree 决定。
-    scene_list = list(bpy.data.scenes)
-    check("这个 .blend 里正好两个 Blender 场景(关卡1 / 关卡2)",
-          len(scene_list) == 2, str([s.name for s in scene_list]))
-    for label, want_tree in (("关卡1", "玩家逻辑"), ("关卡2", "关卡2逻辑")):
+    # ── 每关的逻辑图挂在**角色**身上,场景自己不挂图(第一百三十四轮)─────
+    # 这里原来断言的是 `resolve_scene_tree()` 能解析出那棵树。可那棵树是
+    # 角色图:场景一认领,`logic_tree_scope()` 就把它判成 LEVEL →
+    # `object_logic_trees()` 拒绝"关卡图挂角色" → 角色拿不到脚本;
+    # 而场景根(glb 实例 = **Node3D**)却挂上 `extends CharacterBody3D` 的
+    # 场景脚本,Godot 直接报
+    #     ERROR: Script inherits from native type 'CharacterBody3D',
+    #            so it can't be assigned to an object of type 'Node3D'
+    # 整关逻辑一行都没跑 —— 这就是"第二关走路 / 上帝机"那几条运行时断言
+    # 一直红的原因(不是探针写错)。现在断言的是**正确的那条链**。
+    for label, want_tree, want_player in (("关卡1", "玩家逻辑", "示例角色"),
+                                          ("关卡2", "关卡2逻辑", "第二关角色")):
         scene_obj = bpy.data.scenes.get(label)
-        tree, why = exporter.resolve_scene_tree(scene_obj)
-        actual = getattr(tree, "name", None)
-        check(f"{label} 场景的逻辑图是『{want_tree}』", actual == want_tree,
-              f"{actual}({why})")
+        tree = bpy.data.node_groups.get(want_tree)
+        check(f"{label} 的角色图『{want_tree}』在", tree is not None)
+        if tree is not None:
+            check(f"{label} 的『{want_tree}』是角色图(ROLE)",
+                  exporter.logic_tree_scope(tree) == "ROLE",
+                  exporter.logic_tree_scope(tree))
+        player_obj = bpy.data.objects.get(want_player)
+        physics = getattr(player_obj, "gk_physics", None)
+        check(f"{label} 的『{want_player}』认领了『{want_tree}』",
+              str(getattr(physics, "logic_tree", "") or "") == want_tree
+              and bool(getattr(physics, "script_target", False)),
+              str(getattr(physics, "logic_tree", "")))
+        resolved, why = exporter.resolve_scene_tree(scene_obj)
+        check(f"{label} 的场景**不**挂关卡图(免得脚本挂错节点)",
+              resolved is None, f"{getattr(resolved, 'name', None)}({why})")
 
     # ---- 节点图:按**名字**选『玩家逻辑』(不再"随便拿第一棵")----
     logic = bpy.data.node_groups.get("玩家逻辑")
@@ -770,8 +823,12 @@ def main():
           "change_scene_to_file" in code and "关卡2.tscn" in code)
     check("切换用『相机_切换』做了带过渡的运镜",
           "_gk_cam_blend_total" in code)
+    # ⚠ 别卡右括号:第一百二十六轮起『等待_秒』生成的是
+    #   `create_timer(秒, false)`(暂停时也停 —— 用户报的"按 Esc 暂停后
+    #   后台照样切关卡"就是这条)。原来这里钉的是 `create_timer(1.6)`,
+    #   出码一改就成了假红。
     check("运镜播完才切场景(等待 + 计时器)",
-          "create_timer(1.6)" in code)
+          "create_timer(1.6" in code)
 
     # ── 第三十一轮的生成物:电梯(时间轴抬人)+ 载具(上/下车 + 驾驶)────
     check("电梯每帧被推到轨道值上(X / Z 保持当前坐标)",

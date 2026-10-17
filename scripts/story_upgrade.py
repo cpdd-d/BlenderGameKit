@@ -244,12 +244,29 @@ def upgrade_visuals():
                 obj.data.use_shadow = True
                 obj.data.shadow_soft_size = .12
                 obj.data.use_custom_distance = True
-                obj.data.cutoff_distance = 22 if scene_name != "走廊" else 16
                 if obj.name != "手电筒":
+                    # ── 第 124 轮:射程按房间尺寸给,不再写死 16 / 22 ──────
+                    # 真机实测(走廊,关掉环境光只剩灯):壁灯射程 11 米、房间 48 米
+                    #   射程 11 -> 灯 gain 0.0507
+                    #   射程 30 -> 灯 gain 0.1349   (↑2.7 倍)
+                    #   射程 40 -> 灯 gain 0.2040   (↑4.0 倍)
+                    # 射程就是 Godot 点光的 `omni_range`:它决定"这盏灯够到多远"。
+                    # 写死 16 米时,一条 48 米的走廊有一大半永远照不到 —— 用户看到的
+                    # 就是"灯开着但整条走廊还是平的"。所以按房间最大边长给:
+                    # 走廊 48 米 -> 28(相邻壁灯间距 14.4 米,28 正好接得上,
+                    # 再大只是把远处也照亮、反而没了"走廊深处黑下去"的恐怖感);
+                    # 大堂 / 结局是小房间,22 / 18 已经够铺满。
+                    # ⚠ 手电筒**不在**这条里:它是跟着相机走的聚光灯,20 米射程
+                    #   是"手电该照多远"的取值,和房间尺寸无关,别顺手改掉。
+                    obj.data.cutoff_distance = {"走廊": 28, "大堂": 22,
+                                                "结局": 18}[scene_name]
                     # 第 123 轮:整体再抬一档(6500->7200 / 4000->5200)。
                     # 灯在**后面**才建(天花板壁灯 4200W 那几盏),所以主灯
                     # 亮一点不会过曝 —— 而"提亮"正是二次元高调画面的第一需要。
-                    obj.data.energy = 7200 if scene_name != "走廊" else 5200
+                    # 第 124 轮:环境光从 0.78 降到 0.28 之后,明暗全交给灯,
+                    # 所以主灯再抬到 9000~10000W(见 make_story_demo.ENV_CORRIDOR
+                    # 的实测说明:灯 10.0 + 射程 28 时对比度 sd 0.092 -> 0.163)。
+                    obj.data.energy = 10000 if scene_name != "走廊" else 9000
         # Wall lamps and trim make scale and depth legible without covering gameplay areas.
         width, depth, height = {"大堂": (30, 24, 6), "走廊": (48, 14, 6), "结局": (18, 18, 5)}[scene_name]
         ceiling_name = scene_name + "天花板"
@@ -272,9 +289,21 @@ def upgrade_visuals():
                 make_box(name + "底座", (.48, .2, .75), (x, y, 3.1), (.035, .045, .05, 1), scene=scene)
                 make_box(name + "灯罩", (.26, .27, .48), (x, y - side * .12, 3.1),
                          (.7, .55, .3, 1), scene=scene, glow=((1, .65, .26, 1), 3.0))
-                light = make_light(name, "POINT", (x, y - side * .4, 3.1), 4200,
+                # ── 第 124 轮:壁灯 4200W / 射程 11 -> 9000W / 射程 28 ──────
+                # 真机实测(走廊,第一人称实际游玩机位,关掉环境光只剩灯):
+                #   * 出厂配置下这 7 盏灯对整帧**零贡献**(gain 0.0000)——
+                #     不是灯坏,是被环境光 0.78 压过去了(现在环境光已降到 0.28);
+                #   * 关掉环境光后,4200W(= Godot light_energy 4.2)+ 射程 11 米
+                #     时 gain 只有 0.0507;射程提到 30 米 -> 0.1349;
+                #     能量 20.0 + 射程 40 米 -> 0.2040。
+                # 4200W 在一条 48 米的走廊里本来就不够:每隔 14.4 米一盏、
+                # 射程只有 11 米,灯与灯之间永远有一段照不到(用户看到的
+                # "灯开着但整条走廊还是平的")。所以能量抬到 9000W(= 9.0)、
+                # 射程 28 米 —— 相邻两盏正好接得上,而走廊尽头仍然照不到
+                # (那里该黑下去,是恐怖感的来源,不要铺满)。
+                light = make_light(name, "POINT", (x, y - side * .4, 3.1), 9000,
                                    (1, .72, .38) if side == 1 else (.38, .62, 1),
-                                   scene, cutoff=11, shadow=True)
+                                   scene, cutoff=28, shadow=True)
                 light.data.shadow_soft_size = .10
         # Ensure closed box normals face outward, including ceiling undersides.
         import bmesh

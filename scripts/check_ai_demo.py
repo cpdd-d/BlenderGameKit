@@ -39,6 +39,19 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gk_probe import find_logic_script  # noqa: E402
+
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_ai", "AI示例_godot")
@@ -490,7 +503,9 @@ def main():
         ok = False
 
     # ── 生成物层面的证据 ────────────────────────────────────────────
-    script_path = os.path.join(OUT, "scripts", "game_logic.gd")
+    # 逻辑图可能是关卡图也可能是**角色图**，导出名跟着变 —— 别写死文件名
+    # (详见 scripts/_gk_probe.py 的说明)
+    script_path = find_logic_script(OUT)
     if os.path.isfile(script_path):
         with open(script_path, "r", encoding="utf-8") as handle:
             code = handle.read()

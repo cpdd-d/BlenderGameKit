@@ -2906,6 +2906,19 @@ _ENV_PRESET_HELPER_LINES = (
     "        e.adjustment_brightness = data.get(\"br\", 1.0)",
     "        e.adjustment_contrast = data.get(\"ct\", 1.0)",
     "        e.adjustment_saturation = data.get(\"sat\", 1.0)",
+    # 第 124 轮:高影响键。语义和默认值见 properties.py 里那几个 env_* 的
+    # 注释、以及 asset_export._env_extra_lines 的"出厂值"标注。
+    # ⚠ 短名 / 默认值必须和 asset_export 的 ENV_ZONE_KEYS / ENV_ZONE_FALLBACK
+    #   逐个对齐 —— 否则『环境_应用预设』节点和区域环境点会切出两套氛围。
+    "        e.fog_sky_affect = data.get(\"fog_sa\", 1.0)",
+    "        e.fog_light_energy = data.get(\"fog_le\", 1.0)",
+    "        e.fog_aerial_perspective = data.get(\"fog_ap\", 0.0)",
+    "        e.glow_strength = data.get(\"glow_s\", 1.0)",
+    "        e.glow_hdr_threshold = data.get(\"glow_t\", 1.0)",
+    "        e.glow_blend_mode = data.get(\"glow_m\", 1)",
+    "        e.tonemap_exposure = data.get(\"tm_e\", 1.0)",
+    "        e.tonemap_white = data.get(\"tm_w\", 1.0)",
+    "        e.ambient_light_sky_contribution = data.get(\"amb_sky\", 1.0)",
     "    # 卡通风格:全局覆盖场景里所有 toon 材质(第一百一十三轮大蓝图)",
     "    if data.has(\"shadow_step\"):",
     "        var _gk_stack: Array = [_gk_scene]",
@@ -2941,6 +2954,22 @@ def _env_preset_helper(ctx):
     return name
 
 
+def _env_glow_blend_value(preset):
+    """预设的泛光混合模式(字符串名)-> Godot 的 int(0..4)。
+
+    第 124 轮:枚举 -> int 的映射只在 `asset_export.ENV_GLOW_BLENDS` 里
+    定义一份(离线测试锁着它和 properties 枚举项的顺序一致)。这里**不**
+    抄第二份 —— 从那边现取,取不到(极端裁剪环境)才退回 SCREEN=1,
+    免得出现"预设存的是 REPLACE,游戏里却按滤色跑"。
+    """
+    name = str(getattr(preset, "p_glow_blend", "SCREEN") or "SCREEN")
+    try:
+        from ..asset_export import ENV_GLOW_BLENDS
+    except Exception:                                     # noqa: BLE001
+        return 1
+    return int(ENV_GLOW_BLENDS.get(name, ENV_GLOW_BLENDS.get("SCREEN", 1)))
+
+
 def _resolve_env_preset(ctx, raw):
     """按名字找预设参数:先查文件级预设库,再查内置;都找不到给 None + 告警。"""
     raw = str(raw or "").strip()
@@ -2973,6 +3002,18 @@ def _resolve_env_preset(ctx, raw):
                     "br": float(getattr(preset, "p_brightness", 1.0)),
                     "ct": float(getattr(preset, "p_contrast", 1.0)),
                     "sat": float(getattr(preset, "p_saturation", 1.0)),
+                    # ── 第 124 轮:9 个高影响键 ─────────────────────────
+                    # 短名 / 默认值照 asset_export.ENV_ZONE_KEYS +
+                    # ENV_ZONE_FALLBACK(两处必须一致,见那边的注释)。
+                    "fog_sa": float(getattr(preset, "p_fog_sky_affect", 1.0)),
+                    "fog_le": float(getattr(preset, "p_fog_light_energy", 1.0)),
+                    "fog_ap": float(getattr(preset, "p_fog_aerial", 0.0)),
+                    "glow_s": float(getattr(preset, "p_glow_strength", 1.0)),
+                    "glow_t": float(getattr(preset, "p_glow_threshold", 1.0)),
+                    "glow_m": _env_glow_blend_value(preset),
+                    "tm_e": float(getattr(preset, "p_tonemap_exposure", 1.0)),
+                    "tm_w": float(getattr(preset, "p_tonemap_white", 1.0)),
+                    "amb_sky": float(getattr(preset, "p_ambient_sky", 1.0)),
                     # 卡通风格(第一百一十三轮大蓝图):全局 shader 风格
                     "shadow_step": float(getattr(
                         preset, "p_style_shadow_step", 0.1)),
@@ -3025,6 +3066,18 @@ def _stmt_env_preset(ctx, node, indent):
         f'\"br\": {float(values["br"])!r}',
         f'\"ct\": {float(values["ct"])!r}',
         f'\"sat\": {float(values["sat"])!r}',
+        # 第 124 轮:9 个高影响键(短名 / 默认值照 asset_export.ENV_ZONE_KEYS)
+        f'\"fog_sa\": {float(values.get("fog_sa", 1.0))!r}',
+        f'\"fog_le\": {float(values.get("fog_le", 1.0))!r}',
+        f'\"fog_ap\": {float(values.get("fog_ap", 0.0))!r}',
+        f'\"glow_s\": {float(values.get("glow_s", 1.0))!r}',
+        f'\"glow_t\": {float(values.get("glow_t", 1.0))!r}',
+        # glow_m 是 Godot 枚举的 int —— 走 int() 而不是 float()!,
+        # 否则 gen 出来是 `1.0`,GDScript 那边 `glow_blend_mode` 要的是 int。
+        f'\"glow_m\": {int(values.get("glow_m", 1))}',
+        f'\"tm_e\": {float(values.get("tm_e", 1.0))!r}',
+        f'\"tm_w\": {float(values.get("tm_w", 1.0))!r}',
+        f'\"amb_sky\": {float(values.get("amb_sky", 1.0))!r}',
         # 卡通风格(第一百一十三轮大蓝图)
         f'\"shadow_step\": {float(values.get("shadow_step", 0.1))!r}',
         f'\"shadow_tint\": {color("shadow_tint")}',

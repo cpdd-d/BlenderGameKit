@@ -28,6 +28,7 @@ from . import curve_assets
 from . import generated_files
 from . import gk_log
 from . import godot_look
+from . import godot_material_preview
 # 线框标记物体(第一百二十四轮):出生点 / 区域环境点 / 关卡父级的 kind
 # 与命名常量只在 markers.py 里定义一份,导出侧只负责"按 kind 找物体"
 from . import markers
@@ -255,6 +256,20 @@ extends Node
 ## 不存在。用户实测:"在没有角色的测试里动不了,鼠标也无法控制视角旋转"
 ## —— 而"飞着看看这一关"恰恰经常是空场景 / 纯场景测试。
 ## 环境脚本每张 .tscn 都有一份、还挂在场景根上,所以把它搬到这里。
+##
+## ── ⚠ 这是**调试功能**,正式发行时应当关掉(用户 2026-10-15 明确指出)──
+## 设计原因(三条,都不是"顺手加的"):
+##   1. **它绕开一切规则**:上帝机不走碰撞、可以飞出关卡、能时停、能附身
+##      接管敌人 —— 这些在正式游戏里等于"内置外挂",会直接毁掉解谜 /
+##      潜行 / 追逐类玩法的张力(这一关的核心恰恰是"别被它看见")。
+##   2. **它是给开发者看的,不是给玩家看的**:按 Tab 俯瞰巡逻路线、按 T
+##      冻住世界看细节、按 F 试敌人手感 —— 这些是**做关卡时**的自检动作,
+##      玩家不需要,也不该看到。
+##   3. **键位会和玩法抢**:Tab / T / F / ESC 都是游戏里很常用的键;
+##      上帝机抢走任何一个,都会让玩家"按了没反应"或"突然视角乱飞"。
+## 所以:『世界设置 → 调试用相机』里默认**开**(做关卡时方便),
+## 出包前把它关掉 —— 关掉 = 三张 .tscn 里**压根不生成**上帝机脚本,
+## 运行时一个多余节点都没有(不是"生成了但藏着")。
 @export var god_camera: bool = {god_camera}
 
 ## ── 内置 ESC 退出游戏(第三十九轮)────────────────────────────────
@@ -372,6 +387,11 @@ const _GK_POSSESS_KEY := {possess_key}
 ## `get_gravity()`,这样工程重力设置改了它也跟得上)。
 const _GK_POSSESS_SPEED := 6.0
 const _GK_POSSESS_JUMP := 7.0
+## 附身时相机吊臂的长度 / 最短长度(第 124 轮:带碰撞,见 _gk_possess_cam_place)。
+## 长度取 5.0 和『第三人称角色预设』的默认臂长同量级;最短 0.35 是为了
+## "贴墙时相机不至于钻进角色身体"(和弹簧臂留的余量同一个数)。
+const _GK_POSSESS_ARM := 5.0
+const _GK_POSSESS_ARM_MIN := 0.35
 
 var _gk_dbg_label: Label = null
 var _gk_dbg_visible := false
@@ -1597,11 +1617,60 @@ func _gk_god_possess_begin() -> void:
 	#     (照 `gk_god_camera` / `gk_hide_spot` 那种"两处硬编码、靠测试互钉"的做法)。
 	target.add_to_group("gk_god_possessed")
 	# 相机跟到角色身后(用当前朝向):后面每帧由 _gk_god_possess_tick 维持
-	_gk_god_cam.global_position = (target.global_position
-		+ Vector3(0.0, 1.6, 0.0)
-		+ _gk_god_cam.global_transform.basis.z * 5.0)
+	_gk_god_cam.global_position = _gk_possess_cam_place(target)
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	print("[GK] 附身:%s(再按一下 F 放开)" % target.name)
+
+
+## 附身时相机该站的位置(带碰撞;第 124 轮)。
+##
+## ── 为什么要单独一个函数 + 为什么要打射线(用户实测 bug)────────────
+## 用户原话:"在附身游戏Ai上摄像机会穿墙,这个之前在角色的摄像机修改过"。
+##
+## 原因很简单:原来是**纯位置赋值** —— 把相机放在角色身后 5 米,不管中间
+## 有没有墙。贴墙时那 5 米直接落到墙外/墙里,画面就成了"从墙外面往里看"
+## (或者干脆一片黑)。角色的弹簧臂**早就修过这个问题**
+## (见 codegen/camera.py 的 camera_spring_arm:枢轴 -> 想要的位置打射线,
+## 撞到就把相机拉到撞点前面),附身这条路径当时漏掉了。
+##
+## 这里照弹簧臂那套做,做法和"为什么排除自己"的坑都一一对应:
+##   * 排除**身体自己**和**相机自己** —— 不排除的话射线在枢轴处就命中
+##     自己的身体(实测弹簧臂在 0.11 米处命中自己的胶囊),杆长被压到最短,
+##     相机会永远贴在脸上;
+##   * 留 0.35 米余量(和弹簧臂的 radius 同量级):贴着墙面放会切到墙;
+##   * 最短 0.35 米:再近就钻进角色身体里了;
+##   * 天花板兜底:从**身体**(不是枢轴)竖直向上打 —— 俯视角度大时相机
+##     会被抬到天花板上面,那里从枢轴往外打是打不中的(弹簧臂第 128 轮
+##     真机踩过:25 帧相机跑到屋子外面,屏幕上只剩天花板顶面)。
+func _gk_possess_cam_place(body: Node3D) -> Vector3:
+	var behind := _gk_god_cam.global_transform.basis.z
+	var _gk_pivot: Vector3 = body.global_position + Vector3(0.0, 1.6, 0.0)
+	var _gk_want: Vector3 = _gk_pivot + behind * _GK_POSSESS_ARM
+	var _gk_space := body.get_world_3d().direct_space_state
+	if _gk_space == null:
+		return _gk_want                    # 极端情况:拿不到物理世界就用原值
+	# ⚠ 只排除**身体自己**。别顺手把相机也排除进来:`_gk_god_cam` 的类型是
+	#   `Camera3D`,而 `Camera3D is CollisionObject3D` 在 GDScript 里是
+	#   **静态错误**(Expression is of type "Camera3D" so it can't be of type
+	#   "CollisionObject3D") —— 整份脚本直接加载不了(真机踩过)。
+	#   相机本来也没有碰撞形状,射线不可能打中它,这条排除是多余的。
+	var _gk_exclude: Array[RID] = []
+	if body is CollisionObject3D:
+		_gk_exclude.append((body as CollisionObject3D).get_rid())
+	var _gk_hit := _gk_space.intersect_ray(PhysicsRayQueryParameters3D.create(
+		_gk_pivot, _gk_want, 0xFFFFFFFF, _gk_exclude))
+	if not _gk_hit.is_empty():
+		var _gk_dist: float = _gk_pivot.distance_to(_gk_hit["position"])
+		_gk_want = _gk_pivot + behind * maxf(_gk_dist - 0.35, _GK_POSSESS_ARM_MIN)
+	# 天花板兜底(起点必须是**身体**的位置:它一定在天花板下面)
+	var _gk_up_hit := _gk_space.intersect_ray(PhysicsRayQueryParameters3D.create(
+		body.global_position, body.global_position + Vector3(0.0, 10.0, 0.0),
+		0xFFFFFFFF, _gk_exclude))
+	if not _gk_up_hit.is_empty():
+		var _gk_ceil_y: float = _gk_up_hit["position"].y - 0.1
+		if _gk_want.y > _gk_ceil_y:
+			_gk_want.y = _gk_ceil_y
+	return _gk_want
 
 
 ## 放开附身:角色停在原地,交给它自己的逻辑。
@@ -1662,10 +1731,8 @@ func _gk_god_possess_tick(delta: float) -> void:
 				cb.look_at(look, Vector3.UP)
 	else:
 		body.global_position += move * _GK_POSSESS_SPEED * delta
-	# 相机跟在身后上方(位置跟,朝向仍由鼠标控制)
-	var behind := _gk_god_cam.global_transform.basis.z
-	_gk_god_cam.global_position = (body.global_position
-		+ Vector3(0.0, 1.6, 0.0) + behind * 5.0)
+	# 相机跟在身后上方(位置跟,朝向仍由鼠标控制;带碰撞,见 _gk_possess_cam_place)
+	_gk_god_cam.global_position = _gk_possess_cam_place(body)
 
 
 ## ── 内置 ESC 退出(第三十九轮)─────────────────────────────────────
@@ -1729,12 +1796,20 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseButton:
 		# 滚轮缩放(第三十九轮):和鼠标位移一样,**自己攒一份**,
 		# 物理帧里统一消费 —— 一帧里滚好几格也不会只算最后一格。
+		#
+		# ⚠ 方向约定(第一百三十四轮对齐):**上滚 = 拉近**(FOV 变小)。
+		#   这里原来写反了(上滚加的是负数、`_gk_god_zoom_tick` 又用
+		#   `fov - wheel * 4`,两边一乘就成了"上滚拉远");而
+		#   `check_level_example.py` 从第三十九轮起就按"上滚 -> FOV 变小"
+		#   断言 —— 于是那条断言一直是红的(探针没写错,是功能反了)。
+		#   现在和『输入_鼠标滚轮』节点的约定一致(上滚 = +1),也和
+		#   通用习惯一致。
 		var wheel := event as InputEventMouseButton
 		if wheel.pressed:
 			if wheel.button_index == MOUSE_BUTTON_WHEEL_UP:
-				_gk_god_wheel -= 1.0
-			elif wheel.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 				_gk_god_wheel += 1.0
+			elif wheel.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				_gk_god_wheel -= 1.0
 
 
 ## ── 调试面板(第二十二轮)─────────────────────────────────────────
@@ -2286,6 +2361,7 @@ func _find_camera() -> Camera3D:
 		if node is Camera3D:
 			return node as Camera3D
 	return null
+{post_block}
 '''
 
 # 环境脚本模板的默认填充值(加新字段时只改这一处)。
@@ -2315,6 +2391,9 @@ ENV_SCRIPT_DEFAULTS = dict(
     # 默认值 = 老行为(循环开、总线空、不应用)。
     bgm_loop="true", bgm_bus="",
     music_bus="Music", music_bus_db="-6.0", music_bus_apply="false",
+    # 游戏环境与后期(第一百二十五轮):空串 = 这一关没有后期层 ——
+    # 模板里那一行变成空行,产物与改动前逐字节一致。
+    post_block="",
 )
 
 
@@ -2424,6 +2503,22 @@ def safe_name(text, fallback="model"):
     return name or fallback
 
 
+def material_texture_file_name(name):
+    """Stable PNG name shared by material references and texture export.
+
+    Keep established ASCII filenames, including image extensions. Names that
+    lose Unicode or punctuation during sanitizing need an identity suffix:
+    otherwise two different Chinese images both become ``texture.png``.
+    """
+    import zlib
+
+    text = str(name or "")
+    stem = safe_name(text, "texture")
+    if not re.fullmatch(r"[A-Za-z0-9_\-.]+", text):
+        stem += f"_{zlib.crc32(text.encode('utf-8')) & 0xffffffff:08x}"
+    return stem + ".png"
+
+
 def _unique_file_names(names, fallback="material", prefix=""):
     """给一串材质名算出**互不重复**的文件名。返回 {原名: 文件名}。
 
@@ -2505,6 +2600,49 @@ def _god_camera_on(scene):
     return bool(getattr(settings, "god_camera", False))
 
 
+def _tree_claims_esc(tree):
+    """这棵树里有没有"Esc 已经有主"的证据。
+
+    两条判据(和 `_esc_claimed_by_graph` 的说明一一对应):
+      * 『界面_暂停游戏』勾了『Esc 热键』—— Esc 是暂停;
+      * 『按键』节点的键位就是 Esc —— 用户自己把 Esc 派了活。
+    """
+    for node in getattr(tree, "nodes", ()) or ():
+        kind = getattr(node, "bl_idname", "")
+        if kind == "GKNodeUiPauseGame":
+            if bool(getattr(node, "gk_hotkey", False)):
+                return True
+        elif kind == "GKNodeKey":
+            if str(getattr(node, "gk_key", "") or "").strip().upper() == "ESC":
+                return True
+    return False
+
+
+def _design_trees_of_logic(tree):
+    """这棵逻辑图里『界面_套用设计』引用的设计图(可能有多张)。
+
+    第一百一十二轮把"界面自己的行为"搬进了设计图 —— 暂停热键可能就摆在那儿,
+    所以问"Esc 有没有主"时要顺着这条引用再问一层。
+    """
+    found = []
+    if tree is None:
+        return found
+    try:
+        import bpy
+    except Exception:                                      # noqa: BLE001
+        return found
+    for node in getattr(tree, "nodes", ()) or ():
+        if getattr(node, "bl_idname", "") != "GKNodeUiApplyDesign":
+            continue
+        wanted = str(getattr(node, "gk_design", "") or "").strip()
+        if not wanted:
+            continue
+        design = bpy.data.node_groups.get(wanted)
+        if design is not None:
+            found.append(design)
+    return found
+
+
 def _esc_claimed_by_graph(scene):
     """图里已经有人管 Esc 了吗(第三十九轮)?管了就轮不到内置的退出。
 
@@ -2517,31 +2655,40 @@ def _esc_claimed_by_graph(scene):
         物理测试场都是"按 Esc 退出游戏"),内置的再抢一遍就成了
         "抢先退出,把用户接的行为挤掉"。
     所以:**谁都没用,才兜底**(见 ENVIRONMENT_SCRIPT 的 esc_quit)。
+
+    ── 要问**哪几张**图(第一百三十四轮补全)──────────────────────────
+    只问"这一关的场景图"是不够的,实测漏过两次:
+      * 第一百一十二轮:暂停菜单搬进『主界面』(跨场景常驻)之后,场景图里
+        什么都没有了 —— 于是补了"问主界面"这一条;
+      * 第一百三十四轮:**角色图**。`create_character_preset` 建的图是
+        `gk_scope = "ROLE"`,而界面示例把『界面_暂停游戏』(Esc 热键)摆在这
+        张图里 —— 场景图那一格是空的,只问场景图 -> 判定"没人管 Esc"
+        -> 内置的"按 Esc 退出游戏"把暂停抢掉。真机现象:探针一按 Esc
+        整个游戏直接退出(`[GK] ESC:退出游戏`),后面一串界面断言全挂。
+    所以现在把**场景图 / 角色图 / 它们『界面_套用设计』引用的设计图 /
+    主界面**挨个问一遍,任意一处认领就算有主。
     """
     from . import exporter
 
+    trees = []
     tree, _why = exporter.resolve_scene_tree(scene)
     if tree is not None:
-        for node in getattr(tree, "nodes", ()) or ():
-            kind = getattr(node, "bl_idname", "")
-            if kind == "GKNodeUiPauseGame":
-                if bool(getattr(node, "gk_hotkey", False)):
-                    return True
-            elif kind == "GKNodeKey":
-                if str(getattr(node, "gk_key", "") or "").strip().upper() == "ESC":
-                    return True
-    # ── 主界面(跨场景常驻)里挂的 Esc(第一百一十二轮)────────────────
-    # 暂停菜单搬进『主界面』之后,Esc 热键不在这一关的玩法图里了 ——
-    # 还要问一句"主界面的行为里挂没挂 Esc"。不问的话环境脚本以为
-    # "没人管 Esc",内置的"按 Esc 退出游戏"就会把暂停抢掉
-    # (实测:探针一按 Esc,整个游戏直接退出,后续断言全挂)。
-    from .nodes import nodes as node_lib
-    main_tree = node_lib.main_ui_design_tree()
-    for node in getattr(main_tree, "nodes", ()) or ():
-        if (getattr(node, "bl_idname", "") == "GKNodeUiPauseGame"
-                and bool(getattr(node, "gk_hotkey", False))):
+        trees.append(tree)
+    try:
+        for _obj, role_tree, _reason in exporter.object_logic_trees(scene):
+            if role_tree is not None:
+                trees.append(role_tree)
+    except Exception:                                      # noqa: BLE001
+        pass
+    for candidate in trees:
+        if _tree_claims_esc(candidate):
             return True
-    return False
+        for design in _design_trees_of_logic(candidate):
+            if _tree_claims_esc(design):
+                return True
+    # ── 主界面(跨场景常驻)里挂的 Esc(第一百一十二轮)────────────────
+    from .nodes import nodes as node_lib
+    return _tree_claims_esc(node_lib.main_ui_design_tree())
 
 
 # ==========================================================================
@@ -2594,10 +2741,45 @@ ENV_TONEMAP_MODES = {"LINEAR": 0, "REINHARD": 1, "FILMIC": 2, "ACES": 3,
 #    **关掉卡通材质(用 PBR 材质)** 的项目观感会变亮,这是修回本意。
 ENV_AMBIENT_SOURCES = {"COLOR": 2, "SKY": 3}
 
+# 泛光混合模式(第 124 轮)。值 = Godot 的 Environment.glow_blend_mode 枚举
+# (真机反射核对:hint = Additive,Screen,Softlight,Replace,Mix):
+#     0=相加 1=滤色 2=柔光 3=替换 4=混合
+# ⚠ 顺序 / 取值要和 properties.ENV_GLOW_BLENDS 的枚举项**顺序一致**
+#   (离线测试锁着,和 ENV_BACKGROUND_MODES / ENV_TONEMAP_MODES 同一套规矩)。
+ENV_GLOW_BLENDS = {"ADDITIVE": 0, "SCREEN": 1, "SOFTLIGHT": 2, "REPLACE": 3,
+                   "MIX": 4}
+
 ENV_RESOURCE_ID = "gk_environment"
 ENV_SKY_MATERIAL_ID = "gk_sky_material"
 ENV_SKY_ID = "gk_sky"
 
+# ── 第 124 轮:补上 Godot Environment 的**高影响键**────────────────────
+#
+# 病根(真机实测,不是推测):导出器原先写的 19 个键**全是 Godot 默认值的
+# 子集** —— 也就是说"导出的 Environment 和 Godot 新建一个 Environment 完全
+# 一样",真正改变画面的那几个杠杆一个都没写。在示例走廊上逐项开关测出的
+# 帧均值亮度:
+#     出厂(照原样)                      0.3803
+#     fog_sky_affect = 0                0.3460  ← 雾色**整个盖掉了**背景色
+#     fog_light_energy = 0.25           0.2599  ← 雾亮度:仅次于密度的杠杆
+#     glow_hdr_threshold=0 + strength=3 0.7247  ← 泛光的**真实扳机**
+#     glow_enabled = false              0.3547  ← 说明默认泛光几乎是死的
+#
+# ── 写法规则(spec「第 124-a 号澄清」裁定)──────────────────────────
+# **一个键,当且仅当它的值 ≠ Godot 对该键的出厂值时才写。** 唯一一条规则。
+# 见 `_env_extra_lines` —— 每个键旁边都标着它的出厂值。
+#
+# 为什么这条规则是对的(而不是"功能开着就全写"):
+#   * 全默认 -> 一个键都不多写,产物与改动前**逐字节一致**
+#     (老工程、老示例的观感因此**完全不变** —— 这是本仓库的铁律);
+#   * 9 个新键的默认值**全部等于 Godot 出厂值**(包括 `fog_sky_affect`,
+#     它一度想定成 0.0 来"自动修雾色盖背景",但实测会把恐怖示例整帧压暗
+#     70%,违背上面那条铁律,已退回 1.0;想要那个效果在卡上显式拧到 0);
+#   * 用户把任何一个旋钮拧离出厂值,那一行就一定落地(旋钮够得着);
+#     拧回出厂值那一行就消失(不留"写了也没人读"的噪音行)。
+#
+# ⚠ 以后改默认值要小心:把某个字段的默认值改成 ≠ 出厂值,就等于"一开这个
+#   功能就必然多写一行",铁律那条"逐字节一致"的回归测试会立刻红掉。
 ENVIRONMENT_SUBRESOURCE = """[sub_resource type="Environment" id="{res_id}"]
 background_mode = {background_mode}
 background_color = {bg_color}
@@ -2615,7 +2797,7 @@ adjustment_enabled = {adjust}
 adjustment_brightness = {brightness}
 adjustment_contrast = {contrast}
 adjustment_saturation = {saturation}
-{sky_line}"""
+{extra_lines}{sky_line}"""
 
 # 程序化天空:一个 ProceduralSkyMaterial + 一个 Sky 资源。
 # 天空的顶色 = 用户填的背景色,地平线往白里提一点点(纯色天空不好看);
@@ -2692,12 +2874,24 @@ def env_settings(scene):
     卡自己会红字提醒"只支持 3D"(和调试面板同一条约定)。
     """
     settings = getattr(scene, "gk_settings", None)
-    if settings is None or not bool(getattr(settings, "env_enabled", False)):
+    if settings is None:
         return None
+    if not bool(getattr(settings, "env_enabled", False)):
+        # ── 例外:『环境与后期』图里放了昼夜 / 天空盒卡(第一百三十三轮)──
+        # 天空盒是**挂在 WorldEnvironment 上的**(见 _daynight_lines 的
+        # `_gk_daynight_make_sky`):不建这个节点,用户点了『天空盒』只会
+        # 拿到一句"这一关没有 WorldEnvironment,天空盒没地方挂"。
+        # 所以这几张卡在场时,环境即使没勾也照导(其余键全走出厂值,
+        # 用户没碰过的设置一个都不多写)。
+        if not _daynight_cards():
+            return None
     if str(getattr(settings, "dimension", "3")) == "2":
         return None
     background = str(getattr(settings, "env_background", "COLOR") or "COLOR")
     tonemap = str(getattr(settings, "env_tonemap", "LINEAR") or "LINEAR")
+    glow_blend = str(getattr(settings, "env_glow_blend", "SCREEN") or "SCREEN")
+    if glow_blend not in ENV_GLOW_BLENDS:
+        glow_blend = "SCREEN"
     return {
         "background": background if background in ENV_BACKGROUND_MODES else "COLOR",
         "tonemap": tonemap if tonemap in ENV_TONEMAP_MODES else "LINEAR",
@@ -2717,7 +2911,82 @@ def env_settings(scene):
         "brightness": _env_number(settings, "env_brightness", 1.0),
         "contrast": _env_number(settings, "env_contrast", 1.0),
         "saturation": _env_number(settings, "env_saturation", 1.0),
+        # ── 第 124 轮:高影响键(键名照 spec 冻结,别改名)──────────────
+        "fog_sky_affect": _env_number(settings, "env_fog_sky_affect", 1.0),
+        "fog_light_energy": _env_number(settings, "env_fog_light_energy", 1.0),
+        "fog_aerial_perspective": _env_number(
+            settings, "env_fog_aerial_perspective", 0.0),
+        "glow_strength": _env_number(settings, "env_glow_strength", 1.0),
+        "glow_threshold": _env_number(settings, "env_glow_threshold", 1.0),
+        "glow_blend": glow_blend,
+        "tonemap_exposure": _env_number(settings, "env_tonemap_exposure", 1.0),
+        "tonemap_white": _env_number(settings, "env_tonemap_white", 1.0),
+        "ambient_sky_contribution": _env_number(
+            settings, "env_ambient_sky_contribution", 1.0),
     }
+
+
+def _env_extra_lines(values):
+    """第 124 轮新增键的文本,每行带 `\\n`。
+
+    ── 写法规则(spec「第 124-a 号澄清」,唯一一条)────────────────────
+        **当且仅当"这个键在当前配置里真的有效"且"它的值 ≠ Godot 出厂值"
+        时才写。**
+
+    前半句来自裁定里的"功能没开 → 该组一个键都不写"(雾关不写 fog 组 /
+    泛光关不写 glow 组 / LINEAR 不写 tonemap_white / 纯色不写
+    ambient_light_sky_contribution):那些值在 Godot 里根本不会被读,
+    写进去只是噪音。后半句就是裁定那句"值 ≠ 出厂值才写"。
+
+    两条合起来的效果:
+      * 全默认 -> 返回空串,**产物与改动前逐字节一致**(铁律,老示例观感不变);
+      * 用户把任何一个旋钮拧离出厂值,那一行就一定落地(旋钮够得着);
+        拧回出厂值那一行就消失(不留无效噪音)。
+
+    ⚠ 每个键后面都标了它的 **Godot 出厂值**。以后想改某个字段的默认值,
+      先看那个数:改成 ≠ 出厂值就等于"功能一开必然多写一行",
+      而那会**静默改掉老工程/老示例的观感**。
+    """
+    lines = []
+    # 雾那一组(出厂值:fog_sky_affect=1.0 / fog_light_energy=1.0 /
+    # fog_aerial_perspective=0.0)。雾关着 -> 一个都不写。
+    # ⚠ `fog_sky_affect` 的"0 = 背景色不被雾盖"是本轮**推荐**值(和预览一致),
+    #   但默认仍留 Godot 出厂值 1.0:实测把它一刀切成 0 会把恐怖示例整帧压暗
+    #   70%(那个示例的背景本就近黑)。所以示例 / 内置预设里**显式**写 0,
+    #   不替所有老工程做决定。
+    if values["fog"]:
+        if abs(values["fog_sky_affect"] - 1.0) > 1e-9:
+            lines.append("fog_sky_affect = %.6f" % values["fog_sky_affect"])
+        if abs(values["fog_light_energy"] - 1.0) > 1e-9:
+            lines.append("fog_light_energy = %.6f" % values["fog_light_energy"])
+        if abs(values["fog_aerial_perspective"] - 0.0) > 1e-9:
+            lines.append("fog_aerial_perspective = %.6f"
+                         % values["fog_aerial_perspective"])
+    # 泛光那一组(出厂值:glow_strength=1.0 / glow_hdr_threshold=1.0 /
+    # glow_blend_mode=1(SCREEN))。泛光关着 -> 一个都不写。
+    if values["glow"]:
+        if abs(values["glow_strength"] - 1.0) > 1e-9:
+            lines.append("glow_strength = %.6f" % values["glow_strength"])
+        if abs(values["glow_threshold"] - 1.0) > 1e-9:
+            lines.append("glow_hdr_threshold = %.6f" % values["glow_threshold"])
+        if ENV_GLOW_BLENDS[values["glow_blend"]] != ENV_GLOW_BLENDS["SCREEN"]:
+            lines.append("glow_blend_mode = %d"
+                         % ENV_GLOW_BLENDS[values["glow_blend"]])
+    # 曝光(出厂值 1.0):**不挂在任何功能开关上** —— 它是全局的,雾关泛光关
+    # 也照样影响画面,所以只要拧离 1.0 就必须落地(否则就是"够不着的旋钮")。
+    if abs(values["tonemap_exposure"] - 1.0) > 1e-9:
+        lines.append("tonemap_exposure = %.6f" % values["tonemap_exposure"])
+    # 白点(出厂值 1.0):LINEAR 下 Godot 会忽略它,所以只在非 LINEAR 时才可能写。
+    if values["tonemap"] != "LINEAR" and abs(values["tonemap_white"] - 1.0) > 1e-9:
+        lines.append("tonemap_white = %.6f" % values["tonemap_white"])
+    # 天空参与环境光(出厂值 1.0):真机实测**纯色模式下无效**,只在天空时写。
+    if values["background"] == "SKY" \
+            and abs(values["ambient_sky_contribution"] - 1.0) > 1e-9:
+        lines.append("ambient_light_sky_contribution = %.6f"
+                     % values["ambient_sky_contribution"])
+    if not lines:
+        return ""
+    return "".join(line + "\n" for line in lines)
 
 
 def environment_scene_blocks(scene):
@@ -2749,9 +3018,18 @@ def environment_scene_blocks(scene):
     sub_resources.append(ENVIRONMENT_SUBRESOURCE.format(
         res_id=ENV_RESOURCE_ID,
         background_mode=ENV_BACKGROUND_MODES[values["background"]],
-        # 纯色 -> Color(用户填的颜色才真的生效)、天空 -> Sky(拿天空当环境光);
-        # 见 ENV_AMBIENT_SOURCES 上面那段真机标定
-        ambient_source=ENV_AMBIENT_SOURCES[values["background"]],
+        # ── 第一百四十轮:用户填了『环境光强度』就用 Color ────────────────
+        # 用户原话:"游戏环境与后期的效果有一部分没作用?" —— 查到的其中一条
+        # 就是这个:天空背景下我们写 source=Sky,而 Godot 在 Sky 模式下
+        # **完全忽略** `ambient_light_color / energy` —— 用户调了半天的
+        # 『环境光颜色 / 强度』在游戏里一个字都不生效(预览里却是生效的,
+        # 于是"预览对、运行不对")。
+        # 现在的规则(和预览那边**逐字对齐**):
+        #     环境光强度 > 0 -> Color(用用户填的颜色与强度)
+        #     环境光强度 = 0 -> Sky(拿天空当环境光,想"环境光关掉"的人也不亏)
+        ambient_source=(ENV_AMBIENT_SOURCES["COLOR"]
+                        if float(values.get("ambient_energy", 0.0) or 0.0) > 0.0
+                        else ENV_AMBIENT_SOURCES[values["background"]]),
         bg_color=values["bg_color"],
         ambient_color=values["ambient_color"],
         ambient_energy="%.6f" % values["ambient_energy"],
@@ -2766,6 +3044,9 @@ def environment_scene_blocks(scene):
         brightness="%.6f" % values["brightness"],
         contrast="%.6f" % values["contrast"],
         saturation="%.6f" % values["saturation"],
+        # 第 124 轮:高影响键(值 != 出厂值才写,见 _env_extra_lines)。
+        # 空串时 `{extra_lines}{sky_line}` 拼出来和改动前**逐字节一样**。
+        extra_lines=_env_extra_lines(values),
         sky_line=sky_line))
     settings = getattr(scene, "gk_settings", None)
     sub_resources[-1] += (
@@ -3206,6 +3487,1124 @@ def _debug_watch_text(scene):
     return "|".join(cleaned)
 
 
+# ==========================================================================
+# 游戏环境与后期(第一百二十五轮)—— 把『游戏环境与后期』图编成 GDScript
+# ==========================================================================
+# 用户原话:"环境预设库(请改名字为游戏环境与后期)添加设置色调,连线-屏幕位置
+# (整体?还是局部),添加睁眼效果-连线(持续时间)... 这个的开始卡片是默认环境
+# 卡片连过去"。
+#
+# ── 这一块生成的到底是什么 ─────────────────────────────────────────
+# 一张全屏 ColorRect + `gk_post.gdshader`,放在 layer=100 的 CanvasLayer 里
+# (必须画在 3D 之后才能读回屏幕纹理)。图的执行链从『环境_默认环境』出发,
+# 沿途的『设置色调』会写进 shader 的 uniform;『屏幕位置』接在色调卡上时
+# 打开蒙版,不接就是整屏。
+#
+# ── 为什么挂在**环境脚本**上(而不是新做一个 autoload)─────────────
+# 环境脚本每张 .tscn 都有一个、挂在场景根上,而且已经有 `_ready`
+# (见环境脚本模板)。再加一个 autoload 要多动 project.godot 的自动加载表,
+# 而且"切关卡时旧 overlay 要不要清"又多一份状态要管。挂在环境脚本上,
+# 场景一换 overlay 跟着换,天然干净。
+#
+# ── 为什么用 `_enter_tree` 而不是往 `_ready` 里塞一行 ───────────────
+# 环境脚本模板的 `_ready` 是**模板里的固定文本**,往里插一行就要改模板、
+# 还要多一个占位符。而模板里**没有** `_enter_tree` —— 于是整块后期代码
+# 可以自成一体地定义 `_enter_tree`,一个占位符(`{post_block}`)就接上了。
+#
+# ⚠ 生成出来的 GDScript 里**不许出现单个花括号**:它要经过
+#   `ENVIRONMENT_SCRIPT.format()`。字典字面量一律不要写。
+_POST_SHADER_PATH = "res://shaders/gk_post.gdshader"
+
+# 执行链上最多跟多少张卡(防用户连成环时转不出来)
+_POST_CHAIN_LIMIT = 32
+
+
+def _post_graph():
+    """当前文件的『游戏环境与后期』图(没有就返回 None,不建)。
+
+    ⚠ `bpy` 要**延迟导入**:这个模块在离线测试里是没有 bpy 的桩环境
+      (顶部不 import bpy 是故意的)。而且"图不存在"必须是正常路径 ——
+      绝大多数工程压根没画过这张图,那时产物要与改动前逐字节一致。
+    """
+    try:
+        import bpy
+        groups = list(bpy.data.node_groups)
+    except Exception:                                      # noqa: BLE001
+        # 离线桩里的 bpy 是半个空壳(`bpy.data` 可能根本不存在),
+        # 拿不到图就当"没画过" —— 那条路径必须能正常走完。
+        return None
+    for group in groups:
+        if getattr(group, "bl_idname", "") == "GKEnvLibraryTree":
+            return group
+    return None
+
+
+def _post_chain():
+    """从『环境_默认环境』出发,沿执行流走一遍,返回按顺序的节点列表。
+
+    ── 为什么要"走一遍"而不是"按位置排序" ──────────────────────────
+    用户说的是"开始卡片是默认环境卡片连过去" —— 顺序由**连线**决定,
+    不能按节点在图上的坐标猜(那样挪一下卡片顺序就变了)。
+    """
+    tree = _post_graph()
+    if tree is None:
+        return []
+    start = None
+    for node in getattr(tree, "nodes", ()):
+        if getattr(node, "bl_idname", "") == "GKNodeEnvDefault":
+            start = node
+            break
+    if start is None:
+        return []
+    from .codegen import graph as _graph
+    chain = []
+    seen = set()
+    node = start
+    while node is not None and len(chain) < _POST_CHAIN_LIMIT:
+        chain.append(node)
+        if node in seen:
+            break
+        seen.add(node)
+        nxt = None
+        for socket in getattr(node, "outputs", ()):
+            if getattr(socket, "name", "") not in ("执行", "完成"):
+                continue
+            try:
+                link = _graph.upstream(socket)
+            except ValueError:
+                link = None
+            # `upstream()` 是"往回找来源",这里要的是下游 —— 直接看 links
+            for out_link in getattr(socket, "links", ()):
+                nxt = out_link.to_node
+                break
+            if nxt is not None:
+                break
+            _ = link
+        node = nxt
+    return chain
+
+
+def _post_mask_of(grade_node):
+    """『设置色调』的『屏幕位置』引脚接的是哪张卡(没接返回 None)。"""
+    from .codegen import graph as _graph
+    socket = getattr(grade_node, "inputs", {}).get("屏幕位置") \
+        if hasattr(getattr(grade_node, "inputs", None), "get") else None
+    if socket is None or not getattr(socket, "is_linked", False):
+        return None
+    try:
+        link = _graph.upstream(socket)
+    except ValueError:
+        return None
+    if link is None:
+        return None
+    source = link.from_node
+    if getattr(source, "bl_idname", "") == "GKNodeScreenPos":
+        return source
+    return None
+
+
+def _eye_applies_to(eye, scene):
+    """『环境_睁眼效果』这张卡要不要装进这一关(作用域)。
+
+    用户原话(第一百三十七轮):"在环境睁眼这,应该加上作用域是全部关卡
+    还是单个"。默认 `ALL` = 每一关都装(老工程产物一字不变);
+    选 `ONE` 就只认『关卡』里填的那个**场景名** —— 名字空着或对不上
+    就不装(卡上会红字提醒,不静默)。
+    """
+    if str(getattr(eye, "gk_scope", "ALL")) != "ONE":
+        return True
+    want = str(getattr(eye, "gk_scene", "") or "").strip()
+    if not want:
+        return False
+    return str(getattr(scene, "name", "")) == want
+
+
+def _post_graph_lines(scene=None):
+    """后期那一整块 GDScript(『设置色调』/『睁眼效果』;没有就返回 [])。
+
+    ⚠ 为什么从 `_post_block` 里拆出来(第一百三十三轮)──────────────
+    GDScript 同一个函数只能定义一次,而『游戏环境与后期』图现在有两块
+    各要"进树时启动一次"的东西(后期层 + 昼夜循环)。所以启动函数
+    `_enter_tree` 只由**其中一块**定义:两块都在时,由 `_post_block`
+    往这里的 `_enter_tree` 里补一行 `_gk_daynight_setup.call_deferred()`。
+    只有后期卡时,这里返回的文本**逐字节还是老样子**(老工程产物不变)。
+    """
+    chain = _post_chain()
+    if not chain:
+        return []
+    grade = None
+    mask = None
+    eye = None
+    for node in chain:
+        kind = getattr(node, "bl_idname", "")
+        if kind == "GKNodeEnvGrade" and grade is None:
+            grade = node
+            mask = _post_mask_of(node)
+        elif kind == "GKNodeEyeOpen" and eye is None:
+            # ── 作用域(第一百三十七轮,用户要求)────────────────────────
+            # 用户原话:"在环境睁眼这,应该加上作用域是全部关卡还是单个"。
+            # 这张图是文件级的(所有关共用),所以"只给某一关"要显式判断 ——
+            # `scene=None`(老调用路径 / 离线测试)时**不做过滤**(等于全部)。
+            eye = node
+            if scene is not None and not _eye_applies_to(eye, scene):
+                eye = None
+    if grade is None and eye is None:
+        return []
+
+    lines = [
+        "",
+        "# ---- 游戏环境与后期(第一百二十五轮)----",
+        "# 这一段是『游戏环境与后期』图编出来的:全屏 ColorRect + gk_post.gdshader。",
+        "# 顺序由连线决定,起点是『环境_默认环境』。",
+        f'const _GK_POST_SHADER := "{_POST_SHADER_PATH}"',
+        "var _gk_post_layer: CanvasLayer = null",
+        "var _gk_post_rect: ColorRect = null",
+        "var _gk_post_mat: ShaderMaterial = null",
+        "var _gk_post_eye_tween: Tween = null",
+        # 第一百三十九轮:每次播放 +1 —— 兜底定时器拿着旧令牌就直接作废
+        # (见 `_gk_post_play_eye` 里为什么必须有兜底:真机踩过"整个屏幕全黑")
+        "var _gk_post_eye_token: int = 0",
+        "",
+        "func _enter_tree() -> void:",
+        "	# 延到帧末:这时场景里的其他节点都建好了,overlay 排在最上面",
+        "	_gk_post_ready.call_deferred()",
+        "",
+        "func _gk_post_ready() -> void:",
+        "	if _gk_post_rect != null:",
+        "		return",
+        "	var _gk_shader := load(_GK_POST_SHADER) as Shader",
+        "	if _gk_shader == null:",
+        "		push_warning(\"[GK] 没找到后期着色器:%s\" % _GK_POST_SHADER)",
+        "		return",
+        "	_gk_post_layer = CanvasLayer.new()",
+        "	# layer 100:必须画在 3D 场景**之后**,否则读回来的屏幕纹理是空的",
+        "	_gk_post_layer.layer = 100",
+        "	_gk_post_layer.name = \"GKPost\"",
+        "	add_child(_gk_post_layer)",
+        "	_gk_post_rect = ColorRect.new()",
+        "	_gk_post_rect.name = \"GKPostRect\"",
+        "	_gk_post_rect.anchor_right = 1.0",
+        "	_gk_post_rect.anchor_bottom = 1.0",
+        "	# 后期层绝不能吃掉鼠标 —— 否则整个游戏点不动了",
+        "	_gk_post_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+        "	_gk_post_mat = ShaderMaterial.new()",
+        "	_gk_post_mat.shader = _gk_shader",
+        "	_gk_post_rect.material = _gk_post_mat",
+        "	_gk_post_layer.add_child(_gk_post_rect)",
+        "	# 逻辑图里的『后期_播放睁眼』靠这个组找到我们",
+        "	add_to_group(\"gk_post\")",
+        "	_gk_post_sync_aspect()",
+        "	if not get_viewport().size_changed.is_connected(_gk_post_sync_aspect):",
+        "		get_viewport().size_changed.connect(_gk_post_sync_aspect)",
+    ]
+
+    if grade is not None:
+        lines += _post_grade_lines(grade, mask)
+    if eye is not None:
+        lines += _post_eye_lines(eye)
+
+    lines += [
+        "",
+        "func _gk_post_sync_aspect() -> void:",
+        "	# 圆形蒙版要按宽高比归一化,不然窗口一拉就变成椭圆",
+        "	if _gk_post_mat == null:",
+        "		return",
+        "	var _gk_size := get_viewport().get_visible_rect().size",
+        "	_gk_post_mat.set_shader_parameter(\"viewport_aspect\",",
+        "		_gk_size.x / maxf(_gk_size.y, 1.0))",
+        "",
+        "func _gk_post_set_eye(value: float) -> void:",
+        "	if _gk_post_mat != null:",
+        "		_gk_post_mat.set_shader_parameter(\"eye_amount\", value)",
+        "",
+        "## 播一次睁眼(上下眼皮张开)。逻辑图的『后期_播放睁眼』调这个。",
+        "## `seconds` > 0 时用它当持续时间(逻辑图那张卡的『时长』引脚),",
+        "## 否则用『环境_睁眼效果』卡上的值。",
+        "func _gk_post_play_eye(seconds: float = -1.0) -> void:",
+        "	if _gk_post_mat == null:",
+        "		return",
+    ]
+    if eye is None:
+        lines += [
+            "	# 图里没有『环境_睁眼效果』卡 -> 什么也不做(不报错)",
+            "	return",
+        ]
+    else:
+        slit = _gd_float(getattr(eye, "gk_slit", 0.0))
+        duration = _gd_float(max(0.01, float(getattr(eye, "gk_duration", 1.2))))
+        hold = _gd_float(getattr(eye, "gk_hold", 0.0))
+        color = _post_color(getattr(eye, "gk_color", (0.0, 0.0, 0.0, 1.0)))
+        lines += [
+            f"	_gk_post_mat.set_shader_parameter(\"eye_color\", {color})",
+            "	_gk_post_mat.set_shader_parameter(\"eye_on\", 1.0)",
+            f"	_gk_post_set_eye({slit})",
+            "	if _gk_post_eye_tween != null and _gk_post_eye_tween.is_valid():",
+            "		_gk_post_eye_tween.kill()",
+            "	_gk_post_eye_tween = create_tween()",
+            # ── 两个"别让屏幕黑着"的保险(第一百三十九轮,真机踩到全黑)──────
+            # 症状:预览正常,一进游戏**整个画面全黑**(只剩 HUD)。
+            # 根因:示例的过场会把世界冻住(`tree.paused = true`),而 Tween
+            # 默认是 `TWEEN_PAUSE_BOUND` —— 跟着暂停,眼皮**卡在 6% 那条缝上**
+            # = 94% 黑。所以:
+            #   ① 这个 tween 必须 `TWEEN_PAUSE_PROCESS`(暂停也照样张开);
+            #   ② 再加一个 `process_always = true` 的兜底定时器:到点还没张开完
+            #      (tween 被谁 kill 了 / 场景被换掉),直接把眼皮掀开并关掉。
+            "	_gk_post_eye_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)",
+            "	_gk_post_eye_token += 1",
+            "	var _gk_eye_token := _gk_post_eye_token",
+            # 引脚优先(第一百三十七轮):逻辑图『后期_播放睁眼』的『时长』
+            f"	var _gk_eye_seconds: float = seconds if seconds > 0.0 else {duration}",
+        ]
+        if float(getattr(eye, "gk_hold", 0.0)) > 0.0:
+            lines.append(f"	_gk_post_eye_tween.tween_interval({hold})")
+        # 兜底时间 = 保持 + 张开 + 0.4 秒余量
+        guard = (max(0.0, float(getattr(eye, "gk_hold", 0.0) or 0.0))
+                 + max(0.01, float(getattr(eye, "gk_duration", 1.2) or 1.2)) + 0.4)
+        lines += [
+            f"	_gk_post_eye_tween.tween_method(_gk_post_set_eye, {slit},"
+            f" 1.0, _gk_eye_seconds)",
+            "	_gk_post_eye_tween.tween_callback(_gk_post_eye_done)",
+            f"	var _gk_eye_guard := get_tree().create_timer({_gd_float(guard)}, true)",
+            "	_gk_eye_guard.timeout.connect(func() -> void:",
+            "		if _gk_eye_token != _gk_post_eye_token:",
+            "			return          # 这中间又播过一次,这次兜底作废",
+            "		_gk_post_set_eye(1.0)",
+            "		_gk_post_eye_done())",
+            "",
+            "func _gk_post_eye_done() -> void:",
+            "	# 张开完就关掉这一段,免得一直盖着一层(也省掉每帧的采样)",
+            "	if _gk_post_mat != null:",
+            "		_gk_post_mat.set_shader_parameter(\"eye_on\", 0.0)",
+        ]
+        if str(getattr(eye, "gk_trigger", "LOGIC")) == "AUTO":
+            lines += [
+                "",
+                "func _gk_post_auto_eye() -> void:",
+                "	# 触发方式 = 进关卡自动播",
+                "	_gk_post_play_eye()",
+            ]
+            lines.insert(
+                lines.index("	_gk_post_sync_aspect()"),
+                "	_gk_post_auto_eye.call_deferred()")
+    return lines
+
+
+def _post_grade_lines(grade, mask):
+    """『设置色调』-> shader uniform。"""
+    tint = _post_color(getattr(grade, "gk_tint", (1.0, 1.0, 1.0, 1.0)))
+    lines = [
+        "	# ---- 色调(来自『环境_设置色调』)----",
+        "	_gk_post_mat.set_shader_parameter(\"grade_on\", 1.0)",
+        f"	_gk_post_mat.set_shader_parameter(\"brightness\","
+        f" {_gd_float(getattr(grade, 'gk_brightness', 1.0))})",
+        f"	_gk_post_mat.set_shader_parameter(\"contrast\","
+        f" {_gd_float(getattr(grade, 'gk_contrast', 1.0))})",
+        f"	_gk_post_mat.set_shader_parameter(\"saturation\","
+        f" {_gd_float(getattr(grade, 'gk_saturation', 1.0))})",
+        f"	_gk_post_mat.set_shader_parameter(\"tint\", {tint})",
+        f"	_gk_post_mat.set_shader_parameter(\"tint_amount\","
+        f" {_gd_float(getattr(grade, 'gk_tint_amount', 0.0))})",
+    ]
+    if mask is None:
+        lines += [
+            "	# 『屏幕位置』没接 = 整屏(蒙版关着)",
+            "	_gk_post_mat.set_shader_parameter(\"mask_on\", 0.0)",
+        ]
+    else:
+        center = getattr(mask, "gk_center", (0.5, 0.5, 0.0))
+        size = getattr(mask, "gk_size", (0.5, 0.4, 0.0))
+        lines += [
+            "	# 『屏幕位置』接了 -> 只在这块区域里调色",
+            "	_gk_post_mat.set_shader_parameter(\"mask_on\", 1.0)",
+            "	_gk_post_mat.set_shader_parameter(\"mask_round\",",
+            "		1.0 if %s else 0.0)" % (
+                "true" if bool(getattr(mask, "gk_round", True)) else "false"),
+            "	_gk_post_mat.set_shader_parameter(\"mask_center\","
+            f" Vector2({_gd_float(center[0])}, {_gd_float(center[1])}))",
+            "	_gk_post_mat.set_shader_parameter(\"mask_radius\","
+            f" {_gd_float(getattr(mask, 'gk_radius', 0.35))})",
+            "	_gk_post_mat.set_shader_parameter(\"mask_size\","
+            f" Vector2({_gd_float(size[0])}, {_gd_float(size[1])}))",
+            "	_gk_post_mat.set_shader_parameter(\"mask_feather\","
+            f" {_gd_float(getattr(mask, 'gk_feather', 0.1))})",
+            "	_gk_post_mat.set_shader_parameter(\"mask_invert\",",
+            "		1.0 if %s else 0.0)" % (
+                "true" if bool(getattr(mask, "gk_invert", False)) else "false"),
+        ]
+    return lines
+
+
+def _post_eye_lines(eye):
+    """『睁眼效果』的初始状态(颜色 / 起始缝)。播放由 _gk_post_play_eye 负责。"""
+    color = _post_color(getattr(eye, "gk_color", (0.0, 0.0, 0.0, 1.0)))
+    slit = _gd_float(getattr(eye, "gk_slit", 0.0))
+    return [
+        "	# ---- 睁眼效果(来自『环境_睁眼效果』)----",
+        # 平时 eye_on = 0(完全不参与);播的时候才打开
+        "	_gk_post_mat.set_shader_parameter(\"eye_on\", 0.0)",
+        f"	_gk_post_mat.set_shader_parameter(\"eye_color\", {color})",
+        f"	_gk_post_mat.set_shader_parameter(\"eye_amount\", {slit})",
+    ]
+
+
+def _post_color(value):
+    """把节点的颜色属性写成 GDScript 的 `Color(...)` 字面量。
+
+    ⚠ 这里**不转 sRGB**:节点上的颜色和材质上的颜色不一样 —— 它是
+      "调色系数"(白 = 不偏色),直接乘进线性画面,所以按原值写。
+      (环境背景色那一套要转,是因为它是要**显示**给人看的颜色,
+      见 `_env_color_text` 的说明。两者别搞混。)
+    """
+    try:
+        r, g, b = float(value[0]), float(value[1]), float(value[2])
+    except (TypeError, IndexError, ValueError):
+        r = g = b = 1.0
+    return "Color({:.6f}, {:.6f}, {:.6f}, 1)".format(r, g, b)
+
+
+# ==========================================================================
+# 昼夜循环 + 天空盒 + 太阳 + 云层(第一百三十三轮)
+# ==========================================================================
+# 用户原话(2026-10-15):
+#     "天空盒,时间流逝,昼夜交替,太阳,云层等这些还没有设计啊,这些都可以
+#      添加到游戏环境与后期的右键菜单里,如随着时间流逝,从卡通日间到
+#      卡通夜晚,当然这时间等可以自定义的"
+# 四个追问用户全选了推荐项:① 环境图里配好、**进关卡自动流逝**(逻辑图可以
+# 暂停 / 加速 / 跳到某时刻);② 太阳**真的按时刻转**(影子方向跟着走);
+# ③ 云层是**天空着色器里的流动程序化噪声**(不依赖贴图);④ 关键帧用**多档**,
+# 之间插值、循环闭合。
+#
+# ── 为什么时间轴在 GDScript 这边,不在着色器里 ──────────────────────
+# 着色器里的 `TIME` **暂停时也走**(它是引擎时钟),而用户要的是"逻辑图能
+# 暂停 / 加速 / 跳到某个时刻"。所以"走到哪儿了"记在环境脚本里
+# (`_gk_dn_hour` / `_gk_dn_elapsed`),再喂给天空着色器的 `time_offset`。
+#
+# ── 关键帧 -> 内置氛围档 ────────────────────────────────────────────
+# 卡片上写 `0=夜晚|6=清晨|12=白天|18=黄昏`,导出成常量字符串,运行时解析 +
+# 排序 + 在两个档之间插值,到最后一帧绕回第一帧(**循环闭合**)。
+#
+# ⚠ 这一段文本会被塞进 `ENVIRONMENT_SCRIPT.format(**fields)` ——
+#   **一个花括号都不能有**(字典字面量、`{}` 插值都会把模板打乱)。
+#   所以内置档写成"多条平行数组",不用 Dictionary。
+_DAYNIGHT_PRESETS = (
+    # 名字, 天顶色, 地平线色, 太阳色, 太阳强度, 天光(day), 霞光, 环境光, 雾色
+    ("夜晚", (0.02, 0.03, 0.08), (0.05, 0.07, 0.14), (0.60, 0.70, 1.00),
+     0.06, 0.05, 0.0, 0.08, (0.03, 0.04, 0.09)),
+    ("清晨", (0.20, 0.36, 0.68), (0.85, 0.66, 0.55), (1.00, 0.82, 0.62),
+     0.55, 0.55, 0.6, 0.22, (0.45, 0.42, 0.48)),
+    ("白天", (0.25, 0.45, 0.85), (0.72, 0.82, 0.95), (1.00, 0.96, 0.88),
+     1.00, 1.00, 0.0, 0.35, (0.60, 0.68, 0.78)),
+    ("黄昏", (0.16, 0.20, 0.45), (0.95, 0.48, 0.25), (1.00, 0.55, 0.30),
+     0.50, 0.45, 1.0, 0.20, (0.45, 0.30, 0.28)),
+)
+
+# ── 天气(第一百四十二轮)──────────────────────────────────────────
+# 每种天气 = 4 个倍数(雾 / 云量 / 环境光 / 泛光),乘在昼夜那套值上。
+# 全部是**倍数**而不是绝对值:天气不该把用户调好的氛围整个覆盖掉。
+_WEATHERS = (
+    ("CLEAR", "晴", 0.35, 0.30, 1.00, 1.00),
+    ("CLOUDY", "阴", 0.90, 0.85, 0.80, 0.75),
+    ("RAINY", "雨", 1.80, 1.00, 0.65, 0.55),
+    ("FOGGY", "雾", 2.60, 0.55, 0.85, 0.40),
+)
+
+
+def _weather_index(name):
+    """天气名(晴/阴/雨/雾 或 CLEAR/CLOUDY/RAINY/FOGGY)-> 下标。"""
+    text_name = str(name or "").strip()
+    for index, weather in enumerate(_WEATHERS):
+        if text_name in (weather[0], weather[1]):
+            return index
+    return 0
+
+
+# 档名别名(用户想写"深夜 / 正午 / 黎明"也认;认不出的档 -> 白天)
+_DAYNIGHT_ALIASES = {
+    "深夜": "夜晚", "午夜": "夜晚", "黎明": "清晨", "早上": "清晨",
+    "上午": "清晨", "中午": "白天", "正午": "白天", "日落": "黄昏",
+    "傍晚": "黄昏",
+}
+
+_DAYNIGHT_GROUP = "gk_daynight"
+_SKY_SHADER_PATH = "res://shaders/gk_sky.gdshader"
+
+
+def _daynight_cards():
+    """从执行流上挑出这四张卡(一张都没有 -> None)。
+
+    和 `_post_block` 同一条链:顺序由**连线**决定,起点是『环境_默认环境』。
+    """
+    chain = _post_chain()
+    found = {"sky": None, "clouds": None, "sun": None, "daynight": None,
+             "moon": None, "weather": None}
+    for node in chain:
+        kind = getattr(node, "bl_idname", "")
+        if kind == "GKNodeSkyBox" and found["sky"] is None:
+            found["sky"] = node
+        elif kind == "GKNodeClouds" and found["clouds"] is None:
+            found["clouds"] = node
+        elif kind == "GKNodeSun" and found["sun"] is None:
+            found["sun"] = node
+        elif kind == "GKNodeDayNight" and found["daynight"] is None:
+            found["daynight"] = node
+        elif kind == "GKNodeMoon" and found["moon"] is None:
+            found["moon"] = node
+        elif kind == "GKNodeWeather" and found["weather"] is None:
+            found["weather"] = node
+    if not any(found.values()):
+        return None
+    return found
+
+
+def _daynight_preset_index(name):
+    """档名 -> 下标(别名先归一;认不出当"白天")。"""
+    text = str(name or "").strip()
+    text = _DAYNIGHT_ALIASES.get(text, text)
+    for index, preset in enumerate(_DAYNIGHT_PRESETS):
+        if preset[0] == text:
+            return index
+    return 2                                     # 白天
+
+
+def _daynight_const_lines(cards):
+    """这一段用到的常量(卡上的值)。"""
+    sky = cards["sky"]
+    clouds = cards["clouds"]
+    sun = cards["sun"]
+    daynight = cards["daynight"]
+    moon = cards.get("moon")
+    weather = cards.get("weather")
+
+    def number(node, attr, fallback):
+        if node is None:
+            return float(fallback)
+        try:
+            return float(getattr(node, attr, fallback))
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    def color(node, attr, fallback):
+        if node is None:
+            return _post_color(fallback)
+        return _post_color(getattr(node, attr, fallback))
+
+    def flag(node, attr, fallback):
+        if node is None:
+            return bool(fallback)
+        return bool(getattr(node, attr, fallback))
+
+    def text(node, attr, fallback):
+        if node is None:
+            return str(fallback)
+        return str(getattr(node, attr, fallback) or fallback)
+
+    # ── 天空盒:没有『环境_天空盒』卡但有云 / 昼夜时也要开(否则没地方画云)
+    sky_on = sky is not None or cards["clouds"] is not None \
+        or daynight is not None
+    lines = [
+        f'const _GK_SKY_SHADER := "{_SKY_SHADER_PATH}"',
+        "const _GK_SKY_ON := %s" % ("true" if sky_on else "false"),
+        "const _GK_SKY_TOP := %s" % color(
+            sky, "gk_sky_top", (0.25, 0.45, 0.85, 1.0)),
+        "const _GK_SKY_HORIZON := %s" % color(
+            sky, "gk_sky_horizon", (0.72, 0.82, 0.95, 1.0)),
+        "const _GK_SKY_GROUND := %s" % color(
+            sky, "gk_ground_color", (0.12, 0.12, 0.14, 1.0)),
+        "const _GK_SKY_SUN_SIZE := %s" % _gd_float(
+            number(sky, "gk_sun_size", 0.06)),
+        "const _GK_SKY_GLOW := %s" % _gd_float(
+            number(sky, "gk_horizon_glow", 0.0)),
+        "const _GK_SKY_GLOW_COLOR := %s" % color(
+            sky, "gk_glow_color", (1.0, 0.55, 0.28, 1.0)),
+        "const _GK_CLOUD_ON := %s" % (
+            "true" if clouds is not None else "false"),
+        "const _GK_CLOUD_AMOUNT := %s" % _gd_float(
+            number(clouds, "gk_cloud_amount", 0.45)),
+        "const _GK_CLOUD_SPEED := %s" % _gd_float(
+            number(clouds, "gk_cloud_speed", 0.02)),
+        "const _GK_CLOUD_SCALE := %s" % _gd_float(
+            number(clouds, "gk_cloud_scale", 3.0)),
+        "const _GK_CLOUD_HEIGHT := %s" % _gd_float(
+            number(clouds, "gk_cloud_height", 0.12)),
+        "const _GK_CLOUD_SOFTNESS := %s" % _gd_float(
+            number(clouds, "gk_cloud_softness", 0.22)),
+        "const _GK_CLOUD_LIGHT := %s" % color(
+            clouds, "gk_cloud_light", (1.0, 0.98, 0.95, 1.0)),
+        "const _GK_CLOUD_DARK := %s" % color(
+            clouds, "gk_cloud_dark", (0.45, 0.48, 0.58, 1.0)),
+        "const _GK_DN_ENABLED := %s" % (
+            "true" if daynight is not None else "false"),
+        f'const _GK_DN_GROUP := "{_DAYNIGHT_GROUP}"',
+        "const _GK_DN_KEYFRAMES := \"%s\"" % text(
+            daynight, "gk_keyframes", "0=夜晚|6=清晨|12=白天|18=黄昏"),
+        "const _GK_DN_DAY_SECONDS := %s" % _gd_float(
+            number(daynight, "gk_day_seconds", 120.0)),
+        "const _GK_DN_START_HOUR := %s" % _gd_float(
+            number(daynight, "gk_start_hour", 8.0)),
+        "const _GK_DN_AUTO := %s" % (
+            "true" if flag(daynight, "gk_auto", True) else "false"),
+        "const _GK_DN_BRIGHTNESS := %s" % _gd_float(
+            number(daynight, "gk_brightness", 1.0)),
+        "const _GK_DN_SUN_NAME := \"%s\"" % text(sun, "gk_sun_name", ""),
+        "const _GK_DN_SUN_ORBIT := %s" % (
+            "true" if flag(sun, "gk_sun_orbit", True) else "false"),
+        "const _GK_DN_SUN_LATITUDE := %s" % _gd_float(
+            number(sun, "gk_sun_latitude", 45.0)),
+        "const _GK_DN_SUN_TILT := %s" % _gd_float(
+            number(sun, "gk_sun_tilt", 0.0)),
+        "const _GK_DN_SUN_SCALE := %s" % _gd_float(
+            number(sun, "gk_sun_scale", 1.0)),
+        "const _GK_DN_SUN_SHADOW := %s" % (
+            "true" if flag(sun, "gk_sun_shadow", True) else "false"),
+        # ── 第一百四十二轮:月亮 / 天气 / 对外接口 ─────────────────────
+        'const _GK_ENV_GROUP := "gk_env"',
+        "const _GK_MOON_ON := %s" % (
+            "true" if (moon is not None
+                       and flag(moon, "gk_moon_enabled", True)) else "false"),
+        "const _GK_MOON_COLOR := %s" % color(
+            moon, "gk_moon_color", (0.80, 0.86, 1.0, 1.0)),
+        "const _GK_MOON_ENERGY := %s" % _gd_float(
+            number(moon, "gk_moon_energy", 0.35)),
+        "const _GK_MOON_SIZE := %s" % _gd_float(
+            number(moon, "gk_moon_size", 0.035)),
+        "const _GK_MOON_PHASE := %s" % _gd_float(
+            number(moon, "gk_moon_phase", 1.0)),
+        "const _GK_MOON_SHADOW := %s" % (
+            "true" if flag(moon, "gk_moon_shadow", False) else "false"),
+        "const _GK_MOON_ORBIT := %s" % (
+            "true" if flag(moon, "gk_moon_orbit", True) else "false"),
+        "const _GK_WEATHER_START := %d" % _weather_index(
+            text(weather, "gk_weather", "CLEAR")),
+    ] + _weather_const_lines()
+    return lines
+
+
+def _weather_const_lines():
+    """天气表(平行数组,和 _WEATHERS 一一对应)。"""
+    names = ", ".join('"%s"' % weather[1] for weather in _WEATHERS)
+    fog = ", ".join(_gd_float(weather[2]) for weather in _WEATHERS)
+    cloud = ", ".join(_gd_float(weather[3]) for weather in _WEATHERS)
+    ambient = ", ".join(_gd_float(weather[4]) for weather in _WEATHERS)
+    glow = ", ".join(_gd_float(weather[5]) for weather in _WEATHERS)
+    # ⚠ 只能用**普通数组字面量**:GDScript 的 `const` 不接受
+    #   `PackedFloat32Array([...])` 这种构造调用(实测:
+    #   "Assigned value for constant isn't a constant expression")
+    return [
+        f"const _GK_WX_NAMES = [{names}]",
+        f"const _GK_WX_FOG = [{fog}]",
+        f"const _GK_WX_CLOUD = [{cloud}]",
+        f"const _GK_WX_AMBIENT = [{ambient}]",
+        f"const _GK_WX_GLOW = [{glow}]",
+    ]
+
+
+def _daynight_preset_lines():
+    """内置氛围档(平行数组,不用字典 —— 见上面那条花括号的说明)。"""
+    names = ", ".join('"%s"' % preset[0] for preset in _DAYNIGHT_PRESETS)
+    lines = ["const _GK_DN_PRESET_NAMES := [%s]" % names]
+    fields = (
+        ("TOP", 1, _post_color), ("HORIZON", 2, _post_color),
+        ("SUN", 3, _post_color), ("SUN_E", 4, _gd_float),
+        ("DAY", 5, _gd_float), ("GLOW", 6, _gd_float),
+        ("AMBIENT", 7, _gd_float), ("FOG", 8, _post_color),
+    )
+    for name, index, fmt in fields:
+        values = ", ".join(fmt(preset[index]) for preset in _DAYNIGHT_PRESETS)
+        lines.append("const _GK_DN_PRESET_%s := [%s]" % (name, values))
+    return lines
+
+
+def _daynight_body_lines():
+    """昼夜循环那一整套 GDScript(装天空 / 走时间 / 插值 / 控制接口)。
+
+    ⚠ 这段会原样插进 `ENVIRONMENT_SCRIPT`,里面**不能有花括号**。
+    """
+    return [
+        "# 整点到了(第一百四十三轮):逻辑图『环境_当时间到』接这个信号",
+        "signal gk_hour_reached(hour: int)",
+        "var _gk_dn_hour := 12.0",
+        "var _gk_dn_speed := 1.0",
+        "var _gk_dn_paused := false",
+        "var _gk_dn_elapsed := 0.0",
+        "var _gk_dn_last_ms := 0",
+        "var _gk_dn_hour_int := -1",
+        "var _gk_dn_ready := false",
+        "var _gk_dn_sun: DirectionalLight3D = null",
+        "var _gk_dn_sun_base := 1.0",
+        "var _gk_dn_env: Environment = null",
+        "var _gk_sky_mat: ShaderMaterial = null",
+        "var _gk_sky_on := false",
+        "var _gk_dn_key_hours := PackedFloat32Array()",
+        "var _gk_dn_key_slots := PackedInt32Array()",
+        "# ── 月亮(第一百四十二轮)──",
+        "var _gk_dn_moon: DirectionalLight3D = null",
+        "# ── 天气(第一百四十二轮):4 个倍数,按 _GK_WX_* 表插值 ──",
+        "var _gk_dn_fog_base := 0.0",
+        "var _gk_dn_glow_base := 0.0",
+        "var _gk_wx_target := 0",
+        "var _gk_wx_mix := 1.0",
+        "var _gk_wx_values := PackedFloat32Array()",
+        "var _gk_wx_from := PackedFloat32Array()",
+        "var _gk_wx_to := PackedFloat32Array()",
+        "var _gk_wx_tween: Tween = null",
+        "",
+        "## 进关卡时启动:找太阳 / 装天空 / 接上时间轴(延到帧末,见 _enter_tree)。",
+        "func _gk_daynight_setup() -> void:",
+        "	if _gk_dn_ready:",
+        "		return",
+        "	_gk_dn_ready = true",
+        "	# 逻辑图里的『环境_昼夜设置』靠这个组找到我们(不按名字找:名字用户会改)",
+        "	add_to_group(_GK_DN_GROUP)",
+        "	add_to_group(_GK_ENV_GROUP)",
+        "	_gk_wx_target = _GK_WEATHER_START",
+        "	_gk_wx_values = _gk_env_weather_values(_gk_wx_target)",
+        "	_gk_wx_mix = 1.0",
+        "	_gk_dn_hour = fmod(maxf(_GK_DN_START_HOUR, 0.0), 24.0)",
+        "	_gk_dn_last_ms = Time.get_ticks_msec()",
+        "	_gk_daynight_parse_keys()",
+        "	var viewport := get_viewport()",
+        "	if viewport != null:",
+        "		var world := viewport.find_world_3d()",
+        "		if world != null:",
+        "			_gk_dn_env = world.environment",
+        "			if _gk_dn_env != null:",
+        "				_gk_dn_fog_base = _gk_dn_env.fog_density",
+        "				_gk_dn_glow_base = _gk_dn_env.glow_intensity",
+        "	_gk_dn_sun = _gk_daynight_find_sun()",
+        "	_gk_dn_moon = _gk_daynight_make_moon()",
+        "	if _gk_dn_sun != null:",
+        "		# 记下「出厂强度」 —— 关键帧给的是**倍数**,在这上面乘",
+        "		_gk_dn_sun_base = maxf(_gk_dn_sun.light_energy, 0.0001)",
+        "		_gk_dn_sun.shadow_enabled = _GK_DN_SUN_SHADOW",
+        "	if _GK_SKY_ON:",
+        "		_gk_daynight_make_sky()",
+        "	var tree := get_tree()",
+        "	if tree != null and not tree.physics_frame.is_connected(_gk_daynight_physics):",
+        "		tree.physics_frame.connect(_gk_daynight_physics)",
+        "	_gk_env_emit_hours(-1.0, _gk_dn_hour)",
+        "	_gk_daynight_apply()",
+        "",
+        "## 把程序化天空装到当前 WorldEnvironment 上(没装 WorldEnvironment 就跳过)。",
+        "func _gk_daynight_make_sky() -> void:",
+        "	if _gk_dn_env == null:",
+        "		push_warning(\"[GK] 这一关没有 WorldEnvironment,天空盒没地方挂\")",
+        "		return",
+        "	var shader := load(_GK_SKY_SHADER) as Shader",
+        "	if shader == null:",
+        "		push_warning(\"[GK] 没找到天空着色器:%s\" % _GK_SKY_SHADER)",
+        "		return",
+        "	_gk_sky_mat = ShaderMaterial.new()",
+        "	_gk_sky_mat.shader = shader",
+        "	var sky := Sky.new()",
+        "	sky.sky_material = _gk_sky_mat",
+        "	_gk_dn_env.sky = sky",
+        "	_gk_dn_env.background_mode = Environment.BG_SKY",
+        "	_gk_sky_on = true",
+        "",
+        "## 每一物理帧:推进时刻 + 应用。",
+        "## 用 Time.get_ticks_msec() 自己算间隔(而不是引擎的 delta):",
+        "## 暂停 / 时停时物理帧的 delta 会变成 0,而我们要的是「墙上的钟照走」",
+        "## —— 走不走由 `_gk_dn_paused` 说了算,这样『暂停昼夜』才真的停得住。",
+        "func _gk_daynight_physics() -> void:",
+        "	var now := Time.get_ticks_msec()",
+        "	var delta := float(now - _gk_dn_last_ms) / 1000.0",
+        "	_gk_dn_last_ms = now",
+        "	_gk_daynight_tick(delta)",
+        "",
+        "func _gk_daynight_tick(delta: float) -> void:",
+        "	# 上帝机 / Esc 暂停把世界冻住时,天也一起冻 —— 那是「整局暂停」的语义",
+        "	if _gk_dn_paused or get_tree().paused:",
+        "		return",
+        "	if _GK_DN_ENABLED and _GK_DN_AUTO:",
+        "		var per_second := 24.0 / maxf(_GK_DN_DAY_SECONDS, 0.001)",
+        "		var before := _gk_dn_hour",
+        "		_gk_dn_hour = fmod(_gk_dn_hour + delta * per_second * _gk_dn_speed, 24.0)",
+        "		if _gk_dn_hour < 0.0:",
+        "			_gk_dn_hour += 24.0",
+        "		_gk_env_emit_hours(before, _gk_dn_hour)",
+        "	# 云靠这个数在飘(着色器里的 TIME 暂停时也走,不能用它)",
+        "	_gk_dn_elapsed += delta * _gk_dn_speed",
+        "	_gk_daynight_apply()",
+        "",
+        "## 把当前时刻「长什么样」写到太阳 / 天空 / 环境光 / 雾上。",
+        "func _gk_daynight_apply() -> void:",
+        "	var top: Color = _GK_SKY_TOP",
+        "	var horizon: Color = _GK_SKY_HORIZON",
+        "	var sun_color := Color(1.0, 0.96, 0.88, 1.0)",
+        "	var sun_energy := 1.0",
+        "	var day_amount := 1.0",
+        "	var glow := _GK_SKY_GLOW",
+        "	if _GK_DN_ENABLED:",
+        "		var values := _gk_daynight_mix(_gk_dn_hour)",
+        "		top = values[0]",
+        "		horizon = values[1]",
+        "		sun_color = values[2]",
+        "		sun_energy = float(values[3]) * _GK_DN_SUN_SCALE * _GK_DN_BRIGHTNESS",
+        "		day_amount = clampf(float(values[4]) * _GK_DN_BRIGHTNESS, 0.0, 1.0)",
+        "		glow = float(values[5])",
+        "		if _gk_dn_sun != null:",
+        "			# 颜色 / 强度跟着时刻走(这是「不是只换背景色」的那一半)",
+        "			_gk_dn_sun.light_color = sun_color",
+        "			_gk_dn_sun.light_energy = maxf(_gk_dn_sun_base * sun_energy, 0.0)",
+        "			if _GK_DN_SUN_ORBIT:",
+        "				# 6 点日出 / 12 点最高 / 18 点日落 —— 影子方向**真的**跟着转",
+        "				var angle := (_gk_dn_hour - 6.0) / 12.0 * PI",
+        "				var elevation := sin(angle) * deg_to_rad(_GK_DN_SUN_LATITUDE)",
+        "				var yaw := -cos(angle) * deg_to_rad(120.0) \\",
+        "						+ deg_to_rad(_GK_DN_SUN_TILT)",
+        "				_gk_dn_sun.rotation = Vector3(-elevation, yaw, 0.0)",
+        "		if _gk_dn_env != null:",
+        "			if _gk_dn_env.ambient_light_source == Environment.AMBIENT_SOURCE_COLOR:",
+        "				_gk_dn_env.ambient_light_energy = maxf(",
+        "						float(values[6]) * _GK_DN_BRIGHTNESS, 0.0)",
+        "			if _gk_dn_env.fog_enabled:",
+        "				_gk_dn_env.fog_light_color = values[7]",
+        "	# ── 天气乘子(第一百四十二轮):雾 / 云 / 环境光 / 泛光各乘一道 ──",
+        "	if _gk_dn_env != null:",
+        "		_gk_dn_env.fog_density = _gk_dn_fog_base * _gk_env_wx(0)",
+        "		_gk_dn_env.glow_intensity = _gk_dn_glow_base * _gk_env_wx(3)",
+        "	# ── 月亮:亮度按「夜色程度」,方向跟太阳反着走 ──────────────",
+        "	var night := (1.0 - day_amount) if _GK_DN_ENABLED else 1.0",
+        "	if _gk_dn_moon != null:",
+        "		_gk_dn_moon.light_energy = maxf(",
+        "				_GK_MOON_ENERGY * night * _GK_DN_BRIGHTNESS, 0.0)",
+        "		_gk_dn_moon.light_color = _GK_MOON_COLOR",
+        "		_gk_dn_moon.shadow_enabled = _GK_MOON_SHADOW",
+        "		if _GK_MOON_ORBIT:",
+        "			var sun_rot := Vector3(0.0, 0.0, 0.0)",
+        "			if _gk_dn_sun != null:",
+        "				sun_rot = _gk_dn_sun.rotation",
+        "			_gk_dn_moon.rotation = Vector3(-sun_rot.x, sun_rot.y + PI, 0.0)",
+        "	_gk_daynight_update_sky(top, horizon, sun_color, sun_energy, day_amount, glow)",
+        "",
+        "func _gk_daynight_update_sky(top: Color, horizon: Color, sun_color: Color,",
+        "		sun_energy: float, day_amount: float, glow: float) -> void:",
+        "	if not _gk_sky_on or _gk_sky_mat == null:",
+        "		return",
+        "	# 太阳方向取平行光的 +Z(和卡通材质的 light_dir 同一个约定:",
+        "	# 见 _gk_pick_light 里「光从哪来 = +Z」那段)",
+        "	var sun_dir := Vector3(0.0, -1.0, 0.0)",
+        "	if _gk_dn_sun != null:",
+        "		sun_dir = _gk_dn_sun.global_transform.basis.z.normalized()",
+        "	_gk_sky_mat.set_shader_parameter(\"sky_top\", top)",
+        "	_gk_sky_mat.set_shader_parameter(\"sky_horizon\", horizon)",
+        "	_gk_sky_mat.set_shader_parameter(\"ground_color\", _GK_SKY_GROUND)",
+        "	_gk_sky_mat.set_shader_parameter(\"day_amount\", day_amount)",
+        "	_gk_sky_mat.set_shader_parameter(\"horizon_glow\", glow)",
+        "	_gk_sky_mat.set_shader_parameter(\"horizon_glow_color\", _GK_SKY_GLOW_COLOR)",
+        "	_gk_sky_mat.set_shader_parameter(\"sun_dir\", sun_dir)",
+        "	_gk_sky_mat.set_shader_parameter(\"sun_color\", sun_color)",
+        "	_gk_sky_mat.set_shader_parameter(\"sun_energy\", sun_energy)",
+        "	_gk_sky_mat.set_shader_parameter(\"sun_size\", _GK_SKY_SUN_SIZE)",
+        "	# ── 月盘(第一百四十二轮)────────────────────────────────",
+        "	var moon_dir := Vector3(0.0, 1.0, 0.0)",
+        "	if _gk_dn_moon != null:",
+        "		moon_dir = _gk_dn_moon.global_transform.basis.z.normalized()",
+        "	_gk_sky_mat.set_shader_parameter(\"moon_dir\", moon_dir)",
+        "	_gk_sky_mat.set_shader_parameter(\"moon_color\", _GK_MOON_COLOR)",
+        "	_gk_sky_mat.set_shader_parameter(\"moon_size\", _GK_MOON_SIZE)",
+        "	_gk_sky_mat.set_shader_parameter(\"moon_phase\", _GK_MOON_PHASE)",
+        "	_gk_sky_mat.set_shader_parameter(\"moon_energy\",",
+        "			_gk_dn_moon.light_energy if _gk_dn_moon != null else 0.0)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_on\", 1.0 if _GK_CLOUD_ON else 0.0)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_amount\","
+        " _GK_CLOUD_AMOUNT * _gk_env_wx(1))",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_speed\", _GK_CLOUD_SPEED)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_scale\", _GK_CLOUD_SCALE)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_height\", _GK_CLOUD_HEIGHT)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_softness\", _GK_CLOUD_SOFTNESS)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_light\", _GK_CLOUD_LIGHT)",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_dark\", _GK_CLOUD_DARK)",
+        "	_gk_sky_mat.set_shader_parameter(\"time_offset\", _gk_dn_elapsed)",
+        "",
+        "## 关键帧字符串 -> 时刻表 + 档位表(排序用插入排序:两张表要一起挪)。",
+        "func _gk_daynight_parse_keys() -> void:",
+        "	_gk_dn_key_hours = PackedFloat32Array()",
+        "	_gk_dn_key_slots = PackedInt32Array()",
+        "	for entry in _GK_DN_KEYFRAMES.split(\"|\", false):",
+        "		var text := entry.strip_edges()",
+        "		if text.is_empty() or not text.contains(\"=\"):",
+        "			continue",
+        "		var parts := text.split(\"=\", true, 1)",
+        "		var hour := fmod(maxf(float(parts[0].strip_edges()), 0.0), 24.0)",
+        "		_gk_dn_key_hours.append(hour)",
+        "		_gk_dn_key_slots.append(_gk_daynight_preset_index(parts[1].strip_edges()))",
+        "	var count := _gk_dn_key_hours.size()",
+        "	for i in range(1, count):",
+        "		var hour := _gk_dn_key_hours[i]",
+        "		var slot := _gk_dn_key_slots[i]",
+        "		var j := i - 1",
+        "		while j >= 0 and _gk_dn_key_hours[j] > hour:",
+        "			_gk_dn_key_hours[j + 1] = _gk_dn_key_hours[j]",
+        "			_gk_dn_key_slots[j + 1] = _gk_dn_key_slots[j]",
+        "			j -= 1",
+        "		_gk_dn_key_hours[j + 1] = hour",
+        "		_gk_dn_key_slots[j + 1] = slot",
+        "",
+        "func _gk_daynight_preset_index(name: String) -> int:",
+        "	var index := _GK_DN_PRESET_NAMES.find(name)",
+        "	if index >= 0:",
+        "		return index",
+        "	match name:",
+        "		\"深夜\", \"午夜\":",
+        "			return _GK_DN_PRESET_NAMES.find(\"夜晚\")",
+        "		\"黎明\", \"早上\", \"上午\":",
+        "			return _GK_DN_PRESET_NAMES.find(\"清晨\")",
+        "		\"中午\", \"正午\":",
+        "			return _GK_DN_PRESET_NAMES.find(\"白天\")",
+        "		\"日落\", \"傍晚\":",
+        "			return _GK_DN_PRESET_NAMES.find(\"黄昏\")",
+        "	return _GK_DN_PRESET_NAMES.find(\"白天\")",
+        "",
+        "## 一档氛围的 8 个值(顺序和 _GK_DN_PRESET_* 平行数组一一对应)。",
+        "func _gk_daynight_preset_values(slot: int) -> Array:",
+        "	var index := clampi(slot, 0, _GK_DN_PRESET_NAMES.size() - 1)",
+        "	return [",
+        "		_GK_DN_PRESET_TOP[index], _GK_DN_PRESET_HORIZON[index],",
+        "		_GK_DN_PRESET_SUN[index], _GK_DN_PRESET_SUN_E[index],",
+        "		_GK_DN_PRESET_DAY[index], _GK_DN_PRESET_GLOW[index],",
+        "		_GK_DN_PRESET_AMBIENT[index], _GK_DN_PRESET_FOG[index],",
+        "	]",
+        "",
+        "## 当前时刻的氛围(在相邻两个关键帧之间插值;最后一帧绕回第一帧)。",
+        "func _gk_daynight_mix(hour: float) -> Array:",
+        "	var count := _gk_dn_key_hours.size()",
+        "	if count == 0:",
+        "		return _gk_daynight_preset_values(_gk_daynight_preset_index(\"白天\"))",
+        "	if count == 1:",
+        "		return _gk_daynight_preset_values(_gk_dn_key_slots[0])",
+        "	var prev := count - 1",
+        "	for i in range(count):",
+        "		if hour >= _gk_dn_key_hours[i]:",
+        "			prev = i",
+        "	var nxt := (prev + 1) % count",
+        "	var h0 := _gk_dn_key_hours[prev]",
+        "	var h1 := _gk_dn_key_hours[nxt]",
+        "	if h1 <= h0:",
+        "		h1 += 24.0",
+        "	var hh := hour",
+        "	if hh < h0:",
+        "		hh += 24.0",
+        "	var t := clampf((hh - h0) / maxf(h1 - h0, 0.0001), 0.0, 1.0)",
+        "	var a := _gk_daynight_preset_values(_gk_dn_key_slots[prev])",
+        "	var b := _gk_daynight_preset_values(_gk_dn_key_slots[nxt])",
+        "	var a_top: Color = a[0]",
+        "	var b_top: Color = b[0]",
+        "	var a_horizon: Color = a[1]",
+        "	var b_horizon: Color = b[1]",
+        "	var a_sun: Color = a[2]",
+        "	var b_sun: Color = b[2]",
+        "	var a_fog: Color = a[7]",
+        "	var b_fog: Color = b[7]",
+        "	return [",
+        "		a_top.lerp(b_top, t), a_horizon.lerp(b_horizon, t),",
+        "		a_sun.lerp(b_sun, t), lerpf(float(a[3]), float(b[3]), t),",
+        "		lerpf(float(a[4]), float(b[4]), t), lerpf(float(a[5]), float(b[5]), t),",
+        "		lerpf(float(a[6]), float(b[6]), t), a_fog.lerp(b_fog, t),",
+        "	]",
+        "",
+        "## 找太阳:名字填了就按名字,否则场景里第一盏平行光。",
+        "func _gk_daynight_find_sun() -> DirectionalLight3D:",
+        "	var root := _scene_root()",
+        "	if root == null:",
+        "		return null",
+        "	var wanted := _GK_DN_SUN_NAME.strip_edges()",
+        "	if not wanted.is_empty():",
+        "		var named := root.find_child(wanted, true, false)",
+        "		if named is DirectionalLight3D:",
+        "			return named as DirectionalLight3D",
+        "	for node in root.find_children(\"*\", \"DirectionalLight3D\", true, false):",
+        "		return node as DirectionalLight3D",
+        "	return null",
+        "",
+        "## 建月亮:一盏平行光,挂场景根上(影子默认关,夜景开销大)。",
+        "func _gk_daynight_make_moon() -> DirectionalLight3D:",
+        "	if not _GK_MOON_ON:",
+        "		return null",
+        "	var root := _scene_root()",
+        "	if root == null:",
+        "		return null",
+        "	var moon := DirectionalLight3D.new()",
+        "	moon.name = \"GKMoon\"",
+        "	moon.light_color = _GK_MOON_COLOR",
+        "	moon.light_energy = 0.0",
+        "	moon.shadow_enabled = _GK_MOON_SHADOW",
+        "	root.add_child(moon)",
+        "	return moon",
+        "",
+        "# ---- 天气(第一百四十二轮)----",
+        "## 天气倍数:0=雾 1=云 2=环境光 3=泛光(表在常量里,index 是天气下标)",
+        "func _gk_env_weather_values(index: int) -> PackedFloat32Array:",
+        "	var i := clampi(index, 0, _GK_WX_NAMES.size() - 1)",
+        "	return PackedFloat32Array([",
+        "		_GK_WX_FOG[i], _GK_WX_CLOUD[i], _GK_WX_AMBIENT[i], _GK_WX_GLOW[i],",
+        "	])",
+        "",
+        "func _gk_env_weather_index(name: String) -> int:",
+        "	var found := _GK_WX_NAMES.find(name)",
+        "	if found >= 0:",
+        "		return found",
+        "	var ascii_names := PackedStringArray([\"CLEAR\", \"CLOUDY\", \"RAINY\", \"FOGGY\"])",
+        "	var raw := ascii_names.find(name)",
+        "	return raw if raw >= 0 else 0",
+        "",
+        "## 天气乘子(i 见上;没初始化时当 1.0)",
+        "func _gk_env_wx(i: int) -> float:",
+        "	if i < _gk_wx_values.size():",
+        "		return float(_gk_wx_values[i])",
+        "	return 1.0",
+        "",
+        "## 换天气(带过渡;fade <= 0 立刻换)。逻辑图『环境_切换天气』调这个。",
+        "func _gk_env_set_weather(name: String, fade: float) -> void:",
+        "	var index := _gk_env_weather_index(name)",
+        "	_gk_wx_from = _gk_wx_values",
+        "	_gk_wx_to = _gk_env_weather_values(index)",
+        "	_gk_wx_target = index",
+        "	if _gk_wx_tween != null and _gk_wx_tween.is_valid():",
+        "		_gk_wx_tween.kill()",
+        "	if fade <= 0.01:",
+        "		_gk_wx_values = _gk_wx_to",
+        "		_gk_wx_mix = 1.0",
+        "		_gk_daynight_apply()",
+        "		return",
+        "	_gk_wx_tween = create_tween()",
+        "	# 世界冻着也要过渡完(和睁眼那个 tween 同一个理由)",
+        "	_gk_wx_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)",
+        "	_gk_wx_tween.tween_method(_gk_env_weather_step, 0.0, 1.0, fade)",
+        "",
+        "func _gk_env_weather_step(t: float) -> void:",
+        "	_gk_wx_mix = clampf(t, 0.0, 1.0)",
+        "	_gk_wx_values = PackedFloat32Array()",
+        "	for i in range(_gk_wx_to.size()):",
+        "		var from_value := _gk_wx_from[i] if i < _gk_wx_from.size() else 1.0",
+        "		_gk_wx_values.append(lerpf(from_value, _gk_wx_to[i], _gk_wx_mix))",
+        "	_gk_daynight_apply()",
+        "",
+        "## 整点信号:从 `before` 走到 `after` 跨过哪几个整点,就逐个补发。",
+        "## 倒退(或第一次,传 -1)只发落点那一个 —— 免得开局刷 24 次。",
+        "## ⚠ `_gk_dn_hour` 之外还要照顾『环境_设置时间』那种跳变(一次跨好几点)。",
+        "func _gk_env_emit_hours(before: float, after: float) -> void:",
+        "	var now_hour := int(floor(fmod(maxf(after, 0.0), 24.0)))",
+        "	if before < 0.0:",
+        "		gk_hour_reached.emit(now_hour)",
+        "		_gk_dn_hour_int = now_hour",
+        "		return",
+        "	var from_hour := int(floor(fmod(maxf(before, 0.0), 24.0)))",
+        "	if from_hour == now_hour:",
+        "		return",
+        "	var steps := 0",
+        "	var cursor := from_hour",
+        "	while cursor != now_hour and steps < 24:",
+        "		cursor = (cursor + 1) % 24",
+        "		gk_hour_reached.emit(cursor)",
+        "		steps += 1",
+        "	_gk_dn_hour_int = now_hour",
+        "",
+        "# ---- 对外接口(第一百四十二轮):逻辑图那几张『环境_*』卡靠 gk_env 组调 ----",
+        "func _gk_env_get_hour() -> float:",
+        "	return _gk_dn_hour",
+        "",
+        "func _gk_env_get_state() -> String:",
+        "	var slot := 2",
+        "	var count := _gk_dn_key_slots.size()",
+        "	if count > 0:",
+        "		slot = _gk_dn_key_slots[0]",
+        "		for i in range(count):",
+        "			if _gk_dn_hour >= _gk_dn_key_hours[i]:",
+        "				slot = _gk_dn_key_slots[i]",
+        "	return _GK_DN_PRESET_NAMES[clampi(slot, 0, _GK_DN_PRESET_NAMES.size() - 1)]",
+        "",
+        "func _gk_env_get_is_day() -> float:",
+        "	var values := _gk_daynight_mix(_gk_dn_hour)",
+        "	return 1.0 if float(values[4]) >= 0.5 else 0.0",
+        "",
+        "func _gk_env_get_night() -> float:",
+        "	var values := _gk_daynight_mix(_gk_dn_hour)",
+        "	return clampf(1.0 - float(values[4]), 0.0, 1.0)",
+        "",
+        "func _gk_env_get_weather() -> String:",
+        "	return _GK_WX_NAMES[clampi(_gk_wx_target, 0, _GK_WX_NAMES.size() - 1)]",
+        "",
+        "func _gk_env_set_time(hour: float) -> void:",
+        "	_gk_daynight_set_time(hour)",
+        "",
+        "func _gk_env_set_speed(speed: float) -> void:",
+        "	_gk_daynight_set_speed(speed)",
+        "",
+        "func _gk_env_pause_clock(frozen: bool) -> void:",
+        "	_gk_daynight_pause(frozen)",
+        "",
+        "# ---- 逻辑图『环境_昼夜设置』用的三个接口(靠 gk_daynight 组找到我们)----",
+        "func _gk_daynight_set_time(hour: float) -> void:",
+        "	var before := _gk_dn_hour",
+        "	_gk_dn_hour = fmod(maxf(hour, 0.0), 24.0)",
+        "	_gk_env_emit_hours(before, _gk_dn_hour)",
+        "	_gk_daynight_apply()",
+        "",
+        "func _gk_daynight_pause(frozen: bool) -> void:",
+        "	_gk_dn_paused = frozen",
+        "",
+        "func _gk_daynight_set_speed(speed: float) -> void:",
+        "	_gk_dn_speed = maxf(speed, 0.0)",
+    ]
+
+
+def _daynight_lines(cards):
+    """『昼夜循环 / 天空盒 / 太阳 / 云层』那一整块(一张卡都没有 -> [])。"""
+    if not cards:
+        return []
+    lines = [
+        "",
+        "# ---- 昼夜循环 + 天空盒 + 太阳 + 云层(第一百三十三轮)----",
+        "# 这一段是『游戏环境与后期』图编出来的:时间轴走在这里,"
+        "天空着色器(gk_sky.gdshader)只管画。",
+        "# 关键帧之间插值、到点循环闭合;逻辑图的『环境_昼夜设置』可以"
+        "暂停 / 加速 / 跳到某个时刻。",
+    ]
+    lines += _daynight_const_lines(cards)
+    lines += _daynight_preset_lines()
+    lines += _daynight_body_lines()
+    return lines
+
+
+def _daynight_enter_tree_lines():
+    """只有昼夜那一块时的 `_enter_tree`(两块都有时由后期那块带上,见 _post_block)。"""
+    return [
+        "",
+        "func _enter_tree() -> void:",
+        "	# 延到帧末:这时场景里其他节点都建好了,WorldEnvironment 才找得到",
+        "	_gk_daynight_setup.call_deferred()",
+    ]
+
+
+def _post_block(scene=None):
+    """环境脚本尾巴上的那一整块(后期 + 昼夜;两样都没有 -> 空串)。
+
+    ── 为什么两块要在这里合流(第一百三十三轮)──────────────────────
+    GDScript 同一个函数不能定义两次,而两块都需要"进树时启动一次"。
+    所以 `_enter_tree` **只定义一次**:两块都在时由后期那块定义并补上
+    `_gk_daynight_setup.call_deferred()` 一行;只有昼夜那块时它自己定义。
+    只有后期卡时返回的文本**逐字节与以前一致**(老工程产物不变)。
+    """
+    # 把 scene 传下去:『环境_睁眼效果』卡有**作用域**(全部关卡 / 只这一关),
+    # 按当前导出的场景过滤(第一百三十七轮,用户要求)。
+    lines = _post_graph_lines(scene)
+    day = _daynight_lines(_daynight_cards())
+    if not lines and not day:
+        return ""
+    if day:
+        marker = "	_gk_post_ready.call_deferred()"
+        if marker in lines:
+            # 两块都有:在后期那块自己的 _enter_tree 尾巴上补一行
+            index = lines.index(marker)
+            lines = (lines[:index + 1] + ["	_gk_daynight_setup.call_deferred()"]
+                     + lines[index + 1:])
+        else:
+            day = day + _daynight_enter_tree_lines()
+        lines = lines + day
+    return "\n".join(lines) + "\n"
+
+
 def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
                 is_3d=True):
     """环境脚本模板的填充值(两处分支共用一份)。
@@ -3261,6 +4660,10 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
         visibility_ranges=visibility_ranges,
         no_shadow_nodes=no_shadow_nodes,
         light_shadows=light_shadows,
+        # 游戏环境与后期(第一百二十五轮):从『游戏环境与后期』图编出来的
+        # 那一整块 GDScript。图里没卡就是空串 -> 模板里那一行变空行,
+        # 产物与改动前**逐字节一致**(老工程不受影响)。
+        post_block=_post_block(scene),
     )
 
 
@@ -3791,6 +5194,7 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
     return result
 
 
+@godot_material_preview.suspend()
 def _run_gltf_export(kwargs, path):
     """跑 glTF 导出,参数名不兼容时逐个降级重试。"""
     import bpy
@@ -4525,17 +5929,27 @@ def is_marker_object(obj):
 
 # 区域要带的整套参数。**键顺序固定** —— 生成的 zone_data 字典文本才稳定
 # (改一个字都会让比对旧产物的测试红掉)。
+# ⚠ 第 124 轮:9 个高影响键**追加在末尾**(不插进中间)—— 已有区域的
+#   zone_data 文本只会在尾部多出这几项,前缀部分一字不动。
 ENV_ZONE_KEYS = ("bg_mode", "bg", "amb", "amb_e", "fog", "fog_c", "fog_d",
-                 "glow", "glow_i", "glow_b", "adjust", "br", "ct", "sat")
+                 "glow", "glow_i", "glow_b", "adjust", "br", "ct", "sat",
+                 "fog_sa", "fog_le", "fog_ap",
+                 "glow_s", "glow_t", "glow_m",
+                 "tm_e", "tm_w", "amb_sky")
 
 # 某一项在预设里缺失时的兜底值 —— 和 codegen/statements.py 里
 # `_ENV_PRESET_HELPER_LINES` 的 `data.get(键, 默认值)` 逐个对齐,
 # 免得同名的『环境_应用预设』节点和区域环境点切出两套氛围。
+# ⚠ 第 124 轮的 9 项兜底值 = 场景字段的默认值 = Godot 出厂值(全部,
+#   包括 `fog_sa` = 1.0 —— 想"背景色不被雾盖"要显式设 0)。
 ENV_ZONE_FALLBACK = {
     "bg_mode": 1, "bg": (0.05, 0.06, 0.10), "amb": (0.55, 0.62, 0.80),
     "amb_e": 0.3, "fog": False, "fog_c": (0.30, 0.34, 0.42), "fog_d": 0.02,
     "glow": False, "glow_i": 0.8, "glow_b": 0.1, "adjust": False,
     "br": 1.0, "ct": 1.0, "sat": 1.0,
+    "fog_sa": 1.0, "fog_le": 1.0, "fog_ap": 0.0,
+    "glow_s": 1.0, "glow_t": 1.0, "glow_m": 1,
+    "tm_e": 1.0, "tm_w": 1.0, "amb_sky": 1.0,
 }
 
 
@@ -4584,6 +5998,21 @@ def env_preset_values(name):
                 "br": float(getattr(preset, "p_brightness", 1.0)),
                 "ct": float(getattr(preset, "p_contrast", 1.0)),
                 "sat": float(getattr(preset, "p_saturation", 1.0)),
+                # ── 第 124 轮:9 个高影响键(短名见 ENV_ZONE_KEYS)──────
+                # 短名是 zone_data 字典的紧凑写法,和 codegen/statements.py
+                # 的 `_ENV_PRESET_HELPER_LINES` 逐个对齐(注释里那条规矩)。
+                "fog_sa": float(getattr(preset, "p_fog_sky_affect", 1.0)),
+                "fog_le": float(getattr(preset, "p_fog_light_energy", 1.0)),
+                "fog_ap": float(getattr(preset, "p_fog_aerial", 0.0)),
+                "glow_s": float(getattr(preset, "p_glow_strength", 1.0)),
+                "glow_t": float(getattr(preset, "p_glow_threshold", 1.0)),
+                # 枚举 -> Godot 的 int(未知名回退 SCREEN=1)
+                "glow_m": ENV_GLOW_BLENDS.get(
+                    str(getattr(preset, "p_glow_blend", "SCREEN")),
+                    ENV_GLOW_BLENDS["SCREEN"]),
+                "tm_e": float(getattr(preset, "p_tonemap_exposure", 1.0)),
+                "tm_w": float(getattr(preset, "p_tonemap_white", 1.0)),
+                "amb_sky": float(getattr(preset, "p_ambient_sky", 1.0)),
             })
     except Exception:                                     # noqa: BLE001
         # 预设库读不到(离线桩 / 老文件里那个类不属于当前包路径)时
@@ -4608,6 +6037,10 @@ def _gd_zone_dict(values):
             parts.append(f'"{key}": Color({_fmt(rgb[0])}, {_fmt(rgb[1])}, '
                          f'{_fmt(rgb[2])}, 1.0)')
         elif key == "bg_mode":
+            parts.append(f'"{key}": {int(value)}')
+        elif key == "glow_m":
+            # 第 124 轮:泛光混合模式是个**枚举**(Godot 的 0..4),
+            # 走 int 而不是 float —— `1.000000` 在 GDScript 里也不合法。
             parts.append(f'"{key}": {int(value)}')
         elif key in ("fog", "glow", "adjust"):
             parts.append(f'"{key}": {"true" if value else "false"}')
@@ -4857,6 +6290,17 @@ func _values_of(env: Environment) -> Dictionary:
 \t\t"br": float(env.adjustment_brightness),
 \t\t"ct": float(env.adjustment_contrast),
 \t\t"sat": float(env.adjustment_saturation),
+\t\t# 第 124 轮:高影响键 —— 快照也必须带上,否则"离开区域还原"时
+\t\t# 这几项会停在区域里的值(用户看到"出去了画面还是雾蒙蒙的")。
+\t\t"fog_sa": float(env.fog_sky_affect),
+\t\t"fog_le": float(env.fog_light_energy),
+\t\t"fog_ap": float(env.fog_aerial_perspective),
+\t\t"glow_s": float(env.glow_strength),
+\t\t"glow_t": float(env.glow_hdr_threshold),
+\t\t"glow_m": int(env.glow_blend_mode),
+\t\t"tm_e": float(env.tonemap_exposure),
+\t\t"tm_w": float(env.tonemap_white),
+\t\t"amb_sky": float(env.ambient_light_sky_contribution),
 \t}
 
 
@@ -4877,6 +6321,17 @@ func _apply(env: Environment, values: Dictionary) -> void:
 \tenv.adjustment_brightness = float(values.get("br", env.adjustment_brightness))
 \tenv.adjustment_contrast = float(values.get("ct", env.adjustment_contrast))
 \tenv.adjustment_saturation = float(values.get("sat", env.adjustment_saturation))
+\t# 第 124 轮:高影响键(旧的 zone_data 里没有这几个键 -> 保持当前值,
+\t# 所以第 124 轮之前生成的区域场景行为不变)。
+\tenv.fog_sky_affect = float(values.get("fog_sa", env.fog_sky_affect))
+\tenv.fog_light_energy = float(values.get("fog_le", env.fog_light_energy))
+\tenv.fog_aerial_perspective = float(values.get("fog_ap", env.fog_aerial_perspective))
+\tenv.glow_strength = float(values.get("glow_s", env.glow_strength))
+\tenv.glow_hdr_threshold = float(values.get("glow_t", env.glow_hdr_threshold))
+\tenv.glow_blend_mode = int(values.get("glow_m", int(env.glow_blend_mode)))
+\tenv.tonemap_exposure = float(values.get("tm_e", env.tonemap_exposure))
+\tenv.tonemap_white = float(values.get("tm_w", env.tonemap_white))
+\tenv.ambient_light_sky_contribution = float(values.get("amb_sky", env.ambient_light_sky_contribution))
 
 
 func _switch(values: Dictionary, seconds: float) -> void:
@@ -5123,6 +6578,20 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # (见上面"材质怎么挂"里的说明:相机和灯由 glb 带进来,
     #  Environment 脚本负责设主相机、修灯光亮度、挂材质)
     glb_info = glb_object_names(export_dir, scene_name)
+    # ── ⚠ glb **不进场景**时,它里面的相机也用不上(第一百四十五轮,用户实测)──
+    # "相机由 glb 带进来"有个前提:世界 glb **真的会被 instance** ——
+    # 而上面那行 `if mesh_info:` 只在 glb 里**有网格**时才 instance 它。
+    # 于是"这一关的网格全在各自的 glb 里"(唯一的网格是脚本挂载目标 /
+    # 静态资产,它们各有各的 glb)时,世界 glb 里只剩相机和灯,根节点是
+    # 普通 Node3D,里面的相机**一台都进不了场景**;而这里还按"glb 有相机"
+    # 处理,于是 .tscn 里既没有 glb 实例、也不生成 Camera3D 节点 ——
+    # 场景里**一台相机都没有**。用户按 F5 看到的就是一片灰。
+    # (实测:用户的『环境测试』= 一块平板 + 一盏点光 + 两台相机,
+    #  平板是脚本挂载目标 → 世界 glb 没有网格 → 两台相机全丢了。)
+    # 修法:没有网格时不认 glb 里的相机,让 build_environment_nodes 走
+    # "glb 里没有相机"那条分支,老老实实按 Blender 里的相机生成 Camera3D。
+    if not mesh_info and glb_info.get("cameras"):
+        glb_info = dict(glb_info, cameras=[])
     material_files = {}
     for obj_name in sorted(mesh_info):
         entry = (materials_map or {}).get(obj_name)
@@ -5276,6 +6745,8 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     #
     # glTF 自带的相机和灯由 glb 实例带进来,不再另外生成节点
     # (生成的话场景里会有两个相机,用户会说"多一个摄像头")。
+    # ⚠ 前提是 glb **真的被 instance**(见上面 `not mesh_info` 那段):
+    #   世界 glb 没有网格时相机带不进来,那时这次调用会生成 Camera3D 节点。
     # Environment 脚本负责把相机设成 current 并按 Blender 的强度修正灯光。
     environment, env_files, _camera_name = build_environment_nodes(
         scene, is_3d, skip=glb_info, scene_name=scene_name,
@@ -5655,6 +7126,32 @@ def glb_object_names(export_dir, model_name="World"):
     return result
 
 
+def _camera_vertical_fov(scene, obj, fallback=70.0):
+    """Blender 相机的**垂直**视场角(度)—— Godot 的 `Camera3D.fov` 就是垂直的。
+
+    Blender 给的是**水平**角(`angle_x`),所以按分辨率比例换算一下;
+    用户改过传感器比例时,这个换算比 glTF 的 yfov 更贴 Blender 里的画面。
+
+    ── ⚠ 别在分支里 `import math`(第一百四十五轮真机踩到)─────────────
+    Python 的 `import` 是**函数级**绑定:同一个函数里只要有一条分支写了
+    `import math`,这个名字在整个函数里就都是**局部变量** —— 另一条分支
+    再用 `math` 就是 `UnboundLocalError`,而它正好落在
+    `except Exception: pass` 里**静默**吞掉,退回默认值。
+    真机现象:走"自己补相机"那条分支时,Blender 里 50mm 镜头(垂直 22.9°)
+    导出来变成 70°,镜头对不上(相机节点和 Environment 的相机 FOV 都是 70)。
+
+    `math` 在本模块**模块级**已经 import 过(见文件开头),这里直接用。
+    """
+    try:
+        render = getattr(scene, "render", None)
+        aspect = (float(getattr(render, "resolution_y", 1080)) /
+                  max(1.0, float(getattr(render, "resolution_x", 1920))))
+        return math.degrees(2.0 * math.atan(
+            math.tan(float(obj.data.angle_x) / 2.0) * aspect))
+    except Exception:
+        return fallback
+
+
 def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
                             material_files=None, material_only=False):
     """决定相机和灯怎么处理。返回 (节点文本, 需要写的文件, 相机名)。
@@ -5728,21 +7225,9 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         # FOV 也要一起给:Godot 的 Camera3D.fov 是**垂直**视场角,
         # glTF 的 yfov 也是垂直的,理论上能对上;但用户可能在 Blender 里
         # 改过传感器比例,所以这里按 Blender 的当前值算一遍更稳。
-        fov = 0.0
-        if active is not None:
-            try:
-                # Blender 的 angle 是水平角,按传感器比例换算成垂直角
-                horizontal = float(active.data.angle_x)
-                render = getattr(scene, "render", None)
-                width = float(getattr(render, "resolution_x", 1920) or 1920)
-                height = float(getattr(render, "resolution_y", 1080) or 1080)
-                if width > 0 and height > 0:
-                    import math
-                    fov = math.degrees(
-                        2.0 * math.atan(math.tan(horizontal / 2.0)
-                                        * height / width))
-            except Exception:
-                fov = 0.0
+        # (换算逻辑收在 _camera_vertical_fov 里 —— 见那个函数上面对
+        #  "分支里 import math" 这个坑的说明;失败时退回 0 = 不改 FOV)
+        fov = _camera_vertical_fov(scene, active, 0.0) if active is not None else 0.0
 
         # 灯光**不在这里处理**:用户决定在 Godot 里自己设计灯光,
         # glb 带进来的灯原样保留。以前这里会重算强度/重建灯节点,
@@ -5773,14 +7258,9 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         if owns(obj):
             continue
         position = _godot_position(obj, True)
-        fov = 70.0
-        try:
-            render = getattr(scene, "render", None)
-            aspect = (float(getattr(render, "resolution_y", 1080)) /
-                      max(1.0, float(getattr(render, "resolution_x", 1920))))
-            fov = math.degrees(2.0 * math.atan(math.tan(float(obj.data.angle_x) / 2.0) * aspect))
-        except Exception:
-            pass
+        # 换算成垂直视场角(失败时退回 70 —— 至少别把画面弄坏;
+        # 见 _camera_vertical_fov 里"分支里 import math"那个坑的说明)
+        fov = _camera_vertical_fov(scene, obj)
         name = _sanitize_node_name(obj.name)
         if obj.name == main_camera or not camera_name:
             camera_name = name
@@ -5976,6 +7456,47 @@ def _light_basis_text(obj):
     return _camera_basis_text(obj)
 
 
+def _light_override(obj):
+    """这盏灯有没有打开"用这里的值导出"(第一百二十六轮)。
+
+    返回 `Object.gk_light` 或 None。取不到(老 .blend / 没挂上属性)返回
+    None —— 那条路径必须走老换算,否则老工程产物就变了。
+    """
+    settings = getattr(obj, "gk_light", None)
+    if settings is None or not bool(getattr(settings, "override", False)):
+        return None
+    return settings
+
+
+def _authored_energy(obj):
+    """灯的**原生瓦数**(没被预览调暗过的那个)。
+
+    ── 为什么需要它(第一百二十六轮,自己的功能踩出来的真 bug)─────────
+    『Godot 观感』预览开着的时候,`godot_look` 会把灯临时乘一个系数
+    (默认 0.06),原值记在 `obj["gk_look_energy"]` 上;存盘前会还原,
+    所以 .blend 里的瓦数是对的。
+
+    **但导出不是存盘。** 用户开着预览、在侧栏点『导出到 Godot』时,
+    导出器读到的是**被调暗后的 540W** —— 走廊 .tscn 里就真的写成
+    `light_energy = 0.540`(应为 9.000),游戏里的灯暗 16 倍。
+    实测在示例工程上抓到了(`_dist` 里那份旧产物就是这个状态)。
+
+    所以导出侧一律走这个函数:`gk_look_energy` 在就用它(那是作者填的
+    真值),不在才用当前瓦数。存盘/导出两条路都不会再串味。
+    """
+    source = obj.get("gk_look_light_source") if hasattr(obj, "get") else None
+    if source is not None:
+        source = godot_look.authored_light_data(obj)
+        return float(source.energy)
+    backup = obj.get("gk_look_energy") if hasattr(obj, "get") else None
+    try:
+        if backup is not None:
+            return float(backup)
+    except (TypeError, ValueError):
+        pass
+    return float(getattr(getattr(obj, "data", None), "energy", 0.0) or 0.0)
+
+
 def _light_energy_for(obj):
     """Blender 灯光能量 -> Godot light_energy(第四十八轮)。
 
@@ -5984,8 +7505,16 @@ def _light_energy_for(obj):
           1.0,沿用 ×1.2 的标定比例。
     点光 / 聚光:Blender 是瓦特，Godot 是倍数，沿用 1000W ≈ 1.0。
     保留完整强度范围，避免暗灯被抬亮、亮灯被截断。两套引擎的单位仍需标定。
+
+    ── 第一百二十六轮:用户打开『用这里的值导出』时,这一整套作废 ─────
+    那时 `gk_light.energy` 就是 Godot 里的 `light_energy` **原值**,
+    直接写下去(不再经过瓦特换算)。用户要的正是"精确调、不受 Blender
+    原生设置影响",所以这里**不做任何标定/缩放** —— 他填多少,游戏里就是多少。
     """
-    energy = float(getattr(obj.data, "energy", 1.0) or 0.0)
+    settings = _light_override(obj)
+    if settings is not None:
+        return max(0.0, float(getattr(settings, "energy", 1.0) or 0.0))
+    energy = _authored_energy(obj)
     if str(getattr(obj.data, "type", "")) == "SUN":
         return max(0.0, energy * 1.2)
     return max(0.0, energy / 1000.0)
@@ -5996,15 +7525,22 @@ def _light_node_text(obj):
 
     返回 None = 这盏灯不导(隐藏 / 能量 0 / 类型不支持),调用方跳过它。
     """
-    data = getattr(obj, "data", None)
+    data = godot_look.authored_light_data(obj)
     kind = str(getattr(data, "type", ""))
     if kind not in ("SUN", "POINT", "SPOT"):
         return None
-    if float(getattr(data, "energy", 1.0) or 0.0) <= 0.0:
+    override = _light_override(obj)
+    # ⚠ "能量 0 = 关着的灯"这条只在**老规矩**下成立:用户打开『用这里的值导出』
+    #   之后,Blender 那边的瓦数只是预览用的草稿,填 0 也可能是"这盏灯在
+    #   Godot 里就想要 0.5 的暗补光" —— 那时不该因为它不导。
+    if override is None and _authored_energy(obj) <= 0.0:
         return None                       # 能量 0 = 关着的灯,不当灯导
     godot_type = {"SUN": "DirectionalLight3D", "POINT": "OmniLight3D",
                   "SPOT": "SpotLight3D"}[kind]
     colour = getattr(data, "color", (1.0, 1.0, 1.0))
+    if override is not None and bool(getattr(override, "use_color", False)):
+        # 用 gk_light 上的颜色(用户在侧栏里挑的那个)
+        colour = getattr(override, "color", colour) or colour
     try:
         r, g, b = float(colour[0]), float(colour[1]), float(colour[2])
     except Exception:                                     # noqa: BLE001
@@ -6013,9 +7549,18 @@ def _light_node_text(obj):
     extras = []
     # 范围:用 Blender 的『自定义距离』(= 灯照到多远);没填就交给 Godot 默认。
     cutoff = float(getattr(data, "cutoff_distance", 0.0) or 0.0)
+    if override is not None and float(getattr(override, "range_m", 0.0) or 0.0) > 0.0:
+        # 第一百二十六轮:侧栏填了射程就以它为准(用户要的就是"一处说了算")
+        cutoff = float(override.range_m)
     if kind in ("POINT", "SPOT") and cutoff > 0.0:
         extras.append(("omni_range" if kind == "POINT" else "spot_range",
                        f"{cutoff:.3f}"))
+    if override is not None:
+        attenuation = float(getattr(override, "attenuation", 1.0) or 0.0)
+        if abs(attenuation - 1.0) > 1e-9:
+            # 出厂值 1.0 不写(和"值 ≠ 出厂值才写"同一条规矩)
+            extras.append(("omni_attenuation" if kind == "POINT"
+                           else "spot_attenuation", f"{attenuation:.4f}"))
     if kind == "SPOT":
         # Blender 的 spot_size 是**整锥角**(弧度),Godot 的 spot_angle 是
         # **半角**(度)—— Blender 里 45° 的锥,Godot 里写 22.5 才一样大。
@@ -6031,6 +7576,12 @@ def _light_node_text(obj):
         sun_angle = float(getattr(data, "angle", 0.0) or 0.0)
         extras.append(("light_angular_distance", f"{sun_angle * _DEG:.4f}"))
 
+    # 投影:侧栏打开『用这里的值导出』之后以它为准,否则沿用 Blender 的勾选。
+    if override is not None:
+        shadow_on = bool(getattr(override, "shadow", True))
+    else:
+        shadow_on = bool(getattr(data, "use_shadow", True))
+
     extra_text = "".join(f"{key} = {value}\n" for key, value in extras)
     position = _godot_position(obj, True)
     return LIGHT_NODE.format(
@@ -6040,7 +7591,7 @@ def _light_node_text(obj):
         lx=_fmt(position[0]), ly=_fmt(position[1]), lz=_fmt(position[2]),
         r=_fmt(r), g=_fmt(g), b=_fmt(b),
         energy=_light_energy_for(obj),
-        shadow="true" if bool(getattr(data, "use_shadow", True)) else "false",
+        shadow="true" if shadow_on else "false",
         extra=extra_text)
 
 
@@ -7305,7 +8856,7 @@ def fx_texture_file(obj, export_dir=None):
 
             image = bpy.data.images.get(name)
             if image is not None and image.size[0] > 0:
-                file_name = safe_name(name, "texture") + ".png"
+                file_name = material_texture_file_name(name)
                 if export_dir is None:
                     return file_name
                 if os.path.isfile(os.path.join(export_dir,
@@ -7881,7 +9432,7 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders",
     albedo_ref = "null"
     steps = 2
     if texture:
-        tex_name = safe_name(texture, "texture") + ".png"
+        tex_name = material_texture_file_name(texture)
         textures_block = (
             f'[ext_resource type="Texture2D" path="res://{project.ART_DIR}/{tex_name}" '
             f'id="2_albedo"]\n'
@@ -8012,6 +9563,7 @@ def _scene_toon_style_fields(settings):
     return fields
 
 
+@godot_material_preview.suspend()
 def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
     """给每个 Blender 材质生成一份 Godot 卡通材质。返回 [(材质名, 文件路径, 有无贴图)]。
 
@@ -8110,7 +9662,7 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
             albedo_ref = "null"
             steps = 2
             if texture:
-                tex_name = safe_name(texture, "texture") + ".png"
+                tex_name = material_texture_file_name(texture)
                 textures_block = (
                     f'[ext_resource type="Texture2D" '
                     f'path="res://{project.ART_DIR}/{tex_name}" id="2_albedo"]\n'
@@ -8173,7 +9725,9 @@ def export_textures(export_dir, materials):
         if material is None:
             continue
         # ── 基础色贴图必须按 .tres 期望的**那个名字**导出 ─────────────
-        # 踩过的坑:`.tres` 里写的是 `res://art/{safe_name(图片名)}.png`,
+        # `.tres` 引用和 PNG 写盘共用 material_texture_file_name，
+        # 中文图片名带稳定摘要，避免不同贴图都覆盖到 texture.png。
+        # 原来的 ASCII 图片名仍保持兼容，
         # 比如图片叫 `hair.png` -> 引用 `hair_png.png`;
         # 而这里原来只按 `_material_image_names()` 导出,名字对不上 ——
         # Godot 报 "Resource file not found: res://art/hair_png.png",
@@ -8186,9 +9740,8 @@ def export_textures(export_dir, materials):
             base_image = bpy.data.images.get(base_name)
             if base_image is not None and base_image.size[0] > 0:
                 # 名字算法**必须和 write_materials 里写进 .tres 的完全一致**:
-                # 那边是 `safe_name(texture, "texture") + ".png"`,
-                # 这里少一步就会变成两套名字,Godot 照样找不到文件。
-                file_name = safe_name(base_name, "texture") + ".png"
+                # 名字中不能因为中文/空白被清洗就丢掉图片身份。
+                file_name = material_texture_file_name(base_name)
                 path = os.path.join(target_dir, file_name)
                 try:
                     _save_image(base_image, path)
@@ -8222,7 +9775,7 @@ def export_textures(export_dir, materials):
             image = bpy.data.images.get(name)
             if image is None or image.size[0] == 0:
                 continue
-            file_name = safe_name(name, "texture") + ".png"
+            file_name = material_texture_file_name(name)
             path = os.path.join(target_dir, file_name)
             try:
                 _save_image(image, path)
@@ -8849,6 +10402,7 @@ def _base_class_for(scene, obj, dimension="3"):
     return "StaticBody3D" if str(dimension) != "2" else "StaticBody2D"
 
 
+@godot_material_preview.suspend()
 def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
                            scene_name="World", world_script_name=None):
     """完整的资产导出流程:整场景 glb -> 材质 -> 包装场景 -> 角色场景。
@@ -9253,10 +10807,14 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
 
 
 def _safe_scene_name(name):
-    """Blender 场景名 -> 能当文件名 / 资源名的名字(保留中文)。"""
-    cleaned = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff\-]", "_", str(name or ""))
-    cleaned = cleaned.strip("_")
-    return cleaned or "Scene"
+    """Blender 场景名 -> 能当文件名 / 资源名的名字(保留中文)。
+
+    规矩只有一份,在 `exporter.safe_scene_name`(单棵树导出那条路也要用它给
+    脚本补场景前缀,见 `exporter._multi_scene_script_name`)—— 两边不同名的话
+    就会又冒出一个"同名不同文件"的撞名脚本。
+    """
+    from . import exporter as _exporter
+    return _exporter.safe_scene_name(name)
 
 
 def _project_main_scene(directory):
@@ -9495,29 +11053,38 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                         f"『{char_obj.name}』的角色逻辑图导出失败:"
                         f"{type(exc).__name__}: {exc}")
                 # ── 场景图:关卡/世界逻辑,挂场景根(extends Node3D)──────
-                level_settings = dict(scene_settings)
-                level_settings["base_class"] = (
-                    "Node2D" if scene_dimension == "2" else "Node3D")
-                level_settings["class_name"] = ""
-                level_settings["script_name"] = (
-                    f"game_logic_{scene_name}.gd"
-                    if multi else f"game_logic_{scene_name}_level.gd")
-                try:
-                    level_result = exporter.export_tree(
-                        tree, level_settings, write_scene=False)
-                    world_script_name = level_result.get("script_name") or None
-                    entry["warnings"].extend(level_result.get("warnings", []))
-                    # 输入映射也要并(第一百二十轮踩到):关卡图里的 F 键等动作
-                    # 不并进来,project.godot 的 [input] 就没有这个 action,
-                    # Godot 每帧报 "action doesn't exist"(手电开关直接失效)。
-                    for actions in (level_result.get("input_actions") or []):
-                        entry.setdefault("input_actions", []).append(actions)
-                    entry.setdefault("written", []).extend(
-                        p for p in level_result.get("written", []) if p)
-                except Exception as exc:                    # noqa: BLE001
-                    entry["warnings"].append(
-                        f"『{scene.name}』的关卡逻辑图导出失败:"
-                        f"{type(exc).__name__}: {exc}")
+                # ⚠ `tree` **可能是 None**(这一关的场景图没解析出来 ——
+                #   比如它被认成了角色图)。这时绝不能照样 `export_tree(None)`:
+                #   导出器拿不到图会退回"当前那张",于是**别的关的逻辑被写成
+                #   这一关的场景脚本**。真机抓到(第一百三十四轮):恐怖示例
+                #   三关的 `game_logic_教室/走廊/楼梯间.gd` **逐字节相同**,
+                #   打开一看头部写着"节点树: 标题逻辑" —— 三关的场景根都挂着
+                #   标题页的逻辑,而那三关真正的逻辑在各自的 `_char.gd` 里
+                #   (角色图)。没图的这一路**什么都不导**才是对的。
+                if tree is not None:
+                    level_settings = dict(scene_settings)
+                    level_settings["base_class"] = (
+                        "Node2D" if scene_dimension == "2" else "Node3D")
+                    level_settings["class_name"] = ""
+                    level_settings["script_name"] = (
+                        f"game_logic_{scene_name}.gd"
+                        if multi else f"game_logic_{scene_name}_level.gd")
+                    try:
+                        level_result = exporter.export_tree(
+                            tree, level_settings, write_scene=False)
+                        world_script_name = level_result.get("script_name") or None
+                        entry["warnings"].extend(level_result.get("warnings", []))
+                        # 输入映射也要并(第一百二十轮踩到):关卡图里的 F 键等动作
+                        # 不并进来,project.godot 的 [input] 就没有这个 action,
+                        # Godot 每帧报 "action doesn't exist"(手电开关直接失效)。
+                        for actions in (level_result.get("input_actions") or []):
+                            entry.setdefault("input_actions", []).append(actions)
+                        entry.setdefault("written", []).extend(
+                            p for p in level_result.get("written", []) if p)
+                    except Exception as exc:                    # noqa: BLE001
+                        entry["warnings"].append(
+                            f"『{scene.name}』的关卡逻辑图导出失败:"
+                            f"{type(exc).__name__}: {exc}")
             else:
                 level_only = (exporter.logic_tree_scope(tree) == "LEVEL"
                               and callable(getattr(tree, "is_property_set", None))

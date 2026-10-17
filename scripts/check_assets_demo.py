@@ -29,6 +29,19 @@ import shutil
 import subprocess
 import sys
 
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gk_probe import find_logic_script  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_assets", "资产示例_godot")
@@ -203,7 +216,9 @@ def main():
     if len(wavs) != 1:
         print(f"✗ audio/ 里的音频不是 1 个: {os.listdir(audio_dir) if os.path.isdir(audio_dir) else '缺目录'}")
         ok = False
-    script_path = os.path.join(OUT, "scripts", f"game_logic_{MAIN_SCENE}.gd")
+    # 逻辑图可能是关卡图也可能是**角色图**,导出名跟着变 —— 别写死文件名
+    # (详见 scripts/_gk_probe.py 的说明)
+    script_path = find_logic_script(OUT, MAIN_SCENE)
     if os.path.isfile(script_path):
         code = read(script_path)
         if wavs and f'load("res://audio/{wavs[0]}")' not in code:

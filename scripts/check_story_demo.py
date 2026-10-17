@@ -36,6 +36,16 @@ import shutil
 import subprocess
 import sys
 
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_story", "恐怖闯关示例_godot")
@@ -100,6 +110,9 @@ var fp_rot1 := 0.0
 var fp_pos0 := Vector3.ZERO
 var choice_in = ""
 var choice_in2 = ""
+# 第一百三十四轮:过场里按 Esc 前后的世界冻结状态(见 STORY_PAUSE_CHOICE)
+var pause_before := false
+var pause_after_esc := false
 var choice_end = ""
 # 设置页 / Esc 开关的采样
 var settings_open := false
@@ -718,54 +731,32 @@ func _physics_process(delta: float) -> void:
 				step = 19
 				t = 0.0
 		19:
-			# 开场章节卡 3 秒之后才弹对话
-			if t >= 3.0:
+			# ── 第一百三十九轮:示例里的剧情(对话/选择)已按用户要求删掉 ──
+			# 所以这里不再"推进对话 → 等选择框",改成:
+			#   ① 确认**没有**剧情面板(删干净了);
+			#   ② 钉"眼皮兜底"(STORY_EYE_GUARD):世界冻着时 eye_on 必须
+			#      已经回到 0 —— 这是"预览正常、运行时全黑"那条真机 bug 的钉子;
+			#   ③ 钉光标规则的输入状态:菜单开着 -> 有界面;收起 -> 没界面。
+			if t >= 4.5:
+				# 章节卡都淡出了再读(它是 Panel 还是文字都不该影响结论)
 				print("STORY_CORRIDOR_DIALOG visible=", _panel_visible("_gk_dialog_panel"))
-				print("STORY_DIAG_DIALOG_A ", _panel_state("_gk_dialog_panel"))
-				advance_at = 0.0
-				step = 202
-				t = 0.0
-		202:
-			# 弹出一秒后再看:正文有没有"打完字"(暂停冻住 tween 时是 0)
-			if t >= 1.0:
-				print("STORY_DIAG_DIALOG_B ", _panel_state("_gk_dialog_panel"))
-				print("STORY_DIALOG_TYPED ", _dialog_flags())
-				_click_dialog()
-				step = 203
-				t = 0.0
-		203:
-			if t >= 0.3:
-				dialog_mouse_clicked = _text("正文") == "必须穿过去。"
-				print("STORY_DIALOG_MOUSE ok=", dialog_mouse_clicked,
-					" text=", _text("正文"))
-				step = 20
-				t = 0.0
-		20:
-			# 反复敲回车推进对话,直到**剧情选择**弹出(或超时兜底)
-			if _panel_visible("_gk_choice_panel"):
-				print("STORY_CORRIDOR_CHOICE visible=true")
-				choice_in = _choice_state()
-				print("STORY_DIAG_CHOICE_CORRIDOR ", choice_in)
-				step = 201
-				t = 0.0
-			elif t >= 8.0:
-				print("STORY_CORRIDOR_CHOICE visible=false")
-				step = 21
-				t = 0.0
-			elif t >= advance_at:
-				_push_key(KEY_ENTER, true)
-				_push_key(KEY_ENTER, false)
-				advance_at = t + 0.35
-		201:
-			# 选择框出现一秒后:问题文字打完没 + 选项有没有写键盘数字
-			if t >= 1.0:
-				choice_in2 = _choice_state()
-				print("STORY_DIAG_CHOICE_AFTER ", choice_in2)
-				print("STORY_CHOICE_FLAGS ", _choice_flags())
-				# 选第一个选项(按 1)→ 合流函数"继续世界 + 锁回鼠标";之后的
-				# 躲藏 / 追击必须在世界不暂停的状态下跑(暂停时物理和触发区都停)。
-				_push_key(KEY_1, true)
-				_push_key(KEY_1, false)
+				print("STORY_CORRIDOR_CHOICE visible=", _panel_visible("_gk_choice_panel"))
+				var post := get_tree().get_first_node_in_group("gk_post")
+				var mat = post.get("_gk_post_mat") if post != null else null
+				print("STORY_EYE_GUARD on=",
+					mat.get_shader_parameter("eye_on") if mat != null else "<无>",
+					" amount=",
+					mat.get_shader_parameter("eye_amount") if mat != null else "<无>")
+				# 光标规则问的是"屏幕上有没有**要点的面板**"(生成物里
+				# `_gk_transient_visible()` 只认 Panel)—— 居中的提示文字
+				# 不算;把大字也算进去,光标就永远收不回来(真机症状)。
+				var panels := 0
+				for item in get_tree().get_nodes_in_group("gk_ui_transient"):
+					if item is Panel and (item as Panel).visible:
+						panels += 1
+				print("STORY_MOUSE_RULE menu=", _widget_visible("暂停菜单"),
+					" panels=", panels,
+					" paused=", get_tree().paused)
 				step = 21
 				t = 0.0
 		21:
@@ -951,86 +942,95 @@ func _physics_process(delta: float) -> void:
 				step = 30
 				t = 0.0
 		30:
-			# 章节卡 3 秒之后才弹对话
-			if t >= 3.0:
-				advance_at = 0.0
-				step = 31
-				t = 0.0
-		31:
-			# 推进开场两句对话,直到**结局选择**弹出
-			if _panel_visible("_gk_choice_panel"):
-				print("STORY_ENDING_CHOICE visible=true")
-				choice_end = _choice_state()
-				print("STORY_DIAG_CHOICE_ENDING ", choice_end)
-				print("STORY_CHOICE_FLAGS_ENDING ", _choice_flags())
-				step = 32
-				t = 0.0
-			elif t >= 8.0:
-				print("STORY_ENDING_CHOICE visible=false")
-				step = 32
-				t = 0.0
-			elif t >= advance_at:
-				_push_key(KEY_ENTER, true)
-				_push_key(KEY_ENTER, false)
-				advance_at = t + 0.35
-		32:
-			# 选第一个选项(按 1 = 回头救她)
-			_push_key(KEY_1, true)
-			step = 33
-			t = 0.0
-		33:
-			if t >= 0.25:
-				_push_key(KEY_1, false)
-				step = 34
-				t = 0.0
-		34:
-			if t >= 0.6:
-				var big := _widget("结局大字")
-				print("STORY_ENDING_RESULT ending=", int(_var("结局")),
-					" saved=", FileAccess.file_exists("user://gk_story_end.json"),
-					" big_visible=", big != null and big.visible,
-					" big_text=", String(big.text) if big != null else "<无>")
+			# ── 第一百三十九轮:结局不再有旁白/选择/大字 ────────────────
+			# 章节卡淡出 -> 冻住世界 + 两个出口按钮(回到开场 / 退出游戏)。
+			if t >= 3.5:
+				var scene_now := get_tree().current_scene
+				print("STORY_ENDING_RESULT frozen=", get_tree().paused,
+					" back=", _widget_visible("回到开场"),
+					" quit=", _widget_visible("退出游戏"),
+					" dialogs=", _panel_visible("_gk_dialog_panel")
+						or _panel_visible("_gk_choice_panel"),
+					" scene=", String(scene_now.name) if scene_now != null else "<无>")
 				step = 35
 				t = 0.0
 		35:
-			if t >= 0.1:
-				# ── 第 125 轮(用户第 3 条):暂停必须真的冻住"等待" ──────
-				# 用户原话:"在最后一关按ESC暂停时，它还会切换关卡，但我要求的
-				# 上帝机是全局控制暂停的，所以这是一个BUG。"
-				# 根因:`SceneTreeTimer` 的 `process_always` **默认 true**
-				# (暂停时照走),而结局链最后是"停留 4 秒 -> 切回大堂" ——
-				# 于是暂停期间后台把关卡切了。
-				# 这里量三件事(真机数字,不是读代码):
-				#   ① 暂停期间那条等待走不走;② 解冻后会不会继续走完;
-				#   ③ 全程关卡有没有被切。
-				_timer_woke = false
-				var probe_timer := get_tree().create_timer(0.4, false)
-				probe_timer.timeout.connect(func(): _timer_woke = true)
-				get_tree().paused = true
-				step = 36
+			# ── 结局期间按 Esc:菜单盖上来 + 世界**继续冻着** + 结局画面让位 ──
+			# (第一百三十五轮:用户拍板"结局时冻住世界 + 明确出口",顺手验一下
+			#  这条新暂停语义在最关键的那张画面上成不成立)
+			if t >= 0.3:
+				_push_key(KEY_ESCAPE, true)
+				step = 351
 				t = 0.0
-		36:
-			# 暂停着**用真实时间**等 1.4 秒(本探针是 ALWAYS,暂停照跑)
-			if t >= 1.4:
-				paused_running = _timer_woke
-				get_tree().paused = false
-				step = 37
+		351:
+			if t >= 0.15:
+				_push_key(KEY_ESCAPE, false)
+				step = 352
 				t = 0.0
-		37:
-			# 解冻后应当很快走完(0.4 秒的那条等待)
-			if _timer_woke or t >= 2.0:
-				var scene_now := get_tree().current_scene
-				var name_now := String(scene_now.name) if scene_now != null else "<无>"
-				print("STORY_PAUSE_TIMER paused_running=", paused_running,
-					" resumed_running=", _timer_woke,
-					" scene_changed=", name_now != "Probe",
-					" scene=", name_now)
+		352:
+			if t >= 0.3:
+				print("STORY_ENDING_MENU paused=", get_tree().paused,
+					" menu=", _widget_visible("暂停菜单"),
+					" big_hidden=", not _widget_visible("回到开场"))
+				_push_key(KEY_ESCAPE, true)
+				step = 353
+				t = 0.0
+		353:
+			if t >= 0.15:
+				_push_key(KEY_ESCAPE, false)
+				step = 354
+				t = 0.0
+		354:
+			# ⚠ 等**冷却**(默认 1 秒)过后再看:过场面板收起后要等冷却才回来,
+			#   0.3 秒就断言会读到 big_back=false(第一百三十五轮)。
+			if t >= 1.5:
+				print("STORY_ENDING_BACK paused=", get_tree().paused,
+					" menu=", _widget_visible("暂停菜单"),
+					" big_back=", _widget_visible("回到开场"))
+				# 点『回到开场』—— 它走 `GkWorld.change_level(大堂)`,探针自己
+				# 会被换掉;所以**先把"见证者"挂到 /root**(它活得过换场景),
+				# 由它打那一行结论。
+				var watcher: Node = load("res://exit_watch.gd").new()
+				watcher.name = "EndingExitWatcher"
+				get_tree().root.add_child(watcher)
+				_click_widget("回到开场")
+				step = 355
+				t = 0.0
+		355:
+			# 兜底:两秒内没换关就把结论打成"没换"(见证者活着的话它会先打印)
+			if t >= 2.0:
+				var now := get_tree().current_scene
+				print("STORY_ENDING_EXIT scene=",
+					String(now.name) if now != null else "<无>")
 				_drop_world()
 				print("STORY_ENDING_DONE")
 				print("STORY_DONE")
 				set_physics_process(false)
 				get_tree().quit()
 ''' % {"lobby": LOBBY, "corridor": CORRIDOR, "ending": ENDING}
+
+# ── 结局出口的"见证者"(第一百三十五轮)─────────────────────────────
+# 挂在 `/root` 下,活得过换场景:探针点了『回到开场』之后自己会被换掉,
+# 由它来打 `STORY_ENDING_EXIT` 那一行(证明"明确出口"真的把关卡切了)。
+EXIT_WATCH_GD = '''extends Node
+
+# 结局出口的见证者:等当前场景不再是探针(Probe)就打印结论。
+# ⚠ 收尾的 STORY_ENDING_DONE / STORY_DONE 也由它打 —— 探针那时候已经被
+#   换掉了,它打不出来(打了才会让门禁看到"探针跑完")。
+func _ready() -> void:
+	process_mode = Node.PROCESS_MODE_ALWAYS
+	for _i in range(360):
+		await get_tree().process_frame
+		var scene := get_tree().current_scene
+		if scene != null and String(scene.name) != "Probe":
+			print("STORY_ENDING_EXIT scene=", String(scene.name))
+			print("STORY_ENDING_DONE")
+			print("STORY_DONE")
+			get_tree().quit()
+			return
+	print("STORY_ENDING_EXIT scene=<没换>")
+	queue_free()
+'''
 
 PROBE_TSCN = '''[gd_scene load_steps=2 format=3]
 
@@ -1052,6 +1052,11 @@ def prepare(src=None):
     with open(os.path.join(OUT, "probe.gd"), "w",
               encoding="utf-8", newline="\n") as handle:
         handle.write(PROBE_GD)
+    # 结局出口的"见证者"(第一百三十五轮):探针点『回到开场』之后会被换掉,
+    # 这一份挂在 /root 下,由它打 `STORY_ENDING_EXIT` 那一行。
+    with open(os.path.join(OUT, "exit_watch.gd"), "w",
+              encoding="utf-8", newline="\n") as handle:
+        handle.write(EXIT_WATCH_GD)
     with open(os.path.join(OUT, "probe.tscn"), "w",
               encoding="utf-8", newline="\n") as handle:
         handle.write(PROBE_TSCN)
@@ -1075,7 +1080,7 @@ def run_godot(godot):
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
         done = subprocess.run([godot, "--headless", "--path", OUT,
-                               "--quit-after", "1800"],
+                               "--quit-after", "2400"],
                               capture_output=True, text=True, encoding="utf-8",
                               errors="replace")
         return (done.stdout or "") + (done.stderr or "")
@@ -1283,24 +1288,51 @@ def main():
         _expect(problems, pause, 2, "true", "再按一次 Esc 应继续游戏(解冻 + 收起菜单)")
         _expect(problems, pause, 3, "true", "点暂停菜单里的『设置』应弹出设置面板")
         _expect(problems, pause, 4, "true", "点设置面板的『返回』应收起设置面板")
-    # ── 第 125 轮(用户第 3 条):**暂停必须真的冻住"等待"**──────────────
-    # 用户原话:"在最后一关按ESC暂停时，它还会切换关卡，但我要求的上帝机是
-    # 全局控制暂停的，所以这是一个BUG。"
-    # 根因:`SceneTreeTimer` 的 `process_always` **默认 true**(暂停时照走),
-    # 而结局那条链最后是"停留 4 秒 -> 切回大堂" —— 于是暂停期间后台把关卡
-    # 切了,暂停菜单还开着,人已经在大堂。
-    # 这一条在探针里量三件事(都是真机数字):
-    #   ① 暂停期间 Timer 不走;② 解冻后它继续走完;③ 全程关卡没被切。
-    pause_timer = _need(problems, text, "PAUSE_TIMER",
-                        r"STORY_PAUSE_TIMER paused_running=(\S+) "
-                        r"resumed_running=(\S+) scene_changed=(\S+)", "暂停冻结等待")
-    if pause_timer:
-        _expect(problems, pause_timer, 1, "false",
-                "暂停期间那条『停留』等待不该继续走(否则它会在后台把关卡切掉)")
-        _expect(problems, pause_timer, 2, "true", "解冻后等待应继续走完")
-        _expect(problems, pause_timer, 3, "false", "暂停+等待期间关卡不该被切走")
+    # ── 第 125 轮(用户第 3 条)+ 第一百三十五轮(用户"结局要冻住 + 明确出口")──
+    # 第 125 轮的原话:"在最后一关按ESC暂停时,它还会切换关卡" —— 当时的根因是
+    # `SceneTreeTimer` 的 `process_always` 默认 true,结局链最后"停留 4 秒 ->
+    # 切回大堂"在暂停里照走。
+    # 第一百三十五轮用户拍板改成:**结局时冻住世界 + 给明确出口**,那条
+    # "停留 4 秒自动切关"整条去掉。所以这里改成量四件事(都是真机数字):
+    #   ① 结局画面出来时世界**是冻的**、两个出口按钮在、而且关卡**没被自己切走**;
+    #   ② 结局期间按 Esc:菜单盖上来 + 世界继续冻着 + 结局画面让位;
+    #   ③ 再按一下 Esc:菜单收起、结局画面回来、世界仍冻着;
+    #   ④ 点『回到开场』:真的切到大堂(由挂在 /root 的见证者打那一行)。
+    # ⚠ 旧字段(ending/saved/big_visible/big_text)第一百三十九轮删了 ——
+    #   结局不再有"选择 + 大字 + 存档",只剩"冻住世界 + 两个出口按钮",
+    #   新断言在文件后面(ENDING_RESULT 的另一处,字段是
+    #   frozen/back/quit/dialogs/scene)。
+    ending_menu = _need(problems, text, "ENDING_MENU",
+                        r"STORY_ENDING_MENU paused=(\S+) menu=(\S+) "
+                        r"big_hidden=(\S+)", "结局期间按 Esc")
+    if ending_menu:
+        _expect(problems, ending_menu, 1, "true", "结局期间按 Esc 不该把世界解冻")
+        _expect(problems, ending_menu, 2, "true", "结局期间按 Esc 该弹出暂停菜单")
+        # (第一百三十九轮:结局的两个出口按钮**不**进过场组 —— 菜单盖上来
+        #  时它们还在底下,但菜单在最上层、点得动,这条断言随之去掉)
+    ending_back = _need(problems, text, "ENDING_BACK",
+                        r"STORY_ENDING_BACK paused=(\S+) menu=(\S+) "
+                        r"big_back=(\S+)", "结局期间收起暂停菜单")
+    if ending_back:
+        _expect(problems, ending_back, 1, "true", "收起菜单不该把结局解冻")
+        _expect(problems, ending_back, 2, "false", "再按一下 Esc 菜单该收起")
+        _expect(problems, ending_back, 3, "true", "菜单收起后结局画面该回来")
+    ending_exit = _need(problems, text, "ENDING_EXIT",
+                        r"STORY_ENDING_EXIT scene=(\S+)",
+                        "点『回到开场』该真的切关卡(见证者那一行)")
+    if ending_exit and ending_exit.group(1) not in ("大堂", "<没换>"):
+        # 场景名带后缀(大堂2 之类)也算过;只有"没换"才是失败
+        pass
+    if ending_exit:
+        _expect(problems, ending_exit, 1, "大堂",
+                "点『回到开场』没切回大堂(明确出口没生效)")
     # ── P1(第一百二十六轮):暂停菜单出现时旧界面必须让位 ────────────────
     # 用户原话:"有时点快了,就会有这样的情况,那么在如ESC菜单出现时就立刻
+    # ── 第一百三十九轮:示例里的剧情(对话/选择)已删 ────────────────────
+    # "过场里按 Esc 只开菜单 / 选择框让位 / 收起冷却"那三条断言不再适用
+    # (选择框已经不存在了)。插件那套语义没动 —— 见离线单测
+    # `test_mouse_follows_ui_not_the_cooldown` / `test_transient_*`。
+
     # 隐藏旧的界面,或者添加模糊背景" —— 配图里章节卡「第一章:门厅」糊在
     # 暂停面板的「继续游戏」上。
     # ⚠ 为什么这里**既**要"菜单在最上层"**又**要"章节卡收起来":
@@ -1351,46 +1383,41 @@ def main():
     if start:
         _expect(problems, start, 1, "巡逻", "走廊怪物开场状态(AI 在跑)")
         _expect(problems, start, 2, "true", "走廊怪物找得到")
+    # ── 第一百三十九轮:示例里的对话 / 选择已按用户要求删掉 ─────────────
+    # 所以这几条**反过来钉"确实没有"**(哪天又长回来,这里先红)。
     dial = _need(problems, text, "CORRIDOR_DIALOG",
-                 r"STORY_CORRIDOR_DIALOG visible=(\S+)", "走廊开场对话框")
+                 r"STORY_CORRIDOR_DIALOG visible=(\S+)", "走廊开场(不该有对话框)")
     if dial:
-        _expect(problems, dial, 1, "true", "走廊开场对话框弹出")
-    # ── bug1:对话正文必须真的"打出来" ────────────────────────────────
-    # 开场对话是在**世界暂停**的状态下弹的(『开局选单态』),而逐字冒出的
-    # tween 默认会跟着暂停一起冻住 -> `visible_characters` 永远是 0,
-    # 玩家看到的就是"一个空面板 + 鼠标还在"(用户原话)。
-    typed = _need(problems, text, "DIALOG_TYPED",
-                  r"STORY_DIALOG_TYPED typed=(\S+) vc=(-?\d+) len=(\d+)",
-                  "对话正文逐字显示")
-    if typed:
-        if typed.group(1) != "true":
-            problems.append("暂停中弹出的对话正文没打完字(vc="
-                            + typed.group(2) + "/" + typed.group(3)
-                            + ") —— 逐字冒出的 tween 被暂停冻住了: "
-                            + typed.group(0))
-    dialog_mouse = _need(problems, text, "DIALOG_MOUSE",
-                         r"STORY_DIALOG_MOUSE ok=(\S+) text=(.*)",
-                         "鼠标点击推进对白")
-    if dialog_mouse:
-        _expect(problems, dialog_mouse, 1, "true",
-                "鼠标点击对白区域应推进到下一句")
+        _expect(problems, dial, 1, "false",
+                "走廊又弹出对话框了 —— 用户第一百三十九轮要求把示例里的"
+                "剧情选项与剧情显示全删掉")
     choice = _need(problems, text, "CORRIDOR_CHOICE",
-                   r"STORY_CORRIDOR_CHOICE visible=(\S+)", "走廊剧情选择")
+                   r"STORY_CORRIDOR_CHOICE visible=(\S+)", "走廊剧情选择(不该有)")
     if choice:
-        _expect(problems, choice, 1, "true", "走廊剧情选择弹出")
-    # ── bug3:选项按钮上要写键盘数字(1. / 2.),问题也要打出来 ──────────
-    cflags = _need(problems, text, "CHOICE_FLAGS",
-                   r"STORY_CHOICE_FLAGS q_vc=(-?\d+) n=(\d+) numbered=(\S+)",
-                   "选择框:问题文字 + 选项编号")
-    if cflags:
-        if int(cflags.group(1)) < 0:
-            problems.append("走廊选择框的问题文字没显示出来(q_vc="
-                            + cflags.group(1) + "): " + cflags.group(0))
-        if cflags.group(2) != "2":
-            problems.append("走廊选择框选项数不对(期望 2,实际 "
-                            + cflags.group(2) + "): " + cflags.group(0))
-        _expect(problems, cflags, 3, "true",
-                "选项按钮上写了键盘数字(1. / 2. —— 玩家才知道能按数字键)")
+        _expect(problems, choice, 1, "false", "走廊又弹出剧情选择了 —— 该删干净")
+
+    # ── 新增:眼皮兜底 + 光标规则(第一百三十九轮)──────────────────────
+    # ① 眼皮兜底:世界冻着时 eye_on 必须已经回到 0 —— "预览正常、运行时全黑"
+    #    那条真机 bug 的回归钉子(过场冻住世界 -> tween 默认跟着暂停 ->
+    #    眼皮卡在 6% 的缝上 = 94% 黑)。
+    eye_guard = _need(problems, text, "EYE_GUARD",
+                      r"STORY_EYE_GUARD on=(\S+) amount=(\S+)",
+                      "睁眼兜底(世界冻着也不能把屏幕卡黑)")
+    if eye_guard:
+        _expect(problems, eye_guard, 1, "0.0",
+                "眼皮没张开 —— 运行时整个画面会全黑(查 Tween 的暂停模式)")
+        _expect(problems, eye_guard, 2, "1.0", "张开之后 eye_amount 该是 1.0")
+    # ② 光标规则的输入状态:菜单收起、没有可见的过场面板 = "没界面",
+    #    这时光标就该被收回(用户:"它只有有界面才显示,没有就隐藏")。
+    mouse_rule = _need(problems, text, "MOUSE_RULE",
+                       r"STORY_MOUSE_RULE menu=(\S+) panels=(\d+) "
+                       r"paused=(\S+)",
+                       "光标规则(没界面就别显示)")
+    if mouse_rule:
+        _expect(problems, mouse_rule, 1, "false", "这时候不该有暂停菜单")
+        _expect(problems, mouse_rule, 2, "0",
+                "这时候屏幕上还有可见的面板 —— 按用户的光标规则"
+                "(只有有界面才显示),光标会被一直亮着")
     hide = _need(problems, text, "CORRIDOR_HIDE",
                  r"STORY_CORRIDOR_HIDE in_state=(\S+) in_hint=\[([^\]]*)\] "
                  r"out_state=(\S+) out_hint=\[([^\]]*)\]", "走廊躲藏")
@@ -1435,26 +1462,16 @@ def main():
         problems.append("走廊探针没跑完")
 
     # ── 关卡 3 结局 ─────────────────────────────────────────────────
-    end_choice = _need(problems, text, "ENDING_CHOICE",
-                       r"STORY_ENDING_CHOICE visible=(\S+)", "结局选择框")
-    if end_choice:
-        _expect(problems, end_choice, 1, "true", "结局选择框弹出")
-    # 选项按钮带键盘数字(这条在面板出现的**那一帧**就能验:按钮是同步建的)
-    end_flags = _need(problems, text, "CHOICE_FLAGS_ENDING",
-                      r"STORY_CHOICE_FLAGS_ENDING q_vc=(-?\d+) n=(\d+) "
-                      r"numbered=(\S+)", "结局选择框:选项编号")
-    if end_flags:
-        _expect(problems, end_flags, 2, "2", "结局选择框选项数")
-        _expect(problems, end_flags, 3, "true",
-                "结局选项按钮上写了键盘数字(1. / 2.)")
+    # ── 第一百三十九轮:结局 = 冻住世界 + 两个出口按钮(没有旁白/选择/大字)
     result = _need(problems, text, "ENDING_RESULT",
-                   r"STORY_ENDING_RESULT ending=(\S+) saved=(\S+) "
-                   r"big_visible=(\S+) big_text=(\S+)", "结局结果")
+                   r"STORY_ENDING_RESULT frozen=(\S+) back=(\S+) quit=(\S+) "
+                   r"dialogs=(\S+) scene=(\S+)", "结局(冻住 + 出口按钮)")
     if result:
-        _expect(problems, result, 1, "1", "按 1 后『结局』变量")
-        _expect(problems, result, 2, "true", "结局存档落盘(user://gk_story_end.json)")
-        _expect(problems, result, 3, "true", "结局大字显示出来")
-        _expect(problems, result, 4, "结局:回头救她", "结局大字文字")
+        _expect(problems, result, 1, "true", "结局该把世界冻住")
+        _expect(problems, result, 2, "true", "『回到开场』按钮该在")
+        _expect(problems, result, 3, "true", "『退出游戏』按钮该在")
+        _expect(problems, result, 4, "false",
+                "结局里又出现了剧情面板(对话/选择) —— 该删干净")
     if "STORY_ENDING_DONE" not in text:
         problems.append("结局探针没跑完")
 

@@ -30,6 +30,8 @@ from . import _assets
 from . import _musicset
 # 网络联机(第一百轮:房间 + 自定义消息)—— ENet + @rpc
 from . import _network
+# 游戏环境与后期(第一百二十五轮:『游戏环境与后期』树里的四张卡 + 逻辑触发卡)
+from . import _envpost
 
 
 def _merge_namespaces(*modules):
@@ -43,7 +45,7 @@ def _merge_namespaces(*modules):
 _merge_namespaces(_common, _events, _flow, _movement, _animation,
                   _instances, _fx, _variables, _input, _expressions,
                   _display, _containers, _functions, _ai, _displayset,
-                  _assets, _musicset, _network)
+                  _assets, _musicset, _network, _envpost)
 del _merge_namespaces
 
 
@@ -184,6 +186,9 @@ ALL_CLASSES = tuple(CLASSES)
 CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "资产", "实例", "特效", "变量", "函数", "信号", "网络", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "灯光", "音效", "存档", "界面",
                   "屏幕效果", "氛围", "显示设置", "音乐设置", "射线", "定时", "列表", "字典", "时间",
+                  # 第 125 轮:『游戏环境与后期』树里的四张卡。排在"氛围"附近 ——
+                  # 它和氛围是一回事(都是"这一局长什么样"),只是管的是后期。
+                  "环境与后期",
                   "实用", "动画(旧)")
 
 # Display groups do not change node IDs or serialized categories.
@@ -195,7 +200,8 @@ MENU_GROUPS = {
     "数据与函数": ("变量", "函数", "列表", "字典", "存档"),
     "数学与逻辑": ("运算",),
     "场景与对象": ("实例", "资产", "显示"),
-    "画面与声音": ("相机", "灯光", "音效", "特效", "屏幕效果", "氛围", "界面"),
+    "画面与声音": ("相机", "灯光", "音效", "特效", "屏幕效果", "氛围", "界面",
+                   "环境与后期"),
     "通信": ("信号", "网络"),
     "调试与工具": ("实用",),
 }

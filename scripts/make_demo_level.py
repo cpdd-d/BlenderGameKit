@@ -78,7 +78,18 @@ def clear_scene():
         bpy.data.meshes.remove(mesh)
     scene = bpy.context.scene
     scene.name = "关卡1"
-    apply_settings(scene, (("logic_tree", "玩家逻辑"),))
+    # ── 场景**不挂**关卡图(第一百三十四轮修)──────────────────────────
+    # 这里原来写的是 `logic_tree = "玩家逻辑"`。可那棵树是**角色图**
+    # (挂在玩家身上,`gk_physics.logic_tree`)—— 场景一认领,
+    # `exporter.logic_tree_scope()` 就把它判成 LEVEL,角色那一头反而拿不到
+    # 脚本(`object_logic_trees` 会拒绝"关卡图挂角色")。于是导出的
+    # .tscn 根节点(glb 实例 = **Node3D**)挂着一个 `extends CharacterBody3D`
+    # 的场景脚本,Godot 直接报:
+    #     ERROR: Script inherits from native type 'CharacterBody3D',
+    #            so it can't be assigned to an object of type 'Node3D'
+    # 整关的逻辑**一行都没跑**(自查里"第二关走路 / 上帝机 Tab·F·Esc"
+    # 那几条就是这么红的 —— 不是探针写错,是游戏真的没动)。
+    # 现在两关都是"角色图挂在角色身上",场景自己不挂图。
     scene.unit_settings.system = "METRIC"
     scene.frame_start = 1
     scene.frame_end = 40
@@ -288,6 +299,13 @@ def build_logic(player, coins, goal, elevator=None, vehicle=None):
     if old is not None:
         bpy.data.node_groups.remove(old)
     tree = bpy.data.node_groups.new("玩家逻辑", "GKGameLogicTree")
+    # ── 这棵是**角色图**(第一百三十四轮显式写出来)──────────────────
+    # 显式设 ROLE,不靠 `logic_tree_scope()` 去猜:下面会把它填进玩家物体的
+    # `gk_physics.logic_tree`,场景设置里**不再**指它(见 `build_scene`)。
+    # 以前靠"场景设置里指了它"推出 LEVEL,结果角色拿不到脚本、
+    # 场景又挂了个 extends CharacterBody3D 的脚本在 Node3D 根上 —— 见
+    # `build_scene` 的那段注释。
+    tree.gk_scope = "ROLE"
     # ── 没有用户的节点图**存盘时会被丢掉**(踩过的坑,README 第 14 条)──
     # 表现:生成脚本跑完一切正常,重新打开 .blend 一看"节点图数量=0",
     # 导出时报"找不到节点图"。动作也一样,都要 use_fake_user。
@@ -691,7 +709,65 @@ def build_logic(player, coins, goal, elevator=None, vehicle=None):
     tree.links.new(quit_key.outputs["结果"], quit_branch.inputs["条件"])
     tree.links.new(quit_branch.outputs["是"], do_quit.inputs["执行"])
 
+    _sequence_physics_fanout(tree, physics, await_chain=("转场推镜",))
     return tree
+
+
+def _sequence_physics_fanout(tree, physics, await_chain=()):
+    """把『每当_物理帧』的**扇出**收进『序列』,并让带 await 的那条排最后。
+
+    ── 为什么非做不可(第一百三十四轮)────────────────────────────────
+    出码校验有一条 `SUSPENDING_FLOW_FANOUT`:一个执行出口扇出多条链、
+    其中有 await(『等待_秒』/ 对话框),就告警"顺序依赖节点位置"。
+    示例是**给人抄的**,不能带着告警走(自查里"导出零告警"那一条会红)。
+    而且这条告警说的确实是真事:`await` 会把**这次 `_physics_process`
+    调用剩下的部分**一起挂起 —— 排在它后面的兄弟链(原来是"按 Esc 退出")
+    会跟着被推迟到运镜播完(1.6 秒)才跑。
+
+    接法:`physics -> 序列A`;序列A 的出口按位置顺序接前 7 条链,
+    第 8 个出口接**序列B**;序列B 再接剩下的 4 条(await 那条永远排最后)。
+    一个『序列』最多 8 个出口,所以 11 条链要两层 —— 这也是示例想演示的
+    "出口不够就套一层"。
+    """
+    socket = physics.outputs["执行"]
+    links = list(getattr(socket, "links", ()) or ())
+    if len(links) < 2:
+        return
+
+    def order_key(link):
+        target = getattr(link, "to_node", None)
+        location = getattr(target, "location", (0.0, 0.0))
+        # 先按位置排(和"用户看图时的顺序"一致);await 那条最后
+        last = 1 if getattr(target, "name", "") in await_chain else 0
+        return (last, float(location[0]), float(location[1]))
+
+    targets = [link.to_socket for link in sorted(links, key=order_key)]
+    for link in links:
+        tree.links.remove(link)
+
+    def new_sequence(name, count, x, y):
+        node = tree.nodes.new("GKNodeSequence")
+        node.name = name
+        node.location = (x, y)
+        node.gk_step_count = count
+        return node
+
+    tail_count = 4 if len(targets) > 8 else 0
+    head = targets[:len(targets) - tail_count] if tail_count else targets
+    first = new_sequence("每帧顺序", len(head) + (1 if tail_count else 0),
+                         physics.location[0] + 300.0, physics.location[1])
+    tree.links.new(socket, first.inputs["执行"])
+    for index, target in enumerate(head):
+        tree.links.new(first.outputs[index], target)
+    if tail_count:
+        second = new_sequence("每帧顺序 · 尾", tail_count,
+                              physics.location[0] + 300.0,
+                              physics.location[1] - 260.0)
+        tree.links.new(first.outputs[len(head)], second.inputs["执行"])
+        for index, target in enumerate(targets[len(head):]):
+            tree.links.new(second.outputs[index], target)
+    log(f"每帧顺序:『每当_物理帧』的 {len(targets)} 条链收进序列"
+        f"({len(head)} + {tail_count},await 那条排最后)")
 
 
 def build_second_logic(scene, player):
@@ -714,6 +790,11 @@ def build_second_logic(scene, player):
         with_godot_camera=True,          # Tab 上帝机(第二关也要能飞着看)
         camera_side="第二关机位", camera_top="第二关俯瞰",
     )
+    # ⚠ `create_character_preset` 会把 `gk_scope` 写成 "ROLE" —— 这是**对的**,
+    #   别改成 LEVEL(第一百三十四轮踩过):这棵树是挂在『第二关角色』
+    #   身上的角色图,场景设置里**不许**再指它(见 build_second_level 的
+    #   那段注释:场景一认领,角色就拿不到脚本,导出的场景根还会挂上
+    #   `extends CharacterBody3D` 的脚本,Godot 报类型不匹配,整关不跑)。
     for note in notes:
         log(f"关卡2 预设: {note}")
 
@@ -803,6 +884,16 @@ def write_export_settings(scene, player):
             physics.body_type = "CharacterBody3D"
             physics.dimension = "3"
             physics.script_target = True
+            # 角色图挂在**角色自己**身上(第一百三十四轮):场景不再挂图,
+            # 导出的 .tscn 就变成"根 Node3D + 角色节点挂 CharacterBody3D 脚本"
+            # —— 脚本的 extends 和它挂的节点类型对得上,Godot 不再报错。
+            # ⚠ 只在**没指定**的时候补默认值:第二关的角色图是
+            #   `create_character_preset` 配好的『关卡2逻辑』,
+            #   无条件写成『玩家逻辑』会让第二关的角色去跑第一关的图
+            #   (真机当场报一堆 `Cannot call method 'get_meta' on a null value`,
+            #    因为第一关的图引用『载具』,而第二关里没有那东西)。
+            if not str(getattr(physics, "logic_tree", "") or "").strip():
+                physics.logic_tree = "玩家逻辑"
         elif obj.name.startswith("金币"):
             physics.body_type = "Area3D"
         elif obj.name == "电梯":
@@ -841,7 +932,6 @@ def build_second_level():
     """
     scene = bpy.data.scenes.new("关卡2")
     apply_settings(scene, (
-        ("logic_tree", "关卡2逻辑"),
         ("dimension", "3"),
         ("base_class", "CharacterBody3D"),
         # class_name 必须和第一关(LevelPlayer)**不同** —— Godot 一个工程里
@@ -852,6 +942,11 @@ def build_second_level():
         # 当年第二关是"通关页"所以关着,现在它也照样开着。
         ("god_camera", True),
     ))
+    # ⚠ 这里**不要**再写 `("logic_tree", "关卡2逻辑")`(第一百三十四轮删掉):
+    #   那棵树是挂在『第二关角色』身上的**角色图**,场景一认领就被判成 LEVEL,
+    #   角色拿不到脚本、场景根(Node3D)反而挂上 `extends CharacterBody3D` 的
+    #   脚本 —— Godot 报 "Script inherits from native type 'CharacterBody3D',
+    #   so it can't be assigned to an object of type 'Node3D'",整关不跑。
 
     # 一块地面 + 两道矮墙(别让角色掉出去;第二关不再放金币 / 高台)
     make_box("第二关地面", (ARENA, ARENA, 0.4), (0.0, 0.0, -0.2),

@@ -638,6 +638,113 @@ ENV_TONEMAPS = (
     ("AGX", "AgX", "和 Blender 默认视图变换同名同族 —— 预览对齐首选"),
 )
 
+# 泛光混合模式(第 124 轮)。**值 = Godot 的 Environment.glow_blend_mode
+# 枚举**(真机反射核对:hint = Additive,Screen,Softlight,Replace,Mix):
+#     0=相加 1=滤色 2=柔光 3=替换 4=混合
+# 顺序 / 取值要和 asset_export.ENV_GLOW_BLENDS 一致(离线测试锁着)。
+#
+# 为什么需要它:以前导出只写 `glow_intensity`(Godot 默认 0.8)和 `glow_bloom`
+# —— 而真机实测泛光的**真实扳机**是 `glow_hdr_threshold`(默认 1.0 = 只有
+# 超过 1.0 的像素才泛光,画面几乎是死的)和 `glow_strength`(默认 1.0)。
+# 混合模式是这两个之外"泛光看起来像什么"的那一半:相加最冲(容易过曝)、
+# 滤色(默认)最像常见的辉光、柔光更含蓄。所以这一项也必须够得着。
+ENV_GLOW_BLENDS = (
+    ("ADDITIVE", "相加", "亮部叠加,最冲;容易过曝"),
+    ("SCREEN", "滤色", "默认 —— 柔和的辉光"),
+    ("SOFTLIGHT", "柔光", "更暗更含蓄"),
+    ("REPLACE", "替换", "只留泛光(会把画面变成一团光,一般不用)"),
+    ("MIX", "混合", "按 glow_bloom 和原图混"),
+)
+
+
+def _preview_scale_changed(light_settings, context):
+    """某盏灯的『预览补偿』改了 -> 立刻重算那一关的预览亮度(第一百三十八轮)。
+
+    用户原话:"添加类似 blender 灯光原生的设置来优化预览与运行的差距"。
+    和场景级『灯光倍率』走同一条路(**先还原再乘**,否则越调越暗),
+    只是乘数是**这一盏灯**的 —— 改的只是预览,导出产物一个字不变。
+    """
+    import bpy
+
+    try:
+        from . import godot_look
+    except Exception:                                      # noqa: BLE001
+        return
+    scenes = []
+    if context is not None and getattr(context, "scene", None) is not None:
+        scenes.append(context.scene)
+    for scene in bpy.data.scenes:
+        if scene not in scenes:
+            scenes.append(scene)
+    for scene in scenes:
+        try:
+            godot_look._reset_lights(scene)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+
+class GKObjectLight(bpy.types.PropertyGroup):
+    """挂在**每盏灯**上的"导出到 Godot 的值"(第一百二十六轮)。
+
+    ── 为什么需要它(用户第 10 轮的原话)────────────────────────────
+    用户:"灯光还会受到 blender 的原生灯光设置影响...不行的话,就在开启
+    贴近 godot 观感后就禁用原生灯光设置,转而在游戏环境与后期的侧边栏
+    添加灯光设置。"
+
+    病根是**同一个亮度有两处权威**,而且两边语义对不上:
+      * Blender 灯是按**物理瓦特**算的,还带 `规格化(normalize)`、
+        `半径`、以及 MMD 工具那类插件加的 `曝光度` —— 这些在 Godot 里
+        **根本不存在**;
+      * Godot 的 `light_energy` 是"按 `omni_range` 做距离衰减的倍率",
+        导出侧的换算约定是 1000W ≈ 1.0(只在离灯 9.4 米那一个距离成立)。
+    于是用户在 Blender 面板里改 385W,预览会变,但游戏里的观感变化
+    完全不是那个意思 —— 他没法精确调。
+
+    ── 这一组字段的规矩 ─────────────────────────────────────────────
+    `override` 关着(默认)= **完全按老规矩走**(Blender 瓦数换算),
+    产物与改动前**逐字节一致**;打开之后,下面这几个值就是**权威**:
+    导出直接写它们,预览也按它们反推该多亮 —— 原生面板不再参与。
+    想给一盏灯精确调游戏里的观感,就打开它。
+    """
+
+    override: BoolProperty(
+        name="用这里的值导出", default=False,
+        description=("打开 = 下面这几个值说了算(导出直接写它们,预览也按"
+                     "它们反推);关着 = 按老规矩从 Blender 的瓦数换算"))
+    energy: FloatProperty(
+        name="能量", default=1.0, min=0.0, soft_max=16.0,
+        description=("Godot 的 light_energy。平行光 1.0 ≈ 正午;点光/聚光"
+                     " 1.0 相当于原来 1000W 那档"))
+    range_m: FloatProperty(
+        name="射程", default=0.0, min=0.0, soft_max=100.0,
+        description="Godot 的 omni_range / spot_range(米)。0 = 用 Blender 的『自定义距离』")
+    attenuation: FloatProperty(
+        name="衰减", default=1.0, min=0.0, soft_max=4.0,
+        description=("Godot 的衰减指数。1 = 出厂;调小 = 远处更亮(雾里"
+                     "那盏孤灯),调大 = 光收缩在灯罩附近"))
+    color: FloatVectorProperty(
+        name="颜色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(1.0, 1.0, 1.0, 1.0),
+        description="Godot 的灯颜色(覆盖 Blender 灯的颜色)")
+    use_color: BoolProperty(
+        name="用这里的颜色", default=False,
+        description="不勾 = 沿用 Blender 灯自己的颜色")
+    shadow: BoolProperty(
+        name="投影", default=True,
+        description="Godot 的 shadow_enabled(关掉省性能,适合当补光用的灯)")
+    # ── 逐灯预览补偿(第一百三十八轮,用户要求)──────────────────────────
+    # 用户原话:"添加类似 blender 灯光原生的设置来优化预览与运行的差距"。
+    # 场景级那个『灯光倍率』是**一个数管所有灯**(0.06 是实测标定出来的),
+    # 但每盏灯的偏差并不一样:主光准了,壁灯可能还是偏亮。所以这里给
+    # 每盏灯一个**只影响预览**的乘数 —— 导出产物一个字都不变。
+    preview_scale: FloatProperty(
+        name="预览补偿", default=1.0, min=0.0, soft_max=3.0,
+        description=("只影响『Godot 观感』预览:这盏灯再乘多少(1 = 不动)。"
+                     "用来逐盏灯消掉『预览和运行对不上』的那点差距 —— "
+                     "**导出产物不受影响**"),
+        update=_preview_scale_changed)
+
 
 class GKObjectFx(bpy.types.PropertyGroup):
     """挂在**每个物体**上的粒子发射器设置(需求 5,2026-10-05 第二十一轮)。
@@ -846,6 +953,30 @@ class GKEnvPreset(bpy.types.PropertyGroup):
     p_brightness: FloatProperty(name="亮度", default=1.0, min=0.0, soft_max=2.0)
     p_contrast: FloatProperty(name="对比度", default=1.0, min=0.0, soft_max=2.0)
     p_saturation: FloatProperty(name="饱和度", default=1.0, min=0.0, soft_max=2.0)
+    # ── 第 124 轮:高影响键的预设镜像(和上面的 env_* 一一对应)────────
+    # 命名照现有 p_fog_* / p_glow_* 的风格,统一 p_ 前缀。默认值 = 场景字段
+    # 的默认值 = Godot 的默认值 —— 所以老预设(第 123 轮存下来的那些)
+    # 读到这些新字段就是"什么都不改",观感不会因为这次升级而变。
+    # 映射表在三处必须一致:ui._ENV_PRESET_FIELDS / make_story_demo._ENV_TO_PRESET
+    # / asset_export.ENV_ZONE_KEYS。
+    p_fog_sky_affect: FloatProperty(
+        name="雾盖背景", default=1.0, min=0.0, max=1.0)
+    p_fog_light_energy: FloatProperty(
+        name="雾亮度", default=1.0, min=0.0, soft_max=4.0)
+    p_fog_aerial: FloatProperty(
+        name="远景空气感", default=0.0, min=0.0, max=1.0)
+    p_glow_strength: FloatProperty(
+        name="泛光力度", default=1.0, min=0.0, soft_max=4.0)
+    p_glow_threshold: FloatProperty(
+        name="泛光门槛", default=1.0, min=0.0, soft_max=2.0)
+    p_glow_blend: EnumProperty(
+        name="泛光混合", items=ENV_GLOW_BLENDS, default="SCREEN")
+    p_tonemap_exposure: FloatProperty(
+        name="曝光", default=1.0, min=0.0, soft_max=4.0)
+    p_tonemap_white: FloatProperty(
+        name="白点", default=1.0, min=0.1, soft_max=8.0)
+    p_ambient_sky: FloatProperty(
+        name="天空参与环境光", default=1.0, min=0.0, max=1.0)
     # ── 卡通风格(第一百一十三轮:环境系统大蓝图)────────────────────
     # 这些是**全局 shader 风格**参数,运行时对场景里所有 toon 材质生效。
     # 对应 gk_toon.gdshader 的同名 uniform,值语义见 npr_preview.PARAM_MAP。
@@ -865,6 +996,38 @@ class GKEnvPreset(bpy.types.PropertyGroup):
     p_style_specular: FloatProperty(
         name="高光", default=0.0, min=0.0, max=4.0,
         description="表面高光强度(0 = 关)")
+
+
+def _preview_light_scale_changed(settings, context):
+    """『预览灯光倍率』改了 -> 立刻按新倍率重算预览里的灯(第 124 轮)。
+
+    用户原话:"要不在那添加一个调整灯光倍率值的选项,这样就可以自己来
+    精确的调"。所以系数要能实时拧。
+
+    ⚠ 两个坑:
+      1. **必须先还原再乘**。调暗的写法是"把原瓦数乘系数",如果在已经乘过
+         的结果上再乘,拧三次 0.5 就变成 1/8 —— 越调越暗。所以走
+         `godot_look._reset_lights()`,它先 undim 再按新系数 dim。
+      2. **延迟导入** `godot_look`。properties 是被 nodes / codegen 反过来
+         依赖的地基模块,顶部导入 godot_look 会形成循环。
+    """
+    import bpy
+
+    try:
+        from . import godot_look
+    except Exception:                                      # noqa: BLE001
+        return
+    scenes = []
+    if context is not None and getattr(context, "scene", None) is not None:
+        scenes.append(context.scene)
+    for scene in bpy.data.scenes:
+        if scene not in scenes:
+            scenes.append(scene)
+    for scene in scenes:
+        try:
+            godot_look._reset_lights(scene)
+        except Exception:                                  # noqa: BLE001
+            pass
 
 
 class GKSceneSettings(bpy.types.PropertyGroup):
@@ -1009,11 +1172,18 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     # 这台相机**独立于玩家相机**,不走物理(WASD 平移 / 空格上升 /
     # Shift 下降 / 鼠标转视角,可穿墙),用来像虚幻 5 的上帝视角那样
     # 满地跑着看这一关做得对不对。
+    # ── ⚠ 这是**调试功能**,正式发行时应当关掉(用户 2026-10-15 明确指出)──
+    # 设计原因写在 asset_export.ENVIRONMENT_SCRIPT 的 `god_camera` 文档注释里
+    # (三条:绕开一切规则 = 内置外挂、是给开发者做关卡用的、键位会和玩法抢),
+    # 面板上也照这个说法提示用户。默认 False,已发布的关卡预设才会顺手开
+    # (见 presets.py 的 `with_god_camera`)。
     god_camera: BoolProperty(
         name="上帝摄像机", default=False,
         description=("常驻一台自由飞行相机(独立于玩家相机)。"
                      "运行时按 Tab 切换;WASD 平移 / 空格上升 / Shift 下降 / "
-                     "鼠标转视角,不受碰撞"))
+                     "鼠标转视角,不受碰撞。"
+                     "⚠ 调试功能:正式发行前请关掉 —— 它能穿墙 / 飞出关卡 / "
+                     "时停 / 附身敌人,等于内置外挂,会毁掉追逐潜行类玩法的张力"))
     # ── 主相机(留作自动解析用,侧栏不再单列一行)────────────────────
     # 整局游戏默认用哪台相机。留空 = 自动:
     #   1) 用 Blender 视口当前那台(scene.camera —— 就是你按小键盘 0 看的那台)
@@ -1201,6 +1371,47 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         name="环境与后处理", default=False,
         description=("给这一关挂 WorldEnvironment:背景 / 环境光 / 雾 / 泛光 / 色调。"
                      "关着 = 不导出(和以前完全一样)"))
+    # ── 预览用场景光照(第 124 轮:预览↔运行时对齐)────────────────────
+    # 实测到的差距来源:Blender 的 SOLID 视口默认 `use_scene_lights=False`
+    # + `light='STUDIO'` —— 用的是**跟着视角转的固定棚拍灯**,场景里那几盏
+    # 灯它一盏都不看。于是"Blender 里调好了灯,进 Godot 完全不是那个样子"
+    # (实测:同一关 Blender 渲染 0.76 / Godot 运行时 0.38)。
+    # 打开后『Godot 观感』会把视口切成"真用场景灯 + 真用世界 + 画阴影",
+    # 预览才和运行时是**同一个光照配方**。
+    #
+    # 为什么做成开关而不是直接改:视口观感是用户自己的地盘 —— 有人就喜欢
+    # 棚拍灯那种干净平光(看得清模型),不该被插件强制改掉。默认开是因为
+    # "预览要能代表运行画面"是『Godot 观感』这个功能的**本意**。
+    preview_scene_lights: BoolProperty(
+        name="预览用场景光照", default=True,
+        description=("『Godot 观感』生效时,让视口用场景里的真实灯光画明暗"
+                     "(而不是 Blender 默认那盏跟着视角转的棚拍灯)。"
+                     "关掉 = 只对齐色调映射 / 背景 / 雾,不动光照方式"))
+    # ── 预览灯光倍率(第 124 轮,用户要求"自己来精确的调")──────────────
+    # 自动那档(0.06)是**实测标定**出来的:预览 0.9130 vs 运行 0.3953,
+    # 而且亮的几乎全是灯(把世界强度调到 0 只让 0.9130 动到 0.9123)。
+    # 但那个标定是"一个场景、一个机位"量出来的 —— 用户实测觉得变化不明显,
+    # 所以这里把**系数本身**交出去:0.01~2.0 随便拧,改完立刻重算。
+    #
+    # 为什么要有 update 回调:调暗是"把灯乘一个系数",改了系数必须**先还原
+    # 再乘**(不能在上一次乘完的结果上再乘 —— 那会越调越暗)。回调里调
+    # godot_look 的 `_reset_lights` 做这件事(延迟导入,避免循环依赖)。
+    preview_light_scale: FloatProperty(
+        name="预览灯光倍率", default=0.06, min=0.01, max=2.0,
+        description=("『Godot 观感』里把场景灯光乘多少倍(1.0 = 不动)。"
+                     "默认 0.06 是实测标定值(预览原本比运行亮一倍多)。"
+                     "觉得还是太亮就往小拧、太暗往大拧 —— 改完立刻生效"),
+        update=_preview_light_scale_changed)
+    # ── 侧栏"关卡打勾"(第一百三十七轮,用户要求)───────────────────────
+    # 用户原话:"在游戏环境与后期侧边栏添加选项框,选择一个关卡(选项有关卡
+    # 名称,全部,多选,可以设置成那种打勾的选择)"。
+    # 勾上的关卡会被侧栏里『套给勾选的关卡』/『一键贴近运行画面』一起改 ——
+    # 关卡本身仍是**各存一份设置**(切场景卡上的值跟着切),这里只是一份
+    # "这次要动哪几关"的清单。
+    look_target: BoolProperty(
+        name="一起改", default=True,
+        description="勾上的关卡会被侧栏『套给勾选的关卡』/『一键贴近运行画面』"
+                    "一起改(默认全勾)")
     env_background: EnumProperty(
         name="背景", items=ENV_BACKGROUNDS, default="COLOR",
         description="纯色 = 用下面的背景色铺满;天空 = 程序化天空(天空色跟着背景色走)")
@@ -1254,6 +1465,83 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         name="对比度", default=1.0, min=0.0, soft_max=2.0)
     env_saturation: FloatProperty(
         name="饱和度", default=1.0, min=0.0, soft_max=2.0)
+
+    # ── 第 124 轮:Godot Environment 的**高影响键**(真机实测后补的)──────
+    # 背景:导出器以前写的 19 个键**全是 Godot 默认值的子集** —— 缺的这几个
+    # 才是真正改变画面的杠杆。真机在示例走廊上逐项开关测出的帧均值亮度:
+    #     出厂 0.3803;`fog_sky_affect=0` -> 0.3460(雾色整个盖掉了背景色);
+    #     `fog_light_energy=0.25` -> 0.2599(雾亮度是仅次于密度的杠杆);
+    #     `glow_hdr_threshold=0 + glow_strength=3` -> 0.7247(泛光的真扳机)。
+    # 所以下面这些不是"锦上添花的旋钮",是"够不着的旋钮"。
+    #
+    # 向后兼容:这些字段的**默认值全部等于 Godot 出厂值**,而且导出侧按
+    # "值 ≠ 出厂值才写"的条件输出 —— 所以老项目、老示例(恐怖示例等)的产物
+    # **逐字节不变、观感也不变**。想要新效果就在卡上把值拧离出厂值。
+    #
+    # ⚠ `fog_sky_affect` 一度曾把默认值定成 0.0(那样一开雾就自动修掉"雾色
+    #   盖掉背景色"),但真机实测发现它会把**恐怖示例**整帧压暗 70%
+    #   (0.1422 -> 0.0434,那个示例的背景本来就是近黑、靠雾色垫亮的)。
+    #   本仓库有一条铁律:"老工程与示例的观感不能因为新功能而变",所以这里
+    #   退回出厂值 1.0,改成**在『卡通二次元』那几档内置预设 + 示例里显式写 0**
+    #   —— 谁想要谁开,不替所有人做决定。
+    #
+    # 雾那一组
+    env_fog_sky_affect: FloatProperty(
+        name="雾盖背景", default=1.0, min=0.0, max=1.0,
+        description=("雾色盖掉背景(天空 / 纯色背景色)的程度。1 = Godot 出厂"
+                     "行为:雾色把背景整个换掉(远景糊成一片雾色,和 Blender "
+                     "预览对不上);**0 = 用户选的背景色真的看得见**(推荐,"
+                     "和预览一致)"))
+    env_apply_all_keep_post: BoolProperty(
+        name="只套基础环境,不动后期", default=False,
+        description=("『套用到全部关卡』时,只复制背景 / 环境光 / 雾,"
+                     "不覆盖别的关卡已经调过的泛光与色调调整 —— "
+                     "免得一关特意调的后期被冲掉"))
+    light_push_by_type: BoolProperty(
+        name="按类型刷灯", default=False,
+        description=("『灯光刷到全部关卡』按**灯的类型**匹配(所有平行光 / 所有"
+                     "点光 / 所有聚光),而不是按名字 —— 三关的灯名字通常都"
+                     "不一样(『走廊壁灯』vs『大堂吊灯』),按名字基本刷不到。"
+                     "⚠ 同一类型有多盏时**都会**被盖成同一个设置(会冲掉某一关"
+                     "特意调过的灯),Ctrl+Z 可撤;所以默认关着,要用再勾"))
+    env_fog_light_energy: FloatProperty(
+        name="雾亮度", default=1.0, min=0.0, soft_max=4.0,
+        description=("雾色整体亮度缩放。仅次于雾浓度的雾杠杆:调小让雾变暗"
+                     "(恐怖片常用 0.25~0.5),调大雾会发白发光"))
+    env_fog_aerial_perspective: FloatProperty(
+        name="远景空气感", default=0.0, min=0.0, max=1.0,
+        description=("远处的雾跟着天空颜色走(空气透视)。0 = 雾色恒定"
+                     "(默认);往大调远景越像隔着空气看 —— 强杠杆,慎用"))
+    # 泛光那一组
+    env_glow_strength: FloatProperty(
+        name="泛光力度", default=1.0, min=0.0, soft_max=4.0,
+        description=("泛光真实力度。Godot 默认 1.0,但配合默认门槛 1.0 时泛光"
+                     "几乎是死的;要看到辉光通常是『门槛降到 0.8 以下 + "
+                     "力度拉到 2~3』这一对一起动"))
+    env_glow_threshold: FloatProperty(
+        name="泛光门槛", default=1.0, min=0.0, soft_max=2.0,
+        description=("多亮的像素才泛光。Godot 默认 1.0 = 只有超过白点的像素"
+                     "发光,所以『开了泛光却看不到』多半是这里;降到 0.6~0.9 "
+                     "让灯和亮面真的毛起来(真机实测:0 时整帧亮度 0.38->0.72)"))
+    env_glow_blend: EnumProperty(
+        name="泛光混合", items=ENV_GLOW_BLENDS, default="SCREEN",
+        description="泛光和原图的混合方式(默认『滤色』)")
+    # 色调那一组
+    env_tonemap_exposure: FloatProperty(
+        name="曝光", default=1.0, min=0.0, soft_max=4.0,
+        description=("全局曝光倍率(1.0 = 不变)。色调映射**之前**乘上去,"
+                     "所以暗关拉亮 / 亮关压暗都从这里走"))
+    env_tonemap_white: FloatProperty(
+        name="白点", default=1.0, min=0.1, soft_max=8.0,
+        description=("白点(色调映射映射到最亮的那一个值)。**线性(LINEAR)"
+                     "色调映射下 Godot 会忽略它** —— 选 Reinhard / Filmic / "
+                     "ACES / AgX 之后才有意义;调小 = 整体更亮更灰"))
+    # 背景那一组
+    env_ambient_sky_contribution: FloatProperty(
+        name="天空参与环境光", default=1.0, min=0.0, max=1.0,
+        description=("环境光里『天空』占多少。**只在天空背景模式下生效**"
+                     "(纯色模式下真机实测无效);0 = 环境光完全用下面填的"
+                     "环境光颜色,1 = 全交给天空"))
 
     # ── 全局卡通风格(第一百一十五轮:环境系统大蓝图阶段 B)────────────
     # 场景级 shader 风格:导出时作为**默认**写进没调过参数的材质 .tres
@@ -1758,7 +2046,7 @@ def make_node_picker(prop_name):
 
 
 def current_tree_type(context):
-    """当前节点编辑器在编辑哪一类树 —— 七种之一:
+    """当前节点编辑器在编辑哪一类树 —— 八种之一:
 
         "GKGameLogicTree"  玩法图
         "GKAnimationTree"  动画树(『游戏动画』)
@@ -1767,14 +2055,22 @@ def current_tree_type(context):
         "GKDisplayTree"    显示设置图(『游戏显示』,第四十二轮)
         "GKAssetTree"      资产库(『游戏资产』,第四十三轮)
         "GKMusicTree"      音乐设置图(『游戏音乐』,第八十六轮)
+        "GKEnvLibraryTree" 游戏环境与后期图(第一百二十五轮)
 
     取不到就返回 None。菜单按这个过滤(见 node_menu_entries)。
+
+    ── ⚠ 这张名单就是"哪些图有 GK 菜单"的总开关(第一百二十五轮踩过)─────
+    `GKEnvLibraryTree` 以前**不在这张名单里** —— 于是
+    `_draw_context_menu` / `_draw_add_menu` 一开头就 `return`,
+    右键和 Shift+A 里**一条 GK 条目都没有**。用户原话:
+    "游戏环境与后期的右键菜单那空的"。加一张树类型时,
+    **这里、CATEGORY_ORDER、nodes.py 的导入** 三处都要动,少一处就"菜单是空的"。
     """
     space = getattr(context, "space_data", None)
     kind = getattr(space, "tree_type", "") if space is not None else ""
     if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
                 "GKGameAiTree", "GKDisplayTree", "GKAssetTree",
-                "GKMusicTree"):
+                "GKMusicTree", "GKEnvLibraryTree"):
         return kind
     return None
 
@@ -2116,23 +2412,33 @@ def default_output_dir():
 # 注册顺序很关键:PointerProperty 引用 PropertyGroup 时，PropertyGroup
 # 必须已经注册，否则挂到 Scene / Object 上会报 "missing bl_rna attribute"。
 class GKEnvLibraryTree(bpy.types.NodeTree):
-    """环境预设库 —— 文件级(跨场景)共享的命名预设容器(第一百一十五轮)。
+    """游戏环境与后期 —— 文件级(跨场景)共享的环境/后期图(第一百一十五轮)。
 
     预设原来挂在**每个场景**的 gk_settings.env_presets 上,多关卡时每关
     一份、互不相通(关卡1 存的"恐怖夜"在关卡2 里看不到)。现在统一收到
-    这张**隐藏的树**里 —— 和"动画变量挂动画树"同一个道理:NodeTree 是
+    这张**文件级**的树里 —— 和"动画变量挂动画树"同一个道理:NodeTree 是
     文件里唯一的"跨场景持久数据块"(bpy.data.node_groups)。
 
-    它不进节点图列表、不放任何节点、也不是一张可编辑的图 —— 只是预设的
-    存放处。编辑 / 应用 / 保存的 UI 在『显示_环境氛围』卡上,按
-    `env_preset_library()` 找到这一张。
+    ── 第 124 轮:从"数据容器"升级成一张**能连线的图**(用户要求)──────
+    用户原话:"环境预设库(请改名字为游戏环境与后期)添加设置色调,连线-
+    屏幕位置(整体?还是局部),添加睁眼效果-连线(持续时间),逻辑节点
+    (是否,变量)...这个的开始卡片是默认环境卡片连过去"。
+
+    所以这张树现在有两个身份:
+      * `env_presets` 那一列仍然是**命名预设的存放处**(跨场景共享);
+      * 它同时是一张**可编辑的节点图**,入口是『环境_默认环境』卡,
+        后面按执行流接『环境_设置色调』『环境_屏幕位置』『环境_睁眼效果』
+        以及变量/是否这些逻辑节点 —— 和游戏逻辑图同一套连线习惯。
+
+    名字改成『游戏环境与后期』是因为它的职责已经不只是"存预设"了:
+    它是"这一局的环境 + 后期"的总入口。
     """
 
     bl_idname = "GKEnvLibraryTree"
-    bl_label = "环境预设库"
+    bl_label = "游戏环境与后期"
     bl_icon = "BOOKMARKS"
-    bl_description = ("BlenderGameKit 的环境预设库 —— 跨场景共享的"
-                      "命名预设(数据容器,编辑在『显示_环境氛围』卡)")
+    bl_description = ("BlenderGameKit 的游戏环境与后期 —— 跨场景共享的命名预设"
+                      "+ 可连线的环境/后期图(入口是『默认环境』卡)")
 
     env_presets: CollectionProperty(type=GKEnvPreset)
     env_preset_pick: EnumProperty(
@@ -2144,7 +2450,7 @@ class GKEnvLibraryTree(bpy.types.NodeTree):
 
 
 def env_preset_library():
-    """当前文件的环境预设库树(没有就建一张);跨场景共享。
+    """当前文件的『游戏环境与后期』图(没有就建一张);跨场景共享。
 
     ── 为什么用一张树(而不是继续挂场景)────────────────────────────
     预设是"项目的风格资产",本该多关卡共用。NodeTree 是文件里唯一的
@@ -2154,7 +2460,7 @@ def env_preset_library():
     for group in bpy.data.node_groups:
         if getattr(group, "bl_idname", "") == "GKEnvLibraryTree":
             return group
-    tree = bpy.data.node_groups.new("环境预设库", "GKEnvLibraryTree")
+    tree = bpy.data.node_groups.new("游戏环境与后期", "GKEnvLibraryTree")
     tree.use_fake_user = True
     return tree
 
@@ -2164,5 +2470,5 @@ def env_preset_library():
 # Scene.gk_settings / Object.gk_physics 上的动作在
 # __init__.register() 里做 —— 那边能保证"所有类都注册完了"再挂。
 GK_CLASSES = (GKEnvPreset, GKEnvLibraryTree, GKSceneSettings, GKLogicBinding,
-              GKObjectSettings, GKObjectFx, GKAnimVariable, GKLogicPort,
-              GKLogicVariable, GKLogicFunction)
+              GKObjectSettings, GKObjectFx, GKObjectLight, GKAnimVariable,
+              GKLogicPort, GKLogicVariable, GKLogicFunction)

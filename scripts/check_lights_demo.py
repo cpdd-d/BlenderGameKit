@@ -22,11 +22,22 @@
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+# ⚠ 报错信息里带 `✗`(U+2717),而 Windows 控制台默认是 GBK —— 一打印就
+#   UnicodeEncodeError,把**真正的失败信息**吞掉换成一段 Traceback
+#   (门禁里看到的就是"自查脚本崩了",不是"哪一条不对")。第一百三十一轮在
+#   `make_node_docs.py` 踩过同一个坑,这里用同一条修法:输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -110,10 +121,32 @@ func _toon_path_in(root_node: Node) -> String:
 func _report_cull() -> void:
 	var ground_path := _toon_path_in(_mesh_named("地面"))
 	var player_path := _toon_path_in(character)
-	var ok := ground_path.ends_with("gk_toon_cull.gdshader") \\
-		and player_path.ends_with("gk_toon.gdshader")
+	# 两支都认:平涂(`gk_toon` / `gk_toon_cull`)和引擎光照
+	# (`gk_toon_lit` / `gk_toon_lit_cull`)。选哪支由场景设置
+	# 『卡通跟随场景灯光』决定 —— 这个示例开的就是 lit。
+	var ok := (ground_path.ends_with("gk_toon_cull.gdshader")
+			or ground_path.ends_with("gk_toon_lit_cull.gdshader")) \\
+		and (player_path.ends_with("gk_toon.gdshader")
+			or player_path.ends_with("gk_toon_lit.gdshader"))
 	print("LIGHTS_CULL ground=", ground_path.get_file(),
-		" player=", player_path.get_file(), " ok=", ok)
+		" player=", player_path.get_file(),
+		" branch=", "lit" if _toon_is_lit() else "flat", " ok=", ok)
+
+
+## 这一关用的是哪一支卡通着色器(平涂自算光 / 引擎光照)。
+##
+## ── 为什么要分这一支(第一百三十四轮)──────────────────────────────
+## 灯光示例**故意**开了『卡通跟随场景灯光』(`make_lights_demo.py:374` 的
+## `toon_follow_light = True`),导出侧选的就是 `gk_toon_lit` 那两支;
+## 而 `_lit` 是**吃引擎的灯**的 —— 它根本没有 `light_dir` 这个 uniform。
+## 原来那两条断言按平涂那支写(读 `light_dir`),于是整片假红:
+##     LIGHTS_CULL   期望 gk_toon_cull / gk_toon,拿到 _lit 两支
+##     LIGHTS_TOON_ZERO / LIGHTS_TOON_PICK  读到 null -> 哨兵 (999,999,999)
+## 现在按分支各断言各的:平涂读 `light_dir`,引擎光照读引擎那盏灯。
+func _toon_is_lit() -> bool:
+	var path := _toon_path_in(character)
+	return path.ends_with("gk_toon_lit.gdshader") \\
+		or path.ends_with("gk_toon_lit_cull.gdshader")
 
 
 ## 第九十八轮:可见距离 / 阴影开销 —— 三样都要真的设上。
@@ -235,9 +268,16 @@ func _physics_process(delta: float) -> void:
 		print("LIGHTS_TOGGLE_OFF moon=", _vis(moon), " lamp=", _vis(lamp),
 			" torch=", _vis(torch), " ok=", all_off)
 		var zero_len := _light_dir().length()
-		var zero_ok := toon_mat != null and zero_len < 0.001
+		var zero_ok := false
+		if _toon_is_lit():
+			# 引擎光照那支没有 `light_dir`(明暗交给引擎的灯算):
+			# 三盏全关 = 引擎里没光了。这里断言"确实全关 + 材质在"。
+			zero_ok = all_off and toon_mat != null
+		else:
+			zero_ok = toon_mat != null and zero_len < 0.001
 		print("LIGHTS_TOON_ZERO len=", "%.5f" % zero_len,
-			" mat=", toon_mat != null, " ok=", zero_ok)
+			" mat=", toon_mat != null,
+			" branch=", "lit" if _toon_is_lit() else "flat", " ok=", zero_ok)
 		# 再按 1 = 只开手电筒
 		_send_key(KEY_1, true)
 	elif phase == 2 and elapsed >= 1.6:
@@ -255,10 +295,16 @@ func _physics_process(delta: float) -> void:
 			want = (character.global_position - torch.global_position).normalized()
 			if dir.length() > 0.001:
 				dot = dir.normalized().dot(want)
-		var pick_ok := absf(dir.length() - 1.0) <= 0.05 and dot > 0.9
+		var pick_ok := false
+		if _toon_is_lit():
+			# 只开手电筒时:引擎光照那支由**引擎**挑灯(不吃 light_dir),
+			# 能断言的就是"确实只剩手电筒这一盏亮着"。
+			pick_ok = only_torch and toon_mat != null
+		else:
+			pick_ok = absf(dir.length() - 1.0) <= 0.05 and dot > 0.9
 		print("LIGHTS_TOON_PICK len=", "%.4f" % dir.length(),
 			" dot=", "%.4f" % dot, " dir=", dir, " want=", want,
-			" ok=", pick_ok)
+			" branch=", "lit" if _toon_is_lit() else "flat", " ok=", pick_ok)
 		# ── 第五十一轮:屏幕暗角(阶段④屏幕氛围)──────────────────────
 		_report_vignette()
 		_send_key(KEY_5, true)                 # 按 5 = 暗角加深(带 0.35 秒过渡)
@@ -450,12 +496,14 @@ def main():
         print("✗ 按 1 之后不是『只有手电筒亮』:",
               [line for line in text.splitlines() if "LIGHTS_TOGGLE " in line])
         ok = False
-    if not re.search(r"LIGHTS_TOON_ZERO len=[\d.]+ mat=true ok=true", text):
-        print("✗ 灯全关时卡通材质 light_dir 没被置零(还在画假阴影):",
+    if not re.search(r"LIGHTS_TOON_ZERO .*mat=true.*ok=true", text):
+        print("✗ 灯全关时卡通材质没跟着变暗(平涂要 light_dir 置零 / "
+              "引擎光照要真的没光):",
               [line for line in text.splitlines() if "LIGHTS_TOON_ZERO" in line])
         ok = False
-    if not re.search(r"LIGHTS_TOON_PICK len=[\d.]+ dot=[\d.]+ .*ok=true", text):
-        print("✗ 只开手电筒时卡通材质的光方向不对(没指向手电筒->角色):",
+    if not re.search(r"LIGHTS_TOON_PICK .*ok=true", text):
+        print("✗ 只开手电筒时卡通材质的光源不对(平涂要指向手电筒 / "
+              "引擎光照要只剩手电筒亮):",
               [line for line in text.splitlines() if "LIGHTS_TOON_PICK" in line])
         ok = False
     if not re.search(r"LIGHTS_VIGNETTE .*ok=true", text):
@@ -470,35 +518,48 @@ def main():
         print("✗ 按 6 暗角没放松(强度没到 0.15 / 内圈没到 0.75):",
               [line for line in text.splitlines() if "LIGHTS_VIGNETTE_RELAX" in line])
         ok = False
-    # 数值层面再兜一层(别只信探针自己算的 ok)
-    zero = re.search(r"LIGHTS_TOON_ZERO len=([\d.]+)", text)
-    if zero and float(zero.group(1)) >= 0.001:
-        print("✗ light_dir 长度不是 0:", zero.group(1))
+    # 数值层面再兜一层(别只信探针自己算的 ok)。
+    # ⚠ 只对**平涂**那支查数值:引擎光照那支没有 `light_dir`,探针返回的是
+    #   哨兵值 999(见 `_toon_is_lit` 的说明)。
+    if "branch=flat" in text:
+        zero = re.search(r"LIGHTS_TOON_ZERO len=([\d.]+)", text)
+        if zero and float(zero.group(1)) >= 0.001:
+            print("✗ light_dir 长度不是 0:", zero.group(1))
+            ok = False
+        pick = re.search(r"LIGHTS_TOON_PICK len=([\d.]+) dot=([-\d.]+)", text)
+        if pick:
+            if abs(float(pick.group(1)) - 1.0) > 0.05:
+                print("✗ light_dir 没归一化:", pick.group(1))
+                ok = False
+            if float(pick.group(2)) <= 0.9:
+                print("✗ light_dir 和『手电筒->角色』方向不符:", pick.group(2))
+                ok = False
+    elif "branch=lit" in text:
+        # 引擎光照那支:要确认它**真的是** lit(而不是探针两支都没认出来),
+        # 否则上面那两条会"看起来绿"。
+        print("    卡通材质走的是引擎光照那支(_lit):"
+              " `light_dir` 数值断言按设计跳过")
+    else:
+        print("✗ 探针没说清用的是哪一支着色器(branch= 丢了)")
         ok = False
-    pick = re.search(r"LIGHTS_TOON_PICK len=([\d.]+) dot=([-\d.]+)", text)
-    if pick:
-        if abs(float(pick.group(1)) - 1.0) > 0.05:
-            print("✗ light_dir 没归一化:", pick.group(1))
-            ok = False
-        if float(pick.group(2)) <= 0.9:
-            print("✗ light_dir 和『手电筒->角色』方向不符:", pick.group(2))
-            ok = False
     if "LIGHTS_DONE" not in text:
         print("✗ 探针没跑完(可能中途报错)")
         ok = False
 
     # ── 第九十四轮:背面剔除 ────────────────────────────────────────
     # 运行时:地面(勾了)用剔面版着色器,角色(没勾)保持双面 —— 对照断言
-    cull = re.search(r"LIGHTS_CULL ground=(\S+) player=(\S+) ok=(\w+)", text)
+    cull = re.search(
+        r"LIGHTS_CULL ground=(\S+) player=(\S+) branch=(\w+) ok=(\w+)", text)
     if not cull:
         print("✗ 没跑出背面剔除的结论行(LIGHTS_CULL)")
         ok = False
-    elif cull.group(3) != "true":
+    elif cull.group(4) != "true":
         print("✗ 背面剔除没走到导出(地面该用剔面版 / 角色保持双面):",
               cull.group(0))
         ok = False
     else:
-        print(f"    背面剔除: 地面={cull.group(1)} 角色={cull.group(2)}")
+        print(f"    背面剔除: 地面={cull.group(1)} 角色={cull.group(2)}"
+              f"(着色器分支={cull.group(3)})")
 
     # ── 第九十八轮:可见距离 / 阴影开销 ─────────────────────────────
     # 三样都由环境脚本在运行时设(网格在 glb 实例内部,.tscn 覆盖会被丢掉)
@@ -517,8 +578,23 @@ def main():
               f" 月光阴影={perf.group(3)} 米")
 
     # ── 生成物层面的证据 ────────────────────────────────────────────
-    script_path = os.path.join(OUT, "scripts", "game_logic.gd")
-    if os.path.isfile(script_path):
+    # ⚠ 别写死文件名(第一百三十四轮):这一关的逻辑图是**角色图**
+    #   (角色预设建的),导出名跟着"场景_角色"走 —— 单场景工程是
+    #   `game_logic_World_char.gd`(角色名是中文 -> 压成 `char`)。
+    #   原来这里卡着 `scripts/game_logic.gd`,于是**功能全对也照样红**,
+    #   而且红在"没找到生成的脚本"这种看不出所以然的地方。
+    #   判据改成"在 scripts/ 里找那份带灯光开关代码的逻辑脚本"。
+    candidates = sorted(glob.glob(os.path.join(OUT, "scripts", "game_logic*.gd")))
+    script_path = ""
+    for path in candidates:
+        with open(path, "r", encoding="utf-8") as handle:
+            probe_code = handle.read()
+        if "func _gk_set_light(" in probe_code:
+            script_path = path
+            break
+    if not script_path and candidates:
+        script_path = candidates[0]
+    if script_path and os.path.isfile(script_path):
         with open(script_path, "r", encoding="utf-8") as handle:
             code = handle.read()
         for needle, why in (

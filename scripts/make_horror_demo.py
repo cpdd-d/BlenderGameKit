@@ -736,11 +736,19 @@ def build_stairs_logic(scene, player):
     _link(logic, door, "执行", branch, "执行")
     _link(logic, branch, "否", short, "执行")
 
+    # ── 结局段:先**冻住世界**(用户 2026-10-16 拍板"结局时冻住 + 明确出口")──
+    # 以前是"大字 -> 停留 3 秒 -> 自动回标题",那 3 秒里世界还活着(怪物 /
+    # 物理 / 相机都在动),而且玩家没得选。现在:进结局先冻,给两个按钮。
+    # (和 `make_story_demo.py` 的结局同一个收尾方式,两个示例口径一致。)
+    freeze = _add(logic, "GKNodeUiPauseGame", "结局冻住世界", 420.0, 300.0,
+                  gk_pause=True, gk_show_mouse=True, gk_menu="",
+                  gk_hotkey=False)
     choice = _add(logic, "GKNodeUiChoice", "结局选择", 640.0, 300.0,
                   gk_question="楼梯间的门开了,你要怎么做?",
                   gk_option_count=2,
                   gk_options="回头救同学|独自逃出", gk_speed=0.0)
-    _link(logic, branch, "是", choice, "执行")
+    _link(logic, branch, "是", freeze, "执行")
+    _link(logic, freeze, "完成", choice, "执行")
 
     endings = ((1, "选项1", "回头救她"), (2, "选项2", "独自逃出"))
     for number, pin, label in endings:
@@ -755,20 +763,40 @@ def build_stairs_logic(scene, player):
                     gk_slot="save1", gk_save_verify=True)
         text = _add(logic, "GKNodeUiText", f"结局文字{number}", 1820.0, y,
                     gk_text=f"结局:{label}", gk_x=18.0, gk_y=60.0, gk_size=26)
-        # 演完停 3 秒让玩家看清,再回标题页(一段可循环的短篇)
-        wait = _add(logic, "GKNodeWait", f"停留{number}", 2060.0, y)
-        wait.inputs["秒"].default_value = 3.0
-        back = _add(logic, "GKNodeChangeScene", f"回标题{number}", 2300.0, y,
-                    gk_scene_path=TITLE_RES)
+        # ── 明确出口(用户 2026-10-16 拍板):不再"停留 3 秒自动回标题"────
+        # 世界在结局段是**冻着的**(见上面『结局冻住世界』),两个按钮由玩家选:
+        # 回标题再来一遍 / 直接退出。冻着时按钮照样点得动(界面根是
+        # PROCESS_MODE_ALWAYS,GUI 输入走视口)。
+        tip = _add(logic, "GKNodeUiText", f"结局提示{number}", 2060.0, y,
+                   gk_text="点『回到标题』再玩一遍,或点『退出游戏』",
+                   gk_align="BOTTOM_CENTER", gk_margin=240.0, gk_size=20)
+        # ⚠ 按钮摆**底部**依次往上(别摆正中 —— 会和别的居中控件叠在一起:
+        #   剧情示例那边就这么叠过一次,用户截图里按钮压在结局大字上)。
+        back_btn = _add(logic, "GKNodeUiButton", f"回到标题按钮{number}",
+                        2300.0, y - 80.0, gk_text="回到标题",
+                        gk_align="BOTTOM_CENTER", gk_margin=170.0,
+                        gk_width=200.0, gk_height=52.0)
+        quit_btn = _add(logic, "GKNodeUiButton", f"退出游戏按钮{number}",
+                        2300.0, y + 80.0, gk_text="退出游戏",
+                        gk_align="BOTTOM_CENTER", gk_margin=100.0,
+                        gk_width=200.0, gk_height=52.0)
+        back = _add(logic, "GKNodeChangeScene", f"回标题{number}", 2580.0,
+                    y - 80.0, gk_scene_path=TITLE_RES)
+        quit_game = _add(logic, "GKNodeQuitGame", f"退出{number}", 2580.0,
+                         y + 80.0)
         _link(logic, value, "值", set_end, "值")
         _link(logic, value, "值", write, "值")
         _link(logic, choice, pin, set_end, "执行")
         _link(logic, set_end, "完成", write, "执行")
         _link(logic, write, "完成", save, "执行")
         _link(logic, save, "完成", text, "执行")
-        _link(logic, text, "完成", wait, "执行")
-        _link(logic, wait, "完成", back, "执行")
-    log(f"{STAIRS}逻辑:载入纸条数 + 门口判 >=3 + 两结局 + 存档 + 回标题")
+        _link(logic, text, "完成", tip, "执行")
+        _link(logic, tip, "完成", back_btn, "执行")
+        _link(logic, back_btn, "完成", quit_btn, "执行")
+        _link(logic, back_btn, "点击", back, "执行")
+        _link(logic, quit_btn, "点击", quit_game, "执行")
+    log(f"{STAIRS}逻辑:载入纸条数 + 门口判 >=3 + 两结局 + 存档 + "
+        f"冻住世界 + 出口按钮(回到标题 / 退出游戏)")
     return logic
 
 
@@ -828,7 +856,16 @@ def save_blend(path):
 
 
 def main():
-    from BlenderGameKit import asset_export, project
+    from BlenderGameKit import asset_export, project, register
+
+    # ⚠ 直接 `blender -b --factory-startup --python scripts\make_horror_demo.py`
+    #    跑时插件**没有被启用**,节点类一个都不存在 ——
+    #    第一步 `bpy.data.node_groups.new(..., "GKGameLogicTree")` 就炸。
+    #    门禁是"先装扩展再跑",所以这个洞一直没暴露(用 `--factory-startup`
+    #    复现过:脚本必失败)。这里补上和 `make_story_demo.py` 一样的自注册:
+    #    已经注册过就什么都不做(`register()` 幂等),装好扩展再跑也一样。
+    if bpy.types.NodeTree.bl_rna_get_subclass_py("GKGameLogicTree", None) is None:
+        register()
 
     os.makedirs(OUT_DIR, exist_ok=True)
     room = clear_all()

@@ -1187,8 +1187,26 @@ def _install_camera_shake(ctx, node, indent):
             f"    if {cam_var} is Camera2D:",
             f"        ({cam_var} as Camera2D).offset = Vector2(_ox, _oy)",
             f"    elif {cam_var} is Camera3D:",
-            f"        ({cam_var} as Camera3D).h_offset = _ox",
-            f"        ({cam_var} as Camera3D).v_offset = _oy",
+            # ── 3D 必须换算成"世界单位",不能把像素量直接塞进去(第 124 轮)──
+            # 用户报的 bug:"在关卡2中,被游戏AI攻击的一瞬间传送,就出现了
+            # 类似于肩部摄像机的视角"。惊吓_事件给的强度是 20,而
+            # `Camera3D.h_offset / v_offset` 是**视锥偏移(世界单位)**,
+            # 不是 Camera2D 那种像素 —— 直接填 20 等于把视口横移二十个世界单位。
+            #
+            # 真机标定(640x360 与 1280x720 × fov 50/70/90,量参考物的像素位移):
+            #     px_per_unit ≈ 23.0 * (viewport_height / 360) / tan(fov/2)
+            #   fov=70/360p -> 32.8 px(实测 33);1280x720 -> 65.7(实测 64);
+            #   fov=50 -> 49.3(实测 49);fov=90 -> 23.0(实测 23)。
+            # 反解就是下面这行:把"像素当量"换算成世界单位。
+            # 这样 2D / 3D 同一个『强度』旋钮的观感一致,也不会再把画面甩出屏幕。
+            f"        var _gk_vp := ({cam_var} as Camera3D).get_viewport()",
+            "        var _gk_h: float = 360.0",
+            "        if _gk_vp != null:",
+            "            _gk_h = maxf(_gk_vp.get_visible_rect().size.y, 1.0)",
+            f"        var _gk_half := deg_to_rad(({cam_var} as Camera3D).fov) * 0.5",
+            "        var _gk_unit: float = tan(_gk_half) * 360.0 / (23.0 * _gk_h)",
+            f"        ({cam_var} as Camera3D).h_offset = _ox * _gk_unit",
+            f"        ({cam_var} as Camera3D).v_offset = _oy * _gk_unit",
             f"elif {cam_var} != null:",
             "    # 震动结束:偏移归零，否则相机会一直歪着",
             f"    if {cam_var} is Camera2D:",

@@ -105,6 +105,31 @@ func _count(node: Node) -> Array:
 	return acc
 '''
 
+# 场景二的探针:世界 glb 里没有网格时,相机是 .tscn **自己生成**的节点 ——
+# 这里量"视口里到底有没有当前相机"(没有 = 按 F5 一片灰)。
+NOMESH_PROBE = '''extends SceneTree
+
+func _initialize() -> void:
+	var packed: PackedScene = load("res://scenes/World.tscn") as PackedScene
+	if packed == null:
+		print("GK_NOMESH 加载失败")
+		quit(1)
+		return
+	var root: Node = packed.instantiate()
+	get_root().add_child(root)
+	# 环境脚本是在 _ready 里设的主相机,等两帧再看
+	await process_frame
+	await process_frame
+	var cam: Camera3D = get_root().get_camera_3d()
+	if cam == null:
+		print("GK_NOMESH !! 没有当前相机")
+	else:
+		print("GK_NOMESH 当前相机=", cam.name, " 位置=", cam.global_position,
+				" fov=", cam.fov)
+	print("GK_NOMESH=DONE")
+	quit(0)
+'''
+
 
 def main():
     print("=" * 72)
@@ -196,15 +221,22 @@ def main():
 
     # ── 相机和灯光现在来自 .glb,不是 .tscn 里的节点 ────────────────
     #
-    # glTF 本身就能带相机和灯(写进 cameras 数组和 KHR_lights_punctual),
-    # Godot 导入后自动生成 Camera3D / DirectionalLight3D。
-    # 所以 .tscn 里**不该**再有 Camera3D 节点 —— 有的话场景里就有两个相机。
-    # (实测踩过:用户说"打开 Godot 多一个摄像头"。)
+    # glTF 本身就能带相机(写进 cameras 数组),Godot 导入后自动生成
+    # Camera3D。所以 .tscn 里**不该**再有 Camera3D 节点 —— 有的话场景里
+    # 就有两个相机。(实测踩过:用户说"打开 Godot 多一个摄像头"。)
+    #
+    # ⚠ 灯**不**走 glb(第四十八轮起 `export_lights=False`:Blender 4.5 的
+    #   glTF 导出器导太阳灯时会自己崩,整场景导出失败),改由包装场景生成
+    #   DirectionalLight3D 节点 —— 所以这条断言是反的,别改回去。
     glb_info = asset_export.glb_object_names(directory, "World")
     print(f"    glb 里的相机: {glb_info['cameras']}, 灯: {glb_info['lights']}")
     print(f"    glb 里的对象: {glb_info['nodes']}")
     check("glb 里带了相机", len(glb_info["cameras"]) >= 1, str(glb_info))
-    check("glb 里带了灯", len(glb_info["lights"]) >= 1, str(glb_info))
+    check("glb 里不带灯(灯由包装场景生成)", not glb_info["lights"],
+          str(glb_info))
+    check("包装场景里有灯节点",
+          'type="DirectionalLight3D"' in text or 'type="OmniLight3D"' in text,
+          [ln for ln in text.splitlines() if "Light3D" in ln][:2])
 
     duplicate_cameras = re.findall(r'\[node name="[^"]+" type="Camera3D"', text)
     check("场景里没有重复的 Camera3D 节点", not duplicate_cameras,
@@ -305,6 +337,117 @@ def main():
 
     try:
         os.remove(probe)
+    except OSError:
+        pass
+
+    # ---- 场景二:世界 glb 里**没有网格**时,相机不能丢(第一百四十五轮)----
+    #
+    # 用户原话:"为什么摄像机没起作用?" —— 他那一关里只有一块**平板**,
+    # 而平板是『脚本挂载目标』(它有自己的 glb),于是世界 glb 里只剩相机。
+    # 而包装场景只在"glb 里**有网格**"时才 instance glb(见 write_world_scene
+    # 里的 `if mesh_info:`),相机**一台都带不进来**;导出侧又按"glb 里有相机"
+    # 处理、不再生成 Camera3D 节点 —— 结果 .tscn 里一台相机都没有,
+    # 按 F5 就是一片灰(没有 current 相机 = 没有视点)。
+    # 这里把那个场景原样搭出来:平板(脚本目标)+ 相机 + 一盏灯。
+    print("-" * 72)
+    print("场景二:世界 glb 里没有网格(网格全在脚本目标的 glb 里)")
+    print("-" * 72)
+    directory2 = os.path.join(workdir, "环境测试_godot")
+    for obj in list(scene.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    plate_mesh = bpy.data.meshes.new("PlateMesh")
+    plate = bpy.data.objects.new("Plate", plate_mesh)
+    scene.collection.objects.link(plate)
+    bm = bmesh.new()
+    bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=2.0)
+    bm.to_mesh(plate_mesh)
+    bm.free()
+    # 『游戏物理』勾上『脚本挂载目标』= 用户平板那个设置(它才会单独导 glb)
+    plate.gk_physics.enabled = True
+    plate.gk_physics.script_target = True
+
+    cam_data = bpy.data.cameras.new("ShotCam")
+    cam = bpy.data.objects.new("ShotCam", cam_data)
+    scene.collection.objects.link(cam)
+    cam.location = (0.0, -5.0, 2.0)
+    cam.rotation_euler = (1.25, 0.0, 0.0)
+    scene.camera = cam
+
+    sun_data = bpy.data.lights.new("KeySun", type="SUN")
+    sun_data.energy = 3.0
+    sun = bpy.data.objects.new("KeySun", sun_data)
+    scene.collection.objects.link(sun)
+    sun.rotation_euler = (0.7, 0.2, 0.5)
+
+    project.create_project(directory2)
+    script2 = os.path.join(directory2, "scripts", "game_logic.gd")
+    with open(script2, "w", encoding="utf-8") as handle:
+        handle.write("extends StaticBody3D\n")
+    outcome2 = asset_export.export_assets_pipeline(
+        scene, directory2, dimension="3", script_name="game_logic.gd")
+    check("场景二导出无错误", not outcome2.get("error"),
+          str(outcome2.get("error")))
+
+    world_meshes = asset_export.glb_scene_nodes(
+        directory2, "World").get("meshes", {})
+    check("世界 glb 真的没有网格(复现前提)", not world_meshes,
+          str(sorted(world_meshes)))
+    info2 = asset_export.glb_object_names(directory2, "World")
+    check("世界 glb 里仍然有相机", len(info2["cameras"]) >= 1, str(info2))
+
+    scene2_path = os.path.join(directory2, "scenes", "World.tscn")
+    with open(scene2_path, encoding="utf-8") as handle:
+        text2 = handle.read()
+    check("没有网格时不 instance 世界 glb",
+          'instance=ExtResource("1_world")' not in text2,
+          [ln for ln in text2.splitlines() if "glb" in ln][:2])
+    names2 = re.findall(r'\[node name="([^"]+)" type="Camera3D"', text2)
+    check("相机节点必须自己生成(不能一台都没有)", names2 == ["ShotCam"],
+          str(names2))
+    check("这台相机是 current(否则没有视点)",
+          re.search(r'\[node name="ShotCam" type="Camera3D"[^\[]*current = true',
+                    text2) is not None, text2)
+    # FOV:Blender 默认 50mm 镜头(水平 39.6°)-> 垂直 22.9°。
+    # 这一条钉住"分支里 `import math`"那个坑 —— 那次 FOV 静默变成 70°。
+    fov2 = re.search(r'\[node name="ShotCam" type="Camera3D"[^\[]*fov = ([\d.]+)',
+                     text2)
+    got_fov = float(fov2.group(1)) if fov2 else -1.0
+    check("相机 FOV 跟着 Blender 走(不是默认 70)", abs(got_fov - 22.90) < 0.05,
+          str(got_fov))
+    env2 = os.path.join(directory2, "scripts", "gk_environment.gd")
+    if os.path.isfile(env2):
+        with open(env2, encoding="utf-8") as handle:
+            env2_text = handle.read()
+        check("环境脚本指向这台相机(运行时才会点亮它)",
+              'camera_name: String = "ShotCam"' in env2_text,
+              [ln for ln in env2_text.splitlines() if "camera_name" in ln][:1])
+    else:
+        check("环境脚本写出来了", False, env2)
+
+    # ---- 交给 Godot:这台相机必须真的是"当前相机" ----
+    probe2 = os.path.join(directory2, "_grayprobe2.gd")
+    with open(probe2, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(NOMESH_PROBE)
+    subprocess.run([GODOT, "--headless", "--path", directory2, "--import"],
+                   capture_output=True, text=True, timeout=180)
+    result2 = subprocess.run([GODOT, "--headless", "--path", directory2,
+                              "--script", "res://_grayprobe2.gd"],
+                             capture_output=True, text=True, timeout=180)
+    output2 = (result2.stdout or "") + (result2.stderr or "")
+    print("-" * 72)
+    for line in output2.splitlines():
+        if "GK_NOMESH" in line:
+            print("   ", line.strip())
+    print("-" * 72)
+    cam2 = re.search(r"GK_NOMESH 当前相机=\s*(\S+)\s+位置=", output2)
+    check("场景二在 Godot 里有当前相机", cam2 is not None, output2[-400:])
+    if cam2:
+        print(f"    当前相机: {cam2.group(1)}")
+        check("当前相机就是 Blender 里那台", cam2.group(1) == "ShotCam",
+              cam2.group(1))
+    try:
+        os.remove(probe2)
     except OSError:
         pass
 

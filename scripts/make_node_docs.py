@@ -246,13 +246,17 @@ def main():
 
     if args.check:
         if not os.path.isfile(OUT):
-            print(f"✗ 还没有 {OUT} —— 跑一次 `python scripts\\make_node_docs.py`")
+            _safe_print(f"✗ 还没有 {OUT} —— 跑一次 "
+                        f"`python scripts\\make_node_docs.py`")
             print("CHECK_NODE_DOCS=FAIL")
             return 1
         with open(OUT, "r", encoding="utf-8") as handle:
             current = handle.read()
         if current != text:
-            print("✗ 手册和代码对不上了(加了/改了节点但没重新生成)")
+            # ⚠ 必须走 _safe_print:GBK 控制台编不出 `✗`,裸 print 会在
+            #   **最该看到提示的时候**抛 UnicodeEncodeError(第 131 轮踩过,
+            #   第 137 轮又踩了一次 —— 那一行漏改了)。
+            _safe_print("✗ 手册和代码对不上了(加了/改了节点但没重新生成)")
             print(f"  跑一次:python scripts\\make_node_docs.py")
             print("CHECK_NODE_DOCS=FAIL")
             return 1

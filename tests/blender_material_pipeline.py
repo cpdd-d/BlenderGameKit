@@ -36,6 +36,10 @@ def check(name, condition, detail=""):
 
 
 def find_addon():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.isfile(os.path.join(root, "BlenderGameKit", "__init__.py")):
+        sys.path.insert(0, root)
+        return "BlenderGameKit"
     for module in addon_utils.modules():
         if "blender_game_kit" in getattr(module, "__name__", ""):
             return module.__name__
@@ -56,10 +60,13 @@ func _initialize() -> void:
 	get_root().add_child(root)
 	await process_frame
 
-	var checked := 0
-	_walk(root, [checked])
-	print("GK_MP 检查了 ", checked, " 个网格")
-
+	# ⚠ 计数必须走**这个数组本身**:原来写的是 `var checked := 0` +
+	#   `_walk(root, [checked])` —— 数组是引用传递、`int` 是值传递,
+	#   里面加的 1 落在临时数组上,外面那个 `checked` 永远是 0,
+	#   于是打印出"检查了 0 个网格"而材质行明明都打了(假读数)。
+	var acc: Array = [0]
+	_walk(root, acc)
+	print("GK_MP 检查了 ", acc[0], " 个网格")
 	await process_frame
 	await process_frame
 	var img: Image = get_root().get_texture().get_image()
@@ -167,16 +174,36 @@ def main():
     scene.camera = cam
 
     sun_data = bpy.data.lights.new("KeySun", type="SUN")
-    # 灯光**不再由导出脚本修正**(按用户要求:灯光在 Godot 里设计)。
-    # glTF 会把 Blender 的太阳能量放大约 683 倍(3.0 -> 2049),
-    # Godot 原样接收会冲成纯白。要让 Godot 里出现约 0.34 的正常亮度,
-    # Blender 侧要写 0.34 / 683 —— 直接用这个值来测材质本身。
-    sun_data.energy = 0.0005
+    # 灯光**不再由导出脚本修正**(按用户要求:灯光在 Godot 里设计),
+    # 但**换算**还在:`asset_export._light_energy_for()` 对平行光写
+    # `Blender 能量 × 1.2`(老 glTF 那条 ×683 的路早就不走了)。
+    #
+    # ⚠ 这里原先是 `energy = 0.0005` —— 那是按"glTF 会放大 683 倍"配的
+    #   (0.0005 × 683 ≈ 0.34)。换算改成 ×1.2 之后,同一个 0.0005 写进
+    #   .tscn 就是 `light_energy = 0.001`,**等于把太阳关掉了**:整帧几乎全黑,
+    #   采样出来"只有 2 种颜色",于是"卡通色阶生效"那条永远红 ——
+    #   红的是灯的配平,不是着色器。现在直接写 1.0(→ Godot 里 1.2)。
+    sun_data.energy = 1.0
     sun = bpy.data.objects.new("KeySun", sun_data)
     scene.collection.objects.link(sun)
     sun.rotation_euler = (0.7, 0.2, 0.5)
 
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(workdir, "mat.blend"))
+
+    # ── 必须**打开环境**并让卡通材质跟随场景灯光(否则测不出色阶)──────
+    # 出厂状态下 `env_enabled = False`,环境脚本会走 `_apply_flat()`:
+    # `light_dir` 置零 + 环境色拉满 + 阴影色改白 —— 那是**故意的"全平涂"**
+    # (用户 2020-10-04 那条:平涂 = 贴图本色)。此时整帧就只有"底色 + 背景"
+    # 两种颜色,采样出来必然 = 2,于是"卡通色阶生效"这条永远红。
+    # 要测色阶,场景就得真的用光:环境打开 + `toon_follow_light`(示例工程
+    # 三关都勾了这个)。勾上之后 `_update_light()` 才会把 KeySun 喂进
+    # `light_dir`,球面上才会出现明暗分界。
+    gk_settings = getattr(scene, "gk_settings", None)
+    if gk_settings is not None:
+        for attr in ("env_enabled", "toon_follow_light"):
+            if hasattr(gk_settings, attr):
+                setattr(gk_settings, attr, True)
+
     directory, _reason = project.resolve(scene)
     project.create_project(directory)
     print(f"    项目: {directory}")
@@ -232,10 +259,17 @@ def main():
 
     # 映射表里提到的 .tres 必须真的存在 —— 引用不存在的文件 Godot 会报错,
     # 而且**整个场景加载会失败**(这个坑踩过:贴图没导出时就是这样)
+    # ⚠ 分隔符是 `|`,不是 `\n`(这里原来写的是 `split("\\n")`)。
+    #   映射表由 `asset_export._material_table()` 生成:`"|".join("名字=res://...")`,
+    #   生成端 `gk_environment.gd` 也是 `materials.split("|", false)`(同一份契约)。
+    #   按 `\n` 切的话整串会当成**一个**条目,`.tres` 明明都在也被判"缺失"——
+    #   一条永远红的假红,正是这条测试信用破产的原因。
     missing = []
     table = re.search(r'materials = "([^"]*)"', text)
     if table:
-        for entry in table.group(1).split("\\n"):
+        entries = [e for e in table.group(1).split("|") if e.strip()]
+        check("映射表至少有一项", bool(entries), repr(table.group(1)))
+        for entry in entries:
             if "=" not in entry:
                 continue
             res_path = entry.split("=", 1)[1].strip()
@@ -270,13 +304,24 @@ def main():
     print("-" * 72)
 
     # ---- 4. 材质真的是我们的 ShaderMaterial ----
+    # 先确认"真的走到了网格":探针以前把计数打在了一个临时数组上,
+    # 永远显示 0 —— 那种假读数会让"一条材质都没检查到"看起来也正常。
+    meshes = re.search(r"GK_MP 检查了\s*(\d+)\s*个网格", out)
+    check("探针走到了网格(球 + 地面)", bool(meshes) and int(meshes.group(1)) >= 2,
+          meshes.group(0) if meshes else out[-200:])
     material_lines = [ln for ln in out.splitlines() if "材质=" in ln]
     print(f"    网格材质报告: {len(material_lines)} 条")
     check("Godot 里至少有一个网格用的是 ShaderMaterial",
           any("材质=ShaderMaterial" in ln for ln in material_lines),
           str(material_lines[:3]))
-    check("shader 指向 gk_toon.gdshader",
-          any("gk_toon.gdshader" in ln for ln in material_lines),
+    # 卡通着色器有**两个变体**,选哪一支由『卡通材质跟随场景灯光』决定:
+    #   关(平涂 / 自算光)= `gk_toon.gdshader`(light_dir 由环境脚本喂)
+    #   开(引擎光照)     = `gk_toon_lit.gdshader`(走 Godot 自己的灯)
+    # 本测试为了测出**色阶**,把 `toon_follow_light` 打开了(见上面那段),
+    # 所以这里两支都算通过 —— 但必须是**我们的**着色器,不是 glTF 带过来的 PBR。
+    check("shader 是我们的卡通着色器(gk_toon / gk_toon_lit)",
+          any(("gk_toon.gdshader" in ln) or ("gk_toon_lit.gdshader" in ln)
+              for ln in material_lines),
           str(material_lines[:3]))
     check("能读到卡通参数(说明着色器在跑)",
           "GK_MP   参数 shadow_step=" in out, out[-300:])

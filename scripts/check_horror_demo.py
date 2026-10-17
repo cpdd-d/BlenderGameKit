@@ -27,11 +27,22 @@
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -465,20 +476,49 @@ def _code_checks(problems):
     for name, needles in checks.items():
         path = os.path.join(OUT, name)
         if not os.path.isfile(path):
-            problems.append(f"没找到生成的脚本 {name}")
-            continue
+            # ── 换个名字也要找得到(第一百三十四轮)────────────────────
+            # 这一关的逻辑图是**角色图**(角色预设建的),导出名跟着
+            # "场景_角色"走:`game_logic_楼梯间_char.gd`。以前这里卡死
+            # `game_logic_楼梯间.gd`,于是"功能全对也全红" —— 而且红在
+            # "没找到生成的脚本"这种看不出所以然的地方。
+            # 判据改成"同一个场景名下的那几份里,哪份含第一条关键词"。
+            base = os.path.basename(name)
+            folder = os.path.dirname(path)
+            same_scene = sorted(
+                candidate for candidate in glob.glob(os.path.join(folder, "game_logic*.gd"))
+                if base.replace(".gd", "") in os.path.basename(candidate)
+                or os.path.basename(candidate).startswith(base.replace(".gd", "")))
+            picked = ""
+            for candidate in same_scene:
+                with open(candidate, "r", encoding="utf-8") as handle:
+                    if needles[0][0] in handle.read():
+                        picked = candidate
+                        break
+            if not picked and same_scene:
+                picked = same_scene[0]
+            if not picked:
+                problems.append(f"没找到生成的脚本 {name}")
+                continue
+            path = picked
+            name = os.path.relpath(picked, OUT).replace(os.sep, "/")
         with open(path, "r", encoding="utf-8") as handle:
             code = handle.read()
         for needle, why in needles:
             if needle not in code:
                 problems.append(f"{name} 里没有{why}: 找不到 {needle!r}")
-    # 楼梯间要有 ">= 3" 的门槛
+    # 楼梯间要有 ">= 3" 的门槛(同一份脚本,按关键词找)
     path = os.path.join(OUT, "scripts/game_logic_楼梯间.gd")
+    if not os.path.isfile(path):
+        found = [candidate for candidate in
+                 sorted(glob.glob(os.path.join(OUT, "scripts", "game_logic_楼梯间*.gd")))]
+        path = found[0] if found else path
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as handle:
             code = handle.read()
         if not re.search(r"纸条数\)? >= 3", code):
             problems.append("楼梯间没有『纸条数 >= 3』的门槛")
+    else:
+        problems.append("没找到楼梯间的逻辑脚本(纸条数门槛没法查)")
 
 
 def _scene_checks(problems):

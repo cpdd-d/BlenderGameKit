@@ -23,6 +23,16 @@ import shutil
 import subprocess
 import sys
 
+
+# ⚠ Windows 控制台默认 GBK,而下面会用 `✗`(U+2717)打失败信息 —— 直接打印会
+#   `UnicodeEncodeError`,**失败信息本身**被一段 Traceback 顶掉(门禁里看到的
+#   就是"自查脚本崩了",而不是"哪一条不对")。这里把输出改成能容错的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                          # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "examples", "demo_env", "环境示例_godot")
@@ -225,15 +235,17 @@ def main():
     else:
         day_source = int(source.group(1))
         night_source = int(source.group(2))
-        print(f"    环境光来源: 白天={day_source}(期望 3=Sky)"
-              f" 幽暗={night_source}(期望 2=Color)")
-        if day_source != 3:
-            print("✗ 天空背景的环境光来源该是 3(Sky):", day_source)
-            ok = False
-        if night_source != 2:
-            print("✗ 纯色背景的环境光来源该是 2(Color)—— 写 Sky 等于关掉:",
-                  night_source)
-            ok = False
+        # ⚠ 第一百四十轮:规则改成"**填了『环境光强度』(> 0)就用 Color**" ——
+        #   Godot 在 Sky 模式下会忽略 ambient_light_color / energy,用户调的
+        #   环境光会静默失效(他原话:"游戏环境与后期的效果有一部分没作用?")。
+        #   所以这里断言的是"**不是 Disabled(1)**"(写 Sky 而强度为 0 也算对)。
+        print(f"    环境光来源: 白天={day_source} 幽暗={night_source}"
+              f"(都该是 2=Color 或 3=Sky,不许是 1=Disabled)")
+        for label, value in (("白天(天空)", day_source), ("幽暗(纯色)", night_source)):
+            if value not in (2, 3):
+                print(f"✗ {label}的环境光来源是 {value} —— 1=Disabled 等于把"
+                      f"环境光静默关掉(用户填的强度不生效)")
+                ok = False
 
     # ── 第九十六轮:颜色数字过没过 linear->sRGB ──────────────────────
     # 幽暗的背景色设置是线性 (0.004,...) -> 写进 .tscn 应该是显示值 ≈0.05;

@@ -45,6 +45,103 @@ def safe_file_name(text, fallback="player"):
     return name
 
 
+def safe_scene_name(name):
+    """Blender 场景名 -> 能当文件名 / 资源名的名字(**保留中文**)。
+
+    ⚠ 这条规矩**只有一份**:多场景导出用它拼 `game_logic_<场景名>.gd`
+    (`asset_export._safe_scene_name` 就是转调这里),下面
+    `_multi_scene_script_name` 给"单棵树导出"补前缀时用的也是它 ——
+    两边一旦不同名,就会又冒出一个"同名不同文件"的撞名脚本。
+    """
+    cleaned = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff\-]", "_", str(name or ""))
+    cleaned = cleaned.strip("_")
+    return cleaned or "Scene"
+
+
+def _scene_references_tree(scene, tree_name):
+    """这个场景认领这棵树吗(场景设置里的关卡图 / 某个物体的角色图)。"""
+    if scene is None or not tree_name:
+        return False
+    settings = getattr(scene, "gk_settings", None)
+    if str(getattr(settings, "logic_tree", "") or "") == tree_name:
+        return True
+    for obj in getattr(scene, "objects", ()) or ():
+        physics = getattr(obj, "gk_physics", None)
+        if str(getattr(physics, "logic_tree", "") or "") == tree_name:
+            return True
+    return False
+
+
+def _tree_owner_scene(tree):
+    """这棵树属于哪个 Blender 场景(先看**当前**场景,再看别的)。
+
+    单棵树导出发生在"用户正在编辑的那一关",所以当前场景优先;
+    找不到归属返回 None(调用方保持老行为)。
+    """
+    if tree is None:
+        return None
+    tree_name = str(getattr(tree, "name", "") or "")
+    if not tree_name:
+        return None
+    try:
+        import bpy
+    except Exception:                                     # noqa: BLE001
+        return None
+    candidates = [getattr(bpy.context, "scene", None)] + list(exportable_scenes())
+    seen = set()
+    for scene in candidates:
+        if scene is None or id(scene) in seen:
+            continue
+        seen.add(id(scene))
+        if _scene_references_tree(scene, tree_name):
+            return scene
+    return None
+
+
+def _multi_scene_script_name(default_name, tree):
+    """多场景工程里:把"回退脚本名"换成**带场景前缀**的那一个。
+
+    ── 待办清单③的真凶(真机复现:`_dist/repro_stray_game_logic.py`)──
+    三关的剧情示例里会冒出一份 `scripts/game_logic.gd`,和
+    `game_logic_大堂.gd` **声明了同一个 `class_name`**(`StoryLobbyPlayer`),
+    Godot 直接报
+        Parse Error: Class "StoryLobbyPlayer" hides a global script class
+    —— 整份 `CHECK_STORY_DEMO` 红;手工删掉就好,所以一直不知道是谁写的。
+
+    根因:`export_all_scenes` 会显式传 `script_name = game_logic_<场景名>.gd`,
+    但**单棵树导出**(侧栏『导出脚本』/ F5 / `gk.export_script`)没有 override,
+    于是走默认名 —— 树名是中文,`safe_file_name` 压成空之后回退成
+    `game_logic.gd`。同一个工程里就同时存在 `game_logic.gd` 与
+    `game_logic_大堂.gd`(同一棵树、同一个类名)。
+
+    修法:只在"工程里不止一个场景"、且默认名确实是那个回退名时补前缀,
+    命名和 `export_all_scenes` **逐字一致**:
+        关卡 / 世界图 -> `game_logic_<场景名>.gd`
+        角色图       -> `game_logic_<场景名>_<角色>.gd`
+    单个场景的工程一个字不变(老产物、离线测试都不受影响)。
+    """
+    if default_name != "game_logic.gd":
+        return default_name
+    # ⚠ 整个判断包在 try 里:离线测试用的是 bpy 桩,`bpy.data.scenes` 可能
+    #   根本不存在(或不是可迭代的)—— 那只是"拿不到场景表",不是导出失败,
+    #   保持老行为即可(和 `logic_tree_scope` 里那个 try 同一个理由)。
+    try:
+        if len(list(exportable_scenes())) < 2:
+            return default_name
+        scene = _tree_owner_scene(tree)
+    except Exception:                                     # noqa: BLE001
+        return default_name
+    if scene is None:
+        return default_name
+    scene_name = safe_scene_name(getattr(scene, "name", ""))
+    for obj, role_tree, _reason in object_logic_trees(scene):
+        if role_tree is tree:
+            from . import asset_export
+            return (f"game_logic_{scene_name}_"
+                    f"{asset_export.safe_name(obj.name, 'char')}.gd")
+    return f"game_logic_{scene_name}.gd"
+
+
 def build_settings(scene):
     """从 Blender 场景属性里读出导出设置。
 
@@ -233,6 +330,16 @@ def resolve_scene_tree(scene):
           ②整个 .blend 只有一棵 -> 就用它(单场景项目行为完全不变)
           ③其余情况返回 None,由调用方告警
     返回 (tree, 说明文字)。
+
+    ── ②那条兜底的**边界**(第一百三十四轮修)──────────────────────────
+    "整个 .blend 只有一棵"说的是**关卡图**的棵数,可那一棵很可能**已经是
+    别的场景的**了。真机抓到(恐怖示例):`标题逻辑` 是标题场景的关卡图,
+    而教室 / 走廊 / 楼梯间这一关的逻辑全在**角色图**里(物体上的
+    `gk_physics.logic_tree`,由角色预设配好),场景设置是空的 ——
+    兜底就把**标题页的逻辑**当成了这三关的场景脚本:三份
+    `game_logic_教室/走廊/楼梯间.gd` 逐字节相同、头部写着"节点树: 标题逻辑",
+    三关的场景根都挂着它(进关卡先弹标题 UI,点一下还会切回教室)。
+    所以:那一棵如果**被别的场景显式认领过**,就不许自动用。
     """
     if scene is None:
         return None, ""
@@ -251,11 +358,36 @@ def resolve_scene_tree(scene):
         return None, f"场景设置里指定的『{wanted}』不存在(或不是游戏逻辑图)"
     trees = game_logic_trees("LEVEL")
     if len(trees) == 1:
+        owner = _scene_claiming_tree(trees[0], scene)
+        if owner is not None:
+            return None, (f"整个 .blend 里唯一那棵关卡图『{trees[0].name}』"
+                          f"是『{owner}』这一关的 —— 这个场景得自己指定一棵"
+                          f"(它的逻辑可能挂在角色图上)")
         return trees[0], "只有一棵游戏逻辑图,自动使用"
     if not trees:
         return None, "整个 .blend 里没有游戏逻辑图"
     return None, (f"有 {len(trees)} 棵游戏逻辑图,但这个场景没选 —— "
                   f"请在『导出』面板给场景指定一棵")
+
+
+def _scene_claiming_tree(tree, scene):
+    """有没有**别的**场景在认领这棵树?有就返回那个场景名。
+
+    (见 `resolve_scene_tree` 的说明:兜底"只有一棵就自动用"必须让开
+    "那棵已经名花有主"的情况。判据复用 `_scene_references_tree` ——
+    场景设置里的关卡图 / 某个物体上的角色图都算"认领"。)
+    """
+    if tree is None:
+        return None
+    name = str(getattr(tree, "name", "") or "")
+    if not name:
+        return None
+    for other in exportable_scenes():
+        if other is scene:
+            continue
+        if _scene_references_tree(other, name):
+            return str(getattr(other, "name", "") or "?")
+    return None
 
 
 def exportable_scenes():
@@ -465,6 +597,11 @@ def _generate_code_full(tree, settings=None):
         file_name = override if override.endswith(".gd") else override + ".gd"
     else:
         file_name = safe_file_name(getattr(tree, "name", ""), "game_logic") + ".gd"
+        # ── 多场景工程里别写出"没有场景前缀"的回退名(待办清单③)──────
+        # 见 _multi_scene_script_name 的说明:那份 `game_logic.gd` 会和
+        # `game_logic_<场景>.gd` 撞 class_name,Godot 报
+        # "hides a global script class",而单场景工程行为一字不变。
+        file_name = _multi_scene_script_name(file_name, tree)
     actions = list(result.input_actions)
     assets = dict(getattr(result, "curve_assets", {}) or {})
     return code, warnings, file_name, actions, diagnostics, assets

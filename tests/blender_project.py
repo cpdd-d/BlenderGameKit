@@ -231,11 +231,45 @@ def main():
     real_popen = project.subprocess.Popen
 
     class _FakeProc:
-        pass
+        """`subprocess.Popen` 的最小替身(只记录参数,不真的启动 Godot)。
+
+        ⚠ 必须**支持上下文管理器协议**。`open_in_godot(editor=False)` 会先走
+        `ensure_imported()`,而它用的是 `subprocess.run()` —— CPython 的
+        `run()` 内部正是 `with Popen(...) as process:` + `process.communicate()`。
+        只实现"记录参数"的话,走到"运行游戏"那一步会抛
+        `TypeError: '_FakeProc' object does not support the context manager
+        protocol`,**整个脚本在最后一步崩掉**(前面 36 条检查全绿也照样判红)。
+        """
+
+        def __init__(self, args, **kwargs):
+            self.args = list(args)
+            self.kwargs = kwargs
+            self.returncode = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def communicate(self, input=None, timeout=None):   # noqa: A002
+            return (b"", b"")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def terminate(self):
+            self.returncode = -15
 
     def _fake_popen(args, **kwargs):
         captured.append(list(args))
-        return _FakeProc()
+        return _FakeProc(args, **kwargs)
 
     try:
         project.subprocess.Popen = _fake_popen

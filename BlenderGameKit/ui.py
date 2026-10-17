@@ -3809,146 +3809,21 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
         row.operator("gk.add_asset_instance", text="再加一份实例",
                      icon="DUPLICATE")
 
-        # ---- 粒子特效(需求 5,2026-10-05 第二十一轮)------------------
-        # Blender 的粒子系统导不进 glTF,所以这里做的是"标记 + 参数":
-        # 导出时在 Godot 里生成 GPUParticles3D / CPUParticles3D,
-        # 运行时用『特效_播放』『特效_停止』『特效_爆发』控制。
-        fx = getattr(obj, "gk_fx", None)
-        if fx is not None:
-            box = layout.box()
-            box.label(text="粒子特效", icon="MOD_PARTICLES")
-            col = box.column(align=True)
-            col.prop(fx, "enabled")
-            if not fx.enabled:
-                col.label(text="勾上 = 导出成 Godot 的粒子节点"
-                               "(Blender 自己的粒子导不出去)", icon="INFO")
-            else:
-                col.prop(fx, "particle_type", text="")
-                row = col.row(align=True)
-                row.prop(fx, "amount")
-                row.prop(fx, "lifetime")
-                row = col.row(align=True)
-                row.prop(fx, "one_shot")
-                row.prop(fx, "auto_play")
-                col.prop(fx, "explosiveness")
-                if not fx.auto_play:
-                    col.label(text="不自动播放:要靠『特效_播放』/"
-                                   "『特效_爆发』启动", icon="INFO")
-                col.separator()
-                col.prop(fx, "direction")
-                row = col.row(align=True)
-                row.prop(fx, "speed")
-                row.prop(fx, "spread")
-                col.prop(fx, "gravity")
-                row = col.row(align=True)
-                row.prop(fx, "radius")
-                row.prop(fx, "randomness")
-                col.separator()
-                col.prop(fx, "start_color")
-                col.prop(fx, "end_color")
-                row = col.row(align=True)
-                row.prop(fx, "start_size")
-                row.prop(fx, "end_size")
-                col.prop(fx, "preprocess")
-                row = col.row(align=True)
-                row.prop(fx, "local_coords")
-                row.prop(fx, "additive")
-                col.separator()
-                col.prop(fx, "hide_mesh")
-                if fx.hide_mesh:
-                    col.label(text="本体网格不导出:这个物体只当发射器标记",
-                              icon="CHECKMARK")
-                # 贴图来源(和导出用的是**同一个函数**,不会说法不一致)
-                if asset_export.fx_texture_file(obj) \
-                        == asset_export.FX_DEFAULT_TEXTURE:
-                    col.label(text="贴图:内置圆形柔光(本物体没有材质贴图)",
-                              icon="IMAGE_DATA")
-                else:
-                    col.label(text="贴图:用本物体材质的贴图", icon="IMAGE_DATA")
-                if obj.type != "MESH":
-                    col.label(text="空物体也能当发射器:只标位置和朝向",
-                              icon="INFO")
+        # ---- 粒子特效盒已删除(第一百二十五轮,用户要求)----------
+        # 用户原话:"物体属性的粒子与高光都是之前做的但几乎没什么用,删了吧"。
+        # ⚠ 只删**界面**:数据(`Object.gk_fx`)、导出路径(GPUParticles3D)
+        #   和『特效_播放/停止/爆发』三个节点都还在 —— 删数据结构会让
+        #   老 .blend 与已导出的工程对不上(那本仓库是不允许的)。
+        #   想再要回界面,从 git 历史里取这一段即可。
 
-        # ---- 卡通材质(第一百零一轮:高光参数 + 两张高光贴图)----------
-        _draw_toon_material_box(layout, context, obj)
+        # ---- 高光盒已删除(第一百二十五轮,同上)------------------
+        # 高光参数与两张高光贴图属于 `_draw_toon_material_box()` 那个盒。
+        # 同样只删界面:材质上的自定义属性与导出路径不动。
 
         # ---- 『视口预览』盒第四十二轮搬走了 ----
         # 碰撞线框的"显示这一个 / 显示全部 / 隐藏"原来在这里,和侧栏导出盒里的
         # 『预览碰撞体』是两处入口 —— 用户嫌"不好找"。现在统一收进
         # 『游戏显示』设置图的『显示_碰撞线框』卡上(第四十二轮)。
-
-
-def _draw_toon_material_box(layout, context, obj):
-    """『卡通材质』盒:高光参数 + 两张高光贴图(第一百零一轮)。
-
-    ── 为什么加这一盒 ────────────────────────────────────────────────
-    高光参数(强度 / 大小 / 边缘软硬 / 颜色)一直存在,但**没有任何界面**:
-    它们只是材质上的自定义属性,用户得去『材质属性 -> 自定义属性』里
-    对着中文键一个个改。这一盒把它们搬到看得见的地方,顺手把这一轮新增的
-    『高光形状贴图』『高光遮罩贴图』也做进去。
-
-    ⚠ 这里改的是**当前材质槽**(绿色三角那个);物体有多个材质槽时,
-    先用 Blender 原生的材质槽列表选,免得"改了另一个材质的参数"。
-    """
-    from . import npr_preview
-
-    data = getattr(obj, "data", None)
-    slots = [slot for slot in (getattr(data, "materials", None) or ())
-             if slot is not None]
-    if not slots:
-        return
-
-    box = layout.box()
-    box.label(text="卡通材质 · 高光", icon="MATERIAL")
-    if len(slots) > 1:
-        try:
-            box.template_list("MATERIAL_UL_matslots", "", obj, "material_slots",
-                              obj, "active_material_index", rows=2)
-        except Exception:                                 # noqa: BLE001
-            box.label(text=f"本物体有 {len(slots)} 个材质槽:先用材质槽列表"
-                           f"选中要改的那个", icon="INFO")
-    try:
-        index = int(getattr(obj, "active_material_index", 0))
-    except (TypeError, ValueError):
-        index = 0
-    material = slots[min(max(index, 0), len(slots) - 1)]
-    box.label(text=f"当前材质:{material.name}", icon="DOT")
-
-    # ---- 两张高光贴图 ----
-    for uniform in npr_preview.TEXTURE_KEYS:
-        row = box.row(align=True)
-        current = npr_preview.get_texture(material, uniform)
-        row.label(text=npr_preview.texture_key(uniform),
-                  icon="IMAGE_DATA" if current else "NONE")
-        row.label(text=current or "(没填,高光不受贴图影响)")
-        pick = row.operator("gk.pick_material_image", text="", icon="VIEWZOOM")
-        pick.material_name = material.name
-        pick.uniform = uniform
-        if current:
-            clear = row.operator("gk.clear_material_image", text="", icon="X")
-            clear.material_name = material.name
-            clear.uniform = uniform
-    for uniform in npr_preview.TEXTURE_KEYS:
-        box.label(text=npr_preview.texture_hint(uniform), icon="INFO")
-
-    # ---- 高光参数 + 预览 ----
-    # 参数属性只有"生成过预览材质"之后才存在(用户自己的 Principled 材质
-    # 上什么都没有),所以分两条路走 —— 不硬画一个读不到的属性。
-    if npr_preview.has_param(material, "specular_amount"):
-        col = box.column(align=True)
-        for name, _uniform, _kind, _default, label in npr_preview.PARAM_MAP:
-            if not name.startswith("specular"):
-                continue
-            col.prop(material, f'["{npr_preview.material_key(name)}"]', text=label)
-        box.label(text="改完点下面『刷新预览材质』才看得到(导出一直按新值)",
-                  icon="INFO")
-    else:
-        box.label(text="这个材质还没建过预览节点 —— 点下面生成,"
-                       "就能在 Blender 里看到卡通高光", icon="INFO")
-    row = box.row(align=True)
-    row.operator("gk.rebuild_material_preview",
-                 text="生成 / 刷新预览材质", icon="SHADERFX").material_name = \
-        material.name
 
 
 def _draw_body_type(layout, physics, is_3d):
@@ -4621,6 +4496,19 @@ class GK_PT_GodotLook(bpy.types.Panel):
         col = box.column(align=True)
         for line in godot_look.describe():
             col.label(text=line, icon="DOT" if line.startswith("·") else "NONE")
+
+        # ── 预览用场景光照(第 124 轮)────────────────────────────────
+        # 开关对应 `gk_settings.preview_scene_lights`:开着时『预览贴近 Godot』
+        # 会把视口切到 Rendered 以用真实场景灯(否则 SOLID 用的是棚拍灯,
+        # 和运行时对不上 —— 真机实测,见 godot_look 模块头)。默认开。
+        settings = getattr(scene, "gk_settings", None)
+        if settings is not None and hasattr(settings, "preview_scene_lights"):
+            box.prop(settings, "preview_scene_lights", text="预览用场景光照")
+            # ── 灯光倍率搬去『游戏环境与后期』侧栏了(第一百三十七轮)──────
+            # 用户原话:"把灯光倍率移动到游戏环境与后期的侧边栏里" ——
+            # 那里才是"调环境/灯光"的地方,和关卡打勾、一键贴近运行放一起。
+            box.label(text="灯光倍率在『游戏环境与后期』侧栏(和关卡打勾、"
+                           "一键贴近运行放一起)", icon="INFO")
 
         # ---- Godot 界面英文的对照表 ----
         #
@@ -6949,12 +6837,18 @@ class GK_PT_Main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         tree = props.current_tree(context)
+        # ── 第一百四十轮:节点编辑器没停在逻辑图上时,也要能切/能导出 ──────
+        # 用户截图里"角色逻辑 / 关卡逻辑 不见了"就是这条:他当时在
+        # 『游戏环境与后期』图里,`current_tree()` 拿不到逻辑图,于是那两行
+        # 整块消失(侧栏还在,按钮没了)。这里退回"这一关挂的逻辑图"。
+        if tree is None:
+            scene = getattr(context, "scene", None)
+            settings = getattr(scene, "gk_settings", None) if scene else None
+            name = str(getattr(settings, "logic_tree", "") or "")
+            if name:
+                tree = bpy.data.node_groups.get(name)
 
-        row = layout.row(align=True)
-        row.operator("gk.new_logic_tree", text="新建角色逻辑",
-                     icon="OBJECT_DATA").scope = "ROLE"
-        row.operator("gk.new_logic_tree", text="新建关卡逻辑",
-                     icon="NODETREE").scope = "LEVEL"
+        # 角色逻辑 / 关卡逻辑:作用域切换(用户第一百四十轮点名要留下的)
         scope = exporter.logic_tree_scope(tree) if tree is not None else ""
         if tree is not None:
             row = layout.row(align=True)
@@ -6964,12 +6858,9 @@ class GK_PT_Main(bpy.types.Panel):
                 op.tree_name = tree.name
                 op.scope = value
 
-        # ── 快捷行:一个导出按钮(第 122 轮合并)────────────────────────
-        # 原来这里是『导出』+『资产』两个按钮 —— 用户第 122 轮要求
-        # "把导出到godot的脚本与模型和材质整合成导出到godot",所以
-        # 两个并一个(gk.export_godot = 脚本 + 模型 + 材质 + 场景)。
         row = layout.row(align=True)
         row.operator("gk.export_godot", text="导出到 Godot", icon="FILE_TICK")
+        # 运行(用户第一百四十轮:"运行按钮给误删了")
         row.operator("gk.open_godot", text="运行", icon="PLAY").editor = False
 
         # ---- 空节点树时,先教怎么开始 ----
@@ -7045,9 +6936,6 @@ class GK_PT_Main(bpy.types.Panel):
                         box.operator("gk.add_marker", text="先建一个玩家出生点",
                                      icon="ADD").kind = markers.KIND_PLAYER_START
                 else:
-                    box.label(text=f"整局只生成一次: {chosen.name}", icon="LINKED")
-                    box.label(text="切关卡只挪位置,子对象(相机等)全都留着",
-                              icon="CHECKMARK")
                     _draw_spawn_hint(box, context)
 
                 # ── 上帝摄像机(第 124 轮从『导出到 Godot』盒搬来)────────
@@ -7065,13 +6953,10 @@ class GK_PT_Main(bpy.types.Panel):
                     god_row = box.row(align=True)
                     god_row.prop(settings, "god_camera", toggle=True,
                                  icon="CAMERA_DATA")
+                    # 第一百三十九轮:用户要"除了操作说明,其他的全删"
                     if bool(getattr(settings, "god_camera", False)):
-                        box.label(text="游戏里按 Tab 切过去:WASD 平移 / 空格上升 / "
-                                       "Shift 下降 / 鼠标转视角 / 滚轮缩放 / T 时停",
-                                  icon="INFO")
-                        box.label(text="按 Tab 切回玩家相机(暂停时也能切)", icon="DOT")
-                    else:
-                        box.label(text="关着 = 这一关不导上帝机(产物里没有它)",
+                        box.label(text="Tab 切换 · WASD 平移 · 空格/Shift 升降 · "
+                                       "滚轮缩放 · T 时停",
                                   icon="INFO")
 
                 # ---- 怎么看模型:指路到 **Blender 原生**的上帝机(第 128 轮)----
@@ -7083,11 +6968,8 @@ class GK_PT_Main(bpy.types.Panel):
                 # 这里只留**一句指路** —— 比一个按钮更有用:用户记住的是键,
                 # 而不是"插件侧栏里那个按钮在哪"。
                 box.separator()
-                box.label(text="看模型:Blender 原生飞行导航 Shift + `",
+                box.label(text="看模型:Shift + `(Blender 原生飞行导航)",
                           icon="VIEW3D")
-                box.label(text="鼠标转视角 · WASD 平移 · Q/E 升降 · 左键停留", icon="INFO")
-                box.label(text="速度/重力在 『编辑 → 偏好设置 → 视图导航』 里调",
-                          icon="DOT")
 
         # ---- 打包设置(第六十八轮)已搬走(第 122 轮)-------------------
         # 用户原话:"打包设置移动到 blender 原生的导出里"。
@@ -7102,9 +6984,9 @@ class GK_PT_Main(bpy.types.Panel):
         # 一行一个,带『参与导出』勾选 —— 关掉就是"这张图失效"(节点和连线
         # 都留着,随时能开回来)。点名字直接跳进那张图。
 
-        # ---- 预设(用户 2026-10-04 第六条:一键生成第三人称角色)----
-        if scope != "LEVEL":
-            _draw_preset_box(layout, context)
+        # ---- 预设盒删了(第一百三十九轮)--------------------------------
+        # 用户原话:"预设:全删了,计划在右键菜单中添加"。
+        # `_draw_preset_box` 留着(下次往右键菜单里挂的时候直接复用)。
 
         # ---- 谁挂了脚本(用户第五轮:"不知道哪个搭载了脚本,容易重复")----
         if scope != "LEVEL":
@@ -7137,64 +7019,12 @@ class GK_PT_Main(bpy.types.Panel):
         # 让人多点一次、还多一次"忘了点另一半"的机会,没有任何好处。
         # 现在一个按钮把两套都跑完(见 operator_io 的 gk.export_godot)。
         settings = getattr(context.scene, "gk_settings", None)
-        box, opened = collapsible_box(layout, "export_godot",
-                                      "导出到 Godot", "EXPORT",
-                                      default_open=True)
-        if opened:
-            row = box.row(align=True)
-            row.scale_y = 1.5
-            row.operator("gk.export_godot", text="导出到 Godot", icon="EXPORT")
-            row.operator("gk.preview_script", text="", icon="HIDE_OFF")
-
-            if settings is not None:
-                col = box.column(align=True)
-                row = col.row(align=True)
-                row.prop(settings, "write_scene", toggle=True)
-                row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
-                box.label(text="逻辑 + 模型 + 材质 + 场景一次导完", icon="CHECKMARK")
-                # ── 这里的四个开关第四十二轮搬走了 ──────────────────────
-                # 预览碰撞体 / 运行日志 / 调试面板 / 卡通材质(含跟随光照)
-                # 全部搬进『游戏显示』设置图(用户:"整合如物理显示等的排列,
-                # 不然不好找")—— 侧栏只留导出流程本身的东西。
-                #
-                # ── 上帝摄像机也搬走了(第 124 轮)────────────────────────
-                # 用户原话:"上帝机应该在世界设置那"。
-                # 判据:它**不是**"导出流程的一部分",而是"这一局里玩家能开
-                # 什么视角"—— 和『默认地图 / 默认角色』同属**世界规则**,
-                # 所以搬进『世界设置』盒(默认收起,和那两项在一起)。
-                # 运行时还是按 Tab 切;这里只留一句"当前相机是谁"的提示。
-                cameras = [o.name for o in context.scene.objects
-                           if getattr(o, "type", "") == "CAMERA"]
-                if not cameras:
-                    box.label(text="场景里没相机 —— 运行时会自动造一台", icon="INFO")
-                else:
-                    box.label(text=f"自动:跟着视口当前相机({cameras[0]})",
-                              icon="CHECKMARK")
-
-                # ── 寻路 / 开局 BGM 都搬走了(第 122 轮)──────────────────
-                # 用户原话:"把寻路和开局BGM移动到游戏逻辑右键菜单的AI里
-                # 与游戏音乐的右键菜单中"。
-                #   寻路   -> AI 图右键菜单『寻路(GK)』(GK_MT_NavSettings)
-                #   开局BGM -> 音乐图右键菜单『音乐(GK)』(GK_MT_MusicSettings)
-                # 判据:这两个都是**每关一条的规则**(烤不烤导航网格 / 开局放
-                # 哪首),不是"导出流程"的一部分 —— 侧栏这块本来就挤,它们
-                # 又只在建关那一次要看,常驻纯属占地方。
-                #
-                # ── 打包设置也搬走了(第 122 轮)──────────────────────────
-                # 用户原话:"打包设置移动到 blender 原生的导出里" ->
-                # `文件 → 导出 → 打包游戏(GK)`(GK_MT_ExportPackage)。
-                # 打包是**发布动作**,和"在 Blender 里导资源"不是一回事,
-                # 放在 Blender 自己的『导出』菜单里才找得到。
-
-                # ── 导出瘦身(第一百零六轮 B)搬来这里(第 122 轮)───────
-                # 原来在下面那个收起状态的『导出设置』盒里。它们直接影响
-                # 这次导出的产物体积,放在"导出"这一块比藏在折叠盒里合理。
-                slim = box.row(align=True)
-                slim.prop(settings, "gk_skip_morph", text="不导形态键",
-                          toggle=True)
-                slim.prop(settings, "gk_skip_tangents", text="不导切线",
-                          toggle=True)
-                box.label(text="用了形态键 / 法线贴图的模型别勾", icon="INFO")
+        # ── 『导出到 Godot』折叠盒删了(第一百四十轮)──────────────────────
+        # 用户原话:"导出到Godot:全删,这些是默认行为,不然做这个插件无意义。"
+        # 导出入口就是顶栏那两个 + 侧栏顶部那个按钮(一次导完:脚本 + 模型 +
+        # 材质 + 场景 + 环境),不再摆一盒开关。
+        # ⚠ 跟着没了的:`write_scene`(原来叫『同时生成示例场景』)开关 ——
+        #   默认就是"写场景",所以产物一个字不变。
 
         # ---- 上次导出报告(用户 2026-10-05 第二十三轮:导出报告可视化)--
         # 第五十五轮("侧栏显示的信息太多了"):**正文搬进文本块**,
@@ -7225,43 +7055,15 @@ class GK_PT_Main(bpy.types.Panel):
         # 占了侧栏一大块,却只显示"未分类 · 待机"这种没用的一行。
         # 函数 `_draw_anim_category_box` 留着(以后要做"按分类筛选"再挂回来)。
 
-        # ---- 导出设置(默认**收起**)----
-        # 用户第 24 轮:"侧边栏这里的东西太多了,删掉一些没用的"。
-        # 3D/2D、基类、类名这些**开一次就不用再动**,常驻只会挤掉
-        # 真正常用的东西。现在折起来,要用再展开。
-        if settings is not None:
-            box = layout.box()
-            row = box.row(align=True)
-            row.prop(settings, "show_export_settings",
-                     text="导出设置", icon="TRIA_DOWN"
-                     if getattr(settings, "show_export_settings", False)
-                     else "TRIA_RIGHT", emboss=False)
-            if getattr(settings, "show_export_settings", False):
-                col = box.column(align=True)
-                row = col.row(align=True)
-                row.prop(settings, "dimension", expand=True)
-                col.prop(settings, "base_class", text="")
-                col.prop(settings, "class_name", text="类名")
-                col.prop(settings, "node_name", text="节点名")
-                # 本场景用哪棵逻辑图(用户 2026-10-04:多场景各导一张 .tscn)。
-                # 留空 = 自动(整个 .blend 只有一棵图时就用它)。
-                row = col.row(align=True)
-                row.operator("gk.pick_logic_tree", text="逻辑图:"
-                             + (settings.logic_tree or "自动"), icon="NODETREE")
-                row = col.row(align=True)
-                row.prop(settings, "export_tunables", toggle=True)
-                row.operator("gk.reset_settings", text="", icon="LOOP_BACK")
-                # ── 导出瘦身(第一百零六轮 B)第 122 轮搬进『导出到 Godot』盒
-                # 那两个开关直接影响这次导出的产物体积,跟着导出按钮走更合理。
+        # ---- 『导出设置』盒删了(第一百三十九轮)------------------------
+        # 用户原话:"导出设置:全删,理由同上(这些是默认行为)"。
+        # ⚠ 跟着一起没了的**能力**(要的话说一声,随时加回来):
+        #   2D/3D 切换、基类、类名、节点名、按场景挑逻辑图、不导形态键/切线。
+        #   默认值都是"自动"(3D + 自动基类 + 自动挑图),所以老工程产物不变。
 
-        # ---- 出问题了? + 项目顾问(第五十五轮合成一块)----------------
-        # 两者本来就是一对:一个把诊断**导出成文件**,一个把诊断
-        # **交给 AI 分析并给下一步**。各占一块反而让人以为要做两个选择,
-        # 所以并成一块:两个按钮放一排。
-        #
-        # 『日志』块(最近 8 条)第五十五轮**删掉**了 —— Blender 控制台里
-        # 本来就有全部日志,现在又有『导出诊断信息』和 AI 顾问两条路。
-        _draw_advisor_box(layout, context, settings)
+        # ---- 『出问题了? / 项目顾问』删了(第一百三十九轮)--------------
+        # 用户原话:"这个存在位置不太好,且 AI 的操作项目自由度差,全删了"。
+        # `_draw_advisor_box` 留着(以后想换个位置再挂)。
 
 
 def _draw_advisor_box(layout, context, settings):
@@ -7427,13 +7229,8 @@ def _draw_project_box(layout, context):
     directory, reason = project.resolve(context.scene, adopt=True)
     status, icon = project.project_summary(directory)
 
-    box.label(text=f"对应文件: {os.path.basename(bpy.data.filepath)}",
-              icon="FILE_BLEND")
-
-    sub = box.column(align=True)
-    sub.label(text=directory or "(未绑定)", icon=icon)
-    sub.label(text=f"状态: {status}", icon="INFO")
-    sub.label(text=f"规则: {reason}", icon="INFO")
+    if not directory:
+        box.label(text="(未绑定)", icon=icon)
 
     if not project.is_project(directory):
         # ---- 还没建项目:把"下一步"讲清楚,别让人找按钮 ----
@@ -7458,17 +7255,6 @@ def _draw_project_box(layout, context):
         row.operator("gk.open_godot", text="打开 Godot 编辑器",
                      icon="WINDOW").editor = True
         row.operator("gk.open_export_folder", text="", icon="FILE_FOLDER")
-        row = box.row(align=True)
-        row.scale_y = 1.3
-        row.operator("gk.open_godot", text="直接运行游戏(F5)",
-                     icon="PLAY").editor = False
-        # 运行前自动导出:不勾的话点运行跑的还是上次导出的旧内容
-        prefs = project.preferences(context)
-        if prefs is None or getattr(prefs, "auto_export_on_run", True):
-            box.label(text="运行前会自动保存并导出", icon="INFO")
-        else:
-            box.label(text="运行前不会自动导出(改完记得手动导)", icon="ERROR")
-
         row = box.row(align=True)
         row.operator("gk.relink_project", text="改位置", icon="FILE_FOLDER")
         row.operator("gk.reset_settings", text="重置", icon="LOOP_BACK")
@@ -7907,6 +7693,17 @@ class GK_OT_ApplyBuiltinPreset(bpy.types.Operator):
             if preset_key in values:
                 settings.__setattr__(engine_key, float(values[preset_key]))
                 applied.append(preset_key)
+        for preset_key, engine_key in _ENV_BUILTIN_ENUM:
+            # 内置短名 `glow_m` 是 **Godot 的枚举 int**,场景字段是名字 ——
+            # 反查回名字再写,否则 EnumProperty 会拒绝这个 int(静默不写、
+            # 用户看到"套了预设泛光混合没变")。
+            if preset_key not in values:
+                continue
+            name = _env_blend_name(values[preset_key])
+            if name is None:
+                continue
+            settings.__setattr__(engine_key, name)
+            applied.append(preset_key)
         for preset_key, engine_key in _ENV_BUILTIN_COLOR:
             if preset_key in values:
                 rgb = tuple(float(v) for v in values[preset_key][:3])
@@ -7936,22 +7733,69 @@ class GK_OT_ApplyBuiltinPreset(bpy.types.Operator):
         self.report({"INFO"},
                     f"已套用『{name}』({len(applied)} 项环境参数 + "
                     f"卡通风格已写进本场景,导出立刻生效)")
+        # 第 125 轮:预览开着就顺手刷一遍(否则点了看起来"没反应")
+        from . import godot_look as _look
+        _look.refresh(getattr(context, "scene", None))
+        return {"FINISHED"}
+
+
+class GK_OT_AddEnvCard(bpy.types.Operator):
+    """往『游戏环境与后期』图里加一张卡(已有同名卡就不重复加)。"""
+
+    bl_idname = "gk.add_env_card"
+    bl_label = "加卡"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: bpy.props.EnumProperty(
+        name="卡",
+        items=(("GKNodeMoon", "月亮", ""),
+               ("GKNodeWeather", "天气", ""),
+               ("GKNodeDayNight", "昼夜循环", ""),
+               ("GKNodeSkyBox", "天空盒", ""),
+               ("GKNodeClouds", "云层", ""),
+               ("GKNodeSun", "太阳", "")),
+    )
+
+    def execute(self, context):
+        from . import properties as props
+        tree = getattr(getattr(context, "space_data", None), "edit_tree", None)
+        if tree is None or getattr(tree, "bl_idname", "") != "GKEnvLibraryTree":
+            self.report({"WARNING"}, "先打开『游戏环境与后期』图")
+            return {"CANCELLED"}
+        for node in tree.nodes:
+            if getattr(node, "bl_idname", "") == self.kind:
+                self.report({"INFO"}, "这张图里已经有这张卡了")
+                return {"CANCELLED"}
+        node = tree.nodes.new(self.kind)
+        node.location = (context.space_data.cursor_location
+                        if hasattr(context.space_data, "cursor_location")
+                        else (0.0, 0.0))
+        for other in tree.nodes:
+            other.select = False
+        node.select = True
+        tree.nodes.active = node
         return {"FINISHED"}
 
 
 class GK_PT_EnvLibrary(bpy.types.Panel):
-    """『环境预设库』图的侧栏:列全内置档位 + 一键套用。
+    """『游戏环境与后期』图的侧栏:列全内置档位 + 一键套用 + 连线提示。
 
     ── 为什么给它一个面板(第 124 轮)────────────────────────────────
     这张树以前是**纯数据容器**:不进节点图列表、没面板,用户只能在
     『游戏环境设置』卡的下拉里看到预设 —— 而"预设库"这几个字出现在
     左下角的下拉里时,他自然会想"那这张图里能干什么"。
-    现在它有一块自己的侧栏:左边列内置那几档(点了就套),下面给
-    "存当前为预设 / 删除选中"两个动作,和卡上那份是同一套数据。
+
+    ── 第 124 轮:它从"数据容器"变成了**能连线的图**(用户要求)──────
+    用户原话:"环境预设库(请改名字为游戏环境与后期)添加设置色调,连线-
+    屏幕位置(整体?还是局部),添加睁眼效果-连线(持续时间),逻辑节点
+    (是否,变量)...这个的开始卡片是默认环境卡片连过去"。
+
+    所以面板现在分两块:上面还是"整套氛围预设"(点了就套),下面写清
+    这张图的连线起点 —— 『环境_默认环境』卡,以及它后面能接什么。
     """
 
     bl_idname = "GK_PT_EnvLibrary"
-    bl_label = "环境预设库 (BlenderGameKit)"
+    bl_label = "游戏环境与后期 (BlenderGameKit)"
     bl_space_type = "NODE_EDITOR"
     bl_region_type = "UI"
     bl_category = "环境"
@@ -7980,6 +7824,191 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
             layout.label(text="点下面的档位直接换", icon="CHECKMARK")
         else:
             layout.label(text="环境关着;点一档会自动打开它", icon="INFO")
+
+        # ── 作用范围:全部关卡 / 只这一个(第一百二十六轮,用户要求)──────
+        # 用户原话:"可以在游戏环境与后期的侧边栏添加这个环境设置作用于
+        # 全部关卡还是当个关卡的按钮"。
+        #
+        # ── 为什么给"按钮"而不是一个"归属开关"─────────────────────────
+        # 环境设置本身是**按场景**存的(`scene.gk_settings`),这是对的 ——
+        # 走廊要阴森、大堂要亮堂,一关一套才正常。用户真正要的是
+        # "我调好这一关,想一键复制到别的关卡"(多关卡统一风格),
+        # 以及"看清现在我改的是哪一关"。
+        # 用开关去切换"这份设置属于谁"反而危险:切换那一刻必然要搬家,
+        # 搬错了就是**另一关的观感被静默改掉**。
+        # 加卡(第一百四十三轮):名称自解释,不加说明文字
+        add = layout.box()
+        row = add.row(align=True)
+        for kind, label in (("GKNodeMoon", "月亮"), ("GKNodeWeather", "天气"),
+                            ("GKNodeDayNight", "昼夜"), ("GKNodeSkyBox", "天空"),
+                            ("GKNodeClouds", "云"), ("GKNodeSun", "太阳")):
+            row.operator("gk.add_env_card", text=label).kind = kind
+
+        scope = layout.box()
+        scope.label(text="作用范围", icon="SCENE_DATA")
+        scope.label(text=f"下面的改动只影响『{scene.name if scene else '?'}』这一关",
+                    icon="INFO")
+        scope.operator("gk.env_apply_to_all_levels", text="套用到全部关卡",
+                       icon="DUPLICATE")
+        if settings is not None and hasattr(settings, "env_apply_all_keep_post"):
+            scope.prop(settings, "env_apply_all_keep_post",
+                       text="只套基础环境,不动后期")
+            scope.label(text="勾上 = 只复制背景/环境光/雾,别把这一关的"
+                             "泛光/调色冲掉", icon="DOT")
+        else:
+            scope.label(text="跨关卡统一风格用这个;每关单独调就留着自己改",
+                        icon="DOT")
+
+        # ── 关卡打勾 + 一键贴近运行画面(第一百三十七轮,用户要求)──────────
+        # 用户原话:"在游戏环境与后期侧边栏添加选项框,选择一个关卡(选项有
+        # 关卡名称,全部,多选,可以设置成那种打勾的选择)" +
+        # "把灯光倍率移动到游戏环境与后期的侧边栏里" +
+        # "默认的配置是一键贴近运行画面与环境,如果一键贴近效果不好也可以
+        # 自行调整"。
+        # 所以这一盒干三件事:① 勾要一起改的关卡;② 灯光倍率(从『Godot 观感』
+        # 面板搬过来);③ 一键把标定值写下去。
+        pick = layout.box()
+        pick.label(text="要一起改的关卡(打勾)", icon="CHECKBOX_HLT")
+        row = pick.row(align=True)
+        row.operator("gk.look_pick_all", text="全选")
+        row.operator("gk.look_pick_none", text="全不选")
+        for other in bpy.data.scenes:
+            other_settings = getattr(other, "gk_settings", None)
+            if other_settings is None or not hasattr(other_settings, "look_target"):
+                continue
+            row = pick.row(align=True)
+            row.prop(other_settings, "look_target", text="")
+            row.label(text=other.name,
+                      icon="SCENE_DATA" if other is scene else "DOT")
+        pick.operator("gk.env_apply_to_checked", text="套给勾选的关卡",
+                      icon="DUPLICATE")
+        if settings is not None and hasattr(settings, "preview_light_scale"):
+            col = pick.column(align=True)
+            col.label(text="预览灯光倍率(贴近运行时)", icon="LIGHT")
+            row = col.row(align=True)
+            row.prop(settings, "preview_light_scale", text="倍率")
+            row.operator("gk.preview_light_scale_reset", text="", icon="LOOP_BACK")
+            col.operator("gk.look_match_runtime", text="一键贴近运行画面",
+                         icon="SHADERFX")
+            col.label(text="0.06 = 实测标定值(预览原本比运行亮一倍多);"
+                           "拧完立刻生效,不满意就自己调", icon="DOT")
+
+        # ── 快速调色 / 曝光 / 雾 / 泛光(第一百三十八轮,用户第 ④ 条)──────
+        # 用户原话:"在游戏环境与后期侧边栏,调节整体【一个关卡对应一个环境
+        # 与后期,当然也可以套用到别的关卡】的色调,灯光,影响范围,曝光度等
+        # 等……然后在侧边栏进行一键配置"。
+        # 所以这一盒是"常用那几档"的快捷入口(完整的还在『游戏环境设置』卡上),
+        # 改这里 = 改**当前关卡**的设置,再按上面的打勾刷给别的关卡。
+        # ⚠ 视口里**立刻**能看到 —— 第一百三十七轮的实时刷新生效。
+        if settings is not None and hasattr(settings, "env_tonemap"):
+            tune = layout.box()
+            tune.label(text="快速调色 / 曝光(改完视口立刻变)", icon="COLOR")
+            if not bool(getattr(settings, "env_enabled", False)):
+                tune.label(text="环境关着:下面这些要开『环境与后处理』才导出",
+                           icon="INFO")
+            row = tune.row(align=True)
+            row.prop(settings, "env_tonemap", text="")
+            row.prop(settings, "env_tonemap_exposure", text="曝光")
+            col = tune.column(align=True)
+            col.prop(settings, "env_adjust", text="色调调整(亮度/对比度/饱和度)")
+            sub = col.row(align=True)
+            sub.enabled = bool(getattr(settings, "env_adjust", False))
+            sub.prop(settings, "env_brightness", text="亮度")
+            sub.prop(settings, "env_contrast", text="对比")
+            sub.prop(settings, "env_saturation", text="饱和")
+            fog = tune.column(align=True)
+            fog.prop(settings, "env_fog", text="雾")
+            fog_row = fog.row(align=True)
+            fog_row.enabled = bool(getattr(settings, "env_fog", False))
+            fog_row.prop(settings, "env_fog_density", text="浓度")
+            fog_row.prop(settings, "env_fog_color", text="")
+            glow = tune.column(align=True)
+            glow.prop(settings, "env_glow", text="泛光(预览用 BLOOM 近似)")
+            glow_row = glow.row(align=True)
+            glow_row.enabled = bool(getattr(settings, "env_glow", False))
+            glow_row.prop(settings, "env_glow_intensity", text="强度")
+            glow_row.prop(settings, "env_glow_bloom", text="溢出")
+            tune.operator("gk.env_apply_to_checked",
+                          text="把这套调色套给勾选的关卡", icon="DUPLICATE")
+            tune.label(text="完整档位(背景 / 环境光 / 白点 / 雾的其余项)"
+                           "在『游戏环境设置』卡上", icon="DOT")
+
+        # ── 灯光(第一百二十六轮,用户第 10 轮要求)────────────────────
+        # 用户原话:"灯光还会受到 blender 的原生灯光设置影响...不行的话,
+        # 就在开启贴近 godot 观感后就禁用原生灯光设置,转而在游戏环境与
+        # 后期的侧边栏添加灯光设置。"
+        #
+        # 这一盒就是那个"转而在侧栏"。**权威**在这里,不在 Blender 的灯
+        # 属性面板 —— 原因写在 `GKObjectLight` 的注释里(原生那套
+        # 规格化 / 半径 / 曝光度在 Godot 里根本不存在)。
+        # 一盏灯默认**不接管**(override 关着 = 老规矩换算),这样老工程
+        # 的产物逐字节不变;想精确调某盏灯,打开它即可。
+        lights = [o for o in (getattr(scene, "objects", None) or ())
+                  if getattr(o, "type", "") == "LIGHT"]
+        box = layout.box()
+        box.label(text=f"灯光({len(lights)} 盏)", icon="LIGHT")
+        if not lights:
+            box.label(text="这一关没有灯", icon="INFO")
+        else:
+            box.label(text="改这里 = 直接改游戏里的值;不勾『用这里的值导出』"
+                           "就还按 Blender 的瓦数换算", icon="INFO")
+            # 灯是**物体级**的,上面那个『套用到全部关卡』刷不到它 ——
+            # 这里补一个按名字 / 按类型刷的按钮(见算子的注释)。
+            by_type = bool(getattr(settings, "light_push_by_type", False))
+            box.operator(
+                "gk.lights_apply_to_all_levels",
+                text=("灯光刷到全部关卡(按类型)"
+                      if by_type else "灯光刷到全部关卡(按灯名)"),
+                icon="DUPLICATE")
+            box.prop(settings, "light_push_by_type", text="按类型刷",
+                     icon="LIGHT")
+            box.label(
+                text=("把当前这几盏的设置刷给**所有关卡**里同类型的灯"
+                      "(会盖掉它们原来的值,Ctrl+Z 可撤)"
+                      if by_type else
+                      "按灯名匹配;三关的灯名字不一样就刷不到 —— 勾『按类型刷』换一种"),
+                icon="INFO" if not by_type else "ERROR")
+            box.operator("gk.light_preview_scale_reset",
+                         text="预览补偿全部归 1", icon="LOOP_BACK")
+            box.label(text="『预览』那一列 = 这盏灯在预览里再乘多少"
+                           "(1 = 不动,只影响预览、不影响导出)", icon="DOT")
+        for obj in lights:
+            light = getattr(obj, "gk_light", None)
+            row = box.row(align=True)
+            if light is None:
+                row.label(text=obj.name, icon="LIGHT")
+                continue
+            row.prop(light, "override", text="",
+                     icon="CHECKBOX_HLT" if light.override else "CHECKBOX_DEHLT")
+            row.label(text=obj.name)
+            # ── 逐灯预览补偿(第一百三十八轮)──────────────────────────
+            # 用户原话:"添加类似 blender 灯光原生的设置来优化预览与运行的
+            # 差距"。场景级那个倍率管所有灯,这里给**每盏灯**再一个乘数
+            # (只影响预览;导出产物一个字不变)。
+            if hasattr(light, "preview_scale"):
+                row.prop(light, "preview_scale", text="预览")
+            if not light.override:
+                # 老规矩:显示换算后的 Godot 能量,让用户知道现在是多少
+                try:
+                    row.label(text="→ %.3f" % asset_export._light_energy_for(obj))
+                except Exception:                          # noqa: BLE001
+                    pass
+                continue
+            row.prop(light, "energy", text="能量")
+        # 只给"接管了"的灯画详细行,免得十几盏灯的侧栏变成一堵墙
+        for obj in lights:
+            light = getattr(obj, "gk_light", None)
+            if light is None or not light.override:
+                continue
+            col = box.column(align=True)
+            col.label(text=f"— {obj.name} —", icon="DOT")
+            row = col.row(align=True)
+            row.prop(light, "range_m", text="射程")
+            row.prop(light, "attenuation", text="衰减")
+            row = col.row(align=True)
+            row.prop(light, "use_color", text="", toggle=True)
+            row.prop(light, "color", text="")
+            col.prop(light, "shadow", text="投影")
 
         box = layout.box()
         box.label(text="卡通二次元(动画赛璐璐)", icon="MATERIAL")
@@ -8023,7 +8052,7 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
         row.prop(library, "env_preset_new_name", text="")
         row.operator("gk.env_preset_save", text="存当前", icon="ADD")
         box.operator("gk.env_preset_remove", text="删除选中的预设", icon="X")
-        layout.label(text="预设跨场景共享(存在这张『环境预设库』里)", icon="INFO")
+        layout.label(text="预设跨场景共享(存在这张『游戏环境与后期』里)", icon="INFO")
 
 
 class GK_OT_EnvPresetPickIndex(bpy.types.Operator):
@@ -8350,6 +8379,422 @@ def unregister_keymaps():
 
 # 注册清单。这个元组必须在所有类都定义完之后才求值,
 # 所以放在文件末尾附近 —— 放中间的话后面定义的类会漏注册。
+class GK_OT_PreviewLightScaleReset(bpy.types.Operator):
+    """把『预览灯光倍率』拨回实测标定值(第 124 轮)。
+
+    ── 为什么需要这个按钮 ───────────────────────────────────────────
+    倍率是个连续滑块,拧跑了想回到"实测对得上"的那一档,靠手拖很难精确
+    落回 0.06。所以给一个一键复位 —— 顺带把**这个值是怎么来的**写进
+    tooltip,免得以后有人以为是随手填的。
+
+    ⚠ 必须走 `_reset_lights`(先还原再乘)。只 `setattr` 的话视口里还是
+      旧亮度(重算才是真正把新系数乘上去的那一步)。
+
+    ⚠⚠ 这个类必须定义在 `GK_CLASSES` 那个元组**之前** —— 元组是在模块
+      导入时求值的,写在后面就是 `NameError: name ... is not defined`,
+      整个插件注册失败(实测踩过:ui.py 8512)。所以别把它挪到下面去。
+    """
+
+    bl_idname = "gk.preview_light_scale_reset"
+    bl_label = "恢复标定倍率"
+    bl_description = ("拨回实测标定值 0.06(预览 0.9130 vs 运行 0.3953 量出来的)"
+                      "。想要更暗往小拧、更亮往大拧")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import godot_look as _look
+        settings = getattr(getattr(context, "scene", None), "gk_settings", None)
+        if settings is None or not hasattr(settings, "preview_light_scale"):
+            self.report({"WARNING"}, "拿不到场景设置")
+            return {"CANCELLED"}
+        settings.preview_light_scale = _look.PREVIEW_LIGHT_SCALE
+        _look._reset_lights(context.scene)
+        self.report({"INFO"}, f"预览灯光倍率 = {_look.PREVIEW_LIGHT_SCALE}")
+        return {"FINISHED"}
+
+
+def _look_scenes(context, *, exclude_current=False):
+    """侧栏"关卡打勾"里勾上的那些场景(一个都没勾就退回当前场景)。
+
+    ── 为什么是"打勾"而不是一个"全局 / 单关"开关(第一百三十七轮)──────
+    用户原话:"在游戏环境与后期侧边栏添加选项框,选择一个关卡(选项有关卡
+    名称,全部,多选,可以设置成那种打勾的选择)"。
+    环境设置本身**按场景各存一份**(这是对的:走廊阴森、大堂亮堂),
+    打勾只是"这次要动哪几关"的清单 —— 改完每关仍各存一份,互不牵连。
+    """
+    scenes = []
+    for scene in bpy.data.scenes:
+        settings = getattr(scene, "gk_settings", None)
+        if settings is not None and bool(getattr(settings, "look_target", False)):
+            scenes.append(scene)
+    current = getattr(context, "scene", None)
+    if not scenes and current is not None:
+        scenes = [current]
+    if exclude_current:
+        scenes = [scene for scene in scenes if scene is not current]
+    return scenes
+
+
+class GK_OT_LightPreviewScaleReset(bpy.types.Operator):
+    """把这一关**所有灯**的『预览补偿』拨回 1.0(第一百三十八轮)。
+
+    逐盏灯拧过之后想回到"跟场景级倍率走"的状态,一个个点太麻烦。
+    ⚠ 只动预览用的乘数,导出产物一个字不变。
+    """
+
+    bl_idname = "gk.light_preview_scale_reset"
+    bl_label = "预览补偿全部归 1"
+    bl_description = ("这一关每盏灯的『预览补偿』都拨回 1.0"
+                      "(只影响『Godot 观感』预览,不影响导出)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import godot_look as _look
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            self.report({"WARNING"}, "没有当前场景")
+            return {"CANCELLED"}
+        count = 0
+        for obj in getattr(scene, "objects", ()) or ():
+            light = getattr(obj, "gk_light", None)
+            if light is not None and hasattr(light, "preview_scale"):
+                light.preview_scale = 1.0
+                count += 1
+        _look._reset_lights(scene)
+        self.report({"INFO"}, f"{count} 盏灯的预览补偿已归 1")
+        return {"FINISHED"}
+
+
+class GK_OT_LookPickAll(bpy.types.Operator):
+    """勾上所有关卡(配合『套给勾选的关卡』用)。"""
+
+    bl_idname = "gk.look_pick_all"
+    bl_label = "全选关卡"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        count = 0
+        for scene in bpy.data.scenes:
+            settings = getattr(scene, "gk_settings", None)
+            if settings is not None and hasattr(settings, "look_target"):
+                settings.look_target = True
+                count += 1
+        self.report({"INFO"}, f"勾上了 {count} 个关卡")
+        return {"FINISHED"}
+
+
+class GK_OT_LookPickNone(bpy.types.Operator):
+    """全部取消打勾。"""
+
+    bl_idname = "gk.look_pick_none"
+    bl_label = "全不选"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        for scene in bpy.data.scenes:
+            settings = getattr(scene, "gk_settings", None)
+            if settings is not None and hasattr(settings, "look_target"):
+                settings.look_target = False
+        self.report({"INFO"}, "已全部取消打勾(一个都没勾时按当前关卡来)")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvApplyToChecked(bpy.types.Operator):
+    """把当前关卡的环境设置复制到**打了勾的**关卡(第一百三十七轮)。"""
+
+    bl_idname = "gk.env_apply_to_checked"
+    bl_label = "套给勾选的关卡"
+    bl_description = ("以当前关卡为准,把环境设置复制给上面打了勾的关卡"
+                      "(每关仍各存一份,之后单独改某关不会牵动别人)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        source = getattr(context, "scene", None)
+        source_settings = getattr(source, "gk_settings", None)
+        if source_settings is None:
+            self.report({"WARNING"}, "当前场景没有 GK 设置")
+            return {"CANCELLED"}
+        keep_post = bool(getattr(source_settings, "env_apply_all_keep_post", False))
+        fields = list(GK_OT_EnvApplyToAllLevels.CORE_FIELDS)
+        if not keep_post:
+            fields += list(GK_OT_EnvApplyToAllLevels.POST_FIELDS)
+        targets = _look_scenes(context, exclude_current=True)
+        if not targets:
+            self.report({"WARNING"}, "没有别的关卡被勾上")
+            return {"CANCELLED"}
+        copied = 0
+        for scene in targets:
+            settings = getattr(scene, "gk_settings", None)
+            if settings is None:
+                continue
+            for name in fields:
+                if hasattr(source_settings, name) and hasattr(settings, name):
+                    try:
+                        setattr(settings, name, getattr(source_settings, name))
+                    except Exception:                      # noqa: BLE001
+                        pass
+            copied += 1
+        self.report({"INFO"},
+                    f"『{source.name}』的环境设置已套给 {copied} 个关卡"
+                    + ("(只套基础环境)" if keep_post else ""))
+        return {"FINISHED"}
+
+
+class GK_OT_LookMatchRuntime(bpy.types.Operator):
+    """一键贴近运行画面:把预览的标定值写给勾选的关卡。
+
+    ── 用户要的"默认配置"(第一百三十七轮原话)────────────────────────
+    "默认的配置是一键贴近运行画面与环境,如果一键贴近效果不好也可以自行
+     调整" —— 所以这个按钮只写**实测标定过的那几个值**
+    (预览用场景光照 + 灯光倍率),写完立刻重刷预览;不满意就地拧滑块。
+    """
+
+    bl_idname = "gk.look_match_runtime"
+    bl_label = "一键贴近运行画面"
+    bl_description = ("把预览的标定值(场景光照 + 灯光倍率)写给勾选的关卡,"
+                      "并立刻重刷『Godot 观感』预览")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import godot_look as _look
+        scenes = _look_scenes(context)
+        touched = 0
+        for scene in scenes:
+            settings = getattr(scene, "gk_settings", None)
+            if settings is None:
+                continue
+            if hasattr(settings, "preview_scene_lights"):
+                settings.preview_scene_lights = True
+            if hasattr(settings, "preview_light_scale"):
+                settings.preview_light_scale = _look.PREVIEW_LIGHT_SCALE
+            touched += 1
+        current = getattr(context, "scene", None)
+        if current is not None and _look.is_active(current):
+            _look.request_refresh()
+        self.report({"INFO"},
+                    f"已把标定值(灯光倍率 {_look.PREVIEW_LIGHT_SCALE})"
+                    f"写给 {touched} 个关卡"
+                    + (";预览已重刷" if current is not None
+                       and _look.is_active(current) else
+                       ";开『Godot 观感』即可看到"))
+        return {"FINISHED"}
+
+
+class GK_OT_LightsApplyToAllLevels(bpy.types.Operator):
+    """把**当前关卡**的灯光接管设置刷到其它所有关卡(第一百二十六轮)。
+
+    ── 为什么单独有一个"刷灯"的按钮(补上一轮留的尾巴)───────────────
+    环境那份『套用到全部关卡』刷的是**场景设置**(`gk_settings.env_*`);
+    而灯是**物体级**的(`Object.gk_light`)—— 两者根本不是一份数据,
+    所以那次刷不到灯。用户要"多关卡风格统一"时,十几盏灯一个个点过去
+    是不现实的,这里补一个。
+
+    ── 匹配规则:按**灯的名字**────────────────────────────────────
+    同一个光源在不同关卡里通常是"同一盏灯复制过去的",名字一样
+    (示例里就是 `走廊壁灯` / `大堂吊灯` 这种)。所以按名字找目标关卡里
+    同名的灯,把 `gk_light` 的字段复制过去。
+
+    ⚠ 找不到同名的灯就**跳过**,不新建 —— 凭空在别的关卡里造一盏灯,
+      是往用户的场景里塞东西,比"没刷到"严重得多。
+    ⚠ 只复制**接管开了**的那些字段设置;目标灯自己没打开 override 的话
+      也会被一起打开(否则刷了等于没刷),所以回报里会写清改了几盏。
+    """
+
+    bl_idname = "gk.lights_apply_to_all_levels"
+    bl_label = "灯光刷到全部关卡"
+    bl_description = ("把当前关卡的灯光接管设置(能量/射程/衰减/"
+                      "颜色/投影)复制到其它关卡里的灯上 —— "
+                      "默认按**灯名**匹配,勾了『按类型刷灯』就按**类型**"
+                      "(所有平行光 / 所有点光 / 所有聚光)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    #: `gk_light` 上要复制的字段(和属性组一一对应)
+    FIELDS = ("override", "energy", "range_m", "attenuation",
+              "use_color", "color", "shadow")
+
+    #: 按类型刷时认哪几种灯(Godot 有对应的灯节点;面光没有,不参与)
+    TYPE_LABELS = {"SUN": "平行光", "POINT": "点光", "SPOT": "聚光"}
+
+    @staticmethod
+    def _light_type(obj):
+        """灯的类型(`SUN` / `POINT` / `SPOT` / `AREA`)。"""
+        data = getattr(obj, "data", None)
+        return str(getattr(data, "type", "") or "")
+
+    def _source_lights(self, source_scene, by_type):
+        """要刷出去的源灯。
+
+        返回 `(源灯表, 同类型多出来的灯名表)`:
+          按名字 -> `{名字: gk_light}`;
+          按类型 -> `{类型: gk_light}`(**第一盏为准**,多出来的记在第二个返回值里)。
+        """
+        picked = {}
+        extras = {}
+        for obj in getattr(source_scene, "objects", ()) or ():
+            if getattr(obj, "type", "") != "LIGHT":
+                continue
+            light = getattr(obj, "gk_light", None)
+            if light is None or not bool(getattr(light, "override", False)):
+                continue                      # 没接管的灯不参与(老工程不动)
+            key = self._light_type(obj) if by_type else str(getattr(obj, "name", ""))
+            if not key:
+                continue
+            if by_type and key not in self.TYPE_LABELS:
+                continue                      # 面光之类:Godot 没有,不刷
+            if key in picked and by_type:
+                extras.setdefault(key, []).append(str(getattr(obj, "name", "")))
+                continue
+            picked[key] = light
+        return picked, extras
+
+    def execute(self, context):
+        source_scene = getattr(context, "scene", None)
+        if source_scene is None:
+            self.report({"WARNING"}, "没有当前场景")
+            return {"CANCELLED"}
+        settings = getattr(source_scene, "gk_settings", None)
+        by_type = bool(getattr(settings, "light_push_by_type", False))
+        sources, extras = self._source_lights(source_scene, by_type)
+        if not sources:
+            self.report({"WARNING"},
+                        "这一关没有打开『用这里的值导出』的灯 —— 先打开再刷")
+            return {"CANCELLED"}
+
+        touched = 0
+        matched = 0
+        for scene in bpy.data.scenes:
+            if scene is source_scene:
+                continue
+            for obj in getattr(scene, "objects", ()) or ():
+                if getattr(obj, "type", "") != "LIGHT":
+                    continue
+                if by_type:
+                    key = self._light_type(obj)
+                    light = sources.get(key)
+                else:
+                    light = sources.get(str(getattr(obj, "name", "")))
+                if light is None:
+                    continue
+                matched += 1
+                target = getattr(obj, "gk_light", None)
+                if target is None:
+                    continue
+                for name in self.FIELDS:
+                    if not hasattr(target, name) or not hasattr(light, name):
+                        continue
+                    try:
+                        setattr(target, name, getattr(light, name))
+                    except Exception:                  # noqa: BLE001
+                        continue
+                touched += 1
+        if by_type:
+            kinds = "、".join(
+                sorted({self.TYPE_LABELS.get(key, key) for key in sources}))
+            note = f"按类型刷({kinds}):{len(sources)} 组设置 -> 改了 {touched} 盏"
+            if extras:
+                first = "、".join(
+                    f"{self.TYPE_LABELS.get(key, key)}还有 {len(names)} 盏"
+                    for key, names in sorted(extras.items()))
+                note += f";同类型多盏以第一盏为准({first})"
+        else:
+            note = f"已把 {len(sources)} 盏灯的设置刷到 {touched} 盏同名灯上"
+            if matched > touched:
+                note += f"(另有 {matched - touched} 盏没有 gk_light,跳过)"
+        self.report({"INFO"}, note)
+        try:
+            from . import godot_look as _look
+            for scene in bpy.data.scenes:
+                _look.refresh(scene)
+        except Exception:                              # noqa: BLE001
+            pass
+        return {"FINISHED"}
+
+
+class GK_OT_EnvApplyToAllLevels(bpy.types.Operator):
+    """把**当前关卡**的环境设置复制到其它所有关卡(第一百二十六轮)。
+
+    用户原话:"可以在游戏环境与后期的侧边栏添加这个环境设置作用于
+    全部关卡还是当个关卡的按钮"。
+
+    ── 为什么要"复制"而不是"改成共享" ──────────────────────────────
+    环境设置按场景存是对的(走廊要阴森、大堂要亮堂)。但多关卡作品常常
+    想要**统一风格**,而一个个关卡去调既慢又容易调飘。所以给一条
+    "以这一关为准,刷到其它关"的路 —— 刷完每关**仍然各存一份**,
+    之后想让某一关跑偏,直接改那一关就行,不会牵动别人。
+
+    ── 『只套基础环境』勾上时复制哪些 ──────────────────────────────
+    只复制背景 / 环境光 / 雾(这三样是"这个世界的底子"),
+    **不动**泛光与色调调整 —— 那是"这一关的调色",常常是特意调的
+    (恐怖走廊要强泛光、结局要暖调),一并冲掉就是帮倒忙。
+
+    ⚠ 复制的是**场景设置**(`gk_settings.env_*`),不是那张
+       『游戏环境与后期』图 —— 那张图是**文件级共享**的,本来就
+       所有关卡通用,不需要也不该复制。
+    """
+
+    bl_idname = "gk.env_apply_to_all_levels"
+    bl_label = "套用到全部关卡"
+    bl_description = ("以当前关卡为准,把环境设置复制到其它所有关卡"
+                      "(每关仍各存一份,之后单独改某关不会牵动别人)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    #: 无论勾没勾"只套基础环境"都要复制的字段 —— "这个世界的底子"
+    CORE_FIELDS = (
+        "env_enabled", "env_background", "env_bg_color",
+        "env_ambient_color", "env_ambient_energy", "env_ambient_sky_contribution",
+        "env_fog", "env_fog_color", "env_fog_density",
+        "env_fog_sky_affect", "env_fog_light_energy",
+        "env_fog_aerial_perspective",
+        "env_tonemap", "env_tonemap_exposure", "env_tonemap_white",
+    )
+    #: 只有**不勾**"只套基础环境"时才跟着复制的 —— "这一关的调色"
+    POST_FIELDS = (
+        "env_glow", "env_glow_intensity", "env_glow_bloom",
+        "env_glow_strength", "env_glow_threshold", "env_glow_blend",
+        "env_adjust", "env_brightness", "env_contrast", "env_saturation",
+        "env_ssao", "env_ssil",
+        "style_enabled", "style_shadow_step", "style_shadow_tint",
+        "style_three_tone", "style_rim", "style_specular",
+    )
+
+    def execute(self, context):
+        source_scene = getattr(context, "scene", None)
+        source = getattr(source_scene, "gk_settings", None)
+        if source is None:
+            self.report({"WARNING"}, "拿不到当前场景的设置")
+            return {"CANCELLED"}
+        keep_post = bool(getattr(source, "env_apply_all_keep_post", False))
+        fields = list(self.CORE_FIELDS)
+        if not keep_post:
+            fields += list(self.POST_FIELDS)
+        copied = 0
+        for scene in bpy.data.scenes:
+            if scene is source_scene:
+                continue
+            target = getattr(scene, "gk_settings", None)
+            if target is None:
+                continue
+            for name in fields:
+                if not hasattr(target, name) or not hasattr(source, name):
+                    continue
+                try:
+                    setattr(target, name, getattr(source, name))
+                except Exception:                          # noqa: BLE001
+                    continue
+            copied += 1
+        what = "基础环境" if keep_post else "环境 + 后期"
+        self.report({"INFO"},
+                    f"已把『{source_scene.name}』的{what}套用到 {copied} 个关卡")
+        # 预览开着的话顺手刷一遍(见 godot_look.refresh 的说明)
+        try:
+            from . import godot_look as _look
+            for scene in bpy.data.scenes:
+                _look.refresh(scene)
+        except Exception:                                  # noqa: BLE001
+            pass
+        return {"FINISHED"}
+
+
 GK_CLASSES = (
     GKGameLogicTree,
     GKAnimationTree,
@@ -8458,6 +8903,17 @@ GK_CLASSES = (
     GK_MT_EnvPresetsMood,
     GK_OT_ApplyBuiltinPreset,
     GK_OT_EnvPresetPickIndex,
+    GK_OT_PreviewLightScaleReset,
+    GK_OT_EnvApplyToAllLevels,
+    GK_OT_LightsApplyToAllLevels,
+    # 第一百三十七轮:侧栏"关卡打勾 + 一键贴近运行画面"
+    GK_OT_LookPickAll,
+    GK_OT_LookPickNone,
+    GK_OT_EnvApplyToChecked,
+    GK_OT_LookMatchRuntime,
+    # 第一百三十八轮:逐灯预览补偿
+    GK_OT_LightPreviewScaleReset,
+    GK_OT_AddEnvCard,
     GK_PT_EnvLibrary,
 ) + tuple(CATEGORY_MENUS)
 
@@ -8498,6 +8954,28 @@ _ENV_PRESET_FIELDS = (
     ("p_glow_bloom", "env_glow_bloom"), ("p_adjust", "env_adjust"),
     ("p_brightness", "env_brightness"), ("p_contrast", "env_contrast"),
     ("p_saturation", "env_saturation"),
+    # ── 第 124 轮:9 个高影响键的镜像 ────────────────────────────────
+    # 名字和顺序**照 `_dist/look_spec.md` 的对照表**(映射三处必须一致:
+    # 这里 / `scripts/make_story_demo.py` 的 `_ENV_TO_PRESET` /
+    # `asset_export.py` 的 `ENV_ZONE_KEYS`);字段本身在 properties.py。
+    #
+    # 为什么这 9 个必须在**这张表**里:『存为预设』/『应用预设』两个算子
+    # 都是遍历它做 `setattr`(见下面 `GK_OT_EnvPresetSave` / `EnvPresetApply`)
+    # —— 表里少一项,存预设时那个值**静默不进去**、应用时静默不写回,
+    # 用户看到的是"我明明调了泛光门槛,切个预设又回出厂值了"。
+    #
+    # ⚠ 注意 `env_glow_threshold` 的前缀:场景字段是 `env_glow_threshold`,
+    #   预设字段是 `p_glow_threshold`(两边都**没有** hdr),拼起来才是
+    #   `p_glow_threshold <-> env_glow_threshold`。
+    ("p_fog_sky_affect", "env_fog_sky_affect"),
+    ("p_fog_light_energy", "env_fog_light_energy"),
+    ("p_fog_aerial", "env_fog_aerial_perspective"),
+    ("p_glow_strength", "env_glow_strength"),
+    ("p_glow_threshold", "env_glow_threshold"),
+    ("p_glow_blend", "env_glow_blend"),
+    ("p_tonemap_exposure", "env_tonemap_exposure"),
+    ("p_tonemap_white", "env_tonemap_white"),
+    ("p_ambient_sky", "env_ambient_sky_contribution"),
 )
 
 # ── 「内置档位名 <-> 场景设置字段名」的两张对照表(第 125 轮)──────────
@@ -8512,6 +8990,24 @@ _ENV_BUILTIN_NUM = (                       # 名字两边不一样 / 要换算�
     ("br", "env_brightness"),
     ("ct", "env_contrast"),
     ("sat", "env_saturation"),
+    # ── 第 124 轮:和 ENV_ZONE_KEYS 的短名对齐(雾 / 泛光 / 色调 / 环境光)
+    # 这几项现在内置档位里还**没有**,所以下面的循环会 `continue` 跳过 ——
+    # 表先备好:一旦 `nodes/_common.py` 的档位填上值,套用 / 认档**立刻**
+    # 就按新值走,不会"加了值却静默漏掉"(第 125 轮那个空转 bug 就是这么来的)。
+    ("fog_sa", "env_fog_sky_affect"),
+    ("fog_le", "env_fog_light_energy"),
+    ("fog_ap", "env_fog_aerial_perspective"),
+    ("glow_s", "env_glow_strength"),
+    ("glow_t", "env_glow_threshold"),
+    ("tm_e", "env_tonemap_exposure"),
+    ("tm_w", "env_tonemap_white"),
+    ("amb_sky", "env_ambient_sky_contribution"),
+)
+# 枚举型(短名存的是 **Godot 的枚举 int**,见 asset_export.ENV_ZONE_KEYS 的
+# `glow_m`;而场景字段 `env_glow_blend` 是 EnumProperty 的**名字**)——
+# 两边类型不同,套用 / 认档都要显式换算一次,不能直接比。
+_ENV_BUILTIN_ENUM = (
+    ("glow_m", "env_glow_blend"),
 )
 _ENV_BUILTIN_FLAG = (
     ("fog", "env_fog"),
@@ -8523,6 +9019,25 @@ _ENV_BUILTIN_COLOR = (
     ("amb", "env_ambient_color"),
     ("fog_c", "env_fog_color"),
 )
+
+
+def _env_blend_name(value):
+    """Godot 的 `glow_blend_mode` int -> EnumProperty 的名字(反查不到给 None)。
+
+    映射只定义一份(`asset_export.ENV_GLOW_BLENDS`),这里**倒着查**它 ——
+    抄第二份迟早飘掉(第 124 轮特意把 `glow_m` 的取值收口到那边)。
+    容错:直接喂名字(有人手写预设字典时图省事)也认。
+    """
+    if value in asset_export.ENV_GLOW_BLENDS:
+        return str(value)
+    try:
+        wanted = int(value)
+    except (TypeError, ValueError):
+        return None
+    for name, number in asset_export.ENV_GLOW_BLENDS.items():
+        if int(number) == wanted:
+            return name
+    return None
 
 
 def _env_builtin_matches(settings, values):
@@ -8546,6 +9061,16 @@ def _env_builtin_matches(settings, values):
         if preset_key not in values:
             continue
         if bool(values[preset_key]) != bool(getattr(settings, engine_key, False)):
+            return False
+    for preset_key, engine_key in _ENV_BUILTIN_ENUM:
+        # 枚举:`glow_m` 存的是 Godot 的 int(asset_export.ENV_GLOW_BLENDS 的
+        # 值),场景字段是名字 —— 换算成同一个 int 再比。取不到映射(极端裁剪
+        # 环境)就跳过,不给假告警。
+        if preset_key not in values:
+            continue
+        want = asset_export.ENV_GLOW_BLENDS.get(
+            str(getattr(settings, engine_key, "SCREEN") or "SCREEN"))
+        if want is None or int(want) != int(values[preset_key]):
             return False
     for preset_key, engine_key in _ENV_BUILTIN_NUM:
         if preset_key not in values:
@@ -8684,6 +9209,11 @@ class GK_OT_EnvPresetApply(bpy.types.Operator):
             settings.style_rim = preset_obj.p_style_rim
             settings.style_specular = preset_obj.p_style_specular
         self.report({"INFO"}, f"已套用『{name}』(导出立刻生效)")
+        # ── 第 125 轮:预览开着就顺手刷一遍(用户:"预设风格预览不到")────
+        # 预览的世界 / 雾盒子 / 曝光 / 灯光倍率都是**搭的时候**算的,
+        # 之后改设置卡不会自己跟着变 —— 不刷这一下,点预设看起来"没反应"。
+        from . import godot_look as _look
+        _look.refresh(context.scene)
         return {"FINISHED"}
 
 

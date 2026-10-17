@@ -1467,16 +1467,27 @@ def main():
               and "background_mode = 2" in r49_sky
               and 'sky = SubResource("gk_sky")' in r49_sky)
 
-        # ---- 第九十七轮:环境光来源跟着背景模式 ----
-        # Godot 枚举:Color=2 / Sky=3。写死 Sky 时纯色背景没有天空 ——
-        # 真机标定过:那等于把环境光**静默关掉**(和 Disabled 渲出来一样),
-        # 用户填的『环境光颜色 / 强度』白填。这里两种背景都过一遍。
+        # ---- 第九十七 / 一百四十轮:环境光来源 ----
+        # Godot 枚举:Color=2 / Sky=3 / Disabled=1。写 Sky 时**纯色**背景没有
+        # 天空 —— 真机标定过:那等于把环境光**静默关掉**,用户填的
+        # 『环境光颜色 / 强度』白填。
+        # 第一百四十轮又补了一条:Godot 在 **Sky 模式**下同样**忽略**
+        # `ambient_light_color / energy` —— 所以规则统一成
+        #     **填了强度(> 0)就用 Color;强度 = 0 才用 Sky**
+        # (和预览那边逐字对齐;用户原话"游戏环境与后期的效果有一部分没作用?")。
         check("第九十七轮:纯色背景用 Color 环境光(不是被静默关掉的 Sky)",
               "ambient_light_source = 2" in r49_on
               and "ambient_light_source = 3" not in r49_on,
               r49_on[:400])
-        check("第九十七轮:天空背景才用 Sky 环境光",
-              "ambient_light_source = 3" in r49_sky, r49_sky[:400])
+        # 天空那一份的『环境光强度』是 0(没让人工补光)-> 按新规则走 Sky;
+        # 唯一不许出现的是 **1(Disabled)** —— 那才是填了也不生效。
+        # 新规则下天空背景可能是 2(填了强度)或 3(强度 0)—— 唯一不许的是
+        # **1(Disabled)**:那才是"用户填了也不生效"。
+        check("第一百四十轮:环境光来源不许是 Disabled(1)",
+              ("ambient_light_source = 2" in r49_sky
+               or "ambient_light_source = 3" in r49_sky)
+              and "ambient_light_source = 1" not in r49_sky,
+              r49_sky[:400])
 
         # 第五张卡的 draw_buttons 也要能画完
         class _R49Layout:
@@ -6591,6 +6602,106 @@ def main():
         bpy.data.node_groups.remove(r109_tree)
     except Exception as exc:
         check("第一百零九轮(真潜行)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 待办清单③:多场景工程里"单棵树导出"不许写出没有前缀的回退名 ----
+    # 真机复现(`_dist/repro_stray_game_logic.py`):三关的剧情示例里会多出
+    # 一份 `scripts/game_logic.gd`,和 `game_logic_大堂.gd` **声明了同一个
+    # class_name**(`StoryLobbyPlayer`)—— Godot 直接报
+    # `Parse Error: Class "StoryLobbyPlayer" hides a global script class`,
+    # 整份 CHECK_STORY_DEMO 红;手工删掉就好,所以一直不知道是谁写的。
+    #
+    # 根因:侧栏『导出脚本』(F5 / gk.export_script)走的是
+    # `exporter.export_tree` 的**默认名** —— 树名是中文,`safe_file_name`
+    # 压成空之后回退成 `game_logic.gd`,而 `export_all_scenes` 那条路
+    # 会显式传 `game_logic_<场景名>.gd`。两条路的命名必须一致。
+    try:
+        with tempfile.TemporaryDirectory(prefix="gk_script_name_") as _stray_dir:
+            _stray_scenes = []
+            for _label in ("冒烟甲", "冒烟乙"):
+                _scene = bpy.data.scenes.new(f"多场景{_label}")
+                _tree = bpy.data.node_groups.new(f"{_label}逻辑",
+                                                 "GKGameLogicTree")
+                _tree.nodes.new("GKNodeOnReady")
+                try:
+                    _scene.gk_settings.logic_tree = _tree.name
+                except Exception:                          # noqa: BLE001
+                    pass
+                _stray_scenes.append((_scene, _tree))
+            _settings = exporter.build_settings(_stray_scenes[0][0])
+            _settings["output_dir"] = _stray_dir
+            _result = exporter.export_tree(_stray_scenes[0][1], _settings,
+                                           write_scene=False)
+            check("待办③:多场景里单棵树导出带场景前缀",
+                  _result["script_name"] == "game_logic_多场景冒烟甲.gd",
+                  str(_result["script_name"]))
+            _scripts = os.path.join(_stray_dir, "scripts")
+            check("待办③:没有写出撞名的 game_logic.gd",
+                  not os.path.isfile(os.path.join(_scripts, "game_logic.gd")),
+                  str(sorted(os.listdir(_scripts))
+                      if os.path.isdir(_scripts) else []))
+            for _scene, _tree in _stray_scenes:
+                bpy.data.scenes.remove(_scene)
+                bpy.data.node_groups.remove(_tree)
+    except Exception as exc:
+        check("待办③(多场景脚本命名)", False, f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 待办清单①:灯光"按类型刷到全部关卡"(第一百三十三轮)----
+    # 用户选的做法 A:按**灯的类型**匹配(所有平行光 / 所有点光 / 所有聚光)。
+    # 背景:『按灯名』那条路在真实示例上一盏都没匹配上 —— 三关的灯名字都不一样
+    # (『走廊壁灯』vs『大堂吊灯』)。这里在真 Blender 里钉住两件事:
+    #   ① 按灯名(名字不同)-> 别的关一盏都不该动;
+    #   ② 按类型 -> 同类型的灯真的被刷到,不同类型的灯一动不动。
+    try:
+        _lp_a = bpy.data.scenes.new("灯光刷甲")
+        _lp_b = bpy.data.scenes.new("灯光刷乙")
+
+        def _lp_light(scene, name, kind):
+            data = bpy.data.lights.new(name + "数据", kind)
+            obj = bpy.data.objects.new(name, data)
+            scene.collection.objects.link(obj)
+            return obj
+
+        _lp_sun_a = _lp_light(_lp_a, "甲太阳", "SUN")
+        _lp_sun_b = _lp_light(_lp_b, "乙太阳", "SUN")
+        _lp_lamp_b = _lp_light(_lp_b, "乙壁灯", "POINT")
+        _lp_area_a = _lp_light(_lp_a, "甲面光", "AREA")
+        _lp_sun_a.gk_light.override = True
+        _lp_sun_a.gk_light.energy = 7.5
+        _lp_sun_a.gk_light.range_m = 12.0
+        _lp_area_a.gk_light.override = True      # 面光:Godot 没有,不该参与
+        _lp_area_a.gk_light.energy = 3.0
+
+        _lp_old_scene = bpy.context.window.scene if bpy.context.window else None
+        if bpy.context.window is not None:
+            bpy.context.window.scene = _lp_a
+
+        _lp_a.gk_settings.light_push_by_type = False
+        bpy.ops.gk.lights_apply_to_all_levels()
+        check("待办①:按灯名刷(三关名字不同)-> 别的关不动",
+              not _lp_sun_b.gk_light.override, str(_lp_sun_b.gk_light.override))
+
+        _lp_a.gk_settings.light_push_by_type = True
+        bpy.ops.gk.lights_apply_to_all_levels()
+        check("待办①:按类型刷 -> 同类型的灯被刷到",
+              _lp_sun_b.gk_light.override
+              and abs(_lp_sun_b.gk_light.energy - 7.5) < 1e-6
+              and abs(_lp_sun_b.gk_light.range_m - 12.0) < 1e-6,
+              "override=%s energy=%s" % (_lp_sun_b.gk_light.override,
+                                         _lp_sun_b.gk_light.energy))
+        check("待办①:按类型刷 -> 不同类型一动不动",
+              not _lp_lamp_b.gk_light.override)
+        check("待办①:面光不参与(Godot 没有这种灯)",
+              bool(_lp_area_a.gk_light.override)         # 源自己还是开着的
+              and abs(_lp_area_a.gk_light.energy - 3.0) < 1e-6)
+
+        if _lp_old_scene is not None:
+            bpy.context.window.scene = _lp_old_scene
+        for _scene in (_lp_a, _lp_b):
+            bpy.data.scenes.remove(_scene)
+    except Exception as exc:
+        check("待办①(按类型刷灯)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
     # ---- 卸载不报错 ----

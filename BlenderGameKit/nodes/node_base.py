@@ -145,6 +145,30 @@ def safe_function_name(text, fallback="my_function"):
     return base
 
 
+def godot_node_name(name):
+    """Blender 物体名 -> Godot 场景里的**节点名**(非法字符换成下划线)。
+
+    ── 为什么生成引用时必须转一道(第一百四十五轮,用户实测)───────────
+    Godot 的节点名不允许 `. : @ / % " \\` 这些字符,glTF 导入时**Godot 自己
+    就把点号换成了下划线**(实测:Blender 里叫 `Camera.001` 的相机,导进
+    Godot 之后节点名是 `Camera_001`)。而节点图生成的引用是
+        _gk_ref_typed(self, "Camera.001", "Node")
+    —— 按名字在树里找**永远找不到**,真机控制台里就是
+        [GK] 没找到节点:Camera.001
+        [GK] 相机_启用:没找到相机
+    表现成"图里选了台相机、跑起来它没启用"。Blender 给重名物体自动加
+    `.001` 后缀,所以这个坑非常容易踩到(复制一个相机就中)。
+
+    导出侧一直有这层换算(`asset_export._sanitize_node_name`,相机 / 灯 /
+    材质的名字都过它),生成侧原来漏了 —— 两边必须**用同一套规则**,
+    否则"图里引用的名字"和"场景里的节点名"对不上。
+    """
+    out = []
+    for char in str(name):
+        out.append("_" if char in '.:@/%"\\' else char)
+    return "".join(out) or "Node"
+
+
 def gd_node_path(raw):
     """把节点的目标值转换成 GDScript 里的节点访问表达式。"""
     text = (raw or "").strip()

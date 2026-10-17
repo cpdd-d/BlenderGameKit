@@ -145,6 +145,8 @@ _SUBMODULES = (
     # 资产缩略图(第六十六轮:资产卡上的小图 —— 真图 / 渲染 / 波形 / 折线)。
     # 排在 asset_export 之后、ui 之前:它 import asset_export,而 ui 用它。
     "asset_thumbs",
+    "godot_post",
+    "godot_material_preview",
     "godot_look",
     "godot_glossary",
     "operator_io",
@@ -282,6 +284,15 @@ def register():
             type=_object_fx_type())
     except Exception:  # pragma: no cover
         _log_exception("物体粒子设置挂载失败")
+
+    # 物体级"导出到 Godot 的灯光值"(第一百二十六轮,用户第 10 轮要求)。
+    # 同上:每次注册都重挂,否则老 .blend 里读不到新属性。
+    try:
+        from .properties import GKObjectLight
+        bpy.types.Object.gk_light = bpy.props.PointerProperty(
+            type=GKObjectLight)
+    except Exception:  # pragma: no cover
+        _log_exception("物体灯光设置挂载失败")
 
     # ── 快捷键(F5 = 直接运行游戏)──────────────────────────────────
     # 必须在类都注册完之后 —— 快捷键绑的是算子,算子没注册就绑不上。

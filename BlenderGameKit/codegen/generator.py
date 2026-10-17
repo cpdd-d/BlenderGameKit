@@ -1,6 +1,7 @@
 """`Generator` 主体:扫描节点树、组装事件函数、拼出最终 GDScript。"""
 
 from ..nodes.node_base import (TARGET_SELF, gd_node_path, gd_string,
+                               godot_node_name,
                                safe_function_name, snake_case)
 from ..nodes.nodes import (ANIM_CATEGORY_NAMES, MAIN_UI_AUTOLOAD,
                            action_category, main_ui_design_tree, node_key,
@@ -17,7 +18,8 @@ from .camera import _path_name
 from .services import (_FILTER_SHADER_CONST, _GD_FILTER_SHADER,
                        _GD_VIGNETTE_SHADER, _SAVE_SALT, _SAVE_SALT_CONST,
                        _VIGNETTE_SHADER_CONST, _emit_design_into,
-                       _ui_looks_transient, _ui_root)
+                       _ui_looks_transient, _ui_root, UI_STORY_PANEL_NODES,
+                       UI_TRANSIENT_GROUP)
 from .network import emit_network
 from .context import GenContext
 from .graph import position_key
@@ -97,8 +99,17 @@ class Generator:
             #   隐藏,一个 ColorRect 而已),但没人会去点亮它 —— 不额外写
             #   "删掉刚才那行"的逆向代码,少一处会漂的地方。
             sections.extend(self._emit_ui_main_sections())
-            if self.ctx.need_pause_dim:
-                sections.extend(self._emit_pause_dim())
+            # ── 定义**无条件**发(第一百四十五轮,用户实测)────────────────
+            # `_ready()` 里那行 `_gk_pause_dim_init()` 是无条件写的,定义却
+            # 只在 need_pause_dim 为真时发 —— 主界面里没有『界面_暂停游戏』
+            # (带菜单控件)时,生成的脚本就是**调用了一个不存在的函数**:
+            # Godot 直接报
+            #     Parse Error: Function "_gk_pause_dim_init()" not found in base self
+            # **整份脚本加载失败**(它还挂在 autoload `GkMainUi` 上,真机报
+            # "Failed to load script",界面全没了)。
+            # 按上面那段约定("底照建")把定义补上:多出来的只是一个没人调用的
+            # 小函数,而少一次 Parse Error。
+            sections.extend(self._emit_pause_dim())
 
         # 同类事件合并成一个函数
         grouped = {}
@@ -275,6 +286,48 @@ class Generator:
                     f"    add_child({timer_var})",
                     f"    {timer_var}.timeout.connect({func_name})",
                 ]
+
+        # ── 『环境_当时间到』(第一百四十三轮)──────────────────────────
+        # 它也是"信号回调",但信号在**环境脚本**上(按 `gk_env` 组找),
+        # 不在自己 / 区域节点上 —— 所以单独走一支,逻辑和上面那批触发器一样:
+        # 一个节点一个回调函数,连接补进 `_ready` 最前面。
+        for node in events:
+            if getattr(node, "bl_idname", "") != "GKNodeEnvHourEvent":
+                continue
+            target = int(round(float(getattr(node, "gk_hour_target", 19.0) or 0.0))) % 24
+            daily = bool(getattr(node, "gk_hour_daily", True))
+            func_name = self.ctx.declare_func_name("_gk_on_env_hour",
+                                                   key=node_key(node))
+            self.ctx._active.clear()
+            self.ctx._current_event = node.name
+            lines = self.ctx.new_section()
+            self._emit_event_body(node, 1)
+            body = [
+                f"    if hour != {target}:",
+                "        return",
+            ]
+            if not daily:
+                once = self.ctx.declare_var(
+                    "_gk_env_hour_once_" + func_name.split("_")[-1], "bool",
+                    initial="false")
+                body += [
+                    f"    if {once}:",
+                    "        return",
+                    f"    {once} = true",
+                ]
+            body += list(lines.lines)
+            sections.append({
+                "signature": f"func {func_name}(hour: int) -> void:",
+                "lines": body,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            trigger_ready += [
+                f"    var _gk_env_hour := get_tree().get_first_node_in_group(\"gk_env\")",
+                f"    if _gk_env_hour != null and not "
+                f"_gk_env_hour.gk_hour_reached.is_connected({func_name}):",
+                f"        _gk_env_hour.gk_hour_reached.connect({func_name})",
+            ]
 
         if trigger_ready:
             # ⚠ 必须插到 `_ready` **最前面**:『每当_准备』链里可能有『等待_秒』
@@ -1522,26 +1575,64 @@ class Generator:
                         "        _gk_pause_esc_held = true",
                         "        var tree := get_tree()",
                         "        if tree != null:",
-                        "            _gk_apply_pause(not tree.paused, _gk_pause_menu, _gk_pause_show_mouse)",
+                        # ── 剧情冻着的时候,Esc **只开关菜单**(第一百三十四轮)──
+                        # 不这么分的话,`not tree.paused` 在"剧情冻着"时算出来是
+                        # false -> 那一下变成**解冻剧情**(真机:按 Esc 剧情自己
+                        # 跑起来、选择框照样能点,用户第 134 轮报的就是这个)。
+                        # ⚠ 两件事都判:账在 SceneTree 的 meta 上(冻世界的是
+                        #   这一关的逻辑图,读 Esc 的可能是主界面那份脚本),
+                        #   外加"世界现在确实是冻的"兜底 —— 万一那笔账过时了,
+                        #   也不能把正常的"暂停 / 继续"弄坏。
+                        "            if _gk_story_is_frozen() and tree.paused:",
+                        "                _gk_pause_menu_show(not _gk_pause_menu_open, _gk_pause_menu)",
+                        "            else:",
+                        "                _gk_apply_pause(not tree.paused, _gk_pause_menu, _gk_pause_show_mouse)",
                         "    elif not down:",
                         "        _gk_pause_esc_held = false",
                     ],
                     "empty_body": "    pass",
                     "separator": True,
                 })
+            sections.append({
+                "signature": "func _gk_set_story_frozen(frozen: bool) -> void:",
+                "lines": [
+                    "    var tree := get_tree()",
+                    "    if tree != null:",
+                    "        tree.set_meta(\"gk_story_frozen\", frozen)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_story_is_frozen() -> bool:",
+                "lines": [
+                    "    var tree := get_tree()",
+                    "    if tree == null:",
+                    "        return false",
+                    "    return bool(tree.get_meta(\"gk_story_frozen\", false))",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
             pause_lines = [
                 "    var tree := get_tree()",
                 "    if tree == null:",
                 "        return",
+                # ── 记账 + "别把剧情一起解冻"那一支(第一百三十四轮)──────
+                # `menu` 为空 = **图里**那一路(过场 / 对话 / 结局),也就是
+                # "剧情自己冻的";带菜单名 = 玩家菜单那一层(图里接的
+                # 『继续游戏』按钮带的也是菜单名)。两者共用 `tree.paused`。
+                "    if menu == \"\":",
+                "        _gk_set_story_frozen(paused)",
+                "    elif not paused and _gk_story_is_frozen():",
+                "        # 剧情还冻着:这一下只是收起玩家菜单,世界的冻一个字不动",
+                "        _gk_pause_menu_show(false, menu)",
+                "        return",
                 "    tree.paused = paused",
-                "    if show_mouse:",
-                "        if paused:",
-                "            if _gk_pause_mouse_was < 0:",
-                "                _gk_pause_mouse_was = Input.mouse_mode",
-                "            Input.mouse_mode = Input.MOUSE_MODE_VISIBLE",
-                "        elif _gk_pause_mouse_was >= 0:",
-                "            Input.mouse_mode = _gk_pause_mouse_was as Input.MouseMode",
-                "            _gk_pause_mouse_was = -1",
+                "    _gk_mouse_wanted = show_mouse",
+                "    _gk_mouse_sync(show_mouse)",
+                "    _gk_pause_menu_show(paused, menu)",
+                "    print(\"[GK] 暂停: \", \"开\" if paused else \"关\")",
             ]
             # ── 过场控件让位 + 压暗底(第一百二十六轮)────────────────────
             # 让位那一段**按"菜单在不在"分两半**,别写成一个 `paused` 三元:
@@ -1551,10 +1642,15 @@ class Generator:
             #     "菜单控件名字填错"的工程里把本该藏着的过场控件亮出来
             #     (章节卡淡出之后又冒出来)。收起/还原两边都靠 `paused` 分流,
             #     同一个函数里成对出现,不会有"收了不还"的中间态。
+            # ── 暂停菜单这一层:显隐 + 让位 + 压暗(第一百三十四轮抽出)──────
+            # 为什么单独一个函数:剧情冻着的时候,玩家按 Esc 只该开关**这一层**
+            # (世界继续冻着),『继续游戏』也只该收这一层 —— 两处都不该动
+            # `tree.paused`。所以"世界冻不冻"和"菜单这一层开不开"必须能分开叫。
+            menu_lines = []
             if getattr(self.ctx, "_pause_transient", False):
                 if self.ctx.need_transient_helper:
-                    pause_lines += [
-                        "    if paused:",
+                    menu_lines += [
+                        "    if open:",
                         "        _gk_hide_transient(true)",
                         "    else:",
                         "        var has_menu := false",
@@ -1564,71 +1660,177 @@ class Generator:
                         "            _gk_hide_transient(false)",
                     ]
                 if self.ctx.need_pause_dim:
-                    pause_lines += [
+                    menu_lines += [
                         "    if _gk_pause_dim != null:",
-                        "        _gk_pause_dim.visible = paused",
+                        "        _gk_pause_dim.visible = open",
                     ]
-            pause_lines += [
+            menu_lines += [
                 "    var widget: Control = null",
                 "    if menu != \"\":",
                 "        widget = _gk_find_widget(menu)",
                 "        if widget != null:",
-                "            widget.visible = paused",
+                "            widget.visible = open",
             ]
             if self.ctx.need_raise_helper and getattr(
                     self.ctx, "_pause_menu_raise", False):
                 # 第一百零五轮:弹菜单时也走一遍『置顶 + 互斥组』
                 # (Esc 之前可能已经开着别的面板,不置顶会被压住)
-                pause_lines += [
-                    "            if paused:",
+                menu_lines += [
+                    "            if open:",
                     "                _gk_ui_raise(widget)",
                 ]
-            pause_lines += [
+            menu_lines += [
                 "        else:",
                 "            push_warning(\"找不到暂停菜单控件: \" + menu)",
-                "    print(\"[GK] 暂停: \", \"开\" if paused else \"关\")",
+                "    _gk_pause_menu_open = open",
+                # 菜单这一层动完,光标跟着"界面到底有没有东西"重算一次
+                # (第一百三十七轮;`_gk_mouse_wanted` 由 _gk_apply_pause 记)
+                "    _gk_mouse_sync(_gk_mouse_wanted)",
             ]
+            sections.append({
+                "signature": ("func _gk_pause_menu_show(open: bool, "
+                              "menu: String) -> void:"),
+                "lines": menu_lines,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            # ── 光标跟"界面上有没有要点的东西"走(第一百三十七轮)──────────
+            # 用户原话:"这是界面之间的显示关系,鼠标的显示冷却不应该加上去的,
+            # 它只有有界面才显示,没有就隐藏,除非按住 alt 键。"
+            # 为什么要单独一套:第一百三十五轮给"过场面板放回来"加了冷却,
+            # 于是**菜单收起、面板还在冷却**的那一秒里,界面是空的、光标却
+            # 还亮着(用户截图:画面只剩一个鼠标)。
+            # 规则:菜单开着 或 过场面板可见 -> 显示光标;两者都没有 -> 还原
+            # 成原来的模式(一般是 CAPTURED)。按住 Alt 的那套归玩家脚本管,
+            # 这里不去抢(那时界面本来就是空的,我们只做"没有就隐藏")。
+            mouse_lines = [
+                "    if not show:",
+                "        _gk_mouse_restore()",
+                "        return",
+            ]
+            if self.ctx.need_transient_helper:
+                mouse_lines += [
+                    "    if _gk_pause_menu_open or _gk_transient_visible():",
+                ]
+            else:
+                # 这张图没有过场面板(连组都不存在)-> 只看菜单那一层。
+                # ⚠ 别无条件写 `_gk_transient_visible()`:那会把 `gk_ui_transient`
+                #   这个名字带进"压根没有过场控件"的工程,老图产物就变了
+                #   (测试里钉着这条:没有过场控件时产物逐字不变)。
+                mouse_lines += [
+                    "    if _gk_pause_menu_open:",
+                ]
+            mouse_lines += [
+                "        _gk_mouse_show()",
+                "    else:",
+                "        _gk_mouse_restore()",
+            ]
+            sections.append({
+                "signature": "func _gk_mouse_show() -> void:",
+                "lines": [
+                    "    if _gk_pause_mouse_was < 0:",
+                    "        _gk_pause_mouse_was = Input.mouse_mode",
+                    "    Input.mouse_mode = Input.MOUSE_MODE_VISIBLE",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_mouse_restore() -> void:",
+                "lines": [
+                    "    if _gk_pause_mouse_was >= 0:",
+                    "        Input.mouse_mode = _gk_pause_mouse_was as Input.MouseMode",
+                    "        _gk_pause_mouse_was = -1",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            if self.ctx.need_transient_helper:
+                sections.append({
+                    "signature": "func _gk_transient_visible() -> bool:",
+                    "lines": [
+                        # ⚠ 只认**面板**(Panel):`gk_ui_transient` 组里还有
+                        #   居中的提示文字 / 章节卡 —— 那些是"让位对象",不是
+                        #   "要点的界面"。光标规则问的是"屏幕上有没有要点的
+                        #   东西",把大字提示也算进去,光标就永远收不回来了
+                        #   (用户第一百三十九轮的真机症状:连点 Esc 后画面只剩
+                        #   一个鼠标)。
+                        "    for item in get_tree().get_nodes_in_group(\"gk_ui_transient\"):",
+                        "        if item is Panel and (item as Panel).visible:",
+                        "            return true",
+                        "    return false",
+                    ],
+                    "empty_body": "    return false",
+                    "separator": True,
+                })
+            sections.append({
+                "signature": "func _gk_mouse_sync(show: bool) -> void:",
+                "lines": mouse_lines,
+                "empty_body": "    pass",
+                "separator": True,
+            })
             sections.append({
                 "signature": "func _gk_apply_pause(paused: bool, menu: String, show_mouse: bool) -> void:",
                 "lines": pause_lines,
                 "empty_body": "    pass",
                 "separator": True,
             })
-            # ── 过场控件让位(第一百二十六轮,P1)────────────────────────
+            # ── 过场控件让位(第一百二十六轮,P1 + 第一百三十五轮冷却)────────
             # 用户原话:"有时点快了……那么在如ESC菜单出现时就立刻隐藏旧的
             # 界面" —— 配图是章节卡压在暂停面板上。
             # 收起一批、继续时**原样还原**:用 stash 记住"收起之前各自可不
             # 可见" —— 直接 `visible = true` 会把本来该藏着的控件亮出来
             # (比如已经淡出过的章节卡,继续游戏后反而冒出来)。
+            #
+            # ── 放回来要等一个冷却(用户 2026-10-16 的第二条建议)──────────
+            # 用户原话:"我建议是在打开 esc 后冷却几秒再显示剧情选项,这样
+            # 就可以避免,并且多次打开就多次重置冷却时间" —— 玩家点『继续
+            # 游戏』时鼠标往往正停在刚才那块地方,剧情面板立刻回来会被
+            # 下一击顺手点掉(选到选项 / 继续对话)。
+            # 实现用一个"令牌 + 一次性定时器":每次收 / 放都 +1 令牌,
+            # 过期的回调直接 return —— 于是"多次开关 = 多次重置"天然成立。
+            # ⚠ 定时器用 `process_always = true`(默认):收菜单时世界可能
+            #   还冻着(剧情冻的),`false` 会让面板永远回不来。
             if self.ctx.need_transient_helper:
                 # 还原账本:[暂停前各自可不可见],按组里同一个遍历顺序存 /
                 # 读回去。不存就只能一律 `visible = true`,把"本来就该藏着的
                 # 过场控件"亮出来(章节卡已经淡出过,继续游戏后又冒出来)。
                 self.ctx.declare_var("_gk_transient_hidden", "Array",
                                      initial="[]")
+                self.ctx.declare_var("_gk_transient_token", "int", initial="0")
                 sections.append({
                     "signature": "func _gk_hide_transient(hide: bool) -> void:",
                     "lines": [
                         "    # 按 Godot 组整批收 / 放 —— 组名由生成器写进控件创建处",
                         "    # (见 services.UI_TRANSIENT_GROUP),不靠控件的名字猜。",
-                        "    var found := get_tree().get_nodes_in_group(\"gk_ui_transient\")",
+                        "    # 令牌:每次收 / 放 +1,过期的『放回来』回调直接作废",
+                        "    # (多次开关菜单 = 多次重置冷却)。",
+                        "    _gk_transient_token += 1",
                         "    if hide:",
                         "        _gk_transient_hidden.clear()",
-                        "        for item in found:",
+                        "        for item in get_tree().get_nodes_in_group(\"gk_ui_transient\"):",
                         "            if not (item is CanvasItem):",
                         "                continue",
                         "            var canvas := item as CanvasItem",
                         "            _gk_transient_hidden.append(canvas.visible)",
                         "            canvas.visible = false",
-                        "    else:",
+                        "        _gk_mouse_sync(_gk_mouse_wanted)",
+                        "        return",
+                        "    var token := _gk_transient_token",
+                        "    var timer := get_tree().create_timer(",
+                        "        maxf(_gk_pause_resume_cooldown, 0.0), true)",
+                        "    timer.timeout.connect(func() -> void:",
+                        "        if token != _gk_transient_token:",
+                        "            return          # 这中间又开关过菜单,这次作废",
                         "        var index := 0",
-                        "        for item in found:",
+                        "        for item in get_tree().get_nodes_in_group(\"gk_ui_transient\"):",
                         "            if not (item is CanvasItem):",
                         "                continue",
                         "            if index < _gk_transient_hidden.size():",
                         "                (item as CanvasItem).visible = _gk_transient_hidden[index]",
                         "            index += 1",
                         "        _gk_transient_hidden.clear()",
+                        "        _gk_mouse_sync(_gk_mouse_wanted))",
                     ],
                     "empty_body": "    pass",
                     "separator": True,
@@ -1645,6 +1847,9 @@ class Generator:
                     "    if _gk_dialog_panel == null:",
                     "        _gk_dialog_panel = Panel.new()",
                     "        _gk_dialog_panel.name = \"对话框\"",
+                    # 暂停时让位(第一百三十四轮):挂进过场组,
+                    # `_gk_apply_pause` 会按组把它收起来、继续游戏再还原。
+                    f"        _gk_dialog_panel.add_to_group({gd_string(UI_TRANSIENT_GROUP)})",
                     "        var box := StyleBoxFlat.new()",
                     "        box.bg_color = Color(0.05, 0.06, 0.09, 0.85)",
                     "        box.corner_radius_top_left = 14",
@@ -1866,6 +2071,8 @@ class Generator:
                     "    if _gk_history_panel == null:",
                     "        _gk_history_panel = Panel.new()",
                     "        _gk_history_panel.name = \"对话历史\"",
+                    # 暂停时让位(第一百三十四轮):同上,挂过场组
+                    f"        _gk_history_panel.add_to_group({gd_string(UI_TRANSIENT_GROUP)})",
                     "        var box := StyleBoxFlat.new()",
                     "        box.bg_color = Color(0.05, 0.06, 0.09, 0.92)",
                     "        box.corner_radius_top_left = 14",
@@ -2025,6 +2232,9 @@ class Generator:
                     "    if _gk_choice_panel == null:",
                     "        _gk_choice_panel = Panel.new()",
                     "        _gk_choice_panel.name = \"选择框\"",
+                    # 暂停时让位(第一百三十四轮):挂过场组 —— 用户截图里
+                    # 那一幕就是"暂停菜单压在选择框上、选项还点得动"。
+                    f"        _gk_choice_panel.add_to_group({gd_string(UI_TRANSIENT_GROUP)})",
                     "        var box := StyleBoxFlat.new()",
                     "        box.bg_color = Color(0.05, 0.06, 0.09, 0.88)",
                     "        box.corner_radius_top_left = 14",
@@ -2557,6 +2767,11 @@ class Generator:
         # 那句话就漏了(实测:走廊那关真的漏过,`_gk_apply_pause` 里少一行)。
         for node in self._nodes():
             if _ui_looks_transient(node) or bool(getattr(node, "gk_transient", False)):
+                self.ctx.need_transient_helper = True
+            # 故事面板(对话框 / 选择框 / 字幕 / 对话历史)是 helper **运行时**
+            # 造出来的,自动判定抓不到 —— 只要图里有这类节点,就说明本脚本
+            # 会造出"暂停时该让位"的面板(第一百三十四轮)。
+            if node.bl_idname in UI_STORY_PANEL_NODES:
                 self.ctx.need_transient_helper = True
         # 设计图里建的控件也算(『界面_套用设计』把设计图建进这个场景时,
         # 那些控件的组登记就写在本脚本里)
@@ -3257,6 +3472,14 @@ class Generator:
             # 引用能不能解析 —— 顺带也修好了"用户把相机挪到别的父节点下"。
             for var, (path, gd_type) in ctx.onready.items():
                 name = _path_name(path)
+                # ── 名字还要过一道"Blender 名 -> Godot 节点名"(第一百四十五轮)──
+                # Blender 给重名物体自动加的 `.001` 后缀在 Godot 里是不允许
+                # 的字符,导出的节点名是 `Camera_001` —— 引用里写着原名就
+                # **永远找不到**(真机:`[GK] 相机_启用:没找到相机`)。
+                # 只在**自己拼出来的 `$"…"` 形式**上转:`self` /
+                # `get_node("/root/…")` 这些原样保留(它们不是物体名)。
+                if str(path).strip().startswith("$"):
+                    name = godot_node_name(name)
                 # 引用要**按类型找** —— 同名节点不止一个(网格 + 碰撞代理),
                 # 见下面 _gk_ref_typed 的说明。
                 out.append(f"@onready var {var}: {gd_type} = "

@@ -780,6 +780,66 @@ class TestDisplayNodes(Base):
         code, _ = gen(tree, V2)
         self.assertEqual(code.count("gk_shake_left -= delta"), 1, code)
 
+    # ---- 第 124 轮:Camera3D 的震动必须换算成世界单位 ------------------
+    def test_camera_shake_3d_converts_pixels_to_world_units(self):
+        """2D 的 `offset` 是**像素**,3D 的 `h_offset/v_offset` 是**视锥偏移
+        (世界单位)** —— 同一个『强度』直接填进去,3D 那边等于把画面甩出屏幕。
+
+        用户报的 bug:"在关卡2中,被游戏AI攻击的一瞬间传送,就出现了类似于
+        肩部摄像机的视角"(惊吓_事件给的强度是 20)。真机标定:
+            px_per_unit ≈ 23.0 * (viewport_height / 360) / tan(fov/2)
+        所以 3D 分支必须**先算一个换算系数**再乘上去。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraShake, "受击抖动",
+                             gk_target="主相机", gk_strength=20.0,
+                             gk_duration=0.4)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V3)
+        # 2D 仍是像素,原样用
+        self.assertIn("(_gk_shake_cam as Camera2D).offset = Vector2(_ox, _oy)",
+                      code)
+        # 3D 必须经过换算:不许有"直接把像素量塞进去"的那一行。
+        # ⚠ 用**逐行**判断,不能用 assertNotIn —— 换算后的那行
+        #   `...h_offset = _ox * _gk_unit` 本身就以旧写法为前缀,子串比对
+        #   会误报(这条测试第一版就是这么红的)。
+        for line in code.splitlines():
+            stripped = line.strip()
+            self.assertNotEqual(stripped,
+                                "(_gk_shake_cam as Camera3D).h_offset = _ox",
+                                "3D 震动没换算成世界单位")
+            self.assertNotEqual(stripped,
+                                "(_gk_shake_cam as Camera3D).v_offset = _oy",
+                                "3D 震动没换算成世界单位")
+        self.assertIn("tan(_gk_half) * 360.0 / (23.0 * _gk_h)", code)
+        self.assertIn("(_gk_shake_cam as Camera3D).h_offset = _ox * _gk_unit",
+                      code)
+        self.assertIn("(_gk_shake_cam as Camera3D).v_offset = _oy * _gk_unit",
+                      code)
+        # 分辨率要在**运行时**取,不能写死(窗口大小会变)
+        self.assertIn("get_visible_rect().size.y", code)
+        self.assertIn("(_gk_shake_cam as Camera3D).fov", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_camera_shake_3d_code_has_no_placeholders(self):
+        """生成的代码里不许留 `{...}` 花括号占位符(第 124 轮踩过)。
+
+        `({cam_var} as Camera3D)` 那一行当时漏了 f-string 前缀,生成的
+        GDScript 里就真的写着 `{cam_var}` —— 真机直接 `Parse Error`,
+        整份脚本加载不了。这条把这类"拼接漏 f"钉死。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeCameraShake, "抖动", gk_target="主相机")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, _ = gen(tree, V3)
+        for placeholder in ("{cam_var}", "{power_var}", "{time_var}",
+                            "{total_var}", "{power}", "{cam}"):
+            self.assertNotIn(placeholder, code,
+                             f"生成代码里有没被替换的占位符 {placeholder}")
+
     def test_same_node_referenced_once(self):
         """同一台相机被多个节点引用时，只应声明一个 @onready 变量。
 
@@ -2077,7 +2137,18 @@ class TestUiDesignTree(Base):
                 setattr(bpy_module(), "data", original)
 
     # ---- 树类型 / 菜单归属 ----
-    def test_ui_widget_nodes_belong_to_design_tree_and_logic_keeps_interface(self):
+    def test_ui_widget_nodes_menu_design_only_poll_both_trees(self):
+        """控件构建节点:**菜单**只列设计图,**poll** 两棵树都放行。
+
+        ── 为什么不许把 poll 一起收窄(第一百一十二轮的实测教训)──────
+        收窄成"只许设计图"之后,示例重建脚本当场被打断 —— 它们是**代码直连
+        `nodes.new()`**、不过菜单的:`make_horror_demo.py` 报
+        "无法将 'GKNodeUiText' 类型的节点添加到节点树 '标题逻辑' 中"
+        (整份恐怖示例重建不出来),`make_blend_demo` / `make_ai_nav_demo`
+        这些往玩法图摆控件的脚本同理。老 .blend 里的控件节点也会变得不能再编辑。
+        用户第 112 轮要的是"玩法图**右键菜单**里的界面逻辑删掉" —— 那是菜单层
+        的事(`gk_menu_hidden_trees`),见 properties.node_menu_allowed。
+        """
         from BlenderGameKit import properties as props
         for cls in (NN.GKNodeUiText, NN.GKNodeUiBar, NN.GKNodeUiButton,
                     NN.GKNodeUiImage, NN.GKNodeUiPanel, NN.GKNodeUiList,
@@ -2088,8 +2159,12 @@ class TestUiDesignTree(Base):
                     NN.GKNodeUiCheckbox):
             self.assertTrue(props.node_fits_tree(cls, "GKUiDesignTree"),
                             cls.bl_label + " 应该能放进设计图")
-            self.assertFalse(props.node_fits_tree(cls, "GKGameLogicTree"),
-                             cls.bl_label + " 应从玩法图移到设计图")
+            self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"),
+                            cls.bl_label + " 老图还要能编辑(poll 放行)")
+            self.assertFalse(props.node_menu_allowed(cls, "GKGameLogicTree"),
+                             cls.bl_label + " 应从玩法图的**菜单**里消失")
+            self.assertTrue(props.node_menu_allowed(cls, "GKUiDesignTree"),
+                            cls.bl_label + " 设计图的菜单里要有")
         # ── 第一百一十二轮:三条线(界面搬家)──────────────────────────
         # ① 界面**自己的行为** → 设计图专属(**菜单层面**;poll 照旧放行,
         #    否则老脚本/示例重建会失败 —— 见 properties.node_menu_allowed):
@@ -2124,6 +2199,51 @@ class TestUiDesignTree(Base):
         # 不是界面控件 —— 留在玩法图。
         self.assertTrue(props.node_fits_tree(NN.GKNodeFloatText,
                                              "GKGameLogicTree"))
+
+    def test_multi_scene_fallback_script_name_keeps_scene_prefix(self):
+        """待办清单③:多场景工程的"回退脚本名"必须补上场景前缀。
+
+        真机复现(`_dist/repro_stray_game_logic.py`):三关的剧情示例里会多出
+        一份 `scripts/game_logic.gd`,和 `game_logic_大堂.gd` **声明了同一个
+        class_name**(`StoryLobbyPlayer`)—— Godot 报
+        "hides a global script class",整份 CHECK_STORY_DEMO 红。
+
+        离线这里只钉**改名规则本身**(真 Blender 那一半在
+        `tests/blender_smoke.py` 的"待办清单③"一节):bpy 桩里没有
+        `bpy.data.scenes`,所以把"场景表 / 归属场景"两处喂成假的。
+        """
+        from BlenderGameKit import exporter as ex
+
+        class _Scene:
+            def __init__(self, name):
+                self.name = name
+                self.objects = []
+                self.gk_settings = type("_S", (), {"logic_tree": "大堂逻辑"})()
+
+        tree = type("_T", (), {"name": "大堂逻辑"})()
+        real_scenes = ex.exportable_scenes
+        real_owner = ex._tree_owner_scene
+        try:
+            ex._tree_owner_scene = lambda _tree: _Scene("大堂")
+            # 多场景 -> game_logic_<场景名>.gd(和 export_all_scenes 逐字一致)
+            ex.exportable_scenes = lambda: [_Scene("大堂"), _Scene("走廊")]
+            self.assertEqual(ex._multi_scene_script_name("game_logic.gd", tree),
+                             "game_logic_大堂.gd")
+            # 单场景 -> 老行为一个字都不变
+            ex.exportable_scenes = lambda: [_Scene("大堂")]
+            self.assertEqual(ex._multi_scene_script_name("game_logic.gd", tree),
+                             "game_logic.gd")
+            # 树名能压出 ASCII 名字时**不插手**(用户自己起的名字照旧)
+            ex.exportable_scenes = lambda: [_Scene("大堂"), _Scene("走廊")]
+            self.assertEqual(ex._multi_scene_script_name("mylogic.gd", tree),
+                             "mylogic.gd")
+            # 找不到归属场景 -> 保持老行为(宁可原名,也不乱改名)
+            ex._tree_owner_scene = lambda _tree: None
+            self.assertEqual(ex._multi_scene_script_name("game_logic.gd", tree),
+                             "game_logic.gd")
+        finally:
+            ex.exportable_scenes = real_scenes
+            ex._tree_owner_scene = real_owner
 
     def test_design_tree_menu_lists_widgets_and_behavior(self):
         from BlenderGameKit import properties as props
@@ -2453,7 +2573,9 @@ class TestUiDesignTree(Base):
         self.assertIn("ColorRect.new()", code)
         # 半透明黑 = 压暗(用户说的"或者添加模糊背景"走的就是这条轻的路)
         self.assertIn("Color(0.0, 0.0, 0.0, 0.45)", code)
-        self.assertIn("_gk_pause_dim.visible = paused", code)
+        # 第一百三十四轮:压暗跟着"菜单那一层"的开关走(open),
+        # 因为剧情冻着时玩家开菜单**不该解冻世界**,压暗也就不能挂在 paused 上。
+        self.assertIn("_gk_pause_dim.visible = open", code)
         # 建完就提到根部第一个孩子 = 同层最底 —— 否则会把暂停面板也压暗
         self.assertIn("_gk_ui_root.move_child(_gk_pause_dim, 0)", code)
         # 不吃鼠标:菜单照点
@@ -2478,6 +2600,30 @@ class TestUiDesignTree(Base):
         gk_stub.connect(tree, event, "执行", node, "执行")
         code, _ = gen(tree, V2)
         self.assertNotIn("_gk_pause_dim", code)
+
+    def test_ui_main_without_pause_menu_still_defines_dim(self):
+        """主界面里没有『界面_暂停游戏』时,压暗底的**定义**也必须发。
+
+        ── 这是用户真跑撞到的 Parse Error(第一百四十五轮)──────────────
+        `_ready()` 里的 `_gk_pause_dim_init()` 是**无条件**写的,而定义原来
+        只在 need_pause_dim 为真(=设计图里有带菜单控件的『界面_暂停游戏』)
+        时才生成 —— 于是"只有按钮、没有暂停菜单"的主界面会生成出一句
+        **调用不存在的函数**,Godot 直接报
+            Parse Error: Function "_gk_pause_dim_init()" not found in base self
+        **整份脚本加载失败**(它还挂在 autoload `GkMainUi` 上,真机报
+        "Failed to load script",界面全没了)。
+        """
+        design = self._design("主界面")
+        design.gk_main_ui = True
+        design.new_node(NN.GKNodeUiText, "标题", gk_text="标题")
+        result = self._gen_main_ui(design)
+        self.assertEqual(result.warnings, [], result.warnings)
+        code = result.code
+        self.assertIn("_gk_pause_dim_init()", code)
+        self.assertIn("func _gk_pause_dim_init() -> void:", code)
+        # 变量只声明一次(两处 declare_var 必须去重,否则 Godot 报
+        # "Variable has the same name as a previously declared variable")
+        self.assertEqual(code.count("var _gk_pause_dim: ColorRect"), 1, code)
 
     # ---- 『界面_按钮点击』----
     def test_on_click_binds_once_and_runs_click_chain(self):
@@ -5788,6 +5934,30 @@ class TestCameraSuite(Base):
         self.assertIn(".make_current()", code)
         self.assertIn(".is_current():", code)
         self.assertIn(".clear_current()", code)
+        self.assert_no_chinese_identifiers(code)
+
+    def test_node_reference_uses_godot_node_name(self):
+        """引用的名字要换算成 Godot 的节点名(点号 -> 下划线)。
+
+        ── 用户真跑撞到的(第一百四十五轮)──────────────────────────────
+        Blender 给重名物体自动加 `.001` 后缀,而 Godot 的节点名里不允许点号 ——
+        glTF 导入时**Godot 自己**就把点号换成了下划线(实测:Blender 里叫
+        `Camera.001` 的相机,导进 Godot 之后节点名是 `Camera_001`)。
+        生成侧原来照抄 Blender 原名,于是 `_gk_ref_typed(self, "Camera.001")`
+        按名字在树里**永远找不到**,真机控制台里就是
+            [GK] 没找到节点:Camera.001 / [GK] 相机_启用:没找到相机
+        —— 用户报的"摄像机没起作用"。
+        导出侧一直有这层换算(相机 / 灯 / 材质的名字都过),生成侧漏了。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        on = tree.new_node(NN.GKNodeCameraActive, "开A", gk_target="Camera.001",
+                           gk_active=True)
+        gk_stub.connect(tree, event, "执行", on, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('"Camera_001"', code)
+        self.assertNotIn('"Camera.001"', code)
         self.assert_no_chinese_identifiers(code)
 
     def test_camera_setup_fov_and_distance(self):
@@ -9166,6 +9336,23 @@ class TestMultiScene(Base):
         self.assertIs(got, tree)
         self.assertIn("自动", why)
 
+    def test_only_level_tree_owned_by_another_scene_is_not_auto_used(self):
+        """别的场景认领的那棵关卡图,不许被"只有一棵"兜底偷用(第一百三十四轮)。
+
+        真机场景(恐怖示例):`标题逻辑` 是标题场景的关卡图,教室 / 走廊 /
+        楼梯间这一关的逻辑全在**角色图**里、场景设置是空的 —— 兜底"整个
+        .blend 只有一棵关卡图 -> 自动用"就把标题页的逻辑写成了这三关的场景
+        脚本(三份 game_logic_*.gd 逐字节相同,.tscn 根上挂着它)。
+        """
+        title = self._Tree("标题逻辑")
+        self._patch_data(
+            node_groups=[title],
+            scenes=[self._Scene("标题", logic_tree="标题逻辑"),
+                    self._Scene("走廊")])
+        got, why = exporter.resolve_scene_tree(self._Scene("走廊"))
+        self.assertIsNone(got)
+        self.assertIn("标题", why)
+
     def test_character_tree_is_not_auto_used_as_level_tree(self):
         role = self._Tree("角色逻辑")
         role.gk_scope = "ROLE"
@@ -9659,6 +9846,35 @@ class TestGodCameraRound39(Base):
         # 离开上帝机 / 目标被删了都要自动放手
         self.assertIn("if _gk_god_possess != null:", text)
         self.assertIn("放开附身", text)
+
+    def test_possess_camera_collides_with_walls(self):
+        """附身后的相机必须**走碰撞**,不能穿墙(第 124 轮用户实测)。
+
+        用户原话:"在附身游戏Ai上摄像机会穿墙,这个之前在角色的摄像机修改过"。
+        原来的写法是把相机**纯位置赋值**到角色身后 5 米 —— 贴墙时那 5 米就
+        落到墙外/墙里。角色的弹簧臂早就修过(枢轴->想要的位置打射线,撞到
+        就把相机拉到撞点前面),附身这条路当时漏了。
+
+        这条测试锁四件事:
+          1. 有一个带碰撞的落位函数,begin 和 tick 都走它;
+          2. 真的打射线(不是写死距离);
+          3. 排除了**身体自己**的 RID(不排除的话射线在枢轴处就命中自己);
+          4. 有最短臂长 + 天花板兜底。
+        """
+        text = self._env()
+        self.assertIn("func _gk_possess_cam_place(body: Node3D) -> Vector3:", text)
+        # begin / tick 都得走这个函数(不能一处带碰撞一处不带)
+        self.assertEqual(text.count("_gk_possess_cam_place("), 3,
+                         "begin / tick 各调一次 + 定义一次,共 3 处")
+        self.assertIn("intersect_ray", text)
+        self.assertIn("_gk_exclude.append((body as CollisionObject3D).get_rid())",
+                      text)
+        self.assertIn("_GK_POSSESS_ARM_MIN", text)
+        self.assertIn("_gk_ceil_y", text)
+        # ⚠ 不许出现"把相机也排除"的写法:`Camera3D is CollisionObject3D`
+        #   是 GDScript 静态错误,整份脚本会加载不了(真机踩过)
+        self.assertNotIn("_gk_god_cam is CollisionObject3D", text)
+        self.assertNotIn("(_gk_god_cam as CollisionObject3D)", text)
 
     def test_esc_quits_and_yields_to_pause_menu(self):
         """内置 ESC 退出 —— 暂停菜单没占着 Esc 时才生效。"""
@@ -12528,7 +12744,14 @@ class TestRound49Environment(Base):
             env_fog_density=0.02,
             env_glow=False, env_glow_intensity=0.8, env_glow_bloom=0.1,
             env_tonemap="LINEAR", env_adjust=False,
-            env_brightness=1.0, env_contrast=1.0, env_saturation=1.0)
+            env_brightness=1.0, env_contrast=1.0, env_saturation=1.0,
+            # 第 124 轮的高影响键(默认值全部 = Godot 出厂值,包括 fog 那个)
+            env_fog_sky_affect=1.0, env_fog_light_energy=1.0,
+            env_fog_aerial_perspective=0.0,
+            env_glow_strength=1.0, env_glow_threshold=1.0,
+            env_glow_blend="SCREEN",
+            env_tonemap_exposure=1.0, env_tonemap_white=1.0,
+            env_ambient_sky_contribution=1.0)
         values.update(overrides)
         return types.SimpleNamespace(gk_settings=types.SimpleNamespace(**values))
 
@@ -12617,7 +12840,13 @@ class TestRound49Environment(Base):
                      "env_fog_color", "env_fog_density", "env_glow",
                      "env_glow_intensity", "env_glow_bloom", "env_tonemap",
                      "env_adjust", "env_brightness", "env_contrast",
-                     "env_saturation"):
+                     "env_saturation",
+                     # 第 124 轮的高影响键
+                     "env_fog_sky_affect", "env_fog_light_energy",
+                     "env_fog_aerial_perspective", "env_glow_strength",
+                     "env_glow_threshold", "env_glow_blend",
+                     "env_tonemap_exposure", "env_tonemap_white",
+                     "env_ambient_sky_contribution"):
             self.assertIn(name, annotations, name)
 
     def test_env_card_is_a_display_card(self):
@@ -12628,6 +12857,417 @@ class TestRound49Environment(Base):
         self.assertEqual(list(cls.gk_outputs), [])
         self.assertTrue(props.node_fits_tree(cls, "GKDisplayTree"))
         self.assertFalse(props.node_fits_tree(cls, "GKGameLogicTree"))
+
+
+class TestRound124EnvHighImpactKeys(Base):
+    """第 124 轮:补上 Godot Environment 的**高影响键**(预览↔运行时对齐)。
+
+    病灶(真机实测,不是推测):导出器原先写的 19 个键**全是 Godot 默认值的
+    子集** —— 等于"导出的 Environment 和 Godot 新建一个一模一样",真正改变
+    画面的杠杆一个都没写。在示例走廊上逐项开关测出的帧均值亮度:
+        出厂 0.3803 / `fog_sky_affect=0` -> 0.3460 / `fog_light_energy=0.25`
+        -> 0.2599 / `glow_hdr_threshold=0 + glow_strength=3` -> 0.7247 /
+        `glow_enabled=false` -> 0.3547(说明默认泛光几乎是死的)。
+
+    ── 写法规矩(spec「第 124-a 号澄清」,唯一一条)────────────────────
+    **当且仅当"这个键在当前配置里真的有效"且"它的值 ≠ Godot 出厂值"
+    时才写。** 本类就锁这一条规矩的四个面(照 Lead 指定的四条,不锁行数):
+      1. 功能全关 + 全默认 -> 与改动前**逐字节一致**(铁律,见下面那张
+         从改动前的代码上实测抄下来的黄金文本);
+      2. 雾开着 -> 必含 `fog_sky_affect = 0.000000`(有意修 bug);
+      3. 每个新字段**改成非出厂值** -> 对应的键必须出现(旋钮够得着,
+         这条才是本轮真正要证明的东西);
+      4. 设回出厂值 -> 该键消失(不留"写了也没有任何效果"的噪音行)。
+    """
+
+    # ── 黄金文本:从**改动前**的 asset_export 上实测抄下来的 ──────────
+    # 这不是"照现在的实现回填"—— 是把 HEAD 版本的 asset_export.py 换个
+    # 目录跑同一组输入打印出来的原文,拷在这里当锚点。以后谁不小心让默认
+    # 配置多写一行,这张表会立刻红。
+    GOLDEN_COLOR_DEFAULT = (
+        '[sub_resource type="Environment" id="gk_environment"]\n'
+        'background_mode = 1\n'
+        'background_color = Color(0.247801, 0.271700, 0.349190, 1.000000)\n'
+        'ambient_light_source = 2\n'
+        'ambient_light_color = Color(0.735357, 0.797738, 0.906332, 1.000000)\n'
+        'ambient_light_energy = 0.500000\n'
+        'fog_enabled = false\n'
+        'fog_light_color = Color(0.583831, 0.618031, 0.679976, 1.000000)\n'
+        'fog_density = 0.020000\n'
+        'glow_enabled = false\n'
+        'glow_intensity = 0.800000\n'
+        'glow_bloom = 0.100000\n'
+        'tonemap_mode = 0\n'
+        'adjustment_enabled = false\n'
+        'adjustment_brightness = 1.000000\n'
+        'adjustment_contrast = 1.000000\n'
+        'adjustment_saturation = 1.000000\n'
+        '\n'
+        'ssao_enabled = false\n'
+        'ssil_enabled = false')
+    GOLDEN_SKY_DEFAULT = (
+        '[sub_resource type="Environment" id="gk_environment"]\n'
+        'background_mode = 2\n'
+        'background_color = Color(0.247801, 0.271700, 0.349190, 1.000000)\n'
+        # ⚠ 第一百四十轮改成 2(Color):这份样例的『环境光强度』= 0.5(非 0),
+        #   而 Godot 在 Sky 模式下**忽略** ambient_light_color / energy ——
+        #   用户的『环境光』会静默失效(他的原话:"有一部分没作用")。
+        #   现在规则是"强度 > 0 就用 Color",预览那边逐字对齐。
+        'ambient_light_source = 2\n'
+        'ambient_light_color = Color(0.735357, 0.797738, 0.906332, 1.000000)\n'
+        'ambient_light_energy = 0.500000\n'
+        'fog_enabled = false\n'
+        'fog_light_color = Color(0.583831, 0.618031, 0.679976, 1.000000)\n'
+        'fog_density = 0.020000\n'
+        'glow_enabled = false\n'
+        'glow_intensity = 0.800000\n'
+        'glow_bloom = 0.100000\n'
+        'tonemap_mode = 0\n'
+        'adjustment_enabled = false\n'
+        'adjustment_brightness = 1.000000\n'
+        'adjustment_contrast = 1.000000\n'
+        'adjustment_saturation = 1.000000\n'
+        'sky = SubResource("gk_sky")\n'
+        'ssao_enabled = false\n'
+        'ssil_enabled = false')
+
+    @staticmethod
+    def _scene(**overrides):
+        values = dict(
+            env_enabled=True, env_background="COLOR", dimension="3",
+            env_bg_color=(0.05, 0.06, 0.10, 1.0),
+            env_ambient_color=(0.5, 0.6, 0.8, 1.0), env_ambient_energy=0.5,
+            env_fog=False, env_fog_color=(0.3, 0.34, 0.42, 1.0),
+            env_fog_density=0.02,
+            env_glow=False, env_glow_intensity=0.8, env_glow_bloom=0.1,
+            env_tonemap="LINEAR", env_adjust=False,
+            env_brightness=1.0, env_contrast=1.0, env_saturation=1.0,
+            env_fog_sky_affect=1.0, env_fog_light_energy=1.0,
+            env_fog_aerial_perspective=0.0,
+            env_glow_strength=1.0, env_glow_threshold=1.0,
+            env_glow_blend="SCREEN",
+            env_tonemap_exposure=1.0, env_tonemap_white=1.0,
+            env_ambient_sky_contribution=1.0)
+        values.update(overrides)
+        return types.SimpleNamespace(gk_settings=types.SimpleNamespace(**values))
+
+    def _extra(self, **overrides):
+        """只取新增那几行的文本(空串 = 与改动前逐字节一致)。"""
+        from BlenderGameKit import asset_export as ae
+        return ae._env_extra_lines(ae.env_settings(self._scene(**overrides)))
+
+    def _sub(self, **overrides):
+        from BlenderGameKit import asset_export as ae
+        return ae.environment_scene_blocks(self._scene(**overrides))[0][-1]
+
+    # ---- ① 铁律:功能全关 + 全默认 -> 与改动前逐字节一致 ----------------
+    def test_all_off_is_byte_identical_to_before(self):
+        """雾关 / 泛光关 / LINEAR / 纯色 -> 输出与改动前**逐字节一致**。
+
+        (黄金文本见类头说明:从 HEAD 版 asset_export 实测抄来。)
+        """
+        self.assertEqual(self._extra(), "", "默认配置不许新增任何行")
+        self.assertEqual(self._sub(), self.GOLDEN_COLOR_DEFAULT)
+
+    def test_sky_default_is_byte_identical_to_before(self):
+        """天空背景 + 没动其它键:不写 `ambient_light_sky_contribution` 那些噪音行。
+
+        ⚠ 这一条容易踩:天空模式确实**是**这个键唯一有效的配置,但"有效"
+        不等于"必须写" —— 值 = 出厂值 1.0 时写了也没有任何效果,属于噪音行。
+        规则是两条一起满足才写。
+
+        ⚠ 第一百四十轮起 `ambient_light_source` 在"环境光强度 > 0"时是 **2**,
+        不再是 3 —— 见 `test_sky_background_honours_ambient_when_set`。
+        """
+        self.assertEqual(self._extra(env_background="SKY"), "")
+        self.assertEqual(self._sub(env_background="SKY"), self.GOLDEN_SKY_DEFAULT)
+
+    def test_tone_adjust_and_acestill_byte_identical(self):
+        """开着色调调整 + ACES(但没动白点)-> 那几个键也不许冒出来。"""
+        text = self._sub(env_tonemap="ACES", env_adjust=True,
+                         env_brightness=1.1, env_contrast=1.2,
+                         env_saturation=0.8)
+        self.assertIn("tonemap_mode = 3", text)
+        self.assertIn("adjustment_saturation = 0.800000", text)
+        for key in ("fog_sky_affect", "fog_light_energy", "fog_aerial_perspective",
+                    "glow_strength", "glow_hdr_threshold", "glow_blend_mode",
+                    "tonemap_exposure", "tonemap_white",
+                    "ambient_light_sky_contribution"):
+            self.assertNotIn(key, text, key)
+
+    # ---- ② 雾开着 + 显式把『雾盖背景』拧到 0 -> 才写 fog_sky_affect ----
+    def test_fog_sky_affect_written_when_opted_in(self):
+        """把『雾盖背景』拧到 0(非出厂值)-> 必写 `fog_sky_affect = 0.000000`。
+
+        Godot 出厂值是 1.0(雾色整个盖掉用户选的背景色、和 Blender 预览对不上),
+        所以我们**推荐** 0.0;但默认仍留 1.0 —— 一刀切成 0 会把恐怖示例整帧
+        压暗 70%(实测 0.1422 -> 0.0434),违背"老示例观感不变"那条铁律。
+        所以这条锁的是"**显式**拧到 0 就必须落地"(旋钮够得着),而不是
+        "默认就替你改"。
+        """
+        text = self._sub(env_fog=True, env_fog_sky_affect=0.0)
+        self.assertIn("fog_sky_affect = 0.000000", text)
+        # 另两个雾键值还在出厂值上 -> 不许写(噪音)
+        self.assertNotIn("fog_light_energy", text)
+        self.assertNotIn("fog_aerial_perspective", text)
+
+    def test_fog_on_with_factory_sky_affect_writes_nothing(self):
+        """雾开着但『雾盖背景』还在出厂值 1.0 -> **不写**(老项目产物不变)。
+
+        这条就是"老工程/老示例逐字节不变"的具体体现:新键只在用户真的拧过
+        那个旋钮之后才出现在 .tscn 里。
+        """
+        self.assertEqual(self._extra(env_fog=True), "")
+
+    def test_fog_off_writes_no_fog_keys_even_if_knobs_moved(self):
+        """雾关着 -> 三个雾键一个都不写(**即使**值被拧离了出厂值)。
+
+        理由:雾关着时 Godot 根本不读它们 —— 写了就是"在 .tscn 里留一行
+        谁也不看的数",用户翻产物会以为自己调的东西生效了。
+        """
+        text = self._extra(env_fog_light_energy=0.25,
+                           env_fog_aerial_perspective=0.5,
+                           env_fog_sky_affect=1.0)
+        self.assertEqual(text, "")
+
+    # ---- ③ 每个新字段改成非出厂值 -> 对应键必须出现(旋钮够得着)--------
+    def test_every_new_knob_reaches_the_tscn(self):
+        """**本轮最重要的一条**:每个新旋钮拧离出厂值 -> 产物里必须看到它。
+
+        以前这批键"够不着"就是因为导出器不写;这条测试是那个病的直接解药。
+        """
+        cases = (
+            # (改动, 该出现的那一行)
+            (dict(env_fog=True, env_fog_light_energy=0.25),
+             "fog_light_energy = 0.250000"),
+            (dict(env_fog=True, env_fog_aerial_perspective=0.7),
+             "fog_aerial_perspective = 0.700000"),
+            (dict(env_glow=True, env_glow_strength=3.0),
+             "glow_strength = 3.000000"),
+            (dict(env_glow=True, env_glow_threshold=0.0),
+             "glow_hdr_threshold = 0.000000"),
+            (dict(env_glow=True, env_glow_blend="ADDITIVE"),
+             "glow_blend_mode = 0"),
+            (dict(env_tonemap_exposure=2.0),
+             "tonemap_exposure = 2.000000"),
+            (dict(env_tonemap="ACES", env_tonemap_white=0.8),
+             "tonemap_white = 0.800000"),
+            (dict(env_background="SKY", env_ambient_sky_contribution=0.25),
+             "ambient_light_sky_contribution = 0.250000"),
+        )
+        for overrides, needle in cases:
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self._sub(**overrides))
+
+    def test_exposure_is_reachable_with_everything_else_off(self):
+        """曝光是**全局**的:雾关 + 泛光关 + LINEAR 时也必须落地。
+
+        它是唯一一个"不挂在任何功能开关上"的新键 —— 因为它影响画面不需要
+        任何功能先打开。要是照"功能开着才写"实现,用户在默认项目里调曝光
+        就永远是空转(典型的"哑旋钮")。
+        """
+        text = self._extra(env_tonemap_exposure=1.5)
+        self.assertEqual(text, "tonemap_exposure = 1.500000\n")
+        self.assertIn("tonemap_exposure = 1.500000", self._sub(env_tonemap_exposure=1.5))
+
+    def test_every_glow_blend_name_maps_to_godot_enum(self):
+        """5 档混合模式逐个拧一遍 -> 写成 Godot 的 0..4。"""
+        from BlenderGameKit import asset_export as ae
+        for name, number in ae.ENV_GLOW_BLENDS.items():
+            with self.subTest(blend=name):
+                if name == "SCREEN":            # 出厂值 -> 不写
+                    self.assertEqual(self._extra(env_glow=True,
+                                                 env_glow_blend=name), "")
+                    continue
+                self.assertIn(f"glow_blend_mode = {number}",
+                              self._extra(env_glow=True, env_glow_blend=name))
+
+    def test_enum_matches_properties_order(self):
+        """`ENV_GLOW_BLENDS` 的顺序 / 取值 = properties 里枚举项的顺序 / 下标。
+
+        (和 ENV_BACKGROUND_MODES / ENV_TONEMAP_MODES 同一套规矩:两处各写
+        一份会飘掉,飘掉就是"面板上选柔光、游戏里按替换跑"。)
+        """
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import properties as props
+        order = [item[0] for item in props.ENV_GLOW_BLENDS]
+        self.assertEqual(order, list(ae.ENV_GLOW_BLENDS))
+        self.assertEqual(list(ae.ENV_GLOW_BLENDS.values()),
+                         list(range(len(order))))
+        self.assertEqual(order[ae.ENV_GLOW_BLENDS["SCREEN"]], "SCREEN")
+
+    def test_unknown_glow_blend_falls_back_to_screen(self):
+        """枚举值非法(老文件 / 手改属性)-> 回退滤色,不能 KeyError 崩导出。"""
+        from BlenderGameKit import asset_export as ae
+        values = ae.env_settings(self._scene(env_glow_blend="NOPE"))
+        self.assertEqual(values["glow_blend"], "SCREEN")
+
+    # ---- ④ 设回出厂值 -> 该键消失(噪音不落地)-------------------------
+    def test_knobs_back_at_factory_write_nothing(self):
+        """把每个新字段设成**出厂值** -> 一行都不写(噪音不落地)。
+
+        ⚠ 9 个键的默认值**全部**等于 Godot 出厂值(包括 `fog_sky_affect` = 1.0,
+          见上面那条测试的说明)—— 所以"全默认"就等于"一行都不写",
+          老项目 / 老示例的产物与观感都不变。
+        """
+        self.assertEqual(self._extra(env_glow=True, env_glow_strength=1.0,
+                                     env_glow_threshold=1.0,
+                                     env_glow_blend="SCREEN"), "")
+        self.assertEqual(self._extra(env_tonemap_exposure=1.0), "")
+        self.assertEqual(self._extra(env_tonemap="AGX", env_tonemap_white=1.0), "")
+        self.assertEqual(self._extra(env_background="SKY",
+                                     env_ambient_sky_contribution=1.0), "")
+        # 雾开着 + 雾键全在出厂值 -> 一行都不写
+        self.assertEqual(self._extra(env_fog=True), "")
+        self.assertEqual(
+            self._extra(env_fog=True, env_fog_sky_affect=1.0,
+                        env_fog_light_energy=1.0,
+                        env_fog_aerial_perspective=0.0), "")
+
+    def test_tonemap_white_needs_non_linear(self):
+        """白点:**LINEAR 下不写**(Godot 忽略它),非 LINEAR 才跟着值走。"""
+        self.assertEqual(self._extra(env_tonemap="LINEAR", env_tonemap_white=0.5), "")
+        self.assertEqual(self._extra(env_tonemap="AGX", env_tonemap_white=0.5),
+                         "tonemap_white = 0.500000\n")
+        self.assertEqual(self._extra(env_tonemap="AGX"), "")
+
+    def test_sky_contribution_needs_sky_background(self):
+        """天空参与环境光:**只在天空模式下写**(纯色模式下实测无效)。"""
+        self.assertEqual(self._extra(env_background="COLOR",
+                                     env_ambient_sky_contribution=0.4), "")
+        self.assertEqual(self._extra(env_background="SKY",
+                                     env_ambient_sky_contribution=0.4),
+                         "ambient_light_sky_contribution = 0.400000\n")
+
+    def test_missing_new_fields_fall_back(self):
+        """老 .blend 里没有这些字段 -> 用默认值,且不崩(向后兼容)。
+
+        场景对象上**完全没有**第 124 轮那批属性时,导出必须照旧工作 ——
+        默认值 = 出厂值,所以产物仍然与改动前一致。
+        """
+        from BlenderGameKit import asset_export as ae
+        values = dict(
+            env_enabled=True, env_background="COLOR", dimension="3",
+            env_bg_color=(0.05, 0.06, 0.10, 1.0),
+            env_ambient_color=(0.5, 0.6, 0.8, 1.0), env_ambient_energy=0.5,
+            env_fog=False, env_fog_color=(0.3, 0.34, 0.42, 1.0),
+            env_fog_density=0.02,
+            env_glow=False, env_glow_intensity=0.8, env_glow_bloom=0.1,
+            env_tonemap="LINEAR", env_adjust=False,
+            env_brightness=1.0, env_contrast=1.0, env_saturation=1.0)
+        scene = types.SimpleNamespace(
+            gk_settings=types.SimpleNamespace(**values))
+        self.assertEqual(
+            ae.environment_scene_blocks(scene)[0][-1], self.GOLDEN_COLOR_DEFAULT)
+        # 连 gk_settings 都是空的极端情况也不能炸
+        self.assertEqual(
+            ae.environment_scene_blocks(types.SimpleNamespace())[0][-1]
+            if ae.environment_scene_blocks(types.SimpleNamespace())[0] else "",
+            "")
+
+    def test_zone_keys_and_fallback_cover_new_fields(self):
+        """区域环境点那套键(zone_data)也必须跟上新字段,且兜底值对齐。
+
+        `ENV_ZONE_KEYS` 的注释写着"键顺序固定"(比对旧产物);新键**追加在
+        末尾**,老前缀一字不动。这里的断言同时钉住"9 个新键都在"和"兜底值
+        = 场景字段默认值"(否则『环境_应用预设』和区域环境点会切出两套氛围)。
+        """
+        from BlenderGameKit import asset_export as ae
+        for key in ("fog_sa", "fog_le", "fog_ap", "glow_s", "glow_t", "glow_m",
+                    "tm_e", "tm_w", "amb_sky"):
+            self.assertIn(key, ae.ENV_ZONE_KEYS, key)
+            self.assertIn(key, ae.ENV_ZONE_FALLBACK, key)
+        # 老键必须还在**原来的位置**(append 到末尾,不是插进中间)
+        self.assertEqual(ae.ENV_ZONE_KEYS[:14],
+                         ("bg_mode", "bg", "amb", "amb_e", "fog", "fog_c",
+                          "fog_d", "glow", "glow_i", "glow_b", "adjust", "br",
+                          "ct", "sat"))
+        # 9 项兜底值 = 场景字段默认值 = Godot 出厂值(全默认就不写,噪音不落地)
+        self.assertEqual(ae.ENV_ZONE_FALLBACK["fog_sa"], 1.0)
+        self.assertEqual(ae.ENV_ZONE_FALLBACK["fog_le"], 1.0)
+        self.assertEqual(ae.ENV_ZONE_FALLBACK["glow_m"], 1)
+        self.assertEqual(ae.ENV_ZONE_FALLBACK["tm_w"], 1.0)
+        self.assertEqual(ae.ENV_ZONE_FALLBACK["amb_sky"], 1.0)
+        # zone_data 字面量里 glow_m 必须是 int(写成 1.0 GDScript 会炸)
+        literal = ae._gd_zone_dict({"glow_m": 3, "bg_mode": 1})
+        self.assertIn('"glow_m": 3', literal)
+        self.assertNotIn('"glow_m": 3.0', literal)
+
+    def test_zone_script_applies_new_keys(self):
+        """生成给 Godot 的区域脚本要**真的**应用 / 快照这 9 个键。
+
+        以前"区域里进了雾但走出去没还原"就是因为快照少了键 —— 新键必须
+        同时出现在 `_values_of`(快照)和 `_apply`(应用)里。
+        """
+        from BlenderGameKit import asset_export as ae
+        for attr in ("fog_sky_affect", "fog_light_energy",
+                     "fog_aerial_perspective", "glow_strength",
+                     "glow_hdr_threshold", "glow_blend_mode",
+                     "tonemap_exposure", "tonemap_white",
+                     "ambient_light_sky_contribution"):
+            self.assertIn(f"env.{attr}", ae.ENV_ZONES_SCRIPT, attr)
+        for key in ("fog_sa", "fog_le", "fog_ap", "glow_s", "glow_t", "glow_m",
+                    "tm_e", "tm_w", "amb_sky"):
+            self.assertIn(f'"{key}":', ae.ENV_ZONES_SCRIPT, key)
+
+    def test_preset_fields_exist_and_map(self):
+        """`GKEnvPreset` 上挂了 9 个 `p_*` 字段(预设才带得动新参数)。"""
+        from BlenderGameKit import properties as props
+        annotations = props.GKEnvPreset.__annotations__ or {}
+        for name in ("p_fog_sky_affect", "p_fog_light_energy", "p_fog_aerial",
+                     "p_glow_strength", "p_glow_threshold", "p_glow_blend",
+                     "p_tonemap_exposure", "p_tonemap_white", "p_ambient_sky"):
+            self.assertIn(name, annotations, name)
+
+    def test_env_preset_node_applies_new_keys(self):
+        """『环境_应用预设』节点:字典里带新键,helper 里也真的应用它们。"""
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeEnvPreset, "环境", gk_preset="恐怖夜")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, dict(dimension="3", base_class="CharacterBody3D"))
+        self.assertEqual(warnings, [], warnings)
+        # 字典字面量(恐怖夜没给 fog_sa -> 用出厂兜底值 1.0)
+        for fragment in ('"fog_sa": 1.0', '"fog_le": 1.0', '"fog_ap": 0.0',
+                         '"glow_s": 1.0', '"glow_t": 1.0', '"glow_m": 1',
+                         '"tm_e": 1.0', '"tm_w": 1.0', '"amb_sky": 1.0'):
+            self.assertIn(fragment, code, fragment)
+        # helper 里逐项应用(用 data.get(键, 默认值))
+        for key, default in (("fog_sa", "1.0"), ("fog_le", "1.0"),
+                             ("fog_ap", "0.0"), ("glow_s", "1.0"),
+                             ("glow_t", "1.0"), ("glow_m", "1"),
+                             ("tm_e", "1.0"), ("tm_w", "1.0"),
+                             ("amb_sky", "1.0")):
+            self.assertIn(f'data.get("{key}", {default})', code,
+                          f"{key}: helper 没应用它")
+        self.assert_indent_sane(code)
+
+    def test_env_preset_node_maps_blend_to_int(self):
+        """预设里选『替换』-> 生成的是 Godot 的 int 3(不是 3.0)。
+
+        ⚠ 这里**不**走 `properties.env_preset_library()`:离线桩的 `bpy.data`
+        是个 SimpleNamespace,没有 `node_groups`(真机才跑得通)。所以直接
+        喂一个假预设对象给映射函数 —— 那正是节点生成时用的那一层。
+        文件级预设库那条路(oracle)由 `tests/blender_env_presets.py` 在真
+        Blender 里覆盖。
+        """
+        from BlenderGameKit.codegen import statements
+        for name, number in (("ADDITIVE", 0), ("SCREEN", 1), ("SOFTLIGHT", 2),
+                             ("REPLACE", 3), ("MIX", 4)):
+            with self.subTest(blend=name):
+                fake = types.SimpleNamespace(p_glow_blend=name)
+                self.assertEqual(statements._env_glow_blend_value(fake), number)
+                self.assertIsInstance(
+                    statements._env_glow_blend_value(fake), int,
+                    "必须是 int —— 写成 3.0 赋给 glow_blend_mode,GDScript 会炸")
+        # 脏值 / 缺属性 -> 回退滤色(1),不许崩
+        self.assertEqual(statements._env_glow_blend_value(
+            types.SimpleNamespace(p_glow_blend="NOPE")), 1)
+        self.assertEqual(statements._env_glow_blend_value(
+            types.SimpleNamespace(p_glow_blend="")), 1)
+        self.assertEqual(statements._env_glow_blend_value(
+            types.SimpleNamespace()), 1)
 
 
 class TestRound43Assets(Base):
@@ -19139,14 +19779,35 @@ class TestRound97AmbientSource(Base):
         self.assertNotIn("sky =", text)
 
     def test_sky_background_uses_sky_source(self):
+        """天空背景 + 环境光强度 = 0 -> 拿天空当环境光(source = 3)。
+
+        ⚠ 第一百四十轮改了规则:**用户填了『环境光强度』(> 0)就用 Color** ——
+        Godot 在 Sky 模式下会**完全忽略** `ambient_light_color / energy`,
+        于是用户调了半天的环境光在游戏里一个字都不生效(他的原话:
+        "游戏环境与后期的效果有一部分没作用?")。强度为 0 时才走 Sky。
+        见另一条 `test_ambient_energy_zero_keeps_sky_source`。
+        """
         from BlenderGameKit import asset_export as ae
-        blocks, _node = ae.environment_scene_blocks(
-            self._scene(env_background="SKY"))
+        scene = self._scene(env_background="SKY")
+        scene.gk_settings.env_ambient_energy = 0.0
+        blocks, _node = ae.environment_scene_blocks(scene)
         text = "".join(blocks)
         self.assertIn("background_mode = 2", text)
         self.assertIn("ambient_light_source = 3", text,
-                      "有天空时才该拿天空当环境光")
+                      "环境光强度 = 0(没让人工补光)才该拿天空当环境光")
         self.assertIn("sky = SubResource(", text)
+
+    def test_sky_background_honours_ambient_when_set(self):
+        """天空背景 + 环境光强度 > 0 -> 必须用 Color(否则用户的值被忽略)。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(env_background="SKY")
+        scene.gk_settings.env_ambient_energy = 0.3
+        blocks, _node = ae.environment_scene_blocks(scene)
+        text = "".join(blocks)
+        self.assertIn("ambient_light_source = 2", text,
+                      "填了环境光强度就该用 Color —— Godot 在 Sky 模式下"
+                      "会忽略 ambient_light_color / energy")
+        self.assertIn("ambient_light_energy = 0.300000", text)
 
     def test_ambient_source_covers_every_background(self):
         """背景模式每多一种,环境光来源都必须有对应项(不然会 KeyError)。"""
@@ -20432,14 +21093,113 @@ class TestRound105UiModal(Base):
 
         code = build("暂停菜单")
         self.assertIn("func _gk_ui_raise(widget: Control) -> void:", code)
-        body = self.functions(code)["_gk_apply_pause"]
-        self.assertIn("widget.visible = paused", body)
-        self.assertIn("if paused:", body)
+        # 第一百三十四轮把"菜单这一层"抽成了 `_gk_pause_menu_show(open, menu)`:
+        # 剧情冻着的时候,玩家按 Esc / 点『继续游戏』只该开关这一层,
+        # 不能顺手把剧情解冻。置顶 / 显隐 / 压暗都跟着搬到了那个函数里。
+        body = self.functions(code)["_gk_pause_menu_show"]
+        self.assertIn("widget.visible = open", body)
+        self.assertIn("if open:", body)
         self.assertIn("_gk_ui_raise(widget)", body)
+        # `_gk_apply_pause` 仍然是"冻世界 + 叫一下菜单那一层"
+        apply_body = self.functions(code)["_gk_apply_pause"]
+        self.assertIn("tree.paused = paused", apply_body)
+        self.assertIn("_gk_pause_menu_show(paused, menu)", apply_body)
+        # 剧情冻着时带着菜单名来的"解冻"请求 = 只收菜单(别解剧情)
+        self.assertIn("_gk_story_is_frozen()", apply_body)
 
         # 没填菜单 = 没有面板要置顶(老行为:那一整段都不生成)
         plain = build("")
         self.assertNotIn("_gk_ui_raise", plain)
+
+    def test_esc_during_story_freeze_does_not_unfreeze(self):
+        """剧情冻着时按 Esc:只开菜单,**不许解冻剧情**(第一百三十四轮)。
+
+        真机现象(用户截图 + 原话"暂停时也可以进行剧情选择,并且不会冻结
+        时间"):过场 / 对话 / 结局是图里用 `_gk_apply_pause(true, "", ...)`
+        冻的世界,而玩家菜单也用同一个 `tree.paused` —— 于是 Esc 那一下
+        `not tree.paused` 算出来是 false,**把剧情解冻了**:世界跑起来、
+        选择框照样能点。
+        修法:把"这一下是世界被**剧情**冻的"记在 **SceneTree 的 meta** 上
+        (冻世界的是这一关的逻辑图,读 Esc 的往往是主界面那份脚本 ——
+        各记各的账等于没记),Esc 改成"只开关菜单那一层";
+        菜单里点『继续游戏』(带菜单名的解冻请求)在剧情冻着时也只收菜单。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        pause = tree.new_node(NN.GKNodeUiPauseGame, "暂停热键",
+                              gk_pause=True, gk_menu="暂停菜单", gk_hotkey=True)
+        gk_stub.connect(tree, event, "执行", pause, "执行")
+        code = gen(tree, V3)[0]
+        self.assertIn('tree.set_meta("gk_story_frozen", frozen)', code)
+        self.assertIn('bool(tree.get_meta("gk_story_frozen", false))', code)
+        watch = self.functions(code)["_gk_pause_watch"]
+        self.assertIn("if _gk_story_is_frozen() and tree.paused:", watch)
+        self.assertIn("_gk_pause_menu_show(not _gk_pause_menu_open", watch)
+        apply_body = self.functions(code)["_gk_apply_pause"]
+        # 图里那一路(menu 空)记账
+        self.assertIn("    if menu == \"\":", apply_body)
+        self.assertIn("        _gk_set_story_frozen(paused)", apply_body)
+        # 剧情冻着时,带菜单名的"解冻"只收菜单
+        self.assertIn("elif not paused and _gk_story_is_frozen():", apply_body)
+        menu_body = self.functions(code)["_gk_pause_menu_show"]
+        self.assertIn("_gk_pause_menu_open = open", menu_body)
+
+    def test_transient_resume_waits_for_cooldown(self):
+        """收起暂停菜单后,剧情面板要**等冷却**才放回来(第一百三十五轮)。
+
+        用户原话:"我建议是在打开 esc 后冷却几秒再显示剧情选项,这样就可以
+        避免,并且多次打开就多次重置冷却时间" —— 玩家点『继续游戏』时鼠标
+        往往正停在刚才那块地方,面板立刻回来会被下一击顺手点掉。
+        实现:令牌 + 一次性定时器(每次收 / 放都 +1 令牌,过期回调作废),
+        定时器用 `process_always = true`(收菜单时世界可能还冻着)。
+        """
+        self.assertIn("gk_resume_cooldown",
+                      [entry[0] for entry in NN.GKNodeUiPauseGame.gk_prop_defs])
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        pause = tree.new_node(NN.GKNodeUiPauseGame, "暂停热键",
+                              gk_pause=True, gk_menu="暂停菜单", gk_hotkey=True,
+                              gk_resume_cooldown=2.5)
+        # 必须有"过场控件"(这里用居中的文字,自动算过场)—— 没有它
+        # `need_transient_helper` 是 False,`_gk_hide_transient` 根本不生成。
+        card = tree.new_node(NN.GKNodeUiText, "章节卡", gk_text="第一章",
+                             gk_align="CENTER")
+        gk_stub.connect(tree, event, "执行", pause, "执行")
+        gk_stub.connect(tree, pause, "完成", card, "执行")
+        code = gen(tree, V3)[0]
+        self.assertIn("var _gk_pause_resume_cooldown: float = 2.5", code)
+        body = self.functions(code)["_gk_hide_transient"]
+        self.assertIn("_gk_transient_token += 1", body)
+        self.assertIn("maxf(_gk_pause_resume_cooldown, 0.0), true)", body)
+        self.assertIn("if token != _gk_transient_token:", body)
+
+    def test_mouse_follows_ui_not_the_cooldown(self):
+        """光标跟"界面上有没有要点的东西"走,**不跟着冷却走**(第一百三十七轮)。
+
+        用户原话:"这是界面之间的显示关系,鼠标的显示冷却不应该加上去的,
+        它只有有界面才显示,没有就隐藏,除非按住 alt 键。"
+        真机症状:连点 Esc 之后("菜单收起 + 过场面板还在冷却"的那一秒)
+        画面只剩一个鼠标 —— 因为旧代码只在"暂停/继续"时改光标模式。
+        修法:`_gk_mouse_sync()` 每次界面状态变化都重算(菜单那一层、
+        过场控件的收/放、冷却到点放回来的那一刻)。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        pause = tree.new_node(NN.GKNodeUiPauseGame, "暂停热键",
+                              gk_pause=True, gk_menu="暂停菜单", gk_hotkey=True)
+        card = tree.new_node(NN.GKNodeUiText, "章节卡", gk_text="第一章",
+                             gk_align="CENTER")
+        gk_stub.connect(tree, event, "执行", pause, "执行")
+        gk_stub.connect(tree, pause, "完成", card, "执行")
+        code = gen(tree, V3)[0]
+        sync = self.functions(code)["_gk_mouse_sync"]
+        self.assertIn("_gk_pause_menu_open or _gk_transient_visible()", sync)
+        hide = self.functions(code)["_gk_hide_transient"]
+        self.assertIn("_gk_mouse_sync(_gk_mouse_wanted)", hide)
+        menu = self.functions(code)["_gk_pause_menu_show"]
+        self.assertIn("_gk_mouse_sync(_gk_mouse_wanted)", menu)
+        apply_body = self.functions(code)["_gk_apply_pause"]
+        self.assertIn("_gk_mouse_wanted = show_mouse", apply_body)
 
     # ---- ④ 模态面板 ----
     def test_panel_new_switches_default_off(self):
@@ -21217,6 +21977,57 @@ class TestRound110ModifierKeysAndTyping(Base):
         self.assertIn("_gk_ui_root.process_mode = Node.PROCESS_MODE_ALWAYS",
                       code)
 
+    def _story_tree_with_pause(self, kind, name, props):
+        """『界面_暂停游戏』+ 故事面板 都有的最小图。
+
+        ⚠ 必须带暂停节点:`_gk_hide_transient`(和 `_gk_apply_pause` 里那句
+        调用)是**暂停 helper 那一节**发的,图里没有暂停节点就不会生成 ——
+        而真实工程里"收起来"这件事是**主界面脚本**干的(`gk_main_ui.gd`),
+        它按 Godot 组全局收,所以跨脚本也收得到故事面板。
+        """
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "准备")
+        pause = tree.new_node(NN.GKNodeUiPauseGame, "暂停热键",
+                              gk_pause=True, gk_menu="暂停菜单", gk_hotkey=True)
+        node = tree.new_node(kind, name, **props)
+        gk_stub.connect(tree, ready, "执行", pause, "执行")
+        gk_stub.connect(tree, pause, "完成", node, "执行")
+        return tree
+
+    def test_story_panels_yield_to_pause_menu(self):
+        """故事面板必须**让位**给暂停菜单(第一百三十四轮)。
+
+        真机现象(用户截图 + 原话"暂停时也可以进行剧情选择,并且不会冻结
+        时间"):按 Esc 弹出暂停菜单,底下的『选择框』还亮着,而界面根是
+        `PROCESS_MODE_ALWAYS` —— 点选项照样把剧情选下去。
+        修法:对话框 / 选择框 / 字幕 / 对话历史这四块**运行时**造出来的面板
+        全挂进 `gk_ui_transient` 组,暂停时 `_gk_hide_transient` 按组整批
+        收起、继续游戏原样还原(和用户摆的过场控件同一条路)。
+        """
+        tree = self._story_tree_with_pause(NN.GKNodeUiChoice, "选一个",
+                                           dict(gk_option_count=2,
+                                                gk_options="往前跑|先躲一下"))
+        code = gen(tree, V3)[0]
+        self.assertIn('_gk_choice_panel.add_to_group("gk_ui_transient")', code)
+        # helper + 暂停里那句调用都要在,否则"挂进组"就是死代码(没人收)
+        self.assertIn("func _gk_hide_transient(hide: bool) -> void:", code)
+        self.assertIn("_gk_hide_transient(true)", code)
+
+    def test_dialog_and_history_panels_yield_to_pause_menu(self):
+        cases = (
+            (NN.GKNodeUiDialog, "开场白",
+             {"gk_speaker": "我", "gk_text": "你好"},
+             '_gk_dialog_panel.add_to_group("gk_ui_transient")'),
+            (NN.GKNodeDialogHistory, "回顾", {},
+             '_gk_history_panel.add_to_group("gk_ui_transient")'),
+        )
+        for kind, name, props, needle in cases:
+            tree = self._story_tree_with_pause(kind, name, props)
+            code = gen(tree, V3)[0]
+            self.assertIn(needle, code, kind)
+            self.assertIn("func _gk_hide_transient(hide: bool) -> void:",
+                          code, kind)
+
     def test_alt_held_uses_physical_key_fallback(self):
         tree = make_tree()
         ready = tree.new_node(NN.GKNodeOnReady, "准备")
@@ -21414,6 +22225,783 @@ class TestRound131AiPauseWithGod(Base):
         self.assertEqual(warnings, [], warnings)
         self.assertNotIn(self.GUARD_HEAD, self._physics_block(code))
         self.assertNotIn("is CharacterBody3D", code)
+
+
+# ==========================================================================
+# 第 125 轮:游戏环境与后期(『游戏环境与后期』图 -> gk_post.gdshader)
+# ==========================================================================
+class _FakePostSocket:
+    def __init__(self, name):
+        self.name = name
+        self.links = []
+        self.is_linked = False
+
+
+class _FakePostNode:
+    """假的节点。
+
+    ⚠ `outputs` 必须是**列表**(`inputs` 是字典)—— 这不是随手定的:
+      * `_post_chain()` 是 `for socket in node.outputs` 再读 `socket.name`,
+        直接照 Blender 的集合语义写的。假节点要是给个字典,迭代到的是
+        **键(字符串)**,`getattr(名字, "name", "")` 拿到空串 -> 判定"没有
+        执行出口" -> 链子永远只有起点(第一版就是这么做红的);
+      * `_post_mask_of()` 用的是 `inputs.get("屏幕位置")`,所以那边要字典。
+    """
+    def __init__(self, bl_idname):
+        self.bl_idname = bl_idname
+        self.inputs = {}
+        self.outputs = []
+
+
+def _post_out_socket(node, name):
+    for socket in node.outputs:
+        if socket.name == name:
+            return socket
+    socket = _FakePostSocket(name)
+    node.outputs.append(socket)
+    return socket
+
+
+def _post_link(source, source_name, target, target_name):
+    """在假节点之间连一条线(source.outputs[x] -> target.inputs[y])。"""
+    out_socket = _post_out_socket(source, source_name)
+    in_socket = target.inputs.setdefault(target_name, _FakePostSocket(target_name))
+    link = types.SimpleNamespace(from_node=source, to_node=target,
+                                 from_socket=out_socket, to_socket=in_socket)
+    out_socket.links.append(link)
+    out_socket.is_linked = True
+    in_socket.links.append(link)
+    in_socket.is_linked = True
+
+
+class _FakePostTree:
+    def __init__(self, nodes):
+        self.nodes = list(nodes)
+
+
+class TestRound125EnvPost(unittest.TestCase):
+    """把『游戏环境与后期』图编成后期代码的那条链。
+
+    ── 这一批测试锁的是"没有图就不能改变产物" + "有图就真的编出来" ───
+    最重要的不是"生成得对不对"(那有端到端脚本量),而是**老工程不受影响**:
+    `_post_block()` 在图不存在 / 图上没卡时必须返回**空串**,否则模板里
+    那一行会多出内容,没画过图的工程产物就变了(本仓库的铁律)。
+    """
+
+    def _patch_graph(self, tree):
+        from BlenderGameKit import asset_export as ae
+        return mock.patch.object(ae, "_post_graph", return_value=tree)
+
+    def test_no_graph_means_empty_block(self):
+        """**铁律**:没有『游戏环境与后期』图 -> 后期块是空串。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(None):
+            self.assertEqual(ae._post_block(), "")
+            self.assertEqual(ae._post_chain(), [])
+
+    def test_graph_without_cards_is_empty(self):
+        """图建了但一张卡都没放 -> 还是空串(用户可能只是打开看过)。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(_FakePostTree([])):
+            self.assertEqual(ae._post_block(), "")
+
+    def test_block_has_no_braces(self):
+        """生成的 GDScript 里**不许有花括号** —— 它要过 `.format()`。
+
+        `ENVIRONMENT_SCRIPT.format(**fields)` 会把任何一个没配对的 `{`
+        当占位符,直接 KeyError / IndexError 炸导出,而且报错信息完全
+        指不到"是我在后期块里写了个字典"。这条把那个坑钉死。
+        """
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        grade = _FakePostNode("GKNodeEnvGrade")
+        _post_link(start, "执行", grade, "执行")
+        with self._patch_graph(_FakePostTree([start, grade])):
+            block = ae._post_block()
+        self.assertTrue(block)
+        self.assertEqual(block.count("{"), 0, block)
+        self.assertEqual(block.count("}"), 0, block)
+
+    def test_chain_follows_links_not_position(self):
+        """执行链按**连线**走,不按卡片在图上的坐标。
+
+        (按坐标排的话,用户把卡片拖一下顺序就变了 —— 而"顺序"在这套
+        设计里是语义,不是排版。)
+        """
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        grade = _FakePostNode("GKNodeEnvGrade")
+        eye = _FakePostNode("GKNodeEyeOpen")
+        _post_link(start, "执行", eye, "执行")      # 先接眼皮
+        _post_link(eye, "完成", grade, "执行")      # 再接色调
+        with self._patch_graph(_FakePostTree([grade, eye, start])):
+            chain = [n.bl_idname for n in ae._post_chain()]
+        self.assertEqual(chain, ["GKNodeEnvDefault", "GKNodeEyeOpen",
+                                 "GKNodeEnvGrade"])
+
+    def test_chain_stops_on_cycle(self):
+        """连成环也不能转不出来(手滑把出口接回入口是常见事)。"""
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        grade = _FakePostNode("GKNodeEnvGrade")
+        _post_link(start, "执行", grade, "执行")
+        _post_link(grade, "完成", start, "执行")     # 环
+        with self._patch_graph(_FakePostTree([start, grade])):
+            chain = ae._post_chain()
+        self.assertLessEqual(len(chain), ae._POST_CHAIN_LIMIT)
+
+    def test_mask_only_when_linked(self):
+        """『屏幕位置』没接线 -> 整屏(mask_on = 0)。
+
+        这是用户那个问题的答案:"连线-屏幕位置(整体?还是局部)" ——
+        **不接就是整屏,接了才局部**。
+        """
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        grade = _FakePostNode("GKNodeEnvGrade")
+        _post_link(start, "执行", grade, "执行")
+        with self._patch_graph(_FakePostTree([start, grade])):
+            block = ae._post_block()
+        self.assertIn('set_shader_parameter("mask_on", 0.0)', block)
+        self.assertNotIn("mask_invert", block)
+
+    def test_mask_params_land_when_linked(self):
+        """接了『屏幕位置』-> 蒙版参数全部落地(局部调色 / 暗角)。"""
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        grade = _FakePostNode("GKNodeEnvGrade")
+        mask = _FakePostNode("GKNodeScreenPos")
+        mask.gk_round = True
+        mask.gk_center = (0.5, 0.5, 0.0)
+        mask.gk_radius = 0.62
+        mask.gk_feather = 0.28
+        mask.gk_invert = True
+        _post_link(start, "执行", grade, "执行")
+        _post_link(mask, "屏幕位置", grade, "屏幕位置")
+        with self._patch_graph(_FakePostTree([start, grade, mask])):
+            block = ae._post_block()
+        self.assertIn('set_shader_parameter("mask_on", 1.0)', block)
+        self.assertIn('"mask_radius", 0.62', block)
+        self.assertIn('"mask_feather", 0.28', block)
+        self.assertIn("1.0 if true else 0.0", block)   # invert = 暗角
+
+    def test_eye_is_logic_triggered_by_default(self):
+        """睁眼默认**不自动播** —— 用户选的就是"只在逻辑图里被触发时才播"。
+
+        所以只有 AUTO 才生成 `_gk_post_auto_eye`;LOGIC 不生成。
+        """
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        eye = _FakePostNode("GKNodeEyeOpen")
+        eye.gk_trigger = "LOGIC"
+        eye.gk_duration = 1.6
+        eye.gk_slit = 0.06
+        eye.gk_hold = 0.0
+        eye.gk_color = (0.0, 0.0, 0.0, 1.0)
+        _post_link(start, "执行", eye, "执行")
+        with self._patch_graph(_FakePostTree([start, eye])):
+            logic = ae._post_block()
+        self.assertNotIn("_gk_post_auto_eye", logic)
+        self.assertIn("_gk_post_play_eye", logic)
+
+        eye.gk_trigger = "AUTO"
+        with self._patch_graph(_FakePostTree([start, eye])):
+            auto = ae._post_block()
+        self.assertIn("_gk_post_auto_eye", auto)
+
+    def test_trigger_node_calls_the_post_layer(self):
+        """『后期_播放睁眼』按**组**找后期层(不按节点名 —— 名字用户会改)。"""
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeEyeOpenPlay, "睁眼")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('get_first_node_in_group("gk_post")', code)
+        self.assertIn('has_method("_gk_post_play_eye")', code)
+
+    def test_trigger_node_duration_pin_overrides_card(self):
+        """『后期_播放睁眼』的『时长』引脚接上就盖过卡上的持续时间(第一百三十七轮)。
+
+        用户原话:"逻辑触发要加上逻辑节点引脚的" —— 以前这张逻辑卡
+        **没有引脚**,时长只能去『环境_睁眼效果』卡上改。
+        """
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(NN.GKNodeEyeOpenPlay, "睁眼")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        # 引脚默认 0 = 不填 -> 用卡上的值(老产物一行不变)
+        code, _ = gen(tree, V3)
+        self.assertIn("_gk_post_play_eye()", code)
+        self.assertNotIn("_gk_post_play_eye(float(", code)
+        # 填上 2.5 -> 走带参数那条路(桩节点的 inputs 是 list,按名字挑)
+        duration = [socket for socket in node.inputs
+                    if getattr(socket, "name", "") == "时长"][0]
+        duration.default_value = 2.5
+        code2, warnings2 = gen(tree, V3)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn("_gk_post_play_eye(float(2.5))", code2)
+
+    def test_eye_never_gets_stuck_closed(self):
+        """睁眼动画**不许把屏幕卡黑**(第一百三十九轮,用户真机踩到)。
+
+        症状(用户原话):"在预览状态下正常,但运行时却全黑了" ——
+        逐行查下来:过场会把世界冻住(`tree.paused = true`),而 GDScript 的
+        `create_tween()` 默认 `TWEEN_PAUSE_BOUND` 会**跟着暂停** ——
+        眼皮卡在『起始缝』(0.06)上 = 94% 黑。
+        所以这里钉两条:① tween 必须 `TWEEN_PAUSE_PROCESS`;
+        ② 必须有一个 `process_always = true` 的兜底定时器 + 令牌。
+        """
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        eye = _FakePostNode("GKNodeEyeOpen")
+        eye.gk_trigger = "AUTO"
+        eye.gk_duration = 1.6
+        eye.gk_slit = 0.06
+        eye.gk_hold = 0.0
+        eye.gk_color = (0.0, 0.0, 0.0, 1.0)
+        _post_link(start, "执行", eye, "执行")
+        with self._patch_graph(_FakePostTree([start, eye])):
+            lines = ae._post_graph_lines()
+        text = "\n".join(lines)
+        self.assertIn("set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)", text)
+        self.assertIn("_gk_post_eye_token", text)
+        # 兜底定时器:process_always 必须是 true(第二参)
+        self.assertIn("create_timer(2.0, true)", text)
+        self.assertIn("_gk_post_set_eye(1.0)", text)
+
+    def test_eye_scope_filters_scenes(self):
+        """『环境_睁眼效果』的作用域:全部关卡 / 只这一关(第一百三十七轮)。
+
+        用户原话:"在环境睁眼这,应该加上作用域是全部关卡还是单个"。
+        这张图是**文件级共享**的,所以"只给某一关"必须显式判断。
+        """
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        eye = _FakePostNode("GKNodeEyeOpen")
+        eye.gk_trigger = "LOGIC"
+        eye.gk_duration = 1.2
+        eye.gk_slit = 0.0
+        eye.gk_hold = 0.0
+        eye.gk_color = (0.0, 0.0, 0.0, 1.0)
+        _post_link(start, "执行", eye, "执行")
+        lobby = type("S", (), {"name": "大堂"})()
+        corridor = type("S", (), {"name": "走廊"})()
+
+        def has_eye(lines):
+            return any("_gk_post_play_eye" in line for line in lines)
+
+        eye.gk_scope = "ALL"                     # 默认:每关都装
+        with self._patch_graph(_FakePostTree([start, eye])):
+            self.assertTrue(has_eye(ae._post_graph_lines(lobby)))
+            self.assertTrue(has_eye(ae._post_graph_lines(corridor)))
+
+        eye.gk_scope = "ONE"
+        eye.gk_scene = "大堂"                     # 只给大堂
+        with self._patch_graph(_FakePostTree([start, eye])):
+            self.assertTrue(has_eye(ae._post_graph_lines(lobby)))
+            self.assertEqual(ae._post_graph_lines(corridor), [])
+
+        eye.gk_scene = ""                         # 名字没填 -> 哪一关都不装
+        with self._patch_graph(_FakePostTree([start, eye])):
+            self.assertEqual(ae._post_graph_lines(lobby), [])
+
+    def test_cards_belong_to_the_env_tree_only(self):
+        """四张环境卡只进『游戏环境与后期』图,不进游戏逻辑图。
+
+        (用户选的是"新建一张独立的图" —— 它们描述"这一局长什么样",
+        和角色行为是两回事;混进逻辑图会让菜单里多出一堆放错的卡。)
+        """
+        for name in ("GKNodeEnvDefault", "GKNodeScreenPos",
+                     "GKNodeEnvGrade", "GKNodeEyeOpen"):
+            cls = getattr(NN, name)
+            self.assertEqual(cls.gk_tree_type, "GKEnvLibraryTree", name)
+            self.assertEqual(cls.gk_category, "环境与后期", name)
+        # 触发卡反过来:它属于游戏逻辑树
+        self.assertEqual(NN.GKNodeEyeOpenPlay.gk_tree_type, "GKGameLogicTree")
+
+    def test_env_category_is_registered(self):
+        """新分类必须进 CATEGORY_ORDER,否则菜单里它排不上号。"""
+        self.assertIn("环境与后期", NN.CATEGORY_ORDER)
+
+
+class TestRound142EnvInterfaces(unittest.TestCase):
+    """月亮 + 天气 + 对外接口(第一百四十二轮,用户第 2 条)。
+
+    用户原话:"完善与设计,哪些变量需要,哪些条件逻辑需要,天空盒怎么添加,
+    云层怎么设置,太阳,月亮,昼夜交替节点怎么设计,怎么对外输出链接接口?"
+
+    这一批锁四件事:
+      ① 新卡都在、树类型对(月亮 / 天气属于环境图,读取/设置/切换属于逻辑图);
+      ② 月亮 / 天气的卡值真的编进常量;
+      ③ 环境脚本公开了 `_gk_env_*` 接口,而且挂进 `gk_env` 组;
+      ④ 逻辑图那几张卡按组找环境脚本、调对应方法;找不到就安静跳过。
+    """
+
+    def _patch_graph(self, tree):
+        from BlenderGameKit import asset_export as ae
+        return mock.patch.object(ae, "_post_graph", return_value=tree)
+
+    def _tree(self, *kinds, **props):
+        start = _FakePostNode("GKNodeEnvDefault")
+        previous = start
+        nodes = [start]
+        for kind in kinds:
+            node = _FakePostNode(kind)
+            for attr, value in props.get(kind, {}).items():
+                setattr(node, attr, value)
+            _post_link(previous, "执行", node, "执行")
+            nodes.append(node)
+            previous = node
+        return _FakePostTree(nodes)
+
+    def test_cards_are_in_the_right_trees(self):
+        env_cards = ("GKNodeMoon", "GKNodeWeather")
+        logic_cards = ("GKNodeEnvRead", "GKNodeEnvSetTime", "GKNodeEnvSetSpeed",
+                       "GKNodeEnvPause", "GKNodeEnvWeather")
+        for name in env_cards:
+            self.assertEqual(getattr(NN, name).gk_tree_type, "GKEnvLibraryTree", name)
+        for name in logic_cards:
+            self.assertEqual(getattr(NN, name).gk_tree_type, "GKGameLogicTree", name)
+
+    def test_moon_and_weather_values_reach_constants(self):
+        from BlenderGameKit import asset_export as ae
+        tree = self._tree(
+            "GKNodeSkyBox", "GKNodeMoon", "GKNodeWeather",
+            GKNodeMoon={"gk_moon_enabled": True, "gk_moon_energy": 0.45,
+                        "gk_moon_phase": 0.5, "gk_moon_orbit": True,
+                        "gk_moon_shadow": True},
+            GKNodeWeather={"gk_weather": "FOGGY"})
+        with self._patch_graph(tree):
+            block = ae._post_block()
+        for needle in ("_GK_MOON_ON := true", "_GK_MOON_ENERGY := 0.45",
+                       "_GK_MOON_PHASE := 0.5", "_GK_MOON_SHADOW := true",
+                       "_GK_WEATHER_START := 3", "_GK_WX_NAMES",
+                       "func _gk_daynight_make_moon", "moon_phase"):
+            self.assertIn(needle, block, needle)
+        self.assertEqual(block.count("{"), 0, block)
+
+    def test_env_script_exposes_the_api(self):
+        """环境脚本里要有 `_gk_env_*` 接口 + 进 `gk_env` 组。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree("GKNodeDayNight", "GKNodeMoon")):
+            block = ae._post_block()
+        for name in ("_gk_env_get_hour", "_gk_env_get_state",
+                     "_gk_env_get_is_day", "_gk_env_get_night",
+                     "_gk_env_get_weather", "_gk_env_set_time",
+                     "_gk_env_set_speed", "_gk_env_pause_clock",
+                     "_gk_env_set_weather"):
+            self.assertIn(f"func {name}", block, name)
+        self.assertIn("add_to_group(_GK_ENV_GROUP)", block)
+
+    def _logic_code(self, kind, **props):
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        node = tree.new_node(kind if isinstance(kind, type)
+                             else getattr(NN, kind), "卡", **props)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        return code
+
+    def test_read_card_writes_a_variable(self):
+        """『环境_读取』-> 按 gk_env 组找环境脚本,把值写进变量。"""
+        code = self._logic_code(NN.GKNodeEnvRead, gk_read_kind="HOUR",
+                                gk_var_name="现在几点")
+        self.assertIn('get_first_node_in_group("gk_env")', code)
+        self.assertIn("_gk_env_get_hour()", code)
+        self.assertIn("现在几点", code)
+
+    def test_read_card_kinds(self):
+        expected = {"STATE": "_gk_env_get_state()",
+                    "IS_DAY": "_gk_env_get_is_day()",
+                    "NIGHT": "_gk_env_get_night()",
+                    "WEATHER": "_gk_env_get_weather()"}
+        for kind, call in expected.items():
+            code = self._logic_code(NN.GKNodeEnvRead, gk_read_kind=kind,
+                                    gk_var_name="值")
+            self.assertIn(call, code, kind)
+
+    def test_hour_event_connects_to_the_env_script(self):
+        """『环境_当时间到』:按 gk_env 组找环境脚本、接整点信号、回调里判时刻。
+
+        (用户第 2 条:"哪些条件逻辑需要" —— 入夜熄灯这种要的是**整点事件**。)
+        """
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeEnvHourEvent, "入夜", gk_hour_target=19.0,
+                              gk_hour_daily=True)
+        printer = tree.new_node(NN.GKNodePrint, "熄灯")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('get_first_node_in_group("gk_env")', code)
+        self.assertIn("gk_hour_reached.is_connected(", code)
+        self.assertIn("gk_hour_reached.connect(", code)
+        self.assertIn("func _gk_on_env_hour", code)
+        self.assertIn("if hour != 19:", code)
+        # 每天重复(默认)时不该有"只触发一次"的锁
+        self.assertNotIn("_gk_env_hour_once", code)
+
+    def test_hour_event_can_fire_once(self):
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeEnvHourEvent, "入夜", gk_hour_target=7.0,
+                              gk_hour_daily=False)
+        printer = tree.new_node(NN.GKNodePrint, "一次")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("if hour != 7:", code)
+        self.assertIn("_gk_env_hour_once", code)
+
+    def test_env_script_emits_hour_signal(self):
+        """环境脚本要有整点信号 + 跨点补发的实现。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree("GKNodeDayNight")):
+            block = ae._post_block()
+        self.assertIn("signal gk_hour_reached(hour: int)", block)
+        self.assertIn("func _gk_env_emit_hours", block)
+        self.assertIn("_gk_env_emit_hours(before, _gk_dn_hour)", block)
+
+    def test_control_cards_call_the_api(self):
+        # ⚠ 『时刻 / 倍速』是**可调参数**(走 @export 变量),所以调用长这样:
+        #   _gk_env_set_time(env_hour) —— 不是字面量 19.5
+        cases = ((NN.GKNodeEnvSetTime, {"gk_hour": 19.5},
+                  "_gk_env_set_time(env_hour)"),
+                 (NN.GKNodeEnvSetSpeed, {"gk_speed": 3.0},
+                  "_gk_env_set_speed(env_speed)"),
+                 (NN.GKNodeEnvPause, {"gk_clock_action": "PAUSE"},
+                  "_gk_env_pause_clock(true)"),
+                 (NN.GKNodeEnvPause, {"gk_clock_action": "RESUME"},
+                  "_gk_env_pause_clock(false)"),
+                 (NN.GKNodeEnvWeather, {"gk_weather_set": "RAINY",
+                                           "gk_weather_fade": 1.5},
+                  '_gk_env_set_weather("RAINY", 1.5)'))
+        for cls, props, expected in cases:
+            tree = make_tree()
+            tree.bl_idname = "GKGameLogicTree"
+            event = tree.new_node(NN.GKNodeOnReady, "准备")
+            node = tree.new_node(cls, "卡", **props)
+            gk_stub.connect(tree, event, "执行", node, "执行")
+            code, warnings = gen(tree, V3)
+            self.assertEqual(warnings, [], warnings)
+            self.assertIn('get_first_node_in_group("gk_env")', code)
+            self.assertIn(expected, code)
+
+
+
+    """昼夜循环 + 天空盒 + 太阳 + 云层(第一百三十三轮,待办清单②)。
+
+    用户原话:"天空盒,时间流逝,昼夜交替,太阳,云层等这些还没有设计啊,
+    这些都可以添加到游戏环境与后期的右键菜单里,如随着时间流逝,从卡通
+    日间到卡通夜晚,当然这时间等可以自定义的"。
+
+    ── 这一批锁四条 ────────────────────────────────────────────────
+    ① **铁律**:图里没放这几张卡 -> `_post_block()` 与改动前逐字节一致
+       (空串;老工程产物不能变);
+    ② 放了就真的编出时间轴 / 太阳 / 天空 / 云那一套(不是只写个注释);
+    ③ 后期块 + 昼夜块**合流**时 `_enter_tree` 只能定义一次 ——
+       GDScript 同一个函数定义两次 = 整个环境脚本加载不了;
+    ④ 生成的文本里**不许有花括号**(它要过 `ENVIRONMENT_SCRIPT.format()`),
+       而且真的塞得进模板(跑一遍 `render_env_script` 不炸)。
+    """
+
+    def _patch_graph(self, tree):
+        from BlenderGameKit import asset_export as ae
+        return mock.patch.object(ae, "_post_graph", return_value=tree)
+
+    def _tree(self, *kinds, **props):
+        """起点 + 按顺序挂几张卡(都在执行流上)。"""
+        start = _FakePostNode("GKNodeEnvDefault")
+        previous = start
+        nodes = [start]
+        for kind in kinds:
+            node = _FakePostNode(kind)
+            for attr, value in props.get(kind, {}).items():
+                setattr(node, attr, value)
+            _post_link(previous, "执行", node, "执行")
+            nodes.append(node)
+            previous = node
+        return _FakePostTree(nodes)
+
+    def test_no_cards_keeps_the_old_product(self):
+        """铁律:一张卡都没有 -> 空串(与第一百二十五轮的行为一致)。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(None):
+            self.assertEqual(ae._post_block(), "")
+        with self._patch_graph(_FakePostTree([])):
+            self.assertEqual(ae._post_block(), "")
+
+    def test_daynight_block_has_no_braces_and_renders(self):
+        """生成的块不许有花括号,而且要真的能塞进环境脚本模板。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree("GKNodeSkyBox", "GKNodeClouds",
+                                          "GKNodeSun", "GKNodeDayNight")):
+            block = ae._post_block()
+        self.assertIn("_gk_daynight_setup", block)
+        self.assertEqual(block.count("{"), 0, block)
+        self.assertEqual(block.count("}"), 0, block)
+        # 真的渲染一遍:花括号 / 缺字段都会在这一步炸
+        rendered = ae.render_env_script(post_block=block)
+        self.assertIn("_gk_daynight_tick", rendered)
+
+    def test_sky_cards_emit_shader_parameters(self):
+        """天空盒 / 云层的值 -> 天空着色器的 uniform。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree(
+                "GKNodeSkyBox", "GKNodeClouds",
+                GKNodeSkyBox={"gk_sky_top": (0.1, 0.2, 0.3, 1.0),
+                              "gk_sun_size": 0.12,
+                              "gk_horizon_glow": 0.8},
+                GKNodeClouds={"gk_cloud_amount": 0.7, "gk_cloud_speed": 0.05,
+                              "gk_cloud_scale": 4.5})):
+            block = ae._post_block()
+        self.assertIn("const _GK_SKY_ON := true", block)
+        self.assertIn("const _GK_SKY_TOP := Color(0.100000, 0.200000, 0.300000, 1)", block)
+        self.assertIn("const _GK_SKY_SUN_SIZE := 0.12", block)
+        self.assertIn("const _GK_SKY_GLOW := 0.8", block)
+        self.assertIn("const _GK_CLOUD_ON := true", block)
+        self.assertIn("const _GK_CLOUD_AMOUNT := 0.7", block)
+        self.assertIn("const _GK_CLOUD_SPEED := 0.05", block)
+        self.assertIn("const _GK_CLOUD_SCALE := 4.5", block)
+        # 着色器文件要真的挂上(路径写在一个常量里,运行时 load)
+        self.assertIn('const _GK_SKY_SHADER := "res://shaders/gk_sky.gdshader"', block)
+        self.assertIn('set_shader_parameter("time_offset", _gk_dn_elapsed)', block)
+
+    def test_clouds_alone_still_open_the_sky(self):
+        """只放『云层』也要有地方画云 —— 自动打开程序化天空。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree("GKNodeClouds")):
+            block = ae._post_block()
+        self.assertIn("const _GK_SKY_ON := true", block)
+        self.assertIn("const _GK_CLOUD_ON := true", block)
+        # 没有昼夜卡 -> 时间轴不启用(天色 / 太阳照搬导出值)
+        self.assertIn("const _GK_DN_ENABLED := false", block)
+
+    def test_daynight_card_drives_time_and_sun(self):
+        """『昼夜循环』卡 -> 时间轴 + 太阳按时刻转 + 关键帧插值。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree(
+                "GKNodeSun", "GKNodeDayNight",
+                GKNodeDayNight={"gk_day_seconds": 60.0, "gk_start_hour": 6.5,
+                                "gk_keyframes": "0=夜晚|6=清晨|12=白天|18=黄昏"},
+                GKNodeSun={"gk_sun_name": "月光", "gk_sun_orbit": True,
+                           "gk_sun_scale": 0.5})):
+            block = ae._post_block()
+        self.assertIn("const _GK_DN_ENABLED := true", block)
+        self.assertIn("const _GK_DN_DAY_SECONDS := 60.0", block)
+        self.assertIn("const _GK_DN_START_HOUR := 6.5", block)
+        self.assertIn('const _GK_DN_KEYFRAMES := "0=夜晚|6=清晨|12=白天|18=黄昏"', block)
+        self.assertIn('const _GK_DN_SUN_NAME := "月光"', block)
+        self.assertIn("const _GK_DN_SUN_ORBIT := true", block)
+        self.assertIn("const _GK_DN_SUN_SCALE := 0.5", block)
+        # 内置氛围档(平行数组;不能用字典 —— 花括号会打乱 .format())
+        self.assertIn('const _GK_DN_PRESET_NAMES := ["夜晚", "清晨", "白天", "黄昏"]', block)
+        self.assertEqual(block.count("_GK_DN_PRESET_TOP :="), 1, block)
+        # 太阳真的转(角度由时刻算),影子方向跟着走
+        self.assertIn("_gk_dn_sun.rotation = Vector3(-elevation, yaw, 0.0)", block)
+        self.assertIn("_gk_daynight_physics", block)
+        self.assertIn("physics_frame.connect(_gk_daynight_physics)", block)
+
+    def test_post_and_daynight_share_one_enter_tree(self):
+        """后期块 + 昼夜块都在时,`_enter_tree` **只定义一次**。"""
+        from BlenderGameKit import asset_export as ae
+        grade = _FakePostNode("GKNodeEnvGrade")
+        daynight = _FakePostNode("GKNodeDayNight")
+        start = _FakePostNode("GKNodeEnvDefault")
+        _post_link(start, "执行", grade, "执行")
+        _post_link(grade, "完成", daynight, "执行")
+        with self._patch_graph(_FakePostTree([start, grade, daynight])):
+            block = ae._post_block()
+        self.assertEqual(block.count("func _enter_tree()"), 1, block)
+        self.assertIn("_gk_post_ready.call_deferred()", block)
+        self.assertIn("_gk_daynight_setup.call_deferred()", block)
+        # 真的渲染一遍(GDScript 定义两次在这一步也看不出来,靠上面那条钉)
+        self.assertIn("_gk_daynight_setup", ae.render_env_script(post_block=block))
+
+    def test_only_daynight_defines_its_own_enter_tree(self):
+        """只有昼夜那一块时,`_enter_tree` 由它自己定义(否则没人启动它)。"""
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree("GKNodeDayNight")):
+            block = ae._post_block()
+        self.assertEqual(block.count("func _enter_tree()"), 1, block)
+        self.assertIn("_gk_daynight_setup.call_deferred()", block)
+
+    def test_control_card_calls_the_env_script(self):
+        """『环境_昼夜设置』按**组**找到环境脚本再调它的方法。"""
+        tree = make_tree()
+        tree.bl_idname = "GKGameLogicTree"
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        pause = tree.new_node(NN.GKNodeDayNightSet, "天黑")
+        pause.gk_action = "PAUSE"
+        gk_stub.connect(tree, event, "执行", pause, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('get_first_node_in_group("gk_daynight")', code)
+        self.assertIn("_gk_daynight_pause(true)", code)
+
+        speed = tree.new_node(NN.GKNodeDayNightSet, "快进")
+        speed.gk_action = "SPEED"
+        speed.gk_value = 4.0
+        gk_stub.connect(tree, pause, "完成", speed, "执行")
+        code2, warnings2 = gen(tree, V3)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn("_gk_daynight_set_speed", code2)
+
+    def test_new_cards_belong_to_the_env_tree_only(self):
+        """四张新卡进『游戏环境与后期』图;控制卡反过来进玩法图。"""
+        from BlenderGameKit import properties as props
+        for name in ("GKNodeSkyBox", "GKNodeClouds", "GKNodeSun",
+                     "GKNodeDayNight"):
+            cls = getattr(NN, name)
+            self.assertEqual(cls.gk_tree_type, "GKEnvLibraryTree", name)
+            self.assertEqual(cls.gk_category, "环境与后期", name)
+            # ── 用户要的入口就在这张图的**右键菜单**里 ────────────────
+            # (第一百二十六轮那个 bug 就是这张图的菜单整个空掉:白名单漏了
+            #  `GKEnvLibraryTree`。新卡必须真的列得出来,不只是"能放"。)
+            self.assertTrue(props.node_menu_allowed(cls, "GKEnvLibraryTree"),
+                            name + " 应该出现在『游戏环境与后期』菜单里")
+        self.assertEqual(NN.GKNodeDayNightSet.gk_tree_type, "GKGameLogicTree")
+        self.assertEqual(NN.GKNodeDayNightSet.gk_category, "环境与后期")
+        self.assertTrue(
+            props.node_menu_allowed(NN.GKNodeDayNightSet, "GKGameLogicTree"))
+        # 天空着色器要**随包带**(copy_shaders 只挑 .gdshader,漏了就找不到)
+        from BlenderGameKit import asset_export as ae
+        shader = os.path.join(ae.shader_source_dir(), "gk_sky.gdshader")
+        self.assertTrue(os.path.isfile(shader), shader)
+        with open(shader, encoding="utf-8") as handle:
+            self.assertIn("shader_type sky", handle.read())
+
+
+class TestRound126LightOverride(unittest.TestCase):
+    """灯的『用这里的值导出』(第一百二十六轮)。
+
+    ── 这一批锁的是**老工程不能变** ─────────────────────────────────
+    用户要的是"精确调灯、不受 Blender 原生设置影响",但绝不能因此
+    改动没碰过的工程 —— 所以 `override` 关着时,`_light_energy_for`
+    必须**和以前一字不差**(点光 1000W ≈ 1.0 / 太阳 ×1.2)。
+    """
+
+    @staticmethod
+    def _lamp(kind="POINT", energy=9000.0, override=None):
+        light = types.SimpleNamespace(type=kind, energy=energy,
+                                      cutoff_distance=28.0,
+                                      color=(1.0, 1.0, 1.0),
+                                      use_shadow=True, spot_size=0.0,
+                                      shadow_soft_size=0.0, angle=0.0)
+        obj = types.SimpleNamespace(name="灯", data=light, matrix_world=None)
+        if override is not None:
+            obj.gk_light = override
+        return obj
+
+    def test_off_keeps_the_old_conversion(self):
+        """关着 = 老换算(点光 ÷1000、太阳 ×1.2)—— 老工程产物不变。"""
+        from BlenderGameKit import asset_export as ae
+        self.assertAlmostEqual(ae._light_energy_for(self._lamp("POINT", 9000.0)),
+                               9.0, places=6)
+        self.assertAlmostEqual(ae._light_energy_for(self._lamp("SUN", 1.0)),
+                               1.2, places=6)
+        # 没有 gk_light 属性(老 .blend / 属性没挂上)也必须走老路,不能抛
+        bare = types.SimpleNamespace(
+            name="灯",
+            data=types.SimpleNamespace(type="POINT", energy=2000.0,
+                                       color=(1.0, 1.0, 1.0),
+                                       cutoff_distance=0.0, use_shadow=True,
+                                       spot_size=0.0, shadow_soft_size=0.0,
+                                       angle=0.0),
+            matrix_world=None)
+        self.assertAlmostEqual(ae._light_energy_for(bare), 2.0, places=6)
+
+    def test_on_writes_the_godot_value_verbatim(self):
+        """打开后,`energy` 就是 Godot 的 light_energy **原值**,不再换算。"""
+        from BlenderGameKit import asset_export as ae
+        override = types.SimpleNamespace(
+            override=True, energy=3.5, range_m=12.0, attenuation=1.6,
+            shadow=False, use_color=True, color=(1.0, 0.5, 0.2, 1.0))
+        lamp = self._lamp("POINT", 9000.0, override)
+        self.assertAlmostEqual(ae._light_energy_for(lamp), 3.5, places=6)
+        text = ae._light_node_text(lamp)
+        self.assertIn("light_energy = 3.500", text)
+        self.assertIn("omni_range = 12.000", text)
+        self.assertIn("omni_attenuation = 1.6000", text)
+        self.assertIn("shadow_enabled = false", text)
+
+    def test_on_keeps_factory_values_out(self):
+        """侧栏值等于出厂值时**不写那一行**(和"值 ≠ 出厂值才写"同一条规矩)。"""
+        from BlenderGameKit import asset_export as ae
+        override = types.SimpleNamespace(
+            override=True, energy=1.0, range_m=0.0, attenuation=1.0,
+            shadow=True, use_color=False, color=(1.0, 1.0, 1.0, 1.0))
+        lamp = self._lamp("POINT", 9000.0, override)
+        text = ae._light_node_text(lamp)
+        self.assertIn("light_energy = 1.000", text)
+        self.assertNotIn("attenuation", text)
+
+    def test_zero_watt_still_exports_when_overridden(self):
+        """Blender 瓦数 0 但接管了 -> **仍然要导**(瓦数只是预览草稿)。
+
+        老规矩下"能量 0 = 关着的灯不导"是对的;接管之后那条判据就不成立了
+        —— 用户可能就想要一盏 0.5 的暗补光,而 Blender 那边懒得填瓦数。
+        """
+        from BlenderGameKit import asset_export as ae
+        override = types.SimpleNamespace(
+            override=True, energy=0.5, range_m=0.0, attenuation=1.0,
+            shadow=True, use_color=False, color=(1.0, 1.0, 1.0, 1.0))
+        lamp = self._lamp("POINT", 0.0, override)
+        self.assertIsNotNone(ae._light_node_text(lamp))
+        self.assertIn("light_energy = 0.500", ae._light_node_text(lamp))
+        # 没接管时照旧不导
+        self.assertIsNone(ae._light_node_text(self._lamp("POINT", 0.0)))
+
+    def test_preview_derives_from_the_godot_value(self):
+        """预览:接管后由**能量**反推瓦数,原生瓦数不再参与。"""
+        from BlenderGameKit import godot_look as look
+        override = types.SimpleNamespace(override=True, energy=3.5)
+        lamp = self._lamp("POINT", 9000.0, override)
+        # 9000W 是"原生值",接管后应当被忽略:3.5 × 1000 × 0.06 = 210
+        self.assertAlmostEqual(look._preview_energy(lamp, 9000.0, 0.06),
+                               210.0, places=3)
+        # 没接管 -> 原生瓦数 × 系数
+        self.assertAlmostEqual(look._preview_energy(self._lamp("POINT", 9000.0),
+                                                    9000.0, 0.06), 540.0,
+                               places=3)
+
+    def test_export_ignores_the_preview_dimmed_wattage(self):
+        """**开着预览导出**也必须写原瓦数(第一百二十六轮实测抓到的真 bug)。
+
+        预览会把灯临时乘 0.06,原值记在 `obj["gk_look_energy"]` 上。
+        存盘前会还原,但**导出不是存盘** —— 用户开着预览点『导出到 Godot』
+        时,导出器读到的是 540W,走廊 .tscn 里就真的写成
+        `light_energy = 0.540`(应为 9.000),游戏里灯暗 16 倍。
+        示例工程上实测抓到过(`_dist` 里那份旧产物就是那个状态)。
+        """
+        from BlenderGameKit import asset_export as ae
+
+        class _Obj:
+            """带 `get`(自定义属性)的最小灯物体。"""
+            def __init__(self, energy, backup=None):
+                self.data = types.SimpleNamespace(
+                    type="POINT", energy=energy, cutoff_distance=28.0,
+                    color=(1.0, 1.0, 1.0), use_shadow=True, spot_size=0.0,
+                    shadow_soft_size=0.0, angle=0.0)
+                self.name = "灯"
+                self.matrix_world = None
+                self._props = {} if backup is None else {"gk_look_energy": backup}
+
+            def get(self, key, default=None):
+                return self._props.get(key, default)
+
+        dimmed = _Obj(540.0, backup=9000.0)
+        self.assertAlmostEqual(ae._light_energy_for(dimmed), 9.0, places=6)
+        self.assertIn("light_energy = 9.000", ae._light_node_text(dimmed))
+        # 没备份 -> 用当前值(正常路径)
+        self.assertAlmostEqual(ae._light_energy_for(_Obj(9000.0)), 9.0, places=6)
+        # 备份是 0(作者真的把灯调到 0)-> 不导这盏灯,不能因为"有备份"就导出去
+        self.assertIsNone(ae._light_node_text(_Obj(0.0, backup=0.0)))
 
 
 if __name__ == "__main__":
