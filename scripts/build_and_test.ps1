@@ -202,6 +202,13 @@ Step "1a/6 GDExtension 诊断测试 (不需要 Blender)"
 & $Py (Join-Path $Root "tests\test_gdextension_diag.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "GDExtension 诊断测试失败"; exit 1 }
 
+# ---------- 1a2. 射线方向回退 ----------
+# 第 166 轮:input_vector 未连线时只认 gk_x/gk_y/gk_z,而两个射线节点只有
+# gk_direction —— 拼出零向量,射线永远射空且不报错。这条锁住修法。
+Step "1a2/6 射线方向回退测试 (不需要 Blender)"
+& $Py (Join-Path $Root "tests\test_raycast_direction.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
+if ($LASTEXITCODE -ne 0) { Write-Error "射线方向回退测试失败"; exit 1 }
+
 # ---------- 1b. 示例完整性体检 ----------
 # 第四十五轮固化:目录改名打断脚本路径(ANIM_VERIFY 那次)、示例缺 README、
 # 新示例有探针却没接进门禁 —— 这三类问题都在这里判红。

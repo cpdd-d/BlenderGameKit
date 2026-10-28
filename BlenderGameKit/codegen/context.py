@@ -1031,10 +1031,39 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
                           f"已自动包装成向量")
                 return f"{_gd_vector_ctor(dim)}({', '.join(filled[:dim])})"
             return self.expr_of(socket)
+        mapped = self._mapped_vector(node, socket_name, dim)
+        if mapped is not None:
+            return mapped
         parts = []
         for axis in ("x", "y", "z")[:dim]:
             value = getattr(node, f"gk_{axis}", None)
             parts.append(gd_number(value if isinstance(value, (int, float)) else 0.0))
+        return f"{_gd_vector_ctor(dim)}({', '.join(parts)})"
+
+    def _mapped_vector(self, node, socket_name, dim):
+        """引脚未连线时，按 `gk_input_props` 的映射取节点上的向量属性。
+
+        ── 为什么只在"节点没有 gk_x / gk_y / gk_z"时才用 ────────────────
+        绝大多数节点的向量引脚都是这三件套拼出来的。让映射抢先会改掉
+        老图的出码（铁律：老图逐字一致）。射线节点是特例 —— 它只声明了
+        `gk_direction`，以前未连线时拼出来是 `Vector3(0,0,0)`：
+        射线长度为零、永远走『没打中』，而且**不报错**（待办清单 ⑧）。
+
+        只读映射、不改三件套，是这个修法能"零 diff"的原因。
+        """
+        prop = (getattr(node, "gk_input_props", None) or {}).get(socket_name)
+        if not prop:
+            return None
+        prop_map = getattr(node, "gk_prop_map", None) or {}
+        for axis in ("gk_x", "gk_y", "gk_z"):
+            if hasattr(node, axis) or axis in prop_map:
+                return None
+        value = getattr(node, prop, None)
+        if not isinstance(value, (tuple, list)) or len(value) < 2:
+            return None
+        parts = [gd_number(float(value[index])) for index in range(min(dim, len(value)))]
+        while len(parts) < dim:
+            parts.append("0.0")
         return f"{_gd_vector_ctor(dim)}({', '.join(parts)})"
 
     def _upstream_is_scalar(self, socket):
