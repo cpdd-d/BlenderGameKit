@@ -25,6 +25,11 @@ git clone --depth 1 -b 4.5 https://github.com/godotengine/godot-cpp ..\godot-cpp
 > `speed` / `jump_pressed` / `gravity_scale` 三个属性读写全通过。
 > 这就是 `gk_demo.gdextension` 里写 `compatibility_minimum = "4.5"` 的依据：
 > **低版本编的库能向上跑，反过来不行**。
+>
+> **release 也验过**：`target=template_release` 编出的库，经 Godot 导出成
+> Windows `.exe` 后运行，`ClassDB.class_exists("GKCharacter")` 仍为真、
+> 属性读写通过。导出时 Godot 会把 `…template_release…dll` 自动放到 `.exe`
+> 旁边（不是 `bin/` 子目录），这是它自己的行为，不用手工搬。
 
 ### 2. 编译
 

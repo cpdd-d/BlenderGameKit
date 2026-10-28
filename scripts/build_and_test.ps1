@@ -1,4 +1,4 @@
-﻿﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
+﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
 #
 # 用法:
 #   pwsh -File scripts\build_and_test.ps1
@@ -39,6 +39,15 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+# ── 控制台编码:一律 UTF-8 ────────────────────────────────────────────
+# ⚠ 不加这两行,中文 Windows(默认代码页 936)上会把 Blender / Python 吐出的
+#   UTF-8 当 GBK 解 —— 满屏"娉ㄩ攢澶辫触",于是所有"输出里有没有'已保存'"
+#   这种判据全部误报失败(第一百五十七轮实测 16 个重建步骤一起红,而它们
+#   其实都成功了)。chcp 管控制台显示,OutputEncoding 管**子进程输出的解码**,
+#   两个都要设。
+try { chcp 65001 | Out-Null } catch { }
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $dist = Join-Path $Root "_dist"
 $repo = Join-Path $Root "_testrepo"
 $pkg = Join-Path $Root "BlenderGameKit"
@@ -184,6 +193,14 @@ function Invoke-Verify {
 Step "1/6 离线代码生成测试 (不需要 Blender)"
 & $Py (Join-Path $Root "tests\test_codegen.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "离线测试失败"; exit 1 }
+
+# ---------- 1a. GDExtension 诊断检查 ----------
+# 2026-10-29:.gdextension 里库路径写错时 Godot **不报错**,只是不加载
+# (症状是"GDScript 里找不到那个类")。诊断里那条检查就是把这种静默变成可见,
+# 所以检查本身要有离线测试锁住。
+Step "1a/6 GDExtension 诊断测试 (不需要 Blender)"
+& $Py (Join-Path $Root "tests\test_gdextension_diag.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
+if ($LASTEXITCODE -ne 0) { Write-Error "GDExtension 诊断测试失败"; exit 1 }
 
 # ---------- 1b. 示例完整性体检 ----------
 # 第四十五轮固化:目录改名打断脚本路径(ANIM_VERIFY 那次)、示例缺 README、
@@ -653,6 +670,40 @@ if ($SkipGodot) {
         }
     }
 
+    # 5h2. 界面新功能示例(第一百二十七/二十八轮:连线式父子 / 结构件 /
+    #      引用 / 变量物体 / 界面事件 / 弹入弹出)。这一层验的是新界面这套的
+    #      整条链路:控件建出来 + **连线**挂载 + 容器排版 + 开局藏 +
+    #      取物体名称 + 按 P 弹入(滑入/黑幕/置顶)+ 按 O 弹出(复位/藏)+
+    #      点指定控件 / 点屏幕任意位置。
+    Write-Output ""
+    $uiV2Dir = Join-Path $Root "examples\demo_ui_v2"
+    $uiV2Maker = Join-Path $Root "scripts\make_ui_v2_demo.py"
+    if (-not (Test-Path $Blender)) {
+        Write-Output "跳过界面新功能示例:找不到 Blender(示例要先重建才能真跑)"
+    } elseif (-not (Test-Path $uiV2Dir)) {
+        Write-Output "跳过界面新功能示例:还没有 examples\demo_ui_v2"
+    } else {
+        $uiV2Log = & $Blender -b --python $uiV2Maker 2>&1 | Out-String
+        if ($uiV2Log -notmatch "已保存") {
+            Write-Host "---- 重建界面新功能示例失败,尾部 20 行 ----"
+            ($uiV2Log -split "`n") | Where-Object { $_.Trim() -ne "" } |
+                Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+            $godotOk = $false
+        } else {
+            $uiV2Checker = Join-Path $Root "scripts\check_ui_v2_demo.py"
+            $uiV2Out = & $Py $uiV2Checker --godot $Godot 2>&1 | Out-String
+            $uiV2Out -split "`n" | Where-Object { $_ -match "^(UI_V2|CHECK_UI_V2_DEMO|跳过|✗)" } |
+                ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($uiV2Out -match "CHECK_UI_V2_DEMO=OK") {
+                $godotRan += "界面新功能示例"
+            } elseif ($uiV2Out -match "跳过") {
+                Write-Output "（界面新功能示例跳过）"
+            } else {
+                $godotOk = $false
+            }
+        }
+    }
+
     # 5i. AI 示例(第四十一轮:游戏AI)—— 一个会巡逻、会追、追丢了自己回去的敌人。
     #     这一层验的是 AI 图这套的整条链路:状态机真的在跑(位置在变)、
     #     『看见目标』切追击(而且真的追近了)、『丢失目标』回巡逻、
@@ -1103,8 +1154,21 @@ if ($SkipGodot) {
     } elseif (-not (Test-Path $storyDir)) {
         Write-Output "跳过剧情闯关示例:还没有 examples\demo_story"
     } else {
+        # ⚠ 判据不能只靠"输出里有'已保存'":Blender 的 stdout 是 UTF-8,
+        #   而外壳按 **控制台代码页** 解码(中文机器默认 936/GBK),一行中文
+        #   全是乱码 -> 匹配不上 -> 明明重建成功却报失败(第一百五十七轮
+        #   在 GBK 控制台上实测踩到)。
+        #   所以再加一条**编码无关**的判据:三张 .tscn 是不是刚刚被重写过。
+        $storyStart = Get-Date
         $storyLog = & $Blender -b --python $storyMaker 2>&1 | Out-String
-        if ($storyLog -notmatch "已保存") {
+        $storyFresh = 0
+        foreach ($scene in @("大堂", "走廊", "结局")) {
+            $tscn = Join-Path $storyDir ("恐怖闯关示例_godot\scenes\" + $scene + ".tscn")
+            if ((Test-Path $tscn) -and ((Get-Item $tscn).LastWriteTime -gt $storyStart)) {
+                $storyFresh++
+            }
+        }
+        if ($storyLog -notmatch "已保存" -and $storyFresh -lt 3) {
             Write-Host "---- 重建剧情闯关示例失败,尾部 20 行 ----"
             ($storyLog -split "`n") | Where-Object { $_.Trim() -ne "" } |
                 Select-Object -Last 20 | ForEach-Object { Write-Host $_ }

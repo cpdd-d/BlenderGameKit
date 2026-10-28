@@ -167,6 +167,20 @@ def build_report(context=None):
             add(f"  导出失败: {type(exc).__name__}: {exc}")
             add(traceback.format_exc())
 
+    # ---- 7. GDExtension(声明了哪些库、文件在不在)----
+    # 2026-10-29:.gdextension 里库路径写错时 Godot 不报错,只是不加载这个扩展
+    # (症状是"GDScript 里找不到那个类")。这一段把声明的库和磁盘文件逐条对一遍。
+    add("")
+    add("【7】GDExtension")
+    try:
+        from . import gdextension_info, project
+        directory, reason = project.resolve(scene)
+        add(f"  导出目录: {directory or '(没有)'}  ({reason})")
+        for item in gdextension_info.check(directory):
+            add(item)
+    except Exception as exc:                              # noqa: BLE001
+        add(f"  取不到({exc})")
+
     add("")
     add("=" * 70)
     add("(以上全部内容复制给我就行)")
