@@ -6,14 +6,18 @@
 [configuration]
 
 entry_symbol = "gk_library_init"
-compatibility_minimum = "4.4"
+; godot-cpp 官方目前最高分支是 4.5（没有 4.6 / 4.7 分支），
+; 所以这里按 4.5 声明；用 4.5 编出的库在更高版本 Godot 上能否加载需要实测。
+compatibility_minimum = "4.5"
 reloadable = true
 
 [libraries]
 
-windows.debug.x86_64 = "res://bin/gk_demo.windows.debug.x86_64.dll"
-windows.release.x86_64 = "res://bin/gk_demo.windows.release.x86_64.dll"
-linux.debug.x86_64 = "res://bin/libgk_demo.linux.debug.x86_64.so"
-linux.release.x86_64 = "res://bin/libgk_demo.linux.release.x86_64.so"
-macos.debug = "res://bin/libgk_demo.macos.debug.framework"
-macos.release = "res://bin/libgk_demo.macos.release.framework"
+; 左边是"特性"（debug / release），右边必须和 SConstruct 实际产物名一致：
+; target=template_debug 产出的后缀是 .template_debug，不是 .debug。
+windows.debug.x86_64 = "res://bin/gk_demo.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/gk_demo.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "res://bin/libgk_demo.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://bin/libgk_demo.linux.template_release.x86_64.so"
+macos.debug = "res://bin/libgk_demo.macos.template_debug.framework"
+macos.release = "res://bin/libgk_demo.macos.template_release.framework"

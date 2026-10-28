@@ -20,8 +20,8 @@ if (-not $GodotCpp) {
 Write-Output "godot-cpp: $GodotCpp"
 if (-not (Test-Path $GodotCpp)) {
     Write-Output ""
-    Write-Output "找不到 godot-cpp。请先下载对应版本(例如 Godot 4.4 用分支 4.4):"
-    Write-Output "  git clone -b 4.4 https://github.com/godotengine/godot-cpp `"$GodotCpp`""
+    Write-Output "找不到 godot-cpp。请先下载(官方最高分支是 4.5，没有 4.6 / 4.7):"
+    Write-Output "  git clone --depth 1 -b 4.5 https://github.com/godotengine/godot-cpp `"$GodotCpp`""
     Write-Output ""
     Write-Output "没有 git 就从 GitHub 下载 zip 解压到上面这个路径。"
     exit 1
@@ -41,7 +41,16 @@ if ($UseCMake) {
 } else {
     Write-Output "== 使用 SCons 构建 =="
     $scons = Get-Command scons -ErrorAction SilentlyContinue
+    # pip 装完 scons 常常不在 PATH 上，这时用 python -m SCons 也能跑
+    $useModule = $false
     if (-not $scons) {
+        $py = Get-Command python -ErrorAction SilentlyContinue
+        if ($py) {
+            & python -m SCons --version *> $null
+            if ($LASTEXITCODE -eq 0) { $useModule = $true }
+        }
+    }
+    if (-not $scons -and -not $useModule) {
         Write-Output "找不到 scons。装它:pip install scons"
         Write-Output "或者改用 CMake:powershell -File build.ps1 -UseCMake"
         exit 1
@@ -49,7 +58,11 @@ if ($UseCMake) {
     $target = if ($Release) { "template_release" } else { "template_debug" }
     Push-Location $here
     $env:GODOT_CPP_PATH = $GodotCpp
-    & scons platform=windows target=$target -j8
+    if ($useModule) {
+        & python -m SCons platform=windows target=$target -j8
+    } else {
+        & scons platform=windows target=$target -j8
+    }
     $code = $LASTEXITCODE
     Pop-Location
     if ($code -ne 0) { exit 1 }

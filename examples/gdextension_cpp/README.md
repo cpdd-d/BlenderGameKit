@@ -11,13 +11,20 @@
 
 ### 1. 准备 godot-cpp
 
-版本必须和你的 Godot 对应(Godot 4.4 → 分支 `4.4`):
+**godot-cpp 官方目前最高分支是 `4.5`**，没有 4.6 / 4.7 分支。所以这里固定用
+4.5，不是"Godot 版本号是多少就写多少"：
 
 ```powershell
-git clone -b 4.4 https://github.com/godotengine/godot-cpp ..\godot-cpp
+git clone --depth 1 -b 4.5 https://github.com/godotengine/godot-cpp ..\godot-cpp
 ```
 
 没装 git 就去 GitHub 下载 zip 解压到 `examples\godot-cpp\`。
+
+> **已验证（2026-10-29，Godot 4.7.2 stable）**：用 godot-cpp 4.5 编出的 `.dll`
+> 在 4.7.2 里能正常加载——`GKCharacter` 注册成功、继承关系正确、
+> `speed` / `jump_pressed` / `gravity_scale` 三个属性读写全通过。
+> 这就是 `gk_demo.gdextension` 里写 `compatibility_minimum = "4.5"` 的依据：
+> **低版本编的库能向上跑，反过来不行**。
 
 ### 2. 编译
 
@@ -73,10 +80,16 @@ func _physics_process(_delta: float) -> void:
 1. **改完 C++ 必须重启 Godot 编辑器**,热重载不可靠。
 2. **`.gdextension` 里的 `entry_symbol` 必须和 `register_types.cpp` 里的函数名一致**
    (这里是 `gk_library_init`)。
-3. **godot-cpp 版本和 Godot 版本差太多会在链接期报一堆符号错误**,不是你的代码问题。
-4. **GDExtension 不能直接暴露成员变量**,必须写 `set_xxx`/`get_xxx` 再用
+3. **godot-cpp 的版本只能 ≤ 你的 Godot 版本**。差太多会在链接期报一堆符号错误
+   （不是你的代码问题）；反过来，用高版本 godot-cpp 编的库给低版本引擎用一定失败。
+4. **`.gdextension` 里右边的路径必须和实际产物名一致**：`target=template_debug`
+   产出的是 `.template_debug`，不是 `.debug`。左边那半（`windows.debug.x86_64`）
+   是"特性"，右边才是文件名 —— 两者写混了，Godot 会静默地不去加载。
+5. **GDExtension 不能直接暴露成员变量**,必须写 `set_xxx`/`get_xxx` 再用
    `ADD_PROPERTY` 绑定 —— 这是最容易忘的一步,忘了的话 GDScript 里读不到属性。
-5. `_bind_methods()` 里 `ClassDB::bind_method` 的方法名要和 GDScript 里调用的一致,
+   而且 **getter 不能带参数**（写成 `ADD_PROPERTY(..., "", "set_xxx")` 会直接报
+   `Getter method must not take any argument`）。
+6. `_bind_methods()` 里 `ClassDB::bind_method` 的方法名要和 GDScript 里调用的一致,
    写错了只会在运行时静默失败。
 
 ## 什么时候不该用 C++

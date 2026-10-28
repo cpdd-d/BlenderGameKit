@@ -46,3 +46,11 @@ dist/
 
 # Blender 资产目录文件(打开带资产的 .blend 时自动生成,不是源文件)
 blender_assets.cats.txt
+
+# ── GDExtension:godot-cpp 是外部依赖,bin/ 与 .obj 是编译产物 ──────────
+# 都不该进版本库:godot-cpp 有几个 GB 的历史,产物每次编译都会变。
+examples/godot-cpp/
+examples/gdextension_cpp/bin/
+examples/gdextension_cpp/build/
+examples/gdextension_cpp/**/*.obj
+examples/gdextension_cpp/.sconsign.dblite

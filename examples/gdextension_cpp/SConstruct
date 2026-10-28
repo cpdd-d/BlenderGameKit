@@ -2,8 +2,8 @@
 """SCons 构建脚本(GDExtension 官方推荐方式)。
 
 用法:
-    # 先准备 godot-cpp(和你的 Godot 版本对应)
-    git clone -b 4.4 https://github.com/godotengine/godot-cpp
+    # 先准备 godot-cpp(官方最高分支是 4.5，没有 4.6 / 4.7)
+    git clone --depth 1 -b 4.5 https://github.com/godotengine/godot-cpp
 
     # 然后在本目录:
     scons platform=windows target=template_debug -j8
@@ -23,8 +23,7 @@ env = SConscript(os.path.join(GODOT_CPP_PATH, "SConstruct"))  # noqa: F821
 sources = Glob("src/*.cpp")
 
 # 输出到 res://bin/
-env.Append(LIBPATH=[env["bindir"]])
-
+# (godot-cpp 4.5 起不再提供 env["bindir"],库路径已由 SConscript 写进 LIBS)
 library = env.SharedLibrary(
     target=os.path.join("bin", "gk_demo{}{}".format(env["suffix"], env["SHLIBSUFFIX"])),
     source=sources,

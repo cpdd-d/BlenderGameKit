@@ -44,6 +44,7 @@ public:
 	void set_gravity_scale(double p_value);
 	double get_gravity_scale() const;
 	void set_jump_pressed(bool p_value);
+	bool get_jump_pressed() const;
 };
 
 } // namespace godot

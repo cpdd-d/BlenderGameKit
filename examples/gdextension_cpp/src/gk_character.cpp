@@ -45,7 +45,9 @@ void GKCharacter::_bind_methods() {
 			"set_gravity_scale", "get_gravity_scale");
 
 	ClassDB::bind_method(D_METHOD("set_jump_pressed", "value"), &GKCharacter::set_jump_pressed);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "jump_pressed"), "", "set_jump_pressed");
+	ClassDB::bind_method(D_METHOD("get_jump_pressed"), &GKCharacter::get_jump_pressed);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "jump_pressed"),
+			"set_jump_pressed", "get_jump_pressed");
 }
 
 void GKCharacter::_physics_process(double p_delta) {
@@ -117,4 +119,8 @@ double GKCharacter::get_gravity_scale() const {
 
 void GKCharacter::set_jump_pressed(bool p_value) {
 	jump_pressed = p_value;
+}
+
+bool GKCharacter::get_jump_pressed() const {
+	return jump_pressed;
 }
