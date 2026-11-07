@@ -189,7 +189,7 @@ def target_pin(name="目标"):
     return S.pin(S.OBJECT, name, TARGET_SELF)
 
 
-def node_candidates(tree, prop=None):
+def node_candidates(tree, prop=None, obj_type=None):
     """节点引用下拉列表的候选项。
 
     ── 列**场景物体**,不列节点图里的节点(用户 2026-10-03 的疑问)──────
@@ -198,6 +198,11 @@ def node_candidates(tree, prop=None):
     而这里的引用指的是**导出后场景里的物体**(相机 / 角色 / 空节点),
     两者根本不是一回事:选了节点名,生成的代码会去找一个不存在的物体。
     现在列 `bpy.data.objects` 里的物体(带类型图标),这才是能选的东西。
+
+    ── obj_type 过滤(第一百八十八轮)──────────────────────────
+    `gk_camera` 之类的引用只需要特定类型的物体:相机节点应该只列相机,
+    不应该让用户在一堆网格里翻。传 `obj_type="CAMERA"` 就只列相机。
+    不传 = 列全部(和以前一样)。
     """
     items = [(TARGET_SELF, "自身(脚本所在节点)", "本脚本挂载的节点",
               "OBJECT_DATA", 0)]
@@ -222,6 +227,8 @@ def node_candidates(tree, prop=None):
     index = 1
     for obj in objects:
         kind = str(getattr(obj, "type", "") or "")
+        if obj_type and kind != obj_type:
+            continue
         label = obj.name
         if kind == "CAMERA":
             label = f"{obj.name}   (相机)"
@@ -252,7 +259,11 @@ def node_items_for(node, prop="gk_target"):
     所以这里给个说明文字,别让人以为"列表里随便挑一个就行"。
     """
     tree = getattr(node, "id_data", None)
-    items = list(node_candidates(tree, prop))
+    # gk_camera 只列相机,gk_light 只列灯光(第一百八十八轮)
+    obj_type = None
+    if prop == "gk_camera":
+        obj_type = "CAMERA"
+    items = list(node_candidates(tree, prop, obj_type))
     if bpy is not None and tree is not None:
         slots = set()
         for obj in getattr(getattr(bpy, "data", None), "objects", ()):

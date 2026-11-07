@@ -19,6 +19,13 @@ import bpy
 SEMANTIC_FLOW = "FLOW"
 SEMANTIC_ANY = "ANY"
 SEMANTIC_DATA = "DATA"
+# 特殊引用语义(第一百八十八轮):相机引用只能接相机引用,
+# 动画引用只能接动画引用,UI控件引用只能接UI控件引用。
+# 这样"把动画引用接到相机引用上"会被 link_check 拒绝,
+# 而不是等到生成代码时才报一个看不懂的错。
+SEMANTIC_CAMERA_REF = "CAMERA_REF"
+SEMANTIC_ANIM_REF = "ANIM_REF"
+SEMANTIC_UI_REF = "UI_REF"
 
 _COLOR_FLOW = (1.0, 0.85, 0.35, 1.0)
 _COLOR_ANY = (0.62, 0.62, 0.62, 1.0)
@@ -38,13 +45,22 @@ class GKSocketBase:
         return self.bl_label
 
     def link_check(self, target):
-        """返回 True 表示允许连接。"""
+        """返回 True 表示允许连接。
+
+        语义分组规则(第一百八十八轮扩展):
+          * FLOW 只能接 FLOW
+          * ANY 可以接任何数据引脚
+          * CAMERA_REF 只能接 CAMERA_REF(或 ANY)
+          * DATA 引脚按 bl_idname 判同类
+        """
         src_sem = self.gk_semantic()
         dst_sem = getattr(target, "gk_semantic", lambda: SEMANTIC_DATA)()
         if src_sem == SEMANTIC_FLOW or dst_sem == SEMANTIC_FLOW:
             return src_sem == dst_sem
         if src_sem == SEMANTIC_ANY or dst_sem == SEMANTIC_ANY:
             return True
+        if src_sem == SEMANTIC_CAMERA_REF or dst_sem == SEMANTIC_CAMERA_REF:
+            return src_sem == dst_sem
         return self.bl_idname == target.bl_idname
 
 
@@ -113,6 +129,7 @@ _TYPE_TABLE = {
     "NodeSocketVector2D": ("二维向量", "Vector2"),
     "NodeSocketColor": ("颜色", "Color"),
     "NodeSocketObject": ("节点", "Node"),
+    "GKSocketCameraRef": ("相机引用", "Camera"),
     "NodeSocketVirtual": ("虚", "null"),
     "GKSocketFlow": ("执行流", "void"),
     "GKSocketAny": ("任意", "Variant"),
@@ -128,8 +145,27 @@ _VECTOR_PIN = ("NodeSocketVector", "向量")
 _VECTOR2_PIN = ("NodeSocketVector2D", "二维向量")
 _COLOR_PIN = ("NodeSocketColor", "颜色")
 _OBJECT_PIN = ("NodeSocketObject", "节点")
+# 相机引用引脚(第一百八十八轮)—— 只能接相机引用,不能接普通节点
+_CAMERA_REF_PIN = ("GKSocketCameraRef", "相机引用")
 
-GK_CLASSES = (GKSocketFlow, GKSocketAny)
+class GKSocketCameraRef(GKSocketBase, bpy.types.NodeSocket):
+    """相机引用引脚:只能接相机引用(第一百八十八轮)。"""
+
+    bl_idname = "GKSocketCameraRef"
+    bl_label = "相机引用"
+
+    @classmethod
+    def gk_semantic(cls):
+        return SEMANTIC_CAMERA_REF
+
+    def draw(self, context, layout, node, text):
+        layout.label(text=text)
+
+    def draw_color(self, context, node):
+        return _COLOR_SELF
+
+
+GK_CLASSES = (GKSocketFlow, GKSocketAny, GKSocketCameraRef)
 
 
 def pin(kind, name, default=None):
