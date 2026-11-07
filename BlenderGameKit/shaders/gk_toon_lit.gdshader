@@ -29,6 +29,11 @@ uniform float rim_amount = 0.0;
 uniform float rim_width = 0.55;
 uniform float rim_front = 0.15;
 uniform float emission_amount = 0.0;
+// 自发光的**颜色**(第一百四十八轮)。
+// 以前只有 emission_amount 一个标量,而且永远乘在 ALBEDO 上 —— 灯罩
+// 这种"深色金属 + 暖光"的材质根本发不出光(深色 × 强度 还是深色)。
+// 现在颜色和强度分开:EMISSION = emission_color × amount,和 albedo 无关。
+uniform vec4 emission_color : source_color = vec4(1.0);
 uniform float eye_highlight_boost = 0.0;
 varying vec2 gk_uv;
 
@@ -53,7 +58,8 @@ void fragment() {
 	gk_uv = UV;
 	// Only explicit emission may glow when all scene lights are off.
 	float eye = smoothstep(0.75, 1.0, dot(base.rgb, vec3(0.333)));
-	EMISSION = ALBEDO * (emission_amount + eye * eye_highlight_boost);
+	EMISSION = emission_color.rgb * emission_amount
+		+ ALBEDO * eye * eye_highlight_boost;
 }
 
 void light() {
@@ -66,7 +72,27 @@ void light() {
 	vec3 tint = mix(dark, lit_tint.rgb,
 		gk_band(raw, shadow_step, shadow_smooth));
 	// Godot applies ALBEDO after light(); multiplying it here would square it.
-	DIFFUSE_LIGHT += tint * max(raw, 0.0) * ATTENUATION * LIGHT_COLOR / PI;
+	float diffuse = max(raw, 0.0) * ATTENUATION;
+	if (three_tone > 0.5) {
+		// ── 三层色阶(第一百五十一轮)────────────────────────────────
+		// 用户原话:"阴影的渲染上太单调了,不是浅黑、深黑、暗黑这样的过渡"。
+		// 旧写法只让**朝向光的面**吃到光(`max(raw, 0)`),背光面直接归零,
+		// 于是整片墙永远只有环境光一个色 —— shadow_tint_2 根本没机会出现。
+		// 这里改成两层三档:
+		//   * 朝向:亮 / 浅黑 / 深黑(用 shadow_tint -> shadow_tint_2);
+		//   * 光池:满 / 半 / 无(ATTENUATION 的三档,弱光就是"暗黑")。
+		// ⚠ 过渡带必须**宽**(0.30),否则灯池会变成"同心圆靶心",
+		//   用户第二轮反馈:"灯光的范围显示过于完美了,局部明暗不缓和"。
+		//   宽过渡带 = 三档还在,但边界是渐变的,肉眼读成柔和的明暗过渡。
+		float facing_hi = gk_band(raw, shadow_step, shadow_smooth);
+		float facing_mid = gk_band(raw, shadow_step_2, shadow_smooth);
+		float facing = mix(0.22, mix(0.55, 1.0, facing_hi), facing_mid);
+		float pool_hi = gk_band(ATTENUATION, 0.58, 0.30);
+		float pool_mid = gk_band(ATTENUATION, 0.22, 0.30);
+		float pool = mix(0.0, mix(0.64, 1.0, pool_hi), pool_mid);
+		diffuse = facing * pool;
+	}
+	DIFFUSE_LIGHT += tint * diffuse * LIGHT_COLOR / PI;
 	if (specular_amount > 0.001) {
 		float half_spot = dot(NORMAL, normalize(VIEW + LIGHT));
 		float spot = gk_band(half_spot, 1.0 - specular_size, specular_smooth);

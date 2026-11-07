@@ -28,15 +28,36 @@ def upstream(socket):
     return None
 
 
-def downstream(socket, seen=None):
-    seen = set() if seen is None else seen
+def downstream(socket, seen=None, *, links_by_socket=None):
+    """Flatten reroutes in link order, without a recursion limit on long chains.
+
+    Keep only the current path active: a shared endpoint reached by two paths
+    must retain both executions. An optional link index avoids repeatedly
+    scanning Blender's entire link collection via NodeSocket.links.
+    """
+    active = set(seen or ())
+
+    def links_for(current):
+        if links_by_socket is not None:
+            return links_by_socket.get(current, ())
+        return getattr(current, "links", ())
+
     result = []
-    for link in getattr(socket, "links", ()):
+    stack = [(iter(links_for(socket)), None)]
+    while stack:
+        links, owner = stack[-1]
+        link = next(links, None)
+        if link is None:
+            stack.pop()
+            if owner is not None:
+                active.remove(owner)
+            continue
         target = link.to_node
         if getattr(target, "bl_idname", "") == "NodeReroute":
-            if target in seen:
+            if target in active:
                 raise ValueError("转接点形成循环，请断开循环连线")
-            result.extend(downstream(target.outputs[0], seen | {target}))
+            active.add(target)
+            stack.append((iter(links_for(target.outputs[0])), target))
         else:
             result.append((target, getattr(link.to_socket, "name", "") or "执行"))
     return result

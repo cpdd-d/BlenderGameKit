@@ -172,6 +172,10 @@ def _expr_math(ctx, node):
         return f"ceilf({arg('A')})"
     if op == "ROUND":
         return f"roundf({arg('A')})"
+    if op == "INT":
+        # 取整 **`int()` 而不是 `roundf()`**:`roundf` 返回还是 float,
+        # 拼进"生命: 2"这种文本会显示成 `2.0`(血条踩过)。
+        return f"int({arg('A')})"
     if op == "SIGN":
         return f"signf({arg('A')})"
     if op == "RANDOM":
@@ -720,35 +724,48 @@ def _expr_mouse_button(ctx, node):
 
 @expr_node("GKNodeMouseButtonDown")
 def _expr_mouse_button_down(ctx, node):
-    """鼠标键"刚按下" —— Godot **没有**这个 API,只能自己记上一帧。
-
-    和手柄按键同一个做法(见 `_expr_joy_button_down`):
-    多输出节点会在多个地方被求值,所以状态用**成员变量**存,
-    每一帧比一次、更新一次。
-
-    ── 去重键为什么不能用 `id(node)`(项目里踩过的老坑)─────────────
-    本项目明确规定过(见 `node_key` 的说明):`id()` 会在对象被回收后**复用**,
-    一次导出里前后创建的两批节点可能拿到同一个 id,于是新的"刚按下"节点
-    被误判成"已经登记过",**那一路的按键永远不生效**。
-    这里用节点自己的指针当键(拿不到指针时退回名字)。
-    """
+    """同一个鼠标按下沿可被多条执行链读取，不会在首次读取时消耗。"""
     button = _mouse_button_const(getattr(node, "gk_button", "LEFT"))
-    key = ctx.member_temp("mouse_prev")
-    ctx.physics_hooks.setdefault("mouse_button_edge", [])
-    already = getattr(ctx, "_mouse_edge_nodes", None)
-    if already is None:
-        already = set()
-        ctx._mouse_edge_nodes = already
-    marker = node_lib.node_key(node)
-    if marker not in already:
-        already.add(marker)
-        ctx.physics_hooks["mouse_button_edge"] += [
-            f"{key} = Input.is_mouse_button_pressed({button})",
-        ]
-    # 值本身在"上一帧还没按、这一帧按了"时为真 —— 由上面的钩子维护。
-    # 这里返回"当前按着 && 上一帧没按"的即时判断(不依赖顺序)
-    return (f"(Input.is_mouse_button_pressed({button}) "
-            f"and not {key})")
+    return _button_down_sample(
+        ctx, node, f"Input.is_mouse_button_pressed({button})")
+
+
+def _button_down_sample(ctx, node, pressed_expr):
+    """按节点和帧时钟共享边沿，不能依赖编译期表达式缓存去重。"""
+    made = getattr(ctx, "_button_edge_helpers", None)
+    if made is None:
+        made = {}
+        ctx._button_edge_helpers = made
+    key = node_lib.node_key(node)
+    if key in made:
+        return f"{made[key]}()"
+
+    func = ctx.declare_func_name("_gk_button_down", key=("button_down", key))
+    state = ctx.declare_var(
+        f"_gk_button_edge{ctx.node_tag(node, 'button_edge')}", "Array",
+        initial="[[-1, false, false], [-1, false, false]]", key=key)
+    made[key] = func
+    ctx.extra_sections.append({
+        "signature": f"func {func}() -> bool:",
+        "lines": [
+            "    var physics := Engine.is_in_physics_frame()",
+            "    var frame := Engine.get_physics_frames() if physics else Engine.get_process_frames()",
+            f"    var sample: Array = {state}[1 if physics else 0]",
+            "    if int(sample[0]) != frame:",
+            f"        var pressed: bool = {pressed_expr}",
+            "        sample[2] = pressed and not bool(sample[1])",
+            "        sample[1] = pressed",
+            "        sample[0] = frame",
+            "    return bool(sample[2])",
+        ],
+        "empty_body": "    return false",
+        "separator": True,
+    })
+    # 即使这一帧上游条件不成立，也跟踪按住/松开状态。两个时钟分别记账，
+    # 物理帧读取不会消耗渲染帧的边沿，同一时钟重复读取只返回已有结果。
+    for hooks in (ctx.process_hooks, ctx.physics_hooks):
+        hooks.setdefault("button_edges", []).append(f"{func}()")
+    return f"{func}()"
 
 
 @expr_node("GKNodeMouseWheel")
@@ -833,6 +850,63 @@ def _expr_ui_read_text(ctx, node):
         ctx.warn(f"『{node.bl_label}』没有填控件名 —— 会读到空字符串")
         return '""'
     return f"_gk_widget_text({gd_string(name)})"
+
+
+@expr_node("GKNodeUiWidgetRef")
+def _expr_ui_widget_ref(ctx, node):
+    """把一个界面控件当值取出来(第一百二十七轮:像蓝图的控件变量)。
+
+    走 `_gk_find_widget(名字)`(按名字在整个界面层里找),和
+    『界面_设置』『界面_隐藏控件』同一套查法 —— 只是这里把结果**当值**交出去,
+    可以让别的节点拿它去用 / 当子控件的『父』。
+    """
+    ctx.need_ui_helpers = True
+    name = (getattr(node, "gk_widget", "") or "").strip()
+    if not name:
+        ctx.warn(f"『{node.bl_label}』没有填控件名 —— 会取到 null")
+        return "null"
+    return f"_gk_find_widget({gd_string(name)})"
+
+
+@expr_node("GKNodeUiDesignRef")
+def _expr_ui_design_ref(ctx, node):
+    """把一整套界面当值取出来:那张设计图里的『界面_画布』控件。
+
+    ── 为什么落在"画布"而不是"整个界面层" ─────────────────────────
+    一个脚本的界面层(`_gk_ui_root`)可能同时装着好几张设计图的控件;要"精确
+    引用某一套界面"就得有一个**每套一个的根**,『界面_画布』正好是这个根。
+    没放画布的老图退回本脚本的界面根(`_gk_ui_root`)并告警 —— 至少能用,
+    但会把它和别的界面混在一起。
+    """
+    ctx.need_ui_helpers = True
+    raw = str(getattr(node, "gk_design", "") or "").strip()
+    tree = node_lib.find_ui_design_tree(raw)
+    if tree is None:
+        ctx.warn(f"『{node.bl_label}』找不到界面设计图"
+                 f"(填的是『{raw or '自动(第一张)'}』)—— 会取到 null")
+        return "null"
+    canvas = None
+    for candidate in (getattr(tree, "nodes", ()) or ()):
+        if getattr(candidate, "bl_idname", "") == "GKNodeUiCanvas":
+            canvas = candidate
+            break
+    if canvas is None:
+        ctx.warn(f"设计图『{tree.name}』里没有『界面_画布』—— "
+                 f"『界面_取界面』退回本脚本的界面根;要精确引用请在那张图里"
+                 f"放一个『界面_画布』")
+        return ctx.declare_var("_gk_ui_root", "Control")
+    return f"_gk_find_widget({gd_string(str(canvas.name))})"
+
+
+@expr_node("GKNodeObjectName")
+def _expr_object_name(ctx, node):
+    """取物体的**场景节点名**(第一百二十七轮)。
+
+    走 `target_expr` 拿到的可能是 `self` 也可能是 `@onready 节点_某某`
+    —— 后者是成员变量,必须带 null 守卫(物体被删掉/路径填错时不该整脚本报错)。
+    """
+    expr = ctx.target_expr(node)
+    return f"({expr}.name if {expr} != null else \"\")"
 
 
 def ensure_mouse_delta(ctx):
@@ -1260,21 +1334,10 @@ def _expr_joy_button(ctx, node):
 
 @expr_node("GKNodeJoyButtonDown")
 def _expr_joy_button_down(ctx, node):
-    """刚按下:用 Input.is_action_just_pressed 的思路，但手柄按键没有对应动作名，
-    所以自己记"上一帧是否按住"。"""
+    """刚按下：按节点/设备采样一次，同帧所有读取共享该边沿。"""
     device, button = _joy_button_expr(node)
-    now_var = ctx.declare_var(f"gk_joy_now_{snake_case(node.name, 'btn')}", "bool",
-                              key=node_lib.node_key(node))
-    prev_var = ctx.declare_var(f"gk_joy_prev_{snake_case(node.name, 'btn')}", "bool",
-                               key=node_lib.node_key(node))
-    result_var = ctx.declare_var(f"gk_joy_down_{snake_case(node.name, 'btn')}", "bool",
-                                 key=node_lib.node_key(node))
-    ctx.read_vars.update({now_var, prev_var, result_var})
-    indent = ctx._expr_indent
-    ctx.add_line(indent, f"{now_var} = Input.is_joy_button_pressed({device}, {button})")
-    ctx.add_line(indent, f"{result_var} = {now_var} and not {prev_var}")
-    ctx.add_line(indent, f"{prev_var} = {now_var}")
-    return result_var
+    return _button_down_sample(
+        ctx, node, f"Input.is_joy_button_pressed({device}, {button})")
 
 
 # ==========================================================================

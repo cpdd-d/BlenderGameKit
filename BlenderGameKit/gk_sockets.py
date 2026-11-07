@@ -165,16 +165,69 @@ def is_any(socket):
 #   1. 沿连线(输入看上游 / 输出看下游)找出对面的**具体**引脚类型;
 #   2. 找不到就看节点填的『变量名』在树里有没有声明类型(动画树变量)。
 # 解析出的类型用来给引脚**上色**、把类型名**写在引脚标签后面**。
+# Offline/API-unavailable fallback, sampled from Blender 4.5 native sockets.
+# In Blender, registration reads the running version's own palette instead.
 _COLOR_BY_IDNAME = {
     "NodeSocketFloat": (0.63, 0.63, 0.63, 1.0),
-    "NodeSocketInt": (0.25, 0.55, 0.25, 1.0),
-    "NodeSocketBool": (0.75, 0.45, 0.30, 1.0),
-    "NodeSocketString": (0.42, 0.60, 0.80, 1.0),
-    "NodeSocketVector": (0.30, 0.32, 0.72, 1.0),
-    "NodeSocketVector2D": (0.36, 0.30, 0.55, 1.0),
-    "NodeSocketColor": (0.75, 0.75, 0.20, 1.0),
-    "NodeSocketObject": (0.20, 0.60, 0.20, 1.0),
+    "NodeSocketInt": (0.35, 0.55, 0.36, 1.0),
+    "NodeSocketBool": (0.80, 0.65, 0.84, 1.0),
+    "NodeSocketString": (0.44, 0.70, 1.0, 1.0),
+    "NodeSocketVector": (0.39, 0.39, 0.78, 1.0),
+    "NodeSocketVector2D": (0.39, 0.39, 0.78, 1.0),
+    "NodeSocketColor": (0.78, 0.78, 0.16, 1.0),
+    "NodeSocketObject": (0.93, 0.62, 0.36, 1.0),
 }
+_NATIVE_COLORS = {}
+
+
+def on_register():
+    """Sample native colors once, without touching any user graph.
+
+    Built-in draw_color_simple is exposed on RNA socket instances, not on
+    bpy.types classes. A temporary native group supplies those instances;
+    drawing later only reads the small palette and never creates/scans nodes.
+    """
+    _NATIVE_COLORS.clear()
+    groups = getattr(getattr(bpy, "data", None), "node_groups", None)
+    if not callable(getattr(groups, "new", None)):
+        return
+    tree = None
+    try:
+        tree = groups.new(".GKSocketPalette", "GeometryNodeTree")
+        for idname in _COLOR_BY_IDNAME:
+            # Interfaces expose the base Vector type; its 2D subtype shares
+            # Blender's vector palette entry.
+            if idname == "NodeSocketVector2D":
+                continue
+            try:
+                tree.interface.new_socket(name=idname, in_out="INPUT",
+                                          socket_type=idname)
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+        node = tree.nodes.new("NodeGroupInput")
+        for socket in node.outputs:
+            if socket.bl_idname not in _COLOR_BY_IDNAME:
+                continue
+            simple = getattr(socket, "draw_color_simple", None)
+            try:
+                color = simple() if callable(simple) else socket.draw_color(bpy.context, node)
+                color = tuple(float(component) for component in color)
+                if len(color) == 4:
+                    _NATIVE_COLORS[socket.bl_idname] = color
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+        if "NodeSocketVector" in _NATIVE_COLORS:
+            _NATIVE_COLORS["NodeSocketVector2D"] = _NATIVE_COLORS["NodeSocketVector"]
+    except (AttributeError, RuntimeError, TypeError):
+        # A restricted/offline environment can still draw with the fallback.
+        pass
+    finally:
+        if tree is not None:
+            groups.remove(tree)
+
+
+def on_unregister():
+    _NATIVE_COLORS.clear()
 
 # 动画树变量的声明类型 -> GK 引脚类型 idname
 _VAR_TYPE_TO_IDNAME = {
@@ -219,70 +272,168 @@ def _socket_key(socket):
     return ("i", id(socket))
 
 
-def _linked_socket(socket):
-    """沿连线走一步:输入引脚看上游,输出引脚看下游(取第一条连线)。"""
-    is_output = bool(getattr(socket, "is_output", False))
+def _source_socket(socket):
+    """输入引脚的来源；Blender 数据输入至多有一条连线。"""
     for link in getattr(socket, "links", ()) or ():
-        other = (getattr(link, "to_socket", None) if is_output
-                 else getattr(link, "from_socket", None))
+        other = getattr(link, "from_socket", None)
         if other is not None:
             return other
     return None
 
 
-def _walk_type_idname(socket, limit=64):
-    """沿连线找对面的**具体**引脚类型(通配引脚要一路走下去)。"""
-    pending = [socket]
-    seen = set()
-    steps = 0
-    while pending and steps < limit:
-        current = pending.pop(0)
-        steps += 1
-        key = _socket_key(current)
-        if key in seen:
-            continue
-        seen.add(key)
-        idname = str(getattr(current, "bl_idname", "") or "")
-        if idname and idname != "GKSocketAny" and idname in _TYPE_TABLE:
-            return idname
-        nxt = _linked_socket(current)
-        if nxt is not None:
-            pending.append(nxt)
+def _is_reroute(socket):
+    return getattr(getattr(socket, "node", None), "bl_idname", "") == "NodeReroute"
+
+
+def _concrete_data_type(socket):
+    # Blender 给自定义树里的转接点默认使用 NodeSocketColor。它只是接线，
+    # 不能把这个默认 RNA 类型当作传输的数据类型。
+    if _is_reroute(socket):
+        return ""
+    idname = str(getattr(socket, "bl_idname", "") or "")
+    if idname in _TYPE_TABLE and idname not in {
+            "GKSocketAny", "GKSocketFlow", "NodeSocketVirtual"}:
+        return idname
+    return ""
+
+
+def _variable_slot(socket):
+    node = getattr(socket, "node", None)
+    if (getattr(node, "bl_idname", "") == "GKNodeSetVar"
+            and not getattr(socket, "is_output", False)):
+        name = str(getattr(socket, "name", "") or "")
+        if name.startswith("值 ") and name[2:].isdigit():
+            return "_" + name[2:]
     return ""
 
 
 def _declared_type_idname(socket):
-    """节点上填的『变量名』在树里声明过类型时,返回那个类型(动画树变量)。"""
+    """逻辑/动画变量声明；多变量设置的各个值口分别对应自己的变量。"""
     node = getattr(socket, "node", None)
     if node is None:
         return ""
-    name = str(getattr(node, "gk_var_name", "") or "").strip()
+    name = str(getattr(node, "gk_var_name" + _variable_slot(socket), "") or "").strip()
     if not name:
         return ""
     tree = getattr(node, "id_data", None)
-    variables = getattr(tree, "gk_variables", None) if tree is not None else None
-    if not variables:
-        return ""
-    for var in variables:
-        if str(getattr(var, "var_name", "") or "") == name:
-            return _VAR_TYPE_TO_IDNAME.get(str(getattr(var, "var_type", "")), "")
+    for collection in ("gk_vars", "gk_variables"):
+        for var in getattr(tree, collection, ()) or ():
+            if str(getattr(var, "var_name", "") or "") == name:
+                return _VAR_TYPE_TO_IDNAME.get(str(getattr(var, "var_type", "")), "")
     return ""
 
 
-def resolved_type_idname(socket):
-    """通配引脚实际承载的 GK 引脚类型 idname;解析不出来返回空串。
+def _default_type_idname(socket):
+    """仅识别未连线输入上有明确类型的属性，不猜字符串字面量。"""
+    node = getattr(socket, "node", None)
+    if node is None or getattr(socket, "is_output", False):
+        return ""
+    prop = (getattr(node, "gk_input_props", {}) or {}).get(
+        getattr(socket, "name", ""))
+    slot = _variable_slot(socket)
+    if slot:
+        prop = "gk_value" + slot
+    spec = (getattr(node, "gk_prop_map", {}) or {}).get(prop)
+    if not spec:
+        return ""
+    # Compare.gk_a 等字符串属性保存的是 GDScript 字面量："0" 不是文本值。
+    return {"float": "NodeSocketFloat", "int": "NodeSocketInt",
+            "bool": "NodeSocketBool", "color": "NodeSocketColor",
+            "float_vector": "NodeSocketVector"}.get(spec[1], "")
 
-    优先级:**连线对面**(上游/下游)的具体类型 > 节点声明的变量类型。
+
+def _source_type(socket, limit):
+    """找真实来源，返回 (确定类型, 尚无类型的源输出)。有环/超限则放弃。"""
+    seen = set()
+    current = socket
+    for _step in range(limit):
+        if current is None:
+            break
+        key = _socket_key(current)
+        if key in seen:
+            break
+        seen.add(key)
+        if _is_reroute(current):
+            node = current.node
+            inputs = getattr(node, "inputs", ())
+            outputs = getattr(node, "outputs", ())
+            source = _source_socket(inputs[0]) if inputs else None
+            if source is None:
+                return "", outputs[0] if outputs else None
+            current = source
+            continue
+        if not getattr(current, "is_output", False):
+            source = _source_socket(current)
+            if source is not None:
+                current = source
+                continue
+        concrete = _concrete_data_type(current)
+        if concrete:
+            return concrete, None
+        declared = _declared_type_idname(current)
+        if declared:
+            return declared, None
+        if getattr(current, "is_output", False):
+            return "", current
+        return _default_type_idname(current), None
+    return "", None
+
+
+def _consumer_type(socket, limit):
+    """来源未知时合并所有消费者；冲突或未遍历完时保持任意类型。"""
+    pending = [socket]
+    seen = set()
+    found = set()
+    steps = 0
+    while pending:
+        current = pending.pop()
+        key = _socket_key(current)
+        if key in seen:
+            continue
+        seen.add(key)
+        steps += 1
+        if steps > limit:
+            return ""
+        for link in getattr(current, "links", ()) or ():
+            steps += 1
+            if steps > limit:
+                return ""
+            target = getattr(link, "to_socket", None)
+            if target is None:
+                continue
+            if _is_reroute(target):
+                outputs = getattr(target.node, "outputs", ())
+                if outputs:
+                    pending.append(outputs[0])
+                continue
+            hint = _concrete_data_type(target) or _declared_type_idname(target)
+            if hint:
+                found.add(hint)
+                if len(found) > 1:
+                    return ""
+    return next(iter(found), "")
+
+
+def _walk_type_idname(socket, limit=64):
+    """有限迭代，先找来源再查消费者；不缓存，改线/改声明立即更新。"""
+    known, source = _source_type(socket, limit)
+    if known or source is None:
+        return known
+    return _consumer_type(source, limit)
+
+
+def resolved_type_idname(socket):
+    """通配引脚的显示类型；真正来源优先，未知来源才合并下游类型。
+
+    仅影响提示和颜色，不改变真实引脚类型、连线或生成语义。
     """
     if socket is None:
         return ""
     idname = str(getattr(socket, "bl_idname", "") or "")
-    if idname and idname != "GKSocketAny" and idname in _TYPE_TABLE:
+    if (not _is_reroute(socket) and idname in _TYPE_TABLE
+            and idname not in {"GKSocketAny", "NodeSocketVirtual"}):
         return idname
-    found = _walk_type_idname(socket)
-    if found:
-        return found
-    return _declared_type_idname(socket)
+    return _walk_type_idname(socket)
 
 
 def resolved_type_label(socket):
@@ -293,7 +444,8 @@ def resolved_type_label(socket):
 
 def resolved_color(socket):
     """通配引脚按解析出的类型取显示颜色;解析不出来用默认万能灰。"""
-    return _COLOR_BY_IDNAME.get(resolved_type_idname(socket), _COLOR_ANY)
+    idname = resolved_type_idname(socket)
+    return _NATIVE_COLORS.get(idname, _COLOR_BY_IDNAME.get(idname, _COLOR_ANY))
 
 
 def socket_caption(socket, text):

@@ -871,7 +871,8 @@ def main():
                                link_pair[2].inputs[link_pair[3]])
         r37_button_out = [socket.name for socket in r37_button.outputs]
         check("UI:『界面_按钮』两个出口(完成 = 建好了 / 点击 = 点了)",
-              r37_button_out == ["完成", "点击"], str(r37_button_out))
+              r37_button_out == ["完成", "点击", "自己"],
+              str(r37_button_out))
         check("UI:『界面_面板』的对齐 / 开局藏属性在",
               r37_panel.gk_align == "CENTER" and r37_panel.gk_start_hidden)
         r37_code, r37_warnings = codegen.generate(r37_tree, {
@@ -956,7 +957,8 @@ def main():
         r38_apply.gk_design = r38_design.name
         r38_tree.links.new(r38_ready.outputs["执行"], r38_apply.inputs["执行"])
         check("UI2:『界面_输入框』出口是『完成』+『提交』",
-              [socket.name for socket in r38_input.outputs] == ["完成", "提交"],
+              [socket.name for socket in r38_input.outputs]
+              == ["完成", "提交", "自己"],
               str([socket.name for socket in r38_input.outputs]))
         r38_code, r38_warnings = codegen.generate(r38_tree, {
             "dimension": "3", "base_class": "CharacterBody3D",
@@ -6278,9 +6280,9 @@ def main():
                r104_box.bl_idname) == ("GKNodeUiSlider", "GKNodeUiDropdown",
                                        "GKNodeUiCheckbox"))
         check("三件套:出口形状(完成 + 信号出口 + 数据出口)",
-              [s.name for s in r104_slider.outputs] == ["完成", "变了", "值"]
+              [s.name for s in r104_slider.outputs] == ["完成", "变了", "值", "自己"]
               and [s.name for s in r104_box.outputs]
-              == ["完成", "改了", "勾了吗"],
+              == ["完成", "改了", "勾了吗", "自己"],
               str([s.name for s in r104_slider.outputs]))
         check("三件套:滑块 / 下拉 / 复选框的出码都在",
               "HSlider.new()" in r104_code
@@ -6460,6 +6462,247 @@ def main():
         bpy.data.node_groups.remove(r105_design)
     except Exception as exc:
         check("第一百零五轮(界面收口)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 第一百二十七轮:连线式父子 + 界面结构件 / 引用 / 变量物体 / 事件 ----
+    # 这一批查**接口在真 Blender 里成立**(行为由界面示例的探针在真 Godot 里查):
+    #   ① 每个控件节点真的注册了『父』/『自己』引脚,连线也真连得上;
+    #   ② `ui_parent_name` 认连线,且连线优先于卡片上的『父控件』名字;
+    #   ③ 缺声明引脚的老节点会被加载迁移补上,而且迁移**幂等**(第二次返回 0);
+    #   ④ 连线式父子生成时仍旧"父先子后";
+    #   ⑤ 结构件 / 引用 / 事件节点出码的关键几条都在。
+    try:
+        _nn127 = import_module(f"{module_name}.nodes.nodes")
+        _nb127 = import_module(f"{module_name}.nodes.node_base")
+
+        # ① 引脚:所有控件构建节点都有『父』/『自己』
+        r127_missing = []
+        for idname in _nn127.UI_DESIGN_BUILDER_NODES:
+            cls = getattr(_nn127, idname)
+            pins_in = [spec["name"] for spec in cls.gk_inputs]
+            pins_out = [spec["name"] for spec in cls.gk_outputs]
+            if "父" not in pins_in or "自己" not in pins_out:
+                r127_missing.append(cls.bl_label)
+        check("第一百二十七轮:控件节点都注册了『父』/『自己』引脚",
+              not r127_missing, str(r127_missing))
+
+        # ② 真连线 + 解析器
+        r127_design = bpy.data.node_groups.new("连线父子冒烟127设计",
+                                               "GKUiDesignTree")
+        r127_panel = r127_design.nodes.new("GKNodeUiPanel")
+        r127_panel.name = "底板"
+        r127_text = r127_design.nodes.new("GKNodeUiText")
+        r127_text.name = "标题"
+        r127_text.gk_text = "暂停"
+        r127_link = r127_design.links.new(r127_panel.outputs["自己"],
+                                          r127_text.inputs["父"])
+        check("第一百二十七轮:『自己』->『父』在真 Blender 里连得上",
+              r127_link is not None)
+        check("第一百二十七轮:解析器认连线(且优先于卡片上的名字)",
+              _nb127.ui_parent_name(r127_text) == "底板",
+              _nb127.ui_parent_name(r127_text))
+
+        # ③ 缺声明引脚的老节点 -> 加载迁移补上,再跑一次必须返回 0(幂等)
+        r127_old = bpy.data.node_groups.new("缺引脚冒烟127", "GKUiDesignTree")
+        r127_old_node = r127_old.nodes.new("GKNodeUiText")
+        r127_old_node.name = "老文字"
+        _old_pin = r127_old_node.inputs.get("父")
+        if _old_pin is not None:
+            r127_old_node.inputs.remove(_old_pin)
+        _moved_once = _nn127.migrate_pin_names()
+        check("第一百二十七轮:缺声明的引脚会被加载迁移补上",
+              r127_old_node.inputs.get("父") is not None,
+              str([s.name for s in r127_old_node.inputs]))
+        _moved_twice = _nn127.migrate_pin_names()
+        check("第一百二十七轮:引脚迁移幂等(第二次返回 0)",
+              _moved_twice == 0, f"第一次 {_moved_once} / 第二次 {_moved_twice}")
+
+        # ④ 结构件 / 引用 / 事件一起摆进设计图
+        r127_canvas = r127_design.nodes.new("GKNodeUiCanvas")
+        r127_canvas.name = "画布"
+        r127_box = r127_design.nodes.new("GKNodeUiBox")
+        r127_box.name = "竖排框"
+        r127_box.gk_mode = "VBOX"
+        r127_backdrop = r127_design.nodes.new("GKNodeUiBackdrop")
+        r127_backdrop.name = "底色"
+        r127_textbox = r127_design.nodes.new("GKNodeUiTextBox")
+        r127_textbox.name = "标题条"
+        r127_textbox.gk_text = "第一章"
+        r127_click = r127_design.nodes.new("GKNodeUiOnMouseClick")
+        r127_click.name = "点空白"
+        r127_key = r127_design.nodes.new("GKNodeUiOnKeyPress")
+        r127_key.name = "开背包"
+        r127_key.gk_key = "I"
+        r127_set = r127_design.nodes.new("GKNodeUiSet")
+        r127_set.name = "亮标题"
+        r127_set.gk_widget = "标题条"
+        r127_set.gk_set_text = True
+        r127_setvar = r127_design.nodes.new("GKNodeSetVar")
+        r127_setvar.name = "记一下"
+        r127_setvar.gk_var_name = "当前界面"
+        r127_ref = r127_design.nodes.new("GKNodeUiWidgetRef")
+        r127_ref.name = "取按钮"
+        r127_ref.gk_widget = "标题条"
+
+        r127_tree = bpy.data.node_groups.new("连线父子冒烟127", "GKGameLogicTree")
+        r127_ready = r127_tree.nodes.new("GKNodeOnReady")
+        r127_apply = r127_tree.nodes.new("GKNodeUiApplyDesign")
+        r127_apply.gk_design = r127_design.name
+        r127_tree.links.new(r127_ready.outputs["执行"], r127_apply.inputs["执行"])
+        # 结构件的执行链:画布 -> 竖排框 -> 标题条(挂进竖排框用**连线**)
+        r127_design.links.new(r127_canvas.outputs["完成"], r127_box.inputs["执行"])
+        r127_design.links.new(r127_box.outputs["完成"],
+                              r127_textbox.inputs["执行"])
+        r127_design.links.new(r127_box.outputs["自己"],
+                              r127_textbox.inputs["父"])
+        # 界面行为:点空白 -> 记一下;按 I -> 改标题(两棵行为树各自独立)
+        r127_design.links.new(r127_click.outputs["点了"], r127_setvar.inputs["执行"])
+        r127_design.links.new(r127_ref.outputs["控件"], r127_setvar.inputs["值"])
+        r127_design.links.new(r127_key.outputs["按了"], r127_set.inputs["执行"])
+
+        r127_code, r127_warn = codegen.generate(r127_tree, {
+            "dimension": "2", "base_class": "Node2D",
+        })
+        r127_panel_at = r127_code.find("_gk_ui_底板 = ")
+        r127_child_at = r127_code.find('_gk_find_widget("底板")')
+        check("第一百二十七轮:连线式父子生成时父先子后",
+              r127_panel_at > -1 and r127_child_at > r127_panel_at,
+              f"{r127_panel_at} / {r127_child_at}")
+        check("第一百二十七轮:结构件出码(画布 / 容器 / 背景 / 文本框)",
+              "_gk_ui_画布 = Control.new()" in r127_code
+              and "_gk_ui_竖排框 = VBoxContainer.new()" in r127_code
+              and "_gk_ui_底色 = ColorRect.new()" in r127_code
+              and "_gk_ui_标题条 = PanelContainer.new()" in r127_code)
+        check("第一百二十七轮:引用节点落到 _gk_find_widget",
+              '_gk_find_widget("标题条")' in r127_code)
+        check("第一百二十七轮:界面事件注册了 _input 回调",
+              "func _input(event: InputEvent) -> void:" in r127_code
+              and "MOUSE_BUTTON_LEFT" in r127_code
+              and "key.is_action_pressed(" in r127_code)
+
+        # 卡片:结构件 / 引用 / 事件节点的 draw_buttons 都要能画完
+        class _R127Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r127_draw_ok = True
+        r127_draw_error = ""
+        for card in (r127_canvas, r127_box, r127_backdrop, r127_textbox,
+                     r127_click, r127_key, r127_ref):
+            try:
+                card.draw_buttons(bpy.context, _R127Layout())
+            except Exception as exc:                      # noqa: BLE001
+                r127_draw_ok = False
+                r127_draw_error = (f"{card.bl_label}: "
+                                   f"{type(exc).__name__}: {exc}")
+                break
+        check("第一百二十七轮:结构件 / 引用 / 事件卡片都画得完",
+              r127_draw_ok, r127_draw_error)
+        check("第一百二十七轮:套用设计无告警", not r127_warn,
+              str(r127_warn)[:300])
+
+        bpy.data.node_groups.remove(r127_tree)
+        bpy.data.node_groups.remove(r127_design)
+        bpy.data.node_groups.remove(r127_old)
+    except Exception as exc:
+        check("第一百二十七轮(连线式父子)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 第一百二十八轮:『界面_弹入/弹出』组合卡(原神式滑入)----
+    # 这一批查:在真 Blender 里属性真物化、弹入/弹出的出码关键几条都在
+    # (滑入位移 = 控件自身尺寸 / 位置与透明度同时跑 / 弹出播完复位并藏起来 /
+    # 不勾『等它播完』时复位挂 finished 回调)、卡片画得完。
+    # ⚠ 两个方向**各自单独一棵树**:混在一起就没法断言"弹出不该有置顶"。
+    try:
+        _nn128 = import_module(f"{module_name}.nodes.nodes")
+        r128_widgets = ("gk_widget", "gk_mode", "gk_direction", "gk_time",
+                        "gk_trans", "gk_ease", "gk_fade", "gk_top", "gk_scrim",
+                        "gk_scrim_to", "gk_wait")
+        r128_missing = [name for name in r128_widgets
+                        if name not in getattr(_nn128.GKNodeUiPop,
+                                               "__annotations__", {})]
+        check("第一百二十八轮:弹入/弹出卡片属性都物化了", not r128_missing,
+              str(r128_missing))
+
+        # ① 弹入
+        r128_tree_in = bpy.data.node_groups.new("弹入冒烟128", "GKGameLogicTree")
+        r128_ready = r128_tree_in.nodes.new("GKNodeOnReady")
+        r128_in = r128_tree_in.nodes.new("GKNodeUiPop")
+        r128_in.name = "弹菜单"
+        r128_in.gk_widget = "暂停菜单"
+        r128_in.gk_mode = "IN"
+        r128_in.gk_direction = "LEFT"
+        r128_in.gk_scrim = "黑幕"
+        r128_tree_in.links.new(r128_ready.outputs["执行"], r128_in.inputs["执行"])
+        r128_in_code, r128_in_warn = codegen.generate(r128_tree_in, {
+            "dimension": "2", "base_class": "Node2D",
+        })
+        check("第一百二十八轮:弹入 = 置顶 + 按自身尺寸滑入 + 位置透明度同时跑",
+              "_gk_ui_raise(" in r128_in_code
+              and ".set_parallel(true)" in r128_in_code
+              and ".size.x, 0.0)" in r128_in_code
+              and '"modulate:a"' in r128_in_code)
+        check("第一百二十八轮:弹入带黑幕(显示 + 淡到目标)",
+              '_gk_find_widget("黑幕")' in r128_in_code
+              and ".visible = true" in r128_in_code)
+        check("第一百二十八轮:弹入无告警", not r128_in_warn,
+              str(r128_in_warn)[:300])
+
+        # ② 弹出(不勾『等它播完』)
+        r128_tree_out = bpy.data.node_groups.new("弹出冒烟128", "GKGameLogicTree")
+        r128_ready_out = r128_tree_out.nodes.new("GKNodeOnReady")
+        r128_out = r128_tree_out.nodes.new("GKNodeUiPop")
+        r128_out.name = "收菜单"
+        r128_out.gk_widget = "暂停菜单"
+        r128_out.gk_mode = "OUT"
+        r128_out.gk_direction = "LEFT"
+        r128_out.gk_wait = False
+        r128_tree_out.links.new(r128_ready_out.outputs["执行"],
+                                r128_out.inputs["执行"])
+        r128_out_code, r128_out_warn = codegen.generate(r128_tree_out, {
+            "dimension": "2", "base_class": "Node2D",
+        })
+        check("第一百二十八轮:弹出 = 播完复位 + 藏起来,且**不**置顶",
+              ".visible = false" in r128_out_code
+              and ".position =" in r128_out_code
+              and "_gk_ui_raise(" not in r128_out_code)
+        check("第一百二十八轮:不勾『等它播完』-> 复位挂 finished 回调",
+              ".finished.connect(func() -> void:" in r128_out_code
+              and "await " not in r128_out_code)
+        check("第一百二十八轮:弹出无告警", not r128_out_warn,
+              str(r128_out_warn)[:300])
+
+        class _R128Layout:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AttributeError(name)
+
+                def recorder(*_args, **_kwargs):
+                    return self
+                return recorder
+
+        r128_draw_ok = True
+        r128_draw_error = ""
+        try:
+            r128_in.draw_buttons(bpy.context, _R128Layout())
+            r128_out.draw_buttons(bpy.context, _R128Layout())
+        except Exception as exc:                          # noqa: BLE001
+            r128_draw_ok = False
+            r128_draw_error = f"{type(exc).__name__}: {exc}"
+        check("第一百二十八轮:弹入/弹出卡片画得完", r128_draw_ok,
+              r128_draw_error)
+
+        bpy.data.node_groups.remove(r128_tree_in)
+        bpy.data.node_groups.remove(r128_tree_out)
+    except Exception as exc:
+        check("第一百二十八轮(界面弹入/弹出)", False,
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 

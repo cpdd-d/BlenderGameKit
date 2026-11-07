@@ -1136,6 +1136,10 @@ class GKNodeAnimStateMachine(B.GKStatementNode):
               "所以新方案改成了独立的动画树。留着是为了兼容已经用了它的图")
     gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "起始状态", "idle"),)
     gk_outputs = (S.pin(FLOW, "完成"),)
+    # 按转场生成 `idle→run` 这种**入边引脚** —— 名字不在声明里,不能拿
+    # "名字对不上"当陈旧判据(否则加载迁移每次都重建它)。
+    # 见 nodes/_containers.migrate_pin_names。
+    gk_dynamic_pins = True
 
     gk_prop_defs = (
         ("gk_states", "string", "idle\nrun", "状态列表",

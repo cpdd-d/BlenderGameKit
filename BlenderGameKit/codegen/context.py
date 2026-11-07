@@ -119,6 +119,7 @@ class GenContext:
         # (见 require_base_class / check_base_class)
         self.base_class_requirements = {}
         self._expr_cache = {}      # "节点::输出名" -> 表达式文本
+        self._expr_active = set()  # 正在求值的输出；与缓存分开，覆盖多输出和无缓存节点
         self._active = set()       # 沿执行流的递归栈，用于断环
         self._claimed = {}         # 节点 -> {入口引脚名: 哪个事件函数已经"拥有"它}
         self._current_event = ""   # 当前正在生成的事件标签(用于告警文案)
@@ -301,6 +302,9 @@ class GenContext:
     def new_section(self):
         """开一段新的代码块(一个函数)，返回它的收集器。"""
         self.sink = _Statements()
+        self._expr_cache = {}
+        self._current_indent = 1
+        self._expr_indent = 1
         return self.sink
 
     @contextlib.contextmanager
@@ -316,24 +320,34 @@ class GenContext:
         **整行消失**,它跑到了 `_gk_anim_enter_状态()` 的函数体里 ——
         结果进游戏什么动画都不播,而脚本语法完全正确,特别难查。
         """
-        saved = self.sink
+        saved = (self.sink, self._expr_cache,
+                 self._current_indent, self._expr_indent)
         section = self.new_section()
         try:
             yield section
         finally:
-            self.sink = saved
+            (self.sink, self._expr_cache,
+             self._current_indent, self._expr_indent) = saved
 
     # ---- 语句派发 ----
     def emit_statement(self, node, indent, output="完成"):
         """把一个语句节点翻译成代码，并沿它的执行流出口继续。"""
-        handler = STMT_HANDLERS.get(node.bl_idname)
-        if handler is None:
-            if not getattr(node, "gk_is_comment", False):
-                self.warn(f"节点『{node.bl_label}』还没有实现代码生成，已跳过")
+        # 表达式可能先写出局部变量（输入方向、射线等）。这些临时变量
+        # 只属于当前语句的求值位置，不能从另一个函数/兄弟分支复用。
+        # 同一条语句的多个输入仍共享缓存；子语句进入时会另开一份。
+        saved = (self._expr_cache, self._current_indent, self._expr_indent)
+        self._expr_cache = {}
+        self._current_indent = self._expr_indent = indent
+        try:
+            handler = STMT_HANDLERS.get(node.bl_idname)
+            if handler is None:
+                if not getattr(node, "gk_is_comment", False):
+                    self.warn(f"节点『{node.bl_label}』还没有实现代码生成，已跳过")
+            else:
+                handler(self, node, indent)
             _chain(self, node, indent, output)
-            return
-        handler(self, node, indent)
-        _chain(self, node, indent, output)
+        finally:
+            (self._expr_cache, self._current_indent, self._expr_indent) = saved
 
     def emit_expression(self, socket):
         """求值一个输出引脚。
@@ -913,37 +927,49 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
         # Python 包装对象 id() 不同,用 id() 会**撞键**(拿错别人的表达式)
         # 或者漏缓存 —— 详见 nodes.node_key。
         key = f"{node_lib.node_key(node)}::{output_name or ''}"
+        if key in self._expr_active:
+            label = getattr(node, "name", None) or getattr(node, "bl_label", "?")
+            pin = f"的『{output_name}』输出" if output_name else ""
+            raise CodegenAbort(
+                f"检测到取值连线循环：节点『{label}』{pin}依赖自身。"
+                "请断开循环连线；需要保存上一次的值时，请使用变量读取与设置节点。"
+            )
         if cacheable:
             cached = self._expr_cache.get(key)
             if cached is not None:
                 return cached
 
-        # 多输出节点优先按输出引脚定位
-        special = None
-        if output_name:
-            special = expression_for_output(self, node, output_name)
-            if special is not None:
-                if cacheable:
-                    self._expr_cache[key] = special
-                return special
+        # 活动栈必须包住所有求值路径。用缓存里的 null 占位只能拦住普通
+        # 节点，而且会把非法环静默编译成 null 运算；多输出/射线仍会递归。
+        self._expr_active.add(key)
+        try:
+            if output_name:
+                special = expression_for_output(self, node, output_name)
+                if special is not None:
+                    if cacheable:
+                        self._expr_cache[key] = special
+                    return special
 
-        handler = EXPR_HANDLERS.get(node.bl_idname)
-        # 先登记成占位，避免自引用导致死循环
-        if cacheable:
-            self._expr_cache[key] = "null"
-        if handler is None:
-            self.warn(f"节点『{node.bl_label}』不能作为取值使用，已按 null 处理")
-            result = "null"
-        else:
-            try:
-                result = handler(self, node)
-            except Exception as exc:
-                self.warn(f"节点『{node.bl_label}』求值失败: {exc}")
+            handler = EXPR_HANDLERS.get(node.bl_idname)
+            if handler is None:
+                self.warn(f"节点『{node.bl_label}』不能作为取值使用，已按 null 处理")
                 result = "null"
-        result = result if isinstance(result, str) else gd_literal(result)
-        if cacheable:
-            self._expr_cache[key] = result
-        return result
+            else:
+                try:
+                    result = handler(self, node)
+                except CodegenAbort:
+                    # 转接点/取值环等致命图错误必须交给导出入口处理，不能
+                    # 被某个上游表达式吞掉后继续导出一份无效脚本。
+                    raise
+                except Exception as exc:
+                    self.warn(f"节点『{node.bl_label}』求值失败: {exc}")
+                    result = "null"
+            result = result if isinstance(result, str) else gd_literal(result)
+            if cacheable:
+                self._expr_cache[key] = result
+            return result
+        finally:
+            self._expr_active.discard(key)
 
     # ---- 输入动作 ----
     def input_action(self, node, prop, fallback):

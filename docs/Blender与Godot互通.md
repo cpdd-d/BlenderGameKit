@@ -320,14 +320,17 @@ examples/gdextension_cpp/
 ```ini
 [configuration]
 entry_symbol = "gk_library_init"
-compatibility_minimum = "4.4"
+compatibility_minimum = "4.5"
 
 [libraries]
-windows.debug.x86_64 = "res://bin/gk_demo.windows.debug.x86_64.dll"
-windows.release.x86_64 = "res://bin/gk_demo.windows.release.x86_64.dll"
+windows.debug.x86_64 = "res://bin/gk_demo.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/gk_demo.windows.template_release.x86_64.dll"
 ```
 
 Godot 会去找 `res://bin/` 下对应平台的库。**改了 C++ 要重新编译并重启编辑器**。
+
+> 左边（`windows.debug`）是"特性"，右边是**实际文件名**。`target=template_debug`
+> 产出的是 `.template_debug`，不是 `.debug` —— 写混了 Godot 会静默地不加载。
 
 ### 构建前置条件
 
@@ -335,8 +338,8 @@ Godot 会去找 `res://bin/` 下对应平台的库。**改了 C++ 要重新编�
 # 1. Python + SCons
 pip install scons
 
-# 2. godot-cpp(和你的 Godot 版本对应)
-git clone -b 4.4 https://github.com/godotengine/godot-cpp
+# 2. godot-cpp(官方最高分支是 4.5，没有 4.6 / 4.7 分支)
+git clone --depth 1 -b 4.5 https://github.com/godotengine/godot-cpp
 
 # 3. 编译
 cd examples\gdextension_cpp
@@ -346,8 +349,13 @@ scons platform=windows target=template_debug -j8
 > 你没有装 git 的话,也可以直接下 godot-cpp 的 zip 解压到同级目录。
 > 你机器上有 `D:\cmake` 和 `D:\vs2026`,所以 CMake 路线也走得通。
 
-**注意**:godot-cpp 的版本必须和 Godot 版本大致匹配
-(比如 Godot 4.4 配 godot-cpp 4.4 分支)。版本差太多会在链接时报符号错误。
+**注意**:godot-cpp 的版本只能 **≤ 你的 Godot 版本**。
+版本差太多会在链接时报符号错误，反过来（高版本库给低版本引擎）一定加载失败。
+
+> **实测（2026-10-29）**:godot-cpp `4.5` 编出的 `.dll` 在 **Godot 4.7.2** 里
+> 正常注册：`GKCharacter` 存在、继承 `CharacterBody3D`、`speed` /
+> `jump_pressed` / `gravity_scale` 读写全通过。所以本仓库固定用 4.5，
+> 并在 `.gdextension` 里声明 `compatibility_minimum = "4.5"`。
 
 ### 和节点图配合的方式
 

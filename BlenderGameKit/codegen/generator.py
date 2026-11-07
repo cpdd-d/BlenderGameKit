@@ -658,7 +658,8 @@ class Generator:
         if getattr(self.ctx, "need_light_helper", False):
             sections.append({
                 "signature": "func _gk_set_light(host: Node, light_name: String, "
-                             "on: bool, energy: float, color) -> void:",
+                             "on: bool, energy: float, color, "
+                             "fade: float = 0.0) -> void:",
                 "lines": [
                     "    if light_name.strip_edges().is_empty():",
                     "        return",
@@ -674,17 +675,720 @@ class Generator:
                     "    var light := found as Light3D",
                     "    if light == null:",
                     "        return",
+                    "    if color != null:",
+                    "        light.light_color = color",
+                    "    if fade > 0.0 and host != null and host.is_inside_tree():",
+                    "        var tw := host.create_tween()",
+                    "        if on:",
+                    "            light.visible = true",
+                    "            var target: float = energy if energy > 0.0 "
+                    "else light.light_energy",
+                    '            tw.tween_property(light, "light_energy", '
+                    "target, fade)",
+                    "        else:",
+                    # 关灯要**先淡到 0 再隐藏**:直接 visible=false 是
+                    # 「断」,看不到暗下去的过程。
+                    '            tw.tween_property(light, "light_energy", '
+                    "0.0, fade)",
+                    "            tw.tween_callback(func(): light.visible = false)",
+                    "        return",
                     "    light.visible = on",
                     "    if energy > 0.0:",
                     "        light.light_energy = energy",
-                    "    if color != null:",
-                    "        light.light_color = color",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
             })
 
-        # ---- 骨骼:找 Skeleton3D 的小工具 ----
+        # ---- 灯光闪烁(第一百四十八轮)--------------------------------
+        # 见 statements._stmt_light_flicker / 『灯光_闪烁』节点。
+        # 状态放在一个 Array 里(而不是每个节点一个成员变量):灯是运行时
+        # 按名字找到的,一个节点可能被同一条链重复执行,重复登记会导致
+        # 同一盏灯被算两遍(亮度互相覆盖 -> 看起来"闪得不规律")。
+        # 这里用 `light` 的 instance_id 去重。
+        if getattr(self.ctx, "need_flicker_helper", False):
+            flickers = self.ctx.declare_var("_gk_flickers", "Array", "[]")
+            sections.append({
+                "signature": "func _gk_light_flicker_start(host: Node, "
+                             "light_name: String, mode: int, speed: float, "
+                             "depth: float, base_energy: float) -> void:",
+                "lines": [
+                    "    if light_name.strip_edges().is_empty():",
+                    "        return",
+                    "    var root: Node = host",
+                    "    if host != null and host.is_inside_tree():",
+                    "        root = host.get_tree().root",
+                    "    if root == null:",
+                    "        return",
+                    "    var found := root.find_child("
+                    'light_name.strip_edges(), true, false)',
+                    "    var light := found as Light3D",
+                    "    if light == null:",
+                    "        return",
+                    "    for state in " + flickers + ":",
+                    "        if state.get(\"light\") == light:",
+                    "            return",
+                    "    " + flickers + ".append({",
+                    '        "light": light,',
+                    '        "mode": mode,',
+                    '        "speed": maxf(speed, 0.01),',
+                    '        "depth": clampf(depth, 0.0, 1.0),',
+                    '        "base": base_energy if base_energy > 0.0 '
+                    'else light.light_energy,',
+                    '        "t": 0.0,',
+                    '        "seed": float(light.get_instance_id() % 997) * 0.013,',
+                    "    })",
+                ],
+                "figure": None,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_light_flicker_tick(delta: float) -> void:",
+                "lines": [
+                    "    for state in " + flickers + ":",
+                    '        var light := state["light"] as Light3D',
+                    "        if light == null or not is_instance_valid(light) "
+                    "or not light.visible:",
+                    "            continue",
+                    '        state["t"] = float(state["t"]) + delta * float(state["speed"])',
+                    '        var t: float = state["t"]',
+                    '        var depth: float = state["depth"]',
+                    '        var seed: float = state["seed"]',
+                    "        var level := 1.0",
+                    '        match int(state["mode"]):',
+                    "            0:  # 接触不良:高频双正弦 + 偶发全灭",
+                    "                var wobble := sin(t * 41.0 + seed) "
+                    "* sin(t * 13.7 + seed * 2.0)",
+                    "                level = 1.0 - depth * clampf("
+                    "0.45 - wobble * 0.9, 0.0, 1.0)",
+                    "                # 偶发全灭:两个慢正弦叠加,峰值偶尔超过门槛 ——",
+                    "                # 每次灭会持续好几帧(约 0.3 秒),不是『闪一下就回来』。",
+                    "                # 以前的 sin > 0.985 门槛太窄:平均 37 秒才灭**一帧**,",
+                    "                # 实机探针 150 帧一次都没灭过(等于没有这条效果)。",
+                    "                var cut := sin(t * 2.1 + seed) "
+                    "+ sin(t * 4.7 + seed * 1.3)",
+                    "                if cut > 1.55:",
+                    "                    level = 0.0",
+                    "            1:  # 烛火:慢呼吸 + 高频小抖",
+                    "                var sway := 0.5 + 0.5 * sin(t * 2.3 + seed) "
+                    "* sin(t * 7.1 + seed)",
+                    "                level = 1.0 - depth * (0.35 + 0.65 * sway)",
+                    "            2:  # 警报:方波脉冲",
+                    "                level = 0.18 + 0.82 * (0.5 + 0.5 * sin(t * 6.2831853))",
+                    "            3:  # 呼吸:极慢",
+                    "                level = 1.0 - depth * (0.5 + 0.5 * sin(t * 1.3))",
+                    '        light.light_energy = float(state["base"]) '
+                    "* clampf(level, 0.0, 1.0)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            # 停止闪烁(第一百八十六轮):『灯光_闪烁』勾上"停止闪烁"时生成。
+            # 摘除前把亮度恢复到基准 —— 闪烁器每帧都在改 light_energy,
+            # 不恢复的话灯会停在半暗值上"虚"着。没在闪就是空操作。
+            sections.append({
+                "signature": "func _gk_light_flicker_stop(host: Node, "
+                             "light_name: String) -> void:",
+                "lines": [
+                    "    if light_name.strip_edges().is_empty():",
+                    "        return",
+                    "    var root: Node = host",
+                    "    if host != null and host.is_inside_tree():",
+                    "        root = host.get_tree().root",
+                    "    if root == null:",
+                    "        return",
+                    "    var found := root.find_child("
+                    'light_name.strip_edges(), true, false)',
+                    "    var light := found as Light3D",
+                    "    if light == null:",
+                    "        return",
+                    "    for i in " + flickers + ".size():",
+                    "        var state: Dictionary = " + flickers + "[i]",
+                    '        if state.get("light") == light:',
+                    '            light.light_energy = float('
+                    'state.get("base", light.light_energy))',
+                    "            " + flickers + ".remove_at(i)",
+                    "            return",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 摆动(第一百五十轮)--------------------------------------
+        # 见 statements._stmt_sway / 『动画_摆动』节点。
+        # 状态用 Array:同一个目标被重复登记时只保留第一次(相位 / 幅度不会
+        # 被后来的那张卡改掉),和灯光闪烁的登记规则一致。
+        if getattr(self.ctx, "need_sway_helper", False):
+            sways = self.ctx.declare_var("_gk_sways", "Array", "[]")
+            sections.append({
+                # host 是为了和别的 helper 保持同一套调用形状(调用方传 self),
+                # 这里用不到 —— 参数名前缀 `_` 抑制 Godot 的 UNUSED_PARAMETER。
+                "signature": "func _gk_sway_start(_host: Node, target: Node, "
+                             "axis: int, amplitude: float, period: float, "
+                             "phase: float) -> void:",
+                "lines": [
+                    "    if target == null or not is_instance_valid(target):",
+                    "        return",
+                    "    for state in " + sways + ":",
+                    '        if state.get("target") == target:',
+                    "            return",
+                    "    var base: Variant = null",
+                    "    if target is Node3D:",
+                    "        base = (target as Node3D).rotation",
+                    "    elif target is Control:",
+                    "        base = (target as Control).rotation",
+                    "    else:",
+                    "        return",
+                    "    " + sways + ".append({",
+                    '        "target": target,',
+                    '        "base": base,',
+                    '        "axis": axis,',
+                    '        "amp": deg_to_rad(amplitude),',
+                    '        "period": maxf(period, 0.01),',
+                    '        "phase": phase,',
+                    '        "t": 0.0,',
+                    "    })",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_sway_tick(delta: float) -> void:",
+                "lines": [
+                    "    for state in " + sways + ":",
+                    '        var target = state["target"]',
+                    "        if target == null or not is_instance_valid(target):",
+                    "            continue",
+                    '        state["t"] = float(state["t"]) + delta',
+                    '        var angle: float = sin(TAU * float(state["t"]) '
+                    '/ float(state["period"]) + float(state["phase"])) '
+                    '* float(state["amp"])',
+                    "        if target is Node3D:",
+                    '            var base: Vector3 = state["base"]',
+                    "            var offset := Vector3.ZERO",
+                    '            if int(state["axis"]) == 0:',
+                    "                offset.x = angle",
+                    '            elif int(state["axis"]) == 1:',
+                    "                offset.y = angle",
+                    "            else:",
+                    "                offset.z = angle",
+                    "            (target as Node3D).rotation = base + offset",
+                    "        elif target is Control:",
+                    '            (target as Control).rotation = '
+                    'float(state["base"]) + angle',
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 人形走路摆动(第一百六十三轮)---------------------------
+        # 见 statements._stmt_humanoid_walk / 『角色_走路摆动』节点。
+        # 状态同样放 Array(按 target 去重):『每当_物理帧』每帧都会执行一次
+        # 这个语句,不去重就会登记 N 份、同一只手臂被摆 N 次。
+        if getattr(self.ctx, "need_walk_helper", False):
+            walks = self.ctx.declare_var("_gk_walks", "Array", "[]")
+            links_cache = self.ctx.declare_var(
+                "_gk_walk_links_cache", "Array", "[]")
+            sections.append({
+                "signature": "func _gk_walk_links() -> Array:",
+                "lines": [
+                    # 第 165 轮:配对表(_gk_body_links)在环境脚本的
+                    # 『Environment』节点手里 —— 它是场景根的**子节点**,
+                    # 和 Colliders 是**兄弟**,不在玩家的父链上。所以查找要
+                    # 两手抓:父链每个节点自己查一遍、每个节点的**直接子级**
+                    # 也查一遍(Node.get 动态读,脚本没这属性就返回 null,
+                    # 编译期安全);找到非空表就缓存(表是帧末 call_deferred
+                    # 才建好的,空表不缓存,下一帧再找)。一路都没有就返回
+                    # 空 —— 走路照常,只是怪物收不到零件。
+                    "    if " + links_cache + ".size() > 0:",
+                    "        return " + links_cache,
+                    "    var node: Node = self",
+                    "    while node != null:",
+                    '        var links = node.get("_gk_body_links")',
+                    "        if links is Array and links.size() > 0:",
+                    "            " + links_cache + " = links",
+                    "            return links",
+                    "        for child in node.get_children():",
+                    '            var sub = child.get("_gk_body_links")',
+                    "            if sub is Array and sub.size() > 0:",
+                    "                " + links_cache + " = sub",
+                    "                return sub",
+                    "        node = node.get_parent()",
+                    "    return []",
+                ],
+                "figure": None,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_walk_collect(node: Node, needle: String, "
+                             "out: Array) -> void:",
+                "lines": [
+                    "    if node == null or needle.is_empty():",
+                    "        return",
+                    "    for child in node.get_children():",
+                    "        if child is Node3D and String(child.name).find(needle) >= 0:",
+                    "            out.append(child)",
+                    "        _gk_walk_collect(child, needle, out)",
+                ],
+                "figure": None,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_walk_start(host: Node, target: Node, "
+                             "needle: String, swing_deg: float, bob: float, "
+                             "ref_speed: float, step_path: String = \"\", "
+                             "step_db: float = -10.0, "
+                             "step_3d: bool = false) -> void:",
+                "lines": [
+                    "    if target == null or not is_instance_valid(target):",
+                    "        return",
+                    "    for state in " + walks + ":",
+                    '        if state.get("target") == target:',
+                    "            return",
+                    # 怪物这类"网格在世界 glb、和 body 分离"的角色:零件挂在
+                    # 网格节点下,body 在 _gk_body_links 里配对的那一侧就是它
+                    # 的网格。这里先试着认出来;认不到(配对还没建好,比如本
+                    # 节点在 _ready 里就跑)就退回 target 本身 —— _gk_walk_tick
+                    # 每帧还会再补认一次,不会漏。
+                    "    var root: Node = target",
+                    "    for pair in _gk_walk_links():",
+                    "        if pair.size() >= 2 and pair[1] == target:",
+                    "            root = pair[0]",
+                    "            break",
+                    # 手臂:按节点里填的『关节关键字』认(默认「臂」)。
+                    "    var parts_arms: Array = []",
+                    "    _gk_walk_collect(root, needle, parts_arms)",
+                    # 腿:无论关键字填什么,都额外把名字里带「腿」的零件收进来
+                    #   —— 走路时手脚反相(左手前 ↔ 右腿前)才自然。怪物没有
+                    #   Model(网格是世界里同名的独立节点),取不到就**不浮沉**,
+                    #   那个网格每帧被 `_gk_sync_colliders` 抄成碰撞体的变换,
+                    #   浮沉会被它覆盖掉;但腿的 rotation 摆动不受它影响。
+                    '    var model := target.get_node_or_null("Model") as Node3D',
+                    "    var arms: Array = []",
+                    "    for part in parts_arms:",
+                    '        arms.append({"node": part, "base": (part as Node3D).rotation})',
+                    "    var parts_legs: Array = []",
+                    '    _gk_walk_collect(root, "腿", parts_legs)',
+                    "    var legs: Array = []",
+                    "    for part in parts_legs:",
+                    '        legs.append({"node": part, "base": (part as Node3D).rotation})',
+                    # 速度来源:目标是 CharacterBody3D 就直接读 velocity;
+                    # 不是(比如世界上那个同名网格)就退回"这帧挪了多远"。
+                    "    var body: CharacterBody3D = target as CharacterBody3D",
+                    "    var start_pos := Vector3.ZERO",
+                    "    if target is Node3D:",
+                    "        start_pos = (target as Node3D).global_position",
+                    "    " + walks + ".append({",
+                    '        "target": target,',
+                    '        "needle": needle,',
+                    '        "arms": arms,',
+                    '        "legs": legs,',
+                    '        "model": model,',
+                    '        "base_pos": model.position if model != null else Vector3.ZERO,',
+                    '        "body": body,',
+                    '        "last": start_pos,',
+                    '        "t": 0.0,',
+                    '        "swing": deg_to_rad(swing_deg),',
+                    '        "bob": maxf(bob, 0.0),',
+                    '        "ref": maxf(ref_speed, 0.1),',
+                    # 脚步声(第一百八十二轮):路径空 = 不播;播放器懒创建。
+                    '        "step_path": step_path,',
+                    '        "step_db": step_db,',
+                    '        "step_snd": null,',
+                    '        "step_idx": 0,',
+                    '        "step_3d": step_3d,',
+                    "    })",
+                ],
+                "figure": None,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_walk_tick(delta: float) -> void:",
+                "lines": [
+"    for state in " + walks + ":",
+'        var target = state["target"]',
+"        if target == null or not is_instance_valid(target):",
+"            continue",
+                    # 懒收集兜底:『_gk_link_colliders』是 call_deferred 建的,
+                    # ready 链里登记时配对还没建 —— 每帧补认一次(第 165 轮
+                    # 怪物走路:网格在世界 glb、body 才是注册目标)。
+                    '        if (state["arms"].size() == 0 or state["legs"].size() == 0):',
+                    '            var _root: Node = target',
+                    "            for pair in _gk_walk_links():",
+                    "                if pair.size() >= 2 and pair[1] == target:",
+                    "                    _root = pair[0]",
+                    "                    break",
+                    '            if state["arms"].size() == 0 and _root != null:',
+                    "                var _a: Array = []",
+                    '                _gk_walk_collect(_root, state["needle"], _a)',
+                    "                var _arms: Array = []",
+                    "                for _p in _a:",
+                    '                    _arms.append({"node": _p, "base": (_p as Node3D).rotation})',
+                    '                state["arms"] = _arms',
+                    '            if state["legs"].size() == 0 and _root != null:',
+                    "                var _l: Array = []",
+                    '                _gk_walk_collect(_root, "腿", _l)',
+                    "                var _legs: Array = []",
+                    "                for _p in _l:",
+                    '                    _legs.append({"node": _p, "base": (_p as Node3D).rotation})',
+                    '                state["legs"] = _legs',
+                    "        var speed := 0.0",
+                    "        var on_floor := true",
+                    '        var body = state["body"]',
+                    "        if body != null and is_instance_valid(body):",
+                    '            var v: Vector3 = (body as CharacterBody3D).velocity',
+                    "            speed = Vector2(v.x, v.z).length()",
+                    "            on_floor = (body as CharacterBody3D).is_on_floor()",
+                    "        elif target is Node3D:",
+                    # 没有 CharacterBody3D 的目标(世界 glb 里那个同名网格,
+                    # 每物理帧被 _gk_sync_colliders 抄成碰撞体的变换):
+                    # 直接量它这帧挪了多远 —— 对任何"被别处推着走"的东西都成立。
+                    "            var now_pos: Vector3 = (target as Node3D).global_position",
+                    '            var last_pos: Vector3 = state["last"]',
+                    "            if delta > 0.0001:",
+                    "                var step := now_pos - last_pos",
+                    "                speed = Vector2(step.x, step.z).length() / delta",
+                    '            state["last"] = now_pos',
+                    '        var ratio: float = clampf(speed / float(state["ref"]), 0.0, 1.0)',
+                    # 腾空时收一收:跳跃中手臂还在大幅摆会很假,但完全不动也
+                    # 生硬 —— 留三成。
+                    "        if not on_floor:",
+                    "            ratio *= 0.3",
+                    # 相位按**走过的距离**推进(不是按时间):站着不动就停,
+                    # 走多快就摆多快 —— 时间驱动会让"原地站着的角色"也在摆。
+                    '        state["t"] = float(state["t"]) + delta * (1.6 + speed * 1.5)',
+                    '        var phase: float = state["t"]',
+                    '        var angle: float = sin(phase) * float(state["swing"]) * ratio',
+                    # ── 脚步声:摆动相位每过 π = 一只脚落地 ──────────────
+                    '        if String(state["step_path"]) != "":',
+                    '            if state["step_snd"] == null or '
+                    'not is_instance_valid(state["step_snd"]):',
+                    '                var step_p: Node = null',
+                    '                if bool(state["step_3d"]):',
+                    '                    var p3d := AudioStreamPlayer3D.new()',
+                    '                    p3d.unit_size = 10.0',
+                    '                    step_p = p3d',
+                    '                else:',
+                    '                    step_p = AudioStreamPlayer.new()',
+                    '                step_p.stream = load(state["step_path"])',
+                    '                step_p.volume_db = float(state["step_db"])',
+                    "                step_p.bus = \"Master\"",
+                    "                target.add_child(step_p)",
+                    '                state["step_snd"] = step_p',
+                    '            var step_idx := int(floor(phase / 3.14159))',
+                    '            if step_idx != int(state["step_idx"]):',
+                    '                state["step_idx"] = step_idx',
+                    "                if speed > 0.5 and on_floor:",
+                    '                    var step_s = state["step_snd"]',
+                    "                    step_s.pitch_scale = randf_range(0.9, 1.12)",
+                    "                    step_s.play()",
+                    "        var flip := 1.0",
+                    '        for entry in state["arms"]:',
+                    '            var arm := entry["node"] as Node3D',
+                    "            if arm == null or not is_instance_valid(arm):",
+                    "                continue",
+                    '            var base: Vector3 = entry["base"]',
+                    "            arm.rotation = base + Vector3(angle * flip, 0.0, 0.0)",
+                    "            flip = -flip",
+                    # 腿与手臂反相:左臂前时右腿前(正常的步态),而不是同手同脚。
+                    "        flip = -1.0",
+                    '        for entry in state["legs"]:',
+                    '            var leg := entry["node"] as Node3D',
+                    "            if leg == null or not is_instance_valid(leg):",
+                    "                continue",
+                    '            var base: Vector3 = entry["base"]',
+                    "            leg.rotation = base + Vector3(angle * flip, 0.0, 0.0)",
+                    "            flip = -flip",
+                    '        var model := state["model"] as Node3D',
+                    "        if model != null and is_instance_valid(model):",
+                    '            var base_pos: Vector3 = state["base_pos"]',
+                    '            var lift: float = absf(sin(phase)) '
+                    '* float(state["bob"]) * ratio',
+                    "            model.position = base_pos + Vector3(0.0, lift, 0.0)",
+                    # 怪物自动跟随(第 165 轮):配对是 call_deferred 建的,ready
+                    # 链里还没有;每帧扫一遍 _gk_body_links,把"不是自己的 body"
+                    # 也登记成走路者 —— _gk_walk_start 按 target 去重,重复调用
+                    # 不会重复登记。摆动参数抄玩家第一条(风格统一),浮沉给 0
+                    # (怪物网格每帧被 _gk_sync_colliders 抄变换,浮沉会被覆盖)。
+                    "    if " + walks + ".size() > 0:",
+                    "        var proto = " + walks + "[0]",
+                    "        for pair in _gk_walk_links():",
+                    "            if pair.size() < 2:",
+                    "                continue",
+                    "            var other = pair[1]",
+                    "            if other == null or not is_instance_valid(other) "
+                    "or other == self:",
+                    "                continue",
+                    # 只认 CharacterBody3D(怪物/别的 NPC):配对表里还有
+                    # 墙 / 门 / 触发区这些 StaticBody / Area,全注册的话
+                    # 一关能攒 20 条登记(第 165 轮实测)。
+                    "            if not (other is CharacterBody3D):",
+                    "                continue",
+                    "            _gk_walk_start(self, other, "
+                    'proto["needle"], rad_to_deg(float(proto["swing"])), '
+                    '0.0, float(proto["ref"]), '
+                    '            String(proto["step_path"]), '
+                    '            float(proto["step_db"]) + 4.0, '
+			    '            true)',
+			],
+                "figure": None,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 相机运镜(第一百五十轮)--------------------------------
+        # 见 camera._stmt_camera_shot / 『相机_运镜』节点。
+        # 这是一段**不 await 的协程**:调用后镜头自己演,执行链立刻往下走。
+        if getattr(self.ctx, "need_camera_shot_helper", False):
+            busy = self.ctx.declare_var("_gk_camera_shot_busy", "bool", "false")
+            sections.append({
+                "signature": "func _gk_camera_shot(host: Node, shot_cam: Node, "
+                             "curve: Curve3D, look: Node, duration: float, "
+                             "hold: float, return_time: float, fov_from: float, "
+                             "fov_to: float, return_home: bool, trans: int, "
+                             "ease: int) -> void:",
+                "lines": [
+                    "    if " + busy + ":",
+                    "        return",
+                    "    if shot_cam == null or not is_instance_valid(shot_cam) "
+                    "or not (shot_cam is Camera3D):",
+                    "        return",
+                    "    " + busy + " = true",
+                    # 等一帧:场景刚进树时 Environment 的 _ready 可能还没把
+                    # 主相机设成 current —— 这一帧之后再取 home 才拿得到。
+                    "    if is_instance_valid(host) and host.is_inside_tree():",
+                    "        await host.get_tree().process_frame",
+                    "    if not is_instance_valid(shot_cam) "
+                    "or not (shot_cam is Camera3D):",
+                    "        " + busy + " = false",
+                    "        return",
+                    # ── 换关卡时 host 会被摘出树(真机踩到)──────────────────
+                    # 这时 `get_viewport()` 返回 null,直接 `.get_camera_3d()`
+                    # 就是 "Cannot call method on a null value"。先确认还在树上
+                    # 再取 viewport,拿不到就安静退出(切场景本来就不该运镜)。
+                    "    if not is_instance_valid(host) or not host.is_inside_tree():",
+                    "        " + busy + " = false",
+                    "        return",
+                    "    var viewport := get_viewport()",
+                    "    if viewport == null:",
+                    "        " + busy + " = false",
+                    "        return",
+                    "    var shot := shot_cam as Camera3D",
+                    "    var home := viewport.get_camera_3d()",
+                    "    var home_is_other := home != null and home != shot",
+                    "    var shot_xf0: Transform3D = shot.global_transform",
+                    "    var shot_fov0: float = shot.fov",
+                    "    var start_fov: float = fov_from if fov_from > 0.0 "
+                    "else shot.fov",
+                    "    var end_fov: float = fov_to if fov_to > 0.0 "
+                    "else start_fov",
+                    "    var path_len := 0.0",
+                    "    var curve_start := shot.global_position",
+                    "    if curve != null:",
+                    "        path_len = curve.get_baked_length()",
+                    "        curve_start = curve.sample_baked(0.0, true)",
+                    # ── 起点 / 终点(第一百五十一轮改法)─────────────────
+                    # 以前把**整条曲线**平移,让曲线起点贴住当前相机 ——
+                    # 结果"落点"也跟着平移,示例里镜头会一头扎到怪物脸上。
+                    # 现在:曲线就是**世界坐标**,终点严格按作者摆的落点走;
+                    # 起点从当前相机出发,开头用一小段(≤0.35 秒)并进曲线,
+                    # 既不跳帧,也不会把落点挪走。
+                    "    var start_pos: Vector3 = curve_start",
+                    "    if home != null:",
+                    "        start_pos = home.global_position",
+                    "    var end_pos: Vector3 = shot_xf0.origin",
+                    "    if curve != null:",
+                    "        end_pos = curve.sample_baked(path_len, true)",
+                    "    var approach := minf(0.35, duration * 0.25)",
+                    "    shot.global_position = start_pos",
+                    "    shot.fov = start_fov",
+                    "    shot.make_current()",
+                    # ── 第一帧先摆正朝向,免得切过去时闪一下 ──
+                    "    if look != null and is_instance_valid(look) and look is Node3D:",
+                    "        var aim0: Vector3 = (look as Node3D).global_position "
+                    "+ Vector3(0.0, 0.9, 0.0)",
+                    "        if shot.global_position.distance_to(aim0) > 0.05:",
+                    "            shot.look_at(aim0, Vector3.UP)",
+                    # ── 推近 ──
+                    "    var elapsed := 0.0",
+                    "    while elapsed < duration:",
+                    "        if not is_instance_valid(host) or not host.is_inside_tree():",
+                    "            " + busy + " = false",
+                    "            return",
+                    "        await host.get_tree().physics_frame",
+                    "        var dt := host.get_physics_process_delta_time()",
+                    "        if dt <= 0.0:",
+                    "            dt = 0.016",
+                    "        elapsed += dt",
+                    "        var t := clampf(elapsed / maxf(duration, 0.0001), 0.0, 1.0)",
+                    "        var a := float(Tween.interpolate_value("
+                    "0.0, 1.0, t, 1.0, trans as Tween.TransitionType, "
+                    "ease as Tween.EaseType))",
+                    "        var pos := start_pos.lerp(end_pos, a)",
+                    "        if curve != null:",
+                    "            pos = curve.sample_baked(a * path_len, true)",
+                    # 开头从"当前相机所在位置"并进曲线(曲线是世界坐标,
+                    # 不因为相机起飞点不同而整体平移)。
+                    "            var into := clampf(elapsed / maxf(approach, 0.0001), 0.0, 1.0)",
+                    "            pos = start_pos.lerp(pos, into)",
+                    "        shot.global_position = pos",
+                    "        shot.fov = lerpf(start_fov, end_fov, a)",
+                    "        if look != null and is_instance_valid(look) "
+                    "and look is Node3D:",
+                    "            var aim: Vector3 = (look as Node3D).global_position "
+                    "+ Vector3(0.0, 0.9, 0.0)",
+                    "            if shot.global_position.distance_to(aim) > 0.05:",
+                    "                shot.look_at(aim, Vector3.UP)",
+                    # ── 停在特写上 ──
+                    "    if hold > 0.0:",
+                    "        if is_instance_valid(host) and host.is_inside_tree():",
+                    "            await host.get_tree().create_timer("
+                    "hold, true, false, true).timeout",
+                    # ── 没指定特写相机(目标 = 当前相机)时,也要缩回原位 ──
+                    # 否则『回到原相机』勾着却停在了轨道终点,用户会以为坏了。
+                    "    if return_home and not home_is_other:",
+                    "        var same_from: Transform3D = shot.global_transform",
+                    "        var same_fov: float = shot.fov",
+                    "        var same_rt := 0.0",
+                    "        if return_time > 0.0:",
+                    "            while same_rt < return_time:",
+                    "                if not is_instance_valid(host) "
+                    "or not host.is_inside_tree():",
+                    "                    break",
+                    "                await host.get_tree().physics_frame",
+                    "                var dt3 := host.get_physics_process_delta_time()",
+                    "                if dt3 <= 0.0:",
+                    "                    dt3 = 0.016",
+                    "                same_rt += dt3",
+                    "                var c := clampf(same_rt / maxf(return_time, 0.0001), "
+                    "0.0, 1.0)",
+                    "                var ac := float(Tween.interpolate_value("
+                    "0.0, 1.0, c, 1.0, trans as Tween.TransitionType, "
+                    "ease as Tween.EaseType))",
+                    "                shot.global_transform = same_from.interpolate_with("
+                    "shot_xf0, ac)",
+                    "                shot.fov = lerpf(same_fov, shot_fov0, ac)",
+                    "        shot.global_transform = shot_xf0",
+                    "        shot.fov = shot_fov0",
+                    # ── 缩回原相机(回程跟踪 home 的实时位姿)──
+                    "    if return_home and home_is_other:",
+                    "        var back_from: Transform3D = shot.global_transform",
+                    "        var back_fov: float = shot.fov",
+                    "        var from_home_fov: float = home.fov",
+                    "        var rt := 0.0",
+                    "        if return_time > 0.0:",
+                    "            while rt < return_time:",
+                    "                if not is_instance_valid(host) "
+                    "or not host.is_inside_tree():",
+                    "                    break",
+                    "                await host.get_tree().physics_frame",
+                    "                var dt2 := host.get_physics_process_delta_time()",
+                    "                if dt2 <= 0.0:",
+                    "                    dt2 = 0.016",
+                    "                rt += dt2",
+                    "                var b := clampf(rt / maxf(return_time, 0.0001), "
+                    "0.0, 1.0)",
+                    "                var ab := float(Tween.interpolate_value("
+                    "0.0, 1.0, b, 1.0, trans as Tween.TransitionType, "
+                    "ease as Tween.EaseType))",
+                    "                shot.global_transform = back_from.interpolate_with("
+                    "home.global_transform, ab)",
+                    "                shot.fov = lerpf(back_fov, from_home_fov, ab)",
+                    "        home.make_current()",
+                    # 把特写相机放回原位:下次运镜仍从同一个起点开始
+                    "        shot.global_transform = shot_xf0",
+                    "        shot.fov = shot_fov0",
+                    "    " + busy + " = false",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 自定义脚本(第一百五十一轮)--------------------------------
+        # 『脚本_加载 / 停止 / 调用』共用的三个小助手。实例按"键"存进
+        # `_gk_custom_scripts`,所以三个节点不用手工对齐节点路径。
+        # 关键取舍:**按脚本声明的基类建实例**(ClassDB.instantiate),
+        # 而不是一律 Node.new() —— 用户写 `extends CanvasLayer` 的渲染脚本
+        # 时,Node.new() 会因为基类不匹配直接 set_script 失败。
+        if getattr(self.ctx, "need_script_helpers", False):
+            scripts = self.ctx.declare_var(
+                "_gk_custom_scripts", "Dictionary", "{}")
+            sections.append({
+                "signature": "func _gk_script_load(host: Node, path: String, "
+                             "key: String, start_method: String) -> void:",
+                "lines": [
+                    "    if " + scripts + ".has(key):",
+                    "        var old := " + scripts + ".get(key) as Node",
+                    "        if is_instance_valid(old):",
+                    "            if start_method != \"\" and old.has_method(start_method):",
+                    "                old.call(start_method)",
+                    "            return",
+                    "        " + scripts + ".erase(key)",
+                    "    var script_res := load(path)",
+                    "    if script_res == null or not (script_res is Script):",
+                    "        push_warning(\"[GK] 找不到自定义脚本: \" + path)",
+                    "        return",
+                    "    var script_obj := script_res as Script",
+                    "    var base := \"\"",
+                    "    if script_obj.has_method(\"get_instance_base_type\"):",
+                    "        base = String(script_obj.get_instance_base_type())",
+                    "    var ok_type := base == \"Node\"",
+                    "    if not ok_type and ClassDB.class_exists(base):",
+                    "        ok_type = ClassDB.is_parent_class(base, \"Node\")",
+                    "    if not ok_type:",
+                    "        push_warning(\"[GK] 自定义脚本必须以 Node / CanvasLayer / Node3D / Control 为基类: \" + path)",
+                    "        return",
+                    "    var node := ClassDB.instantiate(base) as Node",
+                    "    if node == null:",
+                    "        push_warning(\"[GK] 自定义脚本没法建实例: \" + path)",
+                    "        return",
+                    "    node.name = \"GKScript_\" + key",
+                    "    node.set_script(script_obj)",
+                    "    host.add_child(node)",
+                    "    " + scripts + "[key] = node",
+                    "    if start_method != \"\" and node.has_method(start_method):",
+                    "        node.call(start_method)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_script_stop(key: String, "
+                             "stop_method: String) -> void:",
+                "lines": [
+                    "    var node := " + scripts + ".get(key) as Node",
+                    "    if node == null or not is_instance_valid(node):",
+                    "        " + scripts + ".erase(key)",
+                    "        return",
+                    "    if stop_method != \"\" and node.has_method(stop_method):",
+                    "        node.call(stop_method)",
+                    "    node.queue_free()",
+                    "    " + scripts + ".erase(key)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_script_call(key: String, "
+                             "method: String) -> void:",
+                "lines": [
+                    "    var node := " + scripts + ".get(key) as Node",
+                    "    if node == null or not is_instance_valid(node):",
+                    "        return",
+                    "    if method == \"\":",
+                    "        return",
+                    "    if node.has_method(method):",
+                    "        node.call(method)",
+                    "    else:",
+                    "        push_warning(\"[GK] 自定义脚本没有方法: \" + method)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
         # glTF 导入的模型骨架常常在**好几层子节点**下面,所以递归找。
         # 找到后缓存在成员变量里 —— 每帧找一遍没必要(骨骼节点不会中途换)。
         if getattr(self.ctx, "need_skeleton_helper", False):
@@ -1080,6 +1784,316 @@ class Generator:
                     '    for found in host.get_tree().root.find_children("*", "Camera3D", true, false):',
                     "        return found",
                     "    return null",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 摘掉相机上的倒地锁(第一百五十七轮)----
+        if getattr(self.ctx, "need_camera_unlock", False):
+            sections.append({
+                "signature": "func _gk_unlock_camera(cam: Node) -> void:",
+                "lines": [
+                    "    if cam == null or not is_instance_valid(cam):",
+                    "        return",
+                    '    cam.remove_meta("gk_cam_locked")',
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 监控画面(第一百五十七轮『显示_监控画面』)----
+        if getattr(self.ctx, "need_live_screen_helper", False):
+            sections.append({
+                "signature": "func _gk_live_screen_setup(host: Node, "
+                             "screen_name: String, look_name: String, "
+                             "pos: Vector3, size: Vector2i, fov: float, "
+                             "tint: Color, near: float, far: float) -> void:",
+                "lines": [
+                    "    if screen_name.strip_edges().is_empty():",
+                    "        return",
+                    "    if host == null or not host.is_inside_tree():",
+                    "        return",
+                    "    var root := host.get_tree().root",
+                    "    var screen := root.find_child("
+                    "screen_name.strip_edges(), true, false)",
+                    "    if screen == null:",
+                    "        push_warning(\"[GK] 显示_监控画面:找不到屏幕 \" "
+                    "+ screen_name)",
+                    "        return",
+                    # 一块屏只建一次:同一条链被执行第二次不应该多一台相机
+                    '    if screen.has_meta("gk_live_done"):',
+                    "        return",
+                    '    screen.set_meta("gk_live_done", true)',
+                    "    var holder: MeshInstance3D = screen as MeshInstance3D",
+                    "    if holder == null:",
+                    '        var meshes := screen.find_children("*", '
+                    '"MeshInstance3D", true, false)',
+                    "        if meshes.is_empty():",
+                    "            push_warning(\"[GK] 显示_监控画面:\" "
+                    "+ screen_name + \" 上没有网格\")",
+                    "            return",
+                    "        holder = meshes[0] as MeshInstance3D",
+                    "    var vp := SubViewport.new()",
+                    '    vp.name = "GKLiveView"',
+                    "    vp.size = size",
+                    "    vp.render_target_update_mode = "
+                    "SubViewport.UPDATE_ALWAYS",
+                    # ── 关键一行:借主世界的 World3D ──────────────────
+                    # SubViewport 默认 `own_world_3d = true`,自带一个**空世界**;
+                    # 不借主世界的话相机挂进去只能拍到背景色 —— 屏幕全黑,
+                    # 而且不报错(最容易被当成"贴图没贴上")。
+                    "    vp.world_3d = host.get_viewport().world_3d",
+                    "    host.add_child(vp)",
+                    "    var cam := Camera3D.new()",
+                    '    cam.name = "GKLiveCam"',
+                    "    cam.fov = fov",
+                    "    cam.near = near",
+                    "    cam.far = far",
+                    "    vp.add_child(cam)",
+                    # ⚠ 视口里的相机必须**显式**设成 current:SubViewport 不像
+                    #   主视口会自动认领第一台相机 —— 不设的话它一台都没有,
+                    #   渲染出来就是一块纯色背景(实测整个屏幕一块灰)。
+                    "    cam.current = true",
+                    "    cam.global_position = pos",
+                    "    if not look_name.strip_edges().is_empty():",
+                    "        var target := root.find_child("
+                    "look_name.strip_edges(), true, false)",
+                    "        if target is Node3D:",
+                    "            cam.look_at((target as Node3D)"
+                    ".global_position, Vector3.UP)",
+                    # ── 屏幕材质必须**自己建** unshaded ───────────────
+                    # 视口纹理已经是"拍好的画面",再走一遍卡通着色就发灰。
+                    "    var mat := StandardMaterial3D.new()",
+                    "    mat.shading_mode = "
+                    "BaseMaterial3D.SHADING_MODE_UNSHADED",
+                    "    mat.albedo_texture = vp.get_texture()",
+                    "    mat.albedo_color = tint",
+                    "    holder.material_override = mat",
+                    # ── 再写一次(0.3 秒后)───────────────────────────
+                    # `gk_environment` 在 _ready 里会给整关**重套一遍材质**
+                    # (remat),把刚贴上去的这张覆盖掉 —— 屏幕变回一块黑板,
+                    # 且不报错。等它干完活我们再贴一次。
+                    #
+                    # ⚠ 为什么不用 `get_tree().create_timer(0.3)` + lambda:
+                    #   换关时屏幕网格会被释放,而那个定时器还挂在 SceneTree 上
+                    #   —— 到点后带着两个**已释放**的捕获去调 lambda,引擎刷
+                    #   `Lambda capture at index 0 was freed`(探针里刷了两次)。
+                    #   改成"记三个成员变量 + 每帧倒数":脚本自己跟着关卡一起
+                    #   释放,不会有"悬空的一次回调"。
+                    "    _gk_live_holder = holder",
+                    "    _gk_live_mat = mat",
+                    "    _gk_live_wait = 0.30",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+
+        # ---- 纸娃娃小窗(第一百五十七轮『显示_纸娃娃』)----
+        if getattr(self.ctx, "need_paper_doll_helper", False):
+            sections.append({
+                "signature": "func _gk_show_subtree(root: Node) -> void:",
+                "lines": [
+                    "    if root == null:",
+                    "        return",
+                    # 模型在 Blender 里常把网格藏起来只留骨骼 ——
+                    # `duplicate()` 连 visible 一起复制,小窗里就空了。
+                    "    if root is Node3D:",
+                    "        (root as Node3D).visible = true",
+                    "    elif root is CanvasItem:",
+                    "        (root as CanvasItem).visible = true",
+                    "    for child in root.get_children():",
+                    "        _gk_show_subtree(child)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_paper_doll_setup(host: Node, "
+                             "target: Node, size: int, px: int, py: int, "
+                             "fov: float, zoom: float, turn: float, "
+                             "only_hidden: bool, bg: Color) -> void:",
+                "lines": [
+                    "    if target == null or not is_instance_valid(target):",
+                    "        return",
+                    "    if host == null or not host.is_inside_tree():",
+                    "        return",
+                    # 一个小窗就够:被重复执行时别叠出一串视口
+                    '    if host.has_meta("gk_doll_done"):',
+                    "        return",
+                    '    host.set_meta("gk_doll_done", true)',
+                    "    var vp := SubViewport.new()",
+                    '    vp.name = "GKPaperDollView"',
+                    "    vp.size = Vector2i(size, size)",
+                    "    vp.render_target_update_mode = "
+                    "SubViewport.UPDATE_ALWAYS",
+                    # 透明底:角上的小窗不该压着一块黑方块
+                    "    vp.transparent_bg = true",
+                    # ── 独立世界:小窗要的是"展示台"的光,不是走廊那盏应急灯 ──
+                    # ⚠ 两个坑一起踩过:
+                    #   ① `own_world_3d = true` 之后 `vp.world_3d` **不一定**
+                    #      有值(实测拿到 null,下一行 `= Environment` 直接
+                    #      "on a base object of type 'null instance'");
+                    #   ② 世界必须在 **add_child 之前**定好:视口一进树就按
+                    #      当前 world_3d 建渲染场景(scenario),之后再换会拆
+                    #      掉旧的 scenario —— 实机连着两行
+                    #      `Parameter "scenario" is null`。
+                    #   所以:`own_world_3d` + 显式 new World3D,都排在
+                    #   add_child 前面。
+                    "    vp.own_world_3d = true",
+                    "    vp.world_3d = World3D.new()",
+                    # 环境也要在 add_child **之前**挂好:改 world_3d 的属性会让
+                    # 引擎去动所有用它的视口的 scenario,那时视口的 scenario
+                    # 还没建好 -> `Parameter "scenario" is null`(同上)。
+                    "    var env := Environment.new()",
+                    "    env.background_mode = Environment.BG_COLOR",
+                    "    env.background_color = bg",
+                    "    env.ambient_light_source = "
+                    "Environment.AMBIENT_SOURCE_COLOR",
+                    "    env.ambient_light_sky_contribution = 0.0",
+                    "    env.ambient_light_color = Color(0.55, 0.58, 0.66)",
+                    # ⚠ 展台的光是**标定过的**:示例玩家 albedo 接近白
+                    #   (0.91/0.92/0.95),环境 1.0 + 主光 1.35 直接把
+                    #   小窗糊成一坨全白。0.45 / 0.9 / 0.35 这组合下
+                    #   浅色模型才有明暗层次(实测 1.0/1.35 是一坨全白)。
+                    "    env.ambient_light_energy = 0.35",
+                    "    vp.world_3d.environment = env",
+                    "    host.add_child(vp)",
+                    "    var key := DirectionalLight3D.new()",
+                    '    key.name = "GKPaperDollKey"',
+                    "    key.light_energy = 0.6",
+                    "    key.rotation_degrees = Vector3(-24.0, 35.0, 0.0)",
+                    "    vp.add_child(key)",
+                    "    var rim := DirectionalLight3D.new()",
+                    '    rim.name = "GKPaperDollRim"',
+                    "    rim.light_energy = 0.25",
+                    "    rim.light_color = Color(0.62, 0.74, 1.0)",
+                    "    rim.rotation_degrees = Vector3(16.0, -145.0, 0.0)",
+                    "    vp.add_child(rim)",
+                    # ── 必须**复制**:直接把模型搬进去主角就没人控制了 ──
+                    "    var copy := target.duplicate()",
+                    '    copy.name = "GKPaperDollModel"',
+                    "    vp.add_child(copy)",
+                    # ⚠ 副本归零:模型在原场景里的局部变换(可能带着几十米的
+                    #   偏移量)不该带进展台,否则自动取景会把相机甩到天边。
+                    #   SubViewport 是 **没有变换** 的 Node,所以副本归零后
+                    #   "副本局部空间" == "宿主局部空间",相机放进去用的是
+                    #   同一套坐标 —— 这就是下面取景能对准的前提。
+                    "    var body := copy as Node3D",
+                    "    if body != null:",
+                    "        body.transform = Transform3D.IDENTITY",
+                    # 副本里自带的相机 / 灯要删掉:它们会抢视口的相机
+                    '    for stray in copy.find_children("*", "Camera3D", '
+                    "true, false):",
+                    "        stray.queue_free()",
+                    '    for stray in copy.find_children("*", "Light3D", '
+                    "true, false):",
+                    "        stray.queue_free()",
+                    "    _gk_show_subtree(copy)",
+                    # ── 按包围盒自动取景 ────────────────────────────
+                    # ⚠ 包围盒要量在 **副本的局部空间** 里,而且**只能手算**:
+                    #   ① `mi.global_transform` 会把宿主(玩家)的世界变换算进来;
+                    #   ② 更坑的是刚 `add_child` 完,子节点的 global 缓存还没刷,
+                    #      量出来的中心是 (0,0,0) —— 实测相机就摆在原点,
+                    #      而模型在十几米外,小窗整块透明(150x150 PNG 只 180 字节)。
+                    #   所以这里从 mi **一级一级往上乘到 copy**,全程局部变换。
+                    "    var box := AABB()",
+                    "    var any := false",
+                    '    for mesh in copy.find_children("*", '
+                    '"MeshInstance3D", true, false):',
+                    "        var mi := mesh as MeshInstance3D",
+                    "        if mi == null or mi.mesh == null:",
+                    "            continue",
+                    "        var rel := Transform3D.IDENTITY",
+                    "        var walk: Node = mi",
+                    "        while walk != null and walk != copy:",
+                    "            if walk is Node3D:",
+                    "                rel = (walk as Node3D).transform * rel",
+                    "            walk = walk.get_parent()",
+                    "        var local := rel * mi.mesh.get_aabb()",
+                    "        if any:",
+                    "            box = box.merge(local)",
+                    "        else:",
+                    "            box = local",
+                    "            any = true",
+                    "    if not any:",
+                    "        box = AABB(Vector3.ZERO, "
+                    "Vector3(0.6, 1.7, 0.6))",
+                    "    var center := box.get_center()",
+                    # 把模型**挪到视口原点**,但挪的是 **副本根的直接子节点**,
+                    #   不是副本根自己 ——
+                    #   ① 相机永远只看 (0,0,0),不用再算方向;
+                    #   ② 『自转』绕的是副本根(也就是模型中心);挪根的话,
+                    #      根原点会离模型 8 米(示例里玩家网格离 Model 根就
+                    #      这么远),一转模型就被甩到画面外(整块透明)。
+                    "    var pivot := Vector3.ZERO",
+                    "    if body != null:",
+                    "        for child in body.get_children():",
+                    "            if child is Node3D:",
+                    "                (child as Node3D).transform = "
+                    "Transform3D.IDENTITY.translated(-center) "
+                    "* (child as Node3D).transform",
+                    "    else:",
+                    "        pivot = center",
+                    "    var radius := maxf(box.size.length() * 0.5, 0.35)",
+                    # ⚠ 是 `sin` 不是 `sinf`:Godot 里 **没有** sinf / cosf
+                    #   (只有 sin / cos;带 f 的那一族只有 absf / maxf /
+                    #   clampf 这些"float 版数学",三角函数没有)。
+                    "    var dist: float = radius / maxf("
+                    "sin(deg_to_rad(fov) * 0.5), 0.05) * maxf(zoom, 0.05)",
+                    "    var cam := Camera3D.new()",
+                    '    cam.name = "GKPaperDollCam"',
+                    "    cam.fov = fov",
+                    "    cam.near = 0.05",
+                    "    cam.far = maxf(dist * 4.0, 5.0)",
+                    "    vp.add_child(cam)",
+                    # 同上:视口里的相机必须显式 current,否则渲染出来是空背景
+                    "    cam.current = true",
+                    # 同上:全部在 **局部空间** 里摆(相机是 SubViewport 的
+                    # 子节点,和副本根节点同一套坐标)。用 `Transform3D`
+                    # 拼好再整体赋值,不碰 global —— 免得宿主一动就偏。
+                    # ⚠ `looking_at` 要求基是 **单位基**(IDENTITY 满足);
+                    #   平移后的 transform 仍满足,可以直接用。
+                    "    cam.transform = Transform3D.IDENTITY.translated("
+                    "Vector3(0.0, box.size.y * 0.10, dist))"
+                    ".looking_at(pivot, Vector3.UP)",
+                    # ── 角上的小窗 ──────────────────────────────────
+                    "    var layer := CanvasLayer.new()",
+                    '    layer.name = "GKPaperDollUI"',
+                    "    layer.layer = 90",
+                    "    host.add_child(layer)",
+                    "    var rect := TextureRect.new()",
+                    '    rect.name = "GKPaperDollRect"',
+                    "    rect.texture = vp.get_texture()",
+                    "    rect.position = Vector2(px, py)",
+                    "    rect.size = Vector2(size, size)",
+                    "    rect.custom_minimum_size = Vector2(size, size)",
+                    "    rect.expand_mode = "
+                    "TextureRect.EXPAND_IGNORE_SIZE",
+                    "    rect.stretch_mode = "
+                    "TextureRect.STRETCH_KEEP_ASPECT_CENTERED",
+                    "    rect.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                    "    layer.add_child(rect)",
+                    # ── 交给 _physics_process 的那几个状态 ────────────
+                    "    var ap_src: AnimationPlayer = null",
+                    '    for found in target.find_children("*", '
+                    '"AnimationPlayer", true, false):',
+                    "        ap_src = found as AnimationPlayer",
+                    "        break",
+                    "    var ap_copy: AnimationPlayer = null",
+                    '    for found in copy.find_children("*", '
+                    '"AnimationPlayer", true, false):',
+                    "        ap_copy = found as AnimationPlayer",
+                    "        break",
+                    "    _gk_doll_src = target",
+                    "    _gk_doll_copy = copy",
+                    "    _gk_doll_model = copy as Node3D",
+                    "    _gk_doll_ap_src = ap_src",
+                    "    _gk_doll_ap_copy = ap_copy",
+                    "    _gk_doll_vp = vp",
+                    "    _gk_doll_rect = rect",
+                    "    _gk_doll_only_hidden = only_hidden",
+                    "    _gk_doll_spin = turn",
                 ],
                 "empty_body": "    pass",
                 "separator": True,
@@ -3478,7 +4492,13 @@ class Generator:
                 # **永远找不到**(真机:`[GK] 相机_启用:没找到相机`)。
                 # 只在**自己拼出来的 `$"…"` 形式**上转:`self` /
                 # `get_node("/root/…")` 这些原样保留(它们不是物体名)。
-                if str(path).strip().startswith("$"):
+                # ⚠ 只对**纯名字**转:相对路径(`./Model`、`../相机`)里的
+                #   点号是路径语法,不是"Blender 自动加的 .001 后缀" ——
+                #   一起转会把 `./Model` 变成 `__Model`,然后在树里永远
+                #   找不到(实机:`[GK] 没找到节点:__Model`,第一人称
+                #   藏自身模型那句直接作用在 null 上,每帧一条 SCRIPT ERROR)。
+                if (str(path).strip().startswith("$")
+                        and "/" not in name and not name.startswith(".")):
                     name = godot_node_name(name)
                 # 引用要**按类型找** —— 同名节点不止一个(网格 + 碰撞代理),
                 # 见下面 _gk_ref_typed 的说明。

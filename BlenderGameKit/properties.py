@@ -273,6 +273,14 @@ class GKObjectSettings(bpy.types.PropertyGroup):
         soft_min=0.0,
         soft_max=4.0,
     )
+    hide_mesh: BoolProperty(
+        name="不渲染网格",
+        default=False,
+        description="导出时**跳过这块网格**,但碰撞体 / 触发区照旧生成。\n"
+                    "给\"看不见的判定体\"用:区域触发块、音量区、检查点。\n"
+                    "以前只能把它涂成近黑色,可实机里仍是一块挡视线 / 挡光的\n"
+                    "实体(门洞里的触发盒会把门口堵成一块黑板)",
+    )
     is_trigger: BoolProperty(
         name="作为触发区",
         description="只检测重叠、不阻挡(碰到就知道,但穿得过去)",
@@ -733,6 +741,37 @@ class GKObjectLight(bpy.types.PropertyGroup):
     shadow: BoolProperty(
         name="投影", default=True,
         description="Godot 的 shadow_enabled(关掉省性能,适合当补光用的灯)")
+    # ── 阴影柔和 / 浓度(第一百五十轮)──────────────────────────────────
+    # 用户原话:"漫射光线的衰减,照射范围的柔和"。
+    # 射程 / 衰减指数已经在上面两项;这里补"阴影边缘"这一半:
+    #   shadow_blur    = Godot 的 shadow_blur,越大影子边缘越糊(真实散射光);
+    #   shadow_opacity = 影子有多黑,1 = 全黑,0.5 = 半透明(环境光透进来)。
+    # 默认值 = 出厂值,导出时**不写**,老工程产物逐字不变。
+    shadow_blur: FloatProperty(
+        name="阴影柔和", default=0.0, min=0.0, soft_max=10.0,
+        description=("Godot 的 shadow_blur:影子边缘的模糊程度。"
+                     "0 = 出厂硬边;2~6 = 柔和散射光(漫射灯 / 雾天)。"
+                     "⚠ 只对开着投影的灯有效"))
+    shadow_opacity: FloatProperty(
+        name="阴影浓度", default=1.0, min=0.0, max=1.0,
+        description=("Godot 的 shadow_opacity:影子多黑。1 = 全黑;"
+                     "0.5 = 半透明,适合想让环境光透进来的漫射灯"))
+    # ── 光斑形状(第一百五十一轮)────────────────────────────────────
+    # 用户原话:"灯的光照的范围太圆了"。
+    # 点光/聚光直接照在墙上就是一个标准圆;窗户、天窗、灯罩本来不该是圆的。
+    # 这里给几种内置投影纹理(运行时挂到 Godot 的 `light_projector`):
+    #   RECT = 柔边矩形(窗 / 天窗 / 门洞投下来的光)
+    #   LAMP = 竖向灯罩纹(壁灯 / 台灯,打破正圆)
+    #   SOFT = 柔边不规则光斑(吊灯 / 上照,边缘和亮度都带一点噪声,
+    #          避免"一个完美椭圆印在墙上")
+    # 0 = 老行为(不挂投影),老工程产物不变。
+    projector: EnumProperty(
+        name="光斑形状", default="NONE",
+        items=(("NONE", "圆形(默认)", "不投影纹理,保持 Godot 默认的圆形光斑"),
+               ("RECT", "矩形柔光", "窗 / 天窗 / 门洞形状的柔边光斑"),
+               ("LAMP", "灯罩竖纹", "竖向条纹,适合壁灯 / 台灯"),
+               ("SOFT", "柔边不规则", "边缘和亮度带一点噪声,避免完美圆形光斑")),
+        description="给这盏灯挂一张内置投影纹理,让光斑不再是标准圆")
     # ── 逐灯预览补偿(第一百三十八轮,用户要求)──────────────────────────
     # 用户原话:"添加类似 blender 灯光原生的设置来优化预览与运行的差距"。
     # 场景级那个『灯光倍率』是**一个数管所有灯**(0.06 是实测标定出来的),
@@ -983,10 +1022,20 @@ class GKEnvPreset(bpy.types.PropertyGroup):
     p_style_shadow_step: FloatProperty(
         name="明暗分界", default=0.1, min=-1.0, max=1.0,
         description="卡通明暗的分界线(0 = 正对光时一半亮一半暗)")
+    p_style_shadow_smooth: FloatProperty(
+        name="分界柔和", default=0.02, min=0.0, max=0.5,
+        description="色阶边缘的柔和宽度")
     p_style_shadow_tint: FloatVectorProperty(
         name="阴影色", subtype="COLOR", size=4, min=0.0, max=1.0,
         default=(0.706, 0.627, 0.902, 1.0),
         description="暗部染上的颜色(偏冷紫 = 常见二次元暗部)")
+    p_style_shadow_tint_2: FloatVectorProperty(
+        name="深阴影色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.50, 0.45, 0.74, 1.0),
+        description="最暗那一档的颜色(三段明暗 > 0.5 时生效)")
+    p_style_shadow_step_2: FloatProperty(
+        name="深阴影分界", default=-0.45, min=-1.0, max=1.0,
+        description="第二段阴影的分界位置")
     p_style_three_tone: FloatProperty(
         name="三段明暗", default=0.0, min=0.0, max=1.0,
         description="0 = 两段明暗;往上加第三段(高光/过渡层)")
@@ -1435,15 +1484,74 @@ class GKSceneSettings(bpy.types.PropertyGroup):
     env_fog_density: FloatProperty(
         name="雾浓度", default=0.02, min=0.0, soft_max=1.0,
         description="越大越浓(0.02 是『远处发灰』,0.1 以上就伸手不见五指)")
+    # ── 高度雾(第一百四十八轮)──────────────────────────────────────
+    # Godot 的 `fog_height / fog_height_density` 是一组**独立**于密度的
+    # 整形参数:让雾"贴着地面浓、往上淡"。走廊 / 街道 / 地窖这种场景,
+    # 平的深度雾只会把远处糊白,而高度雾能把地面压出一层"贴地的雾毯"、
+    # 天花板保持干净 —— 纵向层次一下就出来了。
+    # 出厂值都是 0.0(= 关),所以不勾这两项时产物一字不变(铁律)。
+    env_fog_height: FloatProperty(
+        name="雾高度", default=0.0, soft_min=-50.0, soft_max=50.0,
+        description="高度雾的基准高度(米,Godot 世界坐标)。和『雾层厚度』"
+                    "一起用;两个都 0 = 不启用高度雾")
+    env_fog_height_density: FloatProperty(
+        name="雾层厚度", default=0.0, min=0.0, soft_max=2.0,
+        description="高度雾的浓度:越大越『贴地』,高处越干净。"
+                    "0.1~0.4 是走廊 / 街道的常用档(0 = 不启用)")
     env_glow: BoolProperty(
         name="泛光", default=False,
         description="亮的地方往外溢光 —— 灯 / 手电筒 / 火光'毛'起来")
+    # ── 体积雾(第一百四十八轮)──────────────────────────────────────
+    # 和上面的『雾』是两套东西:
+    #   * 雾(fog_*)       = **深度雾**,按距离把远处糊掉,便宜,只影响颜色;
+    #   * 体积雾(volumetric)= **有体积的介质**,灯光会在里面真的"打出光柱"
+    #     (窗格投影 / 手电筒光锥 / 吊灯周围那团亮雾)—— 这是恐怖场景里
+    #     "空气感"最直接的来源,也是 Godot Forward+ 的看家能力。
+    # 默认关、所有值等于 Godot 出厂,所以老项目产物一字不变。
+    env_volumetric: BoolProperty(
+        name="体积雾", default=False,
+        description="让灯在空气里打出可见光柱(窗格光、手电筒光锥)。"
+                    "比普通雾贵,少量使用即可;需要 Godot Forward+")
+    env_volumetric_density: FloatProperty(
+        name="体积雾浓度", default=0.05, min=0.0, soft_max=0.5,
+        description="介质有多稠(0.02~0.08 是室内常用档;越大光柱越白)")
+    env_volumetric_albedo: FloatVectorProperty(
+        name="体积雾颜色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.85, 0.89, 1.0, 1.0),
+        description="雾滴反射出来的颜色(夜里偏冷蓝,地窖偏土黄)")
+    env_volumetric_anisotropy: FloatProperty(
+        name="前向散射", default=0.2, min=-1.0, max=1.0,
+        description="0.2~0.6 = 顺着光看更亮(真实雾气),负值 = 逆光更亮")
+    env_volumetric_length: FloatProperty(
+        name="体积雾距离", default=64.0, min=1.0, soft_max=256.0,
+        description="体积雾的有效距离(米)。走廊 48 米填 48~64,"
+                    "再远的部分交给深度雾")
+    env_volumetric_ambient: FloatProperty(
+        name="环境注入", default=0.0, min=0.0, max=1.0,
+        description="把环境光灌进体积雾(0 = 只被灯照亮,更戏剧化)")
     env_ssao: BoolProperty(
         name="接触阴影 (SSAO)", default=False,
         description="增强墙角、地面接触处的遮蔽；需要 Godot Forward+ 渲染器")
     env_ssil: BoolProperty(
         name="间接补光 (SSIL)", default=False,
         description="使用屏幕内的光照信息补充暗部层次；需要 Godot Forward+ 渲染器")
+    # ── SSAO 的三个真正起作用的旋钮(第一百四十八轮)─────────────────
+    # 以前只有一个"接触阴影"开关,强度 / 半径 / 是否影响直射光全是 Godot
+    # 出厂值。实机测过:默认真空 —— `ssao_light_affect = 0` 时 SSAO **只
+    # 压暗环境光**,而卡通场景的暗部本来就靠环境光,于是"勾了接触阴影,
+    # 画面上什么也没发生"(示例走廊实测暗部只差 2/255)。
+    # 三个键的出厂值都等于 Godot 默认,所以拧回 0 就不会多写一行。
+    env_ssao_intensity: FloatProperty(
+        name="接触阴影强度", default=2.0, min=0.0, soft_max=8.0,
+        description="SSAO 压暗的力度(Godot 出厂 2.0;4~6 才有明显接触阴影)")
+    env_ssao_radius: FloatProperty(
+        name="接触阴影半径", default=1.0, min=0.05, soft_max=8.0,
+        description="SSAO 采样半径(米)。小 = 只压缝隙,大 = 大块遮蔽"
+                    "(Godot 出厂 1.0)")
+    env_ssao_light_affect: FloatProperty(
+        name="阴影影响直射光", default=0.0, min=0.0, max=1.0,
+        description="0 = SSAO 只压环境光(Godot 出厂,常温和看不出效果);"
+                    "0.5~0.8 = 连直射光一起压 —— 墙角 / 家具根部才会真的暗下去")
     render_quality: EnumProperty(
         name="启动画质", default="KEEP",
         items=(("KEEP", "沿用工程", "保留 Godot 工程的渲染设置"),
@@ -1553,12 +1661,33 @@ class GKSceneSettings(bpy.types.PropertyGroup):
         description="给整关定一套卡通风格(色阶 / 阴影色 / 边缘光 / 高光)。"
                     "导出时作为默认写进材质,不用逐材质调")
     style_shadow_step: FloatProperty(
-        name="明暗分界", default=0.1, min=-1.0, max=1.0)
+        name="明暗分界", default=0.1, min=-1.0, max=1.0,
+        description="色阶分界在 dot(法线, 光向) 的哪个位置。0.1 几乎是"
+                    "'全亮',想看到明显的暗面就抬到 0.25~0.4")
+    style_shadow_smooth: FloatProperty(
+        name="分界柔和", default=0.02, min=0.0, max=0.5,
+        description="色阶边缘的柔和宽度。0.01~0.03 = 硬边卡通;"
+                    "0.1 以上接近渐变(默认 0.02 = 导出模板的老值)")
     style_shadow_tint: FloatVectorProperty(
         name="阴影色", subtype="COLOR", size=4, min=0.0, max=1.0,
-        default=(0.706, 0.627, 0.902, 1.0))
+        default=(0.706, 0.627, 0.902, 1.0),
+        description="中间阴影(浅黑)的颜色")
+    # ── 三色阶阴影(第一百五十一轮)─────────────────────────────────
+    # 用户原话:"阴影的渲染上太单调的,不是浅黑,深黑,暗黑这样的过渡"。
+    # 原来模板只写 shadow_tint(一档),三段的第二档用的是 shader 内置默认值,
+    # 场景设置里根本调不到。现在把"深阴影色 / 深阴影分界"也开放出来:
+    #   亮部 -> shadow_tint(浅黑) -> shadow_tint_2(深黑/暗黑)
+    # 只有三段明暗 > 0.5 时第二档才参与(和 shader 的判据一致)。
+    style_shadow_tint_2: FloatVectorProperty(
+        name="深阴影色", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.50, 0.45, 0.74, 1.0),
+        description="最暗那一档的颜色(深黑 / 暗黑),只在三段明暗 > 0.5 时生效")
+    style_shadow_step_2: FloatProperty(
+        name="深阴影分界", default=-0.45, min=-1.0, max=1.0,
+        description="第二段阴影从哪开始(-0.45 = 背光面最深处)")
     style_three_tone: FloatProperty(
-        name="三段明暗", default=0.0, min=0.0, max=1.0)
+        name="三段明暗", default=0.0, min=0.0, max=1.0,
+        description="0 = 两段明暗;> 0.5 启用第三段(浅黑 / 深黑两档阴影)")
     style_rim: FloatProperty(
         name="边缘光", default=0.0, min=0.0, max=4.0)
     style_specular: FloatProperty(
@@ -2045,6 +2174,16 @@ def make_node_picker(prop_name):
     return refresh
 
 
+# ── "哪些图有 GK 菜单"的总名单(第一百二十七轮抽出常量)────────────
+# 原来这段名单只写在 `current_tree_type` 里,而**加载迁移**(见
+# nodes/_containers.migrate_pin_names)也要扫"所有 GK 树"。两处各写一份
+# 名单的话,加新树类型时必漏一处 —— 漏在迁移侧的表现是"老文件里那类
+# 树的节点引脚永远补不上"。所以收成一个常量,两边都读它。
+GK_TREE_KINDS = ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
+                 "GKGameAiTree", "GKDisplayTree", "GKAssetTree",
+                 "GKMusicTree", "GKEnvLibraryTree")
+
+
 def current_tree_type(context):
     """当前节点编辑器在编辑哪一类树 —— 八种之一:
 
@@ -2068,9 +2207,7 @@ def current_tree_type(context):
     """
     space = getattr(context, "space_data", None)
     kind = getattr(space, "tree_type", "") if space is not None else ""
-    if kind in ("GKGameLogicTree", "GKAnimationTree", "GKUiDesignTree",
-                "GKGameAiTree", "GKDisplayTree", "GKAssetTree",
-                "GKMusicTree", "GKEnvLibraryTree"):
+    if kind in GK_TREE_KINDS:
         return kind
     return None
 

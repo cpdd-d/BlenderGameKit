@@ -24,6 +24,7 @@ DEFAULT_PARAMS = {
     "camera_top": "俯瞰机位",
     # 手感
     "move_speed": 6.0,          # 米/秒(3D)
+    "footstep": "",             # 脚步声 wav;留空 = 没有脚步声
     "jump_force": 7.0,          # 起跳冲量
     "sensitivity": 0.25,        # 鼠标:每像素多少度
     "arm_length": 5.0,          # 弹簧臂长度
@@ -192,7 +193,12 @@ def _build_movement(tree, p):
                 # Godot 的运动学角色**不会**推刚体 —— 不勾的话"撞上箱子
                 # 箱子纹丝不动",十个用户九个以为坏了。预设是"开箱即用"的
                 # 一套,所以这里默认打开(老 .blend 里已建好的节点不受影响)。
-                gk_push_bodies=True, gk_push_force=30.0)
+                gk_push_bodies=True, gk_push_force=30.0,
+                # ── 预设默认"能上台阶"(第一百六十七轮)───────────────────
+                # 0.35 米:正常楼梯一级的高度。四关探测只在"被台阶前脸
+                # 挡住"时才跑,平地零开销;不设的话真台阶楼梯一步都上不去
+                # (第二十九轮的功能,预设一直没默认开)。
+                gk_step_height=0.35)
     _link(tree, physics, "执行", move, "执行")
     _link(tree, direction, "方向", move, "方向")
 
@@ -209,6 +215,19 @@ def _build_movement(tree, p):
     _link(tree, both, "结果", jump_branch, "条件")
     _link(tree, physics, "执行", jump_branch, "执行")
     _link(tree, jump_branch, "是", do_jump, "执行")
+
+    # ── 走路摆动(第一百六十三轮)──────────────────────────────────
+    # 用户:"角色走起来像一块板在平移"。这一版角色是**零件拼的**(没有骨骼、
+    # 没有 .anim),所以用『角色_走路摆动』按名字认出手臂、按速度摆角度。
+    # 参考速度就用走路速度:走路摆满,跑起来摆得更快(超出部分不会更大,
+    # 速率上限 1.0 —— 角度再大就像在抽风)。
+    walk = _add(tree, "GKNodeHumanoidWalk", "走路摆动", -1100.0, 220.0,
+                gk_target="__self__", gk_arm_suffix="臂",
+                gk_swing=34.0, gk_bob=0.03,
+                gk_ref_speed=float(p["move_speed"]),
+                gk_footstep=str(p.get("footstep", "")),
+                gk_footstep_db=-10.0)
+    _link(tree, physics, "执行", walk, "执行")
     return physics
 
 
@@ -278,6 +297,14 @@ def _build_camera(tree, p):
                    gk_pitch=float(p["top_pitch"]), gk_side=0.0,
                    gk_collision=False, gk_radius=0.35, gk_lag=8.0)
     _link(tree, yaw_read, "值", top_arm, "偏航")
+    # ── 俯仰也必须接上(第一百五十轮,用户实测)──────────────────────
+    # 用户原话:"第一人称的视角上下旋转无效,若抬头,低头观察,则无法旋转。"
+    # 根因:上面那根第三人称杆接了『俯仰』,这根(后来被预设改造成第一人称)
+    # **只接了偏航** —— codegen 读不到引脚,就退回属性 gk_pitch=0,
+    # 生成出来永远是 `Basis.from_euler(Vector3(-deg_to_rad(0.0), ...))`:
+    # 抬头低头一点效果都没有。补上这一根线,第一人称的俯仰就跟着
+    # 『写俯仰』那个变量走了。
+    _link(tree, pitch_read, "值", top_arm, "俯仰")
     _link(tree, arm, "完成", top_arm, "执行")
 
     # ---- 滚轮缩放视野(20~90 度,0.15 秒平滑)----

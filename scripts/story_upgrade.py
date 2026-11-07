@@ -171,7 +171,7 @@ def _texture(name, tiles=False):
     return image
 
 
-def _surface(obj, tiles=False):
+def _surface(obj, tiles=False, scale=6.0):
     name = "旧石砖地面" if tiles else "风化墙面"
     mat = bpy.data.materials.get(name)
     if mat is None:
@@ -190,11 +190,11 @@ def _surface(obj, tiles=False):
         axes = [a for a in range(3) if a != axis]
         for index in face.loop_indices:
             co = obj.matrix_world @ obj.data.vertices[obj.data.loops[index].vertex_index].co
-            uv.data[index].uv = (co[axes[0]] / 6.0, co[axes[1]] / 6.0)
+            uv.data[index].uv = (co[axes[0]] / scale, co[axes[1]] / scale)
 
 
 def upgrade_visuals():
-    """给三关补"看得见空间感"的硬装(天花板 / 墙裙 / 壁灯 / 倒角 / 法线)。
+    """给三关补"看得见空间感"的材质 / 倒角 / 阴影参数。
 
     ── 第 123 轮:这里曾经是"中世纪观感"的**真凶** ────────────────────
     用户原话:"现在的环境渲染成了『中世纪』的风格了,但我想要的是卡通二次元"。
@@ -210,12 +210,20 @@ def upgrade_visuals():
     所以这一版把这些**全部删掉** —— 环境与卡通风格交给
     `make_story_demo.ENV_* / STYLE_*`(那一份是按二次元配方写的,含
     LINEAR 色调映射 + 抬高的环境光 + 冷色暗部 + 三段明暗)。
-    这里只保留**和渲染风格无关**的硬装:几何、材质贴图坐标、倒角、
+    这里只保留**和渲染风格无关**的硬装:材质贴图坐标、倒角、
     阴影参数、画质、上帝机开关。
+
+    ── 第一百四十六轮:灯具不再在这里建 ──────────────────────────────
+    灯现在由 `make_story_demo` 的 `build_*` 按"哪一盏该坏 / 该闪 /
+    该由逻辑点亮"逐盏建(带底座 / 吊杆 / 灯罩,名字也是逻辑图要引用的)。
+    这个函数以前会在每面墙上均匀摆 3 盏、并把所有灯的能量统一改成
+    9000W —— 那会把"应急红灯开局 0W"这类设计直接抹掉,所以整段删了。
+    同理,天花板 / 墙裙也不再由这里生成(几何在 build_* 里,尺寸从
+    ROOM 读,免得两边各写一套数字、改一个忘一个)。
     """
-    from make_story_demo import make_box, make_light
+    from make_story_demo import ROOM, LOBBY, CORRIDOR, ENDING
     from BlenderGameKit import godot_look
-    for scene_name in ("大堂", "走廊", "结局"):
+    for scene_name in (LOBBY, CORRIDOR, ENDING):
         scene = bpy.data.scenes[scene_name]
         settings = scene.gk_settings
         # ⚠ 下面这几项**不能**再写 env_* / style_* / toon_* —— 见函数头说明:
@@ -233,78 +241,32 @@ def upgrade_visuals():
         for obj in list(scene.objects):
             if obj.type == "MESH" and not obj.get("gk_environment_preview"):
                 if "地面" in obj.name:
-                    _surface(obj, True)
+                    # 地砖按 1.6 米一格(第一百四十八轮:2.6 米在 48 米长的
+                    # 走廊里一格还是太大,像"四块大板";1.6 米接近真实地砖,
+                    # 透视收缩也才读得出纵深)
+                    _surface(obj, True, 1.6)
                 elif "墙" in obj.name or "柱" in obj.name:
                     _surface(obj)
                 if not obj.modifiers.get("边缘倒角"):
+                    # ── 倒角宽度按物体最小边收敛 ─────────────────────
+                    # 以前写死 0.045:窗棂 / 文件纸这种 1~2 厘米厚的薄片
+                    # 会被倒角吃掉整条边(法线翻转、渲染出黑片)。
+                    thinnest = min((abs(v) for v in obj.dimensions), default=1.0)
+                    width = max(0.004, min(0.045, thinnest * 0.18))
                     bevel = obj.modifiers.new("边缘倒角", "BEVEL")
-                    bevel.width = .045
+                    bevel.width = width
                     bevel.segments = 3
             if obj.type == "LIGHT":
-                obj.data.use_shadow = True
-                obj.data.shadow_soft_size = .12
-                obj.data.use_custom_distance = True
-                if obj.name != "手电筒":
-                    # ── 第 124 轮:射程按房间尺寸给,不再写死 16 / 22 ──────
-                    # 真机实测(走廊,关掉环境光只剩灯):壁灯射程 11 米、房间 48 米
-                    #   射程 11 -> 灯 gain 0.0507
-                    #   射程 30 -> 灯 gain 0.1349   (↑2.7 倍)
-                    #   射程 40 -> 灯 gain 0.2040   (↑4.0 倍)
-                    # 射程就是 Godot 点光的 `omni_range`:它决定"这盏灯够到多远"。
-                    # 写死 16 米时,一条 48 米的走廊有一大半永远照不到 —— 用户看到的
-                    # 就是"灯开着但整条走廊还是平的"。所以按房间最大边长给:
-                    # 走廊 48 米 -> 28(相邻壁灯间距 14.4 米,28 正好接得上,
-                    # 再大只是把远处也照亮、反而没了"走廊深处黑下去"的恐怖感);
-                    # 大堂 / 结局是小房间,22 / 18 已经够铺满。
-                    # ⚠ 手电筒**不在**这条里:它是跟着相机走的聚光灯,20 米射程
-                    #   是"手电该照多远"的取值,和房间尺寸无关,别顺手改掉。
-                    obj.data.cutoff_distance = {"走廊": 28, "大堂": 22,
-                                                "结局": 18}[scene_name]
-                    # 第 123 轮:整体再抬一档(6500->7200 / 4000->5200)。
-                    # 灯在**后面**才建(天花板壁灯 4200W 那几盏),所以主灯
-                    # 亮一点不会过曝 —— 而"提亮"正是二次元高调画面的第一需要。
-                    # 第 124 轮:环境光从 0.78 降到 0.28 之后,明暗全交给灯,
-                    # 所以主灯再抬到 9000~10000W(见 make_story_demo.ENV_CORRIDOR
-                    # 的实测说明:灯 10.0 + 射程 28 时对比度 sd 0.092 -> 0.163)。
-                    obj.data.energy = 10000 if scene_name != "走廊" else 9000
-        # Wall lamps and trim make scale and depth legible without covering gameplay areas.
-        width, depth, height = {"大堂": (30, 24, 6), "走廊": (48, 14, 6), "结局": (18, 18, 5)}[scene_name]
-        ceiling_name = scene_name + "天花板"
-        if ceiling_name not in bpy.data.objects:
-            ceiling = make_box(ceiling_name, (width, depth, .3), (0, 0, height + .15),
-                               (.065, .075, .085, 1), scene=scene)
-            ceiling.gk_physics.collision_shape = "box"
-        for side in (-1, 1):
-            for z in (.14, 1.3, height - .25):
-                name = f"{scene_name}墙裙{side}_{z}"
-                if name not in bpy.data.objects:
-                    obj = make_box(name, (width, .16, .18), (0, side * (depth / 2 - .3), z),
-                                   (.075, .09, .085, 1), scene=scene)
-                bpy.data.objects[name].gk_physics.collision_shape = "box"
-            for i, x in enumerate((-width * .3, 0, width * .3)):
-                name = f"{scene_name}壁灯{side}_{i}"
-                if name in bpy.data.objects:
-                    continue
-                y = side * (depth / 2 - .55)
-                make_box(name + "底座", (.48, .2, .75), (x, y, 3.1), (.035, .045, .05, 1), scene=scene)
-                make_box(name + "灯罩", (.26, .27, .48), (x, y - side * .12, 3.1),
-                         (.7, .55, .3, 1), scene=scene, glow=((1, .65, .26, 1), 3.0))
-                # ── 第 124 轮:壁灯 4200W / 射程 11 -> 9000W / 射程 28 ──────
-                # 真机实测(走廊,第一人称实际游玩机位,关掉环境光只剩灯):
-                #   * 出厂配置下这 7 盏灯对整帧**零贡献**(gain 0.0000)——
-                #     不是灯坏,是被环境光 0.78 压过去了(现在环境光已降到 0.28);
-                #   * 关掉环境光后,4200W(= Godot light_energy 4.2)+ 射程 11 米
-                #     时 gain 只有 0.0507;射程提到 30 米 -> 0.1349;
-                #     能量 20.0 + 射程 40 米 -> 0.2040。
-                # 4200W 在一条 48 米的走廊里本来就不够:每隔 14.4 米一盏、
-                # 射程只有 11 米,灯与灯之间永远有一段照不到(用户看到的
-                # "灯开着但整条走廊还是平的")。所以能量抬到 9000W(= 9.0)、
-                # 射程 28 米 —— 相邻两盏正好接得上,而走廊尽头仍然照不到
-                # (那里该黑下去,是恐怖感的来源,不要铺满)。
-                light = make_light(name, "POINT", (x, y - side * .4, 3.1), 9000,
-                                   (1, .72, .38) if side == 1 else (.38, .62, 1),
-                                   scene, cutoff=28, shadow=True)
-                light.data.shadow_soft_size = .10
+                # ⚠ 不再**强制**打开投影(第一百五十一轮第三轮反馈)。
+                # 这里以前对所有灯写 `use_shadow = True`,把烛光 / 上照这些
+                # 明确 `shadow=False` 的补光又打开了 —— 一盏 1.45 米高的
+                # 烛光会在几米外的地上拉出长黑影,看起来像"低角度射灯"。
+                # 投影与否交给每盏灯的创建代码(默认本来就是开)。
+                if obj.data.shadow_soft_size <= 0.0:
+                    obj.data.shadow_soft_size = .12
+                # ⚠ 能量 / 射程一概不动:它们现在是**逐盏设计**的
+                #   (主光 / 边光 / 应急红灯 / 烛光 / 月光各不相同),
+                #   第 124 轮那种"全部改成 9000W"会把明暗设计抹平。
         # Ensure closed box normals face outward, including ceiling undersides.
         import bmesh
         for obj in scene.objects:
@@ -316,6 +278,7 @@ def upgrade_visuals():
                 bm.free()
         # Keep the Blender rendered viewport on the same lights and ambient environment.
         godot_look.apply(scene)
+        print(f"[恐怖闯关] {scene_name} 硬装:房间 {ROOM[scene_name]}")
 
 
 def upgrade():

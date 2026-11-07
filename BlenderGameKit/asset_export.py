@@ -20,6 +20,7 @@ Blender 里材质的 Base Color 贴图会变成 Godot 的 albedo_texture，
 所以本插件生成的卡通材质会自动带上它(见 _base_color_texture)。
 """
 
+import hashlib
 import math
 import os
 import re
@@ -237,6 +238,20 @@ extends Node
 ## 编辑器里不搬(免得在编辑器里乱动场景)。
 @export var follow_lights: String = "{follow_lights}"
 
+## ── 灯的父子关系(第一百五十轮:摆动吊灯)──────────────────────────
+## 灯在 Blender 里挂在某个父节点下(比如天花板下的『吊灯摆动』空物体)时,
+## 导出成 Godot 后灯是**场景根下的独立节点**,glb 里的父节点动它不动。
+## 这里把"灯名=父节点名"记下来,进场景时把它们**重新挂到父节点下** ——
+## 之后父节点摆 / 父节点被动画挪动,灯都跟着走。
+## 为空 = 这一关没有挂父级的灯(老场景行为一字不变)。
+@export var light_parents: String = "{light_parents}"
+
+## ── 灯光光斑形状(第一百五十一轮)────────────────────────────────
+## "灯名=res://art/light_cookie_rect.png" 形式。运行时把内置的柔边矩形 /
+## 灯罩竖纹贴到 `Light3D.light_projector` —— 窗光不再是正圆,壁灯也不再是
+## 一个标准圆斑。为空 = 这一关没有光斑 cookie(老场景行为一字不变)。
+@export var light_projectors: String = "{light_projectors}"
+
 ## ── 上帝摄像机(关卡测试)──────────────────────────────────────────
 ## 场景设置里开了『上帝摄像机』时,这里常驻一台自由飞行相机:
 ## 运行时按 Tab 在"玩家相机 / 上帝摄像机"之间切;上帝机忽略碰撞、
@@ -416,6 +431,11 @@ func _ready() -> void:
 	# 可见距离 / 阴影开销(第九十八轮)同理:网格在 glb 实例内部,
 	# 现在搜不到它 —— 一样推到帧末(表空时那个函数直接跳过,没有开销)。
 	_apply_render_tuning.call_deferred()
+	# 灯的父子关系(第一百五十轮):灯与父节点都要等整棵树建好才找得到,
+	# 同样推到帧末;表空 = 老场景,什么都不做。
+	_gk_link_light_parents.call_deferred()
+	# 灯光光斑形状(第一百五十一轮):灯节点建好后才能挂 light_projector。
+	_gk_apply_light_projectors.call_deferred()
 	# 碰撞代理配对同理:glb 实例内部的网格节点现在还没进树,搜不到。
 	_gk_link_colliders.call_deferred()
 	# ── 运行时**新加**进场景的网格也要补材质(用户 2026-10-05)────────
@@ -809,6 +829,52 @@ func _gk_follow_light_anchor(light: Light3D) -> Node3D:
 	return null
 
 
+## 把"在 Blender 里挂在父节点下的灯"重新挂到 Godot 的父节点下。
+## 灯是从 Blender 灯光物体单独生成的场景根节点(.tscn 里 parent="."),
+## 不会自动继承 glb 里的父子关系;不补这一步,"整盏吊灯在晃、灯光钉在
+## 天花板"就会同时发生。表里一对都找不到时静默跳过(改名 / 舞台切换)。
+func _gk_link_light_parents() -> void:
+	if light_parents.strip_edges().is_empty() or Engine.is_editor_hint():
+		return
+	var root := _scene_root()
+	if root == null:
+		return
+	for entry in light_parents.split("|", false):
+		var parts := entry.strip_edges().split("=", true, 1)
+		if parts.size() < 2:
+			continue
+		var light_name := parts[0].strip_edges()
+		var parent_name := parts[1].strip_edges()
+		if light_name.is_empty() or parent_name.is_empty():
+			continue
+		var light_node := root.find_child(light_name, true, false)
+		var parent_node := root.find_child(parent_name, true, false)
+		if light_node is Light3D and parent_node is Node3D:
+			(light_node as Node3D).reparent(parent_node, true)
+
+
+## 让灯光不再是"标准圆斑"(第一百五十一轮):按表把内置 cookie 贴到
+## `Light3D.light_projector`。资源缺失时静默跳过(不把游戏搞崩)。
+func _gk_apply_light_projectors() -> void:
+	if light_projectors.strip_edges().is_empty() or Engine.is_editor_hint():
+		return
+	var root := _scene_root()
+	if root == null:
+		return
+	for entry in light_projectors.split("|", false):
+		var parts := entry.strip_edges().split("=", true, 1)
+		if parts.size() < 2:
+			continue
+		var light_name := parts[0].strip_edges()
+		var res_path := parts[1].strip_edges()
+		var light_node := root.find_child(light_name, true, false)
+		if light_node is not Light3D:
+			continue
+		var texture := load(res_path) as Texture2D
+		if texture != null:
+			(light_node as Light3D).light_projector = texture
+
+
 ## 场景灯光 -> 卡通材质(第四十八轮:从"只跟一盏平行光"升级成多光近似)。
 ## 参数名带下划线前缀 = "故意不用":取值走 get_physics_process_delta_time(),
 ## 而 Godot 会把没用上的参数报成 UNUSED_PARAMETER(调试器里一条错误)。
@@ -943,7 +1009,18 @@ func _gk_pick_light(lights: Array, node: Node3D, exclude: Array = []) -> Array:
 				span = 5.0
 			var to_light := l.global_position - here
 			var dist := to_light.length()
-			reach = clampf(1.0 - dist / span, 0.0, 1.0)
+			# ── 衰减指数 / 锥边柔和(第一百五十轮)────────────────────
+			# 用户原话:"漫射光线的衰减,照射范围的柔和"。
+			# 以前这里一律**线性** 1 - d/r:射程边缘是硬折角,近灯又不够亮,
+			# 和 Godot 真实光照(omni_attenuation / spot_angle_attenuation)
+			# 对不上。卡通材质走的是这份近似,所以必须跟导出值一致。
+			var atten := 1.0
+			if l is OmniLight3D:
+				atten = (l as OmniLight3D).omni_attenuation
+			elif l is SpotLight3D:
+				atten = (l as SpotLight3D).spot_attenuation
+			reach = pow(clampf(1.0 - dist / span, 0.0, 1.0),
+					maxf(atten, 0.01))
 			score = l.light_energy * reach
 			if dist > 0.001:
 				dir = to_light.normalized()
@@ -952,7 +1029,9 @@ func _gk_pick_light(lights: Array, node: Node3D, exclude: Array = []) -> Array:
 					# 点乘当权重 —— 照不到的方向不该被它染色。
 					# (灯到材质 = -dir,因为 dir 是材质指向灯)
 					var aim := -l.global_transform.basis.z.normalized()
-					score *= clampf(aim.dot(-dir), 0.0, 1.0)
+					var cone := clampf(aim.dot(-dir), 0.0, 1.0)
+					var cone_soft := (l as SpotLight3D).spot_angle_attenuation
+					score *= pow(cone, maxf(cone_soft, 0.01))
 			else:
 				dir = l.global_transform.basis.z.normalized()
 		if score > best_score:
@@ -1381,6 +1460,20 @@ func _gk_god_toggle() -> void:
 		_gk_god_freeze(true)
 
 
+## 界面上有没有**开着的面板**(菜单 / 对话框 / 选择框)。
+## 只看 Panel:常驻 HUD 是 Label(目标 / 提示),不算"界面开着" ——
+## 和第一百三十九轮 `_gk_transient_visible` 的判定保持同一套规矩。
+func _gk_god_ui_open() -> bool:
+	var tree := get_tree()
+	if tree == null:
+		return false
+	for node in tree.root.find_children("*", "Panel", true, false):
+		var panel := node as Control
+		if panel != null and panel.is_visible_in_tree():
+			return true
+	return false
+
+
 ## 上帝机的每个物理帧:Tab 切换 + 飞行。
 func _gk_god_tick(delta: float) -> void:
 	if _gk_god_cam == null or not is_instance_valid(_gk_god_cam):
@@ -1388,7 +1481,13 @@ func _gk_god_tick(delta: float) -> void:
 	if Input.is_key_pressed(KEY_TAB):
 		if not _gk_god_tab_held:
 			_gk_god_tab_held = true
-			_gk_god_toggle()
+			# ── 界面开着时 Tab 不进上帝机(第一百四十七轮实机)──────────
+			# 探针复现:暂停菜单开着(世界冻着、光标在 UI 上)按 Tab,
+			# 相机照样切到上帝机 —— 菜单还在、画面却已经换成自由视角,
+			# 玩家会以为"暂停菜单坏了"。所以有面板时不进;
+			# **已经在上帝机里时仍然允许退出**,免得被锁在里面。
+			if _gk_god_cam.is_current() or not _gk_god_ui_open():
+				_gk_god_toggle()
 	else:
 		_gk_god_tab_held = false
 	if not _gk_god_cam.is_current():
@@ -2382,6 +2481,10 @@ ENV_SCRIPT_DEFAULTS = dict(
     # (值是**带引号的 GDScript 字符串字面量**,见 render_tuning_tables)
     visibility_ranges='""', no_shadow_nodes='""', light_shadows='""',
     follow_lights="",
+    # 灯的父子关系(第一百五十轮):空 = 没有挂父级的灯
+    light_parents="",
+    # 灯光光斑形状(第一百五十一轮):空 = 不挂 light_projector
+    light_projectors="",
     # 开局 BGM(第七十七轮)。这两个键和 `_env_fields` 里那两行**必须一一对应**:
     # 只加 `_env_fields` 忘了加这里 -> 模板渲染 KeyError,而且只在
     # `render_env_script()` 那条路(测试 / 工具)上炸 —— 导出反而好好的。
@@ -2442,14 +2545,16 @@ shader_parameter/use_albedo_texture = {use_texture:.1f}
 shader_parameter/albedo_strength = 1.0
 shader_parameter/albedo_texture = {albedo_ref}
 shader_parameter/shadow_step = {shadow_step:.6f}
-shader_parameter/shadow_smooth = 0.02
+shader_parameter/shadow_step_2 = {shadow_step_2:.6f}
+shader_parameter/shadow_smooth = {shadow_smooth:.6f}
 shader_parameter/three_tone = {three_tone:.6f}
 shader_parameter/lit_tint = Color(1, 0.976, 0.914, 1)
 shader_parameter/shadow_tint = Color({st_r:.6f}, {st_g:.6f}, {st_b:.6f}, 1)
+shader_parameter/shadow_tint_2 = Color({st2_r:.6f}, {st2_g:.6f}, {st2_b:.6f}, 1)
 shader_parameter/specular_amount = {specular:.6f}
 shader_parameter/rim_amount = {rim:.6f}
-shader_parameter/emission_amount = 0.0
-"""
+{emission_lines}"""
+
 
 # ============================================================================
 # TOON_MATERIAL_TEMPLATE 的参数为什么是这些值 —— **注释不能写进 .tres 里面**
@@ -2904,6 +3009,23 @@ def env_settings(scene):
         "fog_color": _env_color_text(getattr(settings, "env_fog_color", None),
                                      (0.30, 0.34, 0.42, 1.0)),
         "fog_density": _env_number(settings, "env_fog_density", 0.02),
+        # 高度雾(第一百四十八轮):出厂 0 / 0 = 关,老项目一字不变
+        "fog_height": _env_number(settings, "env_fog_height", 0.0),
+        "fog_height_density": _env_number(
+            settings, "env_fog_height_density", 0.0),
+        # 体积雾(第一百四十八轮):独立于深度雾的一组,默认关
+        "volumetric": bool(getattr(settings, "env_volumetric", False)),
+        "volumetric_density": _env_number(
+            settings, "env_volumetric_density", 0.05),
+        "volumetric_albedo": _env_color_text(
+            getattr(settings, "env_volumetric_albedo", None),
+            (1.0, 1.0, 1.0, 1.0)),
+        "volumetric_anisotropy": _env_number(
+            settings, "env_volumetric_anisotropy", 0.2),
+        "volumetric_length": _env_number(
+            settings, "env_volumetric_length", 64.0),
+        "volumetric_ambient": _env_number(
+            settings, "env_volumetric_ambient", 0.0),
         "glow": bool(getattr(settings, "env_glow", False)),
         "glow_intensity": _env_number(settings, "env_glow_intensity", 0.8),
         "glow_bloom": _env_number(settings, "env_glow_bloom", 0.1),
@@ -2962,6 +3084,34 @@ def _env_extra_lines(values):
         if abs(values["fog_aerial_perspective"] - 0.0) > 1e-9:
             lines.append("fog_aerial_perspective = %.6f"
                          % values["fog_aerial_perspective"])
+        # 高度雾(第一百四十八轮):出厂都是 0.0,两个一起用才有效。
+        # `fog_height_density` 是"雾层浓度",0 时 Godot 直接忽略高度雾 ——
+        # 所以只在 > 0 时才写(不写没有意义的高度值)。
+        if values["fog_height_density"] > 1e-9:
+            if abs(values["fog_height"]) > 1e-9:
+                lines.append("fog_height = %.6f" % values["fog_height"])
+            lines.append("fog_height_density = %.6f"
+                         % values["fog_height_density"])
+    # 体积雾(第一百四十八轮):功能关 -> 一个键都不写。
+    # 出厂值:enabled=false / density=0.05 / albedo=白 / anisotropy=0.2 /
+    #         length=64 / ambient_inject=0.0
+    if values["volumetric"]:
+        lines.append("volumetric_fog_enabled = true")
+        if abs(values["volumetric_density"] - 0.05) > 1e-9:
+            lines.append("volumetric_fog_density = %.6f"
+                         % values["volumetric_density"])
+        if values["volumetric_albedo"] != "Color(1.000000, 1.000000, 1.000000, 1)":
+            lines.append("volumetric_fog_albedo = %s"
+                         % values["volumetric_albedo"])
+        if abs(values["volumetric_anisotropy"] - 0.2) > 1e-9:
+            lines.append("volumetric_fog_anisotropy = %.6f"
+                         % values["volumetric_anisotropy"])
+        if abs(values["volumetric_length"] - 64.0) > 1e-9:
+            lines.append("volumetric_fog_length = %.6f"
+                         % values["volumetric_length"])
+        if abs(values["volumetric_ambient"]) > 1e-9:
+            lines.append("volumetric_fog_ambient_inject = %.6f"
+                         % values["volumetric_ambient"])
     # 泛光那一组(出厂值:glow_strength=1.0 / glow_hdr_threshold=1.0 /
     # glow_blend_mode=1(SCREEN))。泛光关着 -> 一个都不写。
     if values["glow"]:
@@ -3052,6 +3202,20 @@ def environment_scene_blocks(scene):
     sub_resources[-1] += (
         '\nssao_enabled = ' + ('true' if getattr(settings, "env_ssao", False) else 'false')
         + '\nssil_enabled = ' + ('true' if getattr(settings, "env_ssil", False) else 'false'))
+    # ── SSAO 的三个旋钮(第一百四十八轮)──────────────────────────────
+    # 只在**开了 SSAO** 且值 != Godot 出厂值时写(同一条"够得着才落地"的
+    # 规矩)。为什么非要暴露它们:默认 `ssao_light_affect = 0` 时 SSAO 只
+    # 压环境光,卡通场景的暗部本来就靠环境光占大头 —— 实机测下来开/关
+    # 只差 2/255,等于"勾了没反应"。示例里把它拧到 0.7 之后,家具根部 /
+    # 墙角才有真正的接触阴影。
+    if getattr(settings, "env_ssao", False):
+        for key, attr, default in (
+                ("ssao_intensity", "env_ssao_intensity", 2.0),
+                ("ssao_radius", "env_ssao_radius", 1.0),
+                ("ssao_light_affect", "env_ssao_light_affect", 0.0)):
+            value = _env_number(settings, attr, default)
+            if abs(value - default) > 1e-9:
+                sub_resources[-1] += "\n%s = %.6f" % (key, value)
     return sub_resources, ENVIRONMENT_NODE_TEXT.format(res_id=ENV_RESOURCE_ID)
 
 
@@ -3892,7 +4056,7 @@ _DAYNIGHT_PRESETS = (
      0.06, 0.05, 0.0, 0.08, (0.03, 0.04, 0.09)),
     ("清晨", (0.20, 0.36, 0.68), (0.85, 0.66, 0.55), (1.00, 0.82, 0.62),
      0.55, 0.55, 0.6, 0.22, (0.45, 0.42, 0.48)),
-    ("白天", (0.25, 0.45, 0.85), (0.72, 0.82, 0.95), (1.00, 0.96, 0.88),
+    ("白天", (0.24, 0.43, 0.80), (0.62, 0.76, 0.92), (1.00, 0.89, 0.68),
      1.00, 1.00, 0.0, 0.35, (0.60, 0.68, 0.78)),
     ("黄昏", (0.16, 0.20, 0.45), (0.95, 0.48, 0.25), (1.00, 0.55, 0.30),
      0.50, 0.45, 1.0, 0.20, (0.45, 0.30, 0.28)),
@@ -3906,6 +4070,12 @@ _WEATHERS = (
     ("CLOUDY", "阴", 0.90, 0.85, 0.80, 0.75),
     ("RAINY", "雨", 1.80, 1.00, 0.65, 0.55),
     ("FOGGY", "雾", 2.60, 0.55, 0.85, 0.40),
+    # ── 第一百五十四轮:大风 / 雪 ──────────────────────────────
+    # 大风:雾被吹散一点(0.70)、云更多(1.20)、整体略暗(0.92);
+    # 雪:雾中等(1.30)、云满(1.00)、环境光**偏亮**(0.98,雪面反光)、
+    #     泛光压一点(0.70,雪的高光别糊成一片)。
+    ("WINDY", "大风", 0.70, 1.20, 0.92, 0.90),
+    ("SNOWY", "雪", 1.30, 1.00, 0.98, 0.70),
 )
 
 
@@ -4003,6 +4173,8 @@ def _daynight_const_lines(cards):
         or daynight is not None
     lines = [
         f'const _GK_SKY_SHADER := "{_SKY_SHADER_PATH}"',
+        'const _GK_MOON_TEXTURE := "res://art/moon_texture.png"',
+        'const _GK_CLOUD_TEXTURE := "res://art/cloud_texture.png"',
         "const _GK_SKY_ON := %s" % ("true" if sky_on else "false"),
         "const _GK_SKY_TOP := %s" % color(
             sky, "gk_sky_top", (0.25, 0.45, 0.85, 1.0)),
@@ -4016,22 +4188,41 @@ def _daynight_const_lines(cards):
             number(sky, "gk_horizon_glow", 0.0)),
         "const _GK_SKY_GLOW_COLOR := %s" % color(
             sky, "gk_glow_color", (1.0, 0.55, 0.28, 1.0)),
+        # ── 星星(第一百五十一轮第四轮)────────────────────────────────
+        # 用户:"实际运行下……星星也没有"。着色器里用球面哈希散点画,
+        # 只在天空够暗时出现;这两项控制数量 / 亮度。
+        "const _GK_STAR_AMOUNT := %s" % _gd_float(
+            number(sky, "gk_star_amount", 0.7)),
+        "const _GK_STAR_BRIGHTNESS := %s" % _gd_float(
+            number(sky, "gk_star_brightness", 1.0)),
+        "const _GK_STAR_TWINKLE := %s" % _gd_float(
+            number(sky, "gk_star_twinkle", 1.0)),
+        # 南北半球(第一百五十二轮):0 = 北,1 = 南
+        "const _GK_STAR_HEMISPHERE := %d" % (
+            1 if str(text(sky, "gk_sky_hemisphere", "NORTH")).upper()
+            == "SOUTH" else 0),
         "const _GK_CLOUD_ON := %s" % (
             "true" if clouds is not None else "false"),
         "const _GK_CLOUD_AMOUNT := %s" % _gd_float(
             number(clouds, "gk_cloud_amount", 0.45)),
         "const _GK_CLOUD_SPEED := %s" % _gd_float(
-            number(clouds, "gk_cloud_speed", 0.02)),
+            number(clouds, "gk_cloud_speed", 0.06)),
         "const _GK_CLOUD_SCALE := %s" % _gd_float(
             number(clouds, "gk_cloud_scale", 3.0)),
         "const _GK_CLOUD_HEIGHT := %s" % _gd_float(
-            number(clouds, "gk_cloud_height", 0.12)),
+            number(clouds, "gk_cloud_height", 0.06)),
         "const _GK_CLOUD_SOFTNESS := %s" % _gd_float(
             number(clouds, "gk_cloud_softness", 0.22)),
         "const _GK_CLOUD_LIGHT := %s" % color(
             clouds, "gk_cloud_light", (1.0, 0.98, 0.95, 1.0)),
         "const _GK_CLOUD_DARK := %s" % color(
             clouds, "gk_cloud_dark", (0.45, 0.48, 0.58, 1.0)),
+        # 云影(第一百五十轮):0 = 老行为,月光亮度完全不受云影响
+        "const _GK_CLOUD_SHADOW := %s" % _gd_float(
+            number(clouds, "gk_cloud_shadow", 0.0)),
+        # 白天云量增加(第一百五十一轮第五轮):0 = 昼夜不影响云量
+        "const _GK_CLOUD_DAY_BOOST := %s" % _gd_float(
+            number(clouds, "gk_cloud_day_boost", 0.0)),
         "const _GK_DN_ENABLED := %s" % (
             "true" if daynight is not None else "false"),
         f'const _GK_DN_GROUP := "{_DAYNIGHT_GROUP}"',
@@ -4045,6 +4236,10 @@ def _daynight_const_lines(cards):
             "true" if flag(daynight, "gk_auto", True) else "false"),
         "const _GK_DN_BRIGHTNESS := %s" % _gd_float(
             number(daynight, "gk_brightness", 1.0)),
+        # 只改天空(第一百五十一轮第六轮):勾着 = 不碰环境光 / 雾,
+        # 只让天色 / 太阳 / 月亮 / 云量随时间变 —— 保住手工调好的场地。
+        "const _GK_DN_SKY_ONLY := %s" % (
+            "true" if flag(daynight, "gk_sky_only", False) else "false"),
         "const _GK_DN_SUN_NAME := \"%s\"" % text(sun, "gk_sun_name", ""),
         "const _GK_DN_SUN_ORBIT := %s" % (
             "true" if flag(sun, "gk_sun_orbit", True) else "false"),
@@ -4052,6 +4247,10 @@ def _daynight_const_lines(cards):
             number(sun, "gk_sun_latitude", 45.0)),
         "const _GK_DN_SUN_TILT := %s" % _gd_float(
             number(sun, "gk_sun_tilt", 0.0)),
+        # 南北半球(第一百五十三轮):1 = 南半球,整条日轨绕天顶转 180°
+        "const _GK_DN_SUN_HEMISPHERE := %d" % (
+            1 if str(text(sun, "gk_sun_hemisphere", "NORTH")).upper()
+            == "SOUTH" else 0),
         "const _GK_DN_SUN_SCALE := %s" % _gd_float(
             number(sun, "gk_sun_scale", 1.0)),
         "const _GK_DN_SUN_SHADOW := %s" % (
@@ -4066,13 +4265,27 @@ def _daynight_const_lines(cards):
         "const _GK_MOON_ENERGY := %s" % _gd_float(
             number(moon, "gk_moon_energy", 0.35)),
         "const _GK_MOON_SIZE := %s" % _gd_float(
-            number(moon, "gk_moon_size", 0.035)),
+            number(moon, "gk_moon_size", 0.06)),
         "const _GK_MOON_PHASE := %s" % _gd_float(
             number(moon, "gk_moon_phase", 1.0)),
+        # 月相动画(第一百五十一轮):在 满月 ↔ 最弯 之间循环
+        "const _GK_MOON_PHASE_AUTO := %s" % (
+            "true" if (moon is not None
+                       and flag(moon, "gk_moon_phase_animate", False))
+            else "false"),
+        "const _GK_MOON_PHASE_SECONDS := %s" % _gd_float(
+            number(moon, "gk_moon_phase_seconds", 40.0)),
+        "const _GK_MOON_PHASE_MIN := %s" % _gd_float(
+            number(moon, "gk_moon_phase_min", 0.15)),
         "const _GK_MOON_SHADOW := %s" % (
             "true" if flag(moon, "gk_moon_shadow", False) else "false"),
         "const _GK_MOON_ORBIT := %s" % (
             "true" if flag(moon, "gk_moon_orbit", True) else "false"),
+        # 固定方向时用(第一百四十九轮):方位角 / 高度角,单位度
+        "const _GK_MOON_AZIMUTH := %s" % _gd_float(
+            number(moon, "gk_moon_azimuth", 0.0)),
+        "const _GK_MOON_ELEVATION := %s" % _gd_float(
+            number(moon, "gk_moon_elevation", 30.0)),
         "const _GK_WEATHER_START := %d" % _weather_index(
             text(weather, "gk_weather", "CLEAR")),
     ] + _weather_const_lines()
@@ -4129,6 +4342,15 @@ def _daynight_body_lines():
         "var _gk_dn_last_ms := 0",
         "var _gk_dn_hour_int := -1",
         "var _gk_dn_ready := false",
+        # 昼夜交替(第一百五十一轮):白天/夜晚之间来回过渡的状态机
+        "var _gk_dn_alt_active := false",
+        "var _gk_dn_alt_phase := 0",
+        "var _gk_dn_alt_t := 0.0",
+        "var _gk_dn_alt_from := 0.0",
+        "var _gk_dn_alt_day := 7.0",
+        "var _gk_dn_alt_night := 21.0",
+        "var _gk_dn_alt_fade := 12.0",
+        "var _gk_dn_alt_hold := 8.0",
         "var _gk_dn_sun: DirectionalLight3D = null",
         "var _gk_dn_sun_base := 1.0",
         "var _gk_dn_env: Environment = null",
@@ -4158,6 +4380,8 @@ def _daynight_body_lines():
         "	add_to_group(_GK_ENV_GROUP)",
         "	_gk_wx_target = _GK_WEATHER_START",
         "	_gk_wx_values = _gk_env_weather_values(_gk_wx_target)",
+        "	# 开局天气也要有粒子(雨/雪/风),不能等逻辑图第一次换天气",
+        "	_gk_wx_set_fx(_GK_WX_NAMES[_gk_wx_target])",
         "	_gk_wx_mix = 1.0",
         "	_gk_dn_hour = fmod(maxf(_GK_DN_START_HOUR, 0.0), 24.0)",
         "	_gk_dn_last_ms = Time.get_ticks_msec()",
@@ -4195,7 +4419,28 @@ def _daynight_body_lines():
         "		return",
         "	_gk_sky_mat = ShaderMaterial.new()",
         "	_gk_sky_mat.shader = shader",
+        "	# 月面纹理:有就挂上(月海 / 环形山),没有就保持纯色月盘",
+        "	# ⚠ 先 ResourceLoader.exists:直接 load() 一个不存在的路径会在",
+        "	#   Godot 里打一条 ERROR(昼夜示例没导出这张图就会误报)",
+        "	if ResourceLoader.exists(_GK_MOON_TEXTURE):",
+        "		var _moon_tex := load(_GK_MOON_TEXTURE) as Texture2D",
+        "		if _moon_tex != null:",
+        "			_gk_sky_mat.set_shader_parameter(\"moon_texture\", _moon_tex)",
+        "			_gk_sky_mat.set_shader_parameter(\"use_moon_texture\", 1.0)",
+        "	# 云密度贴图(第一百五十一轮第四轮):有就采样贴图,没有就退回程序化噪声",
+        "	if ResourceLoader.exists(_GK_CLOUD_TEXTURE):",
+        "		var _cloud_tex := load(_GK_CLOUD_TEXTURE) as Texture2D",
+        "		if _cloud_tex != null:",
+        "			_gk_sky_mat.set_shader_parameter(\"cloud_texture\", _cloud_tex)",
+        "			_gk_sky_mat.set_shader_parameter(\"use_cloud_texture\", 1.0)",
         "	var sky := Sky.new()",
+        "	# ── 必须是 REALTIME(实机踩到)──────────────────────────────",
+        "	# 默认的 PROCESS_MODE_AUTOMATIC 走「烘一次辐射贴图」:材质是脚本",
+        "	# 运行时才建的,首次烘焙用的是**着色器 uniform 默认值**(默认就是",
+        "	# 白天的浅蓝),之后 `set_shader_parameter` 改了参数,烘好的辐射图",
+        "	# 不会更新 —— 表现就是「窗外/天空永远是默认的浅蓝,天空盒卡片",
+        "	# 怎么调都不生效」。REALTIME 每帧按材质画,参数改了就立刻对。",
+        "	sky.process_mode = Sky.PROCESS_MODE_REALTIME",
         "	sky.sky_material = _gk_sky_mat",
         "	_gk_dn_env.sky = sky",
         "	_gk_dn_env.background_mode = Environment.BG_SKY",
@@ -4212,10 +4457,20 @@ def _daynight_body_lines():
         "	_gk_daynight_tick(delta)",
         "",
         "func _gk_daynight_tick(delta: float) -> void:",
-        "	# 上帝机 / Esc 暂停把世界冻住时,天也一起冻 —— 那是「整局暂停」的语义",
-        "	if _gk_dn_paused or get_tree().paused:",
+        "	# ── 换关卡时会有一帧「已经离开场景树、还没被 free」的窗口 ──────",
+        "	# 环境脚本把自己挂在 get_tree().physics_frame 上(见 _gk_daynight_setup),",
+        "	# 而 change_scene_to_file 里旧场景是「先从树上摘下、下一帧才 free」。",
+        "	# 这一帧信号照样会打过来,那时 get_tree() 返回 null —— 直接访问",
+        "	# .paused 就是每帧一条 Invalid access ... on a null instance",
+        "	# (实机日志刷屏)。所以先确认自己还在树上。",
+        "	if not is_inside_tree():",
         "		return",
-        "	if _GK_DN_ENABLED and _GK_DN_AUTO:",
+        "	# 上帝机 / Esc 暂停把世界冻住时,天也一起冻 —— 那是「整局暂停」的语义",
+"	if _gk_dn_paused or get_tree().paused:",
+        "		return",
+        "	if _gk_dn_alt_active:",
+        "		_gk_env_alt_tick(delta)",
+        "	elif _GK_DN_ENABLED and _GK_DN_AUTO:",
         "		var per_second := 24.0 / maxf(_GK_DN_DAY_SECONDS, 0.001)",
         "		var before := _gk_dn_hour",
         "		_gk_dn_hour = fmod(_gk_dn_hour + delta * per_second * _gk_dn_speed, 24.0)",
@@ -4225,6 +4480,52 @@ def _daynight_body_lines():
         "	# 云靠这个数在飘(着色器里的 TIME 暂停时也走,不能用它)",
         "	_gk_dn_elapsed += delta * _gk_dn_speed",
         "	_gk_daynight_apply()",
+        "	_gk_wx_follow()",
+        "",
+        "## 昼夜交替:沿最短方向把小时从 from 推到 to(跨 24 点也不倒着走)。",
+        "func _gk_hour_lerp(from_hour: float, to_hour: float, t: float) -> float:",
+        "	var span := fmod(to_hour - from_hour + 24.0, 24.0)",
+        "	return fmod(from_hour + span * clampf(t, 0.0, 1.0), 24.0)",
+        "",
+        "## 昼夜交替状态机:0 过渡到白天 / 1 白天停留 / 2 过渡到夜晚 / 3 夜晚停留",
+        "func _gk_env_alt_tick(delta: float) -> void:",
+        "	_gk_dn_alt_t += delta",
+        "	if _gk_dn_alt_phase == 0:",
+        "		var a := clampf(_gk_dn_alt_t / maxf(_gk_dn_alt_fade, 0.001), 0.0, 1.0)",
+        "		_gk_dn_hour = _gk_hour_lerp(_gk_dn_alt_from, _gk_dn_alt_day, a)",
+        "		if a >= 1.0:",
+        "			_gk_dn_alt_phase = 1",
+        "			_gk_dn_alt_t = 0.0",
+        "	elif _gk_dn_alt_phase == 1:",
+        "		if _gk_dn_alt_t >= _gk_dn_alt_hold:",
+        "			_gk_dn_alt_phase = 2",
+        "			_gk_dn_alt_t = 0.0",
+        "			_gk_dn_alt_from = _gk_dn_hour",
+        "	elif _gk_dn_alt_phase == 2:",
+        "		var b := clampf(_gk_dn_alt_t / maxf(_gk_dn_alt_fade, 0.001), 0.0, 1.0)",
+        "		_gk_dn_hour = _gk_hour_lerp(_gk_dn_alt_from, _gk_dn_alt_night, b)",
+        "		if b >= 1.0:",
+        "			_gk_dn_alt_phase = 3",
+        "			_gk_dn_alt_t = 0.0",
+        "	else:",
+        "		if _gk_dn_alt_t >= _gk_dn_alt_hold:",
+        "			_gk_dn_alt_phase = 0",
+        "			_gk_dn_alt_t = 0.0",
+        "			_gk_dn_alt_from = _gk_dn_hour",
+        "",
+        "## 启动 / 停止昼夜交替(逻辑图『环境_昼夜交替』调这里)。",
+        "func _gk_env_alt_start(day_hour: float, night_hour: float, fade: float, hold: float) -> void:",
+        "	_gk_dn_alt_day = fmod(maxf(day_hour, 0.0), 24.0)",
+        "	_gk_dn_alt_night = fmod(maxf(night_hour, 0.0), 24.0)",
+        "	_gk_dn_alt_fade = maxf(fade, 0.05)",
+        "	_gk_dn_alt_hold = maxf(hold, 0.0)",
+        "	_gk_dn_alt_from = _gk_dn_hour",
+        "	_gk_dn_alt_phase = 0",
+        "	_gk_dn_alt_t = 0.0",
+        "	_gk_dn_alt_active = true",
+        "",
+        "func _gk_env_alt_stop() -> void:",
+        "	_gk_dn_alt_active = false",
         "",
         "## 把当前时刻「长什么样」写到太阳 / 天空 / 环境光 / 雾上。",
         "func _gk_daynight_apply() -> void:",
@@ -4250,10 +4551,14 @@ def _daynight_body_lines():
         "				# 6 点日出 / 12 点最高 / 18 点日落 —— 影子方向**真的**跟着转",
         "				var angle := (_gk_dn_hour - 6.0) / 12.0 * PI",
         "				var elevation := sin(angle) * deg_to_rad(_GK_DN_SUN_LATITUDE)",
-        "				var yaw := -cos(angle) * deg_to_rad(120.0) \\",
-        "						+ deg_to_rad(_GK_DN_SUN_TILT)",
+        "				# 东 -> 北 -> 西 的一条正弧线(方位偏移只用来整体转朝向):",
+        "				# 旧版用 -cos(angle)*120° 会在东南 / 西南各偏 120°,和月亮",
+        "				# 不在同一条弧上 —— 实机里看起来就是『乱走』。",
+        "				var yaw := PI * 0.5 + angle + deg_to_rad(_GK_DN_SUN_TILT)",
+        "				if _GK_DN_SUN_HEMISPHERE == 1:",
+        "					yaw += PI  # 南半球:日轨绕天顶转半圈(太阳偏北)",
         "				_gk_dn_sun.rotation = Vector3(-elevation, yaw, 0.0)",
-        "		if _gk_dn_env != null:",
+        "		if _gk_dn_env != null and not _GK_DN_SKY_ONLY:",
         "			if _gk_dn_env.ambient_light_source == Environment.AMBIENT_SOURCE_COLOR:",
         "				_gk_dn_env.ambient_light_energy = maxf(",
         "						float(values[6]) * _GK_DN_BRIGHTNESS, 0.0)",
@@ -4265,16 +4570,50 @@ def _daynight_body_lines():
         "		_gk_dn_env.glow_intensity = _gk_dn_glow_base * _gk_env_wx(3)",
         "	# ── 月亮:亮度按「夜色程度」,方向跟太阳反着走 ──────────────",
         "	var night := (1.0 - day_amount) if _GK_DN_ENABLED else 1.0",
+        # ── 云影(第一百五十轮)────────────────────────────────────
+        # 两层慢正弦 = 不规则但可重复的"云飘过月面";乘上云量(含天气倍数),
+        # 这样"阴天云多 -> 月光暗得更频繁"也自动成立。0 = 完全不影响。
+        "	var cloud_shade := 1.0",
+        "	if _GK_CLOUD_ON and _GK_CLOUD_SHADOW > 0.0:",
+        "		var cloud_phase := _gk_dn_elapsed * _GK_CLOUD_SPEED * 18.0",
+        "		var cover := 0.5 + 0.5 * sin(cloud_phase) "
+        "* sin(cloud_phase * 0.37 + 1.7)",
+        "		var amount := _gk_cloud_amount_now(day_amount)",
+        "		cloud_shade = 1.0 - _GK_CLOUD_SHADOW "
+        "* clampf(cover, 0.0, 1.0) * amount",
         "	if _gk_dn_moon != null:",
         "		_gk_dn_moon.light_energy = maxf(",
-        "				_GK_MOON_ENERGY * night * _GK_DN_BRIGHTNESS, 0.0)",
+        "				_GK_MOON_ENERGY * night * _GK_DN_BRIGHTNESS "
+        "* cloud_shade, 0.0)",
         "		_gk_dn_moon.light_color = _GK_MOON_COLOR",
         "		_gk_dn_moon.shadow_enabled = _GK_MOON_SHADOW",
         "		if _GK_MOON_ORBIT:",
-        "			var sun_rot := Vector3(0.0, 0.0, 0.0)",
-        "			if _gk_dn_sun != null:",
-        "				sun_rot = _gk_dn_sun.rotation",
-        "			_gk_dn_moon.rotation = Vector3(-sun_rot.x, sun_rot.y + PI, 0.0)",
+        "			# 月亮的一条夜路(第一百五十一轮第六轮):18 点从东边升起,",
+        "			# 0 点到正北最高,6 点从西边落下;白天在地平线以下。",
+        "			# ⚠ 不再拿太阳灯的方向来推 —— 太阳可以固定在某个方向",
+        "			#   (窗光稳定),月亮照样自己走。",
+        "			if _GK_DN_ENABLED:",
+        "				var moon_t := fmod(_gk_dn_hour + 6.0, 24.0) / 12.0",
+        "				var moon_alt := sin(moon_t * PI) \\",
+        "						* deg_to_rad(_GK_MOON_ELEVATION)",
+        "				var moon_az := PI * 0.5 - moon_t * PI",
+        "				_gk_dn_moon.rotation = Vector3(-moon_alt, PI - moon_az, 0.0)",
+        "			else:",
+        "				# 没有昼夜循环:保持老行为(和场景里的太阳反着走)",
+        "				var sun_rot := Vector3(0.0, 0.0, 0.0)",
+        "				if _gk_dn_sun != null:",
+        "					sun_rot = _gk_dn_sun.rotation",
+        "				_gk_dn_moon.rotation = Vector3(-sun_rot.x, sun_rot.y + PI, 0.0)",
+        "		else:",
+        "			# 固定方向(第一百四十九轮):方位角 / 高度角 -> 光源来向",
+        "			# 方位 0 = 北(-Z),高度 0 = 地平线。look_at 让 -Z 指向照射方向,",
+        "			# 所以光源(+Z 轴)正好从 from 方向打过来。",
+        "			var _az := deg_to_rad(_GK_MOON_AZIMUTH)",
+        "			var _el := deg_to_rad(_GK_MOON_ELEVATION)",
+        "			var _from := Vector3(sin(_az) * cos(_el), sin(_el),",
+        "					-cos(_az) * cos(_el))",
+        "			_gk_dn_moon.look_at_from_position(",
+        "					Vector3.ZERO, -_from, Vector3.UP)",
         "	_gk_daynight_update_sky(top, horizon, sun_color, sun_energy, day_amount, glow)",
         "",
         "func _gk_daynight_update_sky(top: Color, horizon: Color, sun_color: Color,",
@@ -4296,6 +4635,10 @@ def _daynight_body_lines():
         "	_gk_sky_mat.set_shader_parameter(\"sun_color\", sun_color)",
         "	_gk_sky_mat.set_shader_parameter(\"sun_energy\", sun_energy)",
         "	_gk_sky_mat.set_shader_parameter(\"sun_size\", _GK_SKY_SUN_SIZE)",
+        "	_gk_sky_mat.set_shader_parameter(\"star_amount\", _GK_STAR_AMOUNT)",
+        "	_gk_sky_mat.set_shader_parameter(\"star_brightness\", _GK_STAR_BRIGHTNESS)",
+        "	_gk_sky_mat.set_shader_parameter(\"star_twinkle\", _GK_STAR_TWINKLE)",
+        "	_gk_sky_mat.set_shader_parameter(\"star_hemisphere\", float(_GK_STAR_HEMISPHERE))",
         "	# ── 月盘(第一百四十二轮)────────────────────────────────",
         "	var moon_dir := Vector3(0.0, 1.0, 0.0)",
         "	if _gk_dn_moon != null:",
@@ -4303,12 +4646,19 @@ def _daynight_body_lines():
         "	_gk_sky_mat.set_shader_parameter(\"moon_dir\", moon_dir)",
         "	_gk_sky_mat.set_shader_parameter(\"moon_color\", _GK_MOON_COLOR)",
         "	_gk_sky_mat.set_shader_parameter(\"moon_size\", _GK_MOON_SIZE)",
-        "	_gk_sky_mat.set_shader_parameter(\"moon_phase\", _GK_MOON_PHASE)",
+        "	# 月相:静态值,或按环境时钟在 满月 ↔ 最弯 之间循环",
+        "	var moon_phase := _GK_MOON_PHASE",
+        "	if _GK_MOON_PHASE_AUTO:",
+        "		var phase_cycle := fmod(_gk_dn_elapsed,",
+        "				maxf(_GK_MOON_PHASE_SECONDS, 0.001))",
+        "		phase_cycle /= maxf(_GK_MOON_PHASE_SECONDS, 0.001)",
+        "		moon_phase = _GK_MOON_PHASE_MIN + (1.0 - _GK_MOON_PHASE_MIN) * (0.5 + 0.5 * cos(phase_cycle * TAU))",
+        "	_gk_sky_mat.set_shader_parameter(\"moon_phase\", moon_phase)",
         "	_gk_sky_mat.set_shader_parameter(\"moon_energy\",",
         "			_gk_dn_moon.light_energy if _gk_dn_moon != null else 0.0)",
         "	_gk_sky_mat.set_shader_parameter(\"cloud_on\", 1.0 if _GK_CLOUD_ON else 0.0)",
-        "	_gk_sky_mat.set_shader_parameter(\"cloud_amount\","
-        " _GK_CLOUD_AMOUNT * _gk_env_wx(1))",
+        "	_gk_sky_mat.set_shader_parameter(\"cloud_amount\",",
+        "			_gk_cloud_amount_now(day_amount))",
         "	_gk_sky_mat.set_shader_parameter(\"cloud_speed\", _GK_CLOUD_SPEED)",
         "	_gk_sky_mat.set_shader_parameter(\"cloud_scale\", _GK_CLOUD_SCALE)",
         "	_gk_sky_mat.set_shader_parameter(\"cloud_height\", _GK_CLOUD_HEIGHT)",
@@ -4444,7 +4794,8 @@ def _daynight_body_lines():
         "	var found := _GK_WX_NAMES.find(name)",
         "	if found >= 0:",
         "		return found",
-        "	var ascii_names := PackedStringArray([\"CLEAR\", \"CLOUDY\", \"RAINY\", \"FOGGY\"])",
+        "	var ascii_names := PackedStringArray([%s])" % ", ".join(
+            '"%s"' % item[0] for item in _WEATHERS),
         "	var raw := ascii_names.find(name)",
         "	return raw if raw >= 0 else 0",
         "",
@@ -4454,8 +4805,18 @@ def _daynight_body_lines():
         "		return float(_gk_wx_values[i])",
         "	return 1.0",
         "",
+        "## 当前云量(0~1):基础云量 × 天气 + 白天增量 × 白天程度。",
+        "## 白天云量增加(第一百五十一轮第六轮):让「入夜 -> 天亮」时云自己变多。",
+        "func _gk_cloud_amount_now(day_amount: float) -> float:",
+        "	if not _GK_CLOUD_ON:",
+        "		return 0.0",
+        "	var amount := _GK_CLOUD_AMOUNT * _gk_env_wx(1)",
+        "	amount += _GK_CLOUD_DAY_BOOST * clampf(day_amount, 0.0, 1.0)",
+        "	return clampf(amount, 0.0, 1.0)",
+        "",
         "## 换天气(带过渡;fade <= 0 立刻换)。逻辑图『环境_切换天气』调这个。",
         "func _gk_env_set_weather(name: String, fade: float) -> void:",
+        "	_gk_wx_set_fx(name)",
         "	var index := _gk_env_weather_index(name)",
         "	_gk_wx_from = _gk_wx_values",
         "	_gk_wx_to = _gk_env_weather_values(index)",
@@ -4479,6 +4840,115 @@ def _daynight_body_lines():
         "		var from_value := _gk_wx_from[i] if i < _gk_wx_from.size() else 1.0",
         "		_gk_wx_values.append(lerpf(from_value, _gk_wx_to[i], _gk_wx_mix))",
         "	_gk_daynight_apply()",
+        "",
+        "# ---- 天气粒子(第一百五十四轮):雨 / 雪 / 风 ----",
+        "var _gk_wx_fx: GPUParticles3D",
+        "var _gk_wx_kind := \"\"",
+        "var _gk_wx_pending := false",
+        "",
+        "## 换天气时只记下『要哪种』,真正的粒子在 tick 里建(那时一定在树里)。",
+        "func _gk_wx_set_fx(name: String) -> void:",
+        "	_gk_wx_kind = name",
+        "	_gk_wx_pending = true",
+        "",
+        "func _gk_wx_make_fx() -> void:",
+        "	if _gk_wx_fx != null:",
+        "		return",
+        "	_gk_wx_fx = GPUParticles3D.new()",
+        "	_gk_wx_fx.name = \"GKWeatherFX\"",
+        "	_gk_wx_fx.emitting = false",
+        "	_gk_wx_fx.local_coords = false",
+        "	_gk_wx_fx.amount = 900",
+        "	_gk_wx_fx.visibility_aabb = AABB(",
+        "			Vector3(-30.0, -16.0, -30.0), Vector3(60.0, 32.0, 60.0))",
+        "	add_child(_gk_wx_fx)",
+        "",
+        "## 每帧:补建 / 跟着相机走(雨雪是**局部天气**,只在玩家周围下)",
+        "func _gk_wx_follow() -> void:",
+        "	if _gk_wx_pending and is_inside_tree():",
+        "		_gk_wx_pending = false",
+        "		_gk_wx_build(_gk_wx_kind)",
+        "	if _gk_wx_fx == null or not _gk_wx_fx.emitting:",
+        "		return",
+        "	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null",
+        "	if cam != null:",
+        "		_gk_wx_fx.global_position = cam.global_position + Vector3(0.0, 9.0, 0.0)",
+        "",
+        "func _gk_wx_build(name: String) -> void:",
+        "	_gk_wx_make_fx()",
+        "	_gk_wx_fx.emitting = false",
+        "	_gk_wx_fx.draw_pass_1 = null",
+        "	if name == \"RAINY\":",
+        "		_gk_wx_build_rain()",
+        "	elif name == \"SNOWY\":",
+        "		_gk_wx_build_snow()",
+        "	elif name == \"WINDY\":",
+        "		_gk_wx_build_wind()",
+        "	_gk_wx_fx.emitting = _gk_wx_fx.draw_pass_1 != null",
+        "",
+        "func _gk_wx_material(alpha: float, color: Color) -> StandardMaterial3D:",
+        "	var mat := StandardMaterial3D.new()",
+        "	mat.albedo_color = color",
+        "	mat.albedo_color.a = alpha",
+        "	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA",
+        "	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED",
+        "	mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED",
+        "	mat.disable_receive_shadows = true",
+        "	return mat",
+        "",
+        "func _gk_wx_build_rain() -> void:",
+        "	var mat := ParticleProcessMaterial.new()",
+        "	mat.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX",
+        "	mat.emission_box_extents = Vector3(18.0, 1.5, 18.0)",
+        "	mat.direction = Vector3(0.0, -1.0, 0.0)",
+        "	mat.spread = 2.0",
+        "	mat.initial_velocity_min = 18.0",
+        "	mat.initial_velocity_max = 26.0",
+        "	mat.gravity = Vector3(0.0, -14.0, 0.0)",
+        "	mat.scale_min = 0.7",
+        "	mat.scale_max = 1.4",
+        "	_gk_wx_fx.process_material = mat",
+        "	_gk_wx_fx.amount = 1100",
+        "	var mesh := BoxMesh.new()",
+        "	mesh.size = Vector3(0.012, 0.62, 0.012)",
+        "	mesh.material = _gk_wx_material(0.55, Color(0.62, 0.74, 0.95))",
+        "	_gk_wx_fx.draw_pass_1 = mesh",
+        "",
+        "func _gk_wx_build_snow() -> void:",
+        "	var mat := ParticleProcessMaterial.new()",
+        "	mat.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX",
+        "	mat.emission_box_extents = Vector3(16.0, 1.0, 16.0)",
+        "	mat.direction = Vector3(0.0, -1.0, 0.0)",
+        "	mat.spread = 25.0",
+        "	mat.initial_velocity_min = 0.8",
+        "	mat.initial_velocity_max = 1.8",
+        "	mat.gravity = Vector3(0.35, -0.55, 0.15)",
+        "	mat.scale_min = 0.5",
+        "	mat.scale_max = 1.1",
+        "	_gk_wx_fx.process_material = mat",
+        "	_gk_wx_fx.amount = 900",
+        "	var mesh := BoxMesh.new()",
+        "	mesh.size = Vector3(0.028, 0.028, 0.028)",
+        "	mesh.material = _gk_wx_material(0.70, Color(0.94, 0.96, 1.0))",
+        "	_gk_wx_fx.draw_pass_1 = mesh",
+        "",
+        "func _gk_wx_build_wind() -> void:",
+        "	var mat := ParticleProcessMaterial.new()",
+        "	mat.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX",
+        "	mat.emission_box_extents = Vector3(14.0, 3.0, 14.0)",
+        "	mat.direction = Vector3(1.0, -0.12, 0.18)",
+        "	mat.spread = 12.0",
+        "	mat.initial_velocity_min = 7.0",
+        "	mat.initial_velocity_max = 12.0",
+        "	mat.gravity = Vector3(0.0, -0.8, 0.0)",
+        "	mat.scale_min = 0.4",
+        "	mat.scale_max = 1.0",
+        "	_gk_wx_fx.process_material = mat",
+        "	_gk_wx_fx.amount = 420",
+        "	var mesh := BoxMesh.new()",
+        "	mesh.size = Vector3(0.05, 0.05, 0.05)",
+        "	mesh.material = _gk_wx_material(0.35, Color(0.72, 0.70, 0.62))",
+        "	_gk_wx_fx.draw_pass_1 = mesh",
         "",
         "## 整点信号:从 `before` 走到 `after` 跨过哪几个整点,就逐个补发。",
         "## 倒退(或第一次,传 -1)只发落点那一个 —— 免得开局刷 24 次。",
@@ -4606,7 +5076,7 @@ def _post_block(scene=None):
 
 
 def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
-                is_3d=True):
+                is_3d=True, light_projectors=""):
     """环境脚本模板的填充值(两处分支共用一份)。
 
     ── 为什么要抽出来(踩过的坑)──────────────────────────────────
@@ -4621,6 +5091,7 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
     # 表空时环境脚本那两个循环直接跳过,生成物与老版本一字不差。
     visibility_ranges, no_shadow_nodes, light_shadows = \
         render_tuning_tables(scene)
+    scene_lights = _collect_lights(scene)
     return dict(
         camera_name=camera_name,
         fov=_fmt(fov),
@@ -4654,7 +5125,12 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
         nav_costs=nav_costs_literal(nav_cost_areas(scene), dimension),
         # 手电筒(第四十八轮):勾了『跟随相机』的灯名,运行时贴着相机走
         # (见环境脚本里的 _gk_follow_lights_tick)。
-        follow_lights=_follow_light_names(_collect_lights(scene)),
+        follow_lights=_follow_light_names(scene_lights),
+        # 灯的父子关系(第一百五十轮):"灯名=父节点名" —— 进场景时重新挂到
+        # 父节点下,父节点摆 / 动时灯跟着走(吊灯摆动就靠它)。
+        light_parents=_light_parent_names(scene_lights),
+        # 灯光光斑形状(第一百五十一轮):"灯名=res://art/light_cookie_x.png"
+        light_projectors=light_projectors,
         # 可见距离 / 阴影开销(第九十八轮):物体『可见距离』『不投阴影』
         # 与平行光『阴影距离』三张表,运行时由 _apply_render_tuning 应用
         visibility_ranges=visibility_ranges,
@@ -5055,6 +5531,15 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         excluded.add(obj)
         stack.extend(obj.children)
 
+    # ── "藏网格但保留节点"(第 165 轮)───────────────────────────────
+    # hide_mesh 的物体如果有**子级**(怪物的零件全挂在核心盒子下),
+    # 直接取消选中会让子级被 glTF 导出器**提升成顶层节点** —— 零件散了
+    # 一地,Godot 里按 body 名找"同名网格"就找不到(配对失败:零件不
+    # 跟随碰撞体移动,走路摆动也没法从网格根收零件)。
+    # 所以导出期间把这些物体临时换成**空网格**:glTF 会导出成一个空的
+    # Transform 节点(层级保留、网格不出现),导完立刻恢复原网格。
+    restore_mesh = []
+
     skipped = []
     # ── 隐藏的骨架会被导出器跳过 ────────────────────────────────────
     # 见 export_subtree_glb 里的详细说明。这里只做两件事:
@@ -5079,6 +5564,30 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         # 子物体碰撞块是**纯辅助物**:网格不进 glb(它在游戏里只是
         # "看不见的碰撞形状",由宿主的碰撞节点代它出现)。
         from .persistent_player import owns
+        # ── 不渲染网格(第一百五十六轮)──────────────────────────
+        # `gk_physics.hide_mesh` = "这块只是判定体":网格不进 glb,
+        # 但 build_scene / 碰撞体生成那条路照旧走 —— 于是它在 Godot 里
+        # 是一个**看不见的 Area3D / StaticBody3D**。
+        # 为什么需要:区域触发的网格是会被画出来的,门洞里放一个 2.2 米高
+        # 的触发盒,实机里就是一块黑板把门口堵死(踩过)。
+        physics_props = getattr(obj, "gk_physics", None)
+        if physics_props is not None and bool(
+                getattr(physics_props, "hide_mesh", False)) \
+                and obj not in excluded:
+            # 有子级的要"留壳":换空网格、保持选中,让 glTF 导出一个
+            # 空 Transform 节点,子级(零件)才有父级可挂(第 165 轮)。
+            # 没有子级的(触发区这类)照旧整体不进 glb。
+            # ⚠ 名字带 __空壳__ 的是上次异常遗留的空壳 —— 不能再当"原
+            #   网格"存进恢复表,否则恢复回来就真是空壳了。
+            if obj.children and getattr(obj, "type", "") == "MESH" \
+                    and not str(obj.data.name).endswith("__空壳__"):
+                _empty_mesh = bpy.data.meshes.new(obj.name + "__空壳__")
+                restore_mesh.append((obj, obj.data, _empty_mesh))
+                obj.data = _empty_mesh
+                obj.select_set(True)
+            else:
+                obj.select_set(False)
+            continue
         if (is_preview or is_marker or obj in excluded
                 or is_collision_piece(obj) or owns(obj)):
             if not is_marker:
@@ -5165,6 +5674,16 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
             obj.select_set(obj in previous)
     except Exception:
         pass
+    # 把临时换掉的空网格恢复回去(第 165 轮"留壳"的收尾)
+    for _saved_obj, _saved_data, _empty in restore_mesh:
+        try:
+            _saved_obj.data = _saved_data
+        except Exception:
+            pass
+        try:
+            bpy.data.meshes.remove(_empty)
+        except Exception:
+            pass
     # 把临时取消的隐藏恢复回去(见上面 restore_hidden 的说明)
     for obj in restore_hidden:
         try:
@@ -6600,7 +7119,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
 
     environment, env_files, _camera_name = build_environment_nodes(
         scene, is_3d, skip=glb_info, scene_name=scene_name,
-        material_files=material_files)
+        material_files=material_files, export_dir=export_dir)
     if env_files:
         ext_lines.append(f'[ext_resource type="Script" '
                          f'path="{env_script_res(scene_name)}" '
@@ -6750,7 +7269,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     # Environment 脚本负责把相机设成 current 并按 Blender 的强度修正灯光。
     environment, env_files, _camera_name = build_environment_nodes(
         scene, is_3d, skip=glb_info, scene_name=scene_name,
-        material_files=material_files)
+        material_files=material_files, export_dir=export_dir)
     if env_files:
         ext_lines.append(f'[ext_resource type="Script" '
                          f'path="{env_script_res(scene_name)}" '
@@ -7153,7 +7672,8 @@ def _camera_vertical_fov(scene, obj, fallback=70.0):
 
 
 def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
-                            material_files=None, material_only=False):
+                            material_files=None, material_only=False,
+                            export_dir=None):
     """决定相机和灯怎么处理。返回 (节点文本, 需要写的文件, 相机名)。
 
     节点文本里如果需要 ext_resource(id="env_script"),调用方要把它写出来。
@@ -7195,7 +7715,8 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
                 or _debug_panel_on(scene) or scene_bgm_path(scene)
                 or _music_bus_apply_on(scene)):
             fields = _env_fields(scene, camera_name="", fov=_fmt(0.0),
-                                 material_files=material_files, is_3d=False)
+                                 material_files=material_files, is_3d=False,
+                                 light_projectors="")
             files[env_script_rel(scene_name)] = \
                 ENVIRONMENT_SCRIPT.format(**fields)
             return ENVIRONMENT_NODE.format(**fields), files, ""
@@ -7213,6 +7734,20 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     # 两条分支共用同一份名单 —— 以前是各写一个"找第一盏 SUN"的循环,
     # 加类型时只改一边就漏(和 _env_fields 踩过的坑同款)。
     lights = _collect_lights(scene)
+    # 光斑 cookie(第一百五十一轮):用到哪种就写哪张 PNG 到 art/。
+    projector_map = _light_projector_names(lights)
+    if export_dir:
+        for obj in lights:
+            pattern = str(getattr(getattr(obj, "gk_light", None),
+                                   "projector", "NONE") or "NONE").upper()
+            if pattern in _LIGHT_COOKIE_NAMES:
+                ensure_light_cookie(export_dir, pattern)
+        # 月面纹理(第一百五十一轮):天空盒 / 月亮要用,所有 3D 关卡共用一张
+        ensure_moon_texture(export_dir)
+        # 云密度贴图(第一百五十一轮第四轮):只有接了『环境_云层』才写
+        _cards = _daynight_cards()
+        if _cards and _cards.get("clouds") is not None:
+            ensure_cloud_texture(export_dir)
 
     parts = []
     files = {}
@@ -7220,8 +7755,21 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     # ---- 情况 1:相机来自 glb,只需要把它设成 current ----
     if glb_has_camera:
         active = scene.camera
-        name = _sanitize_node_name(active.name) if active is not None else \
-            _sanitize_node_name(skip["cameras"][0])
+        # ── 运镜专用机位不当主相机(第一百五十轮)────────────────────
+        # 走廊里只有一台"怪物特写"是场景相机,其余两台在玩家身上。
+        # 不挡的话这里会挑中特写,一进关就把玩家相机挤掉 —— 镜头钉在
+        # 特写上,`相机_运镜` 的 home 也成了它自己,回不去。
+        if active is not None and _is_shot_camera(active):
+            active = None
+        if active is None:
+            for candidate in getattr(scene, "objects", ()) or ():
+                if getattr(candidate, "type", "") != "CAMERA":
+                    continue
+                if candidate.hide_get() or _is_shot_camera(candidate):
+                    continue
+                active = candidate
+                break
+        name = _sanitize_node_name(active.name) if active is not None else ""
         # FOV 也要一起给:Godot 的 Camera3D.fov 是**垂直**视场角,
         # glTF 的 yfov 也是垂直的,理论上能对上;但用户可能在 Blender 里
         # 改过传感器比例,所以这里按 Blender 的当前值算一遍更稳。
@@ -7241,7 +7789,8 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
             parts.append(_light_node_text(obj))
 
         fields = _env_fields(scene, camera_name=name, fov=fov,
-                             material_files=material_files)
+                             material_files=material_files,
+                             light_projectors=projector_map)
         parts.append(ENVIRONMENT_NODE.format(**fields))
         files[env_script_rel(scene_name)] = ENVIRONMENT_SCRIPT.format(**fields)
         return "".join(parts), files, name
@@ -7262,7 +7811,10 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
         # 见 _camera_vertical_fov 里"分支里 import math"那个坑的说明)
         fov = _camera_vertical_fov(scene, obj)
         name = _sanitize_node_name(obj.name)
-        if obj.name == main_camera or not camera_name:
+        if obj.name == main_camera:
+            camera_name = name
+            fov_for_env = fov
+        elif not camera_name and not _is_shot_camera(obj):
             camera_name = name
             fov_for_env = fov
         parts.append(ENVIRONMENT_CAMERA.format(
@@ -7301,7 +7853,8 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
             or _debug_panel_on(scene) or _nav_on(scene)
             or _music_bus_apply_on(scene)):
         fields = _env_fields(scene, camera_name=camera_name, fov=fov_for_env,
-                             material_files=material_files)
+                             material_files=material_files,
+                             light_projectors=projector_map)
         if not parts:
             # 纯为了挂材质 / 上帝机 / 调试面板而生成:没有相机可指,名字留空
             # 让脚本兜底去找
@@ -7567,6 +8120,16 @@ def _light_node_text(obj):
         angle = float(getattr(data, "spot_size", 0.0) or 0.0)
         half = max(1.0, min(angle * _DEG / 2.0, 89.0))
         extras.append(("spot_angle", f"{half:.3f}"))
+        # ── 锥边柔和度(第一百四十八轮)─────────────────────────────
+        # Blender 的 `spot_blend`(0~1)以前**没有导出**,Godot 那边一律
+        # 出厂 1.0 —— 聚光灯照在墙上是一块**硬边椭圆**,一眼就是"游戏里
+        # 打了个聚光灯",不是壁灯。这里把 blend 映射成 Godot 的
+        # `spot_angle_attenuation`(1.0 线性,越大边缘越柔)。
+        # Blender 出厂 0.15:等于出厂的都不写,老项目产物一字不变。
+        blend = float(getattr(data, "spot_blend", 0.15) or 0.0)
+        if abs(blend - 0.15) > 1e-6:
+            extras.append(("spot_angle_attenuation",
+                           f"{max(1.0 + blend * 2.0, 0.01):.4f}"))
     # 阴影柔和度:Blender 的"半径"和 Godot 的 light_size 是同一个意思(米)。
     soft = float(getattr(data, "shadow_soft_size", 0.0) or 0.0)
     if kind in ("POINT", "SPOT") and soft > 0.0:
@@ -7575,10 +8138,28 @@ def _light_node_text(obj):
         # 太阳的角直径(度)<=> Godot 的 light_angular_distance(同一个东西)。
         sun_angle = float(getattr(data, "angle", 0.0) or 0.0)
         extras.append(("light_angular_distance", f"{sun_angle * _DEG:.4f}"))
+    # ── 体积雾里的"这盏灯有多亮"(第一百四十八轮)──────────────────
+    # Blender 的 `light.volume_factor`(体积散射强度,默认 1.0)和 Godot 的
+    # `light_volumetric_fog_energy` 是同一个概念,1:1 转过去。
+    # 出厂 1.0 不写(和"值 ≠ 出厂值才写"同一条规矩)。
+    # 用法:体积雾开着时,把窗外的灯 / 手电筒调到 2~4,光柱会明显"实在";
+    # 吊灯保持 1.0 即可,否则整间屋子会糊成一团亮雾。
+    volume = float(getattr(data, "volume_factor", 1.0) or 0.0)
+    if abs(volume - 1.0) > 1e-9:
+        extras.append(("light_volumetric_fog_energy", f"{volume:.4f}"))
 
     # 投影:侧栏打开『用这里的值导出』之后以它为准,否则沿用 Blender 的勾选。
     if override is not None:
         shadow_on = bool(getattr(override, "shadow", True))
+        # ── 阴影柔和 / 浓度(第一百五十轮)──────────────────────────
+        # 出厂值不写:0 / 1.0 与 Godot 默认一致,老工程产物逐字不变。
+        blur = float(getattr(override, "shadow_blur", 0.0) or 0.0)
+        if blur > 0.0:
+            extras.append(("shadow_blur", f"{blur:.3f}"))
+        opacity = float(getattr(override, "shadow_opacity", 1.0) or 0.0)
+        if abs(opacity - 1.0) > 1e-9:
+            extras.append(("shadow_opacity",
+                           f"{min(max(opacity, 0.0), 1.0):.4f}"))
     else:
         shadow_on = bool(getattr(data, "use_shadow", True))
 
@@ -7635,10 +8216,56 @@ def _follow_light_names(lights):
                     if _light_follow_camera(obj))
 
 
+def _light_projector_names(lights):
+    """灯名=res://art/light_cookie_xxx.png(第一百五十一轮)。
+
+    只收 `projector != NONE` 的灯;空串 = 这一关没有光斑 cookie,
+    环境脚本完全不碰 `light_projector`(老工程行为不变)。
+    """
+    pairs = []
+    for obj in lights:
+        settings = getattr(obj, "gk_light", None)
+        pattern = str(getattr(settings, "projector", "NONE") or "NONE").upper()
+        name = _LIGHT_COOKIE_NAMES.get(pattern)
+        if not name:
+            continue
+        pairs.append(f"{_sanitize_node_name(obj.name)}="
+                     f"res://{project.ART_DIR}/{name}.png")
+    return "|".join(pairs)
+
+
+def _light_parent_names(lights):
+    """灯在 Blender 里的父子关系(第一百五十轮)。
+
+    返回 `"灯名=父名|…"`,空串 = 一盏挂父级的灯都没有(老场景行为不变)。
+    ⚠ 只收**会进 glb 的父类型**:空物体 / 网格 / 骨架 —— 它们才是场景树里
+      真能找到的 Node3D;集合本身不是节点,挂上去没有意义。
+    """
+    pairs = []
+    for obj in lights:
+        parent = getattr(obj, "parent", None)
+        if parent is None:
+            continue
+        if str(getattr(parent, "type", "")) not in (
+                "MESH", "EMPTY", "ARMATURE", "CURVE"):
+            continue
+        pairs.append(f"{_sanitize_node_name(obj.name)}="
+                     f"{_sanitize_node_name(parent.name)}")
+    return "|".join(pairs)
+
+
 # .tscn 里 Transform3D 的**单位基**(9 个数,列优先其实无所谓 —— 单位矩阵对称)
 _IDENTITY_BASIS = ("1.000000, 0.000000, 0.000000, "
                    "0.000000, 1.000000, 0.000000, "
                    "0.000000, 0.000000, 1.000000")
+
+
+def _is_shot_camera(obj):
+    """运镜专用机位(第一百五十轮):不要被环境脚本当成主相机点亮。"""
+    try:
+        return bool(obj.get("gk_not_main_camera", False))
+    except Exception:                                      # noqa: BLE001
+        return False
 
 
 def _camera_basis_text(obj):
@@ -8902,6 +9529,299 @@ def fx_default_png():
             + chunk(b"IEND", b""))
 
 
+# ── 灯光投影纹理(第一百五十一轮)──────────────────────────────────
+# 用户:"灯的光照的范围太圆了"。点光/聚光直接照墙就是一个正圆;这里用
+# 纯 Python 生成内置 cookie,运行时挂到 Godot 的 `light_projector`:
+#   RECT = 窗 / 天窗形状的柔边矩形
+#   LAMP = 壁灯 / 台灯的竖向条纹
+#   SOFT = 柔边不规则光斑(吊灯 / 上照,避免"完美椭圆")
+_LIGHT_COOKIE_NAMES = {"RECT": "light_cookie_rect",
+                       "LAMP": "light_cookie_lamp",
+                       "SOFT": "light_cookie_soft"}
+
+
+def _cookie_smooth(edge0, edge1, value):
+    if edge0 == edge1:
+        return 0.0 if value < edge0 else 1.0
+    t = max(0.0, min(1.0, (value - edge0) / (edge1 - edge0)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _cookie_noise(u, v):
+    """0..1 的确定性低频噪声(不引入随机数,每次导出同一张图)。
+
+    用途:吊灯 / 上照的光斑如果是一张完美的径向渐变,投到墙上就是
+    "教科书式的椭圆" —— 用户嫌它太假。这里叠两层低频正弦,让亮度和
+    边缘都有一点不均匀,读起来像真实的灯罩 / 灰尘。
+    """
+    n = 0.5 + 0.32 * math.sin(u * 9.0 + 1.2) * math.sin(v * 7.0 + 2.1)
+    n += 0.18 * math.sin(u * 21.0 + 0.4) * math.sin(v * 17.0 + 1.3)
+    return max(0.0, min(1.0, n))
+
+
+def light_cookie_png(pattern):
+    """生成一张 64×64 的灯光投影 PNG(纯 zlib + struct,无 bpy 依赖)。"""
+    import struct
+    import zlib
+
+    size = 64
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)                        # PNG 每行的 filter 字节
+        v = (y + 0.5) / size
+        for x in range(size):
+            u = (x + 0.5) / size
+            if str(pattern).upper() == "RECT":
+                # 柔边矩形:四周 8% 的边距 + 10% 的过渡带
+                ax = _cookie_smooth(0.06, 0.16, u) * _cookie_smooth(
+                    0.94, 0.84, u)
+                ay = _cookie_smooth(0.06, 0.16, v) * _cookie_smooth(
+                    0.94, 0.84, v)
+                alpha = ax * ay
+            elif str(pattern).upper() == "SOFT":
+                # 柔边不规则光斑:径向淡出 + 低频噪声。
+                # 外缘从 0.58 开始淡、到 1.02 才完全透明 —— 没有"边界线"。
+                r = math.hypot(u - 0.5, v - 0.5) * 2.0
+                edge = _cookie_smooth(1.02, 0.58, r)
+                alpha = edge * (0.78 + 0.22 * _cookie_noise(u, v))
+            else:
+                # 灯罩竖纹:上下柔边 + 五条竖向亮暗条(条纹也带一点噪声,
+                # 免得在墙上打出五条数学意义上的完美直线)
+                ax = _cookie_smooth(0.04, 0.16, u) * _cookie_smooth(
+                    0.96, 0.84, u)
+                ay = _cookie_smooth(0.04, 0.14, v) * _cookie_smooth(
+                    0.96, 0.86, v)
+                stripe = 0.55 + 0.45 * (0.5 + 0.5 * math.cos(u * math.pi * 10.0))
+                alpha = ax * ay * stripe * (0.88 + 0.12 * _cookie_noise(u, v))
+            raw += bytes((255, 255, 255, int(round(255 * alpha))))
+
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload
+                + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
+def ensure_light_cookie(export_dir, pattern):
+    """把某种光斑 cookie 写到 art/,返回 res:// 路径(失败返回 "")."""
+    name = _LIGHT_COOKIE_NAMES.get(str(pattern).upper())
+    if not name or not export_dir:
+        return ""
+    target = os.path.join(export_dir, project.ART_DIR, f"{name}.png")
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(light_cookie_png(pattern))
+    except OSError:
+        return ""
+    return f"res://{project.ART_DIR}/{name}.png"
+
+
+# ── 月面纹理(第一百五十一轮:用户"月亮光秃秃的")────────────────────
+# 之前月亮只是天空着色器里的一个纯色圆盘,近看不真实。这里用纯 Python
+# 生成一张 128×128 的月面:低频噪声做"月海",一组确定性环形山做细节,
+# 导出到 art/moon_texture.png,运行时挂到天空材质的 `moon_texture` 上。
+# 不用模型:月亮在天上无限远,纹理月盘在所有窗口 / 天窗里都一致,开销为零。
+_MOON_CRATERS = (
+    (-0.32, 0.18, 0.20, 0.16), (0.12, -0.26, 0.14, 0.12),
+    (0.46, 0.30, 0.11, 0.10), (-0.08, 0.42, 0.09, 0.08),
+    (0.55, -0.22, 0.08, 0.07), (-0.55, -0.30, 0.10, 0.09),
+    (0.20, 0.05, 0.06, 0.06), (-0.22, -0.48, 0.07, 0.06),
+    (0.34, 0.52, 0.06, 0.05), (-0.44, 0.50, 0.05, 0.05),
+    (0.72, 0.10, 0.05, 0.04), (-0.70, 0.02, 0.04, 0.04),
+    (0.05, -0.58, 0.05, 0.05), (0.60, -0.48, 0.04, 0.04),
+    (-0.16, 0.68, 0.04, 0.04), (0.86, -0.05, 0.03, 0.03),
+)
+
+
+def _png_rgba_bytes(size, raw):
+    """128×128 RGBA PNG(和 cookie 同一套 zlib + struct,不依赖 bpy)."""
+    import struct
+    import zlib
+
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload
+                + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
+def moon_texture_png():
+    """一张带月海 / 环形山的月面纹理(确定性,每次导出同一张图)。"""
+    size = 128
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)                        # PNG 每行的 filter 字节
+        v = (y + 0.5) / size * 2.0 - 1.0
+        for x in range(size):
+            u = (x + 0.5) / size * 2.0 - 1.0
+            # 月海:两层低频噪声,暗一块亮一块
+            n = 0.5 + 0.22 * math.sin(u * 2.7 + 1.1) * math.sin(v * 2.2 + 0.4)
+            n += 0.14 * math.sin(u * 5.9 + 2.3) * math.sin(v * 4.7 + 1.7)
+            value = 0.88 - 0.16 * _cookie_smooth(0.52, 0.78, n)
+            # 环形山:深色坑底 + 一圈略亮的坑缘
+            for cx, cy, radius, depth in _MOON_CRATERS:
+                dist = math.hypot(u - cx, v - cy)
+                if dist >= radius:
+                    continue
+                inner = 1.0 - dist / radius
+                value -= depth * inner * inner
+                rim = abs(dist - radius * 0.86) / max(radius * 0.14, 0.001)
+                if rim < 1.0:
+                    value += 0.05 * (1.0 - rim)
+            value = max(0.20, min(1.0, value))
+            level = int(round(255 * value))
+            raw += bytes((level, level, min(255, level + 6), 255))
+    return _png_rgba_bytes(size, raw)
+
+
+def ensure_moon_texture(export_dir):
+    """把月面纹理写到 art/,返回 res:// 路径(失败返回 "")."""
+    if not export_dir:
+        return ""
+    target = os.path.join(export_dir, project.ART_DIR, "moon_texture.png")
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(moon_texture_png())
+    except OSError:
+        return ""
+    return f"res://{project.ART_DIR}/moon_texture.png"
+
+
+# ==========================================================================
+# 云层纹理(第一百五十一轮第四轮)
+# ==========================================================================
+# 用户:"实际运行下,云层的形状,高度的效果不是很好"。
+# 排查发现:天空着色器里那套**逐像素程序化噪声**在部分 Godot/GPU 上会
+# 被量化成一块一块的矩形(实机截图里是"方形云块")。与其和驱动博弈,
+# 不如把噪声**离线烘成一张无缝贴图**:形状由 CPU 决定,运行时只采样,
+# 云就是平滑的团块;Blender 预览也能采样同一张,做到两边一致。
+_CLOUD_TEX_SIZE = 128
+_CLOUD_TEXTURE_CACHE = []
+
+
+def _cloud_fract(value):
+    return value - math.floor(value)
+
+
+def _cloud_hash(ix, iy):
+    """和天空着色器 gk_hash(vec2) 同源的 2D 哈希(整数格点)。"""
+    qx = _cloud_fract(ix * 123.34)
+    qy = _cloud_fract(iy * 456.21)
+    d = qx * (qx + 45.32) + qy * (qy + 45.32)
+    qx = _cloud_fract(qx + d)
+    qy = _cloud_fract(qy + d)
+    return _cloud_fract(qx * qy)
+
+
+def _cloud_periodic_noise(u, v, period):
+    """周期性格点值噪声:格点取模 -> 左右 / 上下无缝。"""
+    x = u * period
+    y = v * period
+    ix = math.floor(x)
+    iy = math.floor(y)
+    fx = x - ix
+    fy = y - iy
+    ux = fx * fx * fx * (fx * (fx * 6.0 - 15.0) + 10.0)
+    uy = fy * fy * fy * (fy * (fy * 6.0 - 15.0) + 10.0)
+    x0 = ix % period
+    x1 = (ix + 1) % period
+    y0 = iy % period
+    y1 = (iy + 1) % period
+    a = _cloud_hash(x0, y0)
+    b = _cloud_hash(x1, y0)
+    c = _cloud_hash(x0, y1)
+    d = _cloud_hash(x1, y1)
+    ab = a + (b - a) * ux
+    cd = c + (d - c) * ux
+    return ab + (cd - ab) * uy
+
+
+def cloud_texture_pixels():
+    """128×128 无缝云密度(灰度 0~255),导出与 Blender 预览共用。"""
+    if _CLOUD_TEXTURE_CACHE:
+        return _CLOUD_TEXTURE_CACHE[0]
+    size = _CLOUD_TEX_SIZE
+    pixels = bytearray(size * size)
+    for y in range(size):
+        v = (y + 0.5) / size
+        for x in range(size):
+            u = (x + 0.5) / size
+            total = 0.0
+            amplitude = 0.5
+            period = 8
+            for _ in range(4):
+                total += _cloud_periodic_noise(u, v, period) * amplitude
+                period *= 2
+                amplitude *= 0.5
+            # fbm 的中心带拉开到 0~1:低值完全透明,高值成团
+            level = (total - 0.20) / 0.55
+            level = max(0.0, min(1.0, level))
+            pixels[y * size + x] = int(round(255.0 * level))
+    _CLOUD_TEXTURE_CACHE.append(bytes(pixels))
+    return _CLOUD_TEXTURE_CACHE[0]
+
+
+_CLOUD_PREVIEW_CACHE = []
+
+
+def cloud_texture_preview_pixels():
+    """给 Blender 小窗用的 64×64 版本(128 的 2×2 平均)。
+
+    小窗只有 200~300 像素宽,直接采样 128 的细节会放大成"马赛克";
+    降一半分辨率 + 双线性,云就是连续的团块。
+    """
+    if _CLOUD_PREVIEW_CACHE:
+        return _CLOUD_PREVIEW_CACHE[0]
+    source = cloud_texture_pixels()
+    size = _CLOUD_TEX_SIZE
+    half = max(1, size // 2)
+    pixels = bytearray(half * half)
+    for y in range(half):
+        row = (y * 2) * size
+        for x in range(half):
+            base = row + x * 2
+            total = (source[base] + source[base + 1]
+                     + source[base + size] + source[base + size + 1])
+            pixels[y * half + x] = total // 4
+    _CLOUD_PREVIEW_CACHE.append(bytes(pixels))
+    return _CLOUD_PREVIEW_CACHE[0]
+
+
+def cloud_texture_png():
+    """把灰度密度写成 RGBA PNG(红通道 = 密度)。"""
+    size = _CLOUD_TEX_SIZE
+    pixels = cloud_texture_pixels()
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)                        # PNG 每行的 filter 字节
+        for x in range(size):
+            level = pixels[y * size + x]
+            raw += bytes((level, level, level, 255))
+    return _png_rgba_bytes(size, raw)
+
+
+def ensure_cloud_texture(export_dir):
+    """把云层纹理写到 art/,返回 res:// 路径(失败返回 "")."""
+    if not export_dir:
+        return ""
+    target = os.path.join(export_dir, project.ART_DIR, "cloud_texture.png")
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(cloud_texture_png())
+    except OSError:
+        return ""
+    return f"res://{project.ART_DIR}/cloud_texture.png"
+
+
 def ensure_fx_default_texture(export_dir):
     """把内置默认贴图写到 art/fx_soft.png。返回路径(失败给 None)。
 
@@ -9275,6 +10195,40 @@ def first_real_material(obj):
     return None
 
 
+def _material_emission(material):
+    """读 Blender 材质的自发光 -> (RGBA, 强度)。
+
+    ── 为什么必须补这一步(第一百四十八轮)──────────────────────────
+    示例里的灯罩 / 灯泡 / 逃生指示牌 / 钥匙都是用 Principled 的
+    `Emission Color + Emission Strength` 做的,但导出的卡通材质模板里
+    `emission_amount` **写死 0.0** —— 于是"在 Blender 里是自发光,进游戏
+    是一块普通塑料"。灯罩尤其致命:它靠自发光才像"灯",不发光就只是一个
+    悬在天花板上的深色方块(实机截图里的那个白团,其实是灯把它照爆了)。
+
+    返回强度 0 表示这个材质不自发光(调用方保持老模板,产物一字不变)。
+    """
+    try:
+        if not getattr(material, "use_nodes", False):
+            return (1.0, 1.0, 1.0, 1.0), 0.0
+        tree = getattr(material, "node_tree", None)
+        if tree is None:
+            return (1.0, 1.0, 1.0, 1.0), 0.0
+        for node in tree.nodes:
+            if node.bl_idname != "ShaderNodeBsdfPrincipled":
+                continue
+            strength = float(
+                node.inputs["Emission Strength"].default_value)
+            if strength <= 1e-6:
+                continue
+            color = tuple(node.inputs["Emission Color"].default_value)
+            while len(color) < 4:
+                color = color + (1.0,)
+            return color, strength
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    return (1.0, 1.0, 1.0, 1.0), 0.0
+
+
 def _base_color_texture(material):
     """从 Blender 材质里找 Base Color 贴图，返回图片名(导出后 Godot 里的文件名)。"""
     if material is None or not material.use_nodes:
@@ -9540,8 +10494,10 @@ def _scene_toon_style_fields(settings):
     没开 / 拿不到设置时返回**老默认值**,老项目产物一字不变。
     """
     fields = {
-        "shadow_step": 0.1, "three_tone": 0.0,
+        "shadow_step": 0.1, "shadow_step_2": -0.45,
+        "shadow_smooth": 0.02, "three_tone": 0.0,
         "st_r": 0.706, "st_g": 0.627, "st_b": 0.902,
+        "st2_r": 0.50, "st2_g": 0.45, "st2_b": 0.74,
         "specular": 0.0, "rim": 0.0,
     }
     if settings is None or not bool(getattr(settings, "style_enabled", False)):
@@ -9549,8 +10505,12 @@ def _scene_toon_style_fields(settings):
     try:
         fields["shadow_step"] = float(
             getattr(settings, "style_shadow_step", 0.1))
+        fields["shadow_smooth"] = float(
+            getattr(settings, "style_shadow_smooth", 0.02))
         fields["three_tone"] = float(
             getattr(settings, "style_three_tone", 0.0))
+        fields["shadow_step_2"] = float(
+            getattr(settings, "style_shadow_step_2", -0.45))
         fields["specular"] = float(getattr(settings, "style_specular", 0.0))
         fields["rim"] = float(getattr(settings, "style_rim", 0.0))
         tint = getattr(settings, "style_shadow_tint", None)
@@ -9558,6 +10518,11 @@ def _scene_toon_style_fields(settings):
             fields["st_r"] = float(tint[0])
             fields["st_g"] = float(tint[1])
             fields["st_b"] = float(tint[2])
+        tint2 = getattr(settings, "style_shadow_tint_2", None)
+        if tint2 is not None:
+            fields["st2_r"] = float(tint2[0])
+            fields["st2_g"] = float(tint2[1])
+            fields["st2_b"] = float(tint2[2])
     except (TypeError, ValueError, IndexError):
         pass
     return fields
@@ -9618,6 +10583,12 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
     file_names = _unique_file_names(wanted, prefix=prefix)
 
     written = []
+    # ── 同色材质去重(第一百七十四轮)────────────────────────────────
+    # "每个物体一个独立 Blender 材质"的用法下,颜色相同(远景 75 栋楼
+    # 一个色、所有灯罩一个色……)会生成几百份**逐字节相同**的 .tres
+    # (实测 551 份里只有 97 种颜色组合)。写文件前先算内容哈希:同内容
+    # 复用已有文件,材质名 -> 同一路径(合法引用)。NPR 材质不走这条缓存。
+    text_cache = {}
     # 剔面变体**整个导出只写一次**(第一个勾了剔除的材质触发,见上)
     cull_written = False
     for obj in objects:
@@ -9670,6 +10641,21 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
                 albedo_ref = 'ExtResource("2_albedo")'
                 steps = 3
 
+            # ── 自发光(第一百四十八轮)──────────────────────────────
+            # 强度 0 时写**老模板那一行**(emission_amount = 0.0),
+            # 保证没自发光的材质产物和改动前逐字节一致。
+            emit_color, emit_strength = _material_emission(material)
+            if emit_strength > 1e-6:
+                if scene_lit:
+                    emit_color = tuple(
+                        godot_look.linear_to_srgb(v) for v in emit_color[:3])
+                emission_lines = (
+                    "shader_parameter/emission_color = Color(%.4f, %.4f, %.4f, 1)\n"
+                    "shader_parameter/emission_amount = %.4f\n"
+                    % (emit_color[0], emit_color[1], emit_color[2],
+                       emit_strength))
+            else:
+                emission_lines = "shader_parameter/emission_amount = 0.0\n"
             text = TOON_MATERIAL_TEMPLATE.format(
                 steps=steps,
                 shader_path=f"res://{shader_res_dir}/{shader_name}",
@@ -9677,12 +10663,19 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
                 r=rgb[0], g=rgb[1], b=rgb[2],
                 albedo_ref=albedo_ref,
                 use_texture=1.0 if texture else 0.0,
+                emission_lines=emission_lines,
                 **style_fields,
             )
+            key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+            cached = text_cache.get(key)
+            if cached is not None:
+                written.append((material.name, cached, bool(texture)))
+                continue
             path = os.path.join(export_dir, project.MATERIALS_DIR, f"{name}.tres")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)
+            text_cache[key] = path
             written.append((material.name, path, bool(texture)))
     return written
 
@@ -10245,6 +11238,32 @@ def collect_assets(scene):
     return grouped
 
 
+def asset_tree_objects(entry):
+    """资产的**本体 + 它的全部子孙**(第一百五十轮:组合道具)。
+
+    ── 为什么需要(用户"门锁不跟着门动")──────────────────────────
+    以前静态资产只把**本体那一个物体**从世界 glb 里排除、也只导本体。
+    门板是资产,可门缝 / 凹槽 / 把手 / 门牌是门板下面的子物体 —— 它们
+    留在世界 glb 里,门板升起时它们原地不动,看起来就是"锁没跟着门走"。
+    现在:本体子树整棵归资产(导进资产 glb),同时整棵从世界 glb 排除,
+    一个模型只出现一次、移动门板时整扇门一起走。
+    """
+    source = entry.get("source") if isinstance(entry, dict) else None
+    if source is None:
+        return []
+    out = []
+    stack = [source]
+    seen = set()
+    while stack:
+        obj = stack.pop()
+        if obj is None or obj in seen:
+            continue
+        seen.add(obj)
+        out.append(obj)
+        stack.extend(getattr(obj, "children", ()) or ())
+    return out
+
+
 def validate_assets(scene):
     """资产设置的告警(返回可读文本列表,给导出报告用)。"""
     warnings = []
@@ -10498,6 +11517,11 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     for name, entry in assets.items():
         model_name = asset_model_name(name, scene_name)
         asset_objects.extend(entry["members"])
+        # 本体**整棵子树**都归这个资产(第一百五十轮:门 + 门锁 / 把手)。
+        # 子孙既会进资产 glb(见下面 export_subtree_glb),也必须从世界 glb
+        # 排除 —— 只排除本体的话,子件会在世界 glb 里再出现一次(重叠),
+        # 而移动本体节点时它们又是另一份、原地不动(用户报的"门锁不跟")。
+        asset_objects.extend(asset_tree_objects(entry))
         if entry["source"] is None:
             asset_models[name] = model_name
             continue
@@ -10726,7 +11750,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     # 相机 / 灯光数量(面板上要报告,用户靠这个判断"会不会又是一片灰")
     glb_info = glb_object_names(directory, scene_name)
     _env, _files, _cam = build_environment_nodes(
-        scene, is_3d, skip=glb_info, scene_name=scene_name)
+        scene, is_3d, skip=glb_info, scene_name=scene_name,
+        export_dir=directory)
     result["cameras"] = len(glb_info.get("cameras", ())) or (
         1 if any(obj.type == "CAMERA" for obj in scene.objects) else 0)
     result["lights"] = len(glb_info.get("lights", ())) or (
@@ -11500,7 +12525,8 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
 
     environment, env_files, _camera_name = build_environment_nodes(
         scene, not dimension_2d, skip=glb_info, scene_name=model_name,
-        material_files=material_files, material_only=not set_as_main)
+        material_files=material_files, material_only=not set_as_main,
+        export_dir=export_dir)
     camera_count = len(glb_info.get("cameras", ()))
     light_count = len(glb_info.get("lights", ()))
 

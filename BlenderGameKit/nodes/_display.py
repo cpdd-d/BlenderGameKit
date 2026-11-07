@@ -568,6 +568,77 @@ class GKNodeCameraPath(B.GKStatementNode):
         _draw_curve_row(layout, self, "gk_curve", "", preview=True)
 
 
+@N
+class GKNodeCameraShot(B.GKStatementNode):
+    bl_idname = "GKNodeCameraShot"
+    bl_label = "相机_运镜"
+    bl_icon = "CAMERA_DATA"
+    gk_category = "相机"
+    gk_doc = ("**一段完整的运镜**:沿曲线推近 -> 停留 -> 缩回原相机。"
+              "开场先看一眼敌人 / 关键道具,再回到玩家背后,用它一条节点就够。\n"
+              "── 和『相机_切换』的区别 ──\n"
+              "『相机_切换』只管“从旧机位到新机位”这一段;"
+              "这里把“推近 + 停住 + 回来”整段收进一个节点,执行后立刻返回"
+              "(不挡后面的逻辑),镜头自己演完。\n"
+              "『看向』选敌人 / 道具:整段运镜都把它保持在画面中心;"
+              "留空则保持特写相机本来的朝向。\n"
+              "『回到原相机』默认开:演完自动切回开始时的相机,"
+              "且回程会跟踪那台相机的**实时位置**(玩家走动了也不会甩飞)。\n"
+              "曲线按**世界坐标**采样(终点的落点就是你在 Blender 里摆的位置);"
+              "开头 0.35 秒从当前相机并进曲线,不会把整条轨道平移。"
+              "曲线不填 = 从相机当前位置直线推到特写机位(仍然会看向目标)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "时长", 2.5),
+        S.pin(FLOAT, "停留", 1.5),
+        S.pin(FLOAT, "回程", 1.0),
+        S.pin(FLOAT, "视野起", 0.0),
+        S.pin(FLOAT, "视野止", 0.0),
+        S.pin(BOOL, "回到原相机", True),
+    )
+    gk_input_props = {
+        "时长": "gk_time", "停留": "gk_hold", "回程": "gk_return_time",
+        "视野起": "gk_fov_from", "视野止": "gk_fov_to",
+        "回到原相机": "gk_return_home",
+    }
+    gk_prop_defs = (
+        ("gk_camera", "node", "", "特写相机",
+         "沿曲线走的那台相机;留空 = 当前相机"),
+        ("gk_curve", "string", "", "轨道",
+         "Blender 里的 3D 曲线;不填 = 直线推进"),
+        ("gk_look_target", "node", "", "看向",
+         "整段运镜都看着它(敌人 / 道具);留空 = 保持相机原朝向"),
+        ("gk_time", "float", 2.5, "时长", "推近用几秒"),
+        ("gk_hold", "float", 1.5, "停留", "推到特写后停多久"),
+        ("gk_return_time", "float", 1.0, "回程", "缩回原相机用几秒;0 = 硬切"),
+        ("gk_return_home", "bool", True, "回到原相机",
+         "演完切回开始时的相机;取消勾选就停在特写上"),
+        ("gk_fov_from", "float", 0.0, "视野起",
+         "开头视野(度);0 = 不改,用相机当前视野"),
+        ("gk_fov_to", "float", 0.0, "视野止",
+         "推到特写时的视野(度);0 = 不改。想“推近”填小一点,比如 35"),
+        ("gk_ease", "enum", "EASE_OUT", "运镜曲线",
+         "推近的速度曲线;缓出 = 起步快、到点前慢下来", EASE_ITEMS),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        B.draw_target_picker(self, row, "gk_camera")
+        row.prop(self, "gk_time", text="时长")
+        row = layout.row(align=True)
+        B.draw_target_picker(self, row, "gk_look_target")
+        row.prop(self, "gk_hold", text="停留")
+        _draw_curve_row(layout, self, "gk_curve", "轨道", preview=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_return_time", text="回程")
+        row.prop(self, "gk_return_home", text="回原相机", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_fov_from", text="视野起")
+        row.prop(self, "gk_fov_to", text="视野止")
+        row.prop(self, "gk_ease", text="")
+
+
 def _draw_curve_row(layout, node, prop, label, preview=False):
     """一行:曲线名 + 『选曲线』+ (可选)『预览运镜』。
 
@@ -859,6 +930,156 @@ class GKNodeBoneLookAtCamera(B.GKStatementNode):
         B.draw_target_picker(self, layout, "gk_camera")
         layout.label(text="骨架:留空 = 从脚本节点往下自动找")
         B.draw_target_picker(self, layout, "gk_skeleton_node")
+
+
+# ==========================================================================
+# 摆动(通用:灯 / 道具 / 界面控件)
+# ==========================================================================
+# 用户原话:"动画上的灯光晃动,如灯光年久失修左右摇摆,有吱吱类似的环境音"。
+#
+# 这件事**不是灯光专属**:吊灯、招牌、UI 上的挂件、被风吹的布条都用同一个
+# 运动规律。所以做成一个通用节点,而不是塞进『灯光_设置』里 —— 目标可以
+# 是任意 Node3D(灯 / 摆件 / 挂着灯的父节点),也可以是 Control(界面控件)。
+#
+# 为什么用"父节点 + 旋转"而不是"直接改灯的位置":
+#   吊灯由吊杆 / 灯罩 / 灯泡 / 聚光 / 上照一堆东西组成,各自绕自己的中心转
+#   会散架。把一整组挂到一个天花板上的空节点下,再让空节点摆 —— 这才是
+#   "年久失修、整盏灯在晃"的样子。灯是 Light3D,导出时不进 glb,所以
+#   环境脚本会按 Blender 的父子关系在运行时把它重新挂到父节点下
+#   (见 asset_export 的 `light_parents`)。
+SWAY_AXES = (
+    ("X", "绕 X 轴(前后摆)", "Godot 的左右轴 —— 灯会朝前 / 朝后晃"),
+    ("Y", "绕 Y 轴(左右转)", "竖直轴 —— 像钟摆那样左右转"),
+    ("Z", "绕 Z 轴(左右摆)", "Godot 的前后轴 —— 灯会朝左 / 朝右晃(最像吊灯)"),
+)
+
+
+@N
+class GKNodeSway(B.GKStatementNode):
+    bl_idname = "GKNodeSway"
+    bl_label = "动画_摆动"
+    bl_icon = "RNDCURVE"
+    gk_category = "动画"
+    gk_tree_type = ("GKGameLogicTree", "GKUiDesignTree")
+    gk_doc = ("让一个节点**一直来回摆** —— 年久失修的吊灯、风吹的招牌、"
+              "界面上的挂件都用它。执行一次就开始摆,之后逐物理帧更新,"
+              "不用再接定时器。\n"
+              "『目标』建议选一个**父节点**(比如天花板下的空物体),"
+              "把灯 / 灯罩 / 灯泡都挂在它下面 —— 整组一起晃才像一盏灯;"
+              "选界面控件时绕它的 Z 轴转,控件自己的『枢轴偏移』(pivot_offset)"
+              "决定绕哪一点转。\n"
+              "『幅度』是最大角度(度),『周期』是一个完整来回的秒数,"
+              "『相位』用来让多盏灯错开(0~6.28,填 1.5 就晚半拍)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(OBJECT, "目标", "__self__"),
+        S.pin(FLOAT, "幅度", 6.0),
+        S.pin(FLOAT, "周期", 4.0),
+        S.pin(FLOAT, "相位", 0.0),
+    )
+    gk_input_props = {"幅度": "gk_amplitude", "周期": "gk_period",
+                      "相位": "gk_phase"}
+    gk_prop_defs = (
+        ("gk_target", "node", "__self__", "目标",
+         "要摆的节点:建议选挂着一整组灯的父节点;界面控件也可以"),
+        ("gk_axis", "enum", "Z", "绕哪个轴", "", SWAY_AXES),
+        ("gk_amplitude", "float", 6.0, "幅度",
+         "最大摆动角度(度)。吊灯 3~8° 就够,招牌可以到 15°"),
+        ("gk_period", "float", 4.0, "周期",
+         "一个完整来回要几秒;越大越慢越沉"),
+        ("gk_phase", "float", 0.0, "相位",
+         "错开多盏灯的节奏(弧度);0 = 从中间开始往一边摆"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        B.draw_target_picker(self, layout)
+        row = layout.row(align=True)
+        row.prop(self, "gk_axis", text="")
+        row.prop(self, "gk_amplitude", text="幅度")
+        row = layout.row(align=True)
+        row.prop(self, "gk_period", text="周期")
+        row.prop(self, "gk_phase", text="相位")
+
+
+# ==========================================================================
+# 『角色_走路摆动』(第一百六十三轮)
+# ==========================================================================
+# 用户:"角色走起来像一块板在平移"。没有骨骼、也没有外部美术资产的情况下,
+# 最省事又最像"在走路"的做法是**程序化摆动**:按名字认出手臂零件,
+# 每物理帧按水平速度摆它们的 rotation.x,顺带让模型上下浮一点。
+#
+# 为什么做成节点而不是写死在角色模板里:
+#   * 用不用、摆多大、认哪个字,项目之间差别很大(方块人 / 有骨骼的 glb /
+#     载具),写死在模板里等于替所有人做决定;
+#   * 它和『动画_摆动』是同一类东西(逐物理帧改变换),放一起好找。
+#
+# 为什么按**名字后缀**认零件(而不是要用户一个个拖):
+#   零件是 Blender 里的独立物体,导出成 glb 子节点后名字保留;
+#   示例里叫『楼梯间玩家左臂』『…右臂』,一个"臂"字就都认出来了。
+#   没有骨骼的模型也能用 —— 这正是现在的处境。
+WALK_ARM_SUFFIX = "臂"
+
+
+@N
+class GKNodeHumanoidWalk(B.GKStatementNode):
+    bl_idname = "GKNodeHumanoidWalk"
+    bl_label = "角色_走路摆动"
+    bl_icon = "ARMATURE_DATA"
+    gk_category = "动画"
+    # 默认只在游戏逻辑树里出现;怪物没有角色预设的走路节点,它的腿/臂
+    # 零件在导出后的网格节点下,要在怪物 AI 图里挂一个『角色_走路摆动』
+    # (目标=怪物自身)。所以这里放行 AI 树 —— 节点只发射 _gk_walk_start,
+    # 在 AI 图里一样能跑(第 164+1 轮)。
+    gk_tree_type = ("GKGameLogicTree", "GKGameAiTree")
+    # 不在 AI 树的"添加节点"菜单里列出来(只是温和引导,程序化添加仍可)。
+    gk_menu_hidden_trees = ("GKGameAiTree",)
+    gk_doc = ("让没有骨骼的角色『走起来像在走』:按名字认出**手臂零件**,"
+              "每物理帧按水平速度摆它们,再让模型轻轻上下浮。\n"
+              "执行一次就生效,之后自己逐帧算(不用接定时器)。\n"
+              "『目标』选角色根节点(CharacterBody3D);"
+              "『关节关键字』是零件名里要包含的字 —— 示例里手臂叫"
+              "『…左臂 / …右臂』,填「臂」就都认出来;腿叫『…腿』就填「腿」。\n"
+              "『摆幅』是最大摆角(度),『浮沉』是上下起伏的米数,"
+              "『参考速度』是用来『摆满』的速度(默认 6 = 走路速度):"
+              "跑起来会比走路摆得更快更大。\n"
+              "⚠ 只改零件的**旋转**,不改位置也不改碰撞 —— 碰撞体还是那一个胶囊。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(OBJECT, "目标", "__self__"),
+        S.pin(FLOAT, "摆幅", 34.0),
+        S.pin(FLOAT, "浮沉", 0.03),
+    )
+    gk_input_props = {"摆幅": "gk_swing", "浮沉": "gk_bob"}
+    gk_prop_defs = (
+        ("gk_target", "node", "__self__", "目标",
+         "角色根节点(CharacterBody3D);零件在它下面(含 Model 子节点里)都会被找"),
+        ("gk_arm_suffix", "string", WALK_ARM_SUFFIX, "关节关键字",
+         "零件名里包含这个字就当关节摆(示例:臂 / 腿 / 手)"),
+        ("gk_swing", "float", 34.0, "摆幅",
+         "最大摆角(度);34 大致是『手臂甩到身前 30 厘米』的感觉"),
+        ("gk_bob", "float", 0.03, "浮沉",
+         "每走一步上下浮几米;3 厘米就够,大了像在蹦"),
+        ("gk_ref_speed", "float", 6.0, "参考速度",
+         "水平速度到多少算『走满』(示例玩家走路 6 m/s);"
+         "摆幅和步频都按 速度/参考速度 缩放"),
+        ("gk_footstep", "string", "", "脚步声",
+         "wav 路径;留空 = 没有脚步声。每只脚落地(摆动相位过零)播一次,"
+         "音调随机 ±10% 免得像机关枪"),
+        ("gk_footstep_db", "float", -10.0, "脚步音量",
+         "分贝;0 = 原声,-10 比环境声轻一档"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        B.draw_target_picker(self, layout)
+        row = layout.row(align=True)
+        row.prop(self, "gk_arm_suffix", text="关键字")
+        row.prop(self, "gk_swing", text="摆幅")
+        row = layout.row(align=True)
+        row.prop(self, "gk_bob", text="浮沉")
+        row.prop(self, "gk_ref_speed", text="参考速度")
 
 
 # ==========================================================================
@@ -1285,6 +1506,181 @@ class GKNodeScare(B.GKStatementNode):
 
 
 @N
+class GKNodeBlackout(B.GKStatementNode):
+    bl_idname = "GKNodeBlackout"
+    bl_label = "恐怖_断电"
+    bl_icon = "LIGHT"
+    gk_category = "氛围"
+    gk_doc = ("**视角突然一黑**:关掉一组灯 + 全屏黑幕(快速压黑→停一下→淡回),"
+              "可选播一条音效。\n"
+              "── 为什么不是『屏幕_闪白』调成黑色 ──\n"
+              "闪白是**一闪就回**;断电要的是『先黑住、再慢慢恢复』——"
+              "黑暗本身要持续零点几秒,玩家才会以为『电断了』。所以这里用"
+              "三段补间:压黑(默认 0.08 秒,够突然)→ 停住 → 淡回。\n"
+              "── 灯 ──\n"
+              "『灯名』填多盏用**竖线**分隔(走廊吊灯1|走廊吊灯3);留空 = "
+              "只黑屏不关灯。\n"
+              "『恢复』勾着 = 黑幕淡回时把灯也恢复;取消 = 灯就一直灭着"
+              "(适合『这一关再也不亮了』)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "灯名", ""),
+        S.pin(FLOAT, "黑屏秒数", 0.6),
+    )
+    gk_input_props = {"灯名": "gk_lights", "黑屏秒数": "gk_hold"}
+    gk_prop_defs = (
+        ("gk_lights", "string", "", "灯名",
+         "要关掉的灯,多盏用竖线分隔(走廊吊灯1|走廊吊灯3);留空 = 只黑屏"),
+        ("gk_hold", "float", 0.6, "黑屏秒数",
+         "黑住多久(秒);0.3~0.8 比较像『跳闸』,2 以上就是『整段停电』"),
+        ("gk_alpha", "float", 0.92, "最黑",
+         "黑幕最浓时的透明度(0.92 = 几乎全黑,还能看到一点点轮廓)"),
+        ("gk_fade", "float", 0.08, "压黑秒数",
+         "从亮到黑用多久;0.05~0.12 才『突然』,0.4 以上是『缓缓暗下去』"),
+        ("gk_path", "string", "", "音效",
+         "断电瞬间播的声音(磁盘路径或 res://;留空 = 静音)"),
+        ("gk_restore", "bool", True, "恢复",
+         "黑幕淡回时把灯也恢复;取消 = 灯一直灭着"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_lights", text="")
+        row.prop(self, "gk_hold", text="秒")
+        row = layout.row(align=True)
+        row.prop(self, "gk_alpha", text="最黑")
+        row.prop(self, "gk_fade", text="压黑")
+        row.prop(self, "gk_restore", text="恢复", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_path", text="")
+        pick = row.operator("gk.pick_sound", text="", icon="SOUND")
+        pick.node_name = self.name
+
+
+@N
+class GKNodeDrop(B.GKStatementNode):
+    bl_idname = "GKNodeDrop"
+    bl_label = "恐怖_掉落"
+    bl_icon = "IMPORT"
+    gk_category = "氛围"
+    gk_doc = ("让一个物体**从空中掉下来**:先抬到当前位置上方 N 米,再加速落到"
+              "原位,落地播一条 3D 音效。\n"
+              "── 用来干嘛 ──\n"
+              "走廊尽头突然掉下来的箱子 / 天花板掉下的木板 / 架子上的罐头 ——"
+              "玩家没看到东西掉,只听到『咚』的一声,回头才发现多了个东西。\n"
+              "── 注意 ──\n"
+              "物体要能被移动(静态箱子也行,它会直接停在落点);"
+              "如果它带刚体,建议关掉物理或改成静态,否则会和补间打架。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "高度", 3.0),
+    )
+    gk_input_props = {"高度": "gk_height"}
+    gk_prop_defs = (
+        ("gk_target", "string", "", "物体",
+         "要掉下来的物体名(和 Blender 里物体名一致,导出后就是 Godot 节点名)"),
+        ("gk_height", "float", 3.0, "高度",
+         "先抬到原位上方多少米(2.5~4 米像『从天花板掉下来』)"),
+        ("gk_fall_time", "float", 0.55, "下落秒数",
+         "下落用时;0.4~0.7 有重力感,1 以上像羽毛"),
+        ("gk_path", "string", "", "落地音效",
+         "落地瞬间播的 3D 音效(磁盘路径或 res://;留空 = 静音)"),
+        ("gk_volume", "float", 0.0, "音量", "分贝;0 = 原始,-6 约减半"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_target", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_height", text="高度")
+        row.prop(self, "gk_fall_time", text="秒")
+        row = layout.row(align=True)
+        row.prop(self, "gk_path", text="")
+        pick = row.operator("gk.pick_sound", text="", icon="SOUND")
+        pick.node_name = self.name
+
+
+@N
+class GKNodeRandomSfx(B.GKStatementNode):
+    bl_idname = "GKNodeRandomSfx"
+    bl_label = "恐怖_音效"
+    bl_icon = "SOUND"
+    gk_category = "氛围"
+    gk_doc = ("从一组**恐怖音效**里随机抽一条播放(每次触发都不一样)。\n"
+              "── 和『音效_播放』的区别 ──\n"
+              "『音效_播放』永远放同一段;恐怖氛围要的是『这次是脚步、"
+              "下次是远处关门』——把几条路径用**竖线**分隔填进来,每次随机抽。\n"
+              "『随机音调』勾着 = 同一条音效每次音高略有不同,不容易听出重复。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(FLOAT, "音量", 0.0),
+    )
+    gk_input_props = {"音量": "gk_volume"}
+    gk_prop_defs = (
+        ("gk_paths", "string", "", "音效列表",
+         "多条用竖线分隔(res://a.wav|res://b.wav);留空 = 什么都不播"),
+        ("gk_volume", "float", 0.0, "音量", "分贝;0 = 原始,-6 约减半"),
+        ("gk_random_pitch", "bool", True, "随机音调",
+         "勾着 = 每次音高在 ±10% 内浮动,不容易听出是同一段"),
+        ("gk_positional", "bool", False, "3D 定位",
+         "勾着 = 按物体位置衰减(需要物体在世界里);不勾 = 直接放给玩家听"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_paths", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_volume", text="音量")
+        row.prop(self, "gk_random_pitch", text="随机音调", toggle=True)
+        row.prop(self, "gk_positional", text="3D", toggle=True)
+
+
+@N
+class GKNodeCameraFall(B.GKStatementNode):
+    bl_idname = "GKNodeCameraFall"
+    bl_label = "相机_倒地"
+    bl_icon = "OUTLINER_OB_CAMERA"
+    gk_category = "相机"
+    gk_doc = ("**被击败时镜头倒下去**:相机向下坠 + 侧翻 + 可选黑屏。\n"
+              "── 为什么要单独一个节点 ──\n"
+              "『相机_震动』是短促抖动,表现不了『人倒了』:倒地要的是"
+              "**一两秒的失衡** —— 先掉下去,再侧翻,视野跟着歪。\n"
+              "── 注意 ──\n"
+              "倒地会把相机从弹簧臂手里**接管**(设 `_gk_cam_locked`),"
+              "之后每帧的跟随都跳过 —— 不接管的话弹簧臂会把相机拉回去,"
+              "看起来像『抖了一下又站起来了』。\n"
+              "『恢复』勾着 = 时长到了把相机放回弹簧臂(复活/重开用)。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_target", "node", "", "相机", "留空 = 自动找当前相机"),
+        ("gk_time", "float", 1.1, "倒地秒数",
+         "从站着到倒下用多久;0.6~1.4 比较像失去平衡"),
+        ("gk_drop", "float", 0.85, "下坠",
+         "相机往下掉多少米(0.6~1.0;太大就到地板下面了)"),
+        ("gk_roll", "float", 72.0, "侧翻角",
+         "绕视线轴滚多少度(60~85 像侧倒;180 是天旋地转)"),
+        ("gk_pitch", "float", 18.0, "前倾角",
+         "镜头向前扎多少度(别超过 30,否则看到的是地板特写)"),
+        ("gk_fade", "float", 0.0, "黑屏秒数",
+         "倒下之后淡到黑用多久;0 = 不黑屏"),
+        ("gk_black", "float", 0.9, "黑到多黑",
+         "黑屏最浓时的透明度"),
+        ("gk_restore", "bool", False, "恢复",
+         "勾着 = 时长到了把相机交还弹簧臂(复活 / 重开)"),
+    )
+
+    def draw_buttons(self, context, layout):
+        B.draw_target_picker(self, layout)
+        row = layout.row(align=True)
+        row.prop(self, "gk_time", text="秒")
+        row.prop(self, "gk_drop", text="坠")
+        row.prop(self, "gk_roll", text="翻")
+        row.prop(self, "gk_pitch", text="倾")
+        row = layout.row(align=True)
+        row.prop(self, "gk_fade", text="黑屏")
+        row.prop(self, "gk_black", text="最黑")
+        row.prop(self, "gk_restore", text="恢复", toggle=True)
+
+
+@N
 class GKNodeTension(B.GKExpressionNode):
     bl_idname = "GKNodeTension"
     bl_label = "氛围_紧张度"
@@ -1301,12 +1697,17 @@ class GKNodeTension(B.GKExpressionNode):
               "── 被看见时更紧张(第七十轮)──\n"
               "『被看见』接一个布尔(比如『AI_输出』的 `is_chasing` 或"
               "『逻辑_比较』的结果);它为真时紧张度**至少抬到『被看见下限』**"
-              "—— 被盯上比单纯『离得近』更慌。不接、不勾 = 只看距离(老行为)。")
+              "—— 被盯上比单纯『离得近』更慌。不接、不勾 = 只看距离(老行为)。\n"
+              "── 『测量谁』(第一百五十八轮)──\n"
+              "从谁身上量到『威胁』的距离。留空 = 脚本所在物体(老行为);"
+              "把紧张度写进**关卡图**(脚本挂在场景根)时,一定要填玩家 —— "
+              "不然量的是世界原点到怪物的距离(实测:走廊里紧张度基本不动)。")
     gk_inputs = (
         S.pin(OBJECT, "威胁", None),
         S.pin(FLOAT, "近距", 3.0),
         S.pin(FLOAT, "远距", 15.0),
         S.pin(BOOL, "被看见", False),
+        S.pin(OBJECT, "测量谁", TARGET_SELF),
     )
     gk_input_props = {"近距": "gk_near", "远距": "gk_far"}
     gk_outputs = (S.pin(FLOAT, "紧张度", 0.0),)
@@ -1317,6 +1718,9 @@ class GKNodeTension(B.GKExpressionNode):
         ("gk_far", "float", 15.0, "远距", "这个距离以外 = 紧张度 0"),
         ("gk_seen_floor", "float", 0.8, "被看见下限",
          "『被看见』为真时,紧张度至少抬到这么多(0 = 不用这个功能)"),
+        ("gk_source", "node", "", "测量谁",
+         "从谁身上量到威胁的距离;留空 = 脚本所在物体。"
+         "关卡图里(脚本挂场景根)要填玩家,否则量的是世界原点"),
     )
 
 
@@ -1325,7 +1729,12 @@ class GKNodeTension(B.GKExpressionNode):
         row.prop(self, "gk_near", text="")
         row.prop(self, "gk_far", text="")
         layout.prop(self, "gk_seen_floor", text="被看见下限")
-        B.draw_target_picker(self, layout, "gk_threat")
+        row = layout.row(align=True)
+        row.label(text="威胁")
+        B.draw_target_picker(self, row, "gk_threat")
+        row = layout.row(align=True)
+        row.label(text="测量谁")
+        B.draw_target_picker(self, row, "gk_source")
 
 
 @N
@@ -1773,6 +2182,16 @@ class GKNodeUiSet(B.GKStatementNode):
         ("gk_text", "string", "", "文字", ""),
     )
     gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def input_default_controls(self):
+        allowed = set()
+        if self.gk_set_pos:
+            allowed.update(("gk_x", "gk_y"))
+        if self.gk_set_alpha:
+            allowed.add("gk_alpha")
+        if self.gk_set_text:
+            allowed.add("gk_text")
+        return allowed
 
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
@@ -2301,6 +2720,108 @@ class GKNodeUiTween(B.GKStatementNode):
         row.prop(self, "gk_trans", text="")
         row.prop(self, "gk_ease", text="")
         row.prop(self, "gk_wait", text="等播完", toggle=True)
+
+
+# ── 界面"弹入 / 弹出"组合卡(第一百二十八轮)────────────────────────
+# 用户:"原神的那种暂停游戏时界面从左到右顺滑展开的界面显示效果怎么做呢"。
+# 拆开看,它其实是**四件事的组合**:
+#   ① 显示 + 置顶 ② 沿某个方向滑进来 ③ 顺带淡入 ④ 背后黑幕一起淡进来。
+# 用现有节点也能摆出来,但要 4~5 张卡(『隐藏控件』+ 两块『缓动』+ 黑幕的一对),
+# 而且『缓动』的位置是**相对**的 —— "从屏幕外滑进来"得自己先算初始位置
+# (填个 -480 之类),很容易算错。所以这张卡把四件事收成一步:
+# 选方向 + 填时长/曲线,滑入距离**自动取控件自身尺寸**。
+#
+# ── 位移量为什么能自动算(相对位移的巧用)──────────────────────────
+# 先把控件按方向**挪出去一个自身尺寸**(向左滑就左移 `w.size.x`),
+# 再缓动**回到原位** —— 位移量就等于控件尺寸,用户不用填任何数字;
+# 弹出时反向滑出去,而且**播完把位置/透明度复位 + 藏起来**,否则第二次
+# 弹入的起点会一次次越偏越远。
+UI_POP_MODES = (
+    ("IN", "弹入", "显示 + 置顶 + 滑进来(可带淡入 + 黑幕)"),
+    ("OUT", "弹出", "滑出去 + 淡出,播完自动复位并藏起来"),
+)
+
+UI_POP_DIRECTIONS = (
+    ("LEFT", "从左", "从左边滑进来 —— 原神暂停菜单那种观感"),
+    ("RIGHT", "从右", "从右边滑进来"),
+    ("TOP", "从上", "从上边滑下来"),
+    ("BOTTOM", "从下", "从下边升上来"),
+    ("NONE", "不滑", "只淡入淡出,不滑动"),
+)
+
+UI_POP_TRANS = (
+    ("TRANS_CUBIC", "三次(先慢后快)", "UI 最常用:一顿就到位,很「原神」"),
+    ("TRANS_QUAD", "二次", "比三次柔和一点"),
+    ("TRANS_SINE", "正弦(平滑)", "最平滑、最不抢戏"),
+    ("TRANS_BACK", "回弹", "冲过头一点再回来,弹窗感更强"),
+    ("TRANS_ELASTIC", "橡皮筋", ""),
+)
+
+UI_POP_EASES = (
+    ("EASE_OUT", "慢出", "起步快、到点前慢下来(UI 推荐)"),
+    ("EASE_IN_OUT", "两头慢", ""),
+    ("EASE_IN", "慢进", ""),
+)
+
+
+@N
+class GKNodeUiPop(B.GKStatementNode):
+    bl_idname = "GKNodeUiPop"
+    bl_label = "界面_弹入/弹出"
+    bl_icon = "IPO_EASE_IN_OUT"
+    gk_category = "界面"
+    gk_doc = ("**一张卡做完「显示 + 置顶 + 滑入 + 淡入 + 黑幕」** —— "
+              "开/关一个面板(暂停菜单、背包、任务面板)的整套动画。\n"
+              "── 和『界面_缓动』的分工 ──\n"
+              "『界面_缓动』是**一次属性动画**(改一个属性、自己填偏移量);"
+              "这张卡是**一次「开/关面板」的完整动作**:滑入距离自动取控件"
+              "自身尺寸(不用你算 -480 这种数)、黑幕一起淡、弹出还会自动复位"
+              "并藏起来。\n"
+              "── 弹入 ──\n"
+              "显示 → (置顶 + 同互斥组收起)→ 从指定方向滑进来 + 淡入"
+              "→ (黑幕淡到『黑幕最终透明度』)→ 勾了『等它播完』就等动画结束。\n"
+              "── 弹出 ──\n"
+              "往同一边滑出去 + 淡出,播完**自动回到原位并藏起来**"
+              "(黑幕一起收)。\n"
+              "⚠ 『黑幕最终透明度』留空黑幕名就不用黑幕;隐藏控件那条路"
+              "仍由『界面_隐藏控件』管。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名",
+         "要弹哪个界面控件(创建它的节点名 / 面板名)"),
+        ("gk_mode", "enum", "IN", "动作", "", UI_POP_MODES),
+        ("gk_direction", "enum", "LEFT", "方向", "从哪一边滑", UI_POP_DIRECTIONS),
+        ("gk_time", "float", 0.35, "时长", "秒"),
+        ("gk_trans", "enum", "TRANS_CUBIC", "曲线", "", UI_POP_TRANS),
+        ("gk_ease", "enum", "EASE_OUT", "缓动方式", "", UI_POP_EASES),
+        ("gk_fade", "bool", True, "顺带淡入淡出",
+         "滑动的同时透明度也跟着变(不勾 = 只滑,不淡)"),
+        ("gk_top", "bool", True, "置顶",
+         "弹入时挪到最上层(卡上填了『互斥组』的,同组其他面板自动收起)"),
+        ("gk_scrim", "string", "", "黑幕控件名",
+         "留空 = 不用黑幕;填一块『界面_背景』的名字,弹入时它一起淡进来"),
+        ("gk_scrim_to", "float", 0.6, "黑幕最终透明度",
+         "弹入淡到多少(弹出反过来淡到 0)"),
+        ("gk_wait", "bool", True, "等它播完",
+         "勾上 = 后面的节点等动画结束再继续(弹出那种「收完再切场景」要靠它)"),
+    )
+    # 出口就叫『完成』:这张卡是"一次动作",播完接着走最符合直觉
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+        row.prop(self, "gk_mode", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_direction", text="")
+        row.prop(self, "gk_time", text="秒")
+        row.prop(self, "gk_trans", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_fade", text="淡入淡出", toggle=True)
+        row.prop(self, "gk_top", text="置顶", toggle=True)
+        row.prop(self, "gk_wait", text="等播完", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_scrim", text="", icon="IMAGE_BACKGROUND")
+        row.prop(self, "gk_scrim_to", text="幕")
 
 
 @N
@@ -2931,6 +3452,366 @@ class GKNodeUiOnValueChanged(B.GKStatementNode):
         layout.label(text="拖动后走『变了』出口", icon="FORWARD")
 
 
+# ==========================================================================
+# 界面结构件(第一百二十七轮:UMG 式的"画布 / 限定框 / 背景 / 文本限定框")
+# ==========================================================================
+# 用户:"修改:界面逻辑从:界面布局(画布)->+界面限定框(子项范围)->+界面按钮->…",
+# "或者参考虚幻 5 的界面设计"。四件的分工和 UMG 一一对应:
+#   * 『界面_画布』     ≈ Canvas Panel —— 整张界面的根,子控件都挂它下面;
+#   * 『界面_限定框』   ≈ HBox / VBox / Grid / Margin Container —— 自动排版
+#     (这就是用户说的"子项范围");
+#   * 『界面_背景』     ≈ 纯色 Image —— 一块铺底的色块;
+#   * 『界面_文本限定框』≈ 带底色 / 边框的文字框 —— 框 + 里面一行字。
+# 把它们登记进 `UI_DESIGN_BUILDER_NODES` 即可:下面那个 design 循环会统一设
+# 树类型 / 追加『互斥组』『过场界面』属性,并自动获得『父』/『自己』连线引脚。
+UI_BOX_MODES = (
+    ("VBOX", "竖排", "从上往下自动排(设置项 / 菜单列表)"),
+    ("HBOX", "横排", "从左往右自动排(工具栏 / 一排按钮)"),
+    ("GRID", "网格", "按『列数』排成格子(背包 / 图标墙)"),
+    ("MARGIN", "边距", "只留一圈内边距,里面自己摆(给单个控件留白)"),
+)
+
+
+@N
+class GKNodeUiCanvas(B.GKStatementNode):
+    bl_idname = "GKNodeUiCanvas"
+    bl_label = "界面_画布"
+    bl_icon = "IMAGE_BACKGROUND"
+    gk_category = "界面"
+    gk_doc = ("整张界面的**根**:子控件的『父控件』填它的名字(或者把子控件的"
+              "『父』引脚连到它的『自己』出口),就都挂在它下面。\n"
+              "『铺满屏幕』默认勾着 —— 自动铺满窗口、窗口大小变了跟着变;"
+              "取消勾选才用下面的『宽』『高』摆一块固定大小的区域。\n"
+              "『界面_取界面』拿到的就是这张画布 —— 玩法图用它整层显示 / 收起。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_full", "bool", True, "铺满屏幕",
+         "勾上 = 自动铺满窗口(推荐);取消 = 用『宽』『高』"),
+        ("gk_width", "float", 640.0, "宽", "不铺满时的宽度(像素)"),
+        ("gk_height", "float", 360.0, "高", "不铺满时的高度(像素)"),
+        ("gk_start_hidden", "bool", False, "开局藏",
+         "建出来就藏起来(配合『界面_弹入/弹出』用)"),
+        ("gk_parent_widget", "string", "", "父控件",
+         "留空 = 直接挂在界面根下"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_full", text="铺满屏幕", toggle=True)
+        if not getattr(self, "gk_full", True):
+            row = layout.row(align=True)
+            row.prop(self, "gk_width", text="宽")
+            row.prop(self, "gk_height", text="高")
+        row = layout.row(align=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        row.prop(self, "gk_start_hidden", text="开局藏", toggle=True)
+
+
+@N
+class GKNodeUiBox(B.GKStatementNode):
+    bl_idname = "GKNodeUiBox"
+    bl_label = "界面_限定框"
+    bl_icon = "MESH_GRID"
+    gk_category = "界面"
+    gk_doc = ("一块**会自己排队**的容器 —— 子控件的『父控件』填它的名字(或"
+              "把『父』引脚连到它的『自己』出口),那些控件就自动排队,不用一个"
+              "个填 X / Y 错开。\n"
+              "── 四种排法 ──\n"
+              "竖排 / 横排 = 一路排下去;网格 = 按『列数』排成格子;"
+              "边距 = 只留一圈内边距,里面自己摆。\n"
+              "⚠ 挂进容器的子控件由容器排版,填 X / Y 不起作用(和『界面_列表』"
+              "同一条规矩)。")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 12.0),
+                 S.pin(FLOAT, "Y", 60.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
+    gk_prop_defs = (
+        ("gk_mode", "enum", "VBOX", "排法", "子项怎么排", UI_BOX_MODES),
+        ("gk_columns", "int", 2, "列数", "网格排法的列数(1~24)",
+         None, {"min": 1, "max": 24}),
+        ("gk_separation", "int", 8, "间距", "子项之间留多少像素"),
+        ("gk_pad", "int", 8, "内边距", "四边留白(边距排法 / 网格用它)"),
+        ("gk_x", "float", 12.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 60.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 320.0, "宽", "像素"),
+        ("gk_height", "float", 200.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_start_hidden", "bool", False, "开局藏",
+         "建出来就藏起来(配合『界面_弹入/弹出』用)"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_mode", text="")
+        if getattr(self, "gk_mode", "VBOX") == "GRID":
+            row.prop(self, "gk_columns", text="列")
+        row.prop(self, "gk_separation", text="距")
+        row.prop(self, "gk_pad", text="内")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_start_hidden", text="开局藏", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiBackdrop(B.GKStatementNode):
+    bl_idname = "GKNodeUiBackdrop"
+    bl_label = "界面_背景"
+    bl_icon = "COLOR"
+    gk_category = "界面"
+    gk_doc = ("一块**纯色**底:铺满屏幕的底 / 一条色带 / 半透明遮罩。"
+              "『铺满屏幕』默认勾着,取消勾选才用『宽』『高』。\n"
+              "要**贴图**背景请用『界面_图片』 —— 这个只管颜色。")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(FLOAT, "X", 0.0),
+                 S.pin(FLOAT, "Y", 0.0),)
+    gk_input_props = {"X": "gk_x", "Y": "gk_y"}
+    gk_prop_defs = (
+        ("gk_color", "color", (0.05, 0.06, 0.10, 1.0), "颜色",
+         "底色；第四位是透明度"),
+        ("gk_full", "bool", True, "铺满屏幕",
+         "勾上 = 自动铺满窗口(推荐);取消 = 用『宽』『高』"),
+        ("gk_x", "float", 0.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 0.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 1280.0, "宽", "不铺满时的宽度(像素)"),
+        ("gk_height", "float", 720.0, "高", "不铺满时的高度(像素)"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 0.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_start_hidden", "bool", False, "开局藏",
+         "建出来就藏起来(配合『界面_弹入/弹出』用)"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_color", text="")
+        layout.prop(self, "gk_full", text="铺满屏幕", toggle=True)
+        if not getattr(self, "gk_full", True):
+            row = layout.row(align=True)
+            row.prop(self, "gk_width", text="宽")
+            row.prop(self, "gk_height", text="高")
+        row = layout.row(align=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        row.prop(self, "gk_start_hidden", text="开局藏", toggle=True)
+        B.draw_ui_align_row(self, layout)
+
+
+@N
+class GKNodeUiTextBox(B.GKStatementNode):
+    bl_idname = "GKNodeUiTextBox"
+    bl_label = "界面_文本限定框"
+    bl_icon = "FONT_DATA"
+    gk_category = "界面"
+    gk_doc = ("一个**带底色 / 边框**的文字框:框 + 里面一行字"
+              "(标题条 / 提示框 / 对话框的正文区)。\n"
+              "── 和『界面_文本』的区别 ──\n"
+              "『界面_文本』是**一根裸文字**;这个是「文字 + 一圈自己的背景和"
+              "内边距」(标题条那种观感)。\n"
+              "框里还能再挂别的控件(它们的『父控件』填这个框的名字),会排在"
+              "这行字下面。")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "文字", ""),
+                 S.pin(FLOAT, "X", 12.0), S.pin(FLOAT, "Y", 12.0),)
+    gk_input_props = {"文字": "gk_text", "X": "gk_x", "Y": "gk_y"}
+    gk_prop_defs = (
+        ("gk_text", "string", "标题", "文字", "框里那行字"),
+        ("gk_size", "int", 24, "字号", "像素"),
+        ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "文字颜色", ""),
+        ("gk_bg", "color", (0.06, 0.07, 0.10, 0.72), "底色",
+         "第四位是透明度"),
+        ("gk_radius", "int", 12, "圆角", "像素；0 = 直角"),
+        ("gk_pad", "int", 12, "内边距", "文字离框边的距离(像素)"),
+        ("gk_x", "float", 12.0, "X", "屏幕坐标；对齐 = 左上时才用它"),
+        ("gk_y", "float", 12.0, "Y", "屏幕坐标"),
+        ("gk_width", "float", 480.0, "宽", "像素"),
+        ("gk_height", "float", 52.0, "高", "像素"),
+        ("gk_align", "enum", "TOP_LEFT", "对齐", UI_ALIGN_HELP, UI_ALIGN_ITEMS),
+        ("gk_margin", "float", 24.0, "边距", "对齐到屏幕边 / 角时留多少像素"),
+        ("gk_start_hidden", "bool", False, "开局藏",
+         "建出来就藏起来(配合『界面_弹入/弹出』用)"),
+        ("gk_parent_widget", "string", "", "父控件", "挂到哪个界面控件下面"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_text", text="", icon="SORTALPHA")
+        row.prop(self, "gk_size", text="号")
+        row = layout.row(align=True)
+        row.prop(self, "gk_bg", text="底")
+        row.prop(self, "gk_color", text="字")
+        row.prop(self, "gk_radius", text="角")
+        row.prop(self, "gk_pad", text="内")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_start_hidden", text="开局藏", toggle=True)
+        row = layout.row(align=True)
+        row.prop(self, "gk_parent_widget", text="", icon="NODE")
+        B.draw_ui_align_row(self, layout)
+
+
+# ── 界面引用取值(第一百二十七轮)──────────────────────────────────
+# 用户:"输出界面名称值(布尔变量,层级,作用域)" —— 经确认他要的是
+# **可连线的界面引用**(像虚幻蓝图里的控件变量)。所以给两个取值节点:
+#   * 『界面_取控件』 —— 按控件名取出一个 Control 引用;
+#   * 『界面_取界面』 —— 按设计图名取出"整套界面"(那张图里的『界面_画布』)。
+# 两张树都能放:玩法图拿它去显示 / 隐藏 / 改属性,设计图拿它拼层级。
+# 引脚用现成的 OBJECT(NodeSocketObject)-> GDScript `Node`:Control 是 Node
+# 的子类,向上转型合法,**不用**新增引脚类型。
+UI_REF_TREES = ("GKGameLogicTree", "GKUiDesignTree")
+
+
+@N
+class GKNodeUiWidgetRef(B.GKExpressionNode):
+    bl_idname = "GKNodeUiWidgetRef"
+    bl_label = "界面_取控件"
+    bl_icon = "RESTRICT_SELECT_OFF"
+    gk_category = "界面"
+    gk_doc = ("把一个界面控件**当值取出来**(类似虚幻蓝图里的控件变量)。"
+              "拿到它就能接到『界面_设置』这类节点,也能当子控件的『父』"
+              "引脚(用引用拼层级)。\n"
+              "填设计图里那个控件的**节点名**。")
+    gk_tree_type = UI_REF_TREES
+    gk_outputs = (S.pin(OBJECT, "控件", None),)
+    gk_prop_defs = (
+        ("gk_widget", "string", "", "控件名", "设计图里那个控件的节点名"),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+
+
+@N
+class GKNodeUiDesignRef(B.GKExpressionNode):
+    bl_idname = "GKNodeUiDesignRef"
+    bl_label = "界面_取界面"
+    bl_icon = "NODETREE"
+    gk_category = "界面"
+    gk_doc = ("把**一整套界面**(一张『游戏界面』设计图)当值取出来 —— "
+              "拿到它就能整层显示 / 收起。\n"
+              "落地的是这张图里『界面_画布』那个控件;设计图里没放画布时"
+              "退回本脚本的界面根(并告警),要精确引用请先在设计图里放一个"
+              "『界面_画布』。\n"
+              "『设计图』留空 = 用文件里第一张设计图。")
+    gk_tree_type = UI_REF_TREES
+    gk_outputs = (S.pin(OBJECT, "界面", None),)
+    gk_prop_defs = (
+        ("gk_design", "string", "", "设计图",
+         "留空 = 用文件里第一张『游戏界面』设计图"),
+    )
+
+    def draw_buttons(self, context, layout):
+        trees = ui_design_tree_names()
+        row = layout.row(align=True)
+        if len(trees) <= 1:
+            row.label(text=f"设计图:{trees[0] if trees else '(还没有)'}",
+                      icon="NODETREE")
+        else:
+            row.prop(self, "gk_design", text="", icon="NODETREE")
+        picker = row.operator("gk.pick_ui_design", text="", icon="VIEWZOOM")
+        picker.node_name = self.name
+
+
+# ── 界面事件(第一百二十七轮:鼠标点击 / 按键按下)────────────────────
+# 用户:"当鼠标点击时…,当键盘(某一个可自定义)被按下时…"。
+#
+# ⚠ 为什么**不**做成 GKEventNode —— 事件节点只在**玩法图**里被执行
+# (`_collect_events` 只扫 self.tree;设计图里的节点只有 STMT_HANDLERS 的
+# 才被发),放进『游戏界面』设计图等于摆设。而这两件事本来就该在界面图里写。
+# 所以做成**语句节点 + register_input_handler**(和『界面_暂停游戏』
+# 『界面_对话框』同一条路):注册一个 `_input` 回调,链式逻辑收进独立函数。
+# 这条路两张图 + 主界面 autoload 都生效,`during_pause` 还能控制"暂停里也
+# 响应"(界面热键正需要这个)。
+#
+# 出口特意**不叫『完成』**(叫『点了』/『按了』):叫『完成』会被自动续接,
+# "刚建出来后面的逻辑就跑了"(和『界面_按钮』同一个坑)。
+UI_EVENT_TREES = ("GKGameLogicTree", "GKUiDesignTree")
+
+UI_MOUSE_BUTTONS = (
+    ("LEFT", "左键", "鼠标左键"),
+    ("RIGHT", "右键", "鼠标右键"),
+)
+
+
+@N
+class GKNodeUiOnMouseClick(B.GKStatementNode):
+    bl_idname = "GKNodeUiOnMouseClick"
+    bl_label = "界面_鼠标点击"
+    bl_icon = "MOUSE_LMB"
+    gk_category = "界面"
+    gk_tree_type = UI_EVENT_TREES
+    gk_doc = ("鼠标**点下去**的时候走『点了』出口。\n"
+              "── 两种用法 ──\n"
+              "『控件名』留空 = 点屏幕**任意位置**都算;填了控件名 = "
+              "只有点到那个控件(或它的子控件)上才算。\n"
+              "和『界面_按钮点击』的区别:那个是**给某个按钮接行为**"
+              "(按钮得先存在);这个是**整屏 / 某个控件上的点击事件**,"
+              "可以拿来做'点空白处关面板''点地图任意处寻路'。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_button", "enum", "LEFT", "哪个键", "", UI_MOUSE_BUTTONS),
+        ("gk_widget", "string", "", "控件名",
+         "留空 = 点屏幕任意位置都算;填了 = 只认点在它(或它的子控件)上"),
+        ("gk_pause", "bool", True, "暂停里也响应",
+         "勾上 = 暂停菜单弹着的时候这个点击也管用(界面交互默认要;"
+         "纯玩法点击可以取消)"),
+    )
+    gk_outputs = (S.pin(FLOW, "点了"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_button", text="")
+        row.prop(self, "gk_widget", text="", icon="RESTRICT_SELECT_OFF")
+        layout.prop(self, "gk_pause", text="暂停里也响应", toggle=True)
+        layout.label(text="点下去就走『点了』出口", icon="FORWARD")
+
+
+@N
+class GKNodeUiOnKeyPress(B.GKStatementNode):
+    bl_idname = "GKNodeUiOnKeyPress"
+    bl_label = "界面_按键按下"
+    bl_icon = "HAND"
+    gk_category = "界面"
+    gk_tree_type = UI_EVENT_TREES
+    gk_doc = ("**自定义的某个键**按下去的时候走『按了』出口 —— "
+              "点右边的按钮,按一下你想用的键就绑好了(不用记动作名)。\n"
+              "和『输入_按键』的区别:那个是**判断**(布尔值,拿去接条件分支);"
+              "这个是**事件**(按下去就执行后面的链),界面热键用这个最直接"
+              "—— 比如「按 I 开背包」「按 M 开地图」。\n"
+              "导出时会把那个键写进 Godot 的输入映射,开箱即用。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_prop_defs = (
+        ("gk_key", "string", "", "按键",
+         "捕获到的键(点右边的按钮,按一下你想用的键)"),
+        ("gk_action", "string", "", "输入动作",
+         "留空 = 按按键名自动生成(比如 W -> key_w);改了它就能和"
+         "『输入_按键』共用同一个动作"),
+        ("gk_pause", "bool", True, "暂停里也响应",
+         "勾上 = 暂停菜单弹着的时候这个键也管用(界面热键默认要)"),
+    )
+    gk_outputs = (S.pin(FLOW, "按了"),)
+
+    def resolved_action(self):
+        """复用『输入_按键』那套"按键 -> 动作名"算法(同一个键两处必须一致)。
+
+        ⚠ 直接借 GKNodeKey 的方法而不是抄一遍:两边算出的动作名一旦不一致,
+          同一个键会在 project.godot 里写成两条没绑键的动作 —— 按时没反应。
+        """
+        from ._input import GKNodeKey
+        return GKNodeKey.resolved_action(self)
+
+    def draw_buttons(self, context, layout):
+        capture = layout.operator("gk.capture_key", text="按一下你要用的键",
+                                  icon="KEYINGSET")
+        capture.node_name = self.name
+        row = layout.row(align=True)
+        row.prop(self, "gk_key", text="按键", icon="SORTALPHA")
+        row.prop(self, "gk_action", text="", icon="DOT")
+        layout.prop(self, "gk_pause", text="暂停里也响应", toggle=True)
+        if not str(getattr(self, "gk_key", "") or "").strip():
+            layout.label(text="点上面的按钮,按一下你要用的键", icon="INFO")
+
+
 # ── 哪些节点算"控件构建"(设计图里该建什么由它决定)──────────────────
 # 判据:**这个节点会建出一个控件**。动作类(隐藏/设置/飘字/缓动/对话框/
 # 列表_填充/暂停游戏/设焦点/取文字)只管"运行时改已有控件",不进设计图 ——
@@ -2942,7 +3823,21 @@ UI_DESIGN_BUILDER_NODES = (
     "GKNodeUiPanel", "GKNodeUiList", "GKNodeUiNinePatch", "GKNodeUiInput",
     "GKNodeUiTextEdit", "GKNodeUiSlider", "GKNodeUiDropdown",
     "GKNodeUiCheckbox",
+    # 第一百二十七轮:结构件(画布 / 限定框 / 背景 / 文本限定框)
+    "GKNodeUiCanvas", "GKNodeUiBox", "GKNodeUiBackdrop", "GKNodeUiTextBox",
 )
+
+# ── 会"接管子控件排版"的容器节点(第一百二十七轮)──────────────────
+# 挂进这些容器的子控件:① 由容器排版,生成器**不能**再写 position / 锚点
+# (写了也白写 —— 容器会覆盖);② 尺寸要用 `custom_minimum_size` 而不是 `size`。
+# 『界面_列表』(第三十八轮)和新的『界面_限定框』『界面_文本限定框』都算。
+UI_CONTAINER_NODES = ("GKNodeUiList", "GKNodeUiBox", "GKNodeUiTextBox")
+
+# ── 里面还有一层"排版容器"的节点名后缀 ────────────────────────────
+# 『界面_列表』是两层(滚动容器 + 里面排版的 VBox/HBox);『界面_文本限定框』
+# 也是两层(框 + 里面的 VBox,文字排在它里面)。子控件要挂**里层**才排队,
+# 由 `_gk_list_body(名字)` 按"第一个 VBox/HBox 孩子"找出来(见 generator)。
+UI_CONTAINER_BODY_NODES = ("GKNodeUiList", "GKNodeUiTextBox")
 
 # ── 所有控件共用的『互斥组』一行(第一百零四轮)─────────────────────
 # 用户:"多个游戏UI界面怎么设置层级的……有时同时按两个键"。答案是一对组合拳:
@@ -3012,6 +3907,26 @@ for _cls in CLASSES:
         _cls.gk_menu_hidden_trees = ("GKGameLogicTree",)
         # 『界面_套用设计』按这个标记挑节点,见 codegen.services._ui_design_nodes
         _cls.gk_ui_builder = True
+        # ── 连线式父子层级(第一百二十七轮)────────────────────────────
+        # 用户:"界面逻辑从」…改成连线,参考虚幻5的界面设计"。于是每个控件
+        # 节点多两个引脚:
+        #   * 『父』(输入)  —— 接父控件的『自己』出口;
+        #   * 『自己』(输出) —— 供子控件的『父』接进来。
+        # 生成时**从连线反推父节点名**,落地仍是原来的
+        # `_gk_find_widget(父名)` 那条路(见 codegen.services 的 resolver 调用点),
+        # 所以运行期零改动。卡片上的『父控件』名字**保留**当快捷键:
+        # 没连线时读它,连线优先(见 nodes.node_base.ui_parent_name)。
+        #
+        # ⚠ 必须"新建 tuple 赋给子类",不能原地改:控件类大多没声明
+        #   `gk_outputs`,那是从 `GKStatementNode.gk_outputs` 继承的**共享
+        #   tuple**,原地 append 会污染所有语句节点。
+        # ⚠ 判重是为了**重复导入**(插件重载会再跑一遍这个循环)不叠引脚。
+        _pin_in_names = [spec["name"] for spec in _cls.gk_inputs]
+        if "父" not in _pin_in_names:
+            _cls.gk_inputs = tuple(_cls.gk_inputs) + (S.pin(S.OBJECT, "父"),)
+        _pin_out_names = [spec["name"] for spec in _cls.gk_outputs]
+        if "自己" not in _pin_out_names:
+            _cls.gk_outputs = tuple(_cls.gk_outputs) + (S.pin(S.OBJECT, "自己"),)
         _cls.gk_prop_defs = tuple(_cls.gk_prop_defs) + (
             _UI_MUTEX_PROP, _UI_TRANSIENT_PROP)
         B.materialize_props(_cls)
@@ -3058,6 +3973,10 @@ UI_TREE_RUNTIME_NODES = (
 # 运行时控件接口 —— 两棵树都能放(见上面 ②)
 UI_TREE_INTERFACE_NODES = (
     "GKNodeUiSet", "GKNodeUiHide", "GKNodeUiReadText", "GKNodeUiFocus",
+    # 第一百二十八轮:『界面_弹入/弹出』= "开/关面板"的完整动作 ——
+    # 玩法图里"任务完成 -> 弹出奖励面板"是**正常用法**,所以两棵树都放、
+    # 两张菜单都列(和『界面_设置』『界面_隐藏控件』同一档)。
+    "GKNodeUiPop",
 )
 
 for _cls in CLASSES:
@@ -3070,6 +3989,28 @@ for _cls in CLASSES:
         _cls.gk_tree_type = ("GKGameLogicTree", "GKUiDesignTree")
 
 
+# ── 吃"界面引用"的节点(第一百二十八轮)────────────────────────────
+# 用户在示例里查出来的缺口:"『界面_取控件』『界面_取界面』取出来的引用
+# **没人吃**" —— 所有界面动作节点都只按**名字**找控件,引用只能当『父』引脚的
+# 上游或塞进 `变量_设置`。这里给几个动作节点各加一个『控件』(OBJECT)输入引脚:
+#   * 引脚接了   -> 用上游那个引用的值(像蓝图的控件变量);
+#   * 引脚没接   -> 还是老规矩 `_gk_find_widget("卡片上填的名字")`。
+# 引脚优先 —— 和『父』引脚(连线式父子)一套规矩,老图(只填名字)生成物
+# 一字不变。
+UI_REF_CONSUMER_NODES = (
+    "GKNodeUiSet",       # 界面_设置(改属性 / 文字)
+    "GKNodeUiHide",      # 界面_隐藏控件(显隐 + 置顶)
+    "GKNodeUiFocus",     # 界面_设焦点
+    "GKNodeUiTween",     # 界面_缓动
+    "GKNodeUiPop",       # 界面_弹入/弹出
+)
+
+for _cls in CLASSES:
+    if _cls.bl_idname in UI_REF_CONSUMER_NODES:
+        if "控件" not in [spec["name"] for spec in _cls.gk_inputs]:
+            _cls.gk_inputs = tuple(_cls.gk_inputs) + (S.pin(S.OBJECT, "控件"),)
+
+
 # ==========================================================================
 # 射线
 # ==========================================================================
@@ -3080,7 +4021,20 @@ class GKNodeRaycast(B.GKStatementNode):
     bl_icon = "RESTRICT_SELECT_OFF"
     gk_category = "射线"
     gk_doc = ("从一个点沿某个方向打一条射线，看打到什么(开枪命中 / 视线判定 / "
-              "地面检测)。打到东西走『命中』，没打到走『没打中』")
+              "地面检测)。打到东西走『命中』，没打到走『没打中』。\n"
+              "── 从哪出发(『起点』) ──\n"
+              "『自身』= 脚本所在物体的位置(默认，老图就是这么射的)；"
+              "『当前相机』= 当前相机的位置(第一人称准星 / 鼠标瞄准)；"
+              "『所属角色』= 沿父链往上找第一个角色(CharacterBody)的位置 —— "
+              "脚本挂在碰撞代理 / 模型子节点上时也能找到人在哪。"
+              "想看眼睛高度就配合『起点偏移』(比如 Y 填 1.6)。\n"
+              "── 往哪打(『方向来源』) ──\n"
+              "『静态方向』= 用『方向』引脚或下面填的向量(默认)；"
+              "『相机前向』= 沿当前相机的朝向 —— 相机看哪就射哪，"
+              "FPS 的准星命中不用自己再算方向。2D 项目取相机旋转后的『上』"
+              "(2D 相机是俯视的，没有 3D 那种看向屏幕里的方向)。\n"
+              "两个开关都默认时，生成的代码和以前**逐字一致**；"
+              "取不到相机(视口里没有 / 不在树里)时退回『自身』，不会崩")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(VECTOR, "方向", (1.0, 0.0, 0.0)),
@@ -3090,8 +4044,16 @@ class GKNodeRaycast(B.GKStatementNode):
     gk_prop_defs = (
         ("gk_direction", "float_vector", (1.0, 0.0, 0.0), "方向", "单位向量，会自动归一化"),
         ("gk_distance", "float", 200.0, "距离", "射线长度(像素 / 米)"),
-        ("gk_offset", "float_vector", (0.0, 0.0, 0.0), "起点偏移", "相对自身位置的偏移"),
+        ("gk_offset", "float_vector", (0.0, 0.0, 0.0), "起点偏移", "相对起点的偏移"),
         ("gk_layer", "int", 1, "碰撞层", "只检测这些层(位掩码，1 表示第 1 层)"),
+        ("gk_origin", "enum", "SELF", "起点", "这条射线从哪出发",
+         (("SELF", "自身", "脚本所在物体的位置(默认，和以前一样)"),
+          ("CAMERA", "当前相机", "当前相机的位置(第一人称准星 / 鼠标瞄准)"),
+          ("PLAYER", "所属角色",
+           "沿父链往上找第一个角色(CharacterBody)的位置"))),
+        ("gk_dir_mode", "enum", "STATIC", "方向来源", "方向怎么取",
+         (("STATIC", "静态方向", "用『方向』引脚 / 下面填的向量(默认)"),
+          ("CAMERA_FORWARD", "相机前向", "沿当前相机的朝向射(相机看哪就射哪)"))),
     )
     # 出口不叫『完成』:见 codegen 里 _stmt_raycast 的说明 ——
     # 叫『完成』会被 emit_statement 自动续接，分支就废了。
@@ -3107,6 +4069,9 @@ class GKNodeRaycast(B.GKStatementNode):
         row.prop(self, "gk_distance", text="")
         row.prop(self, "gk_layer", text="")
         layout.prop(self, "gk_direction", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_origin", text="")
+        row.prop(self, "gk_dir_mode", text="")
 
 
 @N
@@ -3448,6 +4413,13 @@ class GKNodeSetLight(B.GKStatementNode):
         ("gk_energy", "float", 0.0, "亮度", "0 = 不改;大于 0 就把灯设成这个亮度"),
         ("gk_set_color", "bool", False, "改颜色", "勾上才把『颜色』写进灯里"),
         ("gk_color", "color", (1.0, 1.0, 1.0, 1.0), "颜色", "灯光颜色"),
+        # ── 渐变(第一百五十六轮)────────────────────────────────────
+        # 以前开关 / 调亮度都是**瞬间**赋值:警戒时吊灯"啪"一下从 6.0 掉到
+        # 0.9,像跳帧;手电关掉也是直接黑。真实灯具都有余辉 —— 白炽灯
+        # 0.1~0.3 秒、日光灯更快。填了秒数就用 Tween 过渡过去,
+        # 关灯时先淡到 0 再 visible=false(否则一关就断,看不到"暗下去")。
+        ("gk_fade", "float", 0.0, "渐变(秒)",
+         "0 = 瞬间切换(老行为);0.2~0.5 = 灯光柔和地明暗过去"),
     )
 
     def draw_buttons(self, context, layout):
@@ -3456,9 +4428,87 @@ class GKNodeSetLight(B.GKStatementNode):
         row.prop(self, "gk_on", text="开", toggle=True)
         row = layout.row(align=True)
         row.prop(self, "gk_energy", text="亮度")
+        row.prop(self, "gk_fade", text="渐变")
+        row = layout.row(align=True)
         row.prop(self, "gk_set_color", text="颜色", toggle=True)
         if self.gk_set_color:
             layout.prop(self, "gk_color", text="")
+
+# ==========================================================================
+# 『灯光_闪烁』(第一百四十八轮)
+# ==========================================================================
+# 用户:"灯光的节点逻辑设计,建议有:灯光一闪一闪地"。
+#
+# 示例里第一次做灯闪是**六个节点拼出来**的(定时→随机→比较→分支→
+# 两个『灯光_设置』)。那不是"节点不会用",而是这个玩法太常用、又没法
+# 用一个节点表达 —— 每个恐怖 / 赛博 / 停电场景都要重拼一遍,而且用
+# 定时器拼出来的是**方波**(开 / 关两态),看起来像频闪灯,不像坏灯管。
+#
+# 这个节点把"闪烁"收成一条曲线,逐帧算:
+#   * 接触不良:高频双正弦抖动 + 极小概率全灭(真实日光灯的样子)
+#   * 烛火    :慢呼吸叠高频小抖
+#   * 警报    :方波脉冲(应急灯)
+#   * 呼吸    :极慢的正弦(幽暗房间的"活着"感)
+# 只改 `light_energy`,不碰 `visible` —— 所以它和『灯光_设置』的开关
+# 可以叠加:关灯 -> 再开灯,闪烁从当前相位继续。
+LIGHT_FLICKER_MODES = (
+    ("FAULT", "接触不良", "坏日光灯:高频抖 + 偶发全灭"),
+    ("CANDLE", "烛火", "慢呼吸 + 高频小抖"),
+    ("ALARM", "警报", "方波脉冲(应急灯)"),
+    ("BREATH", "呼吸", "极慢的明暗起伏"),
+)
+
+
+@N
+class GKNodeLightFlicker(B.GKStatementNode):
+    bl_idname = "GKNodeLightFlicker"
+    bl_label = "灯光_闪烁"
+    bl_icon = "LIGHT"
+    gk_category = "灯光"
+    gk_doc = ("让一盏灯**自己**闪:坏灯管 / 烛火 / 警报 / 呼吸。"
+              "执行到这句就开始闪,之后不用再管它(逐帧算亮度)。"
+              "『深度』= 最暗能压到多暗(0.6 = 压掉六成);"
+              "『基准亮度』留 0 = 用这盏灯导出时的亮度。"
+              "只改亮度、不改开关,可以和『灯光_设置』叠加。"
+              "勾『停止闪烁』反过来:执行到这句就把这盏灯的闪烁停掉,"
+              "亮度恢复基准 —— 低电手电忽闪、捡到电池恢复常亮这种"
+              "“有条件结束”的闪烁就靠它(开始那句每帧重复执行也安全,"
+              "同一盏灯只登记一次)。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "灯名", ""),
+        S.pin(FLOAT, "速度", 1.0),
+        S.pin(FLOAT, "深度", 0.6),
+    )
+    gk_input_props = {"灯名": "gk_light", "速度": "gk_speed", "深度": "gk_depth"}
+    gk_prop_defs = (
+        ("gk_light", "string", "", "灯名",
+         "Blender 里灯光物体的名字(导出后 Godot 场景里的节点名)"),
+        ("gk_mode", "enum", "FAULT", "模式", "", LIGHT_FLICKER_MODES),
+        ("gk_speed", "float", 1.0, "速度",
+         "闪烁快慢的倍率(1.0 = 设计值;0.5 更慢,2 更急)"),
+        ("gk_depth", "float", 0.6, "深度",
+         "最暗压到多少(0 = 不闪,1 = 可以全黑)"),
+        ("gk_base", "float", 0.0, "基准亮度",
+         "0 = 用灯当前的亮度(Godot light_energy);填大于 0 的数就固定用它"),
+        # ── 停止闪烁(第一百八十六轮)────────────────────────────────
+        # 以前一旦 start 就没有"结束"手段(start 按灯去重、数组在生成脚本
+        # 内部,节点图摸不到)—— 手电低电忽闪之后捡到电池,灯会一直虚闪。
+        ("gk_stop", "bool", False, "停止闪烁",
+         "勾上 = 执行到这句就把这盏灯的闪烁**停掉**(亮度恢复基准);"
+         "不勾 = 开始闪(默认)。每帧重复执行也安全:没在闪就是空操作"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_light", text="")
+        row.prop(self, "gk_mode", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_speed", text="速度")
+        row.prop(self, "gk_depth", text="深度")
+        row = layout.row(align=True)
+        row.prop(self, "gk_stop", text="停止闪烁", toggle=True)
+
 
 # ==========================================================================
 # 『环境_应用预设』(第一百一十三轮)
@@ -3487,3 +4537,135 @@ class GKNodeEnvPreset(B.GKStatementNode):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "gk_preset", text="预设名")
+
+
+# ==========================================================================
+# 『显示_监控画面』(第一百五十七轮)
+# ==========================================================================
+# 用户:"把门卫室的屏幕改成显示走廊的实时画面"。
+#
+# 做法:运行时建一台 SubViewport + 一台 Camera3D,把视口纹理贴到屏幕网格上。
+# 相机放在『机位』(世界坐标),朝『看向』那个物体看 —— 于是屏幕上就是
+# 那个角落的实时画面(监控摄像头的效果)。
+#
+# ⚠ 屏幕网格的材质必须**自己建**(unshaded),不能改它自带的卡通材质:
+#   视口纹理是 sRGB 的 albedo 贴图,走卡通着色会被再算一次光照,画面发灰。
+# ⚠ 材质要**写两次**:`gk_environment` 脚本在 _ready 里会给整关重套材质
+#   (remat),把这张贴上去的覆盖掉。所以立刻写一次 + 0.3 秒后再写一次。
+@N
+class GKNodeLiveScreen(B.GKStatementNode):
+    bl_idname = "GKNodeLiveScreen"
+    bl_label = "显示_监控画面"
+    bl_icon = "CAMERA_DATA"
+    gk_category = "显示"
+    gk_doc = ("把一块屏幕(任意网格物体)变成**监控显示器**:屏幕上放的是"
+              "场景另一处的实时画面。\n"
+              "『屏幕』= 要贴画面的那块网格(Blender 里的物体名);\n"
+              "『机位』= 摄像头放在哪(世界坐标);\n"
+              "『看向』= 摄像头盯着谁(填物体名,通常就是玩家 / 一扇门)。\n"
+              "一个节点管一块屏;同一块屏被执行两次也不会多建一台相机。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "屏幕", ""),
+        S.pin(TEXT, "看向", ""),
+    )
+    gk_input_props = {"屏幕": "gk_screen", "看向": "gk_look"}
+    gk_prop_defs = (
+        ("gk_screen", "string", "", "屏幕",
+         "要贴画面的网格物体名(Blender 里的名字,导出后是 Godot 节点名)"),
+        ("gk_look", "string", "", "看向",
+         "摄像头盯着哪个物体(填物体名);留空就只用『机位』的方向"),
+        ("gk_pos", "float_vector", (0.0, 0.0, 0.0), "机位",
+         "摄像头放在哪(世界坐标,Blender 的 XYZ —— 导出会转成 Godot 的)"),
+        ("gk_width", "int", 512, "画面宽", "渲染分辨率(越小越省;512 够看清人影)",
+         None, {"min": 64, "max": 2048}),
+        ("gk_height", "int", 288, "画面高", "渲染分辨率",
+         None, {"min": 64, "max": 2048}),
+        ("gk_fov", "float", 55.0, "视野", "摄像头视野角(度)"),
+        ("gk_tint", "color", (1.0, 1.0, 1.0, 1.0), "色调",
+         "给画面上一层颜色(监控的偏绿 / 偏蓝就靠它)"),
+        ("gk_near", "float", 0.1, "最近", "比这更近的不拍(米)"),
+        ("gk_far", "float", 60.0, "最远", "比这更远的不拍(米)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_screen", text="屏幕")
+        row.prop(self, "gk_look", text="看向")
+        row = layout.row(align=True)
+        row.prop(self, "gk_pos", text="机位")
+        row = layout.row(align=True)
+        row.prop(self, "gk_width", text="宽")
+        row.prop(self, "gk_height", text="高")
+        row.prop(self, "gk_fov", text="视野")
+        row = layout.row(align=True)
+        row.prop(self, "gk_near", text="最近")
+        row.prop(self, "gk_far", text="最远")
+        layout.prop(self, "gk_tint", text="色调")
+
+
+# ==========================================================================
+# 『显示_纸娃娃』(第一百五十七轮)
+# ==========================================================================
+# 用户:"第一人称下,在屏幕左上角渲染一个角色模型(类似我的世界基岩版的
+#       布娃娃),丰富视觉并知晓模型动作"。
+#
+# 做法:建一个独立世界(own_world_3d)的 SubViewport,把角色模型
+# **复制**一份进去,配一台相机 + 一盏灯,画面作为贴图贴到角上一个
+# TextureRect 上。每物理帧把原模型 AnimationPlayer 的动画名 / 播放位置
+# 同步给副本 —— 于是跑 / 跳 / 攻击的动作在小窗里看得见。
+#
+# ⚠ 必须**复制**而不是"把模型搬进去":搬进去主角就没人控制了。
+# ⚠ 副本要 **visible = true**:模型在 Blender 里常把网格藏起来只留骨骼,
+#   复制之后那些隐藏节点还是隐藏的,小窗里就空了。
+# ⚠ 副本里自带的 Camera3D / Light3D 要删掉:它们会抢视口的相机。
+# ⚠ 独立世界(own_world_3d)是为了**不受本关环境光影响**:小窗要的是
+#   "展示台"的光,不是走廊里那盏应急灯。
+@N
+class GKNodePaperDoll(B.GKStatementNode):
+    bl_idname = "GKNodePaperDoll"
+    bl_label = "显示_纸娃娃"
+    bl_icon = "USER"
+    gk_category = "显示"
+    gk_doc = ("在屏幕角上开一个小窗,里面是**角色自己的模型**(布娃娃视角)。\n"
+              "第一人称看不到自己时用它:能看见跑 / 跳 / 攻击的动作。\n"
+              "『目标』通常填 `./Model`(玩家身上那个模型节点);\n"
+              "『只在隐藏时显示』勾上 = 模型被藏起来(第一人称)才出现,"
+              "切回第三人称自动收起。")
+    gk_inputs = (
+        S.pin(FLOW, "执行"),
+        S.pin(TEXT, "目标", "./Model"),
+    )
+    gk_input_props = {"目标": "gk_target"}
+    gk_prop_defs = (
+        ("gk_target", "node", "./Model", "目标",
+         "要展示的模型节点(通常就是玩家自己的模型)"),
+        ("gk_size", "int", 150, "窗口大小", "小窗的边长(像素)",
+         None, {"min": 48, "max": 512}),
+        ("gk_x", "int", 24, "左边距", "离屏幕左边的像素"),
+        ("gk_y", "int", 150, "上边距", "离屏幕顶部的像素"),
+        ("gk_fov", "float", 40.0, "视野", "小窗相机的视野角(度)"),
+        ("gk_zoom", "float", 1.0, "缩放", "1 = 按包围盒自动取景;>1 拉远,<1 拉近"),
+        ("gk_turn", "float", 0.0, "自转", "每秒转多少度(0 = 不转)"),
+        ("gk_only_hidden", "bool", True, "只在隐藏时显示",
+         "勾上:目标被隐藏(第一人称)才显示;取消:一直显示"),
+        ("gk_bg", "color", (0.0, 0.0, 0.0, 0.0), "底色",
+         "小窗背景色(默认全透明)"),
+    )
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        B.draw_target_picker(self, layout)
+        row = layout.row(align=True)
+        row.prop(self, "gk_size", text="大小")
+        row.prop(self, "gk_fov", text="视野")
+        row = layout.row(align=True)
+        row.prop(self, "gk_x", text="左")
+        row.prop(self, "gk_y", text="上")
+        row = layout.row(align=True)
+        row.prop(self, "gk_zoom", text="缩放")
+        row.prop(self, "gk_turn", text="自转")
+        row = layout.row(align=True)
+        row.prop(self, "gk_only_hidden", text="只在隐藏时")
+        layout.prop(self, "gk_bg", text="底色")

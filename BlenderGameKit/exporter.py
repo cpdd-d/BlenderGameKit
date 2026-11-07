@@ -6,7 +6,7 @@ import tempfile
 import time
 
 from . import (blender_adapter, codegen, curve_assets, gk_log, models, paths,
-               project, sound_assets)
+               project, script_assets, sound_assets)
 from .nodes.node_base import snake_case
 
 GDScriptVersion = 4
@@ -259,17 +259,28 @@ def resolve_main_camera(scene):
     wanted = str(getattr(settings, "main_camera", "") or "").strip()
     if wanted and bpy.data.objects.get(wanted) is not None:
         return wanted, "设置里指定的主相机"
+    def shot_camera(obj):
+        # 第一百五十轮:运镜专用机位(相机_运镜 / 开场特写)不能被当成主相机,
+        # 否则一进关卡环境脚本就把它点亮,玩家的相机被挤掉。
+        try:
+            return bool(obj.get("gk_not_main_camera", False))
+        except Exception:                                  # noqa: BLE001
+            return False
+
     view_cam = getattr(scene, "camera", None)
-    if view_cam is not None and getattr(view_cam, "type", "") == "CAMERA":
+    if view_cam is not None and getattr(view_cam, "type", "") == "CAMERA" \
+            and not shot_camera(view_cam):
         return view_cam.name, "跟着 Blender 视口的当前相机"
     cameras = [o.name for o in scene.objects
-               if getattr(o, "type", "") == "CAMERA"]
+               if getattr(o, "type", "") == "CAMERA"
+               and not shot_camera(o)]
     if cameras:
         return cameras[0], f"自动(场景里第一台;共 {len(cameras)} 台)"
     from .persistent_player import default_player
     player = default_player()
     if player is not None:
-        cameras = [o for o in player.children_recursive if o.type == "CAMERA"]
+        cameras = [o for o in player.children_recursive
+                   if o.type == "CAMERA" and not shot_camera(o)]
         if cameras:
             return cameras[0].name, "世界默认角色的相机"
     return "", "场景里没有相机(运行时造一台自由飞行观察机)"
@@ -901,12 +912,21 @@ def _node_clip_cards(tree):
     cards = []
     seen = set()
     for node in getattr(tree, "nodes", ()) or ():
-        raw = str(getattr(node, "gk_path", "") or "").strip()
-        _script_path, local = sound_assets.resolve_clip(raw)
-        if not local or local in seen:
-            continue
-        seen.add(local)
-        cards.append((str(getattr(node, "name", "") or "音效"), local))
+        raws = []
+        single = str(getattr(node, "gk_path", "") or "").strip()
+        if single:
+            raws.append(single)
+        # 『恐怖_音效』的『音效列表』是多条(竖线分隔),每条都要收
+        multi = str(getattr(node, "gk_paths", "") or "").strip()
+        if multi:
+            raws.extend(part.strip() for part in multi.split("|")
+                        if part.strip())
+        for raw in raws:
+            _script_path, local = sound_assets.resolve_clip(raw)
+            if not local or local in seen:
+                continue
+            seen.add(local)
+            cards.append((str(getattr(node, "name", "") or "音效"), local))
     return cards
 
 
@@ -1041,6 +1061,11 @@ def export_tree(tree, settings=None, write_scene=None):
         for _name, _path, target, _res
         in sound_assets.sound_files(directory, sound_cards)]
     manifest.extend(planned_sounds)
+    # ── 自定义脚本(第一百五十一轮)────────────────────────────────────
+    # 节点引用的 Blender 文本块 -> scripts/custom/*.gd。和音频同一条思路:
+    # 生成的脚本里写死了 `res://scripts/custom/...`,这里就得把文件带上。
+    custom_scripts = script_assets.script_files(directory)
+    manifest.extend(path for _name, path, _text in custom_scripts)
     if scene_path:
         manifest.append(scene_path)
     if actions or should_write_scene:
@@ -1073,6 +1098,14 @@ def export_tree(tree, settings=None, write_scene=None):
             for name, path, text in curve_files:
                 transaction.write(path, text)
             gk_log.info(f"曲线资源 {len(curve_files)} 个 -> {project.CURVES_DIR}/")
+
+        # 自定义脚本文本块(第一百五十一轮):和曲线一起进事务
+        if custom_scripts:
+            stage = "写自定义脚本"
+            for _name, path, text in custom_scripts:
+                transaction.write(path, text)
+            gk_log.info(f"自定义脚本 {len(custom_scripts)} 个 -> "
+                        f"{script_assets.SCRIPT_DIR}/")
 
         # 把用到的输入动作写进 project.godot。
         # 不做这一步的话,Godot 里按键完全没反应,而且只刷一行

@@ -1,4 +1,4 @@
-﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
+﻿﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
 #
 # 用法:
 #   pwsh -File scripts\build_and_test.ps1

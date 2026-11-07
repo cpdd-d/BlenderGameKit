@@ -82,6 +82,31 @@ class Base(unittest.TestCase):
             spaces = len(line) - len(line.lstrip(" "))
             self.assertEqual(spaces % 4, 0, f"第 {number} 行缩进不是 4 的倍数: {line!r}")
 
+    def assert_quotes_balanced(self, code):
+        """每行的双引号必须**成对** —— 抓"生成时多打/少打一个引号"。
+
+        ── 为什么要这条(第一百二十八轮被示例探针真抓到)──────────────
+        『界面_弹入/弹出』的"找不到控件"告警写成
+        `f'push_warning("找不到界面控件: " + {gd_string(name)}")'` ——
+        `gd_string` 自带引号,后面又补了一个,生成物变成
+        `+ "竖排框""`:**整份 GDScript 语法错误、游戏直接起不来**。
+        而当时的断言全是 `assertIn("…" in code)`,这种"多一个字符"的病
+        一个字都拦不住(子串还在,只是多了个引号)。真机上是 Godot 探针
+        才发现的 —— 离线这一层补一条最便宜的:引号成对。
+
+        ⚠ **只能用在没有多行字符串的代码段上**。生成器里有几处辅助函数是
+          用 `"...".join(lines)` 拼的,本身就是**跨行**字符串(一行里只有
+          半个引号);拿这条去扫整份生成物会误报(实测环境脚本里 36 行)。
+          所以只在『界面_弹入/弹出』那种"一行一个完整字符串"的断言里用。
+        """
+        for number, line in enumerate(code.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            # 转义过的引号不算(去掉再数)
+            cleaned = line.replace('\\"', "")
+            self.assertEqual(cleaned.count('"') % 2, 0,
+                             f"第 {number} 行引号不成对: {line.strip()!r}")
+
     @staticmethod
     def functions(code):
         """把生成物切成 {函数名: 函数体} —— 用来查"跨函数引用"。
@@ -2738,6 +2763,113 @@ class TestRaycastNodes(Base):
     def test_raycast_outputs_not_named_done(self):
         names = [spec["name"] for spec in NN.GKNodeRaycast.gk_outputs]
         self.assertNotIn("完成", names, "出口叫『完成』会被 emit_statement 提前续接")
+
+    def test_raycast_origin_and_dir_mode_switches(self):
+        """『起点』/『方向来源』两个开关:取值与默认值都不能跑偏。
+
+        默认值一变，老图的生成物就跟着变 —— 这是这一轮的硬要求
+        (『SELF』+『STATIC』= 改动前逐字一致)。
+        """
+        prop_map = NN.GKNodeRaycast.gk_prop_map
+        self.assertEqual(prop_map["gk_origin"][2], "SELF")
+        self.assertEqual(prop_map["gk_dir_mode"][2], "STATIC")
+        self.assertEqual([item[0] for item in prop_map["gk_origin"][5]],
+                         ["SELF", "CAMERA", "PLAYER"])
+        self.assertEqual([item[0] for item in prop_map["gk_dir_mode"][5]],
+                         ["STATIC", "CAMERA_FORWARD"])
+
+    def test_raycast_default_switches_keep_old_lines(self):
+        """两个开关都默认时，射线那几句的形状必须稳定。
+
+        这里锁的是**形状**而不是临时变量编号:编号由全图流水号决定，
+        另有用例比对完整产物(改动前后逐字一致)。
+
+        ⚠ 2026-10-29(第一百六十六轮):方向那行**有意**变了 —— 以前是
+        `Vector3(0.0, 0.0, 0.0)`(零向量，射线永远射空，还不报错),
+        现在取卡片上的 `gk_direction`(默认 1,0,0)。这是修待办清单 ⑧,
+        不是回归;引脚接了线时仍然用上游。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "射线")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(
+            code, r"var _dir\d+ := \(Vector3\(1\.0, 0\.0, 0\.0\)\)\.normalized\(\)")
+        self.assertRegex(
+            code,
+            r"var _from\d+ := global_transform\.origin \+ Vector3\(0\.0, 0\.0, 0\.0\)")
+        self.assertRegex(code, r"var _to\d+ := _from\d+ \+ _dir\d+ \* 200\.0")
+        # 默认档不许偷偷多出"取相机 / 找角色"的行
+        self.assertNotIn("get_camera_3d", code)
+        self.assertNotIn("is CharacterBody3D", code)
+        self.assertNotIn("get_parent()", code)
+
+    def test_raycast_camera_origin_and_forward_3d(self):
+        """起点=当前相机 + 方向=相机前向:真去取相机，不是写死自身。
+
+        视线射线的用法就是这个组合(FPS 准星命中 / 恐怖游戏看手电照到谁)。
+        """
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "视线",
+                             gk_origin="CAMERA", gk_dir_mode="CAMERA_FORWARD",
+                             gk_distance=50.0)
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("get_viewport().get_camera_3d()", code)
+        self.assertRegex(code, r"_cam\d+ != null:")
+        self.assertRegex(
+            code, r"_from\d+ = _cam\d+\.global_position \+ Vector3\(")
+        self.assertRegex(
+            code, r"_dir\d+ = \(-_cam\d+\.global_transform\.basis\.z\)\.normalized\(\)")
+        # 取不到相机时退回自身的起点(兜底那行还在)
+        self.assertIn("global_transform.origin", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_raycast_camera_origin_and_forward_2d(self):
+        """2D 项目也取相机，但必须用 2D 的 API(Camera2D 上没有 basis)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        node = tree.new_node(NN.GKNodeRaycast, "视线",
+                             gk_origin="CAMERA", gk_dir_mode="CAMERA_FORWARD")
+        gk_stub.connect(tree, event, "执行", node, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("get_viewport().get_camera_2d()", code)
+        self.assertIn("(-Vector2.UP.rotated(_cam", code)
+        self.assertNotIn("get_camera_3d", code)
+        self.assertNotIn("basis.z", code)
+        self.assert_no_chinese_identifiers(code)
+        self.assert_indent_sane(code)
+
+    def test_raycast_player_origin_walks_up_to_character(self):
+        """起点=所属角色:沿父链往上找第一个 CharacterBody。
+
+        脚本常挂在"碰撞代理"或模型子节点上，直接取 self 拿到的是代理原点。
+        找不到角色时退回自身起点，不许崩。
+        """
+        for options, body_type, space_type in (
+                (V3, "CharacterBody3D", "Node3D"),
+                (V2, "CharacterBody2D", "Node2D")):
+            tree = make_tree()
+            event = self._ready(tree)
+            node = tree.new_node(NN.GKNodeRaycast, "视线", gk_origin="PLAYER")
+            gk_stub.connect(tree, event, "执行", node, "执行")
+            code, warnings = gen(tree, options)
+            self.assertEqual(warnings, [], warnings)
+            self.assertIn("var _walk", code)
+            self.assertIn("while _walk", code)
+            self.assertIn(f"is {body_type}:", code)
+            self.assertIn(f"as {space_type}).global_position", code)
+            self.assertIn(".get_parent()", code)
+            # 不需要相机:别为了找角色顺手把相机也取一遍
+            self.assertNotIn("get_viewport().get_camera_", code)
+            self.assert_no_chinese_identifiers(code)
+            self.assert_indent_sane(code)
 
     def test_raycast_check_is_pure_expression(self):
         """『射线_有东西吗』是表达式:生成的多行代码要落在使用它的作用域里。
@@ -16621,6 +16753,50 @@ class TestRound70TensionSeen(Base):
         self.assertNotIn(" else 0.0", code)
 
 
+class TestRound158TensionSource(Base):
+    """第一百五十八轮:紧张度可以在关卡图里显式指定『测量谁』。
+
+    背景:节点以前固定用 `self` 测距。角色图里 `self` = 玩家,没问题;
+    但把系统拆到关卡图后(脚本 extends Node3D、挂场景根),`self` 是
+    世界原点 —— 玩家贴脸紧张度也不动。新引脚/属性留空时仍用 `self`,
+    所以老图生成物必须一字不变。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def test_source_pin_and_property_exist(self):
+        ins = [spec["name"] for spec in NN.GKNodeTension.gk_inputs]
+        self.assertIn("测量谁", ins)
+        props = {entry[0]: entry for entry in NN.GKNodeTension.gk_prop_defs}
+        self.assertIn("gk_source", props)
+
+    def test_empty_source_still_measures_from_self(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        heart = tree.new_node(NN.GKNodeHeartbeat, "心跳")
+        tension = tree.new_node(NN.GKNodeTension, "紧张", gk_threat="怪物",
+                                gk_near=3.0, gk_far=15.0)
+        gk_stub.connect(tree, event, "执行", heart, "执行")
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_global_position_3d(self)).length()", code)
+        self.assertNotIn("节点_测量谁", code)
+
+    def test_source_property_measures_from_that_object(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        heart = tree.new_node(NN.GKNodeHeartbeat, "心跳")
+        tension = tree.new_node(NN.GKNodeTension, "紧张", gk_threat="怪物",
+                                gk_source="玩家", gk_near=3.0, gk_far=15.0)
+        gk_stub.connect(tree, event, "执行", heart, "执行")
+        gk_stub.connect(tree, tension, "紧张度", heart, "紧张度")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_global_position_3d(测量谁_玩家)).length()", code)
+
+
 class TestRound70NoGodotWarnings(Base):
     """第七十轮:把用户截图里那几条**生成代码自己招来的 Godot 告警**修掉。
 
@@ -20742,13 +20918,17 @@ class TestRound104UiTrio(Base):
 
         和『界面_按钮』(『完成』+『点击』)同形 —— 链上要能摆一排控件,
         所以『完成』必须有;玩家的动作走信号出口(独立回调)。
+
+        第一百二十七轮起每个控件节点尾巴上多一个共享的『自己』出口
+        (连线式父子层级:子控件的『父』接它),所以这里断言
+        "声明的那几个 + 『自己』"。
         """
         for cls, names in (
                 (NN.GKNodeUiSlider, ["完成", "变了", "值"]),
                 (NN.GKNodeUiDropdown, ["完成", "选了", "选了第几个"]),
                 (NN.GKNodeUiCheckbox, ["完成", "改了", "勾了吗"])):
             got = [spec["name"] for spec in cls.gk_outputs]
-            self.assertEqual(got, names, cls.bl_label)
+            self.assertEqual(got, names + ["自己"], cls.bl_label)
 
     def test_slider_builds_row_with_live_value_label(self):
         tree = make_tree()
@@ -22804,8 +22984,68 @@ class TestRound142EnvInterfaces(unittest.TestCase):
         self.assertEqual(block.count("_GK_DN_PRESET_TOP :="), 1, block)
         # 太阳真的转(角度由时刻算),影子方向跟着走
         self.assertIn("_gk_dn_sun.rotation = Vector3(-elevation, yaw, 0.0)", block)
+        # 第一百五十一轮第七轮:东 -> 北 -> 西 的正弧线(不再是 ±120° 乱走)
+        self.assertIn("PI * 0.5 + angle", block)
         self.assertIn("_gk_daynight_physics", block)
         self.assertIn("physics_frame.connect(_gk_daynight_physics)", block)
+
+    def test_sky_shader_zenith_plane_and_warm_sun(self):
+        """第一百五十一轮第七轮:天顶不能出现"菊花云",太阳要暖。
+
+        ⚠ 天顶的球面 UV 会向一点收敛 -> 抬头看是放射状长条(用户截图)。
+        修法是高仰角混到**俯视平面投影**;太阳则靠 `sun_near` 把周围的云
+        烘暖。两条都必须在着色器源码里,不能只写在注释里。
+        """
+        from BlenderGameKit import asset_export as ae
+        path = os.path.join(ae.shader_source_dir(), "gk_sky.gdshader")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("float zenith = smoothstep(0.55, 0.90, up)", text)
+        self.assertIn("top_uv * top_tiles", text)
+        self.assertIn("mix(sphere1, top1, zenith)", text)
+        self.assertIn("mix(sphere2, top2, zenith)", text)
+        self.assertIn("sun_near = wide", text)
+        self.assertIn("vec3(1.0, 0.76, 0.38)", text)
+        self.assertIn("sun_near * day_amount", text)
+        self.assertIn("core * sun_draw * 0.55", text)
+        self.assertIn("cloud_height + 0.30", text)
+
+    def test_sky_only_cloud_boost_and_moon_orbit(self):
+        """第一百五十一轮第六轮:只改天空 / 白天云量 / 月亮走夜路。
+
+        ⚠ 这三项都是"运行时行为",静态扫字符串只能锁住**代码真的生成了**;
+        跑得对不对由 `scripts/check_daynight.py` 在真 Godot 里断言。
+        """
+        from BlenderGameKit import asset_export as ae
+        with self._patch_graph(self._tree(
+                "GKNodeClouds", "GKNodeSun", "GKNodeDayNight", "GKNodeMoon",
+                GKNodeClouds={"gk_cloud_day_boost": 0.25},
+                GKNodeDayNight={"gk_sky_only": True, "gk_start_hour": 0.0,
+                                "gk_auto": False},
+                GKNodeMoon={"gk_moon_orbit": True,
+                            "gk_moon_elevation": 22.0})):
+            block = ae._post_block()
+        self.assertIn("const _GK_DN_SKY_ONLY := true", block)
+        self.assertIn("const _GK_CLOUD_DAY_BOOST := 0.25", block)
+        self.assertIn("const _GK_MOON_ORBIT := true", block)
+        self.assertIn("const _GK_MOON_ELEVATION := 22.0", block)
+        # 只改天空:环境光 / 雾不被昼夜预设覆盖
+        self.assertIn(
+            "if _gk_dn_env != null and not _GK_DN_SKY_ONLY:", block)
+        # 云量 = 基础 × 天气 + 白天增量 × 白天程度(云影 / 着色器共用同一个)
+        self.assertIn(
+            "func _gk_cloud_amount_now(day_amount: float) -> float:", block)
+        self.assertIn(
+            "amount += _GK_CLOUD_DAY_BOOST * clampf(day_amount, 0.0, 1.0)",
+            block)
+        self.assertEqual(block.count("_gk_cloud_amount_now(day_amount)"), 2,
+                         block)
+        # 月亮走一条夜路:18 点东升 -> 0 点正北最高 -> 6 点西落
+        self.assertIn(
+            "var moon_t := fmod(_gk_dn_hour + 6.0, 24.0) / 12.0", block)
+        self.assertIn(
+            "_gk_dn_moon.rotation = Vector3(-moon_alt, PI - moon_az, 0.0)",
+            block)
 
     def test_post_and_daynight_share_one_enter_tree(self):
         """后期块 + 昼夜块都在时,`_enter_tree` **只定义一次**。"""
@@ -23002,6 +23242,809 @@ class TestRound126LightOverride(unittest.TestCase):
         self.assertAlmostEqual(ae._light_energy_for(_Obj(9000.0)), 9.0, places=6)
         # 备份是 0(作者真的把灯调到 0)-> 不导这盏灯,不能因为"有备份"就导出去
         self.assertIsNone(ae._light_node_text(_Obj(0.0, backup=0.0)))
+
+
+class TestRound127UiLinks(Base):
+    """第一百二十七轮:连线式父子层级 + 界面结构件 / 界面引用 / 界面事件。
+
+    ── 这一层锁住的几条事实(改代码前先看)──────────────────────────
+    1. 每个控件构建节点都长出『父』(输入)/『自己』(输出)两个 OBJECT 引脚
+       —— 连线式父子的接口;追加必须"新建 tuple",不能污染基类共享的
+       `gk_outputs`(否则**所有**语句节点都会长出『自己』);
+    2. 父控件名走 `NB.ui_parent_name`:**连线优先**,没连才读卡片上的
+       『父控件』字符串(老图照旧能用);
+    3. 生成时仍旧"父先子后"(`_ui_design_order` 一起换了 resolver),
+       而且不刷"找不到父控件"告警;
+    4. 结构件:画布=Control(可铺满)、限定框=自带排版的容器、背景=ColorRect、
+       文本限定框=PanelContainer + 内层 VBox + Label;
+    5. 挂进容器的子控件用 `custom_minimum_size`、**不写** position;
+    6. 引用节点落到 `_gk_find_widget(名字)`;
+    7. 界面事件走**语句节点 + register_input_handler**(不做 GKEventNode,
+       否则放进设计图不执行):出口叫『点了』/『按了』,不叫『完成』。
+    """
+
+    def _ready(self, tree, name="准备"):
+        return tree.new_node(NN.GKNodeOnReady, name)
+
+    def _design(self, name="主界面"):
+        design = gk_stub.StubNodeTree(name)
+        design.bl_idname = "GKUiDesignTree"
+        return design
+
+    def _gen_with_design(self, design, tree, options=None):
+        """把 design 挂到 bpy.data 上,再跑一次生成(用完还原)。"""
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[design]))
+        try:
+            return gen(tree, options or V2)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _apply_design_into(self, design, tree):
+        event = self._ready(tree)
+        apply_node = tree.new_node(NN.GKNodeUiApplyDesign, "套用")
+        gk_stub.connect(tree, event, "执行", apply_node, "执行")
+        return self._gen_with_design(design, tree)
+
+    # ---- 引脚 ----
+    def test_builders_grow_parent_and_self_pins(self):
+        """所有控件构建节点都有『父』/『自己』两个 OBJECT 引脚。"""
+        for idname in NN.UI_DESIGN_BUILDER_NODES:
+            cls = getattr(NN, idname)
+            self.assertIn("父", [spec["name"] for spec in cls.gk_inputs],
+                          idname + " 缺『父』输入引脚")
+            self.assertIn("自己", [spec["name"] for spec in cls.gk_outputs],
+                          idname + " 缺『自己』输出引脚")
+
+    def test_shared_statement_outputs_not_polluted(self):
+        """追加『自己』不能污染基类共享的 `gk_outputs`。
+
+       『界面_文本』没声明 gk_outputs,是从 GKStatementNode 继承的**同一个
+        tuple** —— 原地 append 的话所有语句节点都会长出『自己』。
+        """
+        self.assertEqual([spec["name"] for spec in
+                          NB.GKStatementNode.gk_outputs], ["完成"])
+        # 不是构建节点的语句节点不该多出引脚
+        self.assertEqual([spec["name"] for spec in NN.GKNodeUiHide.gk_outputs],
+                         ["完成"])
+        self.assertIn("自己", [spec["name"] for spec in
+                              NN.GKNodeUiText.gk_outputs])
+
+    # ---- resolver ----
+    def test_parent_name_prefers_link_over_card_field(self):
+        """『父』引脚连线优先;没连才读卡片上的『父控件』。"""
+        design = self._design()
+        panel = design.new_node(NN.GKNodeUiPanel, "底板")
+        text = design.new_node(NN.GKNodeUiText, "标题", gk_text="标题")
+        self.assertEqual(NB.ui_parent_name(text), "")
+        text.gk_parent_widget = "底板"
+        self.assertEqual(NB.ui_parent_name(text), "底板")
+        gk_stub.connect(design, panel, "自己", text, "父")
+        # 连线后即使卡片上的名字是别的,也以连线为准
+        text.gk_parent_widget = "填错的名字"
+        self.assertEqual(NB.ui_parent_name(text), "底板")
+
+    def test_parent_name_reads_widget_ref_upstream(self):
+        """『父』接的是『界面_取控件』时,控件名在它的 gk_widget 上。"""
+        design = self._design()
+        ref = design.new_node(NN.GKNodeUiWidgetRef, "取底板", gk_widget="底板")
+        text = design.new_node(NN.GKNodeUiText, "标题", gk_text="标题")
+        gk_stub.connect(design, ref, "控件", text, "父")
+        self.assertEqual(NB.ui_parent_name(text), "底板")
+
+    def test_parent_missing_pin_falls_back_without_crash(self):
+        """取不到『父』引脚(迁移还没跑到的老节点)时回退字符串,不抛异常。"""
+        holder = types.SimpleNamespace(
+            name="老控件", gk_parent_widget="底板",
+            inputs=types.SimpleNamespace(get=lambda _name: None))
+        self.assertEqual(NB.ui_parent_name(holder), "底板")
+        bare = types.SimpleNamespace(name="老控件", gk_parent_widget="")
+        self.assertEqual(NB.ui_parent_name(bare), "")
+
+    def test_link_based_parent_orders_parent_first_without_warning(self):
+        """连线式父子:父控件仍然先建,子控件真的挂到它下面。"""
+        design = self._design()
+        # 故意把子控件摆在前面 —— 生成时必须自己排回"父先子后"
+        text = design.new_node(NN.GKNodeUiText, "标题", gk_text="暂停")
+        panel = design.new_node(NN.GKNodeUiPanel, "底板",
+                                gk_width=440.0, gk_height=340.0)
+        gk_stub.connect(design, panel, "自己", text, "父")
+        code, warnings = self._apply_design_into(design, make_tree())
+        self.assertEqual(warnings, [], warnings)
+        panel_at = code.find("_gk_ui_底板 = ")
+        child_at = code.find('_gk_find_widget("底板")')
+        self.assertGreater(panel_at, -1, code)
+        self.assertGreater(child_at, -1, code)
+        self.assertLess(panel_at, child_at,
+                        "父控件必须排在子控件前面:\n" + code)
+        # 挂载必须走"父控件"那条分支(而不是退回界面根)——
+        # 注意 `_ui_add_to` 的 else 分支里那句 push_warning("找不到父控件…")
+        # 是**模板文本**,永远在生成物里,不能拿它当判据。
+        window = code[child_at:child_at + 200]
+        self.assertIn("add_child(_gk_ui_标题)", window,
+                      "子控件要挂到父控件下:\n" + window)
+
+    # ---- 结构件 ----
+    def test_structural_nodes_emit_expected_godot_types(self):
+        design = self._design()
+        design.new_node(NN.GKNodeUiCanvas, "画布")
+        design.new_node(NN.GKNodeUiBox, "竖排框", gk_mode="VBOX")
+        design.new_node(NN.GKNodeUiBox, "格子", gk_mode="GRID", gk_columns=3)
+        design.new_node(NN.GKNodeUiBackdrop, "底色")
+        design.new_node(NN.GKNodeUiTextBox, "标题条", gk_text="第一章")
+        code, warnings = self._apply_design_into(design, make_tree())
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Control.new()", code)            # 画布
+        self.assertIn("VBoxContainer.new()", code)      # 竖排限定框
+        self.assertIn("GridContainer.new()", code)      # 网格限定框
+        self.assertIn(".columns = 3", code)
+        self.assertIn("ColorRect.new()", code)          # 背景
+        self.assertIn("PanelContainer.new()", code)     # 文本限定框
+        self.assertIn("set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)",
+                      code)
+
+    def test_box_children_are_container_arranged(self):
+        """挂进『界面_限定框』的子控件用 custom_minimum_size、不写 position。"""
+        design = self._design()
+        box = design.new_node(NN.GKNodeUiBox, "竖排框")
+        button = design.new_node(NN.GKNodeUiButton, "选项", gk_text="开始")
+        gk_stub.connect(design, box, "自己", button, "父")
+        code, warnings = self._apply_design_into(design, make_tree())
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ui_选项.custom_minimum_size", code)
+        self.assertNotIn("_gk_ui_选项.position", code)
+
+    def test_textbox_children_go_into_inner_vbox(self):
+        """文本限定框是两层:子控件挂到里层的 VBox(`_gk_list_body`)。"""
+        design = self._design()
+        box = design.new_node(NN.GKNodeUiTextBox, "标题条", gk_text="标题")
+        button = design.new_node(NN.GKNodeUiButton, "里面", gk_text="点")
+        gk_stub.connect(design, box, "自己", button, "父")
+        code, warnings = self._apply_design_into(design, make_tree())
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_list_body("标题条")', code)
+
+    # ---- 界面引用 / 物体名称 ----
+    def test_widget_and_design_ref_emit_find_widget(self):
+        design = self._design()
+        design.new_node(NN.GKNodeUiCanvas, "主画布")
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        ref = tree.new_node(NN.GKNodeUiWidgetRef, "取按钮", gk_widget="开始按钮")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        gk_stub.connect(tree, ref, "控件", printer, "内容")
+        code, warnings = self._gen_with_design(design, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("开始按钮")', code)
+        # 取界面 -> 那张设计图里『界面_画布』的控件
+        tree2 = make_tree()
+        event2 = self._ready(tree2)
+        printer2 = tree2.new_node(NN.GKNodePrint, "打印")
+        ref2 = tree2.new_node(NN.GKNodeUiDesignRef, "取界面")
+        gk_stub.connect(tree2, event2, "执行", printer2, "执行")
+        gk_stub.connect(tree2, ref2, "界面", printer2, "内容")
+        code2, warnings2 = self._gen_with_design(design, tree2)
+        self.assertEqual(warnings2, [], warnings2)
+        self.assertIn('_gk_find_widget("主画布")', code2)
+
+    def test_object_name_expression_guards_null(self):
+        tree = make_tree()
+        event = self._ready(tree)
+        printer = tree.new_node(NN.GKNodePrint, "打印")
+        name_node = tree.new_node(NN.GKNodeObjectName, "取名字", gk_target="某物")
+        gk_stub.connect(tree, event, "执行", printer, "执行")
+        gk_stub.connect(tree, name_node, "名称", printer, "内容")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".name if ", code)
+        self.assertIn('"")', code)
+
+    # ---- 界面事件 ----
+    def test_mouse_click_event_registers_input_handler(self):
+        """『界面_鼠标点击』:注册 `_input` 回调,链式逻辑收进独立函数。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        click = tree.new_node(NN.GKNodeUiOnMouseClick, "点空白", gk_widget="")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="点了")
+        gk_stub.connect(tree, event, "执行", click, "执行")
+        gk_stub.connect(tree, click, "点了", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _input(event: InputEvent) -> void:", code)
+        self.assertIn("MOUSE_BUTTON_LEFT", code)
+        self.assertIn("click.pressed", code)
+        self.assertIn("print(", code)
+
+    def test_key_press_event_binds_action_and_guards_pressed(self):
+        """『界面_按键按下』:捕获键 -> 输入动作,守卫挡掉按住重复(echo)。"""
+        tree = make_tree()
+        event = self._ready(tree)
+        key = tree.new_node(NN.GKNodeUiOnKeyPress, "开背包", gk_key="I")
+        printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="背包")
+        gk_stub.connect(tree, event, "执行", key, "执行")
+        gk_stub.connect(tree, key, "按了", printer, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _input(event: InputEvent) -> void:", code)
+        self.assertIn("key.is_action_pressed(", code)
+        self.assertIn("key.echo", code)
+        # 捕获到的键 I -> 动作 key_i(和『输入_按键』同一套算法)
+        self.assertIn('"key_i"', code)
+
+    # ---- 菜单归属 ----
+    def test_new_nodes_visible_in_expected_menus(self):
+        from BlenderGameKit import properties as props
+        # 结构件:和其余控件一致 —— 设计图菜单里有、玩法图菜单里没有
+        for cls in (NN.GKNodeUiCanvas, NN.GKNodeUiBox,
+                    NN.GKNodeUiBackdrop, NN.GKNodeUiTextBox):
+            self.assertTrue(props.node_fits_tree(cls, "GKUiDesignTree"))
+            self.assertTrue(props.node_fits_tree(cls, "GKGameLogicTree"))
+            self.assertFalse(props.node_menu_allowed(cls, "GKGameLogicTree"),
+                             cls.bl_label + " 应从玩法图菜单里消失")
+            self.assertTrue(props.node_menu_allowed(cls, "GKUiDesignTree"))
+        # 引用 / 事件 / 变量物体:两张图的菜单里都要有
+        for cls in (NN.GKNodeUiWidgetRef, NN.GKNodeUiDesignRef,
+                    NN.GKNodeUiOnMouseClick, NN.GKNodeUiOnKeyPress,
+                    NN.GKNodeSetVar, NN.GKNodeGetVar, NN.GKNodeGetNode,
+                    NN.GKNodeObjectName):
+            for tree_type in ("GKGameLogicTree", "GKUiDesignTree"):
+                self.assertTrue(props.node_menu_allowed(cls, tree_type),
+                                cls.bl_label + " 应出现在 " + tree_type + " 菜单")
+
+
+class TestRound128UiPop(Base):
+    """第一百二十八轮:『界面_弹入/弹出』组合卡(原神式滑入)。
+
+    一张卡做完"显示 + 置顶 + 滑入 + 淡入 + 黑幕"。这一层钉住四条:
+      1. 滑入的**位移量 = 控件自身尺寸**(先挪出去一个尺寸、再缓动回原位)
+         —— 用户不用自己算 -480 这种数;
+      2. 位置和透明度**同时**跑(`set_parallel(true)`),不设的话会排队;
+      3. 弹出**播完复位 + 藏起来**(不复位的话下次弹入起点会越偏越远);
+      4. 弹出**不勾**『等它播完』-> 复位挂在 `finished` 回调上,链立刻往下走
+         (勾了才 await)。
+    """
+
+    def _chain(self, tree, name, **props):
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        pop = tree.new_node(NN.GKNodeUiPop, name, **props)
+        gk_stub.connect(tree, event, "执行", pop, "执行")
+        return pop
+
+    def test_pop_in_slides_by_self_size_and_raises(self):
+        tree = make_tree()
+        self._chain(tree, "弹菜单", gk_widget="暂停菜单", gk_mode="IN",
+                    gk_direction="LEFT", gk_scrim="黑幕", gk_wait=True)
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("暂停菜单")', code)
+        self.assertIn("_gk_ui_raise(", code)          # 置顶
+        self.assertIn(".size.x, 0.0)", code)          # 位移量 = 自身宽度
+        self.assertIn(".set_parallel(true)", code)    # 位置/透明度同时跑
+        self.assertIn('"modulate:a"', code)           # 顺带淡入
+        self.assertIn('_gk_find_widget("黑幕")', code)
+        self.assertIn("await ", code)                 # 勾了『等它播完』
+        # 引号必须成对(第一百二十八轮真机抓到的那条:多打一个引号
+        # 会让整份 GDScript 语法错误、游戏起不来)
+        self.assert_quotes_balanced(code)
+
+    def test_pop_out_restores_position_and_hides(self):
+        tree = make_tree()
+        self._chain(tree, "收菜单", gk_widget="暂停菜单", gk_mode="OUT",
+                    gk_direction="LEFT", gk_wait=True)
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("暂停菜单")', code)
+        self.assertIn(".visible = false", code)       # 播完藏起来
+        self.assertIn("await ", code)
+        # 弹出不置顶(_gk_ui_raise 只在弹入时才生成)
+        self.assertNotIn("_gk_ui_raise(", code)
+
+    def test_pop_out_without_wait_uses_finished_callback(self):
+        tree = make_tree()
+        self._chain(tree, "收菜单", gk_widget="暂停菜单", gk_mode="OUT",
+                    gk_wait=False)
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn(".finished.connect(func() -> void:", code)
+        self.assertIn(".visible = false", code)
+        self.assertNotIn("await ", code)
+
+    def test_pop_without_widget_warns_and_emits_nothing(self):
+        tree = make_tree()
+        self._chain(tree, "弹菜单", gk_widget="")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in item for item in warnings), warnings)
+        self.assertNotIn("create_tween()", code)
+
+    def test_pop_visible_in_both_menus(self):
+        from BlenderGameKit import properties as props
+        for tree_type in ("GKGameLogicTree", "GKUiDesignTree"):
+            self.assertTrue(props.node_menu_allowed(NN.GKNodeUiPop, tree_type),
+                            "『界面_弹入/弹出』要出现在 " + tree_type + " 菜单")
+
+
+class TestRound128UiFixes(Base):
+    """第一百二十八轮补的两个设计缺口:
+      ① 结构件(画布/限定框/背景/文本限定框)加『开局藏』;
+      ② 『控件』引脚让『取控件/取界面』的引用**真能被吃**(设置/隐藏/设焦点/
+         缓动/弹入弹出),引脚优先、没接才按名字找。
+    """
+
+    def _design(self, name="修缺设计"):
+        design = gk_stub.StubNodeTree(name)
+        design.bl_idname = "GKUiDesignTree"
+        return design
+
+    def _gen_with_design(self, design, tree, options=None):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[design]))
+        try:
+            return gen(tree, options or V2)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def _apply_design(self, design, extra_node=None):
+        """建一棵"有事件 -> 套用设计"的图,顺便可选挂一个节点在链上。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        apply_node = tree.new_node(NN.GKNodeUiApplyDesign, "套用")
+        apply_node.gk_design = design.name
+        gk_stub.connect(tree, event, "执行", apply_node, "执行")
+        if extra_node is not None:
+            gk_stub.connect(tree, apply_node, "完成", extra_node, "执行")
+        return tree
+
+    def test_structural_nodes_have_start_hidden(self):
+        for idname in ("GKNodeUiCanvas", "GKNodeUiBox", "GKNodeUiBackdrop",
+                       "GKNodeUiTextBox"):
+            cls = getattr(NN, idname)
+            self.assertIn("gk_start_hidden",
+                          [spec[0] for spec in cls.gk_prop_defs],
+                          cls.bl_label + " 缺『开局藏』")
+
+    def test_start_hidden_emits_visible_false(self):
+        design = self._design()
+        design.new_node(NN.GKNodeUiBox, "藏起来的框", gk_start_hidden=True)
+        code, warnings = self._gen_with_design(
+            design, self._apply_design(design))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ui_藏起来的框.visible = false", code)
+
+    def test_start_hidden_off_by_default(self):
+        design = self._design()
+        design.new_node(NN.GKNodeUiBox, "摆出来的框")
+        code, warnings = self._gen_with_design(
+            design, self._apply_design(design))
+        self.assertEqual(warnings, [], warnings)
+        self.assertNotIn("_gk_ui_摆出来的框.visible = false", code)
+
+    def test_ref_consumers_have_widget_pin(self):
+        for idname in NN.UI_REF_CONSUMER_NODES:
+            cls = getattr(NN, idname)
+            self.assertIn("控件", [spec["name"] for spec in cls.gk_inputs],
+                          cls.bl_label + " 缺『控件』引脚")
+
+    def test_widget_pin_beats_card_name(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        ref = tree.new_node(NN.GKNodeUiWidgetRef, "取底板", gk_widget="底板")
+        hide = tree.new_node(NN.GKNodeUiHide, "藏", gk_widget="卡片上填错的",
+                             gk_visible=False)
+        gk_stub.connect(tree, event, "执行", hide, "执行")
+        gk_stub.connect(tree, ref, "控件", hide, "控件")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("底板")', code)
+        self.assertIn(".visible = false", code)
+        # 走引脚时**不能**再拿卡片上的名字去拼东西(否则会误导人以为名字错了)
+        self.assertNotIn("卡片上填错的", code)
+
+    def test_name_still_works_without_pin(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        hide = tree.new_node(NN.GKNodeUiHide, "藏", gk_widget="底板",
+                             gk_visible=True)
+        gk_stub.connect(tree, event, "执行", hide, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn('_gk_find_widget("底板")', code)
+        self.assertIn(".visible = true", code)
+
+    def test_missing_both_name_and_pin_warns(self):
+        """名字清空、也没接『控件』引脚 -> 要有一条明确的告警。
+
+        ⚠ 不能靠默认值:『界面_隐藏控件』的『控件名』默认是 "提示"(不是空),
+          不显式清空的话它会当成"填了名字",这条永远测不到(踩过一次)。
+        """
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        hide = tree.new_node(NN.GKNodeUiHide, "藏", gk_widget="")
+        gk_stub.connect(tree, event, "执行", hide, "执行")
+        code, warnings = gen(tree, V2)
+        self.assertTrue(any("控件名" in item for item in warnings), warnings)
+
+
+class TestRound150SwayAndCamera(Base):
+    """第一百五十轮:通用摆动 / 相机运镜 / 第一人称俯仰。"""
+
+    def test_sway_generates_physics_helper(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        sway = tree.new_node(NN.GKNodeSway, "摆", gk_target="吊灯",
+                             gk_axis="Z", gk_amplitude=5.0,
+                             gk_period=4.5, gk_phase=0.0)
+        gk_stub.connect(tree, event, "执行", sway, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_sway_start(", code)
+        self.assertIn("func _gk_sway_tick(delta: float) -> void:", code)
+        self.assertIn("var _gk_sways: Array = []", code)
+        self.assertIn("_gk_sway_start(self, 目标_吊灯, 2, 5.0, 4.5, 0.0)", code)
+        self.assertIn("_gk_sway_tick(delta)", code)
+        # Node3D 和 Control 两种目标都要能摆
+        self.assertIn("if target is Node3D:", code)
+        self.assertIn("elif target is Control:", code)
+
+    def test_camera_shot_generates_async_helper(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        shot = tree.new_node(NN.GKNodeCameraShot, "运镜",
+                             gk_camera="特写机位", gk_look_target="敌人",
+                             gk_time=2.5, gk_hold=1.5, gk_return_time=1.0,
+                             gk_return_home=True, gk_fov_from=60.0,
+                             gk_fov_to=35.0, gk_ease="EASE_OUT")
+        gk_stub.connect(tree, event, "执行", shot, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_camera_shot(", code)
+        self.assertIn("var _gk_camera_shot_busy: bool = false", code)
+        self.assertIn("相机_特写机位", code)
+        self.assertIn("看向_敌人", code)
+        # 不 await:调用后执行链立刻往下走(镜头自己演)
+        self.assertIn("_gk_camera_shot(self, 相机_特写机位, null, 看向_敌人",
+                      code)
+        self.assertIn("shot.look_at(aim, Vector3.UP)", code)
+        self.assertIn("home.make_current()", code)
+        self.assertIn("curve.sample_baked(a * path_len, true)", code)
+        # 第一百五十一轮:曲线是世界坐标(终点不平移),开头从当前相机并线
+        self.assertIn("var approach := minf(0.35", code)
+        self.assertIn("pos = start_pos.lerp(pos, into)", code)
+        self.assertNotIn("curve.sample_baked(path_len, true) + shift", code)
+
+    def test_first_person_uses_dir_for_orientation(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "每帧")
+        arm = tree.new_node(NN.GKNodeCameraSpringArm, "第一人称",
+                            gk_camera="第一人称相机", gk_arm=0.25,
+                            gk_height=1.55, gk_pitch=0.0,
+                            gk_collision=False, gk_lag=0.0)
+        pitch = tree.new_node(NN.GKNodeConstFloat, "俯仰 37", gk_value=37.0)
+        gk_stub.connect(tree, physics, "执行", arm, "执行")
+        gk_stub.connect(tree, pitch, "值", arm, "俯仰")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        # 引脚接的是 37° -> 生成的 Basis 必须带 37,而不是属性里的 0
+        self.assertIn("deg_to_rad(37.0)", code)
+        # 第一人称朝向 = 杆子反方向 -dir(不是 look_at 枢轴)
+        self.assertIn("global_position - _gk_dir, Vector3.UP", code)
+        self.assertIn("_gk_spring_base_yaw", code)
+
+    def test_camera_shot_2d_warns_and_does_nothing(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        shot = tree.new_node(NN.GKNodeCameraShot, "运镜")
+        gk_stub.connect(tree, event, "执行", shot, "执行")
+        _code, warnings = gen(tree, V2)
+        self.assertTrue(any("3D" in item for item in warnings), warnings)
+
+
+class TestRound150AiSense(Base):
+    """第一百五十轮:AI_感知(视听合一)。"""
+
+    def _ready(self, tree):
+        return tree.new_node(NN.GKNodeOnReady, "准备")
+
+    def _ai_tree(self, name="敌人AI"):
+        ai = gk_stub.StubNodeTree(name)
+        ai.bl_idname = "GKGameAiTree"
+        return ai
+
+    def _gen_with_ai(self, ai, tree, options=None):
+        original = getattr(bpy_module(), "data", None)
+        setattr(bpy_module(), "data",
+                types.SimpleNamespace(node_groups=[ai]))
+        try:
+            return gen(tree, options or V3)
+        finally:
+            if original is None:
+                try:
+                    delattr(bpy_module(), "data")
+                except AttributeError:
+                    pass
+            else:
+                setattr(bpy_module(), "data", original)
+
+    def test_sense_feeds_transition(self):
+        ai = self._ai_tree()
+        patrol = ai.new_node(NN.GKNodeAiState, "巡逻", gk_state_name="巡逻",
+                             gk_behavior="STAND")
+        chase = ai.new_node(NN.GKNodeAiState, "追击", gk_state_name="追击",
+                            gk_behavior="CHASE", gk_goal="玩家")
+        sense = ai.new_node(NN.GKNodeAiSense, "感知", gk_goal="玩家",
+                            gk_distance=9.0, gk_angle=0.0,
+                            gk_ear=0.0, gk_memory=1.2,
+                            gk_hear_type="脚步")
+        trans = ai.new_node(NN.GKNodeAiTransition, "看见",
+                            gk_from_state="巡逻", gk_to_state="追击")
+        gk_stub.connect(ai, sense, "看见", trans, "条件")
+        tree = make_tree()
+        event = self._ready(tree)
+        enable = tree.new_node(NN.GKNodeAiEnable, "启用AI")
+        gk_stub.connect(tree, event, "执行", enable, "执行")
+        code, warnings = self._gen_with_ai(ai, tree)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_ai_can_see_3d(self, 节点_玩家, 9.0, 0.0)", code)
+        self.assertIn("_gk_heard_", code)
+        self.assertIn(" or ", code)
+
+    def test_sense_node_fits_ai_tree(self):
+        from BlenderGameKit import properties as props
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiSense,
+                                             "GKGameAiTree"))
+        self.assertTrue(props.node_fits_tree(NN.GKNodeAiSense,
+                                             "GKGameLogicTree"))
+
+
+class TestRound150CloudAndAssets(unittest.TestCase):
+    """第一百五十轮:云影 / 灯的父子关系 / 组合资产。"""
+
+    def test_cloud_shadow_modulates_moon(self):
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        clouds = _FakePostNode("GKNodeClouds")
+        clouds.gk_cloud_shadow = 0.55
+        clouds.gk_cloud_amount = 0.28
+        clouds.gk_cloud_speed = 0.012
+        moon = _FakePostNode("GKNodeMoon")
+        moon.gk_moon_energy = 0.8
+        _post_link(start, "执行", clouds, "执行")
+        _post_link(clouds, "完成", moon, "执行")
+        with mock.patch.object(ae, "_post_graph",
+                               return_value=_FakePostTree(
+                                   [start, clouds, moon])):
+            block = ae._post_block()
+        self.assertIn("const _GK_CLOUD_SHADOW := 0.55", block)
+        self.assertIn("var cloud_shade := 1.0", block)
+        self.assertIn("cloud_shade = 1.0 - _GK_CLOUD_SHADOW", block)
+        self.assertIn("* cloud_shade, 0.0)", block)
+        # 第一百五十一轮:月面纹理 + 云层月光银边
+        self.assertIn("_GK_MOON_TEXTURE", block)
+        self.assertIn("use_moon_texture", block)
+
+    def test_asset_tree_includes_children(self):
+        from BlenderGameKit import asset_export as ae
+
+        class _Obj:
+            def __init__(self, name, children=()):
+                self.name = name
+                self.children = list(children)
+
+        grand = _Obj("门牌")
+        child = _Obj("门锁", [grand])
+        source = _Obj("大门", [child])
+        entry = {"source": source, "members": [source]}
+        names = {obj.name for obj in ae.asset_tree_objects(entry)}
+        self.assertEqual(names, {"大门", "门锁", "门牌"})
+
+    def test_light_parent_names(self):
+        from BlenderGameKit import asset_export as ae
+        pivot = types.SimpleNamespace(name="吊灯摆动", type="EMPTY")
+        light = types.SimpleNamespace(name="吊灯", type="LIGHT", parent=pivot)
+        loose = types.SimpleNamespace(name="太阳", type="LIGHT", parent=None)
+        in_collection = types.SimpleNamespace(
+            name="壁灯", type="LIGHT",
+            parent=types.SimpleNamespace(name="集合", type="COLLECTION"))
+        text = ae._light_parent_names([light, loose, in_collection])
+        self.assertEqual(text, "吊灯=吊灯摆动")
+
+
+class TestRound151LightShape(unittest.TestCase):
+    """第一百五十一轮第二轮:柔边不规则光斑 / 灯池不过于完美。"""
+
+    def test_cookie_patterns_are_valid_png(self):
+        from BlenderGameKit import asset_export as ae
+        blobs = {}
+        for pattern in ("RECT", "LAMP", "SOFT"):
+            data = ae.light_cookie_png(pattern)
+            self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"), pattern)
+            self.assertGreater(len(data), 100, pattern)
+            blobs[pattern] = data
+        # 三种图案必须真的不一样(不是同一张图换个名字)
+        self.assertEqual(len(set(blobs.values())), 3)
+        self.assertEqual(ae._LIGHT_COOKIE_NAMES["SOFT"], "light_cookie_soft")
+
+    def test_soft_cookie_has_irregular_falloff(self):
+        """SOFT 的中心应明显亮于边缘,且不能被切成一张"完美圆盘"。"""
+        from BlenderGameKit import asset_export as ae
+        # 用同一个噪声函数复算中心/边缘的 alpha,钉住"边缘淡出"
+        centre = 0.78 + 0.22 * ae._cookie_noise(0.5, 0.5)
+        edge = ae._cookie_smooth(1.02, 0.58, 1.0)
+        self.assertGreater(centre, 0.6)
+        self.assertLess(edge, 0.1)
+        self.assertGreater(centre * edge, 0.0)
+        self.assertEqual(
+            len(ae.light_cookie_png("SOFT")),
+            len(ae.light_cookie_png("SOFT")),
+            "同一张 cookie 每次生成都该一样(确定性噪声)")
+
+    def test_projector_names_include_soft(self):
+        from BlenderGameKit import asset_export as ae
+        lights = [
+            types.SimpleNamespace(
+                name="吊灯", gk_light=types.SimpleNamespace(projector="SOFT")),
+            types.SimpleNamespace(
+                name="壁灯", gk_light=types.SimpleNamespace(projector="LAMP")),
+            types.SimpleNamespace(
+                name="窗光", gk_light=types.SimpleNamespace(projector="RECT")),
+            types.SimpleNamespace(
+                name="普通灯", gk_light=types.SimpleNamespace(projector="NONE")),
+        ]
+        text = ae._light_projector_names(lights)
+        self.assertIn("吊灯=res://art/light_cookie_soft.png", text)
+        self.assertIn("壁灯=res://art/light_cookie_lamp.png", text)
+        self.assertIn("窗光=res://art/light_cookie_rect.png", text)
+        self.assertNotIn("普通灯", text)
+
+    def test_moon_texture_is_deterministic_png(self):
+        from BlenderGameKit import asset_export as ae
+        first = ae.moon_texture_png()
+        second = ae.moon_texture_png()
+        self.assertTrue(first.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(first, second)
+        self.assertGreater(len(first), 2000)
+
+    def test_moon_phase_animation_constants(self):
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        moon = _FakePostNode("GKNodeMoon")
+        moon.gk_moon_enabled = True
+        moon.gk_moon_phase_animate = True
+        moon.gk_moon_phase_seconds = 24.0
+        moon.gk_moon_phase_min = 0.18
+        _post_link(start, "执行", moon, "执行")
+        with mock.patch.object(ae, "_post_graph",
+                               return_value=_FakePostTree([start, moon])):
+            block = ae._post_block()
+        self.assertIn("const _GK_MOON_PHASE_AUTO := true", block)
+        self.assertIn("const _GK_MOON_PHASE_SECONDS := 24", block)
+        self.assertIn("const _GK_MOON_PHASE_MIN := 0.18", block)
+        self.assertIn("cos(phase_cycle * TAU)", block)
+
+    def test_cloud_texture_is_deterministic_png(self):
+        from BlenderGameKit import asset_export as ae
+        first = ae.cloud_texture_png()
+        second = ae.cloud_texture_png()
+        self.assertTrue(first.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(first, second)
+        self.assertGreater(len(first), 2000)
+        pixels = ae.cloud_texture_pixels()
+        self.assertEqual(len(pixels), ae._CLOUD_TEX_SIZE ** 2)
+        self.assertTrue(any(value < 40 for value in pixels))
+        self.assertTrue(any(value > 200 for value in pixels))
+
+    def test_cloud_texture_loaded_by_env_script(self):
+        from BlenderGameKit import asset_export as ae
+        start = _FakePostNode("GKNodeEnvDefault")
+        clouds = _FakePostNode("GKNodeClouds")
+        _post_link(start, "执行", clouds, "执行")
+        with mock.patch.object(ae, "_post_graph",
+                               return_value=_FakePostTree([start, clouds])):
+            block = ae._post_block()
+        self.assertIn('const _GK_CLOUD_TEXTURE := "res://art/cloud_texture.png"',
+                      block)
+        self.assertIn('set_shader_parameter("use_cloud_texture", 1.0)',
+                      block)
+        self.assertIn('set_shader_parameter("cloud_texture", _cloud_tex)',
+                      block)
+
+    def test_sky_shader_samples_cloud_texture(self):
+        from BlenderGameKit import asset_export as ae
+        path = os.path.join(ae.shader_source_dir(), "gk_sky.gdshader")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("uniform sampler2D cloud_texture", text)
+        self.assertIn("texture(cloud_texture", text)
+        self.assertIn("acos(clamp(to_moon", text)
+        self.assertIn("cos(moon_phase * PI)", text)
+        self.assertIn("star_amount", text)
+
+
+class TestRound151ScriptNodes(unittest.TestCase):
+    """第一百五十一轮:自定义脚本节点(加载 / 停止 / 调用)。"""
+
+    def test_script_paths_are_stable(self):
+        from BlenderGameKit import script_assets as sa
+        name = "我的特效"
+        self.assertTrue(sa.file_name(name).endswith(".gd"))
+        self.assertEqual(sa.file_name(name), sa.file_name(name))
+        self.assertTrue(sa.res_path(name).startswith("res://scripts/custom/"))
+        self.assertEqual(sa.res_path(name),
+                         "res://scripts/custom/" + sa.file_name(name))
+        self.assertTrue(sa.instance_key(name).isascii())
+        # 两个不同的文本块不能落到同一个文件
+        self.assertNotEqual(sa.file_name("特效 A"), sa.file_name("特效 B"))
+
+    def test_load_stop_call_generate_helpers(self):
+        from BlenderGameKit import script_assets as sa
+        text = types.SimpleNamespace(name="我的特效")
+        key = sa.instance_key(text.name)
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        load = tree.new_node(NN.GKNodeScriptLoad, "加载",
+                             gk_script_text=text, gk_start_method="start")
+        stop = tree.new_node(NN.GKNodeScriptStop, "停止",
+                             gk_script_text=text, gk_stop_method="stop")
+        call = tree.new_node(NN.GKNodeScriptCall, "调用",
+                             gk_script_text=text, gk_method="burst")
+        gk_stub.connect(tree, event, "执行", load, "执行")
+        gk_stub.connect(tree, load, "完成", stop, "执行")
+        gk_stub.connect(tree, stop, "完成", call, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("func _gk_script_load(", code)
+        self.assertIn("func _gk_script_stop(", code)
+        self.assertIn("func _gk_script_call(", code)
+        self.assertIn("var _gk_custom_scripts: Dictionary = {}", code)
+        path = sa.res_path(text.name)
+        self.assertIn(f'_gk_script_load(self, "{path}", "{key}", "start")', code)
+        self.assertIn(f'_gk_script_stop("{key}", "stop")', code)
+        self.assertIn(f'_gk_script_call("{key}", "burst")', code)
+
+    def test_missing_script_warns(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        load = tree.new_node(NN.GKNodeScriptLoad, "加载",
+                             gk_script_text=None)
+        gk_stub.connect(tree, event, "执行", load, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertTrue(any("没选脚本" in item for item in warnings), warnings)
+        self.assertNotIn("_gk_script_load(self,", code)
+
+    def test_daynight_alternate_generates_calls(self):
+        from BlenderGameKit import asset_export as ae
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "准备")
+        alt = tree.new_node(NN.GKNodeEnvAlternate, "昼夜交替",
+                            gk_alt_day=7.0, gk_alt_night=21.0,
+                            gk_alt_fade=12.0, gk_alt_hold=8.0)
+        stop = tree.new_node(NN.GKNodeEnvAlternateStop, "停止交替")
+        gk_stub.connect(tree, event, "执行", alt, "执行")
+        gk_stub.connect(tree, alt, "完成", stop, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("_gk_env_alt_start(7.0, 21.0, 12.0, 8.0)", code)
+        self.assertIn("._gk_env_alt_stop()", code)
+        # 环境脚本那一侧也必须真有状态机
+        block = "\n".join(ae._daynight_body_lines())
+        self.assertIn("func _gk_env_alt_start(", block)
+        self.assertIn("func _gk_env_alt_tick(", block)
+        self.assertIn("_gk_env_alt_tick(delta)", block)
+        self.assertIn("func _gk_hour_lerp(", block)
 
 
 if __name__ == "__main__":

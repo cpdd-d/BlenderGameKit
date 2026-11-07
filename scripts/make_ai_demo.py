@@ -248,7 +248,9 @@ def build_ai_tree():
     chase = _add(tree, "GKNodeAiState", "追击", 700.0, 0.0,
                  gk_state_name="追击", gk_behavior="CHASE",
                  gk_goal=PLAYER, gk_speed=CHASE_SPEED,
-                 gk_stop_distance=CHASE_STOP, gk_facing="GOAL")
+                 gk_stop_distance=CHASE_STOP, gk_facing="GOAL",
+                 gk_in_count=3)     # 进入 1/2/3:看见 / 又跑远 / 去查看撞见
+    chase.build_sockets()
     # ── 听觉:听到动静就过去看看(第五十七轮)──────────────────────────
     # 别和『追击』混:追击是"看见你"直接冲过来;去查看是"听见响动但不知道
     # 你在哪",走到那个位置看看 —— 恐怖游戏里最经典的那个"引开 / 被引开"。
@@ -258,8 +260,18 @@ def build_ai_tree():
                 gk_facing="MOVE",
                 # 第八十轮 D-12③:到点后原地环顾 ±70° / 2 秒,看完才许安静回岗
                 gk_look_angle=LOOK_ANGLE, gk_look_time=LOOK_TIME)
+    # ── 视听合一(第一百五十轮)────────────────────────────────────
+    # 用户原话:"AI 的'看见'失效,应该是既能听又能看"。
+    # 这张图原来只有"看见"和"听见"两条**平行**支路:去查看状态里只判
+    # 安静下来,不判视觉 —— 于是"听见动静走过去、走到跟前却看不见"。
+    # 现在用『AI_感知』把两条路收在一起,并把它的『看见』接到
+    # **去查看 -> 追击** 的转场上,视听才真的合流。
+    sense = _add(tree, "GKNodeAiSense", "感知(看+听)", -60.0, 220.0,
+                 gk_goal=PLAYER, gk_distance=SIGHT, gk_angle=0.0,
+                 gk_ear=0.0, gk_memory=EAR_MEMORY,
+                 gk_hear_type=NOISE_TYPE)
     see = _add(tree, "GKNodeAiTransition", "看见玩家", 320.0, 180.0,
-               gk_cond_source="SEE", gk_goal=PLAYER, gk_sight=SIGHT)
+               gk_cond_source="PIN", gk_goal=PLAYER, gk_sight=SIGHT)
     back = _add(tree, "GKNodeAiTransition", "丢失玩家", 320.0, -210.0,
                 gk_cond_source="LOST", gk_goal=PLAYER, gk_sight=LOST_RANGE)
     heard = _add(tree, "GKNodeAiTransition", "听见动静", 320.0, 340.0,
@@ -287,6 +299,9 @@ def build_ai_tree():
     away = _add(tree, "GKNodeAiTransition", "又跑远", 1040.0, -430.0,
                 gk_cond_source="LOST", gk_goal=PLAYER,
                 gk_sight=ATTACK_RANGE + 1.5)
+    # 去查看途中撞见玩家 -> 直接转追击(第一百五十轮:补上视觉那一半)
+    look_see = _add(tree, "GKNodeAiTransition", "撞见玩家", 1040.0, 340.0,
+                    gk_cond_source="PIN")
 
     # 环用连线搭(实测 Blender 4.5.5 允许,保存 / 读回都正常)
     _link(tree, start, "开始", patrol, "进入")
@@ -310,6 +325,11 @@ def build_ai_tree():
     _link(tree, close, "转到", attack, "进入")
     _link(tree, attack, "转到", away, "上游")
     _link(tree, away, "转到", chase, "进入 2")
+    # 视听合一:看见 -> 巡逻/去查看 都接同一个『AI_感知』的『看见』
+    _link(tree, sense, "看见", see, "条件")
+    _link(tree, sense, "看见", look_see, "条件")
+    _link(tree, look, "转到", look_see, "上游")
+    _link(tree, look_see, "转到", chase, "进入 3")
     log(f"AI 图『{tree.name}』:巡逻 --看见({SIGHT:g} 米)--> 追击 "
         f"--贴近({ATTACK_RANGE:g} 米)--> 攻击(每 {ATTACK_COOLDOWN:g} 秒"
         f"『{HIT_VAR}』+1) --又跑远--> 追击;"

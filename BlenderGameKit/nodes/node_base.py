@@ -48,6 +48,7 @@ except Exception:
 _USE_BPY_BASE = _BPY and not _OFFLINE
 
 from .. import gk_sockets as S
+from . import node_presentation as presentation
 
 # bl_idname -> 节点类，codegen 通过它反查节点语义
 node_type_registry = {}
@@ -317,6 +318,53 @@ def draw_ui_align_row(node, layout):
         row.prop(node, "gk_margin", text="边距")
 
 
+# 控件引用取值节点(第一百二十七轮):『父』接的是它时,控件名在它的
+# `gk_widget` 属性上,而不是节点名 —— 见 ui_parent_name 里的分叉。
+UI_WIDGET_REF_NODES = ("GKNodeUiWidgetRef",)
+
+
+def ui_parent_name(node):
+    """界面控件的**父控件名**:先看『父』引脚接了谁,没接才读卡片上的『父控件』。
+
+    ── 为什么是"名字"而不是节点对象(第一百二十七轮)───────────────
+    控件是运行时 `new()` 出来的,父子挂载最终仍走
+    `_gk_find_widget(父名)`(见 codegen.services._ui_add_to)。所以连线只是
+    "另一种写法":这里把连线翻译成父节点名,生成器那条老路一行都不用改,
+    老图(填名字)的生成物逐字不变。
+
+    ── 为什么不能走 ctx.expr_of ───────────────────────────────────
+    『父』接的是控件节点本身(它的『自己』出口),而控件构建节点**没有
+    取值处理器**,`expr_of` 会求成 null 并刷一条"不能作为取值使用"的告警。
+    所以这里直接读连线、取上游节点的名字。
+
+    ── 上游是"控件引用取值节点"时要分叉 ─────────────────────────
+    『界面_取控件』是取值节点(可以接到『父』上当"用引用拼层级"),
+    它的节点名不是控件名 —— 控件名写在它的 `gk_widget` 属性上。
+
+    ── 老文件 / 老图 ──────────────────────────────────────────────
+    `父` 引脚还不存在(迁移没跑到)时 `.get("父")` 返回 None,直接回退到
+    `gk_parent_widget` 字符串 —— 不报错。
+    """
+    socket = None
+    getter = getattr(getattr(node, "inputs", None), "get", None)
+    if callable(getter):
+        try:
+            socket = getter("父")
+        except Exception:
+            socket = None
+    if socket is not None and getattr(socket, "is_linked", False):
+        link = None
+        for candidate in (getattr(socket, "links", ()) or ()):
+            link = candidate
+            break
+        source = getattr(link, "from_node", None) if link is not None else None
+        if source is not None:
+            if getattr(source, "bl_idname", "") in UI_WIDGET_REF_NODES:
+                return str(getattr(source, "gk_widget", "") or "").strip()
+            return str(getattr(source, "name", "") or "").strip()
+    return str(getattr(node, "gk_parent_widget", "") or "").strip()
+
+
 def inline_prop_entries(node):
     """节点体上要**自动画出来**的参数:返回 (属性名, 类型, 标签) 列表。
 
@@ -488,6 +536,14 @@ def prop_action(default=None, name="", description="", **kw):
                            name=name, description=description, **kw)
 
 
+def prop_text_block(default=None, name="", description="", **kw):
+    """引用 Text 数据块，名称或列表顺序变化时仍指向同一个脚本。"""
+    if not _USE_BPY_BASE:
+        return GKProp(default, name=name, description=description, **kw)
+    return PointerProperty(type=bpy.types.Text, name=name,
+                           description=description, **kw)
+
+
 _PROP_FACTORY = {
     "float": prop_float,
     "int": prop_int,
@@ -497,6 +553,7 @@ _PROP_FACTORY = {
     "color": prop_color,
     "float_vector": prop_vector,
     "action": prop_action,
+    "text_block": prop_text_block,
 }
 
 
@@ -539,6 +596,10 @@ def _on_pin_count_changed(node, _context=None):
             pass
 
 
+def _on_presentation_changed(node, _context=None):
+    presentation.apply_socket_style(node)
+
+
 # 这些属性一变就重建引脚(蓝图式动态引脚)。
 # 值是**属性名前缀**:只要属性名里含这些词,就自动挂上重建回调。
 PIN_COUNT_HINTS = ("count", "steps", "cases", "branches", "出口", "分支")
@@ -561,6 +622,8 @@ def materialize_props(cls):
         desc = entry[4] if len(entry) > 4 else ""
         # 声明里可以带第六项:额外 kwargs(比如 min/max/update)
         extra = dict(entry[6]) if len(entry) > 6 and isinstance(entry[6], dict) else {}
+        if prop_name == "gk_op" and hasattr(cls, "active_inputs") and "update" not in extra:
+            extra["update"] = _on_presentation_changed
         if kind == "enum":
             items = entry[5] if len(entry) > 5 else ()
             # 枚举也要能吃第六项的 kwargs —— 『逻辑_布尔运算』换运算方式时
@@ -589,6 +652,10 @@ def materialize_props(cls):
 def finalize(cls):
     """节点类装饰器:物化声明式属性 + 登记到类型表。"""
     materialize_props(cls)
+    if "draw_buttons" in cls.__dict__:
+        cls.draw_buttons = presentation.with_input_controls(cls.draw_buttons)
+    if "build_sockets" in cls.__dict__:
+        cls.build_sockets = presentation.with_socket_style(cls.build_sockets)
     node_type_registry[cls.bl_idname] = cls
     return cls
 
@@ -619,6 +686,7 @@ def build_declared_sockets(node):
                 socket.default_value = spec["default"]
             except Exception:
                 pass
+    presentation.apply_socket_style(node)
 
 
 if _USE_BPY_BASE:
@@ -662,6 +730,10 @@ if _USE_BPY_BASE:
         # ---- 引脚 ----
         def init(self, context):
             self.build_sockets()
+            presentation.apply_node_style(self)
+
+        def update(self):
+            presentation.apply_socket_style(self)
 
         def build_sockets(self):
             build_declared_sockets(self)
@@ -751,6 +823,7 @@ if _USE_BPY_BASE:
             return bool(self.input_value(ctx, socket_name, fallback))
 
         # ---- UI ----
+        @presentation.with_input_controls
         def draw_buttons(self, context, layout):
             """节点体上直接画出声明的参数(用户 2026-10-04)。
 
@@ -780,8 +853,10 @@ if _USE_BPY_BASE:
             box.label(text=f"分类: {self.gk_category}", icon="INFO")
             if self.gk_input_props:
                 col = box.column(align=True)
-                for socket_name, prop_name in self.gk_input_props.items():
-                    col.label(text=f"{socket_name} → {prop_name}", icon="DOT")
+                for socket, _prop in presentation.mapped_inputs(self):
+                    source = "由连线提供" if socket.is_linked else "使用卡片默认值"
+                    col.label(text=f"{socket.name} · {source}",
+                              icon="LINKED" if socket.is_linked else "DOT")
 
 else:
 

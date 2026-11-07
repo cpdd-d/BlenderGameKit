@@ -110,6 +110,12 @@ func _initialize() -> void:
 			and env_res.background_mode == Environment.BG_SKY,
 			str(env_res.background_mode) if env_res != null else "no environment")
 	_check("sky_resource", env_res != null and env_res.sky != null)
+	_check("star_params",
+			float(env._gk_sky_mat.get_shader_parameter("star_amount")) > 0.0,
+			str(env._gk_sky_mat.get_shader_parameter("star_amount")))
+	_check("moon_angular_size",
+			float(env._gk_sky_mat.get_shader_parameter("moon_size")) > 0.0,
+			str(env._gk_sky_mat.get_shader_parameter("moon_size")))
 
 	# ② 太阳:方向 / 强度跟着时刻走
 	var sun: DirectionalLight3D = env._gk_daynight_find_sun()
@@ -126,12 +132,14 @@ func _initialize() -> void:
 	var energy_noon: float = sun.light_energy
 	var day_noon: float = env._gk_sky_mat.get_shader_parameter("day_amount")
 	var top_noon: Color = env._gk_sky_mat.get_shader_parameter("sky_top")
+	var cloud_noon: float = env._gk_sky_mat.get_shader_parameter("cloud_amount")
 	env._gk_daynight_set_time(0.0)
 	await process_frame
 	var dir_night: Vector3 = sun.global_transform.basis.z.normalized()
 	var energy_night: float = sun.light_energy
 	var day_night: float = env._gk_sky_mat.get_shader_parameter("day_amount")
 	var top_night: Color = env._gk_sky_mat.get_shader_parameter("sky_top")
+	var cloud_night: float = env._gk_sky_mat.get_shader_parameter("cloud_amount")
 
 	_check("sun_orbit", dir_morning.distance_to(dir_noon) > 0.05,
 			"%.3f" % dir_morning.distance_to(dir_noon))
@@ -142,6 +150,8 @@ func _initialize() -> void:
 			"noon=%.3f night=%.3f" % [day_noon, day_night])
 	_check("sky_top_changes", top_noon != top_night,
 			str(top_noon) + " vs " + str(top_night))
+	_check("cloud_day_boost", cloud_noon > cloud_night + 0.2,
+			"noon=%.3f night=%.3f" % [cloud_noon, cloud_night])
 
 	# ③ 时间真的在走(直接喂 tick:无头跑得快,墙钟不可靠)
 	env._gk_daynight_set_speed(1.0)
@@ -196,12 +206,19 @@ func _initialize() -> void:
 		env._gk_daynight_set_time(0.0)
 		await process_frame
 		moon_night = moon.light_energy
+		var moon_dir_night: Vector3 = moon.global_transform.basis.z.normalized()
 		env._gk_daynight_set_time(12.0)
 		await process_frame
 		moon_day = moon.light_energy
+		var moon_dir_day: Vector3 = moon.global_transform.basis.z.normalized()
 		_check("moon_at_night", moon_night > 0.05, "%.4f" % moon_night)
 		_check("moon_dim_by_day", moon_night > moon_day * 2.0,
 				"night=%.4f day=%.4f" % [moon_night, moon_day])
+		# 第一百五十一轮第六轮:月亮按环境时钟走一条夜路(不再钉死)
+		_check("moon_moves", moon_dir_night.distance_to(moon_dir_day) > 0.3,
+				"%.3f" % moon_dir_night.distance_to(moon_dir_day))
+		_check("moon_night_high", moon_dir_night.y > 0.4,
+				"y=%.3f" % moon_dir_night.y)
 	_check("moon_sky_params",
 			float(env._gk_sky_mat.get_shader_parameter("moon_phase")) > 0.0)
 
@@ -228,6 +245,40 @@ func _initialize() -> void:
 	env._gk_env_set_time(20.2)
 	await process_frame
 	_check("hour_signal", hits.has(19) and hits.has(20), str(hits))
+
+	# ⑩ 月相动画(第一百五十一轮第四轮):满月 -> 最弯 -> 复圆
+	env._gk_daynight_set_speed(1.0)
+	env._gk_dn_elapsed = 0.0
+	env._gk_daynight_tick(0.001)
+	await process_frame
+	var phase_full: float = float(env._gk_sky_mat.get_shader_parameter("moon_phase"))
+	env._gk_dn_elapsed = 0.0
+	env._gk_daynight_tick(4.0)
+	await process_frame
+	var phase_new: float = float(env._gk_sky_mat.get_shader_parameter("moon_phase"))
+	_check("moon_phase_wanes", phase_full > phase_new + 0.4,
+			"%.3f -> %.3f" % [phase_full, phase_new])
+	_check("moon_phase_reaches_min", phase_new < 0.26, "%.3f" % phase_new)
+	env._gk_dn_elapsed = 0.0
+	env._gk_daynight_tick(8.0)
+	await process_frame
+	var phase_back: float = float(env._gk_sky_mat.get_shader_parameter("moon_phase"))
+	_check("moon_phase_returns", phase_back > phase_new + 0.5,
+			"%.3f" % phase_back)
+
+	# ⑪ 昼夜交替(第一百五十一轮第四轮):过渡 -> 停留 -> 过渡 -> 停留
+	env._gk_daynight_set_time(0.0)
+	env._gk_env_alt_start(7.0, 21.0, 2.0, 1.0)
+	_check("alt_start", env._gk_dn_alt_active)
+	env._gk_daynight_tick(2.0)
+	_check("alt_to_day", is_equal_approx(env._gk_dn_hour, 7.0),
+			"%.3f" % env._gk_dn_hour)
+	env._gk_daynight_tick(1.0)
+	env._gk_daynight_tick(2.0)
+	_check("alt_to_night", is_equal_approx(env._gk_dn_hour, 21.0),
+			"%.3f" % env._gk_dn_hour)
+	env._gk_env_alt_stop()
+	_check("alt_stop", not env._gk_dn_alt_active)
 	_finish()
 
 
@@ -275,10 +326,18 @@ def build_project(work):
     # 固定几个值,断言才好写;其余走卡上的出厂默认
     daynight.gk_day_seconds = 60.0
     daynight.gk_start_hour = 8.0
+    # 只改天空(第一百五十一轮第六轮):环境光 / 雾保持场景设置
+    daynight.gk_sky_only = True
     clouds.gk_cloud_amount = 0.6
+    # 白天云量增加(第一百五十一轮第六轮):白天比夜里多 0.3 的云
+    clouds.gk_cloud_day_boost = 0.3
     moon = tree.new_node(NN.GKNodeMoon, "月亮")
     moon.gk_moon_energy = 0.5
     moon.gk_moon_phase = 0.5
+    # 月相动画(第一百五十一轮第四轮):8 秒一整轮,最弯 0.2
+    moon.gk_moon_phase_animate = True
+    moon.gk_moon_phase_seconds = 8.0
+    moon.gk_moon_phase_min = 0.2
     weather = tree.new_node(NN.GKNodeWeather, "天气")
     weather.gk_weather = "CLOUDY"
     gk_stub.connect(tree, start, "执行", sun, "执行")
@@ -296,6 +355,10 @@ def build_project(work):
         ae._post_graph = original
     if "_gk_daynight_setup" not in block:
         raise SystemExit("环境脚本里没有生成昼夜那一块:\n" + block[:400])
+    for needle in ("const _GK_DN_SKY_ONLY := true",
+                   "const _GK_CLOUD_DAY_BOOST := 0.3"):
+        if needle not in block:
+            raise SystemExit("环境脚本里没有生成常量 %s" % needle)
 
     script = ae.render_env_script(camera_name="", post_block=block)
     with open(os.path.join(work, "scripts", "gk_environment.gd"), "w",

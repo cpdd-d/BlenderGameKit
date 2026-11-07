@@ -477,35 +477,88 @@ PIN_RENAMES = {
 
 
 def migrate_pin_names():
-    """把所有 GK 节点树里过期的引脚名换成新的。返回改了几个节点。"""
+    """把所有 GK 节点树里过期的引脚名换成新的。返回改了几个节点。
+
+    ── 第一百二十七轮:除了"改名",还补"声明了但实例上没有"的引脚 ─────
+    界面控件节点新加了『父』『自己』两个引脚(连线式父子层级),而引脚是在
+    节点 init() 时按类的 `gk_inputs / gk_outputs` 建的 —— **已经存进
+    .blend 的节点不会自己长出来**。所以判据从"有陈旧引脚"扩成
+    "实例引脚集合和声明对不上(缺了 / 多了)",对不上就 rebuild。
+
+    `rebuild_sockets()` 会先把连线按引脚名存下来、重建完再照原名接回去
+    (见 node_base._GKNodeBase.rebuild_sockets),所以补引脚不会丢旧连线。
+
+    ⚠ 必须幂等:重建后缺失引脚已存在,再跑一次就该返回 0。某类节点的
+      `build_sockets` 若产不出某个声明引脚,这里就会**每次加载都重建** ——
+      冒烟测试里有一条"连跑两次第二次返回 0"的断言钉着这件事。
+
+    ── 扫描范围也扩了 ─────────────────────────────────────────────
+    原来只扫 `GKGameLogicTree` / `GKAnimationTree`;界面设计图等其余 GK 树
+    里的节点同样会缺引脚,所以改成读 properties.GK_TREE_KINDS 那份总名单
+    (为什么收成常量见那边的说明)。
+    """
     try:
         import bpy
     except Exception:
         return 0
+    try:
+        from .. import properties as _properties
+        kinds = getattr(_properties, "GK_TREE_KINDS", ())
+    except Exception:
+        kinds = ()
     changed = 0
     for tree in getattr(getattr(bpy, "data", None), "node_groups", ()) or ():
-        if getattr(tree, "bl_idname", "") not in ("GKGameLogicTree",
-                                                  "GKAnimationTree"):
+        if kinds and getattr(tree, "bl_idname", "") not in kinds:
             continue
         for node in getattr(tree, "nodes", ()) or ():
-            mapping = PIN_RENAMES.get(getattr(node, "bl_idname", ""), {})
-            wanted = [spec.get("name") for spec in (node.gk_inputs or ())]
+            declared_in = getattr(node, "gk_inputs", None)
+            declared_out = getattr(node, "gk_outputs", None)
+            if declared_in is None and declared_out is None:
+                # NodeFrame / 备注框这类**不是 GK 节点**的东西也住在 GK 树里
+                # (没有 gk_inputs/gk_outputs)。直接读属性会 AttributeError ——
+                # 踩过的坑:整趟迁移被那一句掀翻,靠调用方的 try/except 吞掉,
+                # 表现成"迁移一直悄悄不干活"。
+                continue
+            wanted_in = [spec.get("name") for spec in (declared_in or ())]
+            wanted_out = [spec.get("name") for spec in (declared_out or ())]
             # ── 除了改名,还要删掉**已经不存在**的引脚(用户 2026-10-03)──
             # 用户反复问"这些重复为什么删不掉":我在代码里把重复的物体引脚
             # 删了,但他**已经保存的 .blend** 里,那些引脚是当数据存着的 ——
             # 新建的节点没这个问题,老节点会一直顶着旧引脚。
             # 判据:当前引脚名既不在声明里、也不在"动态引脚"的名单里
             # (『进入 2』『出口 3』这种是按数量生成的),就重建。
+            #
+            # ⚠ 『→』也要算动态(第一百二十七轮实测抓到的):『动画_状态机』
+            #   按转场生成 `idle→run` / `run→idle` 这种**入边引脚**,名字不在
+            #   声明里、也不带上面那些前缀 —— 不算动态的话这个节点**每次
+            #   加载都会被重建**(而且是老代码里就潜伏的 bug:迁移因此永不
+            #   收敛,重建还会把转场连线抖一遍)。
+            #
+            # ⚠ 还有一类"名字完全由内容决定"的动态引脚(『函数_调用』按函数
+            #   声明的**参数名**长引脚,比如「金额」)—— 前缀/『→』都抓不到,
+            #   由类自己声明 `gk_dynamic_pins = True` 跳过这项判定。
             dynamic_prefixes = ("进入 ", "出口 ", "分支 ", "值 ", "输入 ")
-            stale = []
-            for socket in getattr(node, "inputs", ()) or ():
-                name = getattr(socket, "name", "")
-                if name in wanted:
-                    continue
-                if any(name.startswith(p) for p in dynamic_prefixes):
-                    continue
-                stale.append(name)
-            if not stale:
+            dynamic_class = bool(getattr(node, "gk_dynamic_pins", False))
+            current_in = [getattr(socket, "name", "")
+                          for socket in (getattr(node, "inputs", ()) or ())]
+            current_out = [getattr(socket, "name", "")
+                           for socket in (getattr(node, "outputs", ()) or ())]
+            stale = [] if dynamic_class else [
+                name for name in current_in
+                if name not in wanted_in
+                and "→" not in name
+                and not any(name.startswith(p) for p in dynamic_prefixes)]
+            # 缺声明引脚:类上声明了、实例的 inputs/outputs 里却没有。
+            # ⚠ 有些声明引脚在**特定模式下按设计就不该存在**:
+            #   『逻辑_布尔运算』选『非』时只有 A,没有 B。不算"可选"的话,
+            #   每次加载都会判"缺 B"并重建,永远不收敛(第一百五十八轮
+            #   恐怖示例里的 NOT 节点真踩到:每次打开都提示升级 1 个节点)。
+            optional = set(getattr(node, "gk_optional_declared_inputs", ()) or ())
+            missing = [name for name in wanted_in + wanted_out
+                       if name and name not in optional
+                       and name not in current_in
+                       and name not in current_out]
+            if not stale and not missing:
                 continue
             rebuild = getattr(node, "rebuild_sockets", None)
             if rebuild is None:

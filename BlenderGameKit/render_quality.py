@@ -9,6 +9,12 @@ def apply_startup_quality(directory, scene):
     values = {
         "scaling_3d/scale": "1.0",
         "anti_aliasing/quality/msaa_3d": "2",
+        # ── 去色带(第一百四十八轮)─────────────────────────────────
+        # 卡通材质靠**大面积的平滑渐变**吃饭(灯下的墙、天花板的光晕)。
+        # 8 位帧缓冲把这种渐变切成一层层同心圆环 —— 实机天花板上一圈
+        # 一圈的,像贴了张等高线图。Godot 的 debanding 在抖动噪声里补
+        # 1 bit,专门治这个。属于"高画质"该有的默认。
+        "anti_aliasing/quality/use_debanding": "true",
         "textures/default_filters/use_nearest_mipmap_filter": "false",
         "textures/default_filters/anisotropic_filtering_level": "3",
         "lights_and_shadows/positional_shadow/atlas_size": "4096",

@@ -25,6 +25,8 @@ _testrepo/
 # Local scratch
 .audit/
 *.log
+# 脚本误用 %SystemDrive% 字面量时落进仓库的 Windows 缓存副本 —— 垃圾,不提交
+%SystemDrive%/
 # AI 助手的工作记忆(不是项目内容,只是本地会话记录)——别让它进公共仓库
 .workbuddy/
 
@@ -34,6 +36,9 @@ _testrepo/
 #   2) 每次导出都产生一堆"改动",把真正的代码改动淹掉
 # 真正该进版本库的是**源文件**:.blend、节点图脚本生成器、README。
 examples/**/*_godot/
+# 游戏项目同理:源文件是 games/<名字>/<名字>.blend + scripts/make_*.py,
+# <名字>_godot/ 每次生成都会重写,不进版本库。
+games/**/*_godot/
 examples/**/art/*.glb
 examples/**/*.import
 examples/**/*.uid

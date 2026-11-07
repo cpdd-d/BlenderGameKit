@@ -413,6 +413,79 @@ class GKNodeAiHear(B.GKExpressionNode):
 
 
 @N
+class GKNodeAiSense(B.GKExpressionNode):
+    bl_idname = "GKNodeAiSense"
+    bl_label = "AI_感知"
+    bl_icon = "HIDE_ON"
+    gk_category = "AI"
+    gk_tree_type = ("GKGameLogicTree", AI_TREE_ID)
+    gk_doc = ("**把'看'和'听'合成一个判断** —— 三个输出:\n"
+              "* 『看见』:目标在视野距离内、在视野角里、而且没被墙挡住;"
+              "\n"
+              "* 『听见』:最近『记忆秒数』内听到过同类型的噪音;"
+              "\n"
+              "* 『发现』:看见 **或** 听见。\n"
+              "── 为什么要合成 ──\n"
+              "分开用『AI_看得见』+『AI_听见』再接『逻辑_或』也能做,"
+              "但 AI 图里每多一个状态就要重拼一遍;而且只接一个通道时,"
+              "经常出现'听见了走过去,走到跟前却看不见'的断档 —— "
+              "把这个节点的『看见』接到**去查看 -> 追击**的转场条件上,"
+              "视听两条路才真的合流。\n"
+              "── 参数 ──\n"
+              "视野 / 听觉参数和两个单独节点完全一致;"
+              "『听觉距离』填 0 = 不限(只看噪音自己的响度)。")
+    gk_inputs = (
+        S.pin(OBJECT, "目标", None),
+        S.pin(FLOAT, "视野距离", 12.0),
+        S.pin(FLOAT, "视野角", 120.0),
+        S.pin(FLOAT, "听觉距离", 0.0),
+        S.pin(FLOAT, "记忆秒数", 3.0),
+        S.pin(TEXT, "只听类型", ""),
+    )
+    gk_input_props = {
+        "视野距离": "gk_distance", "视野角": "gk_angle",
+        "听觉距离": "gk_ear", "记忆秒数": "gk_memory",
+        "只听类型": "gk_hear_type",
+    }
+    gk_outputs = (
+        S.pin(BOOL, "看见", False),
+        S.pin(BOOL, "听见", False),
+        S.pin(BOOL, "发现", False),
+    )
+    gk_prop_defs = (
+        ("gk_goal", "node", "", "目标",
+         "看谁(『目标』引脚没接线时用它,一般选玩家)"),
+        ("gk_distance", "float", 12.0, "视野距离",
+         "多远以内算看得见(米 / 像素)"),
+        ("gk_angle", "float", 120.0, "视野角",
+         "前方多少度算看得见;0 = 全向(360°)"),
+        ("gk_ear", "float", 0.0, "听觉距离",
+         "耳朵最远能听多远;0 = 不限制(只看噪音响度)"),
+        ("gk_memory", "float", 3.0, "记忆秒数",
+         "听到之后记多久(秒)"),
+        ("gk_hear_type", "string", "", "只听类型",
+         "只对这个类型的噪音算'听见';留空 = 什么都听"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.label(text="目标")
+        B.draw_target_picker(self, row, "gk_goal")
+        row = layout.row(align=True)
+        row.prop(self, "gk_distance", text="视野")
+        row.prop(self, "gk_angle", text="角度")
+        row = layout.row(align=True)
+        row.prop(self, "gk_ear", text="听觉")
+        row.prop(self, "gk_memory", text="记忆")
+        layout.prop(self, "gk_hear_type", text="只听类型")
+        if not str(getattr(self, "gk_goal", "") or "").strip():
+            socket = getattr(self, "inputs", None)
+            socket = socket.get("目标") if socket is not None else None
+            if socket is None or not getattr(socket, "is_linked", False):
+                layout.label(text="! 没选目标,『看见』永远为假", icon="ERROR")
+
+
+@N
 class GKNodeNoise(B.GKStatementNode):
     """『声音_发出噪音』:游戏里"弄出动静",让听得见的 AI 过去查看。
 

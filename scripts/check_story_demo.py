@@ -26,10 +26,12 @@
     『屏住呼吸…』+ 暗角变深、**AI 状态仍是巡逻(不再冻结)**、出来恢复;
     **真潜行:玩家在柜子里、怪物贴在正前方也看不见(仍巡逻),挪出柜子才追击**;
     凑到怪物正前方近处 -> 转追击 + 紧张度上去 + 心跳在响 + 贴身惊吓;
-  * 关卡 3 结局:选择框弹出 -> 按 1 -> 存档落盘(user://)+ 结局大字显示。
+  * 关卡 3 结局:世界**不暂停**、没有『回到开场 / 退出游戏』按钮、场景仍是
+    『结局』;按 S 还能走动 —— 留给玩家继续观察环境。
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -916,6 +918,13 @@ func _physics_process(delta: float) -> void:
 				t = 0.0
 		27:
 			# 追 + 吓:这 1.2 秒里每帧采样心跳 / 震动
+			# ⚠ 第一百四十六轮:这里**真的每帧**把玩家贴在怪物前方 2 米。
+			#   注释一直写着"每帧贴着",实现却只在进这一步时摆了一次 ——
+			#   走廊收窄到 8.4 米之后,怪物一旦转向墙,被摆过去的玩家会落到
+			#   墙外/斜后方,1.2 秒里被甩到十米开外,紧张度自然上不去
+			#   (实测 0.471 = 约 10 米)。这条断言的本意是"贴近且被追时紧张度
+			#   要拉满",所以按本意每帧摆位,而不是把阈值调低。
+			_place_in_front(enemy, player, 2.0)
 			var heart = _var("_gk_heart_player")
 			if heart != null and heart.playing:
 				heard = true
@@ -942,95 +951,39 @@ func _physics_process(delta: float) -> void:
 				step = 30
 				t = 0.0
 		30:
-			# ── 第一百三十九轮:结局不再有旁白/选择/大字 ────────────────
-			# 章节卡淡出 -> 冻住世界 + 两个出口按钮(回到开场 / 退出游戏)。
+			# ── 第一百五十一轮第四轮:结局改成**自由观察环境**──────────
+			# 不再冻住世界、不再有切关卡 / 退出按钮 —— 章节卡淡出后
+			# 世界继续跑,玩家还能按 W/S 走动看环境。
 			if t >= 3.5:
-				var scene_now := get_tree().current_scene
-				print("STORY_ENDING_RESULT frozen=", get_tree().paused,
+				# ⚠ 关卡是当成探针的**子节点**加载的(见 _load 的说明),
+				#   所以 `get_tree().current_scene` 永远是探针自己 ——
+				#   要看"有没有被切走",得看 world 这个实例还在不在、叫什么。
+				print("STORY_ENDING_OBSERVE paused=", get_tree().paused,
 					" back=", _widget_visible("回到开场"),
 					" quit=", _widget_visible("退出游戏"),
-					" dialogs=", _panel_visible("_gk_dialog_panel")
-						or _panel_visible("_gk_choice_panel"),
-					" scene=", String(scene_now.name) if scene_now != null else "<无>")
-				step = 35
+					" scene=", String(world.name) if world != null else "<无>")
+				fp_pos0 = player.global_position if player != null else Vector3.ZERO
+				_push_key(KEY_S, true)
+				step = 31
 				t = 0.0
-		35:
-			# ── 结局期间按 Esc:菜单盖上来 + 世界**继续冻着** + 结局画面让位 ──
-			# (第一百三十五轮:用户拍板"结局时冻住世界 + 明确出口",顺手验一下
-			#  这条新暂停语义在最关键的那张画面上成不成立)
-			if t >= 0.3:
-				_push_key(KEY_ESCAPE, true)
-				step = 351
+		31:
+			if t >= 0.8:
+				_push_key(KEY_S, false)
+				var ending_moved := 0.0
+				if player != null:
+					ending_moved = (player.global_position - fp_pos0).length()
+				print("STORY_ENDING_MOVE moved=", snappedf(ending_moved, 0.01),
+					" paused=", get_tree().paused)
+				step = 32
 				t = 0.0
-		351:
-			if t >= 0.15:
-				_push_key(KEY_ESCAPE, false)
-				step = 352
-				t = 0.0
-		352:
-			if t >= 0.3:
-				print("STORY_ENDING_MENU paused=", get_tree().paused,
-					" menu=", _widget_visible("暂停菜单"),
-					" big_hidden=", not _widget_visible("回到开场"))
-				_push_key(KEY_ESCAPE, true)
-				step = 353
-				t = 0.0
-		353:
-			if t >= 0.15:
-				_push_key(KEY_ESCAPE, false)
-				step = 354
-				t = 0.0
-		354:
-			# ⚠ 等**冷却**(默认 1 秒)过后再看:过场面板收起后要等冷却才回来,
-			#   0.3 秒就断言会读到 big_back=false(第一百三十五轮)。
-			if t >= 1.5:
-				print("STORY_ENDING_BACK paused=", get_tree().paused,
-					" menu=", _widget_visible("暂停菜单"),
-					" big_back=", _widget_visible("回到开场"))
-				# 点『回到开场』—— 它走 `GkWorld.change_level(大堂)`,探针自己
-				# 会被换掉;所以**先把"见证者"挂到 /root**(它活得过换场景),
-				# 由它打那一行结论。
-				var watcher: Node = load("res://exit_watch.gd").new()
-				watcher.name = "EndingExitWatcher"
-				get_tree().root.add_child(watcher)
-				_click_widget("回到开场")
-				step = 355
-				t = 0.0
-		355:
-			# 兜底:两秒内没换关就把结论打成"没换"(见证者活着的话它会先打印)
-			if t >= 2.0:
-				var now := get_tree().current_scene
-				print("STORY_ENDING_EXIT scene=",
-					String(now.name) if now != null else "<无>")
+		32:
+			if t >= 0.2:
 				_drop_world()
 				print("STORY_ENDING_DONE")
 				print("STORY_DONE")
 				set_physics_process(false)
 				get_tree().quit()
 ''' % {"lobby": LOBBY, "corridor": CORRIDOR, "ending": ENDING}
-
-# ── 结局出口的"见证者"(第一百三十五轮)─────────────────────────────
-# 挂在 `/root` 下,活得过换场景:探针点了『回到开场』之后自己会被换掉,
-# 由它来打 `STORY_ENDING_EXIT` 那一行(证明"明确出口"真的把关卡切了)。
-EXIT_WATCH_GD = '''extends Node
-
-# 结局出口的见证者:等当前场景不再是探针(Probe)就打印结论。
-# ⚠ 收尾的 STORY_ENDING_DONE / STORY_DONE 也由它打 —— 探针那时候已经被
-#   换掉了,它打不出来(打了才会让门禁看到"探针跑完")。
-func _ready() -> void:
-	process_mode = Node.PROCESS_MODE_ALWAYS
-	for _i in range(360):
-		await get_tree().process_frame
-		var scene := get_tree().current_scene
-		if scene != null and String(scene.name) != "Probe":
-			print("STORY_ENDING_EXIT scene=", String(scene.name))
-			print("STORY_ENDING_DONE")
-			print("STORY_DONE")
-			get_tree().quit()
-			return
-	print("STORY_ENDING_EXIT scene=<没换>")
-	queue_free()
-'''
 
 PROBE_TSCN = '''[gd_scene load_steps=2 format=3]
 
@@ -1052,11 +1005,6 @@ def prepare(src=None):
     with open(os.path.join(OUT, "probe.gd"), "w",
               encoding="utf-8", newline="\n") as handle:
         handle.write(PROBE_GD)
-    # 结局出口的"见证者"(第一百三十五轮):探针点『回到开场』之后会被换掉,
-    # 这一份挂在 /root 下,由它打 `STORY_ENDING_EXIT` 那一行。
-    with open(os.path.join(OUT, "exit_watch.gd"), "w",
-              encoding="utf-8", newline="\n") as handle:
-        handle.write(EXIT_WATCH_GD)
     with open(os.path.join(OUT, "probe.tscn"), "w",
               encoding="utf-8", newline="\n") as handle:
         handle.write(PROBE_TSCN)
@@ -1153,11 +1101,10 @@ def _code_checks(problems):
         if f"res://scripts/gk_environment_{env}.gd" not in scene:
             problems.append(f"{level}.tscn 没引用 gk_environment_{env}.gd")
 
-    # 每个 game_logic 里要有"切到下一关"那句(路径对得上)
+    # 前两关要有"切到下一关"那句;结局**不许**有切关卡逻辑(第一百五十一轮)
     switches = {
         "大堂": "res://scenes/走廊.tscn",
         "走廊": "res://scenes/结局.tscn",
-        "结局": "res://scenes/大堂.tscn",
     }
     for level, target in switches.items():
         path = os.path.join(OUT, "scripts", f"game_logic_{level}.gd")
@@ -1170,6 +1117,153 @@ def _code_checks(problems):
             problems.append(f"game_logic_{level}.gd 里没有切关卡的调用")
         if f'"{target}"' not in code:
             problems.append(f"game_logic_{level}.gd 里没有切到 {target} 的那句")
+
+    ending_code_path = os.path.join(OUT, "scripts", "game_logic_结局.gd")
+    if not os.path.isfile(ending_code_path):
+        problems.append("没找到生成的脚本 scripts/game_logic_结局.gd")
+    else:
+        with open(ending_code_path, "r", encoding="utf-8") as handle:
+            ending_code = handle.read()
+        if "change_scene_to_file" in ending_code:
+            problems.append("结局关卡不该再有切关卡逻辑(会妨碍持续观察环境)")
+        if "res://scenes/大堂.tscn" in ending_code:
+            problems.append("结局关卡不该再指回大堂")
+        # 第一百五十一轮第六轮:章节卡淡出后要启动昼夜交替(月亮走夜路 ->
+        # 太阳升起 -> 云变多),而不是停在定格的夜。
+        if "_gk_env_alt_start(12.0, 0.0, 45.0, 25.0)" not in ending_code:
+            problems.append("结局没有启动昼夜交替(月亮不会走、太阳不会出来)")
+
+    # ── 第一百五十轮:摆灯 / 相机运镜 / 云影 / 灯的父子 / 柔和阴影 ──────
+    # 这些是"设计落地"的证据:只改 .blend 不重新导出 / 生成器回归了,
+    # 下面的文本断言会当场变红。
+    extras = {
+        "scripts/game_logic_大堂.gd": (
+            ("_gk_sway_start", "吊灯摆动没有生成"),
+            ("大堂吊灯摆动", "摆动目标没进引用表"),
+            ("_gk_script_load", "自定义脚本示例没有生成"),
+        ),
+        "scripts/game_logic_走廊.gd": (
+            ("_gk_camera_shot", "开场运镜没有生成"),
+            ("走廊怪物特写", "运镜特写机位没进引用表"),
+            ("var approach := minf(0.35", "运镜没有从当前相机并进曲线"),
+        ),
+        "scripts/gk_environment_大堂.gd": (
+            ("light_parents", "灯的父子关系没导出(灯不会跟吊灯摆)"),
+            ("_gk_link_light_parents", "灯没有在运行时挂回父节点"),
+            ("_GK_CLOUD_SHADOW", "云影没有进环境脚本"),
+            ("light_projectors", "光斑 cookie 表没进环境脚本"),
+            ("_gk_apply_light_projectors", "光斑 cookie 没有运行时挂载"),
+            ("_GK_MOON_COLOR := Color(0.860000", "月亮颜色没按冷白导出"),
+            ("_GK_MOON_TEXTURE", "月面纹理路径没进环境脚本"),
+            ("use_moon_texture", "月面纹理没有运行时挂载"),
+            # 第一百五十一轮第四轮:云速 / 月相动画
+            ("_GK_CLOUD_SPEED := 0.06", "云速没有按 0.06 导出(云几乎不动)"),
+            ("_GK_CLOUD_HEIGHT := 0.05", "云层高度没按 0.05 导出"),
+            ("_GK_MOON_SIZE := 0.06", "月盘没有按角半径 0.06 导出"),
+            ("_GK_STAR_AMOUNT := 1.0", "星星数量没导出"),
+            ("_GK_STAR_BRIGHTNESS := 0.75", "星星亮度没导出"),
+            ("star_amount", "星星参数没写进天空材质"),
+            ("_GK_CLOUD_TEXTURE", "云层密度贴图路径没进环境脚本"),
+            ("use_cloud_texture", "云层密度贴图没有运行时挂载"),
+            ("_GK_MOON_PHASE_AUTO := true", "月相动画没有导出"),
+            ("_GK_MOON_PHASE_SECONDS := 24.0", "月相周期不是 24 秒"),
+            ("_GK_MOON_PHASE_MIN := 0.18", "最弯月相不是 0.18"),
+            # 第一百五十一轮第六轮:昼夜时间轴 / 只改天空 / 白天云量 / 月亮升落
+            ("_GK_DN_ENABLED := true", "昼夜循环没有导出"),
+            ("_GK_DN_START_HOUR := 0.0", "起始时刻不是 0 点(月亮不在正北)"),
+            ("_GK_DN_AUTO := false", "昼夜循环不该自动流逝(时间要留给结局接管)"),
+            ("_GK_DN_SKY_ONLY := true", "『只改天空』没有导出(会盖掉场地环境光/雾)"),
+            ("_GK_CLOUD_DAY_BOOST := 0.25", "白天云量增加没有导出"),
+            ("_GK_MOON_ORBIT := true", "月亮没有按昼夜升落"),
+            ("_GK_DN_SUN_NAME := \"太阳\"", "太阳没有按名字绑定"),
+            ("_GK_DN_SUN_TILT := 0.0", "太阳方位偏移不是 0(日轨会歪)"),
+            ("PI * 0.5 + angle", "太阳没有走东→北→西的正弧线"),
+            ("sun_size", "太阳盘参数没写进天空材质"),
+        ),
+        "scripts/gk_environment_走廊.gd": (
+            ("light_cookie_lamp", "壁灯的灯罩竖纹 cookie 没导出"),
+            ("light_cookie_soft", "吊灯的柔边不规则 cookie 没导出"),
+            ("_GK_MOON_PHASE := 1.0", "月亮不是满月"),
+        ),
+        "shaders/gk_sky.gdshader": (
+            ("acos(clamp(to_moon", "月盘没有按角半径算(会变成满屏大圆盘)"),
+            ("cos(moon_phase * PI)", "月相晨昏线不是椭圆(弯月会是硬切线)"),
+            ("star_amount", "天空着色器没有星星"),
+            ("texture(cloud_texture", "云层没有采样密度贴图"),
+            ("sky_uv", "云层没有用球面 UV(地平线附近会碎成叶子)"),
+            ("floor(cloud_scale * 2.0 + 0.5)",
+             "云层方位角没取整数张(会有一条竖直切断的接缝)"),
+            ("floor(cloud_scale * 3.0 + 0.5)", "第二层云没取整数张"),
+            ("mix(0.45, 1.0, day_amount)", "云的昼夜亮度曲线没更新"),
+            ("float zenith = smoothstep(0.55, 0.90, up)",
+             "天顶没有切到平面投影(抬头看会是菊花云)"),
+            ("top_uv * top_tiles", "天顶平面投影没采样"),
+            ("sun_near = wide", "太阳暖晕没算出来"),
+            ("vec3(1.0, 0.76, 0.38)", "太阳附近的云没有被烘暖"),
+            ("core * sun_draw * 0.55", "云后面没有补日核(太阳会被云咬成弯月)"),
+            ("sun_size > 0.0005", "不画太阳时没有整段跳过(天空会被洗灰)"),
+        ),
+        "shaders/gk_toon_lit.gdshader": (
+            ("facing_mid", "三层朝向色阶没有生成"),
+            ("pool_mid", "三层光池色阶没有生成"),
+        ),
+        "scenes/大堂.tscn": (
+            ("shadow_blur = 2.500", "柔和阴影没导出"),
+            ("shadow_opacity = 0.8000", "阴影浓度没导出"),
+        ),
+        "scenes/结局.tscn": (
+            ('[node name="太阳" type="DirectionalLight3D"',
+             "结局场景没有『太阳』平行光(天亮时没有太阳可升)"),
+        ),
+    }
+    for rel, checks in extras.items():
+        path = os.path.join(OUT, rel)
+        if not os.path.isfile(path):
+            problems.append(f"缺文件 {rel}(第一百五十轮的设计没落地)")
+            continue
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        for needle, why in checks:
+            if needle not in text:
+                problems.append(f"{rel}: {why}")
+
+    # 第一百五十一轮:自定义脚本文本块必须真的落到 scripts/custom/
+    custom_scripts = glob.glob(os.path.join(OUT, "scripts", "custom", "GK*.gd"))
+    if not custom_scripts:
+        problems.append("自定义脚本没有导出到 scripts/custom/")
+    else:
+        with open(custom_scripts[0], "r", encoding="utf-8") as handle:
+            body = handle.read()
+        if "extends Node" not in body:
+            problems.append("导出的自定义脚本不是合法的 GDScript")
+        if "[GK示例脚本]" not in body:
+            problems.append("导出的自定义脚本内容不对(找不到示例标记)")
+
+    # 第一百五十一轮:月面纹理必须真的写进 art/
+    moon_png = os.path.join(OUT, "art", "moon_texture.png")
+    if not os.path.isfile(moon_png):
+        problems.append("月面纹理没有导出到 art/moon_texture.png")
+    else:
+        with open(moon_png, "rb") as handle:
+            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+                problems.append("moon_texture.png 不是合法 PNG")
+
+    # 第一百五十一轮第四轮:云密度贴图也必须真的写进 art/
+    cloud_png = os.path.join(OUT, "art", "cloud_texture.png")
+    if not os.path.isfile(cloud_png):
+        problems.append("云层密度贴图没有导出到 art/cloud_texture.png")
+    else:
+        with open(cloud_png, "rb") as handle:
+            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+                problems.append("cloud_texture.png 不是合法 PNG")
+
+    # 第一百五十一轮:结局那盏"从窗外斜切进来的聚光"必须已经撤掉 ——
+    # 它和月亮重复,还会把蜡烛 / 椅子拉出长黑影。
+    ending_scene = os.path.join(OUT, "scenes", "结局.tscn")
+    if os.path.isfile(ending_scene):
+        with open(ending_scene, "r", encoding="utf-8") as handle:
+            if "结局窗光" in handle.read():
+                problems.append("结局窗光聚光又回来了(会和月亮重复、拉长影子)")
 
 
 def main():
@@ -1213,6 +1307,14 @@ def main():
                     r"STORY_KEYHINT ok=(\S+)", "按键提示 HUD")
     if keyhint:
         _expect(problems, keyhint, 1, "true", "按键提示控件存在且文本非空")
+    # 第一百五十一轮:自定义脚本节点(加载 / 启动 / 调用 / 停止四行打印)
+    for marker, why in (
+            ("[GK示例脚本] 已加载", "『脚本_加载』没有运行脚本"),
+            ("[GK示例脚本] start", "『脚本_加载』没有调用启动方法"),
+            ("[GK示例脚本] hello", "『脚本_调用』没有执行脚本方法"),
+            ("[GK示例脚本] stop", "『脚本_停止』没有执行停止方法 / 没有销毁实例")):
+        if marker not in text:
+            problems.append(why)
     # ── bug4:Alt 必须绑在 **KEY_ALT(4194328)** 上 ────────────────────
     # 这张表曾经把 LEFT_ALT 写成 4194327,那是 Godot 的 **META(Windows 键)**
     # —— 用户按 Alt 一点反应都没有("alt 并未调出鼠标显示")。
@@ -1288,44 +1390,36 @@ def main():
         _expect(problems, pause, 2, "true", "再按一次 Esc 应继续游戏(解冻 + 收起菜单)")
         _expect(problems, pause, 3, "true", "点暂停菜单里的『设置』应弹出设置面板")
         _expect(problems, pause, 4, "true", "点设置面板的『返回』应收起设置面板")
-    # ── 第 125 轮(用户第 3 条)+ 第一百三十五轮(用户"结局要冻住 + 明确出口")──
-    # 第 125 轮的原话:"在最后一关按ESC暂停时,它还会切换关卡" —— 当时的根因是
-    # `SceneTreeTimer` 的 `process_always` 默认 true,结局链最后"停留 4 秒 ->
-    # 切回大堂"在暂停里照走。
-    # 第一百三十五轮用户拍板改成:**结局时冻住世界 + 给明确出口**,那条
-    # "停留 4 秒自动切关"整条去掉。所以这里改成量四件事(都是真机数字):
-    #   ① 结局画面出来时世界**是冻的**、两个出口按钮在、而且关卡**没被自己切走**;
-    #   ② 结局期间按 Esc:菜单盖上来 + 世界继续冻着 + 结局画面让位;
-    #   ③ 再按一下 Esc:菜单收起、结局画面回来、世界仍冻着;
-    #   ④ 点『回到开场』:真的切到大堂(由挂在 /root 的见证者打那一行)。
-    # ⚠ 旧字段(ending/saved/big_visible/big_text)第一百三十九轮删了 ——
-    #   结局不再有"选择 + 大字 + 存档",只剩"冻住世界 + 两个出口按钮",
-    #   新断言在文件后面(ENDING_RESULT 的另一处,字段是
-    #   frozen/back/quit/dialogs/scene)。
-    ending_menu = _need(problems, text, "ENDING_MENU",
-                        r"STORY_ENDING_MENU paused=(\S+) menu=(\S+) "
-                        r"big_hidden=(\S+)", "结局期间按 Esc")
-    if ending_menu:
-        _expect(problems, ending_menu, 1, "true", "结局期间按 Esc 不该把世界解冻")
-        _expect(problems, ending_menu, 2, "true", "结局期间按 Esc 该弹出暂停菜单")
-        # (第一百三十九轮:结局的两个出口按钮**不**进过场组 —— 菜单盖上来
-        #  时它们还在底下,但菜单在最上层、点得动,这条断言随之去掉)
-    ending_back = _need(problems, text, "ENDING_BACK",
-                        r"STORY_ENDING_BACK paused=(\S+) menu=(\S+) "
-                        r"big_back=(\S+)", "结局期间收起暂停菜单")
-    if ending_back:
-        _expect(problems, ending_back, 1, "true", "收起菜单不该把结局解冻")
-        _expect(problems, ending_back, 2, "false", "再按一下 Esc 菜单该收起")
-        _expect(problems, ending_back, 3, "true", "菜单收起后结局画面该回来")
-    ending_exit = _need(problems, text, "ENDING_EXIT",
-                        r"STORY_ENDING_EXIT scene=(\S+)",
-                        "点『回到开场』该真的切关卡(见证者那一行)")
-    if ending_exit and ending_exit.group(1) not in ("大堂", "<没换>"):
-        # 场景名带后缀(大堂2 之类)也算过;只有"没换"才是失败
-        pass
-    if ending_exit:
-        _expect(problems, ending_exit, 1, "大堂",
-                "点『回到开场』没切回大堂(明确出口没生效)")
+    # ── 第一百五十一轮第四轮:结局是**自由观察环境**的一关 ─────────────
+    # 用户原话:"在游戏逻辑的结局关卡不需要再有切换关卡等的逻辑了,
+    # 这对关卡环境的持续观察有害。" 所以这里量三件事:
+    #   ① 结局画面出来时世界**没有暂停**、没有『回到开场 / 退出游戏』按钮;
+    #   ② 按 S 还能真的走动(世界没被冻住);
+    #   ③ 没有自动切关卡(场景一直叫『结局』)。
+    ending_observe = _need(
+        problems, text, "ENDING_OBSERVE",
+        r"STORY_ENDING_OBSERVE paused=(\S+) back=(\S+) quit=(\S+) "
+        r"scene=(\S+)", "结局自由观察")
+    if ending_observe:
+        _expect(problems, ending_observe, 1, "false",
+                "结局不该再冻住世界(会妨碍观察环境)")
+        _expect(problems, ending_observe, 2, "false",
+                "结局不该再有『回到开场』按钮(会切走关卡)")
+        _expect(problems, ending_observe, 3, "false",
+                "结局不该再有『退出游戏』按钮")
+        _expect(problems, ending_observe, 4, "结局", "结局场景不该被切走")
+    ending_move = _need(
+        problems, text, "ENDING_MOVE",
+        r"STORY_ENDING_MOVE moved=(\S+) paused=(\S+)", "结局还能走动")
+    if ending_move:
+        try:
+            moved = float(ending_move.group(1))
+        except ValueError:
+            moved = 0.0
+        if moved < 0.1:
+            problems.append(f"结局里按 S 没走动(moved={moved}) —— 世界被冻住了")
+        _expect(problems, ending_move, 2, "false",
+                "结局走动时世界不该是暂停状态")
     # ── P1(第一百二十六轮):暂停菜单出现时旧界面必须让位 ────────────────
     # 用户原话:"有时点快了,就会有这样的情况,那么在如ESC菜单出现时就立刻
     # ── 第一百三十九轮:示例里的剧情(对话/选择)已删 ────────────────────
@@ -1462,16 +1556,8 @@ def main():
         problems.append("走廊探针没跑完")
 
     # ── 关卡 3 结局 ─────────────────────────────────────────────────
-    # ── 第一百三十九轮:结局 = 冻住世界 + 两个出口按钮(没有旁白/选择/大字)
-    result = _need(problems, text, "ENDING_RESULT",
-                   r"STORY_ENDING_RESULT frozen=(\S+) back=(\S+) quit=(\S+) "
-                   r"dialogs=(\S+) scene=(\S+)", "结局(冻住 + 出口按钮)")
-    if result:
-        _expect(problems, result, 1, "true", "结局该把世界冻住")
-        _expect(problems, result, 2, "true", "『回到开场』按钮该在")
-        _expect(problems, result, 3, "true", "『退出游戏』按钮该在")
-        _expect(problems, result, 4, "false",
-                "结局里又出现了剧情面板(对话/选择) —— 该删干净")
+    # 第一百五十一轮第四轮:不再冻住世界 / 不再有出口按钮(断言在上面的
+    # `ENDING_OBSERVE` / `ENDING_MOVE`)。这里只确认探针跑完。
     if "STORY_ENDING_DONE" not in text:
         problems.append("结局探针没跑完")
 

@@ -329,6 +329,21 @@ def _stmt_move_direction(ctx, node, indent):
                 ctx.add_line(indent, f"{target}.velocity.x = {horiz_expr} * {speed}")
     else:
         ctx.add_line(indent, f"{target}.velocity = {temp} * {speed}")
+    # ── 人物转向移动方向(第一百七十六轮,真机反馈)──────────────────
+    # 3D 第三人称:移动 codegen 之前只写 velocity —— 人物模型永远面朝
+    # 初始朝向,相机一转就"横着走/倒着走"。有移动输入时把宿主的 yaw
+    # 转向移动方向(lerp_angle 平滑,不瞬跳;上帝相机把方向抹零,不转)。
+    if ctx.dim == 3:
+        face_dir = world_dir if world_dir is not None else f"({temp})"
+        face_yaw = ctx.new_temp("face_yaw")
+        ctx.add_line(indent, f"if ({face_dir}).length_squared() > 0.0001:")
+        ctx.add_line(
+            indent + 1,
+            f"var {face_yaw} := atan2(-({face_dir}).x, -({face_dir}).z)")
+        ctx.add_line(
+            indent + 1,
+            f"{target}.rotation.y = lerp_angle({target}.rotation.y, "
+            f"{face_yaw}, minf(1.0, 12.0 * get_physics_process_delta_time()))")
     ctx.add_line(indent, f"{target}.move_and_slide()")
     # 『推开刚体』(用户 2026-10-05 第二十八轮)—— 必须放在 move_and_slide 之后,
     # 那时候才有 get_slide_collision() 可查。
@@ -1349,6 +1364,19 @@ def _stmt_set_visible(ctx, node, indent):
     else:
         value = "true" if getattr(node, "gk_visible", True) else "false"
     ctx.add_line(indent, f"{target}.visible = {value}")
+    # ── 同名节点一起藏(第一百五十六轮)──────────────────────────────
+    # 一个 Blender 物体在 Godot 里常常是**两个节点**:网格(glb 实例里)
+    # 和碰撞代理(Colliders 下)。`target` 按类型解析,拿到的是 Area3D /
+    # StaticBody3D —— 只把它 visible=false,网格还留在原地。
+    # 实机表现:捡起钥匙,钥匙**还在桌上**(只是不能再捡)。
+    # 所以再按名字把同名节点全部设一遍;名字没有重复时这一句是空转。
+    raw = str(getattr(node, "gk_target", "") or "").strip()
+    if raw and raw not in ("self",) and not raw.startswith(("@", "./", "../")):
+        ctx.add_line(indent, f"for _gk_node in get_tree().root.find_children("
+                             f"{gd_string(raw)}, \"\", true, false):")
+        ctx.add_line(indent + 1,
+                     "if _gk_node is Node3D or _gk_node is CanvasItem:")
+        ctx.add_line(indent + 2, f"_gk_node.visible = {value}")
 
 
 @stmt_node("GKNodeSetPaused")
@@ -1556,12 +1584,38 @@ def _ray_origin_and_space(ctx, node, indent):
     return space, params_type, origin
 
 
+def _ray_camera_expr(ctx):
+    """『当前相机』的取值表达式。
+
+    2D / 3D 的 API 名字不同，和 _ray_origin_and_space 一个道理:
+    Node2D 上写 get_camera_3d() 在**编译期**就会被拒绝。
+    """
+    if ctx.dim == 2:
+        return "get_viewport().get_camera_2d()"
+    return "get_viewport().get_camera_3d()"
+
+
+def _ray_camera_forward(ctx, cam_var):
+    """相机前向。
+
+    3D: -basis.z —— 相机自己看向的方向(Godot 的相机朝 -Z)。
+    2D: 相机是**俯视**的，没有"看向屏幕里"这个方向，取相机旋转后的
+        『上』(= Vector2.UP.rotated(global_rotation)，和
+        -global_transform.y 是同一个向量)—— 相机转多少，视线就转多少。
+    """
+    if ctx.dim == 2:
+        return f"(-Vector2.UP.rotated({cam_var}.global_rotation))"
+    return f"(-{cam_var}.global_transform.basis.z)"
+
+
 def _emit_ray_branch(ctx, node, indent, hit_var, origin_expr, params_type, space):
     """把射线射出去，结果写进 hit_var。"""
     direction = ctx.input_vector(node, "方向")
     distance = ctx.input_number(node, "距离", "200.0")
     offset = getattr(node, "gk_offset", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
     layer = int(getattr(node, "gk_layer", 1) or 1)
+    origin_mode = str(getattr(node, "gk_origin", "SELF") or "SELF")
+    dir_mode = str(getattr(node, "gk_dir_mode", "STATIC") or "STATIC")
 
     vector_ctor = "Vector2" if ctx.dim == 2 else "Vector3"
     offset_expr = f"{vector_ctor}({gd_number(offset[0])}, {gd_number(offset[1])}" + (
@@ -1571,9 +1625,46 @@ def _emit_ray_branch(ctx, node, indent, hit_var, origin_expr, params_type, space
     from_var = ctx.new_temp("from")
     to_var = ctx.new_temp("to")
     query_var = ctx.new_temp("query")
+    # ── 两个新开关都取默认值时，一个额外临时变量都不许占 ──────────────
+    # new_temp 是全图共用的流水号，多占一个就把后面所有节点的 "dir3" /
+    # "from4" 全顶偏一格 —— 老图的生成物会从"逐字一致"变成满屏 diff。
+    needs_camera = dir_mode == "CAMERA_FORWARD" or origin_mode == "CAMERA"
+    cam_var = ctx.new_temp("cam") if needs_camera else None
 
-    ctx.add_line(indent, f"var {dir_var} := ({direction}).normalized()")
-    ctx.add_line(indent, f"var {from_var} := {origin_expr} + {offset_expr}")
+    if cam_var is not None:
+        ctx.add_line(indent, f"var {cam_var} := {_ray_camera_expr(ctx)}")
+
+    if dir_mode == "CAMERA_FORWARD":
+        # 取不到相机时退回静态方向(而不是崩在一次空的属性访问上)
+        ctx.add_line(indent, f"var {dir_var} := ({direction}).normalized()")
+        ctx.add_line(indent, f"if {cam_var} != null:")
+        ctx.add_line(indent + 1,
+                     f"{dir_var} = {_ray_camera_forward(ctx, cam_var)}.normalized()")
+    else:
+        ctx.add_line(indent, f"var {dir_var} := ({direction}).normalized()")
+
+    if origin_mode == "CAMERA":
+        ctx.add_line(indent, f"var {from_var} := {origin_expr} + {offset_expr}")
+        ctx.add_line(indent, f"if {cam_var} != null:")
+        ctx.add_line(indent + 1,
+                     f"{from_var} = {cam_var}.global_position + {offset_expr}")
+    elif origin_mode == "PLAYER":
+        # 沿父链往上找第一个角色:脚本常挂在"碰撞代理"或模型的子节点上，
+        # 直接取 self 会拿到代理原点(脚下)，拿不到角色本人的位置。
+        walk_var = ctx.new_temp("walk")
+        body_type = "CharacterBody2D" if ctx.dim == 2 else "CharacterBody3D"
+        space_type = "Node2D" if ctx.dim == 2 else "Node3D"
+        ctx.add_line(indent, f"var {from_var} := {origin_expr} + {offset_expr}")
+        ctx.add_line(indent, f"var {walk_var}: Node = self")
+        ctx.add_line(indent, f"while {walk_var} != null:")
+        ctx.add_line(indent + 1, f"if {walk_var} is {body_type}:")
+        ctx.add_line(indent + 2,
+                     f"{from_var} = ({walk_var} as {space_type}).global_position "
+                     f"+ {offset_expr}")
+        ctx.add_line(indent + 2, "break")
+        ctx.add_line(indent + 1, f"{walk_var} = {walk_var}.get_parent()")
+    else:
+        ctx.add_line(indent, f"var {from_var} := {origin_expr} + {offset_expr}")
     ctx.add_line(indent, f"var {to_var} := {from_var} + {dir_var} * {distance}")
     ctx.add_line(indent, f"var {query_var} := {params_type}.create({from_var}, {to_var})")
     ctx.add_line(indent, f"{query_var}.collision_mask = {layer}")
@@ -2843,8 +2934,124 @@ def _stmt_set_light(ctx, node, indent):
     else:
         color_text = "null"
     ctx.need_light_helper = True
-    ctx.add_line(indent, f"_gk_set_light(self, {light}, {on}, {energy}, "
-                         f"{color_text})")
+    fade = float(getattr(node, "gk_fade", 0.0) or 0.0)
+    if fade > 0.0:
+        # 第六个参数只在**填了渐变**时才出现 —— 没填的老图产物一字不变。
+        ctx.add_line(indent, f"_gk_set_light(self, {light}, {on}, {energy}, "
+                             f"{color_text}, {gd_number(fade)})")
+    else:
+        ctx.add_line(indent, f"_gk_set_light(self, {light}, {on}, {energy}, "
+                             f"{color_text})")
+
+
+_FLICKER_MODES = {"FAULT": 0, "CANDLE": 1, "ALARM": 2, "BREATH": 3}
+
+
+@stmt_node("GKNodeLightFlicker")
+def _stmt_light_flicker(ctx, node, indent):
+    """『灯光_闪烁』:把一盏灯登记给逐帧的闪烁器。
+
+    ── 为什么不用『定时_每隔几秒』拼(示例上一版就是这么做的)────────
+    Timer 只能给"开 / 关"两态,而且间隔一到就跳一下 —— 出来的是**方波**,
+    看着像频闪灯。真正的坏灯管是"连续抖动 + 偶尔全灭",必须逐帧算。
+    所以这里生成一句 `_gk_light_flicker_start(...)`,亮度由注册在
+    `_process` 里的 `_gk_light_flicker_tick` 每帧重写。
+
+    ⚠ 只改 `light_energy`,**不碰** `visible`:
+      * 和『灯光_设置』的开关可以叠加(关灯 -> 开灯,相位继续);
+      * 灯被场景切成不可见时,闪烁器会自动跳过它,不会把灯"偷偷点亮"。
+
+    ── 『停止闪烁』(第一百八十六轮)─────────────────────────────────
+    start 对同一盏灯去重(重复执行不会登记两次),但**没有结束手段** ——
+    低电手电忽闪之后捡到电池,灯会一直虚闪。勾上 gk_stop 生成
+    `_gk_light_flicker_stop(...)`:把灯从闪烁数组里摘掉并恢复基准亮度;
+    没在闪就是空操作,所以"每物理帧按条件二选一"这种接法是安全的。
+    """
+    light = ctx.input_string(node, "灯名", "")
+    stop = bool(getattr(node, "gk_stop", False))
+    ctx.need_flicker_helper = True
+    if stop:
+        ctx.add_line(indent, f"_gk_light_flicker_stop(self, {light})")
+        return
+    speed = ctx.input_number(node, "速度", "1.0")
+    depth = ctx.input_number(node, "深度", "0.6")
+    mode = str(getattr(node, "gk_mode", "FAULT") or "FAULT").upper()
+    mode_index = _FLICKER_MODES.get(mode, 0)
+    base = float(getattr(node, "gk_base", 0.0) or 0.0)
+    ctx.process_hooks.setdefault("light_flicker", [])
+    if "_gk_light_flicker_tick(delta)" not in ctx.process_hooks["light_flicker"]:
+        ctx.process_hooks["light_flicker"].append("_gk_light_flicker_tick(delta)")
+    ctx.add_line(indent, f"_gk_light_flicker_start(self, {light}, {mode_index}, "
+                         f"{speed}, {depth}, {gd_number(base)})")
+
+
+_SWAY_AXES = {"X": 0, "Y": 1, "Z": 2}
+
+
+@stmt_node("GKNodeSway")
+def _stmt_sway(ctx, node, indent):
+    """『动画_摆动』:把目标登记给逐物理帧的摆动器。
+
+    ── 为什么用**物理帧**而不是渲染帧 ──────────────────────────────
+    吊灯是场景道具,玩家在物理帧移动、相机也跟着物理帧;两边不同拍时,
+    灯在画面里会"慢半帧"。而且摆动只改 rotation,物理帧足够。
+    """
+    target = ctx.target_expr(node, "gk_target", "目标")
+    amplitude = ctx.input_number(
+        node, "幅度", gd_number(float(getattr(node, "gk_amplitude", 6.0) or 0.0)))
+    period = ctx.input_number(
+        node, "周期", gd_number(float(getattr(node, "gk_period", 4.0) or 0.1)))
+    phase = ctx.input_number(
+        node, "相位", gd_number(float(getattr(node, "gk_phase", 0.0) or 0.0)))
+    axis = _SWAY_AXES.get(str(getattr(node, "gk_axis", "Z") or "Z"), 2)
+    ctx.need_sway_helper = True
+    ctx.physics_hooks.setdefault("sway", [])
+    if "_gk_sway_tick(delta)" not in ctx.physics_hooks["sway"]:
+        ctx.physics_hooks["sway"].append("_gk_sway_tick(delta)")
+    ctx.add_line(indent, f"_gk_sway_start(self, {target}, {axis}, "
+                         f"{amplitude}, {period}, {phase})")
+
+
+_WALK_ARM_SUFFIX = "臂"
+
+
+@stmt_node("GKNodeHumanoidWalk")
+def _stmt_humanoid_walk(ctx, node, indent):
+    """『角色_走路摆动』:把角色登记给逐**物理**帧的人形摆动器。
+
+    ── 为什么不用『动画_播放』──────────────────────────────────────
+    动画节点要 AnimationPlayer + 动画资源,而角色是**零件拼的**(没有骨骼、
+    没有 .anim)。这一版按"名字认零件 + 按速度摆角度"来,零资源、零骨骼。
+
+    ── 为什么是物理帧而不是渲染帧 ──────────────────────────────────
+    摆幅是按 `CharacterBody3D.velocity` 算的,而 velocity 只在物理帧更新;
+    放渲染帧会在两次物理帧之间重复读同一个速度,高刷屏上看起来"一顿一顿"。
+    """
+    # 目标:自身(self)走玩家,填名字走怪物。命名目标要按类型全树查找
+    # (用 _gk_ref_typed),不能写相对 $"怪物" —— 脚本挂在玩家节点上,
+    # 怪物是它的兄弟,相对路径找不到(第 164+1 轮:怪物走路摆动)。
+    target = ctx.target_expr(node, "gk_target", "目标", "CharacterBody3D")
+    # 关键字没有引脚(它就是给"零件怎么命名"用的一个筛选器),直接读属性。
+    # ⚠ 别写成 `ctx.input_string(node, "关节", gd_string(text))`:input_string
+    #   会对字符串**再引一次**,生成 `"\"臂\""` —— 一个永远匹配不到任何零件的
+    #   关键字(第 163 轮实测,第一次重建就是这样)。
+    suffix = gd_string(str(getattr(node, "gk_arm_suffix", "")
+                           or _WALK_ARM_SUFFIX))
+    swing = ctx.input_number(
+        node, "摆幅", gd_number(float(getattr(node, "gk_swing", 34.0) or 34.0)))
+    bob = ctx.input_number(
+        node, "浮沉", gd_number(float(getattr(node, "gk_bob", 0.03))))
+    ref = gd_number(float(getattr(node, "gk_ref_speed", 6.0) or 6.0))
+    # 脚步声(第一百八十二轮):留空 = 不播;填 wav 路径就按摆动相位
+    # 过零(每只脚落地)播一次,音调随机 ±10%。
+    step_path = gd_string(str(getattr(node, "gk_footstep", "") or ""))
+    step_db = gd_number(float(getattr(node, "gk_footstep_db", -10.0)))
+    ctx.need_walk_helper = True
+    ctx.physics_hooks.setdefault("humanoid_walk", [])
+    if "_gk_walk_tick(delta)" not in ctx.physics_hooks["humanoid_walk"]:
+        ctx.physics_hooks["humanoid_walk"].append("_gk_walk_tick(delta)")
+    ctx.add_line(indent, f"_gk_walk_start(self, {target}, {suffix}, "
+                         f"{swing}, {bob}, {ref}, {step_path}, {step_db})")
 
 
 # ==========================================================================

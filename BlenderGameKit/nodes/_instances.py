@@ -243,6 +243,27 @@ class GKNodeGetNode(B.GKExpressionNode):
 
 
 @N
+class GKNodeObjectName(B.GKExpressionNode):
+    bl_idname = "GKNodeObjectName"
+    bl_label = "取值_物体名称"
+    bl_icon = "SORTALPHA"
+    gk_category = "实例"
+    # 界面图里也能用(第一百二十七轮:用户要"获取物体名称")
+    gk_tree_type = ("GKGameLogicTree", "GKUiDesignTree")
+    gk_doc = ("取一个物体的**名字**(Godot 场景树里的节点名)—— "
+              "拼提示文字 / 和某个名字比一比都用它。\n"
+              "⚠ 取的是它在**场景树里的节点名**,不是 Blender 里那个物体对象"
+              "的名字;『物体』留空 = 脚本自己。")
+    gk_outputs = (S.pin(TEXT, "名称", ""),)
+
+    gk_prop_defs = (("gk_target", "node", TARGET_SELF, "物体",
+                     "要取名字的节点;留空 = 脚本自己"),)
+
+    def draw_buttons(self, context, layout):
+        B.draw_target_picker(self, layout)
+
+
+@N
 class GKNodeIsOnFloor(B.GKExpressionNode):
     bl_idname = "GKNodeIsOnFloor"
     bl_label = "取值_是否在地面"

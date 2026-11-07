@@ -89,23 +89,19 @@ class GKNodeSetVar(B.GKStatementNode):
     def draw_buttons(self, context, layout):
         count = max(1, min(SET_VAR_SLOTS,
                            int(getattr(self, "gk_var_count", 1) or 1)))
-        row = layout.row(align=True)
-        row.prop(self, "gk_var_count", text="变量")
-        row.prop(self, "gk_var_name", text="", icon="SORTALPHA")
-        # 放大镜 = 从侧栏『变量』里**声明过的**名字里挑(用户 2026-10-04),
-        # 省得手打名字打错;没声明过的名字照样能手打进去(兼容老图)。
-        pick = row.operator("gk.pick_var", text="", icon="VIEWZOOM")
-        pick.node_name = self.name
-        pick.slot = 1
-        row.prop(self, "gk_value", text="")
-        for index in range(2, count + 1):
-            row = layout.row(align=True)
-            row.label(text=f"{index}.", icon="BLANK1")
-            row.prop(self, f"gk_var_name_{index}", text="")
+        layout.prop(self, "gk_var_count", text="变量数量")
+        for index in range(1, count + 1):
+            suffix = "" if index == 1 else f"_{index}"
+            column = layout.column(align=True)
+            row = column.row(align=True)
+            row.prop(self, f"gk_var_name{suffix}",
+                     text="" if count == 1 else f"变量 {index}")
+            # 变量名独占一行，避免数量、拾取按钮和默认值挤掉中文名称。
             pick = row.operator("gk.pick_var", text="", icon="VIEWZOOM")
             pick.node_name = self.name
             pick.slot = index
-            row.prop(self, f"gk_value_{index}", text="")
+            column.prop(self, f"gk_value{suffix}",
+                        text="值" if index == 1 else f"值 {index}")
 
 
 @N
@@ -140,13 +136,12 @@ class GKNodeAddVar(B.GKStatementNode):
         pick = row.operator("gk.pick_var", text="", icon="VIEWZOOM")
         pick.node_name = self.name
         pick.slot = 1
-        row.prop(self, "gk_amount", text="")
-        row = layout.row(align=True)
-        row.prop(self, "gk_clamp", text="限制范围", toggle=True)
+        layout.prop(self, "gk_amount", text="增减")
+        layout.prop(self, "gk_clamp", text="限制范围", toggle=True)
         if getattr(self, "gk_clamp", False):
-            row.prop(self, "gk_min", text="")
-            row.label(text="~")
-            row.prop(self, "gk_max", text="")
+            column = layout.column(align=True)
+            column.prop(self, "gk_min", text="最小")
+            column.prop(self, "gk_max", text="最大")
 
 
 @N

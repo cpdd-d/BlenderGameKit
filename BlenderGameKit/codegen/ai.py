@@ -31,7 +31,7 @@ from ..nodes.node_base import (TARGET_SELF, gd_string, snake_case)
 from ..nodes import nodes as node_lib
 
 from .literals import gd_number
-from .registry import _chain, expr_node, stmt_node
+from .registry import _chain, expr_node, multi_output, stmt_node
 
 
 # ==========================================================================
@@ -133,6 +133,12 @@ def _emit_patrol_waypoints(ctx, indent, self_expr, reader, stop, speed, facing,
     ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
     _emit_ai_facing(ctx, indent, self_expr, diff, facing)
     ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+    # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+    # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+    # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+    # 前脸挡住才跑,平地零开销。
+    _step_up_helper(ctx)
+    ctx.add_line(indent, f"_gk_step_up_body({self_expr}, 0.35)")
 
 
 # ==========================================================================
@@ -236,6 +242,51 @@ def _ai_nav_layers(state):
     return nav_layer_mask_of(state)
 
 
+def _step_up_helper(ctx):
+    """确保『上台阶』四关探测的 helper 已追加进本脚本(第一百六十七轮)。
+
+    AI 的移动不走『移动_按方向』节点(statements._step_up 的内联版只在
+    节点里生成),7 处状态共用一个函数 —— extra_sections 幂等追加,
+    谁先用谁注册,重复调用不重复生成。逻辑与节点内联版一字不差。
+    """
+    if getattr(ctx, "_ai_step_helper_done", False):
+        return
+    ctx._ai_step_helper_done = True
+    ctx.extra_sections.append({
+        "signature": "func _gk_step_up_body(body: CharacterBody3D, "
+                     "height: float) -> void:",
+        "lines": [
+            "    if body == null or not is_instance_valid(body):",
+            "        return",
+            "    if not body.is_on_floor() "
+            "or body.get_slide_collision_count() == 0:",
+            "        return",
+            "    var flat := Vector3(body.velocity.x, 0.0, body.velocity.z)",
+            "    if flat.length_squared() <= 0.0001:",
+            "        return",
+            "    var forward := flat.normalized() * 0.35",
+            "    var probe := KinematicCollision3D.new()",
+            "    if not body.test_move(body.global_transform, forward, probe):",
+            "        return",
+            "    if absf(probe.get_normal().y) >= 0.5:",
+            "        return",
+            "    var lift := Vector3.UP * height + forward",
+            "    if body.test_move(body.global_transform, lift):",
+            "        return",
+            "    var ahead := body.global_transform.translated(lift)",
+            "    if body.test_move(ahead, forward):",
+            "        return",
+            "    var land := KinematicCollision3D.new()",
+            "    var drop := maxf(height - 0.05, 0.05)",
+            "    if body.test_move(ahead, Vector3.DOWN * drop, land) "
+            "and land.get_normal().y >= 0.5:",
+            "        body.global_position += lift",
+        ],
+        "empty_body": "    pass",
+        "separator": True,
+    })
+
+
 def _walk_direction(ctx, indent, self_expr, goal_at, diff, layers=None):
     """这个行为**这一帧朝哪走** —— 返回一个 GDScript 表达式字符串。
 
@@ -301,6 +352,12 @@ def _stop_and_slide(ctx, indent, self_expr):
     """退化 / 待机:刹住 + 走一帧(保持和碰撞、地面的接触)。"""
     ctx.add_line(indent, f"{self_expr}.velocity = {_vector_zero(ctx)}")
     ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+    # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+    # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+    # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+    # 前脸挡住才跑,平地零开销。
+    _step_up_helper(ctx)
+    ctx.add_line(indent, f"_gk_step_up_body({self_expr}, 0.35)")
 
 
 def _emit_investigate_reset(ctx, indent, machine, at_var, now_var):
@@ -410,6 +467,12 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         # 朝向仍看**目标**(不是看绕路的那个方向):追人的怪应该盯着人
         _emit_ai_facing(ctx, indent, self_expr, diff, facing)
         ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+        # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+        # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+        # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+        # 前脸挡住才跑,平地零开销。
+        _step_up_helper(ctx)
+        ctx.add_line(indent, f"_gk_step_up_body({self_expr}, 0.35)")
         return
 
     # ---- 攻击:走进攻击距离就停,每『冷却』秒"打一下"(第七十九轮)----
@@ -455,6 +518,12 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         # 打的时候仍然看着目标(甩头打不像话)
         _emit_ai_facing(ctx, indent, self_expr, diff, facing)
         ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+        # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+        # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+        # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+        # 前脸挡住才跑,平地零开销。
+        _step_up_helper(ctx)
+        ctx.add_line(indent, f"_gk_step_up_body({self_expr}, 0.35)")
         return
 
     # ---- 逃跑:目标靠近到『停在多远』以内就往反方向跑 ----
@@ -500,6 +569,12 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         ctx.add_line(indent, f"var {face} := -{away}")
         _emit_ai_facing(ctx, indent, self_expr, face, facing)
         ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+        # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+        # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+        # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+        # 前脸挡住才跑,平地零开销。
+        _step_up_helper(ctx)
+        ctx.add_line(indent, f"_gk_step_up_body({self_expr}, 0.35)")
         return
 
     # ---- 去查看:朝**最近听到的噪音点**走(第四十一轮:听觉)----------
@@ -535,6 +610,12 @@ def _emit_ai_behavior(ctx, indent, machine, state):
         _emit_investigate_look(ctx, inner + 1, machine, state, self_expr,
                                now_var)
         ctx.add_line(inner, f"{self_expr}.move_and_slide()")
+        # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+        # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+        # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+        # 前脸挡住才跑,平地零开销。
+        _step_up_helper(ctx)
+        ctx.add_line(inner, f"_gk_step_up_body({self_expr}, 0.35)")
         return
 
     # ---- 巡逻 / 返回:去巡逻点(A / B / C / D,或只去 A)----
@@ -584,6 +665,12 @@ def _emit_ai_behavior(ctx, indent, machine, state):
     ctx.add_line(indent + 1, f"{self_expr}.velocity = {walk} * {speed}")
     _emit_ai_facing(ctx, indent, self_expr, diff, facing)
     ctx.add_line(indent, f"{self_expr}.move_and_slide()")
+    # 『上台阶』(第一百六十七轮):AI 移动不走『移动_按方向』节点,
+    # 这边也要能上真台阶 —— 四关探测抽成了 helper(generator),
+    # 逻辑与节点内联版一字不差。0.35 米 = 正常楼梯一级;被台阶
+    # 前脸挡住才跑,平地零开销。
+    _step_up_helper(ctx)
+    ctx.add_line(indent, f"_gk_step_up_body({self_expr}, 0.35)")
 
 
 # ==========================================================================
@@ -1477,3 +1564,39 @@ def _expr_ai_hear(ctx, node):
     want_type = gd_string(
         str(getattr(node, "gk_hear_type", "") or "").strip())
     return f"{heard_fn}({self_expr}, {ear}, {memory}, {want_type})"
+
+
+@multi_output("GKNodeAiSense")
+def _multi_ai_sense(ctx, node):
+    """『AI_感知』:看 + 听 两条路一次算出来。
+
+    ── 为什么三个输出分开返回 ────────────────────────────────────
+    用户可以在 AI 图里只接『看见』(去查看途中撞见玩家 -> 追击),
+    也可以接『发现』(视听任一成立就警戒)。三个都接时会各算一次 ——
+    看得见那条含射线,代价略高,但比"每多一个状态就重拼一套逻辑"划算;
+    而且 AI 图本来每秒只算几十次,远不到需要缓存的量级。
+    """
+    from .expressions import ensure_position_helper
+    ensure_position_helper(ctx)
+    goal_socket = ctx._socket(node, "目标")
+    if goal_socket is not None and getattr(goal_socket, "is_linked", False):
+        goal = ctx.expr_of(goal_socket)
+    else:
+        goal = _ai_goal_expr(ctx, node)
+        if goal is None:
+            ctx.warn(f"『{node.bl_label}』没选『目标』也没接引脚 —— "
+                     f"『看见』永远返回 false")
+            goal = "null"
+    self_expr = getattr(ctx, "_ai_self_expr", None) or "self"
+    dist = ctx.input_number(node, "视野距离", "12.0")
+    angle = ctx.input_number(node, "视野角", "120.0")
+    see_fn = _ensure_ai_see_helper(ctx)
+    see = f"{see_fn}({self_expr}, {goal}, {dist}, {angle})"
+    prefix = _hear_prefix(getattr(ctx, "_ai_hear_var", "ai_state"))
+    heard_fn, _pos, _at, _type = _ensure_ai_hear_helper(ctx, prefix)
+    ear = ctx.input_number(node, "听觉距离", "0.0")
+    memory = ctx.input_number(node, "记忆秒数", "3.0")
+    want_type = gd_string(
+        str(getattr(node, "gk_hear_type", "") or "").strip())
+    hear = f"{heard_fn}({self_expr}, {ear}, {memory}, {want_type})"
+    return {"看见": see, "听见": hear, "发现": f"({see} or {hear})"}

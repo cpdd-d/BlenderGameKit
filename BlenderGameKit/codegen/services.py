@@ -1,6 +1,7 @@
 """周边服务类发射器:音频、存档、屏幕效果 / UI、滤镜。"""
 
-from ..nodes.node_base import TARGET_SELF, gd_node_path, gd_string, snake_case
+from ..nodes.node_base import (TARGET_SELF, gd_node_path, gd_string,
+                               snake_case, ui_parent_name)
 from ..nodes import nodes as node_lib
 from .. import sound_assets
 
@@ -275,7 +276,21 @@ def _expr_tension(ctx, node):
         reader = ensure_position_helper(ctx)
         near = ctx.input_number(node, "近距", gd_number(getattr(node, "gk_near", 3.0)))
         far = ctx.input_number(node, "远距", gd_number(getattr(node, "gk_far", 15.0)))
-        dist = f"({reader}({threat}) - {reader}(self)).length()"
+        # ── 『测量谁』(第一百五十八轮:关卡图分工暴露的真问题)──────────
+        # 以前固定用 `self`。挂角色图时没问题;挂**关卡图**(脚本 extends
+        # Node3D、在场景根)时,`self` 是世界原点 —— 紧张度变成"原点到怪物
+        # 的距离",玩家走到怪物面前它也不动(恐怖示例真实踩到)。
+        # 新引脚留空时仍用 self,老图生成物一字不变。
+        source_socket = ctx._socket(node, "测量谁")
+        if source_socket is not None and getattr(source_socket, "is_linked", False):
+            source = ctx.expr_of(source_socket)
+        else:
+            raw_source = str(getattr(node, "gk_source", "") or "").strip()
+            if raw_source and raw_source != TARGET_SELF:
+                source = ctx.target_expr(node, "gk_source", hint="测量谁")
+            else:
+                source = "self"
+        dist = f"({reader}({threat}) - {reader}({source})).length()"
         base = (f"clampf((({far}) - {dist}) / "
                 f"maxf(({far}) - ({near}), 0.0001), 0.0, 1.0)")
     return _apply_seen_floor(ctx, node, base)
@@ -422,6 +437,380 @@ def _stmt_scare(ctx, node, indent):
     ctx.add_line(indent + 1, f"{player}.finished.connect({player}.queue_free)")
     ctx.add_line(indent, "else:")
     ctx.add_line(indent + 1, f'push_warning("找不到音频文件: " + str({path}))')
+
+
+# ==========================================================================
+# 恐怖氛围三件套(第一百五十二轮)
+# ==========================================================================
+# 用户:『视角突然变黑,物品莫名掉落,恐怖音效...』
+#
+# 三个都做成**语句节点**,生成的是内联代码(不写 helper 函数):
+#   * 断电:关灯 + 三段补间的全屏黑幕 —— 黑幕要"压黑→停住→淡回",
+#     闪白那种一闪就回不够吓人;
+#   * 掉落:把物体抬到上方 N 米,再加速落回原位,落地播 3D 音效;
+#   * 随机音效:从竖线分隔的路径里抽一条,可选随机音调。
+#
+# ⚠ 变量名全部走 ctx.new_temp:同一个脚本里放两个断电节点时,
+#   固定名字会"重复声明"直接编译失败。
+@stmt_node("GKNodeBlackout")
+def _stmt_blackout(ctx, node, indent):
+    """『恐怖_断电』:关灯 + 全屏黑幕(压黑 / 停住 / 淡回)。"""
+    lights = ctx.input_string(node, "灯名", "")
+    hold = ctx.input_number(node, "黑屏秒数", "0.6")
+    alpha = gd_number(getattr(node, "gk_alpha", 0.92))
+    fade = gd_number(getattr(node, "gk_fade", 0.08))
+    restore = bool(getattr(node, "gk_restore", True))
+
+    was = ctx.new_temp("bo_was")
+    rect = ctx.new_temp("bo_rect")
+    tween = ctx.new_temp("bo_tween")
+    loop = ctx.new_temp("bo_item")
+    light = ctx.new_temp("bo_light")
+
+    # ① 关灯(先记下原来的可见性,恢复时按原样还原)
+    ctx.add_line(indent, f"var {was}: Array = []")
+    ctx.add_line(indent, f"for {loop} in {lights}.split(\"|\", false):")
+    ctx.add_line(indent + 1,
+                 f"var {light} := get_tree().root.find_child("
+                 f"{loop}.strip_edges(), true, false) as Light3D")
+    ctx.add_line(indent + 1, f"if {light} != null:")
+    ctx.add_line(indent + 2, f"{was}.append([{light}, {light}.visible])")
+    ctx.add_line(indent + 2, f"{light}.visible = false")
+
+    # ② 黑幕(一个没有任何着色器的 ColorRect,最省)
+    ctx.add_line(indent, f"var {rect} := ColorRect.new()")
+    ctx.add_line(indent, f"{rect}.color = Color(0.0, 0.0, 0.0, 0.0)")
+    ctx.add_line(indent, f"{rect}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent, f"{rect}.set_anchors_preset(Control.PRESET_FULL_RECT)")
+    ctx.add_line(indent, f"{rect}.z_index = 100")
+    ctx.add_line(indent, "add_child(" + rect + ")")
+
+    # ③ 三段补间:压黑 -> 停住 -> 淡回(恢复灯 + 释放黑幕)
+    ctx.add_line(indent, f"var {tween} := create_tween()")
+    ctx.add_line(indent, f"{tween}.tween_property({rect}, \"color:a\", "
+                         f"{alpha}, maxf({fade}, 0.01))")
+    ctx.add_line(indent, f"{tween}.tween_interval(maxf({hold}, 0.0))")
+    ctx.add_line(indent, f"{tween}.tween_property({rect}, \"color:a\", 0.0, 0.45)")
+    ctx.add_line(indent, f"{tween}.tween_callback(func():")
+    if restore:
+        ctx.add_line(indent + 1, f"for {loop} in {was}:")
+        ctx.add_line(indent + 2, f"if is_instance_valid({loop}[0]):")
+        ctx.add_line(indent + 3, f"{loop}[0].visible = {loop}[1]")
+    ctx.add_line(indent + 1, f"{rect}.queue_free()")
+    ctx.add_line(indent, ")")
+
+    # ④ 断电音效(可留空;路径走 resolve_clip,本地素材会被复制进工程)
+    sound_raw = str(getattr(node, "gk_path", "") or "").strip()
+    if sound_raw:
+        stream = ctx.new_temp("bo_stream")
+        player = ctx.new_temp("bo_sfx")
+        sound_expr = _audio_clip_expr(ctx, node, "音效")
+        ctx.add_line(indent, f"var {stream}: AudioStream = load("
+                             f"{sound_expr}) as AudioStream")
+        ctx.add_line(indent, f"if {stream} != null:")
+        ctx.add_line(indent + 1, f"var {player} := AudioStreamPlayer.new()")
+        ctx.add_line(indent + 1, f"{player}.stream = {stream}")
+        ctx.add_line(indent + 1, f"{player}.volume_db = -2.0")
+        ctx.add_line(indent + 1, f"add_child({player})")
+        ctx.add_line(indent + 1, f"{player}.play()")
+        ctx.add_line(indent + 1, f"{player}.finished.connect({player}.queue_free)")
+
+
+@stmt_node("GKNodeDrop")
+def _stmt_drop(ctx, node, indent):
+    """『恐怖_掉落』:物体抬升 -> 加速落回 -> 落地 3D 音效。"""
+    target_name = str(getattr(node, "gk_target", "") or "").strip()
+    if not target_name:
+        ctx.warn("『恐怖_掉落』没填『物体』—— 这句什么都不会掉")
+        return
+    height = ctx.input_number(node, "高度", "3.0")
+    fall = gd_number(getattr(node, "gk_fall_time", 0.55))
+    sound_raw = str(getattr(node, "gk_path", "") or "").strip()
+    volume = gd_number(getattr(node, "gk_volume", 0.0))
+
+    body = ctx.new_temp("dr_body")
+    home = ctx.new_temp("dr_home")
+    tween = ctx.new_temp("dr_tween")
+
+    ctx.add_line(indent, f"var {body} := get_tree().root.find_child("
+                         f"{gd_string(target_name)}, true, false) as Node3D")
+    ctx.add_line(indent, f"if {body} is Node3D:")
+    ctx.add_line(indent + 1, f"var {home}: Vector3 = ({body} as Node3D).global_position")
+    ctx.add_line(indent + 1, f"({body} as Node3D).global_position = "
+                             f"{home} + Vector3(0.0, {height}, 0.0)")
+
+    stream = None
+    if sound_raw:
+        stream = ctx.new_temp("dr_stream")
+        sound_expr = _audio_clip_expr(ctx, node, "音效")
+        ctx.add_line(indent + 1, f"var {stream}: AudioStream = load("
+                                 f"{sound_expr}) as AudioStream")
+
+    ctx.add_line(indent + 1, f"var {tween} := create_tween()")
+    ctx.add_line(indent + 1,
+                 f"{tween}.tween_property({body}, \"global_position\", {home}, "
+                 f"maxf({fall}, 0.05)).set_trans(Tween.TRANS_QUAD)"
+                 f".set_ease(Tween.EASE_IN)")
+    ctx.add_line(indent + 1, f"{tween}.tween_callback(func():")
+    if stream is not None:
+        player = ctx.new_temp("dr_sfx")
+        ctx.add_line(indent + 2, f"if {stream} != null:")
+        ctx.add_line(indent + 3, f"var {player} := AudioStreamPlayer3D.new()")
+        ctx.add_line(indent + 3, f"{player}.stream = {stream}")
+        ctx.add_line(indent + 3, f"{player}.volume_db = {volume}")
+        ctx.add_line(indent + 3, f"add_child({player})")
+        ctx.add_line(indent + 3,
+                     f"{player}.global_position = ({body} as Node3D).global_position")
+        ctx.add_line(indent + 3, f"{player}.play()")
+        ctx.add_line(indent + 3,
+                     f"{player}.finished.connect({player}.queue_free)")
+    ctx.add_line(indent + 1, ")")
+    ctx.add_line(indent, "else:")
+    ctx.add_line(indent + 1,
+                 f"push_warning(\"『恐怖_掉落』的目标不是 Node3D: \" + str({body}))")
+
+
+@stmt_node("GKNodeRandomSfx")
+def _stmt_random_sfx(ctx, node, indent):
+    """『恐怖_音效』:从一组路径里随机抽一条播放。"""
+    paths = str(getattr(node, "gk_paths", "") or "").strip()
+    if not paths:
+        ctx.warn("『恐怖_音效』没填『音效列表』—— 这句什么都不会播")
+        return
+    volume = ctx.input_number(node, "音量", gd_number(
+        getattr(node, "gk_volume", 0.0)))
+    pitch = bool(getattr(node, "gk_random_pitch", True))
+    positional = bool(getattr(node, "gk_positional", False))
+
+    # 每条路径都走一遍 resolve_clip:本地素材换成 res://audio/<名字_摘要>.wav,
+    # 导出时由 _node_clip_cards 收集复制(见 exporter)。
+    resolved = []
+    for part in paths.split("|"):
+        clean = part.strip()
+        if not clean:
+            continue
+        script_path, _local = sound_assets.resolve_clip(clean)
+        resolved.append(script_path)
+    if not resolved:
+        ctx.warn("『恐怖_音效』的路径全是空的 —— 这句什么都不会播")
+        return
+    pool = ctx.new_temp("sfx_pool")
+    path = ctx.new_temp("sfx_path")
+    stream = ctx.new_temp("sfx_stream")
+    player = ctx.new_temp("sfx_player")
+    ctx.add_line(indent, f"var {pool}: PackedStringArray = "
+                         f"{gd_string('|'.join(resolved))}.split(\"|\", false)")
+    ctx.add_line(indent, f"if not {pool}.is_empty():")
+    ctx.add_line(indent + 1,
+                 f"var {path}: String = {pool}[randi() % {pool}.size()].strip_edges()")
+    ctx.add_line(indent + 1, f"var {stream}: AudioStream = load({path}) as AudioStream")
+    ctx.add_line(indent + 1, f"if {stream} != null:")
+    cls = "AudioStreamPlayer3D" if positional else "AudioStreamPlayer"
+    ctx.add_line(indent + 2, f"var {player} := {cls}.new()")
+    ctx.add_line(indent + 2, f"{player}.stream = {stream}")
+    ctx.add_line(indent + 2, f"{player}.volume_db = {volume}")
+    if pitch:
+        ctx.add_line(indent + 2, f"{player}.pitch_scale = randf_range(0.90, 1.10)")
+    ctx.add_line(indent + 2, f"add_child({player})")
+    if positional:
+        ctx.add_line(indent + 2, f"if self is Node3D:")
+        ctx.add_line(indent + 3, f"{player}.global_position = (self as Node3D).global_position")
+    ctx.add_line(indent + 2, f"{player}.play()")
+    ctx.add_line(indent + 2, f"{player}.finished.connect({player}.queue_free)")
+
+
+@stmt_node("GKNodeCameraFall")
+def _stmt_camera_fall(ctx, node, indent):
+    """『相机_倒地』:下坠 + 侧翻 + 可选黑屏,期间接管弹簧臂。"""
+    from .camera import _camera_expr
+    camera, is_specific = _camera_expr(ctx, node)
+    seconds = gd_number(getattr(node, "gk_time", 1.1))
+    drop = gd_number(getattr(node, "gk_drop", 0.85))
+    roll = gd_number(getattr(node, "gk_roll", 72.0))
+    pitch = gd_number(getattr(node, "gk_pitch", 18.0))
+    fade = gd_number(getattr(node, "gk_fade", 0.0))
+    black = gd_number(getattr(node, "gk_black", 0.9))
+    restore = bool(getattr(node, "gk_restore", False))
+
+    cam_var = ctx.declare_var("_gk_fall_cam", "Node")
+    # 弹簧臂那边也会声明它;declare_var 幂等,这里再声明一次保证
+    # **没有弹簧臂的场景**也能编译(只靠倒地节点接管相机)。
+    ctx.declare_var("_gk_cam_locked", "bool", initial="false")
+    if is_specific:
+        ctx.add_line(indent, f"{cam_var} = {camera}")
+    else:
+        ctx.add_line(indent, f'{cam_var} = get_tree().get_first_node_in_group("gk_camera")')
+        ctx.add_line(indent, f"if {cam_var} == null:")
+        ctx.add_line(indent + 1, f"{cam_var} = _gk_find_camera(self)")
+
+    node_var = ctx.new_temp("fall_node")
+    home_var = ctx.new_temp("fall_home")
+    tween_var = ctx.new_temp("fall_tween")
+    ctx.add_line(indent, f"if {cam_var} is Node3D:")
+    ctx.add_line(indent + 1, "_gk_cam_locked = true")
+    # ── 锁也要写进**相机节点**(第一百五十七轮)───────────────────────
+    # 只写脚本变量的版本在"倒地写在关卡图、弹簧臂写在角色图"时失效:
+    # 两个脚本各有一份变量,互相看不见。meta 挂在节点上,谁都读得到。
+    ctx.add_line(indent + 1,
+                 f"({cam_var} as Node3D).set_meta(\"gk_cam_locked\", true)")
+    ctx.add_line(indent + 1, f"var {node_var} := {cam_var} as Node3D")
+    ctx.add_line(indent + 1, f"var {home_var}: Vector3 = {node_var}.global_position")
+    ctx.add_line(indent + 1, f"var {tween_var} := create_tween()")
+    ctx.add_line(indent + 1,
+                 f"{tween_var}.set_ease(Tween.EASE_OUT)"
+                 f".set_trans(Tween.TRANS_CUBIC)")
+    ctx.add_line(indent + 1,
+                 f"{tween_var}.tween_property({node_var}, \"global_position\", "
+                 f"{home_var} + Vector3(0.0, -({drop}), 0.0), {seconds})")
+    ctx.add_line(indent + 1,
+                 f"{tween_var}.parallel().tween_property({node_var}, "
+                 f"\"rotation:z\", {node_var}.rotation.z + deg_to_rad({roll}), "
+                 f"{seconds})")
+    ctx.add_line(indent + 1,
+                 f"{tween_var}.parallel().tween_property({node_var}, "
+                 f"\"rotation:x\", {node_var}.rotation.x - deg_to_rad({pitch}), "
+                 f"{seconds})")
+
+    if float(getattr(node, "gk_fade", 0.0) or 0.0) > 0.01:
+        rect_var = ctx.new_temp("fall_rect")
+        fade_var = ctx.new_temp("fall_fade")
+        ctx.add_line(indent, f"var {rect_var} := ColorRect.new()")
+        ctx.add_line(indent, f"{rect_var}.color = Color(0.0, 0.0, 0.0, 0.0)")
+        ctx.add_line(indent, f"{rect_var}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+        ctx.add_line(indent, f"{rect_var}.set_anchors_preset(Control.PRESET_FULL_RECT)")
+        ctx.add_line(indent, f"{rect_var}.z_index = 100")
+        ctx.add_line(indent, f"add_child({rect_var})")
+        ctx.add_line(indent, f"var {fade_var} := create_tween()")
+        ctx.add_line(indent, f"{fade_var}.tween_interval({seconds})")
+        ctx.add_line(indent,
+                     f"{fade_var}.tween_property({rect_var}, \"color:a\", "
+                     f"{black}, {fade})")
+
+    if restore:
+        back_var = ctx.new_temp("fall_back")
+        ctx.add_line(indent, f"var {back_var} := create_tween()")
+        ctx.add_line(indent,
+                     f"{back_var}.tween_interval({seconds} + {fade})")
+        # 恢复时**两个锁都要摘**:脚本变量 + 相机节点上的 meta。
+        # meta 不摘的话,弹簧臂会一直让位 —— 相机永远停在倒地那一下。
+        ctx.add_line(indent, f"{back_var}.tween_callback(func(): "
+                             f"_gk_cam_locked = false)")
+        ctx.add_line(indent, f"{back_var}.tween_callback(func(): "
+                             f"_gk_unlock_camera({cam_var}))")
+        ctx.need_camera_unlock = True
+
+
+# ==========================================================================
+# 『显示_监控画面』(第一百五十七轮)—— 一块屏播另一处的实时画面
+# ==========================================================================
+# 用户:"把门卫室的屏幕改成显示走廊的实时画面"。
+#
+# 运行时建 SubViewport + Camera3D,把视口纹理贴到屏幕网格上。
+# 相机挂在 SubViewport 里、**借主世界的 World3D** —— 于是它拍到的就是
+# 走廊里正在发生的事(监控摄像头)。
+@stmt_node("GKNodeLiveScreen")
+def _stmt_live_screen(ctx, node, indent):
+    screen = ctx.input_string(node, "屏幕", "")
+    look = ctx.input_string(node, "看向", "")
+    pos = tuple(getattr(node, "gk_pos", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0))
+    # Blender(x, y, z) -> Godot(x, z, -y),和 asset_export._godot_position 同一套
+    gx, gy, gz = float(pos[0]), float(pos[2]), -float(pos[1])
+    width = int(getattr(node, "gk_width", 512) or 512)
+    height = int(getattr(node, "gk_height", 288) or 288)
+    fov = float(getattr(node, "gk_fov", 55.0) or 55.0)
+    near = float(getattr(node, "gk_near", 0.1) or 0.1)
+    far = float(getattr(node, "gk_far", 60.0) or 60.0)
+    tint = tuple(getattr(node, "gk_tint", (1.0, 1.0, 1.0, 1.0)))
+    tint_text = (f"Color({gd_number(tint[0])}, {gd_number(tint[1])}, "
+                 f"{gd_number(tint[2])}, {gd_number(tint[3])})")
+    ctx.need_live_screen_helper = True
+    # 三个"再贴一次"用的状态(见 helper 里的说明:不要用定时器 + lambda)
+    ctx.declare_var("_gk_live_holder", "MeshInstance3D")
+    ctx.declare_var("_gk_live_mat", "Material")
+    ctx.declare_var("_gk_live_wait", "float", initial="0.0")
+    hook = ctx.process_hooks.setdefault("live_screen", [])
+    if not hook:
+        hook.extend([
+            "if _gk_live_wait > 0.0:",
+            "    _gk_live_wait -= delta",
+            "    if _gk_live_wait <= 0.0:",
+            "        _gk_live_wait = 0.0",
+            "        if _gk_live_holder != null "
+            "and is_instance_valid(_gk_live_holder):",
+            "            _gk_live_holder.material_override = _gk_live_mat",
+        ])
+    ctx.add_line(indent,
+                 f"_gk_live_screen_setup(self, {screen}, {look}, "
+                 f"Vector3({gd_number(gx)}, {gd_number(gy)}, {gd_number(gz)}), "
+                 f"Vector2i({width}, {height}), {gd_number(fov)}, "
+                 f"{tint_text}, {gd_number(near)}, {gd_number(far)})")
+
+
+# ==========================================================================
+# 『显示_纸娃娃』(第一百五十七轮)—— 角上的角色小窗
+# ==========================================================================
+# 用户:"第一人称下,在屏幕左上角渲染一个角色模型(类似我的世界基岩版的
+#       布娃娃),丰富视觉并知晓模型动作"。
+@stmt_node("GKNodePaperDoll")
+def _stmt_paper_doll(ctx, node, indent):
+    target = ctx.target_expr(node, "gk_target", "纸娃娃")
+    size = int(getattr(node, "gk_size", 150) or 150)
+    px = int(getattr(node, "gk_x", 24) or 0)
+    py = int(getattr(node, "gk_y", 150) or 0)
+    fov = float(getattr(node, "gk_fov", 40.0) or 40.0)
+    zoom = float(getattr(node, "gk_zoom", 1.0) or 1.0)
+    turn = float(getattr(node, "gk_turn", 0.0) or 0.0)
+    only_hidden = bool(getattr(node, "gk_only_hidden", True))
+    bg = tuple(getattr(node, "gk_bg", (0.0, 0.0, 0.0, 0.0)))
+    bg_text = (f"Color({gd_number(bg[0])}, {gd_number(bg[1])}, "
+               f"{gd_number(bg[2])}, {gd_number(bg[3])})")
+    ctx.need_paper_doll_helper = True
+    # 小窗状态放成员变量:同步动画那段在 _physics_process 里,读不到局部变量
+    for name, gd_type in (("_gk_doll_src", "Node"),
+                          ("_gk_doll_copy", "Node"),
+                          ("_gk_doll_model", "Node3D"),
+                          ("_gk_doll_ap_src", "AnimationPlayer"),
+                          ("_gk_doll_ap_copy", "AnimationPlayer"),
+                          ("_gk_doll_vp", "SubViewport"),
+                          ("_gk_doll_rect", "Control")):
+        ctx.declare_var(name, gd_type)
+    ctx.declare_var("_gk_doll_only_hidden", "bool", initial="false")
+    ctx.declare_var("_gk_doll_spin", "float", initial="0.0")
+    ctx.add_line(indent,
+                 f"_gk_paper_doll_setup(self, {target}, {size}, {px}, {py}, "
+                 f"{gd_number(fov)}, {gd_number(zoom)}, {gd_number(turn)}, "
+                 f"{'true' if only_hidden else 'false'}, {bg_text})")
+    # 每物理帧:同步动画 + 按"模型藏没藏"决定小窗出不出来
+    # ⚠ 不要写 `\` 续行:GDScript 的续行只认**括号里换行**,
+    #   反斜杠会被当成语法错误(整个脚本编不过)。条件长就拆成两层 if。
+    frame = [
+        "if _gk_doll_ap_src != null and _gk_doll_ap_copy != null:",
+        "    if is_instance_valid(_gk_doll_ap_copy):",
+        "        if _gk_doll_ap_copy.current_animation != "
+        "_gk_doll_ap_src.current_animation:",
+        "            _gk_doll_ap_copy.play("
+        "_gk_doll_ap_src.current_animation)",
+        "        _gk_doll_ap_copy.seek("
+        "_gk_doll_ap_src.current_animation_position, true)",
+        "if _gk_doll_rect != null and is_instance_valid(_gk_doll_rect):",
+        "    var _gk_doll_show := true",
+        "    if _gk_doll_only_hidden:",
+        "        if _gk_doll_src != null and is_instance_valid(_gk_doll_src):",
+        "            _gk_doll_show = not _gk_doll_src.visible",
+        "    _gk_doll_rect.visible = _gk_doll_show",
+        # 藏起来就不渲染:小窗也是一整个视口,白算一帧不划算
+        "    if _gk_doll_vp != null and is_instance_valid(_gk_doll_vp):",
+        "        _gk_doll_vp.render_target_update_mode = "
+        "SubViewport.UPDATE_ALWAYS if _gk_doll_show "
+        "else SubViewport.UPDATE_DISABLED",
+        "if _gk_doll_model != null and is_instance_valid(_gk_doll_model):",
+        "    if _gk_doll_spin != 0.0:",
+        "        _gk_doll_model.rotate_y(deg_to_rad(_gk_doll_spin) "
+        "* get_physics_process_delta_time())",
+    ]
+    hook = ctx.physics_hooks.setdefault("paper_doll", [])
+    if not hook:
+        hook.extend(frame)
 
 
 # ==========================================================================
@@ -674,6 +1063,42 @@ def _stmt_daynight_set(ctx, node, indent):
         ctx.add_line(indent + 1, "%s._gk_daynight_set_time(%s)" % (target, value))
 
 
+def _alt_hour(node, key, default):
+    value = getattr(node, key, default)
+    try:
+        return gd_number(float(default if value is None else value))
+    except (TypeError, ValueError):
+        return gd_number(float(default))
+
+
+@stmt_node("GKNodeEnvAlternate")
+def _stmt_env_alternate(ctx, node, indent):
+    """『环境_昼夜交替』—— 让环境脚本在白天 / 夜晚之间自动来回走。"""
+    day = _alt_hour(node, "gk_alt_day", 7.0)
+    night = _alt_hour(node, "gk_alt_night", 21.0)
+    fade = _alt_hour(node, "gk_alt_fade", 12.0)
+    hold = _alt_hour(node, "gk_alt_hold", 8.0)
+    target = ctx.new_temp("daynight")
+    ctx.add_line(indent, "var %s := get_tree().get_first_node_in_group(\"gk_daynight\")"
+                 % target)
+    ctx.add_line(indent, "if %s != null and %s.has_method(\"_gk_env_alt_start\"):"
+                 % (target, target))
+    ctx.add_line(indent + 1,
+                 "%s._gk_env_alt_start(%s, %s, %s, %s)"
+                 % (target, day, night, fade, hold))
+
+
+@stmt_node("GKNodeEnvAlternateStop")
+def _stmt_env_alternate_stop(ctx, node, indent):
+    """『环境_停止交替』—— 停掉自动循环,时间停在此刻。"""
+    target = ctx.new_temp("daynight")
+    ctx.add_line(indent, "var %s := get_tree().get_first_node_in_group(\"gk_daynight\")"
+                 % target)
+    ctx.add_line(indent, "if %s != null and %s.has_method(\"_gk_env_alt_stop\"):"
+                 % (target, target))
+    ctx.add_line(indent + 1, "%s._gk_env_alt_stop()" % target)
+
+
 # ── 环境状态 <-> 逻辑图(第一百四十二轮)────────────────────────────
 # 这几张卡和『环境_昼夜设置』同一个套路:环境脚本在 `gk_env` 组里,
 # 逻辑卡按组找它、调公开方法(`_gk_env_*`)。找不到就安静跳过。
@@ -822,33 +1247,70 @@ UI_ALIGN_PRESETS = {
 }
 
 
-def _ui_list_names(ctx):
-    """图里所有『界面_列表』节点的名字(第三十八轮)。
+def _ui_scan_trees(ctx):
+    """要扫的树:当前这张 + 被『界面_套用设计』引用进来的设计图。
 
-    用来判断"这个控件的父控件是不是一个容器" —— 是的话它由容器排版,
-    生成器**不能再写 position / 锚点**(容器会把它们覆盖掉,真 Godot 实测)。
-
-    第四十轮起还要扫**被『界面_套用设计』引用进来的设计图** —— 列表住在
-    设计图里(_register_ui_design_tree 登记的),只扫玩法图的话会把挂在
-    设计图列表里的控件当成"自由摆放",白写一堆 position(容器会覆盖)。
+    第四十轮起控件可能住在**设计图**里(_register_ui_design_tree 登记的),
+    只扫玩法图的话会把挂在设计图容器里的控件当成"自由摆放",白写一堆
+    position(容器会覆盖)。
     """
-    cache = getattr(ctx, "_ui_list_names", None)
+    trees = [getattr(ctx, "tree", None)]
+    trees.extend(getattr(ctx, "_gk_ui_design_trees", ()) or ())
+    return trees
+
+
+def _ui_names_of(ctx, cache_key, kinds):
+    """缓存"图里 bl_idname 属于 kinds 的节点名集合"(两个容器表共用)。"""
+    cache = getattr(ctx, cache_key, None)
     if cache is None:
         cache = set()
-        trees = [getattr(ctx, "tree", None)]
-        trees.extend(getattr(ctx, "_gk_ui_design_trees", ()) or ())
-        for tree in trees:
+        for tree in _ui_scan_trees(ctx):
             for node in (getattr(tree, "nodes", ()) or ()):
-                if getattr(node, "bl_idname", "") == "GKNodeUiList":
+                if getattr(node, "bl_idname", "") in kinds:
                     cache.add(str(getattr(node, "name", "")))
-        ctx._ui_list_names = cache
+        setattr(ctx, cache_key, cache)
     return cache
 
 
-def _ui_in_list(ctx, node):
-    """这个控件的『父控件』是不是一个『界面_列表』(容器)。"""
-    parent = str(getattr(node, "gk_parent_widget", "") or "").strip()
-    return bool(parent) and parent in _ui_list_names(ctx)
+def _ui_container_names(ctx):
+    """**接管子控件排版**的容器节点名(第一百二十七轮)。
+
+    『界面_列表』『界面_限定框』『界面_文本限定框』都算:挂进它们下面的控件
+    由容器自己排队 —— 生成器**不能再写 position / 锚点**(写了也会被覆盖,
+    真 Godot 实测),尺寸也要用 `custom_minimum_size`。
+    """
+    kinds = tuple(getattr(node_lib, "UI_CONTAINER_NODES", ("GKNodeUiList",)))
+    return _ui_names_of(ctx, "_ui_container_names", kinds)
+
+
+def _ui_body_parent_names(ctx):
+    """**里面还有一层排版容器**的节点名(列表 / 文本限定框)。
+
+    子控件得挂**里层**(见 `_gk_list_body`)才排队 —— 挂外层会浮着不动。
+    """
+    kinds = tuple(getattr(node_lib, "UI_CONTAINER_BODY_NODES",
+                          ("GKNodeUiList",)))
+    return _ui_names_of(ctx, "_ui_body_parent_names", kinds)
+
+
+def _ui_list_names(ctx):
+    """图里所有『界面_列表』节点的名字(第三十八轮)。
+
+    ⚠ 和 `_ui_container_names` 不是一回事:那个是"所有会排版的容器",这个
+    **只认『界面_列表』** —— 『界面_列表_填充』的目标只能是一个列表节点。
+    """
+    return _ui_names_of(ctx, "_ui_list_names", ("GKNodeUiList",))
+
+
+def _ui_in_container(ctx, node):
+    """这个控件的『父控件』是不是一个容器(列表 / 限定框 / 文本限定框)。"""
+    parent = ui_parent_name(node)
+    return bool(parent) and parent in _ui_container_names(ctx)
+
+
+# 旧名字保留成别名:第三十八轮起 `_ui_in_list` 被 _ui_size / _ui_place / 别处
+# 反复引用,改名会牵一片;语义已经从"列表"扩成"所有容器"(第一百二十七轮)。
+_ui_in_list = _ui_in_container
 
 
 def _ui_size(ctx, indent, widget, node, width, height):
@@ -936,7 +1398,7 @@ def _ui_looks_transient(node):
     """
     if getattr(node, "bl_idname", "") not in ("GKNodeUiText", "GKNodeUiSubtitle"):
         return False
-    if str(getattr(node, "gk_parent_widget", "") or "").strip():
+    if ui_parent_name(node):
         return False
     return str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT") != "TOP_LEFT"
 
@@ -975,16 +1437,16 @@ def _ui_add_to(ctx, indent, widget, node, root, after=None):
         ctx.need_transient_helper = True
         ctx.add_line(indent, f"{widget}.add_to_group({gd_string(UI_TRANSIENT_GROUP)})")
     after = list(after or [])
-    parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
+    parent_name = ui_parent_name(node)
     if not parent_name:
         ctx.add_line(indent, f"{root}.add_child({widget})")
         for line in after:
             ctx.add_line(indent, line)
         return
     var = ctx.new_temp("parent")
-    if parent_name in _ui_list_names(ctx):
-        # 父控件是『界面_列表』-> 要挂到它**里面那个排版的容器**上,
-        # 不是挂到滚动容器本身(挂错的话子控件会浮着不排队)
+    if parent_name in _ui_body_parent_names(ctx):
+        # 父控件是**两层**的节点(『界面_列表』/『界面_文本限定框』)-> 要挂到
+        # 它**里面那个排版的容器**上,不是挂到外层(挂错的话子控件会浮着不排队)
         ctx.need_list_helper = True
         ctx.add_line(indent, f"var {var} := _gk_list_body({gd_string(parent_name)})")
     else:
@@ -1172,6 +1634,36 @@ def _stmt_ui_button(ctx, node, indent):
     })
 
 
+def _ui_target(ctx, node):
+    """解析"这次要动哪个控件":返回 (取控件的那句表达式, 取不到时的告警语句)。
+
+    ── 两种写法(第一百二十八轮)──────────────────────────────────────
+    * 『控件』引脚接了东西 -> 用上游引用的值(『界面_取控件』/『界面_取界面』);
+    * 没接 -> 老规矩 `_gk_find_widget("卡片上填的名字")`。
+    ⚠ 引脚优先 —— 和『父』引脚(连线式父子)一套规矩;老图只填名字,
+      生成物一字不变。
+    ⚠ 走引脚时**不能**再拿卡片上的名字拼"找不到 X":那时候没有名字可言,
+      只能说"引用是 null" —— 否则会误导人以为是名字填错了。
+    """
+    name = (getattr(node, "gk_widget", "") or "").strip()
+    socket = None
+    getter = getattr(getattr(node, "inputs", None), "get", None)
+    if callable(getter):
+        try:
+            socket = getter("控件")
+        except Exception:                                 # noqa: BLE001
+            socket = None
+    if socket is not None and getattr(socket, "is_linked", False):
+        ctx.need_ui_helpers = True
+        return (ctx.expr_of(socket),
+                'push_warning("界面引用是 null —— 上一环没取到控件")')
+    if not name:
+        return None, None
+    ctx.need_ui_helpers = True
+    return (f"_gk_find_widget({gd_string(name)})",
+            f'push_warning("找不到界面控件: " + {gd_string(name)})')
+
+
 @stmt_node("GKNodeUiHide")
 def _stmt_ui_hide(ctx, node, indent):
     """显示 / 隐藏某个界面控件。
@@ -1181,18 +1673,22 @@ def _stmt_ui_hide(ctx, node, indent):
       * 挪到最上层(谁后开谁在上,同时开两块面板时最后按的盖在上面);
       * 把『互斥组』里同组的其他成员收起来("同组只留一个开着")。
     没勾 = 老行为一字不变(只改 visible)—— 老图生成物不受影响。
+
+    ── 『控件』引脚(第一百二十八轮)────────────────────────────────
+    接了就用引用,没接才按名字找 —— 见 `_ui_target`。
     """
-    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    target, warn_line = _ui_target(ctx, node)
+    if target is None:
+        ctx.warn(f"『{node.bl_label}』没有填『控件名』也没接『控件』引脚 —— "
+                 f"这一句被跳过了")
+        return
     visible = "true" if getattr(node, "gk_visible", False) else "false"
     show = bool(getattr(node, "gk_visible", False))
     raise_it = show and bool(getattr(node, "gk_raise", False))
-    if not widget_name:
-        ctx.warn(f"『{node.bl_label}』没有填控件名，这一句被跳过了")
-        return
     # 用 group 查而不是路径查:UI 控件是运行时挂在 CanvasLayer 下的，
     # 路径会随场景变化，按名字找更稳。
     var = ctx.new_temp("widget")
-    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"var {var} := {target}")
     ctx.add_line(indent, f"if {var} != null:")
     ctx.add_line(indent + 1, f"{var}.visible = {visible}")
     if raise_it:
@@ -1200,8 +1696,7 @@ def _stmt_ui_hide(ctx, node, indent):
         ctx.need_raise_helper = True
         ctx.add_line(indent + 1, f"_gk_ui_raise({var})")
     ctx.add_line(indent, "else:")
-    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
-    ctx.need_ui_helpers = True
+    ctx.add_line(indent + 1, warn_line)
 
 
 @stmt_node("GKNodeUiImage")
@@ -1363,25 +1858,219 @@ def _stmt_ui_panel(ctx, node, indent):
     _ui_place(ctx, indent, widget, node, "20.0", "20.0")
 
 
+# ── 界面结构件(第一百二十七轮:画布 / 限定框 / 背景 / 文本限定框)───────
+# 用户:"界面逻辑从:界面布局(画布)->+界面限定框(子项范围)->…",参考虚幻 5。
+# 生成物和 UMG 一一对应:
+#   * 画布   ≈ Canvas Panel —— 一个具名 Control,子控件都挂它下面;
+#   * 限定框 ≈ HBox / VBox / Grid / Margin Container —— 自动排版;
+#   * 背景   ≈ 纯色 ColorRect;
+#   * 文本限定框 ≈ PanelContainer(框)+ VBox(内层)+ Label(那行字)。
+UI_BOX_GD_TYPES = {
+    "VBOX": "VBoxContainer",
+    "HBOX": "HBoxContainer",
+    "GRID": "GridContainer",
+    "MARGIN": "MarginContainer",
+}
+
+
+@stmt_node("GKNodeUiCanvas")
+def _stmt_ui_canvas(ctx, node, indent):
+    """画布:整张界面的根(子控件挂它下面;『界面_取界面』拿的就是它)。
+
+    ── 为什么用普通 Control 而不是又一个容器 ───────────────────────
+    画布要能**自己定坐标**(子控件按设计里的 X / Y 摆),所以它不是
+    "接管排版"的容器 —— 不进 `UI_CONTAINER_NODES`,子控件照旧写 position。
+
+    ── 铺满 / 固定大小 ─────────────────────────────────────────────
+    『铺满屏幕』(默认)走 Godot 的 `PRESET_FULL_RECT`:窗口大小一变,
+    画布跟着变;取消勾选才用『宽』『高』摆一块固定区域。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "Control",
+                             key=node_lib.node_key(node))
+    full = bool(getattr(node, "gk_full", True))
+    width = gd_number(getattr(node, "gk_width", 640.0))
+    height = gd_number(getattr(node, "gk_height", 360.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = Control.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    # 画布不吃鼠标(它是背景层):点空白处要穿到上面真正的按钮 / 游戏画面
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    # 『开局藏』(第一百二十八轮):和『界面_面板』同一条规矩 ——
+    # "藏起来 -> 按 P 弹入"是最典型的用法,以前只有面板能开局藏。
+    after = ([f"{widget}.visible = false"]
+             if bool(getattr(node, "gk_start_hidden", False)) else [])
+    _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    if full:
+        ctx.add_line(indent, f"{widget}.set_anchors_and_offsets_preset("
+                             f"Control.PRESET_FULL_RECT)")
+    else:
+        ctx.add_line(indent, f"{widget}.size = Vector2({width}, {height})")
+        ctx.add_line(indent, f"{widget}.position = Vector2(0.0, 0.0)")
+
+
+@stmt_node("GKNodeUiBox")
+def _stmt_ui_box(ctx, node, indent):
+    """限定框:会自己排队的容器(横排 / 竖排 / 网格 / 边距)。
+
+    子控件挂进它下面**由容器排版** —— `_ui_size` 会改用
+    `custom_minimum_size`、`_ui_place` 直接跳过(容器会覆盖 position / 锚点,
+    见 `_ui_in_container` 的说明)。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    mode = str(getattr(node, "gk_mode", "VBOX") or "VBOX")
+    gd_type = UI_BOX_GD_TYPES.get(mode, "VBoxContainer")
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", gd_type,
+                             key=node_lib.node_key(node))
+    separation = int(getattr(node, "gk_separation", 8) or 0)
+    pad = int(getattr(node, "gk_pad", 8) or 0)
+    columns = max(1, min(24, int(getattr(node, "gk_columns", 2) or 2)))
+    width = gd_number(getattr(node, "gk_width", 320.0))
+    height = gd_number(getattr(node, "gk_height", 200.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = {gd_type}.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    # 纯排版容器不吃鼠标:点它空白处应该穿到游戏 / 下面的控件
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    if mode == "GRID":
+        ctx.add_line(indent + 1, f"{widget}.columns = {columns}")
+        ctx.add_line(indent + 1, f"{widget}.add_theme_constant_override("
+                                 f"\"h_separation\", {separation})")
+        ctx.add_line(indent + 1, f"{widget}.add_theme_constant_override("
+                                 f"\"v_separation\", {separation})")
+    elif mode == "MARGIN":
+        for side in ("left", "top", "right", "bottom"):
+            ctx.add_line(indent + 1, f"{widget}.add_theme_constant_override("
+                                     f"\"margin_{side}\", {pad})")
+    else:
+        ctx.add_line(indent + 1, f"{widget}.add_theme_constant_override("
+                                 f"\"separation\", {separation})")
+    after = ([f"{widget}.visible = false"]
+             if bool(getattr(node, "gk_start_hidden", False)) else [])
+    _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "12.0", "60.0")
+
+
+@stmt_node("GKNodeUiBackdrop")
+def _stmt_ui_backdrop(ctx, node, indent):
+    """背景:一块纯色底(『铺满屏幕』或固定大小)。"""
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "ColorRect",
+                             key=node_lib.node_key(node))
+    color = getattr(node, "gk_color", (0.05, 0.06, 0.10, 1.0))
+    full = bool(getattr(node, "gk_full", True))
+    width = gd_number(getattr(node, "gk_width", 1280.0))
+    height = gd_number(getattr(node, "gk_height", 720.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = ColorRect.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    ctx.add_line(indent + 1, f"{widget}.color = Color({gd_number(color[0])}, "
+                             f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                             f"{gd_number(color[3])})")
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    after = ([f"{widget}.visible = false"]
+             if bool(getattr(node, "gk_start_hidden", False)) else [])
+    _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    if full:
+        ctx.add_line(indent, f"{widget}.set_anchors_and_offsets_preset("
+                             f"Control.PRESET_FULL_RECT)")
+    else:
+        _ui_size(ctx, indent, widget, node, width, height)
+        _ui_place(ctx, indent, widget, node, "0.0", "0.0")
+
+
+@stmt_node("GKNodeUiTextBox")
+def _stmt_ui_textbox(ctx, node, indent):
+    """文本限定框:框(PanelContainer)+ 内层 VBox + 一行 Label。
+
+    ── 为什么是三层(真 Godot 排版需要)────────────────────────────
+    PanelContainer **只认一个孩子** —— 直接塞两个进去会重叠。所以里面套一个
+    VBox:那行字排第一行,用户再挂别的控件(『父控件』填这个框的名字)就
+    自然排在下面。子控件靠 `_gk_list_body(框名)` 找到那个 VBox 挂进去
+    (见 `_ui_body_parent_names` / generator 的 `_gk_list_body`)。
+
+    ⚠ 文字赋值放在 null 守卫**外面**(和『界面_文本』一样):再次执行时
+    能刷新内容,不会"只建一次、以后改字不生效"。
+    """
+    _layer, root = _ui_root(ctx, indent)
+    widget = ctx.declare_var(f"_gk_ui_{node.name}", "PanelContainer",
+                             key=node_lib.node_key(node))
+    inner = ctx.declare_var(f"_gk_ui_{node.name}_内容", "VBoxContainer",
+                            key=(node_lib.node_key(node), "内容"))
+    label = ctx.declare_var(f"_gk_ui_{node.name}_文字", "Label",
+                            key=(node_lib.node_key(node), "文字"))
+    text = ctx.input_string(node, "文字", "")
+    size = int(getattr(node, "gk_size", 24) or 24)
+    color = getattr(node, "gk_color", (1.0, 1.0, 1.0, 1.0))
+    bg = getattr(node, "gk_bg", (0.06, 0.07, 0.10, 0.72))
+    radius = int(getattr(node, "gk_radius", 12) or 0)
+    pad = int(getattr(node, "gk_pad", 12) or 0)
+    width = gd_number(getattr(node, "gk_width", 480.0))
+    height = gd_number(getattr(node, "gk_height", 52.0))
+
+    ctx.add_line(indent, f"if {widget} == null:")
+    ctx.add_line(indent + 1, f"{widget} = PanelContainer.new()")
+    ctx.add_line(indent + 1, f"{widget}.name = {gd_string(node.name)}")
+    box = ctx.new_temp("gk_box")
+    ctx.add_line(indent + 1, f"var {box} := StyleBoxFlat.new()")
+    ctx.add_line(indent + 1, f"{box}.bg_color = Color({gd_number(bg[0])}, "
+                             f"{gd_number(bg[1])}, {gd_number(bg[2])}, "
+                             f"{gd_number(bg[3])})")
+    for corner in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        ctx.add_line(indent + 1, f"{box}.corner_radius_{corner} = {radius}")
+    # 内边距 = stylebox 的 content_margin(文字离框边的距离)
+    for side in ("left", "top", "right", "bottom"):
+        ctx.add_line(indent + 1, f"{box}.content_margin_{side} = {pad}")
+    ctx.add_line(indent + 1, f"{widget}.add_theme_stylebox_override("
+                             f"\"panel\", {box})")
+    ctx.add_line(indent + 1, f"{widget}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{inner} = VBoxContainer.new()")
+    ctx.add_line(indent + 1, f"{inner}.name = {gd_string(node.name + '内容')}")
+    ctx.add_line(indent + 1, f"{inner}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{widget}.add_child({inner})")
+    ctx.add_line(indent + 1, f"{label} = Label.new()")
+    ctx.add_line(indent + 1, f"{label}.name = {gd_string(node.name + '文字')}")
+    ctx.add_line(indent + 1, f"{label}.mouse_filter = Control.MOUSE_FILTER_IGNORE")
+    ctx.add_line(indent + 1, f"{label}.add_theme_font_size_override("
+                             f"\"font_size\", {size})")
+    ctx.add_line(indent + 1, f"{label}.add_theme_color_override(\"font_color\", "
+                             f"Color({gd_number(color[0])}, "
+                             f"{gd_number(color[1])}, {gd_number(color[2])}, "
+                             f"{gd_number(color[3])}))")
+    ctx.add_line(indent + 1, f"{inner}.add_child({label})")
+    after = ([f"{widget}.visible = false"]
+             if bool(getattr(node, "gk_start_hidden", False)) else [])
+    _ui_add_to(ctx, indent + 1, widget, node, root, after=after)
+    # 文字在守卫外面赋值:再次执行时刷新(和『界面_文本』同一条规矩)
+    ctx.add_line(indent, f"{label}.text = str({text})")
+    _ui_size(ctx, indent, widget, node, width, height)
+    _ui_place(ctx, indent, widget, node, "12.0", "12.0")
+
+
 @stmt_node("GKNodeUiSet")
 def _stmt_ui_set(ctx, node, indent):
     """运行时改控件:位置 / 大小 / 透明度 / 着色 / 文字(勾哪项改哪项)。"""
     ctx.need_ui_helpers = True
-    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    target, warn_line = _ui_target(ctx, node)
     flags = [bool(getattr(node, key, False)) for key in
              ("gk_set_pos", "gk_set_size", "gk_set_alpha", "gk_set_color",
               "gk_set_text")]
-    if not widget_name:
-        ctx.warn(f"『{node.bl_label}』没有填控件名，这一句被跳过了")
+    if target is None:
+        ctx.warn(f"『{node.bl_label}』没有填『控件名』也没接『控件』引脚 —— "
+                 f"这一句被跳过了")
         return
     if not any(flags):
         ctx.warn(f"『{node.bl_label}』一项都没勾(位置 / 大小 / 透明度 / 颜色 / "
                  f"文字)—— 这句什么都不会做")
         return
     var = ctx.new_temp("widget")
-    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"var {var} := {target}")
     ctx.add_line(indent, f"if {var} == null:")
-    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.add_line(indent + 1, warn_line)
     ctx.add_line(indent, "else:")
     body = indent + 1
     if getattr(node, "gk_set_pos", False):
@@ -1404,10 +2093,14 @@ def _stmt_ui_set(ctx, node, indent):
                            f"{var}.modulate.g, {var}.modulate.b, {alpha})")
     if getattr(node, "gk_set_text", False):
         text = ctx.input_string(node, "文字", "")
+        # 告警里要点名"是哪个控件":走『控件』引脚时卡片上没名字,只能说
+        # "引脚接的那个"(第一百二十八轮把这条从 widget_name 改成 target_label)
+        target_label = ((getattr(node, "gk_widget", "") or "").strip()
+                        or "『控件』引脚接的那个控件")
         ctx.add_line(body, f"if {var} is Label or {var} is Button:")
         ctx.add_line(body + 1, f"{var}.text = str({text})")
         ctx.add_line(body, "else:")
-        ctx.add_line(body + 1, f'push_warning("『{widget_name}』不是文字控件，'
+        ctx.add_line(body + 1, f'push_warning("『{target_label}』不是文字控件，'
                                f'『改文字』跳过")')
 
 
@@ -1996,9 +2689,10 @@ def _expr_ui_list_fill(ctx, node):
 def _stmt_ui_tween(ctx, node, indent):
     """把一个界面控件的属性缓动过去(菜单淡入 / 提示条滑进来)。"""
     ctx.need_ui_helpers = True
-    widget_name = (getattr(node, "gk_widget", "") or "").strip()
-    if not widget_name:
-        ctx.warn(f"『{node.bl_label}』没有填『控件名』—— 这一句被跳过了")
+    target, warn_line = _ui_target(ctx, node)
+    if target is None:
+        ctx.warn(f"『{node.bl_label}』没有填『控件名』也没接『控件』引脚 —— "
+                 f"这一句被跳过了")
         return
     prop = str(getattr(node, "gk_property", "ALPHA") or "ALPHA")
     to = ctx.input_number(node, "到", gd_number(getattr(node, "gk_to", 1.0)))
@@ -2021,9 +2715,9 @@ def _stmt_ui_tween(ctx, node, indent):
 
     var = ctx.new_temp("widget")
     tween = ctx.new_temp("ui_tween")
-    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"var {var} := {target}")
     ctx.add_line(indent, f"if {var} == null:")
-    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.add_line(indent + 1, warn_line)
     ctx.add_line(indent, "else:")
     body = indent + 1
     ctx.add_line(body, f"var {tween} := {var}.create_tween()")
@@ -2040,6 +2734,128 @@ def _stmt_ui_tween(ctx, node, indent):
     if wait:
         # 勾了"等它播完":后面的节点等动画结束再走(不勾就边播边往下)
         ctx.add_line(body, f"await {tween}.finished")
+
+
+# ── 『界面_弹入/弹出』组合卡(第一百二十八轮)────────────────────────
+# 一张卡做完"显示 + 置顶 + 滑入 + 淡入 + 黑幕"(见 nodes/_display.py 那段说明)。
+@stmt_node("GKNodeUiPop")
+def _stmt_ui_pop(ctx, node, indent):
+    ctx.need_ui_helpers = True
+    target, warn_line = _ui_target(ctx, node)
+    if target is None:
+        ctx.warn(f"『{node.bl_label}』没有填『控件名』也没接『控件』引脚 —— "
+                 f"这一句被跳过了")
+        return
+    inward = str(getattr(node, "gk_mode", "IN") or "IN") != "OUT"
+    direction = str(getattr(node, "gk_direction", "LEFT") or "LEFT")
+    time = gd_number(float(getattr(node, "gk_time", 0.35) or 0.0))
+    trans = str(getattr(node, "gk_trans", "TRANS_CUBIC") or "TRANS_CUBIC")
+    ease = str(getattr(node, "gk_ease", "EASE_OUT") or "EASE_OUT")
+    fade = bool(getattr(node, "gk_fade", True))
+    top = bool(getattr(node, "gk_top", True))
+    scrim = (getattr(node, "gk_scrim", "") or "").strip()
+    scrim_to = gd_number(float(getattr(node, "gk_scrim_to", 0.6) or 0.0))
+    wait = bool(getattr(node, "gk_wait", True))
+
+    var = ctx.new_temp("pop")
+    tween = ctx.new_temp("pop_tween")
+    home = ctx.new_temp("pop_home")
+    offset = ctx.new_temp("pop_off")
+    alpha0 = ctx.new_temp("pop_alpha")
+    scrim_var = ctx.new_temp("pop_scrim") if scrim else None
+
+    # 位移量 = 控件**自身尺寸**(先挪出去一个尺寸、再缓动回原位,用户不用算数)
+    if direction == "LEFT":
+        off = f"Vector2(-{var}.size.x, 0.0)"
+    elif direction == "RIGHT":
+        off = f"Vector2({var}.size.x, 0.0)"
+    elif direction == "TOP":
+        off = f"Vector2(0.0, -{var}.size.y)"
+    elif direction == "BOTTOM":
+        off = f"Vector2(0.0, {var}.size.y)"
+    else:
+        off = "Vector2.ZERO"
+
+    ctx.add_line(indent, f"var {var} := {target}")
+    ctx.add_line(indent, f"if {var} == null:")
+    ctx.add_line(indent + 1, warn_line)
+    ctx.add_line(indent, "else:")
+    body = indent + 1
+    if inward:
+        ctx.add_line(body, f"{var}.visible = true")
+    # 黑幕(可选):弹入时显示 + 淡到目标;弹出时跟着淡出去。
+    # ⚠ 变量**两个方向都要声明** —— 弹出那边复位时要藏它,不声明就是
+    #   "Identifier not declared"整份脚本加载失败。
+    if scrim:
+        ctx.add_line(body, f"var {scrim_var} := _gk_find_widget({gd_string(scrim)})")
+    if scrim and inward:
+        # 先亮黑幕,面板随后置顶盖上去才不会被压在下面
+        ctx.add_line(body, f"if {scrim_var} != null:")
+        ctx.add_line(body + 1, f"{scrim_var}.visible = true")
+        ctx.add_line(body + 1, f"{scrim_var}.modulate.a = 0.0")
+        s_tween = ctx.new_temp("pop_scrim_tween")
+        ctx.add_line(body + 1, f"var {s_tween} := {scrim_var}.create_tween()")
+        ctx.add_line(body + 1, f"{s_tween}.set_trans(Tween.{trans})")
+        ctx.add_line(body + 1, f"{s_tween}.set_ease(Tween.{ease})")
+        ctx.add_line(body + 1, f"{s_tween}.tween_property({scrim_var}, "
+                               f"\"modulate:a\", {scrim_to}, {time})")
+    elif scrim:
+        ctx.add_line(body, f"if {scrim_var} != null:")
+        s_tween = ctx.new_temp("pop_scrim_tween")
+        ctx.add_line(body + 1, f"var {s_tween} := {scrim_var}.create_tween()")
+        ctx.add_line(body + 1, f"{s_tween}.set_trans(Tween.{trans})")
+        ctx.add_line(body + 1, f"{s_tween}.set_ease(Tween.{ease})")
+        ctx.add_line(body + 1, f"{s_tween}.tween_property({scrim_var}, "
+                               f"\"modulate:a\", 0.0, {time})")
+    if top and inward:
+        ctx.need_raise_helper = True
+        ctx.add_line(body, f"_gk_ui_raise({var})")
+    ctx.add_line(body, f"var {home} := {var}.position")
+    ctx.add_line(body, f"var {offset} := {off}")
+    ctx.add_line(body, f"var {alpha0} := {var}.modulate.a")
+    if inward:
+        # 先挪到屏外 -> 缓动回原位(位移量自动 = 控件尺寸)
+        ctx.add_line(body, f"{var}.position = {home} + {offset}")
+        if fade:
+            ctx.add_line(body, f"{var}.modulate.a = 0.0")
+        target = home
+    else:
+        # 弹出:从原位滑出去,播完再复位(复位这一步在下面)
+        target = f"{home} + {offset}"
+    ctx.add_line(body, f"var {tween} := {var}.create_tween()")
+    ctx.add_line(body, f"{tween}.set_trans(Tween.{trans})")
+    ctx.add_line(body, f"{tween}.set_ease(Tween.{ease})")
+    # 位置和透明度**同时**跑(不设 parallel 的话它们会一前一后排队)
+    ctx.add_line(body, f"{tween}.set_parallel(true)")
+    ctx.add_line(body, f"{tween}.tween_property({var}, \"position\", "
+                       f"{target}, {time})")
+    if fade:
+        ctx.add_line(body, f"{tween}.tween_property({var}, \"modulate:a\", "
+                           f"{'%s' % (alpha0 if inward else '0.0')}, {time})")
+    if inward:
+        if wait:
+            ctx.add_line(body, f"await {tween}.finished")
+    else:
+        # 弹出必须"播完复位位置 + 藏起来" —— 不复位的话,下一次弹入的起点
+        # 会一次比一次偏(滑出去多少就跑远多少)。
+        restore = [(0, f"{var}.position = {home}")]
+        if fade:
+            restore.append((0, f"{var}.modulate.a = {alpha0}"))
+        restore.append((0, f"{var}.visible = false"))
+        if scrim:
+            restore.append((0, f"if {scrim_var} != null:"))
+            restore.append((1, f"{scrim_var}.visible = false"))
+        if wait:
+            ctx.add_line(body, f"await {tween}.finished")
+            for delta, text in restore:
+                ctx.add_line(body + delta, text)
+        else:
+            # 不等:同一件事挂在 finished 回调上做,用户那条链立刻往下走
+            ctx.add_line(body, f"{tween}.finished.connect(func() -> void:")
+            last = len(restore) - 1
+            for index, (delta, text) in enumerate(restore):
+                suffix = ")" if index == last else ""
+                ctx.add_line(body + 1 + delta, text + suffix)
 
 
 @stmt_node("GKNodeUiNinePatch")
@@ -2641,18 +3457,18 @@ def _stmt_ui_skin(ctx, node, indent):
 def _stmt_ui_focus(ctx, node, indent):
     """把键盘 / 手柄焦点放到某个控件上(方向键就能选按钮了)。"""
     ctx.need_ui_helpers = True
-    widget_name = (getattr(node, "gk_widget", "") or "").strip()
+    target, warn_line = _ui_target(ctx, node)
     focus = bool(getattr(node, "gk_focus", True))
-    if not widget_name:
+    if target is None:
         # 留空 = 清掉焦点(回到鼠标操作)
         ctx.add_line(indent, "var _gk_focused := get_viewport().gui_get_focus_owner()")
         ctx.add_line(indent, "if _gk_focused != null:")
         ctx.add_line(indent + 1, "_gk_focused.release_focus()")
         return
     var = ctx.new_temp("widget")
-    ctx.add_line(indent, f"var {var} := _gk_find_widget({gd_string(widget_name)})")
+    ctx.add_line(indent, f"var {var} := {target}")
     ctx.add_line(indent, f"if {var} == null:")
-    ctx.add_line(indent + 1, f'push_warning("找不到界面控件: " + {gd_string(widget_name)})')
+    ctx.add_line(indent + 1, warn_line)
     ctx.add_line(indent, "else:")
     if focus:
         ctx.add_line(indent + 1, f"{var}.grab_focus()")
@@ -2711,7 +3527,7 @@ def _ui_design_order(nodes):
         if key in done or key in visiting:
             return
         visiting.add(key)
-        parent = by_name.get(str(getattr(node, "gk_parent_widget", "") or "").strip())
+        parent = by_name.get(ui_parent_name(node))
         if parent is not None:
             visit(parent)
         visiting.discard(key)
@@ -2981,6 +3797,106 @@ def _stmt_ui_on_value_changed(ctx, node, indent):
 def _expr_ui_on_value_changed(ctx, node):
     """值输出只在信号回调内使用,由生成器绑定为当前回调参数。"""
     return {"值": "_value"}
+
+
+# ── 界面事件(第一百二十七轮:鼠标点击 / 按键按下)────────────────────
+# 为什么是**语句节点 + register_input_handler**、不是 GKEventNode:事件节点只在
+# 玩法图里被执行(见 nodes/_display.py 那两段说明),放进界面设计图等于摆设。
+# 链式逻辑用 `_ui_signal_section` 收进独立函数;`_input` 回调只放一段守卫 +
+# 调那个函数 —— 守卫写在**注册的 body** 里,所以暂停分组(during_pause)
+# 由生成器统一处理,界面热键默认"暂停里也响应"。
+UI_MOUSE_BUTTON_CONSTS = {
+    "LEFT": "MOUSE_BUTTON_LEFT",
+    "RIGHT": "MOUSE_BUTTON_RIGHT",
+}
+
+
+@stmt_node("GKNodeUiOnMouseClick")
+def _stmt_ui_on_mouse_click(ctx, node, indent):
+    """『界面_鼠标点击』:点下去时执行『点了』出口后面那段链。
+
+    ── 为什么命中判定用"全局矩形"而不是 event.position ───────────────
+    界面挂在 CanvasLayer 下,`_input(event)` 里的 `event.position` 可能是
+    **窗口坐标**,而控件的 `get_global_rect()` 是**画布坐标** —— 有缩放 / 偏移
+    时两者对不上(点左边却判成右边)。所以统一用
+    `控件.get_global_rect().has_point(控件.get_global_mouse_position())`。
+    """
+    handler = ctx.declare_func_name(
+        f"gk_onclick_{snake_case(node.name, 'click')}",
+        key=node_lib.node_key(node))
+    _ui_signal_section(ctx, node, handler, output="点了")
+    button = UI_MOUSE_BUTTON_CONSTS.get(
+        str(getattr(node, "gk_button", "LEFT") or "LEFT"), "MOUSE_BUTTON_LEFT")
+    widget = (getattr(node, "gk_widget", "") or "").strip()
+    body = [
+        "    if not (event is InputEventMouseButton):",
+        "        return",
+        "    var click := event as InputEventMouseButton",
+        f"    if not click.pressed or click.button_index != {button}:",
+        "        return",
+    ]
+    if widget:
+        ctx.need_ui_helpers = True
+        body += [
+            f"    var gk_target := _gk_find_widget({gd_string(widget)})",
+            "    if gk_target == null:",
+            "        return",
+            "    if not gk_target.get_global_rect().has_point("
+            "gk_target.get_global_mouse_position()):",
+            "        return",
+        ]
+    body.append(f"    {handler}()")
+    cb = ctx.declare_func_name(f"{handler}_input",
+                               key=(node_lib.node_key(node), "input"))
+    ctx.register_input_handler(
+        cb, reset=False, during_pause=bool(getattr(node, "gk_pause", True)),
+        body=body)
+
+
+@stmt_node("GKNodeUiOnKeyPress")
+def _stmt_ui_on_key_press(ctx, node, indent):
+    """『界面_按键按下』:按一下捕获到的那个键,执行『按了』出口后面那段链。
+
+    按键仍然走"输入动作"(Godot 的输入抽象):捕获到的**物理键**只在导出时
+    写进 project.godot 的输入映射(和『输入_按键』共用一套算法/一张表)。
+    """
+    handler = ctx.declare_func_name(
+        f"gk_onkey_{snake_case(node.name, 'key')}",
+        key=node_lib.node_key(node))
+    _ui_signal_section(ctx, node, handler, output="按了")
+    resolver = getattr(node, "resolved_action", None)
+    if callable(resolver):
+        action = resolver()
+    else:
+        action = (str(getattr(node, "gk_action", "") or "").strip() or "jump")
+    const = ctx.add_action(action, getattr(node, "gk_key", ""))
+    raw_key = str(getattr(node, "gk_key", "") or "").upper()
+    body = [
+        "    if not (event is InputEventKey):",
+        "        return",
+        "    var key := event as InputEventKey",
+        # echo 是"按住不放时系统重复送的事件",要挡掉(否则按住会连发)
+        "    if not key.pressed or key.echo:",
+        "        return",
+    ]
+    if raw_key in ("LEFT_ALT", "RIGHT_ALT", "ALT"):
+        # 修饰键在 Windows 上经常不以 action 状态送到 Godot(鼠标 CAPTURED 时
+        # 尤其)—— 直接查物理键,和『输入_按键』那条 Alt 特判同一个理由。
+        body += [
+            "    if key.physical_keycode != KEY_ALT:",
+            "        return",
+        ]
+    else:
+        body += [
+            f"    if not key.is_action_pressed({const}):",
+            "        return",
+        ]
+    body.append(f"    {handler}()")
+    cb = ctx.declare_func_name(f"{handler}_input",
+                               key=(node_lib.node_key(node), "input"))
+    ctx.register_input_handler(
+        cb, reset=False, during_pause=bool(getattr(node, "gk_pause", True)),
+        body=body)
 
 
 @stmt_node("GKNodeFloatText")

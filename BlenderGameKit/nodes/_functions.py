@@ -81,6 +81,10 @@ class GKNodeFunctionCall(B.GKStatementNode):
          "侧栏『函数』框里声明的名字"),
     )
     gk_outputs = (S.pin(FLOW, "完成"), S.pin(ANY, "结果", None),)
+    # 引脚按**函数声明的参数名**生成(用户自己起的名字,比如「金额」)——
+    # 名字既不在声明里、也不带动态前缀,所以"名字对不上"不能当陈旧判据
+    # (否则加载迁移每次都重建它)。见 nodes/_containers.migrate_pin_names。
+    gk_dynamic_pins = True
 
     def function_spec(self):
         """从**所属的节点图**里取这个函数的声明(名字 / 参数 / 返回值)。

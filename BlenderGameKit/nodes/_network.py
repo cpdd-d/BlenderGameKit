@@ -119,6 +119,9 @@ class GKNodeNetSend(B.GKStatementNode):
         ("gk_peer", "int", 0, "发给谁", "玩家编号;接『有人进来』的『谁』更省事"),
     )
 
+    def input_default_controls(self):
+        return ("gk_text", "gk_peer") if self.gk_mode == "ONE" else ("gk_text",)
+
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         row.prop(self, "gk_channel", text="频道")

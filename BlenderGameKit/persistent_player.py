@@ -458,6 +458,36 @@ var changing := false
 var active_camera: Camera3D
 # 开局那一关的"出生点还没装好"重试标记(见 `_level_ready`)
 var _level_retried := false
+# ── 相机的"出厂位姿"(第一百五十七轮)──────────────────────────────
+# 玩家身上的相机是**常驻**的:换关 / 重开都不会重建。而『相机_倒地』
+# 那条链把它下坠 0.85 米、侧翻 78°,关卡脚本跑了就没别人管了 ——
+# 于是"第二关失败重开"之后玩家的第一 / 第三人称机位还躺在地上翻着,
+# 看起来就是"视角穿模更严重"(用户原话)。
+# 这里在**任何关卡脚本跑之前**把每台相机的 transform 记一份,
+# 每次进关时还原回去。
+var _camera_homes := {}
+# 记下"出厂时哪台相机是当前的",重开时优先回到它
+var _default_camera := ""
+
+func _camera_key(owner: Node, camera: Node3D) -> String:
+    return str(owner.get_path()) + "|" + str(owner.get_path_to(camera))
+
+func _remember_cameras(owner: Node) -> void:
+    for camera in owner.find_children("*", "Camera3D", true, false):
+        var key := _camera_key(owner, camera)
+        if not _camera_homes.has(key):
+            _camera_homes[key] = camera.transform
+        if camera.current and _default_camera == "":
+            _default_camera = key
+
+func _restore_cameras(owner: Node) -> void:
+    for camera in owner.find_children("*", "Camera3D", true, false):
+        var key := _camera_key(owner, camera)
+        if _camera_homes.has(key):
+            camera.transform = _camera_homes[key]
+        # 『相机_倒地』在相机节点上留的锁(meta):重开时必须摘掉,
+        # 否则弹簧臂一直让位,相机就永远停在倒地那一下的位置上。
+        camera.remove_meta("gk_cam_locked")
 
 func _ready() -> void:
     process_mode = Node.PROCESS_MODE_ALWAYS
@@ -467,6 +497,9 @@ func _ready() -> void:
     for camera in player.find_children("*", "Camera3D", true, false):
         camera.current = camera.name == "__DEFAULT_CAMERA__"
     add_child(player)
+    # 一进树就记:autoload 的 _ready 比主场景早,此刻还没有任何关卡脚本
+    # 碰过相机,这份 transform 就是"出厂位姿"。
+    _remember_cameras(player)
     # ── 开局那一关必须**自己**接一次(用户实测 bug,第一百二十五轮)──────
     # `scene_changed` 是**引擎启动加载第一个场景时**发出去的,而 autoload 的
     # `_ready()` 那时才刚跑 —— 信号早就响过了,开局这次没有任何人接。
@@ -496,6 +529,17 @@ func _level_ready() -> void:
     if spawn != null:
         player.global_transform = spawn.global_transform
     player.velocity = Vector3.ZERO
+    # ── 相机回到"出厂位姿"(第一百五十七轮)─────────────────────────
+    # 关卡自己的相机(运镜用的那台)每次重开都是新实例,但**玩家身上的
+    # 相机是常驻的**:上一局倒地 / 运镜留下的位移和侧翻会带进新的一局。
+    # 先记(第一次见才记)再还原,于是重开时拿到的是出厂值。
+    _remember_cameras(level)
+    _restore_cameras(level)
+    _restore_cameras(player)
+    # 关卡脚本里那个 `_gk_cam_locked` 变量也让弹簧臂让位,重开时必须清掉。
+    for property in player.get_property_list():
+        if String(property.name) == "_gk_cam_locked":
+            player.set(property.name, false)
     # Spring arms cache world positions; a teleport must not interpolate across levels.
     for property in player.get_property_list():
         if String(property.name).begins_with("_gk_spring_ready") or String(property.name).begins_with("_gk_spring_base_yaw_ready"):
@@ -505,9 +549,19 @@ func _level_ready() -> void:
     if is_instance_valid(active_camera):
         active_camera.make_current()
     elif get_viewport().get_camera_3d() == null:
-        var cameras := player.find_children("*", "Camera3D", true, false)
-        if not cameras.is_empty():
-            cameras[0].make_current()
+        # 没有"进关时那台"了(重开同一关时旧实例已被释放)-> 回到出厂的那台。
+        var home := player.get_node_or_null(_default_camera) as Camera3D
+        if home == null and _default_camera != "":
+            # 出厂相机是关卡自己的(不在玩家身上)就按路径分段找
+            var parts := _default_camera.split("|", true, 1)
+            if parts.size() == 2 and parts[1] != "":
+                home = level.get_node_or_null(parts[1]) as Camera3D
+        if home != null:
+            home.make_current()
+        else:
+            var cameras := player.find_children("*", "Camera3D", true, false)
+            if not cameras.is_empty():
+                cameras[0].make_current()
     changing = false
     _level_retried = false
 

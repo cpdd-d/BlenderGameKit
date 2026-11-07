@@ -601,6 +601,17 @@ func _check_widgets() -> void:
 		" score_parent=", score.get_parent().name if score != null and score.get_parent() != null else "<none>",
 		" btn_parent=", resume.get_parent().name if resume != null and resume.get_parent() != null else "<none>")
 
+	# ── 第一百二十七轮:**连线式**父子(卡片上的『父控件』名字留空)──────
+	# 设计图里『设计标题』/『设计按钮』的父是**用『父』引脚连到底板**的,
+	# 不是填名字。这里验的是整条翻译链通不通:
+	#   引脚连线 -> ui_parent_name 解析 -> 生成的 _gk_find_widget(底板) -> Godot 真的挂上
+	var link_title := _widget("设计标题")
+	var link_panel := _widget("设计底板")
+	print("UI_PARENT_LINK ok=",
+		link_title != null and link_panel != null \\
+		and link_title.get_parent() == link_panel,
+		" title_parent=", link_title.get_parent().name if link_title != null and link_title.get_parent() != null else "<none>")
+
 	# 对齐:底部提示 = 底边居中 + 边距 28(按**当前视口尺寸**现算)
 	var view := get_viewport().get_visible_rect().size
 	var hint := _widget("底部提示")
@@ -1260,6 +1271,8 @@ def main():
         (r"UI_WIDGETS ok=true", "界面控件没建全(面板 / 图片 / 文本 / 进度条 / 按钮)"),
         (r"UI_IMAGE ok=true", "徽标图片没加载出来(Blender 的图没导出成 art/ui_*.png?)"),
         (r"UI_PARENT ok=true", "『父控件』没生效(控件没挂到底板下面)"),
+        (r"UI_PARENT_LINK ok=true",
+         "连线式父子没生效(『父』引脚接的底板没被翻译成挂载目标)"),
         (r"UI_ALIGN ok=true", "『对齐』位置不对(底部居中 + 边距)"),
         (r"UI_MENU_HIDDEN ok=true", "暂停菜单开局没藏起来(『开局藏』没生效)"),
         (r"UI_MENU_CENTER ok=true", "暂停菜单没有居中(居中锚点)"),

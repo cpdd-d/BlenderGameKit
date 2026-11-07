@@ -30,6 +30,8 @@ from . import _assets
 from . import _musicset
 # 网络联机(第一百轮:房间 + 自定义消息)—— ENet + @rpc
 from . import _network
+# 自定义脚本(第一百五十一轮:加载 / 停止 / 调用用户写的 GDScript)
+from . import _scripting
 # 游戏环境与后期(第一百二十五轮:『游戏环境与后期』树里的四张卡 + 逻辑触发卡)
 from . import _envpost
 
@@ -45,7 +47,7 @@ def _merge_namespaces(*modules):
 _merge_namespaces(_common, _events, _flow, _movement, _animation,
                   _instances, _fx, _variables, _input, _expressions,
                   _display, _containers, _functions, _ai, _displayset,
-                  _assets, _musicset, _network, _envpost)
+                  _assets, _musicset, _network, _scripting, _envpost)
 del _merge_namespaces
 
 
@@ -99,6 +101,8 @@ AI_TREE_VALUE_NODES = ANIM_TREE_VALUE_NODES + (
     "GKNodeDistance",        # 取值_距离
     "GKNodeGetPosition",     # 取值_位置
     "GKNodeRaycastCheck",    # 射线_有东西吗 —— 视线遮挡
+    # 视听合一(第一百五十轮):AI 图里条件和转场都能直接用它
+    "GKNodeAiSense",
 )
 
 # 已经在动画树里开放的节点再加 AI 树时必须**三个都保留** ——
@@ -165,9 +169,13 @@ for _cls in CLASSES:
 # 判据同样只认**纯取值 + 分支/切换**(没有副作用,什么时候求值都安全):
 #   * 常量 / 数学 / 比较 / 逻辑 / 向量 / 输入查询 —— 拼条件的基本材料;
 #   * 『流程_分支』『流程_切换』—— 就地分流,本身就是界面行为的一部分。
-# 移动 / 相机 / 生成实例这些"改世界"的**不**开 —— 界面行为不该偷偷动游戏;
-# 变量_读取也**不**开 —— 变量是按脚本存的,在主界面脚本里读到的是它自己
-# 那份(空的),摆进来只会让人误会"能看到玩法侧的变量"。
+# 移动 / 相机 / 生成实例这些"改世界"的**不**开 —— 界面行为不该偷偷动游戏。
+# ⚠ 变量_读取原来也**不**开(第一百一十二轮的理由:变量是按脚本存的,主界面
+#   脚本里读到的是它自己那份)。第一百二十七轮用户明确要"设置变量"进界面图,
+#   于是单列下面那份 `UI_TREE_VARIABLE_NODES` 开放 —— 同时把这条限制讲清楚:
+#   设计图在**场景里套用**时变量进场景脚本(和玩法图共享);**主界面**
+#   (autoload)里的变量活在 gk_main_ui.gd,两边不互通;跨脚本请用
+#   『界面_取控件』/『界面_取界面』。
 UI_TREE_VALUE_NODES = ANIM_TREE_VALUE_NODES + (
     "GKNodeBranch", "GKNodeSwitch",
 )
@@ -180,10 +188,36 @@ for _cls in CLASSES:
         if "GKUiDesignTree" not in kinds:
             _cls.gk_tree_type = tuple(kinds) + ("GKUiDesignTree",)
 
+
+# ==========================================================================
+# 『游戏界面』里还能用的"变量 / 物体"节点 —— 第一百二十七轮
+# ==========================================================================
+# 用户:"添加:设置变量,设置物体(get object),获取物体名称"。
+# 和上面那份"纯取值"名单**分开列**:这一组会**改变状态**(变量_设置 /
+# 变量_增减)或引用场景物体,判据和"随时求值都安全"不是一回事,混在一个
+# 名单里以后没人看得懂谁是谁。
+UI_TREE_VARIABLE_NODES = (
+    "GKNodeSetVar",        # 变量_设置
+    "GKNodeGetVar",        # 变量_读取
+    "GKNodeGetNode",       # 取值_获取节点(用户说的"get object")
+    "GKNodeObjectName",    # 取值_物体名称
+)
+
+for _cls in CLASSES:
+    if _cls.bl_idname in UI_TREE_VARIABLE_NODES:
+        # 追加而不是覆盖:这几个节点各自的动画树 / AI 树归属要保住
+        # (直接赋值会把『变量_设置』从 AI 图里关回去 —— 用户 2026-10-03
+        # 踩过一次一模一样的坑)。
+        kinds = getattr(_cls, "gk_tree_type", "GKGameLogicTree")
+        if isinstance(kinds, str):
+            kinds = (kinds,)
+        if "GKUiDesignTree" not in kinds:
+            _cls.gk_tree_type = tuple(kinds) + ("GKUiDesignTree",)
+
 ALL_CLASSES = tuple(CLASSES)
 
 # "添加节点"菜单里的分类排列顺序
-CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "资产", "实例", "特效", "变量", "函数", "信号", "网络", "输入",
+CATEGORY_ORDER = ("事件", "流程", "移动", "物理", "动画", "动画系统", "AI", "资产", "实例", "特效", "变量", "函数", "脚本", "信号", "网络", "输入",
                   "手柄", "触屏", "运算", "显示", "相机", "灯光", "音效", "存档", "界面",
                   "屏幕效果", "氛围", "显示设置", "音乐设置", "射线", "定时", "列表", "字典", "时间",
                   # 第 125 轮:『游戏环境与后期』树里的四张卡。排在"氛围"附近 ——
@@ -220,7 +254,7 @@ MENU_GROUPS = {
 SUBCATEGORY_ORDER = {
     "运算": ("常量", "数学", "向量", "逻辑", "转换"),
     "输入": ("键盘", "鼠标", "手柄", "触屏"),
-    "动画": ("播放", "骨骼"),
+    "动画": ("播放", "骨骼", "动态"),
 }
 
 # 节点 bl_idname -> 二级分类名。只给上面列了 SUBCATEGORY_ORDER 的分类登记。
@@ -277,6 +311,9 @@ SUBCATEGORY_OF = {
     "GKNodeGetBone": "骨骼",   # 骨骼_取数据
     "GKNodeSetBone": "骨骼",   # 骨骼_设置
     "GKNodeBoneLookAtCamera": "骨骼",   # 骨骼_跟随视角
+    # 摆动是"道具 / 灯 / 界面自己的动态",和骨骼 / 动画播放分开
+    "GKNodeSway": "动态",
+    "GKNodeHumanoidWalk": "动态",
     "GKNodeMouseButton": "鼠标",
     "GKNodeMouseButtonDown": "鼠标",
     "GKNodeMouseWheel": "鼠标",

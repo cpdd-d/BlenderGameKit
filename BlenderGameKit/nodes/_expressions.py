@@ -95,6 +95,7 @@ MATH_OPS = (
     ("FLOOR", "向下取整 floor", ""),
     ("CEIL", "向上取整 ceil", ""),
     ("ROUND", "四舍五入 round", ""),
+    ("INT", "取整 int", ""),
     ("CLAMP", "钳制 clamp", ""),
     ("LERP", "线性插值 lerp", ""),
     ("SIGN", "符号 sign", ""),
@@ -105,7 +106,7 @@ MATH_OPS = (
 
 MATH_TWO_ARG = {"ADD", "SUB", "MUL", "DIV", "MOD", "POW", "MIN", "MAX"}
 MATH_THREE_ARG = {"CLAMP", "LERP"}
-MATH_ONE_ARG = {"ABS", "SQRT", "SIN", "COS", "FLOOR", "CEIL", "ROUND", "SIGN", "DEG2RAD", "RAD2DEG"}
+MATH_ONE_ARG = {"ABS", "SQRT", "SIN", "COS", "FLOOR", "CEIL", "ROUND", "INT", "SIGN", "DEG2RAD", "RAD2DEG"}
 
 
 @N
@@ -135,6 +136,8 @@ class GKNodeMath(B.GKExpressionNode):
 
     def active_inputs(self):
         op = getattr(self, "gk_op", "ADD")
+        if op == "RANDOM":
+            return ()
         if op in MATH_THREE_ARG:
             return ("A", "B", "C")
         if op in MATH_TWO_ARG:
@@ -200,6 +203,10 @@ class GKNodeLogic(B.GKExpressionNode):
          "与/或 有几个输入(2~8)", None, {"min": 2, "max": 8}),
     )
     gk_outputs = (S.pin(BOOL, "结果", False),)
+    # 『非』按设计只留 A —— 但类上声明了 B,加载迁移会把"缺 B"当成
+    # 遗留引脚缺失、每次打开 .blend 都重建一次(永远不收敛)。
+    # 这里明确告诉迁移:这些声明引脚在某些模式下**允许不存在**。
+    gk_optional_declared_inputs = ("B",)
 
 
     def build_sockets(self):

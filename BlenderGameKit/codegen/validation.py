@@ -144,40 +144,57 @@ _SUSPENDING_NODES = {"GKNodeWait", "GKNodeUiDialog", "GKNodeUiChoice"}
 
 
 def _check_suspending_flow_fanout(tree, warnings):
-    """An awaited branch makes sibling execution order difficult to reason about."""
-    for node in getattr(tree, "nodes", ()) or ():
+    """Find implicit fanout with waits, including branches hidden by reroutes.
+
+    Build the flow graph once, then propagate suspension backwards once rather
+    than walking the same downstream chain for every branching socket.
+    """
+    from .graph import downstream
+
+    nodes = list(getattr(tree, "nodes", ()) or ())
+    links_by_socket = None
+    if hasattr(tree, "links"):
+        links_by_socket = {}
+        for link in tree.links:
+            links_by_socket.setdefault(link.from_socket, []).append(link)
+    predecessors = {}
+    branches = []
+    for node in nodes:
+        # Reroutes are editor wiring; report at the real flow output that owns
+        # the branch, even when Blender gives the reroute a generic socket.
+        if getattr(node, "bl_idname", "") == "NodeReroute":
+            continue
         for socket in getattr(node, "outputs", ()) or ():
             if getattr(socket, "bl_idname", "") != "GKSocketFlow":
                 continue
-            links = list(getattr(socket, "links", ()) or ())
-            if len(links) < 2:
+            try:
+                targets = downstream(socket, links_by_socket=links_by_socket)
+            except ValueError:
+                # Reachable reroute cycles already abort code generation. An
+                # unused cyclic chain must not break this advisory check.
                 continue
-            pending = [getattr(link, "to_node", None) for link in links]
-            seen = set()
-            suspends = False
-            while pending:
-                current = pending.pop()
-                if current is None:
-                    continue
-                key = (getattr(current, "as_pointer", lambda: id(current))())
-                if key in seen:
-                    continue
-                seen.add(key)
-                if getattr(current, "bl_idname", "") in _SUSPENDING_NODES:
-                    suspends = True
-                    break
-                for output in getattr(current, "outputs", ()) or ():
-                    if getattr(output, "bl_idname", "") == "GKSocketFlow":
-                        pending.extend(getattr(link, "to_node", None)
-                                       for link in getattr(output, "links", ()) or ())
-            if suspends:
-                name = str(getattr(node, "name", "") or "?")
-                warnings.append(Diagnostic(
-                    level="warning", code="SUSPENDING_FLOW_FANOUT",
-                    message=f"『{name}』的『{socket.name}』连接了多条执行链，其中有等待节点；执行顺序依赖节点位置。",
-                    hint="接一个『序列』节点，用编号出口明确初始化与等待链的顺序；把等待链放在最后。",
-                    node_name=name,
-                ))
+            for target, _entry in targets:
+                predecessors.setdefault(target, set()).add(node)
+            if len(targets) > 1:
+                branches.append((node, socket, targets))
+
+    suspending = {node for node in nodes
+                  if getattr(node, "bl_idname", "") in _SUSPENDING_NODES}
+    pending = list(suspending)
+    while pending:
+        for parent in predecessors.get(pending.pop(), ()):
+            if parent not in suspending:
+                suspending.add(parent)
+                pending.append(parent)
+    for node, socket, targets in branches:
+        if any(target in suspending for target, _entry in targets):
+            name = str(getattr(node, "name", "") or "?")
+            warnings.append(Diagnostic(
+                level="warning", code="SUSPENDING_FLOW_FANOUT",
+                message=f"『{name}』的『{socket.name}』连接了多条执行链，其中有等待节点；执行顺序依赖节点位置。",
+                hint="接一个『序列』节点，用编号出口明确初始化与等待链的顺序；把等待链放在最后。",
+                node_name=name,
+            ))
 
 
 def required_base_class(tree, options=None):

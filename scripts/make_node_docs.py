@@ -74,6 +74,7 @@ TREE_LABELS = {
 PROP_KINDS = {
     "string": "文本", "float": "数值", "int": "整数", "bool": "开关",
     "enum": "下拉", "node": "物体引用", "color": "颜色", "vector": "向量",
+    "text_block": "文本块引用",
 }
 
 

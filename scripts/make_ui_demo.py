@@ -288,13 +288,18 @@ def build_design_tree():
     text = _add(design, "GKNodeUiText", "设计标题", 300.0, 0.0,
                 gk_text="设计图 HUD", gk_size=22,
                 gk_color=(0.78, 1.0, 0.86, 1.0),
-                gk_x=16.0, gk_y=12.0, gk_parent_widget="设计底板")
+                gk_x=16.0, gk_y=12.0)
     button = _add(design, "GKNodeUiButton", "设计按钮", 600.0, 0.0,
                   gk_text="点我", gk_x=16.0, gk_y=48.0,
-                  gk_width=120.0, gk_height=38.0,
-                  gk_parent_widget="设计底板")
+                  gk_width=120.0, gk_height=38.0)
+    # ── 第一百二十七轮:父子改成**连线**(子控件的『父』<- 底板的『自己』)──
+    # 卡片上的『父控件』名字**故意留空**:专门走"连线式层级"那条新路。
+    # 生成时它会被翻译回底板的名字,运行期挂载结果和填名字完全一样 ——
+    # 探针 check_ui_demo.py 的 UI_PARENT_LINK 就是钉这一条的。
+    _link(design, panel, "自己", text, "父")
+    _link(design, panel, "自己", button, "父")
     log(f"设计图『{design.name}』:{len(design.nodes)} 个控件"
-        f"(底板 / 标题 / 按钮,后两个挂在底板上)")
+        f"(底板 / 标题 / 按钮,后两个用**连线**挂在底板上)")
     return design
 
 

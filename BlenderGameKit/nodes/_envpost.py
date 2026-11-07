@@ -292,11 +292,27 @@ class GKNodeSkyBox(B.GKStatementNode):
         ("gk_ground_color", "color", (0.12, 0.12, 0.14, 1.0), "地面色",
          "地平线**以下**那半边的颜色(免得天空色漏到脚下)"),
         ("gk_sun_size", "float", 0.06, "太阳盘大小",
-         "天空里那个太阳圆盘的大小;0 = 不画太阳盘"),
+         "太阳盘的角半径(弧度);0 = 不画太阳盘"),
         ("gk_horizon_glow", "float", 0.0, "霞光强度",
          "地平线那圈橙红边,黄昏 / 清晨拧大它(0 = 不画)"),
         ("gk_glow_color", "color", (1.0, 0.55, 0.28, 1.0), "霞光颜色",
          "霞光往什么颜色偏"),
+        # ── 星星(第一百五十一轮第四轮)──────────────────────────────
+        # 用户原话:"实际运行下……星星也没有"。天空着色器现在用球面哈希散点
+        # 画星星,只在天空够暗时出现(白天 / 黄昏自动隐去)。
+        ("gk_star_amount", "float", 0.7, "星星数量",
+         "0 = 没有星星,1 = 满天星(只在夜空出现)"),
+        ("gk_star_brightness", "float", 1.0, "星星亮度",
+         "星星的亮度倍率(1 = 正常,2 = 更亮)"),
+        ("gk_star_twinkle", "float", 1.0, "星星闪动",
+         "0 = 恒定亮着,1 = 正常闪烁,2 = 很夸张(每颗星相位/频率不同)"),
+        # ── 南北半球(第一百五十二轮)────────────────────────────────
+        # 用户要"南/北半球天空的切换开关"。两个半球的星空不是同一片天
+        # 转个角度:北天有北极星(几乎不动)、南天看不到北极星但有大小
+        # 麦哲伦云,星图本身也是镜像的。所以做成一个真的换布局的开关。
+        ("gk_sky_hemisphere", "enum", "NORTH", "半球", "",
+         (("NORTH", "北半球", "北极星 + 北天星图"),
+          ("SOUTH", "南半球", "麦哲伦云 + 南天星图"))),
     )
 
     def draw_buttons(self, context, layout):
@@ -308,6 +324,11 @@ class GKNodeSkyBox(B.GKStatementNode):
         row.prop(self, "gk_sun_size", text="太阳盘")
         row.prop(self, "gk_horizon_glow", text="霞光")
         layout.prop(self, "gk_glow_color", text="")
+        row = layout.row(align=True)
+        row.prop(self, "gk_star_amount", text="星星")
+        row.prop(self, "gk_star_brightness", text="亮度")
+        row.prop(self, "gk_star_twinkle", text="闪动")
+        layout.prop(self, "gk_sky_hemisphere", text="半球")
 
 
 @N
@@ -329,17 +350,30 @@ class GKNodeClouds(B.GKStatementNode):
     gk_prop_defs = (
         ("gk_cloud_amount", "float", 0.45, "云量",
          "0 = 一丝云都没有,1 = 满天都是"),
-        ("gk_cloud_speed", "float", 0.02, "云速", "云飘得多快(0 = 定住)"),
+        ("gk_cloud_speed", "float", 0.06, "云速", "云飘得多快(0 = 定住)"),
         ("gk_cloud_scale", "float", 3.0, "云尺度",
          "越大云团越小、越密;越小云团越大"),
-        ("gk_cloud_height", "float", 0.12, "云层高度",
-         "云底压在地平线以上多少(太小远处的云会糊在地平线上)"),
+        ("gk_cloud_height", "float", 0.06, "云层高度",
+         "云底压在地平线以上多少(以 sin(仰角) 计;0.06 ≈ 3.4°,"
+         "太小云会糊到地平线,太大只剩头顶一片)"),
         ("gk_cloud_softness", "float", 0.22, "云边柔和",
          "云团边缘过渡多宽;卡通风格留 0.15~0.3 比较像手绘"),
         ("gk_cloud_light", "color", (1.0, 0.98, 0.95, 1.0), "云亮面",
          "被太阳照到的那一侧"),
         ("gk_cloud_dark", "color", (0.45, 0.48, 0.58, 1.0), "云暗面",
          "背光那一边(夜里整体压暗)"),
+        # ── 云影(第一百五十轮)──────────────────────────────────────
+        # 用户原话:"云层上,会缓缓移动而影响月光照射"。
+        # 云飘过月亮时月光会一暗一明;这里按云量 / 云速算一层**慢速遮罩**,
+        # 乘在月光亮度上。0 = 关(老场景月光不变),0.3~0.6 是"薄云飘过"。
+        ("gk_cloud_shadow", "float", 0.0, "云影(遮月光)",
+         "云飘过月亮时月光变暗多少;0 = 不影响(老行为),"
+         "0.3~0.6 = 薄云缓缓飘过,1 = 可以完全遮黑"),
+        # ── 白天云量增加(第一百五十一轮第五轮)──────────────────────
+        # 用户:"之后是太阳的出现,和云层的增多"。接昼夜循环后,
+        # 白天的云量在这个值上再加一道;0 = 老行为(昼夜不影响云量)。
+        ("gk_cloud_day_boost", "float", 0.0, "白天云量增加",
+         "0 = 老行为;0.25 = 白天比夜里多两成半的云(昼夜循环才生效)"),
     )
 
     def draw_buttons(self, context, layout):
@@ -350,6 +384,8 @@ class GKNodeClouds(B.GKStatementNode):
         row = layout.row(align=True)
         row.prop(self, "gk_cloud_light", text="")
         row.prop(self, "gk_cloud_dark", text="")
+        layout.prop(self, "gk_cloud_shadow", text="云影(遮月光)")
+        layout.prop(self, "gk_cloud_day_boost", text="白天云量增加")
 
 
 @N
@@ -377,6 +413,13 @@ class GKNodeSun(B.GKStatementNode):
          "在关键帧给的强度上再乘一道(0.5 = 暗一半)"),
         ("gk_sun_shadow", "bool", True, "投影",
          "关掉 = 这盏太阳不投影子(影子开销大,夜景可以关)"),
+        # ── 南北半球(第一百五十三轮)───────────────────────────────
+        # 北半球:太阳从东升、**偏南**划过天空、西落(正午影子朝北);
+        # 南半球:同一套时刻,整条日轨绕天顶转 180° —— 太阳偏北,影子朝南。
+        # 只翻"划过的方向",不改高度角(高度角还是由『正午高度角』决定)。
+        ("gk_sun_hemisphere", "enum", "NORTH", "半球", "",
+         (("NORTH", "北半球", "太阳偏南划过,影子朝北"),
+          ("SOUTH", "南半球", "太阳偏北划过,影子朝南"))),
     )
 
     def draw_buttons(self, context, layout):
@@ -387,6 +430,7 @@ class GKNodeSun(B.GKStatementNode):
         row.prop(self, "gk_sun_latitude", text="高度角")
         row.prop(self, "gk_sun_tilt", text="方位")
         row.prop(self, "gk_sun_scale", text="倍数")
+        layout.prop(self, "gk_sun_hemisphere", text="半球")
 
 
 @N
@@ -415,6 +459,12 @@ class GKNodeDayNight(B.GKStatementNode):
         ("gk_auto", "bool", True, "自动流逝",
          "勾着 = 一进关卡时间就往前走;取消 = 停在起始时刻"
          "(留给逻辑图用『环境_昼夜设置』手动推)"),
+        # ── 只改天空(第一百五十一轮第五轮)──────────────────────────
+        # 恐怖示例的走廊 / 大厅有手工调好的环境光与雾;如果昼夜循环
+        # 把这两项也按预设覆盖掉,原氛围会被冲淡。勾上后它只改天色、
+        # 太阳 / 月亮、云量,环境光和雾保持场景设置。
+        ("gk_sky_only", "bool", False, "只改天空",
+         "勾着 = 不动环境光 / 雾,只让天色、太阳、月亮、云量随时间变"),
         ("gk_brightness", "float", 1.0, "整体亮度",
          "把关键帧给的天光 / 太阳强度一起乘一道(0.5 = 整条时间轴压暗一半)"),
     )
@@ -426,6 +476,7 @@ class GKNodeDayNight(B.GKStatementNode):
         row.prop(self, "gk_start_hour", text="起点(时)")
         row = layout.row(align=True)
         row.prop(self, "gk_auto", text="自动流逝", toggle=True)
+        row.prop(self, "gk_sky_only", text="只改天空", toggle=True)
         row.prop(self, "gk_brightness", text="亮度")
         layout.label(text="氛围档:夜晚 / 清晨 / 白天 / 黄昏", icon="INFO")
 
@@ -438,6 +489,8 @@ WEATHER_KINDS = (
     ("CLOUDY", "阴", "阴天:云多、光偏冷偏暗"),
     ("RAINY", "雨", "雨天:浓雾 + 冷色 + 云层压暗"),
     ("FOGGY", "雾", "雾天:雾最浓、泛光压低"),
+    ("WINDY", "大风", "大风:云被吹快、空中飘尘、雾被吹散一点"),
+    ("SNOWY", "雪", "雪:飘雪 + 中等雾,环境光偏亮(雪面反光)"),
 )
 
 
@@ -457,14 +510,28 @@ class GKNodeMoon(B.GKStatementNode):
         ("gk_moon_color", "color", (0.80, 0.86, 1.0, 1.0), "颜色", "月光颜色"),
         ("gk_moon_energy", "float", 0.35, "强度",
          "月光亮度(相对太阳的出厂强度;夜里 0.2~0.6 比较自然)"),
-        ("gk_moon_size", "float", 0.035, "月盘大小",
-         "天空里月亮的视角大小(0.02~0.08)"),
+        ("gk_moon_size", "float", 0.06, "月盘大小",
+         "月盘的角半径(弧度):0.06 ≈ 3.4° 半径 / 6.9° 直径(0.02~0.10)"),
         ("gk_moon_phase", "float", 1.0, "月相",
          "1 = 满月,0 = 新月;中间的数是缺掉的多少"),
+        # ── 第一百五十一轮:月相动画(用户:"从圆满到弯月的动画")────────
+        ("gk_moon_phase_animate", "bool", False, "月相动画",
+         "勾着 = 月相随环境时钟在『满月 ↔ 最弯』之间循环(不用逻辑图驱动)"),
+        ("gk_moon_phase_seconds", "float", 40.0, "月相周期(秒)",
+         "一个完整的 满月 → 弯月 → 满月 循环要多少秒"),
+        ("gk_moon_phase_min", "float", 0.15, "最弯月相",
+         "循环到最弯时保留多少月面(0.15 = 一弯细月,0 = 全黑)"),
         ("gk_moon_shadow", "bool", False, "月光投影",
          "勾着 = 月光也投影子(夜景开销大,默认关)"),
         ("gk_moon_orbit", "bool", True, "随昼夜升落",
-         "勾着 = 和太阳反着走;取消 = 固定方向"),
+         "勾着 = 走一条夜路:18 点东升 → 半夜在正北最高 → 6 点西落;"
+         "取消 = 用下面两个角固定方向"),
+        ("gk_moon_azimuth", "float", 0.0, "方位角",
+         "固定方向时,月亮从哪个方向来(度,Godot 世界):"
+         "0 = 北(-Z),90 = 东(+X),180 = 南,270 = 西"),
+        ("gk_moon_elevation", "float", 30.0, "高度角",
+         "固定方向时,月亮挂多高(度):0 = 地平线,90 = 正头顶;"
+         "『随昼夜升落』勾着时 = 月亮在半夜最高挂多高"),
     )
 
     def draw_buttons(self, context, layout):
@@ -473,9 +540,18 @@ class GKNodeMoon(B.GKStatementNode):
         row.prop(self, "gk_moon_energy", text="强度")
         row.prop(self, "gk_moon_phase", text="月相")
         row = layout.row(align=True)
+        row.prop(self, "gk_moon_phase_animate", text="月相动画", toggle=True)
+        if self.gk_moon_phase_animate:
+            row.prop(self, "gk_moon_phase_seconds", text="周期(秒)")
+            layout.prop(self, "gk_moon_phase_min", text="最弯月相")
+        row = layout.row(align=True)
         row.prop(self, "gk_moon_size", text="盘大小")
         row.prop(self, "gk_moon_orbit", text="升落", toggle=True)
         row.prop(self, "gk_moon_shadow", text="投影", toggle=True)
+        if not self.gk_moon_orbit:
+            row = layout.row(align=True)
+            row.prop(self, "gk_moon_azimuth", text="方位")
+            row.prop(self, "gk_moon_elevation", text="高度")
 
 
 @N
@@ -566,6 +642,56 @@ class GKNodeDayNightSet(B.GKStatementNode):
         if action in ("SET_TIME", "SPEED"):
             if not bool(getattr(self.inputs.get("值"), "is_linked", False)):
                 row.prop(self, "gk_value", text="")
+
+
+@N
+class GKNodeEnvAlternate(B.GKStatementNode):
+    bl_idname = "GKNodeEnvAlternate"
+    bl_label = "环境_昼夜交替"
+    bl_icon = "TIME"
+    gk_category = ENV_CATEGORY
+    gk_tree_type = "GKGameLogicTree"
+    gk_doc = ("**让这一关在白天和夜晚之间自动来回过渡。**\n"
+              "执行一次后,环境时钟会从当前时刻慢慢走到『白天时刻』,"
+              "停留一会儿,再慢慢走到『夜晚时刻』,然后一直循环 —— "
+              "不用你自己写定时器 / 变量。\n"
+              "『过渡秒数』= 走完一次白天→夜晚要多久;『停留秒数』= "
+              "到了之后停多久。\n"
+              "⚠ 需要『游戏环境与后期』图里有『环境_昼夜循环』卡"
+              "(『自动流逝』可以关掉,交替会接管时间)。想停就用"
+              "『环境_停止交替』。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_outputs = (S.pin(FLOW, "完成"),)
+    gk_prop_defs = (
+        ("gk_alt_day", "float", 7.0, "白天时刻", "白天停在几点(0~24)"),
+        ("gk_alt_night", "float", 21.0, "夜晚时刻", "夜晚停在几点(0~24)"),
+        ("gk_alt_fade", "float", 12.0, "过渡秒数", "从白天走到夜晚要多少秒"),
+        ("gk_alt_hold", "float", 8.0, "停留秒数", "到了白天 / 夜晚后停多久"),
+    )
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_alt_day", text="白天")
+        row.prop(self, "gk_alt_night", text="夜晚")
+        row = layout.row(align=True)
+        row.prop(self, "gk_alt_fade", text="过渡(秒)")
+        row.prop(self, "gk_alt_hold", text="停留(秒)")
+
+
+@N
+class GKNodeEnvAlternateStop(B.GKStatementNode):
+    bl_idname = "GKNodeEnvAlternateStop"
+    bl_label = "环境_停止交替"
+    bl_icon = "PAUSE"
+    gk_category = ENV_CATEGORY
+    gk_tree_type = "GKGameLogicTree"
+    gk_doc = ("停掉『环境_昼夜交替』的自动循环,时间就停在此刻。"
+              "之后可以用『环境_昼夜设置』接管(跳时刻 / 暂停 / 加速)。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_outputs = (S.pin(FLOW, "完成"),)
+
+    def draw_buttons(self, context, layout):
+        layout.label(text="停在此刻;时间不再自动来回", icon="INFO")
 
 
 GK_CLASSES_ENVPOST = ()

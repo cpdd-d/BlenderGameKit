@@ -14,6 +14,8 @@
 
 import sys
 import os
+import math
+import time
 import traceback
 from importlib import import_module
 
@@ -439,9 +441,144 @@ def main():
             # 新算子都注册上了
             for name in ("look_pick_all", "look_pick_none",
                          "env_apply_to_checked", "look_match_runtime",
-                         "light_preview_scale_reset"):
+                         "light_preview_scale_reset",
+                         # 第一百五十一轮第四轮:右键工具 + 天空预览开关
+                         "env_fill_cards", "env_auto_chain", "env_tidy",
+                         "env_unlink_selected", "env_preview_toggle",
+                         "env_preview_drag"):
                 check(f"算子 gk.{name} 注册上了",
                       hasattr(bpy.ops.gk, name), "")
+            # ── 第一百五十一轮第四轮:右键工具真的能补齐 / 连线 / 整理 ──
+            # 这三个算子在侧栏不画按钮(右键菜单里),所以在这里直接执行 ——
+            # 它们改的是树本身,不依赖窗口。
+            tools = bpy.data.node_groups.new("面板冒烟环境工具151",
+                                             "GKEnvLibraryTree")
+            try:
+                tool_ctx = FakeNodeContext(cube, scene, tools)
+                # ⚠ 不能直接 `ui.GK_OT_EnvFillCards()` —— bpy 的算子类
+                #   只能由 Blender 自己 new(bpy_struct.__new__ 需要参数)。
+                #   这里用假 self 调**未绑定**的 execute,只验函数体。
+                class FakeOperator:
+                    def report(self, level, text):
+                        pass
+
+                def run(operator_class):
+                    return operator_class.execute(FakeOperator(), tool_ctx)
+
+                run(ui.GK_OT_EnvFillCards)
+                kinds = {node.bl_idname for node in tools.nodes}
+                check("补齐标准环境卡:9 张都补上了",
+                      all(kind in kinds for kind, _label
+                          in ui._ENV_CARD_ORDER),
+                      str(sorted(kinds)))
+                run(ui.GK_OT_EnvAutoChain)
+                check("自动连线:串起 8 条执行线",
+                      len(tools.links) == 8, str(len(tools.links)))
+                # 断线:只选中第一张卡 -> 只删它那一条出线
+                for item in tools.nodes:
+                    item.select = False
+                first = next(item for item in tools.nodes
+                             if item.bl_idname == ui._ENV_CARD_ORDER[0][0])
+                first.select = True
+                run(ui.GK_OT_EnvUnlinkSelected)
+                check("断开选中节点的连线:只删它自己的线",
+                      len(tools.links) == 7, str(len(tools.links)))
+                first.select = False
+                run(ui.GK_OT_EnvTidy)
+                columns = {round(node.location.x, 1) for node in tools.nodes}
+                check("整理成一列:横坐标一致", len(columns) == 1,
+                      str(sorted(columns)))
+                values = ui._env_preview_values(tools)
+                check("天空预览读得到太阳 / 月亮 / 云 / 天空",
+                      "moon_on" in values and "sun_on" in values
+                      and "top" in values
+                      and "cloud_amount" in values,
+                      str(sorted(values))[:200])
+                # 第一百五十一轮第四轮:星星 / 角半径月盘 / 不在环境图里也能取到树
+                check("天空预览读得到星星参数",
+                      "star_amount" in values
+                      and "star_brightness" in values, str(sorted(values)))
+                check("天空预览也读『环境_设置色调』",
+                      values["grade_on"]
+                      and "grade_tint_amount" in values, str(sorted(values)))
+                check("月盘默认按角半径 0.06 读",
+                      abs(values["moon_size"] - 0.06) < 1e-6,
+                      str(values["moon_size"]))
+                check("没在编辑环境图时也能找到预览树",
+                      ui._env_preview_tree() is not None, "")
+                cover = ui._env_preview_cloud_cover(
+                    (0.0, 0.5, -0.866), values, 0.0)
+                check("预览云量算出来是 0~1 的数",
+                      0.0 <= cover <= 1.0, str(cover))
+                yaw, pitch = ui._env_preview_camera(values)
+                if (values.get("sun_on")
+                        and values.get("day_amount", 1.0) > 0.45
+                        and values.get("sun_elevation", -90.0) > 2.0):
+                    target_az = values["sun_azimuth"]
+                    target_el = max(-12.0, min(78.0, values["sun_elevation"]))
+                    target_name = "太阳"
+                elif (values.get("moon_on")
+                      and values.get("moon_elevation", -90.0) > 2.0):
+                    target_az = values["moon_azimuth"]
+                    target_el = max(-12.0, min(78.0, values["moon_elevation"]))
+                    target_name = "月亮"
+                else:
+                    target_az, target_el, target_name = 0.0, 20.0, "地平线"
+                check("预览默认朝向太阳 / 月亮 / 地平线",
+                      abs(math.degrees(yaw) - target_az) < 1e-6
+                      and abs(math.degrees(pitch) - target_el) < 1e-6,
+                      "%s %.2f / %.2f" % (target_name, math.degrees(yaw),
+                                          math.degrees(pitch)))
+                # 第一百五十一轮第七轮:白天预览(拨时刻 + 播一天)
+                check("预览时刻 / 播一天算子已注册",
+                      hasattr(bpy.ops.gk, "env_preview_time")
+                      and hasattr(bpy.ops.gk, "env_preview_play"), "")
+                ui._ENV_PREVIEW_HOUR[0] = None
+                ui._ENV_PREVIEW_PLAY[0] = False
+                daynight_node = next(item for item in tools.nodes
+                                     if item.bl_idname == "GKNodeDayNight")
+                daynight_node.gk_auto = False
+                daynight_node.gk_start_hour = 0.0
+                night_vals = ui._env_preview_daynight(daynight_node)
+                check("昼夜预览:0 点取到夜晚档",
+                      night_vals is not None and night_vals[2] < 0.1,
+                      str(night_vals))
+                night_values = ui._env_preview_values(tools)
+                check("昼夜预览:夜里云亮度被压暗",
+                      night_values["cloud_light"][0] < 0.5,
+                      str(night_values["cloud_light"]))
+                ui._ENV_PREVIEW_HOUR[0] = 12.0
+                noon_values = ui._env_preview_values(tools)
+                check("预览能拨到白天(太阳出来、云变亮)",
+                      noon_values["day_amount"] > 0.9
+                      and noon_values["sun_on"]
+                      and noon_values["sun_elevation"] > 10.0
+                      and noon_values["cloud_light"][0]
+                      > night_values["cloud_light"][0],
+                      "day=%.2f sun=%.2f/el=%.1f"
+                      % (noon_values["day_amount"],
+                         noon_values["sun_opacity"],
+                         noon_values["sun_elevation"]))
+                check("白天预览的太阳在正北",
+                      abs(noon_values["sun_azimuth"]) < 1e-6,
+                      str(noon_values["sun_azimuth"]))
+                ui._ENV_PREVIEW_PLAY_FROM[0] = 0.0
+                ui._ENV_PREVIEW_PLAY_START[0] = time.time() - 12.0
+                ui._ENV_PREVIEW_PLAY[0] = True
+                check("预览一天循环在走(12 秒 = 6 点)",
+                      abs(ui._env_preview_hour(None) - 6.0) < 0.2,
+                      "%.2f" % ui._env_preview_hour(None))
+                ui._ENV_PREVIEW_PLAY[0] = False
+                ui._ENV_PREVIEW_HOUR[0] = None
+                daynight_node.gk_start_hour = 12.0
+                day_vals = ui._env_preview_daynight(daynight_node)
+                check("昼夜预览:12 点取到白天档",
+                      day_vals is not None and day_vals[2] > 0.9,
+                      str(day_vals))
+                check("预览定时器在没有节点编辑器时也不报错",
+                      ui._env_preview_tick() > 0.0, "")
+            finally:
+                bpy.data.node_groups.remove(tools)
     except Exception as exc:                              # noqa: BLE001
         check("『游戏环境与后期』侧栏", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
@@ -1037,6 +1174,83 @@ def main():
         bpy.data.node_groups.remove(tree)
     except Exception as exc:
         check("『界面_列表_填充』卡片(第一百零六轮 A)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
+    # ---- 6l. 第一百二十七轮:结构件 / 引用 / 事件卡片 + 清单缩进 ----
+    # 这批节点的 draw_buttons 全是新写的 —— "画一半崩"在 Blender 里表现为
+    # **卡片整块消失**,冒烟那层只验"节点在、代码对",看不见画的事。
+    # 顺带在真 Blender 里钉住"连线式父子"的清单缩进。
+    print("=" * 72)
+    print("6l. 界面结构件 / 引用 / 事件卡片(第一百二十七轮)")
+    print("=" * 72)
+    try:
+        _nb127 = import_module(f"{module_name}.nodes.node_base")
+        tree = bpy.data.node_groups.new("面板冒烟界面127", "GKUiDesignTree")
+        cards = []
+        for idname, name in (
+                ("GKNodeUiCanvas", "画布"),
+                ("GKNodeUiBox", "竖排框"),
+                ("GKNodeUiBackdrop", "底色"),
+                ("GKNodeUiTextBox", "标题条"),
+                ("GKNodeUiOnMouseClick", "点空白"),
+                ("GKNodeUiOnKeyPress", "开背包"),
+                ("GKNodeUiWidgetRef", "取按钮"),
+                ("GKNodeUiDesignRef", "取界面"),
+                ("GKNodeObjectName", "取名字"),
+                # 第一百二十八轮:『界面_弹入/弹出』组合卡
+                ("GKNodeUiPop", "弹菜单")):
+            node = tree.nodes.new(idname)
+            node.name = name
+            cards.append(node)
+
+        bad_card = ""
+        for card in cards:
+            try:
+                card.draw_buttons(bpy.context, RecordingLayout())
+            except Exception as exc:                      # noqa: BLE001
+                bad_card = f"{card.bl_label}: {type(exc).__name__}: {exc}"
+                break
+        check("第一百二十七轮:十张新卡片都画得完", not bad_card, bad_card)
+
+        # 新属性必须**真物化过**(只写进 gk_prop_defs 而没 materialize ->
+        # Blender 读这个属性当场 AttributeError,卡片就画不出来)
+        check("第一百二十七轮:结构件属性都物化了",
+              "gk_mode" in getattr(type(cards[1]), "__annotations__", {})
+              and "gk_full" in getattr(type(cards[0]), "__annotations__", {})
+              and "gk_bg" in getattr(type(cards[3]), "__annotations__", {}))
+        check("第一百二十七轮:事件卡片属性都物化了",
+              "gk_button" in getattr(type(cards[4]), "__annotations__", {})
+              and "gk_pause" in getattr(type(cards[4]), "__annotations__", {})
+              and "gk_key" in getattr(type(cards[5]), "__annotations__", {}))
+        check("第一百二十八轮:弹入/弹出卡片属性都物化了",
+              "gk_mode" in getattr(type(cards[9]), "__annotations__", {})
+              and "gk_direction" in getattr(type(cards[9]), "__annotations__", {})
+              and "gk_scrim" in getattr(type(cards[9]), "__annotations__", {}))
+
+        # 连线式父子:控件清单的缩进要认连线
+        panel = tree.nodes.new("GKNodeUiPanel")
+        panel.name = "底板"
+        title = tree.nodes.new("GKNodeUiText")
+        title.name = "标题"
+        tree.links.new(panel.outputs["自己"], title.inputs["父"])
+        widgets = [n for n in tree.nodes if getattr(n, "gk_ui_builder", False)]
+        depth_of = {str(n.name): depth
+                    for n, depth in ui._ui_design_widget_rows(widgets)}
+        check("第一百二十七轮:控件清单按连线缩进(子比父深一级)",
+              depth_of.get("标题", 0) == depth_of.get("底板", 0) + 1,
+              str(depth_of))
+        check("第一百二十七轮:解析器在真 Blender 里认连线",
+              _nb127.ui_parent_name(title) == "底板",
+              _nb127.ui_parent_name(title))
+        check("第一百二十七轮:控件节点都有『父』/『自己』引脚",
+              all("父" in [s.name for s in n.inputs]
+                  and "自己" in [s.name for s in n.outputs]
+                  for n in (panel, title)))
+
+        bpy.data.node_groups.remove(tree)
+    except Exception as exc:
+        check("界面结构件 / 引用 / 事件卡片(第一百二十七轮)", False,
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 

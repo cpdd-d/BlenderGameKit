@@ -389,6 +389,10 @@ class GKNodeFlip(B.GKStatementNode):
         ("gk_face_left", "bool", False, "朝左", "『朝左』引脚未连线且方式为手动时使用"),
     )
 
+    def input_default_controls(self):
+        # Unlinked input is determined by gk_mode; gk_face_left is not consumed.
+        return ()
+
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         B.draw_target_picker(self, row)

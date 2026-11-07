@@ -62,6 +62,7 @@ _SUBMODULES = (
     "presets",
     # 关卡预设(2D 闯关 / 3D 关卡 / 2.5D,第八十七轮):同上,operator_io 用
     "levels",
+    "nodes.node_presentation",
     "nodes.node_base",
     # 节点按领域拆成 _*.py,门面 nodes/nodes.py 合并命名空间。
     # _common 必须排最前 —— 它里面 `CLASSES = []` 负责把登记表清空,
@@ -93,6 +94,8 @@ _SUBMODULES = (
     "nodes._musicset",
     # 网络联机(第一百轮)—— 同样必须在重载表里,否则重载后这 7 个节点整批消失
     "nodes._network",
+    # 自定义脚本节点(第一百五十一轮)—— 同样必须在重载表里
+    "nodes._scripting",
     "nodes.nodes",
     "nodes",
     # codegen 主体按领域拆成 10 个模块(纯搬运)。顺序 = 依赖顺序:
@@ -103,6 +106,8 @@ _SUBMODULES = (
     # 音频资产(第四十三轮:『资产_声音卡』-> 项目的 audio/)。放在
     # exporter 之前 —— exporter 会 import 它,重载时它得先刷新。
     "sound_assets",
+    # 自定义脚本文本块 -> 项目 scripts/custom 的资产表(第一百五十一轮)
+    "script_assets",
     "codegen.literals",
     "codegen.registry",
     "codegen.easing",
@@ -115,6 +120,8 @@ _SUBMODULES = (
     # 网络联机发射器(第一百轮)—— 必须在 generator 之前:
     # generator 会 `from .network import emit_network`
     "codegen.network",
+    # 自定义脚本发射器(第一百五十一轮)—— 同样必须在 generator 之前
+    "codegen.scripting",
     "codegen.context",
     "codegen.generator",
     "codegen.validation",

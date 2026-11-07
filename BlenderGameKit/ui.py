@@ -1,11 +1,12 @@
 """UI:侧栏面板、添加节点菜单、节点引用选择器。"""
 
+import math
 import os
 import time
 
 import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
-                       IntProperty, StringProperty)
+                       FloatProperty, IntProperty, StringProperty)
 
 from . import (advisor, advisor_tools, codegen, diagnostics, export_report,
                exporter, gk_log, logic_info, project)
@@ -609,6 +610,11 @@ _UI_WIDGET_ICONS = {
     "GKNodeUiList": "LINENUMBERS_ON",
     "GKNodeUiNinePatch": "MESH_GRID",
     "GKNodeUiInput": "GREASEPENCIL",
+    # 结构件(第一百二十七轮:画布 / 限定框 / 背景 / 文本限定框)
+    "GKNodeUiCanvas": "IMAGE_BACKGROUND",
+    "GKNodeUiBox": "MESH_GRID",
+    "GKNodeUiBackdrop": "COLOR",
+    "GKNodeUiTextBox": "FONT_DATA",
 }
 
 
@@ -626,7 +632,9 @@ def _ui_design_widget_rows(nodes):
     children = {}
     roots = []
     for node in nodes:
-        parent = by_name.get(str(getattr(node, "gk_parent_widget", "") or "").strip())
+        # 父控件名走解析器(第一百二十七轮):『父』引脚连线优先,没连才读
+        # 卡片上的『父控件』—— 和 codegen 那边同一套判断,预览与生成一致。
+        parent = by_name.get(NB.ui_parent_name(node))
         if parent is not None and node_lib.node_key(parent) != node_lib.node_key(node):
             children.setdefault(str(getattr(parent, "name", "")), []).append(node)
         else:
@@ -661,6 +669,14 @@ def _ui_preview_size(node):
         size = float(getattr(node, "gk_size", 24) or 24)
         text = str(getattr(node, "gk_text", "") or "")
         return (max(60.0, len(text) * size * 1.05), size * 1.4)
+    if kind == "GKNodeUiTextBox":
+        # 文本限定框 = 框 + 内边距 + 一行字;高度至少装得下那行字(第一百二十七轮)
+        size = float(getattr(node, "gk_size", 24) or 24)
+        pad = float(getattr(node, "gk_pad", 12) or 12)
+        width = float(getattr(node, "gk_width", 0.0) or 0.0)
+        height = float(getattr(node, "gk_height", 0.0) or 0.0)
+        return (width if width > 0.0 else 240.0,
+                max(height, size * 1.4 + pad * 2.0))
     width = float(getattr(node, "gk_width", 0.0) or 0.0)
     height = float(getattr(node, "gk_height", 0.0) or 0.0)
     return (width if width > 0.0 else 128.0,
@@ -689,25 +705,52 @@ def _ui_preview_rects(tree):
         if getattr(node, "bl_idname", "") == "GKNodeUiList":
             list_names[str(getattr(node, "name", ""))] = float(
                 getattr(node, "gk_separation", 8) or 8.0)
+    # ── 会接管排版的容器(第一百二十七轮)────────────────────────────
+    # 名字 -> (流向, 间距)。『界面_列表』『界面_限定框』『界面_文本限定框』
+    # 都会让子控件自己排队;预览按"大致流向"流水摆即可(网格当竖排估)。
+    containers = {}
+    for node in widgets:
+        kind = getattr(node, "bl_idname", "")
+        name = str(getattr(node, "name", ""))
+        if kind == "GKNodeUiList":
+            containers[name] = (
+                "v" if bool(getattr(node, "gk_vertical", True)) else "h",
+                float(getattr(node, "gk_separation", 8) or 8.0))
+        elif kind == "GKNodeUiBox":
+            mode = str(getattr(node, "gk_mode", "VBOX") or "VBOX")
+            containers[name] = (
+                "h" if mode == "HBOX" else "v",
+                float(getattr(node, "gk_separation", 8) or 8.0))
+        elif kind == "GKNodeUiTextBox":
+            containers[name] = ("v", 6.0)
 
     rects = {}
     out = []
-    row_cursor = {}          # 列表容器 -> 下一个子控件排到哪了(竖排)
+    row_cursor = {}          # 容器 -> 下一个子控件排到哪了(沿流向)
     for node, depth in _ui_design_widget_rows(widgets):
         name = str(getattr(node, "name", ""))
         width, height = _ui_preview_size(node)
-        parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
+        parent_name = NB.ui_parent_name(node)
         parent = rects.get(parent_name) or (0.0, 0.0, screen_w, screen_h)
         px, py, pw, ph = parent
         align = str(getattr(node, "gk_align", "TOP_LEFT") or "TOP_LEFT")
         margin = float(getattr(node, "gk_margin", 24.0) or 0.0)
 
-        if parent_name in list_names:
-            # 容器排版:从容器左上角往下流水摆(间距照『间距』属性估)
-            separation = list_names[parent_name]
+        # 铺满屏幕的画布 / 背景:预览直接占满整屏(第一百二十七轮)
+        if (getattr(node, "bl_idname", "") in ("GKNodeUiCanvas",
+                                               "GKNodeUiBackdrop")
+                and bool(getattr(node, "gk_full", True))):
+            width, height = screen_w, screen_h
+            x, y = 0.0, 0.0
+        elif parent_name in containers:
+            # 容器排版:从容器左上角沿流向流水摆(间距照『间距』属性估)
+            flow, separation = containers[parent_name]
             cursor = row_cursor.get(parent_name, (px, py))
-            x, y = cursor
-            row_cursor[parent_name] = (x, y + height + separation)
+            x, y = cursor[0], cursor[1]
+            if flow == "h":
+                row_cursor[parent_name] = (x + width + separation, y)
+            else:
+                row_cursor[parent_name] = (x, y + height + separation)
         elif align == "TOP_LEFT":
             x = px + float(getattr(node, "gk_x", 20.0) or 0.0)
             y = py + float(getattr(node, "gk_y", 20.0) or 0.0)
@@ -979,7 +1022,7 @@ class GK_OT_UiDragWidget(bpy.types.Operator):
         row = by_name.get(str(getattr(node, "name", "")))
         if row is None:
             return None
-        parent_name = str(getattr(node, "gk_parent_widget", "") or "").strip()
+        parent_name = NB.ui_parent_name(node)
         parent = by_name.get(parent_name)
         px = float(parent[1]) if parent is not None else 0.0
         py = float(parent[2]) if parent is not None else 0.0
@@ -1376,7 +1419,7 @@ class GK_PT_UiDesign(bpy.types.Panel):
             known = {str(getattr(n, "name", "")) for n in widgets}
             for widget, depth in _ui_design_widget_rows(widgets):
                 name = str(getattr(widget, "name", ""))
-                parent_name = str(getattr(widget, "gk_parent_widget", "") or "").strip()
+                parent_name = NB.ui_parent_name(widget)
                 row = box.row(align=True)
                 icon = _UI_WIDGET_ICONS.get(getattr(widget, "bl_idname", ""), "NODE")
                 if parent_name and parent_name not in known:
@@ -1391,9 +1434,11 @@ class GK_PT_UiDesign(bpy.types.Panel):
                 solo = row.operator("gk.solo_ui_widget", text="", icon="HIDE_OFF")
                 solo.tree_name = tree.name
                 solo.node_name = name
-            missing = [str(n.name) for n in widgets
-                       if str(getattr(n, "gk_parent_widget", "") or "").strip()
-                       and str(getattr(n, "gk_parent_widget", "") or "").strip() not in known]
+            missing = []
+            for n in widgets:
+                pname = NB.ui_parent_name(n)
+                if pname and pname not in known:
+                    missing.append(str(n.name))
             if missing:
                 box.label(text=f"父控件名字对不上:{'、'.join(missing[:3])}",
                           icon="ERROR")
@@ -2936,6 +2981,1010 @@ def _remove_ai_preview_handler():
             pass
 
 
+# ==========================================================================
+# 『游戏环境与后期』的天空预览小窗(第一百五十一轮第四轮)
+# ==========================================================================
+# 用户原话:"我希望能在 3D 视图上预览到这些如月亮,云层,星星等等的实时
+# 显示,这样方便随时修改。" Blender 视口显示不了 Godot 的着色器,所以这里
+# 在 3D 视口右上角画一个**实时小窗**(天空渐变 + 星星 + 月亮 + 飘动的云),
+# 每帧从『游戏环境与后期』图里读卡片的参数 —— 改一个值,下一帧就变。
+_ENV_PREVIEW_HANDLE = []
+_ENV_PREVIEW_TIMER = [False]
+
+
+def _env_preview_tree():
+    """文件里的『游戏环境与后期』图(优先当前打开的那张;没有就 None)。
+
+    第一百五十一轮第四轮(用户):"在同一关卡下的不同节点图时启用中
+    也能实时预览" —— 所以这里**不再要求当前编辑的就是环境图**:
+    只要文件里有这张图,编辑游戏逻辑 / AI / 界面图时小窗照样在。
+    """
+    screen = getattr(bpy.context, "screen", None)
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") != "NODE_EDITOR":
+            continue
+        for space in getattr(area, "spaces", ()) or ():
+            tree = (getattr(space, "edit_tree", None)
+                    or getattr(space, "node_tree", None))
+            if tree is not None and str(getattr(tree, "bl_idname", "")) == \
+                    "GKEnvLibraryTree":
+                return tree
+    for group in getattr(bpy.data, "node_groups", ()) or ():
+        if str(getattr(group, "bl_idname", "")) == "GKEnvLibraryTree":
+            return group
+    return None
+
+
+def _env_preview_any_node_editor():
+    """当前屏幕里有没有节点编辑器(有的话才需要按 0.12 秒重画)。"""
+    screen = getattr(bpy.context, "screen", None)
+    for area in getattr(screen, "areas", ()) or ():
+        if getattr(area, "type", "") == "NODE_EDITOR":
+            return True
+    return False
+
+
+def _env_preview_cards(tree):
+    """预览要用的卡片(第一次出现的算数)。"""
+    cards = {}
+    for node in getattr(tree, "nodes", ()) or ():
+        kind = str(getattr(node, "bl_idname", ""))
+        if kind in ("GKNodeSkyBox", "GKNodeClouds", "GKNodeMoon",
+                    "GKNodeDayNight", "GKNodeSun",
+                    "GKNodeEnvGrade") and kind not in cards:
+            cards[kind] = node
+    return cards
+
+
+def _env_preview_color(value, fallback, alpha=1.0):
+    """卡片上的颜色 -> 预览窗里的颜色(和天空着色器的输出保持一致)。
+
+    ⚠ 这里**不做 linear→sRGB**:天空 / 月亮 / 云的颜色是直接写进
+      `Color(...)` 常量、再喂给 `source_color` uniform 的 —— Godot 会把
+      这个数当 sRGB 读进去再转回线性,最终**屏幕上显示的就是这个数**。
+      预览要是再做一次转换,就会比游戏里亮一大截(和"预览/运行时不一致"
+      的老问题同一个坑)。
+    """
+    try:
+        rgb = (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, ValueError, IndexError):
+        rgb = fallback
+    return (max(0.0, min(1.0, rgb[0])),
+            max(0.0, min(1.0, rgb[1])),
+            max(0.0, min(1.0, rgb[2])),
+            alpha)
+
+
+# 预览窗口的固定视野(80° 横向)和宽高比 —— 和游戏里 60° 左右的相机接近,
+# 但小窗只有 300 像素宽,再大的 FOV 会让月亮只有几个像素。
+_ENV_PREVIEW_FOV = math.radians(80.0)
+_ENV_PREVIEW_ASPECT = 0.62
+# 预览自己的观察方向 [方位, 仰角, 是否已手动拖过]。
+# 默认"没拖过"时朝向月亮(见 _env_preview_camera),这样打开就能看到月盘;
+# 拖过之后按拖出来的方向看,不再自动跟着月亮。
+_ENV_PREVIEW_VIEW = [0.0, 0.0, False]
+# 云 / 星星的时间基准:用相对时间,避免 time.time() 的 1e9 量级
+# 丢进噪声哈希后损失小数位。
+_ENV_PREVIEW_EPOCH = time.time()
+# 预览时刻(0~24):None = 跟『环境_昼夜循环』卡走;数字 = 手动选的时刻。
+# 播放一天时优先用播放进度(48 秒 = 24 小时,1 小时 2 秒,方便看完整循环)。
+_ENV_PREVIEW_HOUR = [None]
+_ENV_PREVIEW_PLAY = [False]
+_ENV_PREVIEW_PLAY_START = [0.0]
+_ENV_PREVIEW_PLAY_FROM = [0.0]
+_ENV_PREVIEW_PLAY_SECONDS = 48.0
+# 关键帧里能填的氛围档别名(和导出侧 `_gk_daynight_preset_index` 一致)
+_ENV_PREVIEW_DAY_ALIASES = {
+    "深夜": "夜晚", "午夜": "夜晚",
+    "黎明": "清晨", "早上": "清晨", "上午": "清晨",
+    "中午": "白天", "正午": "白天",
+    "日落": "黄昏", "傍晚": "黄昏",
+}
+
+
+def _env_preview_clamp(value, low, high):
+    return low if value < low else high if value > high else value
+
+
+def _env_preview_mix(a, b, t):
+    t = _env_preview_clamp(t, 0.0, 1.0)
+    return (float(a[0]) + (float(b[0]) - float(a[0])) * t,
+            float(a[1]) + (float(b[1]) - float(a[1])) * t,
+            float(a[2]) + (float(b[2]) - float(a[2])) * t)
+
+
+def _env_preview_grade(color, values):
+    """把『环境_设置色调』的亮度 / 对比 / 饱和 / 色调也叠到预览上。
+
+    游戏里这块是**全屏后期**,天空当然也会被它染;预览不叠的话,
+    用户看到的永远是"预览冷、游戏暖"(用户第 1 条反馈)。
+    只是在显示值上做近似(和色卡同一套系数),不是精确的线性后期。
+    """
+    if not values.get("grade_on"):
+        return (float(color[0]), float(color[1]), float(color[2]))
+    contrast = float(values.get("grade_contrast", 1.0))
+    brightness = float(values.get("grade_brightness", 1.0))
+    saturation = float(values.get("grade_saturation", 1.0))
+    tint = values.get("grade_tint", (1.0, 1.0, 1.0))
+    amount = _env_preview_clamp(
+        float(values.get("grade_tint_amount", 0.0)), 0.0, 1.0)
+    # ⚠ 对比度的支点用 0.18 而不是 0.5:夜空本身只有 0.03~0.10,
+    #   绕 0.5 做对比会把它直接压成纯黑(预览和游戏又对不上)。
+    pivot = 0.18
+    rgb = [(float(color[index]) - pivot) * contrast + pivot
+           for index in range(3)]
+    rgb = [max(0.0, value * brightness) for value in rgb]
+    luminance = 0.30 * rgb[0] + 0.59 * rgb[1] + 0.11 * rgb[2]
+    rgb = [luminance + (value - luminance) * saturation for value in rgb]
+    rgb = [value * (1.0 - amount + float(tint[index]) * amount)
+           for index, value in enumerate(rgb)]
+    return (_env_preview_clamp(rgb[0], 0.0, 1.0),
+            _env_preview_clamp(rgb[1], 0.0, 1.0),
+            _env_preview_clamp(rgb[2], 0.0, 1.0))
+
+
+def _env_preview_smooth(e0, e1, x):
+    if abs(e1 - e0) < 1e-9:
+        return 1.0 if x >= e1 else 0.0
+    t = _env_preview_clamp((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _env_preview_fract(value):
+    return value - math.floor(value)
+
+
+def _env_preview_hash(x, y):
+    """和 gk_sky.gdshader 里 gk_hash(vec2) 同一个算法。"""
+    qx = _env_preview_fract(x * 123.34)
+    qy = _env_preview_fract(y * 456.21)
+    d = qx * (qx + 45.32) + qy * (qy + 45.32)
+    qx = _env_preview_fract(qx + d)
+    qy = _env_preview_fract(qy + d)
+    return _env_preview_fract(qx * qy)
+
+
+def _env_preview_noise(x, y):
+    """值噪声(五次平滑),对应着色器里的 gk_value_noise。"""
+    ix, iy = math.floor(x), math.floor(y)
+    fx, fy = x - ix, y - iy
+    ux = fx * fx * fx * (fx * (fx * 6.0 - 15.0) + 10.0)
+    uy = fy * fy * fy * (fy * (fy * 6.0 - 15.0) + 10.0)
+    a = _env_preview_hash(ix, iy)
+    b = _env_preview_hash(ix + 1.0, iy)
+    c = _env_preview_hash(ix, iy + 1.0)
+    d = _env_preview_hash(ix + 1.0, iy + 1.0)
+    ab = a + (b - a) * ux
+    cd = c + (d - c) * ux
+    return ab + (cd - ab) * uy
+
+
+def _env_preview_density(x, y):
+    """四个倍频,对应着色器里的 gk_cloud_density。"""
+    total = 0.0
+    amplitude = 0.5
+    scale = 1.0
+    for _ in range(4):
+        total += _env_preview_noise(x * scale, y * scale) * amplitude
+        scale *= 2.03
+        amplitude *= 0.5
+    return total
+
+
+_ENV_PREVIEW_CLOUD_TEX = []
+# 云格子的缓存 [键, 分组]:视口每帧重画时不能把 1 万多个格子重新算一遍。
+_ENV_PREVIEW_CLOUD_CACHE = [None, None]
+
+
+def _env_preview_cloud_sample(u, v):
+    """采样导出用的云贴图的 64×64 预览版(双线性 + 重复),拿不到返回 None。"""
+    try:
+        from . import asset_export as _export
+        if not _ENV_PREVIEW_CLOUD_TEX:
+            _ENV_PREVIEW_CLOUD_TEX.append(
+                _export.cloud_texture_preview_pixels())
+        pixels = _ENV_PREVIEW_CLOUD_TEX[0]
+        size = max(1, _export._CLOUD_TEX_SIZE // 2)
+    except Exception:                                     # noqa: BLE001
+        return None
+    x = (u - math.floor(u)) * size - 0.5
+    y = (v - math.floor(v)) * size - 0.5
+    x0, y0 = math.floor(x), math.floor(y)
+    fx, fy = x - x0, y - y0
+
+    def texel(ix, iy):
+        return pixels[(iy % size) * size + (ix % size)] / 255.0
+
+    a = texel(x0, y0)
+    b = texel(x0 + 1, y0)
+    c = texel(x0, y0 + 1)
+    d = texel(x0 + 1, y0 + 1)
+    ab = a + (b - a) * fx
+    cd = c + (d - c) * fx
+    return ab + (cd - ab) * fy
+
+
+def _env_preview_cloud_cover(direction, values, clock):
+    """和着色器同一条球面 UV + 两层云量(优先采样云贴图)。"""
+    up = direction[1]
+    height = values["cloud_height"]
+    if up <= height:
+        return 0.0
+    azimuth = math.atan2(direction[2], direction[0]) / math.tau
+    elevation = math.asin(_env_preview_clamp(up, -1.0, 1.0)) / math.pi
+    scale = values["cloud_scale"]
+    wind = clock * values["cloud_speed"]
+    amount = values["cloud_amount"]
+    softness = values["cloud_softness"]
+    # 方位角方向取整数张,和着色器一致(否则预览里也会看到竖直接缝)
+    tiles_x = max(1.0, float(int(scale * 2.0 + 0.5)))
+    tiles_x2 = max(1.0, float(int(scale * 3.0 + 0.5)))
+    density = _env_preview_cloud_sample(
+        azimuth * tiles_x + wind,
+        elevation * (scale * 2.0) + wind * 0.35)
+    density2 = _env_preview_cloud_sample(
+        azimuth * tiles_x2 + wind * 0.55 + 0.37,
+        elevation * (scale * 3.0) + wind * 0.20 + 0.19)
+    # 天顶:和着色器一样改用俯视平面投影,避免放射状"菊花云"
+    zenith = _env_preview_smooth(0.55, 0.90, up)
+    top_tiles = max(1.0, float(int(scale * 0.7 + 0.5)))
+    px = direction[0] / max(up, 0.35)
+    pz = direction[2] / max(up, 0.35)
+    top1 = _env_preview_cloud_sample(
+        px * top_tiles + wind, pz * top_tiles + wind * 0.35)
+    top2 = _env_preview_cloud_sample(
+        px * (top_tiles * 1.5) + wind * 0.55 + 0.37,
+        pz * (top_tiles * 1.5) + wind * 0.20 + 0.19)
+    if (density is None or density2 is None
+            or top1 is None or top2 is None):
+        # 贴图生成失败(离线桩 / 无 bpy):退回同一套 CPU 噪声
+        plane = scale * math.tau
+        density = _env_preview_density(
+            azimuth * plane + wind, elevation * plane + wind * 0.35)
+        density2 = _env_preview_density(
+            azimuth * plane * 1.75 + wind * 0.55 + 11.3,
+            elevation * plane * 1.75 + wind * 0.20 + 7.1)
+        top1 = _env_preview_density(
+            px * scale * 2.0 + wind, pz * scale * 2.0 + wind * 0.35)
+        top2 = _env_preview_density(
+            px * scale * 3.0 + wind * 0.55 + 11.3,
+            pz * scale * 3.0 + wind * 0.20 + 7.1)
+    if zenith > 0.0:
+        density = density + (top1 - density) * zenith
+        density2 = density2 + (top2 - density2) * zenith
+    cover = _env_preview_smooth(1.0 - amount,
+                                1.0 - amount + softness, density)
+    cover2 = _env_preview_smooth(1.0 - amount * 0.8,
+                                 1.0 - amount * 0.8 + softness, density2)
+    cover = max(cover, cover2 * 0.55)
+    return cover * _env_preview_smooth(height, height + 0.30, up)
+
+
+def _env_preview_hour(node):
+    """预览时刻(0~24):播放 > 手动 > 卡片起始时刻 / 自动流逝。"""
+    if _ENV_PREVIEW_PLAY[0]:
+        elapsed = time.time() - _ENV_PREVIEW_PLAY_START[0]
+        return (_ENV_PREVIEW_PLAY_FROM[0]
+                + elapsed / _ENV_PREVIEW_PLAY_SECONDS * 24.0) % 24.0
+    if _ENV_PREVIEW_HOUR[0] is not None:
+        return float(_ENV_PREVIEW_HOUR[0]) % 24.0
+    if node is None:
+        return 12.0
+    try:
+        hour = float(getattr(node, "gk_start_hour", 8.0) or 0.0)
+    except (TypeError, ValueError):
+        hour = 8.0
+    if bool(getattr(node, "gk_auto", True)):
+        try:
+            seconds = max(0.1, float(getattr(node, "gk_day_seconds", 120.0)))
+        except (TypeError, ValueError):
+            seconds = 120.0
+        hour += (time.time() - _ENV_PREVIEW_EPOCH) / seconds * 24.0
+    return hour % 24.0
+
+
+def _env_preview_daynight(node):
+    """『环境_昼夜循环』卡 -> 天空一组值;没有这张卡 = None。
+
+    返回 `(天顶色, 地平线色, 白天程度, 预览时刻, 太阳色, 太阳强度)`。
+    预览也按这张卡的关键帧走:『自动流逝』勾着就按实时推进,
+    手动选了时刻 / 播放一天就用那个时刻 —— 和时间轴在游戏里的行为一致。
+    """
+    if node is None:
+        return None
+    hour = _env_preview_hour(node)
+    presets = asset_export._DAYNIGHT_PRESETS
+    names = [preset[0] for preset in presets]
+    keys = []
+    for entry in str(getattr(node, "gk_keyframes", "") or "").split("|"):
+        text = entry.strip()
+        if "=" not in text:
+            continue
+        left, right = text.split("=", 1)
+        try:
+            key_hour = float(left.strip()) % 24.0
+        except ValueError:
+            continue
+        name = _ENV_PREVIEW_DAY_ALIASES.get(right.strip(), right.strip())
+        slot = names.index(name) if name in names else names.index("白天")
+        keys.append((key_hour, slot))
+    if not keys:
+        keys = [(0.0, names.index("夜晚")), (6.0, names.index("清晨")),
+                (12.0, names.index("白天")), (18.0, names.index("黄昏"))]
+    keys.sort()
+    prev = len(keys) - 1
+    for index, (key_hour, _slot) in enumerate(keys):
+        if hour >= key_hour:
+            prev = index
+    following = (prev + 1) % len(keys)
+    h0, slot_a = keys[prev]
+    h1, slot_b = keys[following]
+    if h1 <= h0:
+        h1 += 24.0
+    if hour < h0:
+        hour += 24.0
+    t = _env_preview_clamp((hour - h0) / max(h1 - h0, 0.0001), 0.0, 1.0)
+    a = presets[slot_a]
+    b = presets[slot_b]
+    top = tuple(a[1][channel] + (b[1][channel] - a[1][channel]) * t
+                for channel in range(3)) + (1.0,)
+    horizon = tuple(a[2][channel] + (b[2][channel] - a[2][channel]) * t
+                    for channel in range(3)) + (1.0,)
+    sun = tuple(a[3][channel] + (b[3][channel] - a[3][channel]) * t
+                for channel in range(3)) + (1.0,)
+    sun_energy = a[4] + (b[4] - a[4]) * t
+    day = _env_preview_clamp(a[5] + (b[5] - a[5]) * t, 0.0, 1.0)
+    return top, horizon, day, hour % 24.0, sun, sun_energy
+
+
+def _env_preview_values(tree):
+    """把卡片参数读成一组画图用的值(每帧重读 -> 实时)。"""
+    cards = _env_preview_cards(tree)
+    sky = cards.get("GKNodeSkyBox")
+    clouds = cards.get("GKNodeClouds")
+    moon = cards.get("GKNodeMoon")
+    grade = cards.get("GKNodeEnvGrade")
+
+    def number(node, attr, fallback):
+        try:
+            return float(getattr(node, attr, fallback))
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    top = _env_preview_color(
+        getattr(sky, "gk_sky_top", (0.03, 0.04, 0.09, 1.0)),
+        (0.03, 0.04, 0.09))
+    horizon = _env_preview_color(
+        getattr(sky, "gk_sky_horizon", (0.07, 0.085, 0.16, 1.0)),
+        (0.07, 0.085, 0.16))
+    ground = _env_preview_color(
+        getattr(sky, "gk_ground_color", (0.02, 0.022, 0.03, 1.0)),
+        (0.02, 0.022, 0.03))
+    # 有『环境_昼夜循环』卡时,天色 / 云量 / 云亮度按它的关键帧算 ——
+    # 否则预览会和游戏里差一大截(昼夜循环每帧都会覆盖这几项)。
+    daynight = _env_preview_daynight(cards.get("GKNodeDayNight"))
+    preview_hour = _env_preview_hour(cards.get("GKNodeDayNight"))
+    day_amount = 1.0
+    sun_color = _env_preview_color((1.0, 0.89, 0.68, 1.0),
+                                   (1.0, 0.89, 0.68))
+    sun_energy = 1.0
+    if daynight is not None:
+        top, horizon, day_amount, preview_hour, sun_color, sun_energy = daynight
+    star_amount = _env_preview_clamp(number(sky, "gk_star_amount", 0.7),
+                                     0.0, 1.0)
+    star_brightness = max(0.0, number(sky, "gk_star_brightness", 1.0))
+    cloud_amount = _env_preview_clamp(number(clouds, "gk_cloud_amount", 0.0),
+                                      0.0, 1.0)
+    # 白天云量增加(第一百五十一轮第六轮):和运行时用同一个公式
+    cloud_amount = _env_preview_clamp(
+        cloud_amount + max(0.0, number(clouds, "gk_cloud_day_boost", 0.0))
+        * day_amount, 0.0, 1.0)
+    cloud_speed = number(clouds, "gk_cloud_speed", 0.0)
+    cloud_scale = max(0.2, number(clouds, "gk_cloud_scale", 3.0))
+    cloud_height = _env_preview_clamp(number(clouds, "gk_cloud_height", 0.06),
+                                      0.0, 0.9)
+    cloud_softness = max(0.01, number(clouds, "gk_cloud_softness", 0.22))
+    cloud_light = _env_preview_color(
+        getattr(clouds, "gk_cloud_light", (0.21, 0.24, 0.33, 1.0)),
+        (0.21, 0.24, 0.33))
+    cloud_dark = _env_preview_color(
+        getattr(clouds, "gk_cloud_dark", (0.03, 0.035, 0.06, 1.0)),
+        (0.03, 0.035, 0.06))
+    # 运行时云亮度按 day_amount 压一道(着色器里的 mix(0.45, 1.0, ...))
+    if day_amount < 0.999:
+        cloud_dim = 0.45 + 0.55 * day_amount
+        cloud_light = tuple(channel * cloud_dim for channel in cloud_light[:3]) + (1.0,)
+        cloud_dark = tuple(channel * cloud_dim for channel in cloud_dark[:3]) + (1.0,)
+    moon_on = bool(getattr(moon, "gk_moon_enabled", True)) if moon else False
+    moon_color = _env_preview_color(
+        getattr(moon, "gk_moon_color", (0.80, 0.86, 1.0, 1.0)),
+        (0.80, 0.86, 1.0))
+    moon_size = max(0.001, number(moon, "gk_moon_size", 0.06))
+    moon_phase = number(moon, "gk_moon_phase", 1.0)
+    phase_animate = bool(getattr(moon, "gk_moon_phase_animate", False))
+    phase_seconds = max(0.5, number(moon, "gk_moon_phase_seconds", 40.0))
+    phase_min = _env_preview_clamp(
+        number(moon, "gk_moon_phase_min", 0.15), 0.0, 1.0)
+    if phase_animate:
+        phase = phase_min + (1.0 - phase_min) * (
+            0.5 + 0.5 * math.cos(
+                (time.time() - _ENV_PREVIEW_EPOCH) / phase_seconds * math.tau))
+    else:
+        phase = moon_phase
+    # 月亮也按环境时钟走夜路(18 点东升 -> 0 点正北最高 -> 6 点西落);
+    # 固定在某一关的月亮卡仍然读方位 / 高度。
+    moon_orbit = bool(getattr(moon, "gk_moon_orbit", True)) if moon else False
+    moon_peak = number(moon, "gk_moon_elevation", 30.0)
+    if moon is not None and moon_orbit:
+        moon_t = ((preview_hour + 6.0) % 24.0) / 12.0
+        moon_azimuth = 90.0 - moon_t * 180.0
+        moon_elevation = math.sin(moon_t * math.pi) * moon_peak
+    else:
+        moon_azimuth = number(moon, "gk_moon_azimuth", 0.0)
+        moon_elevation = moon_peak
+    moon_visibility = _env_preview_clamp(1.0 - day_amount, 0.0, 1.0)
+    moon_on = (moon_on and moon_elevation > -1.0
+               and moon_visibility > 0.02)
+    # 太阳:和月亮同一条弧、相位差 12 小时(6 点东升 / 12 点正北 / 18 点西落)
+    sun_node = cards.get("GKNodeSun")
+    sun_size = max(0.0, number(sky, "gk_sun_size", 0.06))
+    sun_latitude = number(sun_node, "gk_sun_latitude", 45.0)
+    sun_tilt = number(sun_node, "gk_sun_tilt", 0.0)
+    sun_orbit = (bool(getattr(sun_node, "gk_sun_orbit", True))
+                 if sun_node else True)
+    if sun_orbit:
+        sun_angle = (preview_hour - 6.0) / 12.0 * math.pi
+        sun_elevation = math.degrees(
+            math.sin(sun_angle) * math.radians(sun_latitude))
+        sun_azimuth = 90.0 - (preview_hour - 6.0) * 15.0 - sun_tilt
+    else:
+        sun_elevation = sun_latitude
+        sun_azimuth = -sun_tilt
+    sun_on = (sun_node is not None and sun_size > 0.0005
+              and sun_elevation > -2.0)
+    sun_opacity = _env_preview_clamp(
+        sun_energy * (0.15 + 0.85 * day_amount), 0.0, 1.0)
+    return {
+        "top": top, "horizon": horizon, "ground": ground,
+        "day_amount": day_amount, "preview_hour": preview_hour,
+        "star_amount": star_amount, "star_brightness": star_brightness,
+        "cloud_amount": cloud_amount, "cloud_speed": cloud_speed,
+        "cloud_scale": cloud_scale, "cloud_height": cloud_height,
+        "cloud_softness": cloud_softness,
+        "cloud_light": cloud_light, "cloud_dark": cloud_dark,
+        "moon_on": moon_on, "moon_color": moon_color,
+        "moon_size": moon_size,
+        "moon_phase": _env_preview_clamp(phase, 0.0, 1.0),
+        "moon_visibility": moon_visibility,
+        "moon_azimuth": moon_azimuth,
+        "moon_elevation": moon_elevation,
+        "sun_on": sun_on, "sun_size": sun_size,
+        "sun_azimuth": sun_azimuth, "sun_elevation": sun_elevation,
+        "sun_color": sun_color, "sun_opacity": sun_opacity,
+        # ── 环境_设置色调(全屏后期):预览也要叠,否则冷暖和游戏对不上 ──
+        "grade_on": grade is not None,
+        "grade_brightness": number(grade, "gk_brightness", 1.0),
+        "grade_contrast": number(grade, "gk_contrast", 1.0),
+        "grade_saturation": number(grade, "gk_saturation", 1.0),
+        "grade_tint": _env_preview_color(
+            getattr(grade, "gk_tint", (1.0, 1.0, 1.0, 1.0)),
+            (1.0, 1.0, 1.0)),
+        "grade_tint_amount": _env_preview_clamp(
+            number(grade, "gk_tint_amount", 0.0), 0.0, 1.0),
+    }
+
+
+def _env_preview_basis(yaw, pitch):
+    """方位 / 仰角 -> 前 / 右 / 上 三个基向量(和着色器的方位约定一致)。"""
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    forward = (sy * cp, sp, -cy * cp)
+    right = (cy, 0.0, sy)
+    up = (right[1] * forward[2] - right[2] * forward[1],
+          right[2] * forward[0] - right[0] * forward[2],
+          right[0] * forward[1] - right[1] * forward[0])
+    return forward, right, up
+
+
+def _env_preview_ray(u, v, basis):
+    """窗口坐标(-1..1)-> 世界方向。"""
+    forward, right, up = basis
+    tan_h = math.tan(_ENV_PREVIEW_FOV * 0.5)
+    tan_v = tan_h * _ENV_PREVIEW_ASPECT
+    x = u * tan_h
+    y = v * tan_v
+    dx = forward[0] + right[0] * x + up[0] * y
+    dy = forward[1] + right[1] * x + up[1] * y
+    dz = forward[2] + right[2] * x + up[2] * y
+    length = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+    return dx / length, dy / length, dz / length
+
+
+def _env_preview_project(direction, basis):
+    """世界方向 -> 窗口坐标(-1..1);在视野外返回 None。"""
+    forward, right, up = basis
+    denom = (direction[0] * forward[0] + direction[1] * forward[1]
+             + direction[2] * forward[2])
+    if denom <= 0.02:
+        return None
+    tan_h = math.tan(_ENV_PREVIEW_FOV * 0.5)
+    tan_v = tan_h * _ENV_PREVIEW_ASPECT
+    su = (direction[0] * right[0] + direction[1] * right[1]
+          + direction[2] * right[2]) / denom / tan_h
+    sv = (direction[0] * up[0] + direction[1] * up[1]
+          + direction[2] * up[2]) / denom / tan_v
+    if abs(su) > 1.6 or abs(sv) > 1.6:
+        return None
+    return su, sv
+
+
+def _env_preview_sky_color(up, values):
+    if up < 0.0:
+        t = _env_preview_smooth(0.0, -0.3, up)
+        return _env_preview_mix(values["horizon"], values["ground"], t)
+    t = _env_preview_smooth(-0.05, 0.65, up)
+    return _env_preview_mix(values["horizon"], values["top"], t)
+
+
+def _env_preview_camera(values):
+    """预览自己的观察方向:白天看太阳,夜里看月亮,都没露头就看地平线。"""
+    if _ENV_PREVIEW_VIEW[2]:
+        return _ENV_PREVIEW_VIEW[0], _ENV_PREVIEW_VIEW[1]
+    if (values.get("sun_on")
+            and values.get("day_amount", 1.0) > 0.45
+            and values.get("sun_elevation", -90.0) > 2.0):
+        return (math.radians(values["sun_azimuth"]),
+                math.radians(_env_preview_clamp(values["sun_elevation"],
+                                                 -12.0, 78.0)))
+    if values.get("moon_on") and values.get("moon_elevation", -90.0) > 2.0:
+        return (math.radians(values["moon_azimuth"]),
+                math.radians(_env_preview_clamp(values["moon_elevation"],
+                                                 -12.0, 78.0)))
+    return 0.0, math.radians(20.0)
+
+
+def _env_preview_moon_dir(values):
+    azimuth = math.radians(values["moon_azimuth"])
+    elevation = math.radians(values["moon_elevation"])
+    return (math.sin(azimuth) * math.cos(elevation),
+            math.sin(elevation),
+            -math.cos(azimuth) * math.cos(elevation))
+
+
+def _env_preview_sun_dir(values):
+    azimuth = math.radians(values["sun_azimuth"])
+    elevation = math.radians(values["sun_elevation"])
+    return (math.sin(azimuth) * math.cos(elevation),
+            math.sin(elevation),
+            -math.cos(azimuth) * math.cos(elevation))
+
+
+def _env_preview_batch(shader, batch_for_shader, verts, color):
+    if not verts:
+        return
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _env_preview_smooth_batch(shader, batch_for_shader, verts, colors):
+    """SMOOTH_COLOR:每个顶点自己的 RGBA -> 云和光晕是连续渐变,不是格子。"""
+    if not verts:
+        return
+    batch = batch_for_shader(shader, "TRIS",
+                             {"pos": verts, "color": colors})
+    shader.bind()
+    batch.draw(shader)
+
+
+def _env_preview_halo(shader, batch_for_shader, cx, cy, radius, color,
+                      alpha, segments=40):
+    verts = [(cx, cy)]
+    colors = [color[:3] + (alpha,)]
+    for index in range(segments + 1):
+        angle = index / segments * math.tau
+        verts.append((cx + math.cos(angle) * radius,
+                      cy + math.sin(angle) * radius))
+        colors.append(color[:3] + (0.0,))
+    batch = batch_for_shader(shader, "TRI_FAN",
+                             {"pos": verts, "color": colors})
+    shader.bind()
+    batch.draw(shader)
+
+
+def _env_preview_disc(shader, batch_for_shader, cx, cy, rx, ry, color,
+                      segments=20):
+    verts = [(cx, cy)]
+    for index in range(segments + 1):
+        angle = index / segments * math.tau
+        verts.append((cx + math.cos(angle) * rx, cy + math.sin(angle) * ry))
+    batch = batch_for_shader(shader, "TRI_FAN", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _env_preview_rect(shader, batch_for_shader, left, bottom, right, top,
+                      color):
+    verts = ((left, bottom), (right, bottom), (right, top),
+             (left, bottom), (right, top), (left, top))
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _env_preview_draw():
+    """3D 视口右上角的实时天空预览(POST_PIXEL)。
+
+    ── 第一百五十一轮第四轮(用户反馈)──────────────────────────────
+    "预览与实际运行后的效果不一致" —— 旧版是"天空渐变 + 椭圆云 + 硬切
+    月亮",和着色器根本对不上。这一版把着色器那套**搬过来**:
+      * 天空 / 地面按仰角插值(地平线会随视角上下移动);
+      * 云用同一套球面 UV + 四倍频值噪声(两层),不再是几个椭圆;
+      * 月亮按角半径画,月相用椭圆晨昏线,弯月是圆弧不是竖线;
+      * 星星用确定性散点 + 闪烁(着色器里也有,数量随『星星数量』)。
+    视角可以拖(见 `GK_OT_EnvPreviewDrag`),不再只看一个固定方向。
+    """
+    try:
+        if not _ENV_PREVIEW_ENABLED[0]:
+            return
+        tree = _env_preview_tree()
+        if tree is None:
+            return
+        region = getattr(bpy.context, "region", None)
+        if region is None or region.width < 160 or region.height < 130:
+            return
+        import blf
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+
+        values = _env_preview_values(tree)
+        clock = time.time() - _ENV_PREVIEW_EPOCH
+        day_amount = values.get("day_amount", 1.0)
+        moon_visibility = values.get("moon_visibility", 1.0)
+        w = min(300.0, region.width * 0.36)
+        h = w * _ENV_PREVIEW_ASPECT
+        x0 = region.width - w - 18.0
+        y0 = region.height - h - 18.0
+        x1, y1 = x0 + w, y0 + h
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        smooth_shader = gpu.shader.from_builtin("SMOOTH_COLOR")
+        gpu.state.blend_set("ALPHA")
+        try:
+            # 外框
+            _env_preview_rect(shader, batch_for_shader, x0 - 2, y0 - 2,
+                              x1 + 2, y1 + 2, (0.02, 0.02, 0.03, 0.92))
+
+            yaw, pitch = _env_preview_camera(values)
+            basis = _env_preview_basis(yaw, pitch)
+
+            # ── 天空 + 地面(按仰角分 22 条横带)──────────────────
+            # 和着色器同一条:up<0 走地面色,up>0 在地平线色与天顶色之间插值。
+            # 分带而不是逐像素,是因为小窗只有 300 像素宽,看不出条纹。
+            bands = 22
+            for index in range(bands):
+                v0 = -1.0 + 2.0 * index / bands
+                v1 = -1.0 + 2.0 * (index + 1) / bands
+                vc = (v0 + v1) * 0.5
+                ray = _env_preview_ray(0.0, vc, basis)
+                color = _env_preview_grade(
+                    _env_preview_sky_color(ray[1], values), values) + (1.0,)
+                _env_preview_rect(shader, batch_for_shader,
+                                  x0, y0 + h * (v0 * 0.5 + 0.5),
+                                  x1, y0 + h * (v1 * 0.5 + 0.5), color)
+
+            # ── 星星:确定性散点 + 闪烁 ───────────────────────────
+            horizon = values["horizon"]
+            luminance = (0.30 * horizon[0] + 0.59 * horizon[1]
+                         + 0.11 * horizon[2])
+            night = 1.0 - _env_preview_smooth(0.08, 0.30, luminance)
+            if (values["star_amount"] > 0.01 and night > 0.01
+                    and values["star_brightness"] > 0.01):
+                buckets = ([], [], [], [])
+                for index in range(420):
+                    h1 = _env_preview_fract(
+                        math.sin(index * 12.9898 + 3.1) * 43758.5453)
+                    h2 = _env_preview_fract(
+                        math.sin(index * 78.233 + 1.7) * 12543.7845)
+                    h3 = _env_preview_fract(
+                        math.sin(index * 39.346 + 9.0) * 24634.6345)
+                    if h3 > values["star_amount"]:
+                        continue
+                    azimuth = h1 * math.tau
+                    elevation = math.asin(_env_preview_clamp(
+                        0.04 + 0.96 * h2, 0.0, 1.0))
+                    direction = (math.sin(azimuth) * math.cos(elevation),
+                                 math.sin(elevation),
+                                 -math.cos(azimuth) * math.cos(elevation))
+                    projected = _env_preview_project(direction, basis)
+                    if projected is None:
+                        continue
+                    su, sv = projected
+                    twinkle = 0.62 + 0.38 * math.sin(
+                        clock * (1.1 + h1 * 2.3) + index * 1.7)
+                    strength = (night * values["star_brightness"]
+                                * (0.35 + 0.65 * h2) * max(0.0, twinkle))
+                    if strength < 0.06:
+                        continue
+                    sx = x0 + (su * 0.5 + 0.5) * w
+                    sy = y0 + (sv * 0.5 + 0.5) * h
+                    size = 0.9 + 0.9 * h1
+                    bucket = min(3, max(0, int(strength * 4.0)))
+                    buckets[bucket].append((sx, sy, size))
+                for bucket, points in enumerate(buckets):
+                    if not points:
+                        continue
+                    verts = []
+                    for sx, sy, size in points:
+                        verts += [(sx - size, sy - size),
+                                  (sx + size, sy - size),
+                                  (sx + size, sy + size),
+                                  (sx - size, sy - size),
+                                  (sx + size, sy + size),
+                                  (sx - size, sy + size)]
+                    alpha = (0.25, 0.45, 0.65, 0.90)[bucket]
+                    star_rgb = _env_preview_grade((0.80, 0.87, 1.0), values)
+                    _env_preview_batch(shader, batch_for_shader, verts,
+                                       star_rgb + (alpha,))
+
+            # ── 太阳:角半径 + 暖黄大光晕 ─────────────────────────
+            sun_core = None
+            sun_dir = _env_preview_sun_dir(values)
+            sun_radius = math.tan(min(values["sun_size"], 1.2)) * (w * 0.5) \
+                / math.tan(_ENV_PREVIEW_FOV * 0.5)
+            sun_opacity = values.get("sun_opacity", 0.0)
+            if (values.get("sun_on") and sun_radius > 0.5
+                    and sun_opacity > 0.01):
+                sun_projected = _env_preview_project(sun_dir, basis)
+                if sun_projected is not None:
+                    su, sv = sun_projected
+                    cx = x0 + (su * 0.5 + 0.5) * w
+                    cy = y0 + (sv * 0.5 + 0.5) * h
+                    sun_rgb = _env_preview_grade(values["sun_color"], values)
+                    _env_preview_halo(smooth_shader, batch_for_shader,
+                                      cx, cy, sun_radius * 8.0,
+                                      (1.0, 0.62, 0.28), 0.24 * sun_opacity)
+                    _env_preview_halo(smooth_shader, batch_for_shader,
+                                      cx, cy, sun_radius * 2.6,
+                                      sun_rgb, 0.34 * sun_opacity)
+                    _env_preview_disc(shader, batch_for_shader,
+                                      cx, cy, sun_radius, sun_radius,
+                                      sun_rgb + (min(1.0, sun_opacity),))
+                    sun_core = (cx, cy, sun_radius, sun_rgb, sun_opacity)
+
+            # ── 月亮:角半径 + 椭圆晨昏线 ─────────────────────────
+            moon_dir = _env_preview_moon_dir(values)
+            moon_projected = (None if not values["moon_on"]
+                              else _env_preview_project(moon_dir, basis))
+            moon_radius = math.tan(min(values["moon_size"], 1.2)) * (w * 0.5) \
+                / math.tan(_ENV_PREVIEW_FOV * 0.5)
+            if moon_projected is not None and moon_radius > 0.5:
+                su, sv = moon_projected
+                cx = x0 + (su * 0.5 + 0.5) * w
+                cy = y0 + (sv * 0.5 + 0.5) * h
+                moon_rgb = _env_preview_grade(values["moon_color"], values)
+                moon_vis = values.get("moon_visibility", 1.0)
+                moon_rgb = tuple(channel * moon_vis for channel in moon_rgb)
+                # 地球照:暗面几乎看不见(和着色器的 0.012 一致)
+                earth = _env_preview_mix((0.0, 0.0, 0.0), moon_rgb, 0.012)
+                _env_preview_disc(shader, batch_for_shader, cx, cy,
+                                  moon_radius, moon_radius,
+                                  earth + (moon_vis,))
+                # 光晕:一个顶点渐变的三角扇,中心和边缘的 alpha 不同 ——
+                # 比叠 16 个硬边圆更平滑,也更快。
+                _env_preview_halo(smooth_shader, batch_for_shader,
+                                  cx, cy, moon_radius * 2.7, moon_rgb,
+                                  0.09 * moon_vis)
+                # 亮面:每一行取 [晨昏线, 圆盘边缘],拼成自然的弯月
+                k = math.cos(values["moon_phase"] * math.pi)
+                strips = 30
+                lit_verts = []
+                for index in range(strips):
+                    y0n = -1.0 + 2.0 * index / strips
+                    y1n = -1.0 + 2.0 * (index + 1) / strips
+                    yc = (y0n + y1n) * 0.5
+                    edge0 = math.sqrt(max(1.0 - y0n * y0n, 0.0))
+                    edge1 = math.sqrt(max(1.0 - y1n * y1n, 0.0))
+                    right = min(edge0, edge1)
+                    left = max(k * math.sqrt(max(1.0 - yc * yc, 0.0)),
+                               -right)
+                    if right - left <= 0.004:
+                        continue
+                    px0 = cx + left * moon_radius
+                    px1 = cx + right * moon_radius
+                    py0 = cy + y0n * moon_radius
+                    py1 = cy + y1n * moon_radius
+                    lit_verts += [(px0, py0), (px1, py0), (px1, py1),
+                                  (px0, py0), (px1, py1), (px0, py1)]
+                _env_preview_batch(shader, batch_for_shader, lit_verts,
+                                   moon_rgb[:3] + (0.95 * moon_vis,))
+                # 环形山:只画落在亮面里的几个(暗面不画,免得又变回灰圆盘)
+                for ox, oy, crater in ((0.52, 0.10, 0.11),
+                                       (0.66, -0.22, 0.09),
+                                       (0.74, 0.30, 0.07)):
+                    if ox <= k * math.sqrt(max(1.0 - oy * oy, 0.0)) - 0.02:
+                        continue
+                    _env_preview_disc(
+                        shader, batch_for_shader,
+                        cx + ox * moon_radius, cy + oy * moon_radius,
+                        crater * moon_radius, crater * moon_radius,
+                        tuple(moon_rgb[i] * 0.55 for i in range(3))
+                        + (0.20 * moon_vis,))
+
+            # ── 云:和着色器同一套球面 UV + 同一张云贴图 ───────────────
+            # 用 SMOOTH_COLOR 的**顶点渐变网格**:每个顶点有自己的 RGBA,
+            # 顶点之间由 GPU 插值 —— 不会出现"一格一格的方块云"。
+            # 网格按 3fps 重算并缓存,视口每帧重画时只重建三角形。
+            if values["cloud_amount"] > 0.01:
+                cols, rows = 120, 68
+                cloud_key = (
+                    round(w, 2), round(h, 2),
+                    round(yaw, 2), round(pitch, 2), int(clock * 3),
+                    round(values["cloud_amount"], 2),
+                    round(values["cloud_speed"], 2),
+                    round(values["cloud_scale"], 2),
+                    round(values["cloud_height"], 2),
+                    round(values["cloud_softness"], 2),
+                    tuple(round(channel, 2)
+                          for channel in values["cloud_light"][:3]),
+                    tuple(round(channel, 2)
+                          for channel in values["cloud_dark"][:3]),
+                    tuple(round(channel, 2)
+                          for channel in values["grade_tint"][:3]),
+                    round(values["grade_tint_amount"], 2),
+                    round(values["moon_azimuth"], 1),
+                    round(values["moon_elevation"], 1),
+                    bool(values["moon_on"]),
+                    round(values.get("moon_visibility", 1.0), 2),
+                    round(values.get("day_amount", 1.0), 2),
+                    round(values.get("sun_azimuth", 0.0), 1),
+                    round(values.get("sun_elevation", 0.0), 1),
+                    round(values.get("sun_opacity", 0.0), 2),
+                    round(values.get("sun_size", 0.0), 3),
+                )
+                if _ENV_PREVIEW_CLOUD_CACHE[0] == cloud_key:
+                    verts, colors = _ENV_PREVIEW_CLOUD_CACHE[1]
+                else:
+                    cloud_clock = int(clock * 3) / 3.0
+                    grid = []
+                    for iy in range(rows + 1):
+                        v = -1.0 + 2.0 * iy / rows
+                        row = []
+                        for ix in range(cols + 1):
+                            u = -1.0 + 2.0 * ix / cols
+                            direction = _env_preview_ray(u, v, basis)
+                            cover = _env_preview_cloud_cover(
+                                direction, values, cloud_clock)
+                            moon_lit = _env_preview_clamp(
+                                (direction[0] * moon_dir[0]
+                                 + direction[1] * moon_dir[1]
+                                 + direction[2] * moon_dir[2]) * 0.5 + 0.5,
+                                0.0, 1.0)
+                            sun_lit = 0.0
+                            sun_warm = 0.0
+                            if values.get("sun_on") and sun_opacity > 0.01:
+                                sun_dot = _env_preview_clamp(
+                                    (direction[0] * sun_dir[0]
+                                     + direction[1] * sun_dir[1]
+                                     + direction[2] * sun_dir[2]), -1.0, 1.0)
+                                sun_lit = (sun_dot * 0.5 + 0.5) * day_amount
+                                if values["sun_size"] > 0.0005:
+                                    sun_ang = math.acos(sun_dot)
+                                    sun_warm = (1.0 - _env_preview_smooth(
+                                        values["sun_size"] * 2.0,
+                                        values["sun_size"] * 9.0, sun_ang)
+                                                ) * day_amount
+                            row.append((cover, moon_lit, sun_lit, sun_warm))
+                        grid.append(row)
+                    verts = []
+                    colors = []
+
+                    def shade(sample):
+                        cover, moon_lit, sun_lit, sun_warm = sample
+                        lit = max(moon_lit * moon_visibility, sun_lit)
+                        rgb = _env_preview_grade(
+                            _env_preview_mix(values["cloud_dark"],
+                                             values["cloud_light"], lit),
+                            values)
+                        if sun_warm > 0.001:
+                            warm = min(1.0, sun_warm * 0.72)
+                            rgb = (rgb[0] + (1.0 - rgb[0]) * warm,
+                                   rgb[1] + (0.76 - rgb[1]) * warm,
+                                   rgb[2] + (0.38 - rgb[2]) * warm)
+                        return rgb + (min(0.95, cover),)
+
+                    for iy in range(rows):
+                        v0 = -1.0 + 2.0 * iy / rows
+                        v1 = -1.0 + 2.0 * (iy + 1) / rows
+                        py0 = y0 + (v0 * 0.5 + 0.5) * h
+                        py1 = y0 + (v1 * 0.5 + 0.5) * h
+                        for ix in range(cols):
+                            u0 = -1.0 + 2.0 * ix / cols
+                            u1 = -1.0 + 2.0 * (ix + 1) / cols
+                            c00 = grid[iy][ix]
+                            c10 = grid[iy][ix + 1]
+                            c11 = grid[iy + 1][ix + 1]
+                            c01 = grid[iy + 1][ix]
+                            if max(c00[0], c10[0], c11[0], c01[0]) < 0.015:
+                                continue
+                            px0 = x0 + (u0 * 0.5 + 0.5) * w
+                            px1 = x0 + (u1 * 0.5 + 0.5) * w
+                            verts += [(px0, py0), (px1, py0), (px1, py1),
+                                      (px0, py0), (px1, py1), (px0, py1)]
+                            colors += [shade(c00), shade(c10), shade(c11),
+                                       shade(c00), shade(c11), shade(c01)]
+                    _ENV_PREVIEW_CLOUD_CACHE[:] = [cloud_key,
+                                                   (verts, colors)]
+                _env_preview_smooth_batch(smooth_shader, batch_for_shader,
+                                          verts, colors)
+
+            # 云之后补一道日核(和着色器同一个理由:别让云把太阳咬成弯月)
+            if sun_core is not None:
+                cx, cy, radius, rgb, opacity = sun_core
+                _env_preview_disc(shader, batch_for_shader, cx, cy,
+                                  radius, radius,
+                                  rgb + (min(1.0, opacity * 0.55),))
+
+            # ── 标题 / 状态 ───────────────────────────────────────
+            blf.size(0, 11)
+            blf.color(0, 0.82, 0.88, 1.0, 0.95)
+            blf.position(0, x0 + 8.0, y1 - 16.0, 0.0)
+            blf.draw(0, "环境预览 · 天空 / 太阳 / 月亮 / 云")
+            blf.size(0, 9)
+            blf.color(0, 0.62, 0.70, 0.84, 0.9)
+            blf.position(0, x0 + 8.0, y0 + 17.0, 0.0)
+            blf.draw(0, "%04.1f 点 · 方位 %.0f° · 仰角 %.0f°"
+                     % (values["preview_hour"],
+                        math.degrees(yaw) % 360.0, math.degrees(pitch)))
+            blf.position(0, x0 + 8.0, y0 + 5.0, 0.0)
+            blf.draw(0, "月相 %.2f · 侧栏可拨白天 / 播一天"
+                     % values["moon_phase"])
+            _ENV_PREVIEW_ERROR.clear()
+        finally:
+            gpu.state.blend_set("NONE")
+    except Exception as exc:                                 # noqa: BLE001
+        # 绘制回调不抛异常;留一条最近错误方便排查(和 UI 预览同一个做法)
+        _ENV_PREVIEW_ERROR[:] = [f"{type(exc).__name__}: {exc}"]
+
+
+_ENV_PREVIEW_ERROR = []
+
+
+def _remove_env_preview_handler():
+    import bpy as _bpy
+    while _ENV_PREVIEW_HANDLE:
+        handle = _ENV_PREVIEW_HANDLE.pop()
+        try:
+            _bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except Exception:                                 # noqa: BLE001
+            pass
+    if _ENV_PREVIEW_TIMER[0]:
+        try:
+            _bpy.app.timers.unregister(_env_preview_tick)
+        except Exception:                                 # noqa: BLE001
+            pass
+        _ENV_PREVIEW_TIMER[0] = False
+
+
+def _env_preview_tick():
+    """编辑任意节点图时按 0.12 秒重画 —— 云和月相才会真的动。
+
+    ⚠ 不是"只在编辑环境图时":用户要的是**同一关卡的其它节点图里也能看**
+      (第一百五十一轮第四轮)。只在当前屏幕有节点编辑器时才刷新,纯建模时
+      不让它一直重画整个视口。
+    """
+    if not _ENV_PREVIEW_ENABLED[0]:
+        return 0.5
+    if _env_preview_tree() is None:
+        return 0.5
+    if not _env_preview_any_node_editor():
+        return 0.35
+    _tag_viewports_redraw()
+    return 0.12
+
+
 class GK_PT_AiDesign(bpy.types.Panel):
     """AI 图专属面板:状态清单 + 问题 + 预览开关 + 用法提示。"""
 
@@ -3287,6 +4336,8 @@ def _make_tools_menu():
         layout = self.layout
         layout.operator("gk.auto_link", text="把选中的两个节点连起来",
                         icon="LINKED")
+        layout.operator("gk.style_logic_nodes", text="统一节点外观",
+                        icon="COLOR")
         layout.operator("gk.add_comment_box", text="分组框(框住选中节点)",
                         icon="PIVOT_BOUNDBOX")
         layout.operator("gk.toggle_group", text="折叠/展开分组框(选中的)",
@@ -7713,7 +8764,10 @@ class GK_OT_ApplyBuiltinPreset(bpy.types.Operator):
         # 它们不属于"环境与后处理",属于『全局卡通风格』,但内置档位里带着,
         # 所以一起写(不然套了"卡通日间"却没有卡通色阶,等于半套)。
         style_pairs = (("shadow_step", "style_shadow_step"),
+                       ("shadow_step_2", "style_shadow_step_2"),
+                       ("shadow_smooth", "style_shadow_smooth"),
                        ("shadow_tint", "style_shadow_tint"),
+                       ("shadow_tint_2", "style_shadow_tint_2"),
                        ("three_tone", "style_three_tone"),
                        ("rim", "style_rim"),
                        ("specular", "style_specular"))
@@ -7811,87 +8865,103 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
         layout = self.layout
         scene = getattr(context, "scene", None)
         settings = getattr(scene, "gk_settings", None) if scene else None
-        layout.label(text=f"当前场景: {scene.name if scene else '?'}", icon="SCENE_DATA")
-        # ── 用户第 8 条:得有一眼看出"现在生效的是哪一档"的地方 ──────────
         current = active_env_preset_name(scene)
+        # ── 顶部状态压成一行(第一百五十一轮第四轮:去冗余)──────────────
+        # 原来这里三行"当前场景 / 正在用 / 点下面换"互相重复,
+        # 现在一句说清"改的是哪一关 + 现在是什么状态"。
         if settings is None:
             layout.label(text="这个场景没有 GK 设置(重载插件试试)", icon="ERROR")
+        elif current:
+            layout.label(text=(f"『{scene.name}』· 正在用『{current}』"),
+                         icon="CHECKMARK")
         elif bool(getattr(settings, "env_enabled", False)):
-            if current:
-                layout.label(text=f"正在用:『{current}』", icon="CHECKMARK")
-            else:
-                layout.label(text="环境已开,但没对上任何一档(手动调过)", icon="INFO")
-            layout.label(text="点下面的档位直接换", icon="CHECKMARK")
+            layout.label(text=f"『{scene.name}』· 环境开着(手动调过)", icon="INFO")
         else:
-            layout.label(text="环境关着;点一档会自动打开它", icon="INFO")
+            layout.label(text=f"『{scene.name}』· 环境关着(点档位会自动打开)",
+                         icon="INFO")
+        # 天空预览开关(第一百五十一轮第四轮):放在最上面,改月亮 / 云时
+        # 一眼能找到 —— 视口右上角的小窗会实时跟着卡片参数变。
+        preview_row = layout.row(align=True)
+        preview_row.operator(
+            "gk.env_preview_toggle",
+            text=("天空预览:开" if _ENV_PREVIEW_ENABLED[0] else "天空预览:关"),
+            icon="WORLD")
+        preview_row.operator("gk.env_preview_drag", text="拖动预览视角",
+                             icon="HAND")
+        # 白天预览(第一百五十一轮第七轮):光看夜里的月亮不够 ——
+        # 拨时刻 / 播一整天,直接在预览小窗里看日出、正午、黄昏。
+        tree = getattr(getattr(context, "space_data", None), "node_tree", None)
+        time_box = layout.box()
+        hour_now = _env_preview_hour(_env_preview_cards(tree))
+        time_box.label(text="白天预览 · 预览时刻 %04.1f 点%s" % (
+            hour_now, " · 播放中" if _ENV_PREVIEW_PLAY[0] else ""),
+            icon="TIME")
+        row = time_box.row(align=True)
+        for label, value in (("0点", 0.0), ("6点", 6.0),
+                             ("12点", 12.0), ("18点", 18.0)):
+            row.operator("gk.env_preview_time", text=label,
+                         depress=(_ENV_PREVIEW_HOUR[0] == value
+                                  and not _ENV_PREVIEW_PLAY[0])).hour = value
+        row = time_box.row(align=True)
+        for label, value in (("9点", 9.0), ("15点", 15.0), ("21点", 21.0)):
+            row.operator("gk.env_preview_time", text=label,
+                         depress=(_ENV_PREVIEW_HOUR[0] == value
+                                  and not _ENV_PREVIEW_PLAY[0])).hour = value
+        row.operator("gk.env_preview_time", text="跟卡片",
+                     depress=(_ENV_PREVIEW_HOUR[0] is None
+                              and not _ENV_PREVIEW_PLAY[0])).hour = -1.0
+        play_row = time_box.row(align=True)
+        play_row.operator("gk.env_preview_play", icon=(
+            "PAUSE" if _ENV_PREVIEW_PLAY[0] else "PLAY"),
+            text=("暂停一天循环" if _ENV_PREVIEW_PLAY[0] else "播放一天循环"),
+            depress=_ENV_PREVIEW_PLAY[0])
+        if _ENV_PREVIEW_ERROR:
+            layout.label(text=f"预览绘制失败: {_ENV_PREVIEW_ERROR[-1]}",
+                         icon="ERROR")
 
-        # ── 作用范围:全部关卡 / 只这一个(第一百二十六轮,用户要求)──────
-        # 用户原话:"可以在游戏环境与后期的侧边栏添加这个环境设置作用于
-        # 全部关卡还是当个关卡的按钮"。
-        #
-        # ── 为什么给"按钮"而不是一个"归属开关"─────────────────────────
-        # 环境设置本身是**按场景**存的(`scene.gk_settings`),这是对的 ——
-        # 走廊要阴森、大堂要亮堂,一关一套才正常。用户真正要的是
-        # "我调好这一关,想一键复制到别的关卡"(多关卡统一风格),
-        # 以及"看清现在我改的是哪一关"。
-        # 用开关去切换"这份设置属于谁"反而危险:切换那一刻必然要搬家,
-        # 搬错了就是**另一关的观感被静默改掉**。
         # 加卡(第一百四十三轮):名称自解释,不加说明文字
         add = layout.box()
+        add.label(text="加一张环境卡", icon="ADD")
         row = add.row(align=True)
         for kind, label in (("GKNodeMoon", "月亮"), ("GKNodeWeather", "天气"),
                             ("GKNodeDayNight", "昼夜"), ("GKNodeSkyBox", "天空"),
                             ("GKNodeClouds", "云"), ("GKNodeSun", "太阳")):
             row.operator("gk.add_env_card", text=label).kind = kind
 
+        # ── 作用范围与跨关卡复制(第一百二十六 / 一百三十七轮)──────────
+        # 这里原来是**两盒**:『作用范围』(套用到全部关卡)和
+        # 『要一起改的关卡(打勾)』(套给勾选的)。前者是后者的"全选 + 套",
+        # 功能完全重合 —— 合成一盒,只留更灵活的那个。
         scope = layout.box()
-        scope.label(text="作用范围", icon="SCENE_DATA")
-        scope.label(text=f"下面的改动只影响『{scene.name if scene else '?'}』这一关",
+        scope.label(text="作用范围 / 复制到别的关卡", icon="SCENE_DATA")
+        scope.label(text=f"改动先存在『{scene.name if scene else '?'}』这一关",
                     icon="INFO")
-        scope.operator("gk.env_apply_to_all_levels", text="套用到全部关卡",
-                       icon="DUPLICATE")
-        if settings is not None and hasattr(settings, "env_apply_all_keep_post"):
-            scope.prop(settings, "env_apply_all_keep_post",
-                       text="只套基础环境,不动后期")
-            scope.label(text="勾上 = 只复制背景/环境光/雾,别把这一关的"
-                             "泛光/调色冲掉", icon="DOT")
-        else:
-            scope.label(text="跨关卡统一风格用这个;每关单独调就留着自己改",
-                        icon="DOT")
-
-        # ── 关卡打勾 + 一键贴近运行画面(第一百三十七轮,用户要求)──────────
-        # 用户原话:"在游戏环境与后期侧边栏添加选项框,选择一个关卡(选项有
-        # 关卡名称,全部,多选,可以设置成那种打勾的选择)" +
-        # "把灯光倍率移动到游戏环境与后期的侧边栏里" +
-        # "默认的配置是一键贴近运行画面与环境,如果一键贴近效果不好也可以
-        # 自行调整"。
-        # 所以这一盒干三件事:① 勾要一起改的关卡;② 灯光倍率(从『Godot 观感』
-        # 面板搬过来);③ 一键把标定值写下去。
-        pick = layout.box()
-        pick.label(text="要一起改的关卡(打勾)", icon="CHECKBOX_HLT")
-        row = pick.row(align=True)
+        scope.label(text="要一起改的关卡(打勾)", icon="CHECKBOX_HLT")
+        row = scope.row(align=True)
         row.operator("gk.look_pick_all", text="全选")
         row.operator("gk.look_pick_none", text="全不选")
         for other in bpy.data.scenes:
             other_settings = getattr(other, "gk_settings", None)
             if other_settings is None or not hasattr(other_settings, "look_target"):
                 continue
-            row = pick.row(align=True)
+            row = scope.row(align=True)
             row.prop(other_settings, "look_target", text="")
             row.label(text=other.name,
                       icon="SCENE_DATA" if other is scene else "DOT")
-        pick.operator("gk.env_apply_to_checked", text="套给勾选的关卡",
-                      icon="DUPLICATE")
+        scope.operator("gk.env_apply_to_checked", text="套给勾选的关卡",
+                       icon="DUPLICATE")
+        if settings is not None and hasattr(settings, "env_apply_all_keep_post"):
+            scope.prop(settings, "env_apply_all_keep_post",
+                       text="只套基础环境,不动后期")
         if settings is not None and hasattr(settings, "preview_light_scale"):
-            col = pick.column(align=True)
+            col = scope.column(align=True)
             col.label(text="预览灯光倍率(贴近运行时)", icon="LIGHT")
             row = col.row(align=True)
             row.prop(settings, "preview_light_scale", text="倍率")
             row.operator("gk.preview_light_scale_reset", text="", icon="LOOP_BACK")
             col.operator("gk.look_match_runtime", text="一键贴近运行画面",
                          icon="SHADERFX")
-            col.label(text="0.06 = 实测标定值(预览原本比运行亮一倍多);"
-                           "拧完立刻生效,不满意就自己调", icon="DOT")
+            col.label(text="0.06 = 实测标定值;只影响预览,不影响导出", icon="DOT")
 
         # ── 快速调色 / 曝光 / 雾 / 泛光(第一百三十八轮,用户第 ④ 条)──────
         # 用户原话:"在游戏环境与后期侧边栏,调节整体【一个关卡对应一个环境
@@ -7928,8 +8998,6 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
             glow_row.enabled = bool(getattr(settings, "env_glow", False))
             glow_row.prop(settings, "env_glow_intensity", text="强度")
             glow_row.prop(settings, "env_glow_bloom", text="溢出")
-            tune.operator("gk.env_apply_to_checked",
-                          text="把这套调色套给勾选的关卡", icon="DUPLICATE")
             tune.label(text="完整档位(背景 / 环境光 / 白点 / 雾的其余项)"
                            "在『游戏环境设置』卡上", icon="DOT")
 
@@ -7963,15 +9031,13 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
             box.prop(settings, "light_push_by_type", text="按类型刷",
                      icon="LIGHT")
             box.label(
-                text=("把当前这几盏的设置刷给**所有关卡**里同类型的灯"
-                      "(会盖掉它们原来的值,Ctrl+Z 可撤)"
-                      if by_type else
-                      "按灯名匹配;三关的灯名字不一样就刷不到 —— 勾『按类型刷』换一种"),
-                icon="INFO" if not by_type else "ERROR")
+                text=("按类型刷 = 只找同类型的灯;按灯名刷 = 只找同名的灯"
+                      "(会盖掉目标的值,Ctrl+Z 可撤)"),
+                icon="INFO")
             box.operator("gk.light_preview_scale_reset",
                          text="预览补偿全部归 1", icon="LOOP_BACK")
-            box.label(text="『预览』那一列 = 这盏灯在预览里再乘多少"
-                           "(1 = 不动,只影响预览、不影响导出)", icon="DOT")
+            box.label(text="『预览』= 预览里再乘多少(1 = 不动,不影响导出)",
+                      icon="DOT")
         for obj in lights:
             light = getattr(obj, "gk_light", None)
             row = box.row(align=True)
@@ -8008,12 +9074,20 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
             row = col.row(align=True)
             row.prop(light, "use_color", text="", toggle=True)
             row.prop(light, "color", text="")
-            col.prop(light, "shadow", text="投影")
+            row = col.row(align=True)
+            row.prop(light, "shadow", text="投影")
+            row.prop(light, "shadow_blur", text="柔和")
+            row.prop(light, "shadow_opacity", text="浓度")
+            col.prop(light, "projector", text="光斑形状")
+            if float(getattr(light, "shadow_blur", 0.0) or 0.0) > 0.0:
+                col.label(text="柔和 > 0 = 影子边缘糊开(漫射灯 / 雾天)",
+                          icon="INFO")
+            if str(getattr(light, "projector", "NONE")) != "NONE":
+                col.label(text="矩形 / 条纹 / 柔边不规则 = 打破正圆光斑",
+                          icon="INFO")
 
         box = layout.box()
-        box.label(text="卡通二次元(动画赛璐璐)", icon="MATERIAL")
-        box.label(text="高调 + 冷暗部 + 高饱和 —— 想要『原神那种』先点这三档",
-                  icon="INFO")
+        box.label(text="内置风格(点一下套到当前场景)", icon="WORLD")
         for name in ENV_PRESET_ANIME:
             values = ENV_PRESET_BUILTINS.get(name, {})
             label, in_use = env_preset_label(name, current)
@@ -8025,8 +9099,7 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
             row.label(text="环境光 %.2f · 饱和 %.2f"
                            % (float(values.get("amb_e", 0.0)),
                               float(values.get("sat", 1.0))))
-
-        box = layout.box()
+        box.separator()
         box.label(text="氛围(恐怖 / 白天 / 黄昏 / 浓雾)", icon="WORLD")
         for name in ENV_PRESET_HORROR:
             label, in_use = env_preset_label(name, current)
@@ -8035,7 +9108,6 @@ class GK_PT_EnvLibrary(bpy.types.Panel):
                 "gk.env_preset_apply_builtin", text=label,
                 icon="CHECKMARK" if in_use else "WORLD")
             op.preset_name = name
-            row.label(text="套到当前场景")
 
         library = props.env_preset_library()
         box = layout.box()
@@ -8074,6 +9146,273 @@ class GK_OT_EnvPresetPickIndex(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ── 第一百五十一轮第四轮:『游戏环境与后期』图的右键工具 ───────────────
+# 用户原话:"对游戏环境与后期节点图的右键菜单进行优化修改,
+# 可以进行增添,删减,已经连线逻辑,节点引脚优化等。"
+# 这里补三件最常用的:补齐标准卡 / 按标准顺序自动连线 / 整理成一列。
+# "删减"用 Blender 原生的 Delete;菜单里也放一条显式的。
+_ENV_CARD_ORDER = (
+    ("GKNodeEnvDefault", "环境_默认环境"),
+    ("GKNodeSkyBox", "环境_天空盒"),
+    ("GKNodeClouds", "环境_云层"),
+    ("GKNodeWeather", "环境_天气"),
+    ("GKNodeDayNight", "环境_昼夜循环"),
+    ("GKNodeSun", "环境_太阳"),
+    ("GKNodeMoon", "环境_月亮"),
+    ("GKNodeEnvGrade", "环境_设置色调"),
+    ("GKNodeEyeOpen", "环境_睁眼效果"),
+)
+
+# 3D 视口右上角的天空预览小窗(开 / 关;见 GK_OT_EnvPreviewToggle)
+_ENV_PREVIEW_ENABLED = [True]
+
+
+def _tag_viewports_redraw():
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def _env_tree(context):
+    space = getattr(context, "space_data", None)
+    tree = getattr(space, "node_tree", None)
+    if tree is not None and getattr(tree, "bl_idname", "") == "GKEnvLibraryTree":
+        return tree
+    return None
+
+
+class GK_OT_EnvFillCards(bpy.types.Operator):
+    """补齐『游戏环境与后期』图里缺失的标准卡(不碰已有的卡)。"""
+
+    bl_idname = "gk.env_fill_cards"
+    bl_label = "补齐标准环境卡"
+    bl_description = "把默认环境 / 天空 / 云 / 天气 / 昼夜 / 太阳 / 月亮 / 色调 / 睁眼缺的那几张补上"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _env_tree(context)
+        if tree is None:
+            return {"CANCELLED"}
+        have = {str(getattr(node, "bl_idname", "")) for node in tree.nodes}
+        missing = [kind for kind, _label in _ENV_CARD_ORDER
+                   if kind not in have]
+        baseline = 560.0
+        for index, kind in enumerate(missing):
+            node = tree.nodes.new(kind)
+            node.location = (-560.0, baseline - index * 250.0)
+        self.report({"INFO"}, f"补了 {len(missing)} 张环境卡")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvAutoChain(bpy.types.Operator):
+    """按标准顺序把现有环境卡的执行口接起来(已有的连线不重复加)。"""
+
+    bl_idname = "gk.env_auto_chain"
+    bl_label = "按标准顺序自动连线"
+    bl_description = ("默认环境 → 天空盒 → 云层 → 天气 → 昼夜 → 太阳 → 月亮 → "
+                      "设置色调 → 睁眼;只连存在的卡")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _env_tree(context)
+        if tree is None:
+            return {"CANCELLED"}
+        by_kind = {}
+        for node in tree.nodes:
+            kind = str(getattr(node, "bl_idname", ""))
+            if kind in dict(_ENV_CARD_ORDER) and kind not in by_kind:
+                by_kind[kind] = node
+        order = [by_kind[k] for k, _label in _ENV_CARD_ORDER if k in by_kind]
+        if len(order) < 2:
+            self.report({"WARNING"}, "至少要有『默认环境』和另一张环境卡")
+            return {"CANCELLED"}
+        added = 0
+        for left, right in zip(order, order[1:]):
+            out = (left.outputs.get("完成") or left.outputs.get("执行"))
+            inp = right.inputs.get("执行")
+            if out is None or inp is None:
+                continue
+            already = any(link.from_socket == out and link.to_socket == inp
+                          for link in tree.links)
+            if not already:
+                tree.links.new(out, inp)
+                added += 1
+        self.report({"INFO"}, f"连了 {added} 条执行线")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvTidy(bpy.types.Operator):
+    """把环境卡按标准顺序排成一列(不连线,只摆位置)。"""
+
+    bl_idname = "gk.env_tidy"
+    bl_label = "整理成一列"
+    bl_description = "按默认环境 → 天空 → 云 → 天气 → 昼夜 → 太阳 → 月亮 → 色调 → 睁眼 排好"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _env_tree(context)
+        if tree is None:
+            return {"CANCELLED"}
+        known = {kind: index for index, (kind, _label)
+                 in enumerate(_ENV_CARD_ORDER)}
+        nodes = list(tree.nodes)
+        nodes.sort(key=lambda node: (
+            known.get(str(getattr(node, "bl_idname", "")), 99),
+            str(getattr(node, "name", ""))))
+        for index, node in enumerate(nodes):
+            node.location = (-560.0, 560.0 - index * 230.0)
+        return {"FINISHED"}
+
+
+class GK_OT_EnvUnlinkSelected(bpy.types.Operator):
+    """断开选中环境卡上的所有连线(方便重接)。"""
+
+    bl_idname = "gk.env_unlink_selected"
+    bl_label = "断开选中节点的连线"
+    bl_description = "把选中节点作为起点或终点的连线全部删掉(节点本身保留)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        tree = _env_tree(context)
+        if tree is None:
+            return {"CANCELLED"}
+        selected = [node for node in tree.nodes if bool(getattr(node, "select", False))]
+        if not selected:
+            self.report({"WARNING"}, "先选中要断线的节点")
+            return {"CANCELLED"}
+        doomed = [link for link in tree.links
+                  if link.from_node in selected or link.to_node in selected]
+        for link in doomed:
+            tree.links.remove(link)
+        self.report({"INFO"}, f"断开了 {len(doomed)} 条线")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvPreviewDrag(bpy.types.Operator):
+    """拖动天空预览的观察方向(移动鼠标 = 转视角,单击结束)。
+
+    用户原话:"我希望这个预览可以拖动观察"。Blender 的绘制回调收不到
+    鼠标事件,所以这里用一个**模态算子**:点一下侧栏按钮,之后移动鼠标
+    就是拖动天空,单击 / 右键 / Esc 停下。
+    """
+
+    bl_idname = "gk.env_preview_drag"
+    bl_label = "拖动预览视角"
+    bl_description = "移动鼠标 = 转动天空预览的观察方向;单击结束"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        if getattr(context, "window", None) is None:
+            self.report({"WARNING"}, "拖动预览需要在有窗口的 Blender 里用")
+            return {"CANCELLED"}
+        if not _ENV_PREVIEW_ENABLED[0]:
+            _ENV_PREVIEW_ENABLED[0] = True
+        if not _ENV_PREVIEW_VIEW[2]:
+            tree = _env_preview_tree()
+            values = _env_preview_values(tree) if tree is not None else {}
+            yaw, pitch = _env_preview_camera(values)
+            _ENV_PREVIEW_VIEW[0] = yaw
+            _ENV_PREVIEW_VIEW[1] = pitch
+            _ENV_PREVIEW_VIEW[2] = True
+        self._last = (event.mouse_x, event.mouse_y)
+        context.window_manager.modal_handler_add(self)
+        try:
+            context.window.cursor_modal_set("HAND")
+        except Exception:                                 # noqa: BLE001
+            pass
+        _tag_viewports_redraw()
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type == "MOUSEMOVE":
+            dx = event.mouse_x - self._last[0]
+            dy = event.mouse_y - self._last[1]
+            self._last = (event.mouse_x, event.mouse_y)
+            _ENV_PREVIEW_VIEW[0] -= dx * 0.006
+            _ENV_PREVIEW_VIEW[1] = _env_preview_clamp(
+                _ENV_PREVIEW_VIEW[1] + dy * 0.006,
+                math.radians(-12.0), math.radians(78.0))
+            _tag_viewports_redraw()
+            return {"RUNNING_MODAL"}
+        if event.type in {"LEFTMOUSE", "RIGHTMOUSE", "ESC", "RET", "SPACE"}:
+            try:
+                context.window.cursor_modal_restore()
+            except Exception:                             # noqa: BLE001
+                pass
+            _tag_viewports_redraw()
+            return {"FINISHED"}
+        return {"RUNNING_MODAL"}
+
+
+class GK_OT_EnvPreviewToggle(bpy.types.Operator):
+    """开关 3D 视口右上角的『天空预览』小窗(月亮 / 云 / 星星实时动)。"""
+
+    bl_idname = "gk.env_preview_toggle"
+    bl_label = "天空预览 开/关"
+    bl_description = "在 3D 视口右上角实时画天空、月亮、云层和星星"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        _ENV_PREVIEW_ENABLED[0] = not _ENV_PREVIEW_ENABLED[0]
+        _tag_viewports_redraw()
+        state = "开" if _ENV_PREVIEW_ENABLED[0] else "关"
+        self.report({"INFO"}, f"天空预览: {state}")
+        return {"FINISHED"}
+
+
+class GK_OT_EnvPreviewTime(bpy.types.Operator):
+    """把天空预览拨到某个时刻(0~24 点);`hour = -1` = 跟卡片。"""
+
+    bl_idname = "gk.env_preview_time"
+    bl_label = "预览时刻"
+    bl_description = "把天空预览拨到指定时刻(0~24 点),看白天 / 黄昏的天空"
+    bl_options = {"REGISTER"}
+
+    hour: FloatProperty(default=-1.0, min=-1.0, max=24.0,
+                        description="预览时刻(0~24);-1 = 跟卡片")
+
+    def execute(self, context):
+        if self.hour < 0.0:
+            _ENV_PREVIEW_HOUR[0] = None
+            _ENV_PREVIEW_PLAY[0] = False
+            self.report({"INFO"}, "天空预览:跟着『环境_昼夜循环』的起始时刻")
+        else:
+            _ENV_PREVIEW_HOUR[0] = self.hour % 24.0
+            _ENV_PREVIEW_PLAY[0] = False
+            self.report({"INFO"}, f"天空预览时刻: {self.hour:.0f} 点")
+        _tag_viewports_redraw()
+        return {"FINISHED"}
+
+
+class GK_OT_EnvPreviewPlay(bpy.types.Operator):
+    """在预览小窗里按 48 秒一天循环播放(日出 / 正午 / 黄昏)。"""
+
+    bl_idname = "gk.env_preview_play"
+    bl_label = "播放一天循环"
+    bl_description = "在天空预览里循环播放一整天(48 秒 = 24 小时)"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if _ENV_PREVIEW_PLAY[0]:
+            # 暂停:把当前播放进度钉成手动时刻,不再跟着跑
+            _ENV_PREVIEW_HOUR[0] = _env_preview_hour(None)
+            _ENV_PREVIEW_PLAY[0] = False
+            self.report({"INFO"}, f"天空预览:停在 {_ENV_PREVIEW_HOUR[0]:.1f} 点")
+        else:
+            _ENV_PREVIEW_PLAY_FROM[0] = (
+                float(_ENV_PREVIEW_HOUR[0])
+                if _ENV_PREVIEW_HOUR[0] is not None else 6.0)
+            _ENV_PREVIEW_PLAY_START[0] = time.time()
+            _ENV_PREVIEW_PLAY[0] = True
+            self.report({"INFO"}, "天空预览:播放一天循环(48 秒)")
+        _tag_viewports_redraw()
+        return {"FINISHED"}
+
+
 def _draw_tree_context_extras(layout, context):
     """右键菜单末尾追加的 GK 子菜单(寻路 / 开局 BGM / 环境预设)。
 
@@ -8094,6 +9433,20 @@ def _draw_tree_context_extras(layout, context):
         # 第 124 轮:环境预设库这张图里右键 -> 直接换整套氛围
         # (用户原话:"可以在环境预设库的右键菜单里加点什么,
         #  比如恐怖环境。卡通环境等。")
+        # ── 第一百五十一轮第四轮:先放"图工具"(增添 / 连线 / 整理)────
+        layout.operator("gk.env_fill_cards", text="补齐标准环境卡",
+                        icon="ADD")
+        layout.operator("gk.env_auto_chain", text="按标准顺序自动连线",
+                        icon="LINKED")
+        layout.operator("gk.env_tidy", text="整理成一列", icon="SORTALPHA")
+        layout.operator("gk.env_unlink_selected", text="断开选中节点的连线",
+                        icon="UNLINKED")
+        layout.operator("gk.env_preview_toggle", text="天空预览 开/关",
+                        icon="WORLD")
+        layout.operator("gk.env_preview_drag", text="拖动预览视角",
+                        icon="HAND")
+        layout.operator("node.delete", text="删除选中节点", icon="X")
+        layout.separator()
         # ── 第 125 轮:先写一行"现在生效的是哪一档" ────────────────────
         # 用户原话:"环境预设里哪个选了但没标颜色,不知道现在生效的是哪个环境。"
         # 只把每个条目画上对勾没用(每一档本来就都画着对勾,分不出来);
@@ -8256,6 +9609,20 @@ def on_register():
                 _ai_preview_draw, (), "WINDOW", "POST_PIXEL"))
     except Exception as exc:                              # pragma: no cover
         gk_log.warn(f"AI 预览绘制挂载失败: {exc}")
+
+    # ---- 天空预览小窗(第一百五十一轮第四轮)----
+    # 只在正编辑『游戏环境与后期』图时画(用户要"改一个值马上看到")。
+    # 云和月相要**动**起来,所以另配一个 0.12 秒的定时器去 tag 视口重画;
+    # 没开那张图时定时器什么都不做,开销可以忽略。
+    _remove_env_preview_handler()
+    try:
+        _ENV_PREVIEW_HANDLE.append(
+            bpy.types.SpaceView3D.draw_handler_add(
+                _env_preview_draw, (), "WINDOW", "POST_PIXEL"))
+        bpy.app.timers.register(_env_preview_tick, persistent=True)
+        _ENV_PREVIEW_TIMER[0] = True
+    except Exception as exc:                              # pragma: no cover
+        gk_log.warn(f"天空预览绘制挂载失败: {exc}")
 
     # ---- 资产卡的缩略图(第六十六轮,挂在**节点编辑器**上)----
     # 和上面两个不同:它挂 SpaceNodeEditor(资产卡长在节点编辑器里),
@@ -8745,6 +10112,8 @@ class GK_OT_EnvApplyToAllLevels(bpy.types.Operator):
         "env_fog", "env_fog_color", "env_fog_density",
         "env_fog_sky_affect", "env_fog_light_energy",
         "env_fog_aerial_perspective",
+        # 第一百四十八轮:高度雾属于"这个世界的底子",跟着基础环境走
+        "env_fog_height", "env_fog_height_density",
         "env_tonemap", "env_tonemap_exposure", "env_tonemap_white",
     )
     #: 只有**不勾**"只套基础环境"时才跟着复制的 —— "这一关的调色"
@@ -8753,7 +10122,13 @@ class GK_OT_EnvApplyToAllLevels(bpy.types.Operator):
         "env_glow_strength", "env_glow_threshold", "env_glow_blend",
         "env_adjust", "env_brightness", "env_contrast", "env_saturation",
         "env_ssao", "env_ssil",
-        "style_enabled", "style_shadow_step", "style_shadow_tint",
+        # 第一百四十八轮:SSAO 的三个真旋钮 + 体积雾,属于"这一关的调色"
+        "env_ssao_intensity", "env_ssao_radius", "env_ssao_light_affect",
+        "env_volumetric", "env_volumetric_density", "env_volumetric_albedo",
+        "env_volumetric_anisotropy", "env_volumetric_length",
+        "env_volumetric_ambient",
+        "style_enabled", "style_shadow_step", "style_shadow_step_2",
+        "style_shadow_smooth", "style_shadow_tint", "style_shadow_tint_2",
         "style_three_tone", "style_rim", "style_specular",
     )
 
@@ -8903,6 +10278,15 @@ GK_CLASSES = (
     GK_MT_EnvPresetsMood,
     GK_OT_ApplyBuiltinPreset,
     GK_OT_EnvPresetPickIndex,
+    # 第一百五十一轮第四轮:环境图右键工具 + 天空预览开关
+    GK_OT_EnvFillCards,
+    GK_OT_EnvAutoChain,
+    GK_OT_EnvTidy,
+    GK_OT_EnvUnlinkSelected,
+    GK_OT_EnvPreviewToggle,
+    GK_OT_EnvPreviewDrag,
+    GK_OT_EnvPreviewTime,
+    GK_OT_EnvPreviewPlay,
     GK_OT_PreviewLightScaleReset,
     GK_OT_EnvApplyToAllLevels,
     GK_OT_LightsApplyToAllLevels,
@@ -8923,6 +10307,7 @@ def on_unregister():
     _remove_ui_preview_handler()
     _remove_ai_preview_handler()
     _remove_asset_thumb_handler()
+    _remove_env_preview_handler()
     # 摘掉菜单回调。按标记摘 —— 这样连以前重载遗留的旧函数也一起清掉,
     # 禁用插件后不会留野回调。
     # ⚠ 表必须和 `on_register` 那张**一一对应**:漏一个就会在 Blender 的
@@ -9204,7 +10589,10 @@ class GK_OT_EnvPresetApply(bpy.types.Operator):
         if preset_obj is not None:
             settings.style_enabled = True
             settings.style_shadow_step = preset_obj.p_style_shadow_step
+            settings.style_shadow_step_2 = preset_obj.p_style_shadow_step_2
+            settings.style_shadow_smooth = preset_obj.p_style_shadow_smooth
             settings.style_shadow_tint = preset_obj.p_style_shadow_tint
+            settings.style_shadow_tint_2 = preset_obj.p_style_shadow_tint_2
             settings.style_three_tone = preset_obj.p_style_three_tone
             settings.style_rim = preset_obj.p_style_rim
             settings.style_specular = preset_obj.p_style_specular
@@ -9246,6 +10634,19 @@ class GK_OT_EnvPresetSave(bpy.types.Operator):
         preset.preset_name = name
         for p_field, e_field in _ENV_PRESET_FIELDS:
             setattr(preset, p_field, getattr(settings, e_field))
+        # 卡通风格也一起存(第一百五十一轮):以前只存环境那套,
+        # 存完再应用回来会发现三段阴影 / 深阴影色全丢了。
+        for p_field, e_field in (
+                ("p_style_shadow_step", "style_shadow_step"),
+                ("p_style_shadow_step_2", "style_shadow_step_2"),
+                ("p_style_shadow_smooth", "style_shadow_smooth"),
+                ("p_style_shadow_tint", "style_shadow_tint"),
+                ("p_style_shadow_tint_2", "style_shadow_tint_2"),
+                ("p_style_three_tone", "style_three_tone"),
+                ("p_style_rim", "style_rim"),
+                ("p_style_specular", "style_specular")):
+            if hasattr(preset, p_field) and hasattr(settings, e_field):
+                setattr(preset, p_field, getattr(settings, e_field))
         self.report({"INFO"}, f"预设『{name}』已保存(同名已覆盖)")
         return {"FINISHED"}
 

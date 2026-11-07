@@ -1288,6 +1288,32 @@ class GK_OT_FixBaseClass(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GK_OT_StyleLogicNodes(bpy.types.Operator):
+    """将选中的游戏逻辑节点统一为当前卡片样式。"""
+    bl_idname = "gk.style_logic_nodes"
+    bl_label = "统一节点外观"
+    bl_description = "统一选中节点的颜色、宽度和引脚显示；未选择时处理整张图，可撤销"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        tree = getattr(getattr(context, "space_data", None), "edit_tree", None)
+        return tree is not None and tree.bl_idname == "GKGameLogicTree"
+
+    def execute(self, context):
+        from .nodes.node_presentation import apply_node_style
+        tree = _tree_of(self, context)
+        if tree is None or tree.bl_idname != "GKGameLogicTree":
+            return {"CANCELLED"}
+        selected = [node for node in tree.nodes if node.select]
+        nodes = [node for node in (selected or list(tree.nodes))
+                 if node.bl_idname.startswith("GKNode")]
+        for node in nodes:
+            apply_node_style(node)
+        _report(self, "INFO", f"已统一 {len(nodes)} 个节点的外观")
+        return {"FINISHED"}
+
+
 class GK_OT_AutoLink(bpy.types.Operator):
     """把两个选中节点自动连起来(按第一个匹配的引脚)。"""
 
@@ -2484,7 +2510,9 @@ class GK_OT_PreviewCameraPath(bpy.types.Operator):
 
     def _target_camera(self, scene, node):
         """节点上选的相机(留空 = 场景的当前活动相机)。"""
-        raw = str(getattr(node, "gk_target", "") or "").strip()
+        # 『相机_运镜』用的是 gk_camera;其它相机节点是 gk_target。
+        raw = str(getattr(node, "gk_target", "")
+                  or getattr(node, "gk_camera", "") or "").strip()
         objects = getattr(bpy.data, "objects", None)
         if raw and raw != "__self__" and objects is not None:
             found = objects.get(raw) if hasattr(objects, "get") else None
@@ -2530,6 +2558,19 @@ class GK_OT_PreviewCameraPath(bpy.types.Operator):
                 objects = getattr(bpy.data, "objects", None)
                 if raw and objects is not None and hasattr(objects, "get"):
                     self._look_target = objects.get(raw)
+        elif node.bl_idname == "GKNodeCameraShot":
+            # 第一百五十轮:『相机_运镜』预览 = 沿轨道飞 + 看向目标 + 自己选的缓动档。
+            # 不能落进下面『相机_切换』那条:它读的是 gk_blend / gk_path_mode,
+            # 这个节点根本没有这些属性(会预览成一条直线)。
+            curve_name = str(getattr(node, "gk_curve", "") or "").strip()
+            self._duration = max(
+                0.5, float(getattr(node, "gk_time", 2.5) or 2.5))
+            self._preset = str(getattr(node, "gk_ease", "EASE_OUT") or "EASE_OUT")
+            raw = str(getattr(node, "gk_look_target", "") or "").strip()
+            objects = getattr(bpy.data, "objects", None)
+            if raw and objects is not None and hasattr(objects, "get"):
+                self._look_target = objects.get(raw)
+            self._path_mode = True
         else:
             # 相机_切换:运镜轨道优先;没有轨道就按"过渡秒数"走直线
             if str(getattr(node, "gk_path_mode", "DIRECT")) == "CURVE":
@@ -2564,7 +2605,8 @@ class GK_OT_PreviewCameraPath(bpy.types.Operator):
         self._saved_matrix = camera.matrix_world.copy()
         self._start_matrix = None
         self._start_quat = None
-        if node.bl_idname != "GKNodeCameraPath" and self._saved_camera is not None \
+        if node.bl_idname not in ("GKNodeCameraPath", "GKNodeCameraShot") \
+                and self._saved_camera is not None \
                 and self._saved_camera is not camera:
             self._start_matrix = self._saved_camera.matrix_world.copy()
         if self._start_matrix is not None:
@@ -4237,6 +4279,7 @@ class GK_OT_SoloUiWidget(bpy.types.Operator):
 
 
 GK_CLASSES = (
+    GK_OT_StyleLogicNodes,
     GK_OT_AddNode,
     GK_OT_AddCommentBox,
     # 分组框的折叠 / 展开(第六十二轮)

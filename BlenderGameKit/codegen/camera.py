@@ -471,6 +471,18 @@ def _stmt_camera_spring_arm(ctx, node, indent):
         ]
     lines = [
         f"if {cam_var} != null and {arm_node} is Node3D:",
+        # ── 任何相机过渡期间:弹簧臂让位,并把"已就绪"清掉 ─────────────
+        # 让位是老规矩(谁过渡谁说了算)。这里多一句"清就绪":过渡结束时
+        # `_gk_spring_pos` 还停在过渡开始前的位置,不清的话下一帧会从那个
+        # 旧位置 lerp 过来 —— 短过渡(0.3~0.5 秒)时相机要穿半个房间才追上,
+        # 中间那几帧正好穿过墙 / 角色模型。
+        # 清掉之后,过渡结束的第一帧就走"没就绪 = 直接吸附到目标"。
+        f"    if {blend_left} > 0.0:",
+        f"        {ready_var} = false",
+    ]
+    if first_person_lock:
+        lines.append(f"        {base_yaw_ready_var} = false")
+    lines += [
         # 枢轴 = 杆子挂点的位置 + 偏移向量(偏移可以接线,运行中改)
         f"    var _gk_pivot: Vector3 = {arm3d}.global_position "
         f"+ ({offset_expr})",
@@ -539,9 +551,33 @@ def _stmt_camera_spring_arm(ctx, node, indent):
             "    if not _gk_hit.is_empty():",
             "        var _gk_dist: float = _gk_pivot.distance_to("
             "_gk_hit[\"position\"])",
-            f"        _gk_dist = maxf(_gk_dist - {gd_number(radius)},"
-            f" {gd_number(min_arm)})",
+            # ⚠ 命中之后**不能再用 min_arm 兜底**(第一百五十五轮):
+            #   min_arm 是"防贴脸"的,但它不认墙 —— 墙离枢轴 0.3 米时,
+            #   `max(dist - radius, 0.2)` 会把相机推到 0.2 米以外,**正好在墙里**
+            #   (用户截图:第三人称贴着应急红灯的墙,画面整片粉红)。
+            #   命中时改成只留 0.05(比 near 0.1 小),宁可贴脸也不穿墙;
+            #   min_arm 只在**没命中**的平滑路径里用。
+            f"        _gk_dist = maxf(_gk_dist - {gd_number(radius)}, 0.05)",
             "        _gk_want = _gk_pivot + _gk_dir * _gk_dist",
+            # ── 反向补一刀(第一百五十五轮):从"想去的位置"往枢轴打 ──────
+            # 正射线有个天生盲区:**起点本身已经在实心体里时,它什么都撞不到**
+            # (intersect_ray 不报自己所在的那块)。天井 / 贴墙 / 站在矮天花板下
+            # 都会触发:枢轴被顶进板里 -> 正射线 miss -> 杆子恢复全长 ->
+            # 相机跑到屋顶外面,屏幕上只剩板背面(用户截图的黑色块)。
+            #
+            # 反向射线从 _gk_want 打回枢轴:只要两者之间隔着任何东西,它一定命中
+            # (哪怕枢轴在板里,表面还在)。命中点离枢轴多远,杆子就收多短。
+            # 这是**单向射线做不到的兜底**,和上面那条不是重复。
+            f"    var _gk_back := _gk_space.intersect_ray("
+            f"PhysicsRayQueryParameters3D.create(_gk_want, _gk_pivot, "
+            f"0xFFFFFFFF, _gk_exclude))",
+            f"    if not _gk_back.is_empty() "
+            f"and _gk_back[\"collider\"] != {follow}:",
+            f"        var _gk_bdist: float = _gk_back[\"position\"].distance_to("
+            f"_gk_pivot)",
+            f"        _gk_bdist = maxf(_gk_bdist - {gd_number(radius)}, 0.05)",
+            f"        if _gk_bdist < _gk_pivot.distance_to(_gk_want):",
+            f"            _gk_want = _gk_pivot + _gk_dir * _gk_bdist",
         ]
         # ── 天花板兜底:相机不许跑到"头顶那块天花板"上面(第 128 轮)────────
         # 用户原话:"摄像机穿模是我站在**第三关卡的那个正方体上面**,然后跳跃,
@@ -656,8 +692,40 @@ def _stmt_camera_spring_arm(ctx, node, indent):
             f"    _gk_xform.basis = {basis_var}",
             f"    ({cam_var} as Node3D).global_transform = _gk_xform",
         ]
+    elif first_person_lock:
+        # ── 第一人称:朝**杆子的反方向**看(第一百五十轮,用户实测)──────
+        # 以前这里和第三人称一样 `look_at(_gk_pivot)`:臂长 0.25 时
+        # 相机站在枢轴后面 0.25 米,视线=杆子反方向,看起来"能用";
+        # 可是一旦臂长收到 0(真正贴头),相机和枢轴**重合**,
+        # `look_at(自己)` 是退化方向 —— 相机干脆不转,抬头低头全失效。
+        # 而且 `look_at` 的俯仰方向还被枢轴锁死,改了俯仰也只挪一点位置。
+        # 现在直接用 `_gk_dir` 定朝向:相机正前方 = -_gk_dir,
+        # 俯仰(无论是引脚还是属性)就真的变成"抬头 / 低头"。
+        lines += [
+            f"    if {blend_left} <= 0.0:",
+            f"        ({cam_var} as Node3D).look_at("
+            f"({cam_var} as Node3D).global_position - _gk_dir, Vector3.UP)",
+        ]
     else:
         lines.append(f"    ({cam_var} as Node3D).look_at(_gk_pivot, Vector3.UP)")
+    # ── 倒地接管(第一百五十四轮,第一百五十七轮改读 meta)────────────
+    # 『相机_倒地』会把 `_gk_cam_locked` 置 true;每帧跟随必须让位,
+    # 否则弹簧臂会在下一帧把相机拉回站姿 —— 倒地看起来像"抖了一下"。
+    #
+    # ⚠ 为什么还要看**相机节点上的 meta**:倒地那条链常常写在**关卡图**里,
+    # 而弹簧臂在**角色图**里 —— 两个脚本各有一份 `_gk_cam_locked`,
+    # 关卡图把变量设成 true,角色图里的那一份还是 false,锁等于没上
+    # (真机:倒地后相机被弹簧臂拽回站姿,倒地像"抖了一下")。
+    # 现在改成两边都认:`_gk_cam_locked`(本脚本)+ 相机节点上的
+    # `gk_cam_locked` meta(跨脚本)。换关时由常驻玩家脚本统一摘掉。
+    lines = [
+        "if _gk_cam_locked:",
+        "    return",
+        f"if {cam_var} is Node3D and ({cam_var} as Node3D)"
+        ".has_meta(\"gk_cam_locked\"):",
+        "    return",
+    ] + lines
+    ctx.declare_var("_gk_cam_locked", "bool", initial="false")
     ctx.physics_hooks.setdefault("camera_spring_arm", []).extend(lines)
 
 
@@ -884,6 +952,47 @@ def _stmt_camera_path(ctx, node, indent):
     ctx.physics_hooks.setdefault("camera_path", []).extend(frame)
 
 
+@stmt_node("GKNodeCameraShot")
+def _stmt_camera_shot(ctx, node, indent):
+    """『相机_运镜』:沿曲线推近 -> 停留 -> 缩回原相机(整段一次排好)。
+
+    ── 为什么不在节点上直接 await ─────────────────────────────────
+    直接生成 `await` 会把**整条执行链**卡在运镜上:开场运镜 4 秒,
+    后面的 HUD / AI / 存档就都得等它演完。这里改成调用一个 async 辅助
+    函数而**不 await** —— 镜头自己演,执行链立刻往下走。
+    """
+    if ctx.dim == 2:
+        ctx.warn("『相机_运镜』只支持 3D 项目(2D 请用『相机_切换』)")
+        return
+    if not str(getattr(node, "gk_camera", "") or "").strip():
+        ctx.warn("『相机_运镜』没选『特写相机』—— 它会和弹簧臂抢同一台"
+                 "当前相机(画面会抖)。建议在场景里放一台专用机位")
+    camera = _camera_node_expr(ctx, node, "gk_camera")
+    curve_name = str(getattr(node, "gk_curve", "") or "").strip()
+    curve = easing.curve_expr(ctx, curve_name, "Curve3D") if curve_name else "null"
+    raw_look = str(getattr(node, "gk_look_target", "") or "").strip()
+    look = (ctx.target_expr(node, "gk_look_target", "看向")
+            if raw_look and raw_look != TARGET_SELF else "null")
+    duration = ctx.input_number(
+        node, "时长", gd_number(float(getattr(node, "gk_time", 2.5) or 2.5)))
+    hold = ctx.input_number(
+        node, "停留", gd_number(float(getattr(node, "gk_hold", 1.5) or 0.0)))
+    back = ctx.input_number(
+        node, "回程", gd_number(float(getattr(node, "gk_return_time", 1.0) or 0.0)))
+    fov_from = ctx.input_number(
+        node, "视野起", gd_number(float(getattr(node, "gk_fov_from", 0.0) or 0.0)))
+    fov_to = ctx.input_number(
+        node, "视野止", gd_number(float(getattr(node, "gk_fov_to", 0.0) or 0.0)))
+    return_home = ctx.input_bool_expr(
+        node, "回到原相机",
+        "true" if bool(getattr(node, "gk_return_home", True)) else "false")
+    trans, ease = easing.ease_constants(str(getattr(node, "gk_ease", "EASE_OUT")))
+    ctx.need_camera_shot_helper = True
+    ctx.add_line(indent, f"_gk_camera_shot(self, {camera}, {curve}, {look}, "
+                         f"{duration}, {hold}, {back}, {fov_from}, {fov_to}, "
+                         f"{return_home}, {trans}, {ease})")
+
+
 @stmt_node("GKNodeCameraSetCurrent")
 def _stmt_camera_set_current(ctx, node, indent):
     """切相机;填了『过渡』就是丝滑推镜,还能沿曲线飞过去。
@@ -922,6 +1031,32 @@ def _stmt_camera_set_current(ctx, node, indent):
     ctx.add_line(indent + 1, f"push_warning(\"[GK] 相机_切换:没找到相机\")")
     if blend <= 0.0:
         ctx.add_line(indent, f"else:")
+        # ── 硬切 = **立刻接管**(第一百五十六轮)──────────────────────
+        # 用户实测:开场运镜还在跑的时候按 C / V 切人称,画面变成"角色
+        # 内部" —— 因为运镜把 `_gk_cam_blend_left` 撑着,弹簧臂的每帧
+        # 逻辑在 `if blend_left <= 0` 里,于是**新切过去的相机根本没人摆**,
+        # 就停在上一帧的位置(第一人称那个位置正好在网格内部)。
+        # 硬切语义就是"我现在说了算":把过渡计时清零,弹簧臂下一帧恢复,
+        # 运镜也不会再往旧相机上写位姿。
+        # ⚠ 只有**这张图里真的存在带过渡的切换**时才写这一句:
+        #   没有过渡的图,多一个成员变量就是"老图产物被改了"
+        #   (离线测试会逐字对比,实测直接 FAILED)。
+        tree = getattr(node, "id_data", None)
+        has_blend = False
+        for other in getattr(tree, "nodes", ()) or ():
+            if getattr(other, "bl_idname", "") != "GKNodeCameraSetCurrent":
+                continue
+            try:
+                if float(getattr(other, "gk_blend", 0.0) or 0.0) > 0.0:
+                    has_blend = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        if has_blend:
+            left_shared = ctx.declare_var("_gk_cam_blend_left", "float")
+            ctx.add_line(indent + 1,
+                         "# 硬切接管:把还在跑的运镜掐掉,否则弹簧臂会被它挡住")
+            ctx.add_line(indent + 1, f"{left_shared} = 0.0")
         ctx.add_line(indent + 1, f"{to_var}.make_current()")
         return
 

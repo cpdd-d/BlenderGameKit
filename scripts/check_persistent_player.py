@@ -25,7 +25,21 @@ func run() -> void:
         await physics_frame
     check(player.global_position.y > 0.3 and player.global_position.y < 2.0 and player.is_on_floor(), "standing_on_floor")
     check(Vector2(player.global_position.x, player.global_position.z).distance_to(Vector2(spawn_position.x, spawn_position.z)) < 0.2, "spawn_not_pushed_by_helpers")
-    var cameras := player.find_children("*", "Camera3D", true, false)
+    # ⚠ 第一百五十七轮:**离屏渲染的相机不算**(`GKPaperDollCam` 之类)。
+    #   纸娃娃 / 监控画面会在下面挂 SubViewport,里面各有一台 Camera3D。
+    #   它们确实是玩家的子节点,但不是"游戏机位"—— 测的是"玩家自己的两台
+    #   有没有被场景重载堆出来",离屏相机不该算进来。
+    var cameras: Array = []
+    for found in player.find_children("*", "Camera3D", true, false):
+        var inside_viewport := false
+        var walk: Node = found
+        while walk != null and walk != player:
+            if walk is SubViewport:
+                inside_viewport = true
+                break
+            walk = walk.get_parent()
+        if not inside_viewport:
+            cameras.append(found)
     print("CAMERA_PATHS ", root.find_children("*", "Camera3D", true, false))
     check(cameras.size() == 2, "two_owned_cameras")
     var camera_id: int = cameras[0].get_instance_id()
@@ -61,15 +75,33 @@ func run() -> void:
         # **它测的是"示例的设置",不是"有没有重复"**。
         # 现在按**分组**判断(不能按名字:用户可能改节点名,
         # 见 `_gk_god_setup` 里"不能用名字判断"那段):
-        #   非上帝机的相机必须还是 2 台(没被场景重载堆出来),
+        #   角色名下的相机必须还是 2 台(没被场景重载堆出来),
         #   上帝机必须且只有 1 台(重载能被找回来,不是每切一次多一台)。
+        # ⚠ 第一百五十轮:走廊多了一台**场景特写机位**(开场运镜用),
+        #   它不是玩家的、也不该被算成"重复"。所以这里只数
+        #   `player.is_ancestor_of(...)` 的相机 —— 测的是"玩家自己的两台
+        #   有没有被堆成四台",而不是"整关只能有两台相机"。
+        # ⚠ 第一百五十七轮:**离屏渲染的相机不算**。
+        #   『显示_纸娃娃』会在玩家下面挂一个 SubViewport,里面有一台
+        #   Camera3D(专拍小窗里的模型),『显示_监控画面』同理。它们确实是
+        #   玩家的子节点,但不是"游戏机位"—— 不参与 make_current、
+        #   不进 gk_camera 组、也不会被场景重载堆出来。
+        #   判据用"祖先里有没有 SubViewport",不看名字(名字用户可以改)。
         var game_cameras := 0
         var god_cameras := 0
         for found in root.find_children("*", "Camera3D", true, false):
             if (found as Camera3D).is_in_group("gk_god_camera"):
                 god_cameras += 1
-            else:
-                game_cameras += 1
+            elif player.is_ancestor_of(found):
+                var inside_viewport := false
+                var walk: Node = found
+                while walk != null and walk != player:
+                    if walk is SubViewport:
+                        inside_viewport = true
+                        break
+                    walk = walk.get_parent()
+                if not inside_viewport:
+                    game_cameras += 1
         check(game_cameras == 2, level + "_no_duplicate_cameras")
         check(god_cameras == 1, level + "_one_god_camera")
         for i in range(5):

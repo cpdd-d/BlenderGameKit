@@ -1,4 +1,4 @@
-﻿# 一键构建 GDExtension(Windows)
+﻿﻿# 一键构建 GDExtension(Windows)
 #
 # 用法:
 #   powershell -ExecutionPolicy Bypass -File build.ps1

@@ -264,11 +264,18 @@ class GKNodeDisplayStyle(B.GKStatementNode):
         if bool(getattr(settings, "style_enabled", False)):
             srow = box.row(align=True)
             srow.prop(settings, "style_shadow_step", text="明暗分界")
+            srow.prop(settings, "style_shadow_step_2", text="深阴影分界")
+            srow = box.row(align=True)
             srow.prop(settings, "style_three_tone", text="三段")
-            box.prop(settings, "style_shadow_tint", text="阴影色")
+            srow.prop(settings, "style_shadow_smooth", text="柔和")
+            box.prop(settings, "style_shadow_tint", text="浅阴影色")
+            box.prop(settings, "style_shadow_tint_2", text="深阴影色")
             srow = box.row(align=True)
             srow.prop(settings, "style_rim", text="边缘光")
             srow.prop(settings, "style_specular", text="高光")
+            if float(getattr(settings, "style_three_tone", 0.0) or 0.0) <= 0.5:
+                box.label(text="『三段』≤ 0.5 = 只有浅/深两档;调到 0.8 才看到第三档",
+                          icon="INFO")
             box.label(text="导出时作为整关材质的默认风格", icon="INFO")
         else:
             box.label(text="关着 = 老默认风格(不改任何材质)", icon="INFO")
@@ -404,8 +411,11 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
             style_box.label(text="卡通风格(运行时覆盖所有材质)", icon="MATERIAL")
             srow = style_box.row(align=True)
             srow.prop(picked, "p_style_shadow_step", text="明暗分界")
+            srow.prop(picked, "p_style_shadow_step_2", text="深阴影分界")
+            srow = style_box.row(align=True)
             srow.prop(picked, "p_style_three_tone", text="三段")
-            style_box.prop(picked, "p_style_shadow_tint", text="阴影色")
+            style_box.prop(picked, "p_style_shadow_tint", text="浅阴影色")
+            style_box.prop(picked, "p_style_shadow_tint_2", text="深阴影色")
             srow = style_box.row(align=True)
             srow.prop(picked, "p_style_rim", text="边缘光")
             srow.prop(picked, "p_style_specular", text="高光")
@@ -419,6 +429,21 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
         # 第 123 轮:从"开头"挪到"预设之后" —— 先挑整套,再动细节。
         detail = layout.box()
         detail.label(text="逐项微调(挑了预设之后再用)", icon="OPTIONS")
+        # ── 氛围摘要(第一百五十二轮)────────────────────────────────
+        # 这张卡以前一打开就是二十多个旋钮,看不出"这一关现在到底是什么
+        # 氛围"。加一行摘要:背景 / 雾 / 泛光 / 接触阴影,一眼读得出来。
+        fog_on = bool(getattr(settings, "env_fog", False))
+        fog_d = float(getattr(settings, "env_fog_density", 0.0) or 0.0)
+        glow_on = bool(getattr(settings, "env_glow", False))
+        glow_i = float(getattr(settings, "env_glow_intensity", 0.0) or 0.0)
+        ssao_on = bool(getattr(settings, "env_ssao", False))
+        summary = detail.box()
+        summary.label(text="这一关现在长什么样", icon="INFO")
+        summary.label(text=(
+            "背景 " + str(getattr(settings, "env_background", "COLOR"))
+            + " · 雾 " + ("开 %.3f" % fog_d if fog_on else "关")
+            + " · 泛光 " + ("开 %.2f" % glow_i if glow_on else "关")
+            + " · 接触阴影 " + ("开" if ssao_on else "关")))
 
         box = detail.box()
         # ⚠ `IMAGE_BG` 不存在(第 123 轮用户实测抓到的崩溃):
@@ -426,7 +451,7 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
         # 正确的名字是 `IMAGE_BACKGROUND`。图标名写错的症状很隐蔽 ——
         # 只往状态栏打一行 traceback,整个卡片直接不画。
         # 批量自查工具见 `.audit\check_icons_all.py`。
-        box.label(text="背景", icon="IMAGE_BACKGROUND")
+        box.label(text="① 背景与环境光", icon="IMAGE_BACKGROUND")
         row = box.row(align=True)
         row.prop(settings, "env_background", expand=True)
         row = box.row(align=True)
@@ -456,11 +481,21 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
                       icon="ERROR")
 
         box = detail.box()
+        box.label(text="② 空气(雾 / 高度雾 / 体积雾)", icon="MOD_FLUID")
         row = box.row(align=True)
         row.prop(settings, "env_fog", toggle=True, icon="MOD_FLUID")
         if bool(getattr(settings, "env_fog", False)):
             row.prop(settings, "env_fog_color", text="")
             box.prop(settings, "env_fog_density", text="浓度")
+            # ── 高度雾(第一百四十八轮)────────────────────────────────
+            # 平的深度雾只会把远处糊白;高度雾让雾"贴地浓、往上淡",
+            # 走廊里地面那层雾毯 + 干净的天花板 = 纵向层次。
+            row = box.row(align=True)
+            row.prop(settings, "env_fog_height", text="雾层高度")
+            row.prop(settings, "env_fog_height_density", text="厚度")
+            if float(getattr(settings, "env_fog_height_density", 0.0)) > 0.0:
+                box.label(text="高度雾开着:越高越干净,地面附近最浓"
+                               "(厚度 0.1~0.4 为宜)", icon="INFO")
             # ── 第 124 轮:雾的三个"够不着的旋钮"接上来 ────────────────
             # 真机实测(示例走廊,帧均值亮度):雾开着的出厂画面 0.3803,
             # 其中 `fog_sky_affect = 0` -> 0.3460、`fog_light_energy = 0.25`
@@ -486,6 +521,7 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
                           icon="ERROR")
 
         box = detail.box()
+        box.label(text="③ 后期(泛光 / 色调 / 接触阴影)", icon="SHADERFX")
         row = box.row(align=True)
         row.prop(settings, "env_glow", toggle=True, icon="LIGHT_SUN")
         if bool(getattr(settings, "env_glow", False)):
@@ -508,6 +544,21 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
                           icon="INFO")
 
         box = detail.box()
+        row = box.row(align=True)
+        row.prop(settings, "env_volumetric", toggle=True, icon="MOD_FLUID")
+        if bool(getattr(settings, "env_volumetric", False)):
+            box.prop(settings, "env_volumetric_density", text="浓度")
+            row = box.row(align=True)
+            row.prop(settings, "env_volumetric_albedo", text="")
+            row.prop(settings, "env_volumetric_anisotropy", text="前向")
+            row = box.row(align=True)
+            row.prop(settings, "env_volumetric_length", text="距离")
+            row.prop(settings, "env_volumetric_ambient", text="环境注入")
+            box.label(text="灯要在里面打出光柱:把灯物体的『体积散射』"
+                           "(Light > Volume Factor)调到 2~4", icon="INFO")
+            box.label(text="比普通雾贵;Forward+ 才有", icon="DOT")
+
+        box = detail.box()
         box.prop(settings, "env_tonemap", text="色调映射")
         box.label(text="ACES 会把颜色压灰;二次元一般用 Linear",
                   icon="INFO") if str(getattr(settings, "env_tonemap", "")) == "ACES" else None
@@ -528,6 +579,17 @@ class GKNodeDisplayEnvironment(B.GKStatementNode):
         row = box.row(align=True)
         row.prop(settings, "env_ssao")
         row.prop(settings, "env_ssil")
+        if bool(getattr(settings, "env_ssao", False)):
+            # ── 第 148 轮:SSAO 的三个真旋钮 ──────────────────────────
+            # `ssao_light_affect` 出厂 0 = 只压环境光,卡通场景里几乎看不出;
+            # 0.5~0.8 才会在墙角 / 家具根部压出真正的接触阴影。
+            row = box.row(align=True)
+            row.prop(settings, "env_ssao_intensity", text="强度")
+            row.prop(settings, "env_ssao_radius", text="半径")
+            box.prop(settings, "env_ssao_light_affect", text="影响直射光")
+            if float(getattr(settings, "env_ssao_light_affect", 0.0)) < 0.2:
+                box.label(text="『影响直射光』还是 0 —— 接触阴影几乎看不出来;"
+                               "调到 0.5~0.8", icon="INFO")
         row = box.row(align=True)
         row.prop(settings, "env_adjust", toggle=True, icon="COLOR")
         if bool(getattr(settings, "env_adjust", False)):
