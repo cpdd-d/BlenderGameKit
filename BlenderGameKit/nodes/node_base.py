@@ -259,10 +259,13 @@ def node_items_for(node, prop="gk_target"):
     所以这里给个说明文字,别让人以为"列表里随便挑一个就行"。
     """
     tree = getattr(node, "id_data", None)
-    # gk_camera 只列相机,gk_light 只列灯光(第一百八十八轮)
+    # 目标类型过滤(第一百八十八轮)—— 引用只列对类型的物体,
+    # 用户不用在一堆网格里翻相机/骨架。
     obj_type = None
     if prop == "gk_camera":
         obj_type = "CAMERA"
+    elif prop == "gk_skeleton_node":
+        obj_type = "ARMATURE"
     items = list(node_candidates(tree, prop, obj_type))
     if bpy is not None and tree is not None:
         slots = set()

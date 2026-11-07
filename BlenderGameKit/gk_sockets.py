@@ -26,6 +26,8 @@ SEMANTIC_DATA = "DATA"
 SEMANTIC_CAMERA_REF = "CAMERA_REF"
 SEMANTIC_ANIM_REF = "ANIM_REF"
 SEMANTIC_UI_REF = "UI_REF"
+SEMANTIC_ANIM_REF = "ANIM_REF"
+SEMANTIC_UI_REF = "UI_REF"
 
 _COLOR_FLOW = (1.0, 0.85, 0.35, 1.0)
 _COLOR_ANY = (0.62, 0.62, 0.62, 1.0)
@@ -59,7 +61,7 @@ class GKSocketBase:
             return src_sem == dst_sem
         if src_sem == SEMANTIC_ANY or dst_sem == SEMANTIC_ANY:
             return True
-        if src_sem == SEMANTIC_CAMERA_REF or dst_sem == SEMANTIC_CAMERA_REF:
+        if src_sem in (SEMANTIC_CAMERA_REF, SEMANTIC_ANIM_REF, SEMANTIC_UI_REF) or dst_sem in (SEMANTIC_CAMERA_REF, SEMANTIC_ANIM_REF, SEMANTIC_UI_REF):
             return src_sem == dst_sem
         return self.bl_idname == target.bl_idname
 
@@ -130,6 +132,8 @@ _TYPE_TABLE = {
     "NodeSocketColor": ("颜色", "Color"),
     "NodeSocketObject": ("节点", "Node"),
     "GKSocketCameraRef": ("相机引用", "Camera"),
+    "GKSocketAnimRef": ("动画引用", "Animation"),
+    "GKSocketUiRef": ("控件引用", "Control"),
     "NodeSocketVirtual": ("虚", "null"),
     "GKSocketFlow": ("执行流", "void"),
     "GKSocketAny": ("任意", "Variant"),
@@ -165,7 +169,39 @@ class GKSocketCameraRef(GKSocketBase, bpy.types.NodeSocket):
         return _COLOR_SELF
 
 
-GK_CLASSES = (GKSocketFlow, GKSocketAny, GKSocketCameraRef)
+class GKSocketAnimRef(GKSocketBase, bpy.types.NodeSocket):
+    """动画引用引脚:只能接动画引用(第一百八十八轮)。"""
+
+    bl_idname = "GKSocketAnimRef"
+    bl_label = "动画引用"
+
+    @classmethod
+    def gk_semantic(cls):
+        return SEMANTIC_ANIM_REF
+
+    def draw(self, context, layout, node, text):
+        layout.label(text=text)
+
+    def draw_color(self, context, node):
+        return _COLOR_SELF
+
+class GKSocketUiRef(GKSocketBase, bpy.types.NodeSocket):
+    """UI 控件引用引脚:只能接 UI 控件引用(第一百八十八轮)。"""
+
+    bl_idname = "GKSocketUiRef"
+    bl_label = "控件引用"
+
+    @classmethod
+    def gk_semantic(cls):
+        return SEMANTIC_UI_REF
+
+    def draw(self, context, layout, node, text):
+        layout.label(text=text)
+
+    def draw_color(self, context, node):
+        return _COLOR_SELF
+
+GK_CLASSES = (GKSocketFlow, GKSocketAny, GKSocketCameraRef, GKSocketAnimRef, GKSocketUiRef)
 
 
 def pin(kind, name, default=None):
