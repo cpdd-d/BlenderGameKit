@@ -631,9 +631,7 @@ def main():
         sound.gk_path = "res://audio/registered.ogg"
         sound.gk_name = "只登记"
         # 旧卡也要能画(老 .blend 不坏)
-        tree.nodes.new("GKNodeAssetImage")
-        tree.nodes.new("GKNodeAssetSound")
-
+                
         panel = getattr(ui, "GK_PT_AssetTree", None)
         if panel is None:
             check("GK_PT_AssetTree 存在", False, "类找不到")

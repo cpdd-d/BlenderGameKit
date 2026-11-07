@@ -192,12 +192,12 @@ class TestCharacter(Base):
         """一个完整可跑的 2D 角色图:方向移动 + 翻转 + 在地面时跳跃。"""
         tree = make_tree()
         physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧", gk_order=0)
-        direction = tree.new_node(NN.GKNodeGetVector, "方向")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向")
         speed = tree.new_node(NN.GKNodeConstFloat, "速度", gk_value=220.0)
         move_direction = tree.new_node(NN.GKNodeMoveDirection, "移动")
         flipping = tree.new_node(NN.GKNodeFlip, "翻转")
         on_floor = tree.new_node(NN.GKNodeIsOnFloor, "在地面")
-        jump_key = tree.new_node(NN.GKNodeActionJustPressed, "跳跃键", gk_action="jump")
+        jump_key = tree.new_node(NN.GKNodeKey, "跳跃键", gk_action="jump", gk_trigger="JUST")
         jump = tree.new_node(NN.GKNodeJump, "跳跃", gk_jump_force=520.0)
         branch = tree.new_node(NN.GKNodeBranch, "如果能跳")
         set_state = tree.new_node(NN.GKNodeSetState, "状态", gk_state="jump")
@@ -211,7 +211,7 @@ class TestCharacter(Base):
         # 条件:在地面 and 按下跳跃键
         logic = tree.new_node(NN.GKNodeLogic, "与", gk_op="AND")
         gk_stub.connect(tree, on_floor, "在地面", logic, "A")
-        gk_stub.connect(tree, jump_key, "刚按下", logic, "B")
+        gk_stub.connect(tree, jump_key, "结果", logic, "B")
         gk_stub.connect(tree, logic, "结果", branch, "条件")
         gk_stub.connect(tree, branch, "是", jump, "执行")
         gk_stub.connect(tree, jump, "完成", set_state, "执行")
@@ -232,8 +232,8 @@ class TestCharacter(Base):
         # move_* 导出时会连按键一起写进 project.godot(WASD 开箱即用)。
         self.assertIn('const ACTION_MOVE_LEFT := "move_left"', code)
         self.assertIn('const ACTION_JUMP := "jump"', code)
-        self.assertIn("Input.get_vector(ACTION_MOVE_LEFT, ACTION_MOVE_RIGHT, "
-                      "ACTION_MOVE_UP, ACTION_MOVE_DOWN, 0.2)", code)
+        self.assertIn("Input.get_action_strength(ACTION_MOVE_RIGHT)", code)
+        self.assertIn("Input.get_action_strength(ACTION_MOVE_LEFT)", code)
         self.assertIn(".normalized()", code)
         self.assertIn(".move_and_slide()", code)
         self.assertIn("Input.is_action_just_pressed(ACTION_JUMP)", code)
@@ -321,12 +321,12 @@ class TestExpressions(Base):
         tree = make_tree()
         event = tree.new_node(NN.GKNodeOnReady, "启动")
         velocity = tree.new_node(NN.GKNodeSetVelocity, "设速度")
-        axis = tree.new_node(NN.GKNodeGetAxis, "轴")
-        gk_stub.connect(tree, axis, "强度", velocity, "速度")
+        axis = tree.new_node(NN.GKNodeConstFloat, "轴", gk_value=1.0)
+        gk_stub.connect(tree, axis, "值", velocity, "速度")
         gk_stub.connect(tree, event, "执行", velocity, "执行")
         code, warnings = gen(tree, V2)
         self.assertTrue(any("包装成向量" in w for w in warnings), warnings)
-        self.assertIn("Vector2(Input.get_axis", code)
+        self.assertIn("Vector2(", code)
         self.assert_no_chinese_identifiers(code)
 
 
@@ -3745,7 +3745,7 @@ class TestDimensionSafety(Base):
         event = self._ready(tree)
         move = tree.new_node(NN.GKNodeMoveDirection, "移动")
         move.gk_keep_y = True
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
         gk_stub.connect(tree, event, "执行", move, "执行")
         gk_stub.connect(tree, vec, "方向", move, "方向")
         code, warnings = gen(tree, {"dimension": "3", "base_class": "CharacterBody3D"})
@@ -3764,7 +3764,7 @@ class TestDimensionSafety(Base):
         tree = make_tree()
         event = self._ready(tree)
         move = tree.new_node(NN.GKNodeMoveDirection, "移动")
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
         gk_stub.connect(tree, event, "执行", move, "执行")
         gk_stub.connect(tree, vec, "方向", move, "方向")
         code, _ = gen(tree, V2)
@@ -3825,8 +3825,8 @@ class TestInputActions(Base):
         """
         tree = make_tree()
         event = tree.new_node(NN.GKNodeOnReady, "准备")
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
-        vec.gk_left, vec.gk_right = "move_left", "move_right"
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
+        vec.gk_action_left, vec.gk_action_right = "move_left", "move_right"
         move = tree.new_node(NN.GKNodeMoveDirection, "移动")
         printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="hi")
         gk_stub.connect(tree, event, "执行", move, "执行")
@@ -4220,7 +4220,7 @@ class TestMoveSpeedDimension(Base):
         ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
         move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=300.0)
         move.gk_keep_y = True
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
         gk_stub.connect(tree, ev, "执行", move, "执行")
         gk_stub.connect(tree, vec, "方向", move, "方向")
         return tree
@@ -4243,7 +4243,7 @@ class TestMoveSpeedDimension(Base):
         tree = make_tree()
         ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
         move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=6.0)
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
         gk_stub.connect(tree, ev, "执行", move, "执行")
         gk_stub.connect(tree, vec, "方向", move, "方向")
         code, warns = gen(tree, V3)
@@ -4263,7 +4263,7 @@ class TestDefaultInputActions(Base):
         tree = make_tree()
         ev = tree.new_node(NN.GKNodeOnProcess, "每帧")
         mov = tree.new_node(NN.GKNodeMoveDirection, "移动")
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
         # 必须真的连上 —— 没被消费的节点会被当成死代码丢掉
         gk_stub.connect(tree, ev, "执行", mov, "执行")
         gk_stub.connect(tree, vec, "方向", mov, "方向")
@@ -4279,13 +4279,13 @@ class TestDefaultInputActions(Base):
     def test_jump_default_action(self):
         tree = make_tree()
         ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
-        pressed = tree.new_node(NN.GKNodeActionJustPressed, "跳跃键")
+        pressed = tree.new_node(NN.GKNodeKey, "跳跃键")
         branch = tree.new_node(NN.GKNodeBranch, "分支")
         jump = tree.new_node(NN.GKNodeJump, "跳")
         # ActionJustPressed 是表达式节点(只有"刚按下"输出,没有执行引脚),
         # 所以要接到分支的『条件』上,再让分支去驱动跳
         gk_stub.connect(tree, ev, "执行", branch, "执行")
-        gk_stub.connect(tree, pressed, "刚按下", branch, "条件")
+        gk_stub.connect(tree, pressed, "结果", branch, "条件")
         gk_stub.connect(tree, branch, "是", jump, "执行")
         code, _ = gen(tree, V3)
         self.assertIn('"jump"', code)
@@ -4423,7 +4423,7 @@ class TestMoveAxes(Base):
         tree = make_tree()
         ev = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
         move = tree.new_node(NN.GKNodeMoveDirection, "移动")
-        vec = tree.new_node(NN.GKNodeGetVector, "方向")
+        vec = tree.new_node(NN.GKNodeInputDirection, "方向")
         move.gk_keep_y = keep_y
         move.gk_axis_h = axis_h
         move.gk_axis_v = axis_v
@@ -5180,106 +5180,6 @@ class TestAnimationEvents(Base):
             borrowed = re.findall(r"(?<!_gk)_(?:ap|anim)\d+", body)
             self.assertEqual(borrowed, [],
                              f"{name} 引用了别的函数的局部变量 {borrowed}")
-
-
-class TestAnimationStateMachine(Base):
-    """动画状态机 —— 取代手拼分支网。
-
-    用户要求"做动画状态机",这也是 UPBGE 那套最大的缺陷
-    (它一次只能播一个动画,没有状态机)。
-    """
-
-    def test_parse_transitions(self):
-        self.assertEqual(NN.parse_transitions("idle -> run\nrun -> idle"),
-                         [("idle", "run"), ("run", "idle")])
-
-    def test_parse_accepts_full_width_arrow(self):
-        self.assertEqual(NN.parse_transitions("idle→run"), [("idle", "run")])
-
-    def test_parse_ignores_blank_and_comments(self):
-        text = "  idle -> run  \n\n# 注释\nrun->idle\n"
-        self.assertEqual(NN.parse_transitions(text),
-                         [("idle", "run"), ("run", "idle")])
-
-    def test_parse_tolerates_half_typed_rule(self):
-        """用户正在打字时的半截规则不该让整个节点崩掉。"""
-        self.assertEqual(NN.parse_transitions("idle ->"), [])
-        self.assertEqual(NN.parse_transitions(""), [])
-        self.assertEqual(NN.parse_transitions(None), [])
-
-    def test_transitions_create_bool_pins(self):
-        node = make_tree().new_node(NN.GKNodeAnimStateMachine, "状态机")
-        node.gk_transitions = "idle -> run\nrun -> jump"
-        node.build_sockets()
-        names = [s.name for s in node.inputs]
-        self.assertIn("idle→run", names)
-        self.assertIn("run→jump", names)
-
-    def test_duplicate_rules_make_one_pin(self):
-        node = make_tree().new_node(NN.GKNodeAnimStateMachine, "状态机")
-        node.gk_transitions = "idle -> run\nidle -> run"
-        node.build_sockets()
-        names = [s.name for s in node.inputs]
-        self.assertEqual(names.count("idle→run"), 1)
-
-    def _build(self, transitions, condition=None, mode="EVERY_FRAME"):
-        tree = make_tree()
-        event = tree.new_node(NN.GKNodeOnReady, "准备")
-        machine = tree.new_node(NN.GKNodeAnimStateMachine, "状态机")
-        machine.gk_transitions = transitions
-        machine.gk_check_mode = mode
-        machine.build_sockets()
-        gk_stub.connect(tree, event, "执行", machine, "执行")
-        if condition is not None:
-            cond = tree.new_node(NN.GKNodeActionPressed, "输入")
-            cond.gk_action = condition
-            first = NN.parse_transitions(transitions)[0]
-            gk_stub.connect(tree, cond, "按住", machine,
-                            NN.transition_pin_name(*first))
-        return gen(tree, V3)
-
-    def test_every_frame_goes_to_physics_process(self):
-        """『每帧检查』要挂 _physics_process —— 跟移动同步判定。
-
-        放渲染帧里会出现"人已经走出去了状态还没切"的一帧延迟
-        (和相机跟随同一个道理)。
-        """
-        code, warnings = self._build("idle -> run", condition="move_right")
-        self.assertEqual(warnings, [], warnings)
-        self.assertIn("func _physics_process(", code)
-        self.assertIn('anim_state == "idle"', code)
-        self.assertIn('anim_state = "run"', code)
-        self.assertIn('.play("run"', code)
-        self.assert_no_chinese_identifiers(code)
-        self.assert_indent_sane(code)
-
-    def test_on_enter_mode_does_not_need_physics_process(self):
-        code, _ = self._build("idle -> run", condition="move_right",
-                              mode="ON_ENTER")
-        self.assertNotIn("func _physics_process(", code)
-
-    def test_empty_table_warns(self):
-        _code, warnings = self._build("")
-        self.assertTrue(any("状态表是空的" in w for w in warnings), warnings)
-
-    def test_unwired_rule_warns(self):
-        """规则没接条件 -> 永远不会触发,必须明确告诉用户。"""
-        _code, warnings = self._build("idle -> run\nrun -> idle")
-        self.assertTrue(any("没有接条件" in w for w in warnings), warnings)
-
-    def test_state_name_is_also_the_animation_name(self):
-        """状态名直接当动画名用 —— 少一层映射就少一类 bug。"""
-        code, _ = self._build("idle -> attack", condition="attack")
-        self.assertIn('has_animation("attack")', code)
-        self.assertIn('.play("attack"', code)
-
-    def test_missing_animation_warns_at_runtime(self):
-        code, _ = self._build("idle -> attack", condition="attack")
-        self.assertIn("没有对应的动画", code)
-
-    def test_state_var_is_declared_once(self):
-        code, _ = self._build("idle -> run", condition="move_right")
-        self.assertEqual(code.count("var anim_state: String"), 1)
 
 
 class TestAnimLocomotion(Base):
@@ -13433,8 +13333,8 @@ class TestRound43Assets(Base):
         # 第六十六轮:四张分开的卡合成一张『资产卡』(ASSET_CARD_IDS 只剩一个)
         self.assertEqual(len(NN.ASSET_CARD_IDS), 1)
         self.assertIn("GKNodeAssetCard", NN.ASSET_CARD_IDS)
-        # 旧四张卡保留兼容(定义还在、还认资产树),但不再进菜单
-        self.assertEqual(len(NN.LEGACY_ASSET_CARD_IDS), 4)
+        # 第一百八十七轮:旧四张卡已删除,LEGACY_ASSET_CARD_IDS 为空
+        self.assertEqual(len(NN.LEGACY_ASSET_CARD_IDS), 0)
         for blob in tuple(NN.ASSET_CARD_IDS) + tuple(NN.LEGACY_ASSET_CARD_IDS):
             cls = getattr(NN, blob, None)
             self.assertIsNotNone(cls, f"资产卡名单里的 {blob} 没定义")
@@ -13444,9 +13344,6 @@ class TestRound43Assets(Base):
             self.assertTrue(props.node_fits_tree(cls, "GKAssetTree"))
         for blob in NN.ASSET_CARD_IDS:
             self.assertFalse(getattr(getattr(NN, blob), "gk_hidden", False))
-        for blob in NN.LEGACY_ASSET_CARD_IDS:
-            self.assertTrue(getattr(getattr(NN, blob), "gk_hidden", False),
-                            f"旧卡 {blob} 应该从菜单里藏起来")
 
     def test_asset_cards_tree_scope(self):
         from BlenderGameKit import properties as props
@@ -15496,7 +15393,7 @@ class TestRound62NodeGroups(Base):
         tree = make_tree()
         event = tree.new_node(NN.GKNodeOnReady, "准备")
         printer = tree.new_node(NN.GKNodePrint, "打印", gk_text="你好")
-        direction = tree.new_node(NN.GKNodeGetVector, "方向输入")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向输入")
         move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=240.0)
         gk_stub.connect(tree, event, "执行", printer, "执行")
         gk_stub.connect(tree, event, "执行", move, "执行")
@@ -15972,11 +15869,6 @@ class TestRound66AssetCard(unittest.TestCase):
         self.assertEqual(NN.card_kind(self._card(tree, "sound")), "sound")
         # 认不出来的类型 -> 空串(不是资产卡)
         self.assertEqual(NN.card_kind(self._card(tree, "nope")), "")
-        # 旧卡按 bl_idname 认
-        self.assertEqual(
-            NN.card_kind(tree.new_node(NN.GKNodeAssetCurve, "旧")), "curve")
-        self.assertEqual(
-            NN.card_kind(tree.new_node(NN.GKNodeAssetModel, "旧")), "model")
 
     def test_card_path_and_name(self):
         tree = self._tree()
@@ -15990,18 +15882,12 @@ class TestRound66AssetCard(unittest.TestCase):
         self.assertEqual(
             NN.card_name(self._card(tree, "sound", "/a/b/叮.wav", "开门")),
             "开门")
-        # 旧卡走各自的属性
-        old = tree.new_node(NN.GKNodeAssetImage, "旧", gk_image="头像")
-        self.assertEqual(NN.card_path(old), "头像")
 
     def test_card_is_asset_honours_the_checkbox(self):
         tree = self._tree()
         self.assertTrue(NN.card_is_asset(self._card(tree, "model", "树")))
         self.assertFalse(
             NN.card_is_asset(self._card(tree, "model", "树", is_asset=False)))
-        # 旧卡没有这个开关,一直算数
-        self.assertTrue(NN.card_is_asset(
-            tree.new_node(NN.GKNodeAssetModel, "旧", gk_asset="树")))
 
     def test_card_entries_and_counts_skip_unchecked(self):
         tree = self._tree()
@@ -16019,15 +15905,6 @@ class TestRound66AssetCard(unittest.TestCase):
         # 卡节点还在(只是没勾/没路径)
         self.assertEqual(len(NN.card_nodes(tree)), 4)
 
-    def test_legacy_cards_still_count(self):
-        tree = self._tree()
-        tree.new_node(NN.GKNodeAssetModel, "模型", gk_asset="树")
-        tree.new_node(NN.GKNodeAssetSound, "声音",
-                      gk_res="res://audio/b.wav")
-        counts = NN.card_counts(tree)
-        self.assertEqual(counts["model"], 1)
-        self.assertEqual(counts["sound"], 1)
-
     # ---- 声音卡 -> 导出清单 ----
 
     def test_sound_card_entries_reads_unified_card(self):
@@ -16039,18 +15916,15 @@ class TestRound66AssetCard(unittest.TestCase):
                          [("开门声", "/tmp/x/叮.wav",
                            sound_assets.sound_res_path("/tmp/x/叮.wav"))])
 
-    def test_sound_card_entries_keeps_legacy_and_res_only(self):
+    def test_sound_card_entries_keeps_res_only(self):
         tree = self._tree()
-        tree.new_node(NN.GKNodeAssetSound, "旧", gk_name="旧声",
-                      gk_file="/tmp/old.wav", gk_res="res://audio/old.wav")
         # 路径本身就是 res:// -> 只登记,不复制
         self._card(tree, "sound", "res://audio/registered.ogg", "只登记")
         # 勾掉的卡不进清单
         self._card(tree, "sound", "/tmp/skip.wav", "勾掉了", is_asset=False)
         entries = NN.sound_card_entries(tree)
-        self.assertIn(("旧声", "/tmp/old.wav", "res://audio/old.wav"), entries)
         self.assertIn(("只登记", "", "res://audio/registered.ogg"), entries)
-        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(entries), 1)
 
     # ---- 缩略图的纯函数 ----
 

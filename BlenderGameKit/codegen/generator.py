@@ -4,8 +4,7 @@ from ..nodes.node_base import (TARGET_SELF, gd_node_path, gd_string,
                                godot_node_name,
                                safe_function_name, snake_case)
 from ..nodes.nodes import (ANIM_CATEGORY_NAMES, MAIN_UI_AUTOLOAD,
-                           action_category, main_ui_design_tree, node_key,
-                           parse_transitions, transition_pin_name)
+                           action_category, main_ui_design_tree, node_key)
 
 from .literals import (EVENT_KINDS, TRIGGER_KINDS, _BANNER, gd_class_name,
                        gd_number)

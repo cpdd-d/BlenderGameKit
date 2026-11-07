@@ -1777,63 +1777,6 @@ def _emit_blend_update(ctx, indent, spec):
                      f'{var_name}.set("parameters/{path}", {param})')
 
 
-@stmt_node("GKNodeAnimStateMachine")
-def _stmt_anim_state_machine(ctx, node, indent):
-    """动画状态机 —— 取代手拼分支网。
-
-    ── 生成思路 ────────────────────────────────────────────────────
-    不做"每个状态一个函数"那种展开(GDScript 里会很啰嗦),
-    而是生成一段**紧凑的 if 链**:按状态表顺序逐条判断,
-
-        if anim_state == "idle" and <条件引脚>:
-            anim_state = "run"
-            <切动画>
-
-    这么做的理由:
-      * 生成结果短、可读 —— 用户能直接看出哪条规则在生效
-      * 状态表是**有序**的,优先级就是书写顺序(第一条命中的赢),
-        这和 UPBGE / 蓝图里"从上往下第一个为真的分支"直觉一致
-      * 不需要为每个状态生成函数,省掉一堆样板
-
-    ── 检查时机 ────────────────────────────────────────────────────
-    『每帧检查』-> 整段挂在 `_physics_process` 里
-    『只在进入时判』-> 只在本次执行时判一次
-    """
-    rules = parse_transitions(getattr(node, "gk_transitions", ""))
-    if not rules:
-        ctx.warn(f"节点『{node.bl_label}』的状态表是空的,什么都不会发生。"
-                 f"写一行像 `idle -> run` 这样的规则")
-        return
-
-    player = ctx.animation_player(node)
-    # ── 状态变量**按节点**独立(用户 2026-10-03 的问题)──────────────
-    # 用户问"一个游戏逻辑里是否可以有多个游戏动画?"—— 以前**不行**:
-    # 两张动画树都写进同一个 `anim_state`、共用同一个 `_gk_anim_enter`,
-    # 后一张把前一张整个盖掉(实测:两张树只生成一套状态机)。
-    # 现在按节点 key 声明,第二个状态机自动叫 `anim_state_2`。
-    var_name = ctx.declare_var(
-        snake_case(getattr(node, "gk_state_var", "anim_state"), "anim_state"),
-        "String", key=node_lib.node_key(node))
-    player_temp = ctx.new_temp("ap")
-    ctx.add_line(indent, f"var {player_temp} := {player}")
-    # 首次执行时把状态设成"起始状态"
-    start_state = ctx.input_string(node, "起始状态", "idle")
-    ctx.add_line(indent, f"if {var_name}.is_empty():")
-    ctx.add_line(indent + 1, f"{var_name} = {start_state}")
-
-    every_frame = str(getattr(node, "gk_check_mode", "EVERY_FRAME")) == "EVERY_FRAME"
-    if every_frame:
-        # 整段逻辑要放进 _physics_process —— 由 ctx 收集,generate() 统一发射
-        ctx.anim_state_machines.append({
-            "node": node, "rules": rules, "var": var_name,
-            "player": player_temp,
-        })
-        ctx.need_anim_state_process = True
-        return
-
-    # 只在进入时判:直接在这里展开一次
-    _emit_state_transitions(ctx, node, indent, rules, var_name, player_temp)
-
 
 def _emit_state_transitions(ctx, node, indent, rules, var_name, player_temp):
     """生成转移判断的 if 链。见 _stmt_anim_state_machine 的说明。"""
@@ -1863,7 +1806,6 @@ def _emit_state_transitions(ctx, node, indent, rules, var_name, player_temp):
         ctx.add_line(indent + 2,
                      f'push_warning("[GK] 状态『{end}』没有对应的动画: %s" % '
                      f"{gd_string(end)})")
-
 
 @stmt_node("GKNodeSetState")
 def _stmt_set_state(ctx, node, indent):

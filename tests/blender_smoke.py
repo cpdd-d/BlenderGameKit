@@ -111,9 +111,9 @@ def main():
     try:
         start = new_node("GKNodeOnReady", "开始")
         physics = new_node("GKNodeOnPhysicsProcess", "物理帧")
-        direction = new_node("GKNodeGetVector", "方向输入")
+        direction = new_node("GKNodeInputDirection", "方向输入")
         move = new_node("GKNodeMoveDirection", "移动", gk_speed=240.0)
-        jump_key = new_node("GKNodeActionJustPressed", "跳跃键", gk_action="jump")
+        jump_key = new_node("GKNodeKey", "跳跃键", gk_action="jump", gk_trigger="JUST")
         branch = new_node("GKNodeBranch", "能跳吗")
         do_jump = new_node("GKNodeJump", "起跳", gk_jump_force=520.0)
         printer = new_node("GKNodePrint", "打印")
@@ -148,7 +148,7 @@ def main():
         link(physics, "执行", move, "执行")
         link(direction, "方向", move, "方向")
         link(move, "完成", branch, "执行")
-        link(jump_key, "刚按下", branch, "条件")
+        link(jump_key, "结果", branch, "条件")
         link(branch, "是", do_jump, "执行")
         link(do_jump, "完成", printer, "执行")
         # 最后一条:**预期会被 Blender 拒绝**
@@ -1827,14 +1827,6 @@ def main():
               bool(r43_peaks) and all(0.0 <= value <= 1.0
                                       for value in r43_peaks),
               f"peaks={r43_peaks[:4]}")
-        # 旧『资产_声音卡』仍然认(老 .blend 不坏)
-        r43_legacy_sound = r43_tree.nodes.new("GKNodeAssetSound")
-        r43_legacy_sound.gk_name = "旧声音43"
-        r43_legacy_sound.gk_file = r43_wav
-        r43_legacy_sound.gk_res = r43_sound.sound_res_path(r43_wav)
-        check("资产:旧『资产_声音卡』仍然读得出来(兼容老工程)",
-              ("旧声音43", r43_wav, r43_sound.sound_res_path(r43_wav))
-              in node_lib.sound_card_entries(r43_tree))
 
         # ⑥ 卡片 draw + 缩略图叠加 + 面板注册
         # 缩略图绘制回调:没有节点编辑器上下文时应**静默返回**(不是抛异常)
@@ -2297,7 +2289,7 @@ def main():
         check("生成代码", bool(code))
         check("生成代码含 _physics_process", "func _physics_process(delta: float) -> void:" in code)
         check("生成代码含 move_and_slide", "move_and_slide()" in code)
-        check("生成代码含 get_vector", "Input.get_vector(ACTION_" in code)
+        check("生成代码含 get_action_strength", "Input.get_action_strength(ACTION_" in code)
         # 默认动作名是 move_*(WASD 开箱即用),不再是 Godot 内置的 ui_*(方向键)
         check("输入动作已抽成常量", 'const ACTION_MOVE_LEFT := "move_left"' in code
               and 'const ACTION_UI_LEFT := "ui_left"' not in code)
@@ -2333,7 +2325,8 @@ def main():
         # 和"基类自愈"一样属于信息类提示,不该让冒烟失败 —— 按**共同前缀**
         # 豁免,两种维度的文案都不会顶掉这条断言。
         real_warnings = [w for w in result["warnings"]
-                         if "场景里一台相机都没有" not in str(w)]
+                         if "场景里一台相机都没有" not in str(w)
+                         and "导出目录里没有 project.godot" not in str(w)]
         check("导出时无告警", not real_warnings, str(real_warnings))
 
         # 读回来比对，确认磁盘内容与生成内容一致

@@ -210,9 +210,9 @@ def build_graph():
                    "『保留纵向速度』必须勾上，否则重力被清掉、角色悬空不下落")
 
     physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
-    d2 = tree.new_node(NN.GKNodeGetVector, "方向输入")
-    d2.gk_left, d2.gk_right = "move_left", "move_right"
-    d2.gk_up, d2.gk_down = "move_up", "move_down"
+    d2 = tree.new_node(NN.GKNodeInputDirection, "方向输入")
+    d2.gk_action_left, d2.gk_action_right = "move_left", "move_right"
+    d2.gk_action_up, d2.gk_action_down = "move_up", "move_down"
 
     move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=260.0)
     move.gk_keep_y = True          # 关键:让重力生效
@@ -226,8 +226,9 @@ def build_graph():
 
     # 跳跃:在地面 且 按下跳跃
     onfloor = tree.new_node(NN.GKNodeIsOnFloor, "在地面")
-    jp = tree.new_node(NN.GKNodeActionJustPressed, "跳跃键")
+    jp = tree.new_node(NN.GKNodeKey, "跳跃键")
     jp.gk_action = "jump"
+    jp.gk_trigger = "JUST"
     both = tree.new_node(NN.GKNodeLogic, "与")
     both.gk_op = "AND"
     jump_branch = tree.new_node(NN.GKNodeBranch, "能跳吗")
@@ -235,7 +236,7 @@ def build_graph():
 
     gk_stub.connect(tree, flip, "完成", jump_branch, "执行")
     gk_stub.connect(tree, onfloor, "在地面", both, "A")
-    gk_stub.connect(tree, jp, "刚按下", both, "B")
+    gk_stub.connect(tree, jp, "结果", both, "B")
     gk_stub.connect(tree, both, "结果", jump_branch, "条件")
     gk_stub.connect(tree, jump_branch, "是", do_jump, "执行")
 

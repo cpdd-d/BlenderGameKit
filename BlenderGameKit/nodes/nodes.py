@@ -74,8 +74,7 @@ ANIM_TREE_VALUE_NODES = (
     "GKNodeVectorNormalize",
     "GKNodeCompare", "GKNodeLogic", "GKNodeConvert",
     # 输入 / 手柄 —— "按住 A 且在地面"这类条件不用回玩法图拼
-    "GKNodeActionPressed", "GKNodeActionJustPressed",
-    "GKNodeGetAxis", "GKNodeGetVector",
+    "GKNodeKey", "GKNodeInputDirection",
     "GKNodeJoyAxis", "GKNodeJoyVector",
     "GKNodeJoyButton", "GKNodeJoyButtonDown",
     # 动画自身的查询 —— "这段播完了吗""还有多久"
@@ -286,11 +285,7 @@ SUBCATEGORY_OF = {
     "GKNodeNumberText": "转换",
     # 输入 / 键盘
     "GKNodeKey": "键盘",
-    "GKNodeActionPressed": "键盘",
-    "GKNodeActionJustPressed": "键盘",
-    "GKNodeGetAxis": "键盘",
     "GKNodeInputDirection": "键盘",
-    "GKNodeGetVector": "键盘",
     "GKNodeOnInput": "键盘",
     # 输入 / 鼠标
     "GKNodePlayAnim": "播放",   # 动画_播放
@@ -349,7 +344,7 @@ COMMON_NODES = (
     "GKNodeMoveDirection",
     "GKNodeMoveAndSlide",
     "GKNodeJump",
-    "GKNodeActionJustPressed",
-    "GKNodeGetVector",
+    "GKNodeKey",
+    "GKNodeInputDirection",
     "GKNodeComment",
 )

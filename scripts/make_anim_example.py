@@ -211,16 +211,17 @@ def build_anim_tree():
     get_hurt.gk_var_name = "is_hurt"
 
     # 「跳」的条件:刚按下空格 与 在地面  (演示"转场条件就地拼")
-    press_jump = tree.nodes.new("GKNodeActionJustPressed")
+    press_jump = tree.nodes.new("GKNodeKey")
     press_jump.location = (-900.0, -300.0)
     press_jump.gk_action = "jump"
+    press_jump.gk_trigger = "JUST"
 
     can_jump = tree.nodes.new("GKNodeLogic")
     can_jump.location = (-640.0, -420.0)
     can_jump.gk_op = "AND"
     can_jump.gk_input_count = 2
     can_jump.build_sockets()
-    tree.links.new(press_jump.outputs["刚按下"], can_jump.inputs["A"])
+    tree.links.new(press_jump.outputs["结果"], can_jump.inputs["A"])
     tree.links.new(loco.outputs["在地面"], can_jump.inputs["B"])
 
     # ---- 状态 ----
@@ -402,7 +403,7 @@ def build_logic_tree():
     # 接两个会生成两行 move_and_slide()(实测就是这么写出来的)。
     physics = tree.nodes.new("GKNodeOnPhysicsProcess")
     physics.location = (-400.0, -100.0)
-    direction = tree.nodes.new("GKNodeGetVector")
+    direction = tree.nodes.new("GKNodeInputDirection")
     direction.location = (-400.0, -260.0)
     move = tree.nodes.new("GKNodeMoveDirection")
     move.location = (0.0, -100.0)
@@ -425,16 +426,17 @@ def build_logic_tree():
     const_true = tree.nodes.new("GKNodeConstBool")
     const_true.location = (200.0, -420.0)
     const_true.gk_value = True
-    hurt_key = tree.nodes.new("GKNodeActionJustPressed")
+    hurt_key = tree.nodes.new("GKNodeKey")
     hurt_key.location = (-400.0, -520.0)
     hurt_key.gk_action = "hurt"
+    hurt_key.gk_trigger = "JUST"
     hurt_branch = tree.nodes.new("GKNodeBranch")
     hurt_branch.location = (0.0, -520.0)
     set_hurt = tree.nodes.new("GKNodeSetVar")
     set_hurt.location = (400.0, -520.0)
     set_hurt.gk_var_name = "is_hurt"
     tree.links.new(physics.outputs["执行"], hurt_branch.inputs["执行"])
-    tree.links.new(hurt_key.outputs["刚按下"], hurt_branch.inputs["条件"])
+    tree.links.new(hurt_key.outputs["结果"], hurt_branch.inputs["条件"])
     tree.links.new(hurt_branch.outputs["是"], set_hurt.inputs["执行"])
     tree.links.new(const_true.outputs["值"], set_hurt.inputs["值"])
 

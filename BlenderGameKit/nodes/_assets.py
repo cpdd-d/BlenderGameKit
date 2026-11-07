@@ -18,8 +18,7 @@
                ┌──────────┐
                │  缩略图   │        ← 叠加绘制(节点卡片本身画不了图片)
                └──────────┘
-旧的四张卡(`GKNodeAssetModel` …)保留兼容(老 .blend 里有它们,
-删了那张图就打不开),但**不再出现在『添加节点』菜单**里。
+
 
 ── 和场景里的"常规物体"怎么隔开 ─────────────────────────────────────
 * 资产库是 **.blend 级**的(跨场景):收录时扫所有场景,关卡 1 的树
@@ -38,14 +37,8 @@ from ._common import *  # noqa: F401,F403
 # ── 统一资产卡(第六十六轮)───────────────────────────────────────────
 ASSET_CARD_ID = "GKNodeAssetCard"
 
-# 旧的四张卡:保留兼容(**不进菜单**,见 node_base.gk_hidden),
-# 老 .blend 里已经有它们、已有的图还要能打开。
-LEGACY_ASSET_CARD_IDS = (
-    "GKNodeAssetModel",
-    "GKNodeAssetImage",
-    "GKNodeAssetCurve",
-    "GKNodeAssetSound",
-)
+# 旧四张卡已删除(第一百八十七轮)—— 保留空元组,兼容引用它的代码
+LEGACY_ASSET_CARD_IDS = ()
 
 # 这张图现在能放的卡。名单在这里是因为有三个地方要用它:
 # 侧栏『收录』按它补齐、测试按它断言、诊断信息按它列清单。
@@ -66,13 +59,7 @@ ASSET_KIND_LABELS = {kind: label for kind, label, _desc in ASSET_KINDS}
 ASSET_KIND_ICONS = {"model": "MESH_DATA", "image": "IMAGE_DATA",
                     "curve": "CURVE_DATA", "sound": "SOUND"}
 
-# 旧卡 -> (类型, 存"路径/名字"的那个属性)。统一卡走 gk_kind / gk_path。
-LEGACY_CARD_KIND_PROP = {
-    "GKNodeAssetModel": ("model", "gk_asset"),
-    "GKNodeAssetImage": ("image", "gk_image"),
-    "GKNodeAssetCurve": ("curve", "gk_curve"),
-    "GKNodeAssetSound": ("sound", "gk_res"),
-}
+
 
 # ── "谁在用"要看的属性名(判据:这些属性存的就是资产的名字)───────────
 # 图片:『界面_图片』『界面_对话框』立绘 —— 存的是 Blender 图片名。
@@ -95,22 +82,17 @@ def missing_asset_cards(tree):
 
 # ── 读一张卡(统一卡 + 旧卡都认)—— 纯函数,离线可测 ──────────────────
 def card_kind(node):
-    """这张卡是什么类型。统一卡读 `gk_kind`;旧卡按 bl_idname 认。
+    """这张卡是什么类型。统一卡读 `gk_kind`。
 
     返回 "model" / "image" / "curve" / "sound",认不出来返回 ""。
     """
-    blob = str(getattr(node, "bl_idname", ""))
-    legacy = LEGACY_CARD_KIND_PROP.get(blob)
-    if legacy is not None:
-        return legacy[0]
     kind = str(getattr(node, "gk_kind", "") or "")
     return kind if kind in ASSET_KIND_IDS else ""
 
 
 def _card_path_prop(node):
-    """卡上"路径/名字"存在哪个属性里(统一卡是 gk_path,旧卡各不相同)。"""
-    legacy = LEGACY_CARD_KIND_PROP.get(str(getattr(node, "bl_idname", "")))
-    return legacy[1] if legacy is not None else "gk_path"
+    """卡上"路径/名字"存在哪个属性里(统一卡是 gk_path)。"""
+    return "gk_path"
 
 
 def card_path(node):
@@ -138,8 +120,6 @@ def card_is_asset(node):
     统一卡看『标记为游戏资产』勾选;旧卡没有这个开关 —— 一直算数
     (老工程里它们本来就是资产)。
     """
-    if str(getattr(node, "bl_idname", "")) in LEGACY_CARD_KIND_PROP:
-        return True
     return bool(getattr(node, "gk_is_asset", True))
 
 
@@ -305,13 +285,6 @@ def sound_card_entries(tree=None):
     out = []
     for node in getattr(tree, "nodes", ()) or ():
         blob = str(getattr(node, "bl_idname", ""))
-        if blob == "GKNodeAssetSound":
-            # 旧卡:本地文件 + res:// 分开存
-            name = str(getattr(node, "gk_name", "") or "").strip()
-            path = str(getattr(node, "gk_file", "") or "").strip()
-            res = str(getattr(node, "gk_res", "") or "").strip()
-            out.append((name, path, res))
-            continue
         if blob != ASSET_CARD_ID:
             continue
         if not card_is_asset(node) or card_kind(node) != "sound":
@@ -502,206 +475,6 @@ def _draw_card_status(layout, node, kind):
                 layout.label(text=f"本地文件找不到了:{path}", icon="ERROR")
     if kind in ("image", "curve", "sound"):
         _draw_asset_users(layout, kind, path)
-
-
-@N
-class GKNodeAssetModel(B.GKStatementNode):
-    bl_idname = "GKNodeAssetModel"
-    bl_label = "资产_模型卡"
-    bl_icon = "MESH_DATA"
-    gk_category = "资产"
-    gk_hidden = True          # 旧卡:保留兼容,不进菜单(见 GKNodeAssetCard)
-    gk_tree_type = "GKAssetTree"
-    gk_inputs = ()
-    gk_outputs = ()
-    gk_prop_defs = (
-        ("gk_asset", "string", "", "资产名",
-         "静态资产的名字(物体『游戏物理』→『静态资产』里填的那个)"),
-    )
-    gk_doc = ("**一份 3D 道具资产**(树 / 石头 / 箱子这类可复用的模型)。\n"
-              "『资产名』对应物体上的同名栏位:同名物体算一份资产,"
-              "没勾『作为实例』的那份是**本体**(定义模型)。\n"
-              "── 跨场景 ──\n"
-              "资产库是整个 .blend 共用的:关卡 1 的树在关卡 2 点『再摆一份』"
-              "就能摆出来 —— 这一关还没有本体时,摆的第一份会自动当本体"
-              "(否则导出的场景里实例没有模型)。\n"
-              "『定位』会切到本体所在的场景并选中它。")
-
-    def draw_buttons(self, context, layout):
-        name = str(getattr(self, "gk_asset", "") or "").strip()
-        if not name:
-            layout.label(text="还没填资产名 —— 侧栏点『收录』或『登记选中』",
-                         icon="ERROR")
-            return
-        layout.prop(self, "gk_asset", text="", icon="ASSET_MANAGER")
-
-        usage = asset_scene_usage(name)
-        here = str(getattr(getattr(context, "scene", None), "name", ""))
-        local = usage.get(here)
-        if local:
-            layout.label(text=f"本场景 {local['total']} 份"
-                              + ("(有本体)" if local["source"] else ""),
-                         icon="CHECKMARK")
-        else:
-            layout.label(text="本场景还没有摆", icon="INFO")
-
-        # 本体在哪个场景(跨场景共用时最关键的一行)
-        sources = [(scene, info["source"]) for scene, info in usage.items()
-                   if info["source"]]
-        if sources:
-            scene_name, obj_name = sources[0]
-            text = (f"本体:{obj_name}(本场景)" if scene_name == here
-                    else f"本体在『{scene_name}』:{obj_name}")
-            layout.label(text=text, icon="MESH_DATA")
-        else:
-            layout.label(text="还没有本体(找个场景摆第一份)", icon="ERROR")
-
-        if usage and not (local or {}).get("source"):
-            layout.label(text="这一关缺本体:点『再摆一份』会自动补上",
-                         icon="INFO")
-
-        row = layout.row(align=True)
-        focus = row.operator("gk.asset_focus", text="定位", icon="VIEWZOOM")
-        focus.asset_name = name
-        place = row.operator("gk.asset_place", text="再摆一份", icon="DUPLICATE")
-        place.asset_name = name
-
-
-@N
-class GKNodeAssetImage(B.GKStatementNode):
-    bl_idname = "GKNodeAssetImage"
-    bl_label = "资产_图片卡"
-    bl_icon = "IMAGE_DATA"
-    gk_category = "资产"
-    gk_hidden = True          # 旧卡:保留兼容,不进菜单(见 GKNodeAssetCard)
-    gk_tree_type = "GKAssetTree"
-    gk_inputs = ()
-    gk_outputs = ()
-    gk_prop_defs = (
-        ("gk_image", "string", "", "图片",
-         "Blender 里的图片名(『界面_图片』/『对话框』立绘用的那张)"),
-    )
-    gk_doc = ("**一张图片资产**(界面图 / 立绘 / 图标)。\n"
-              "导出时这张图会落盘成 `art/ui_xxx.png` 带进 Godot —— "
-              "源图在 Blender 里,不用自己拷文件。\n"
-              "卡上写的是**谁在用**(哪个图里哪个节点引用了它);"
-              "想换图就点『选图片』。")
-
-    def draw_buttons(self, context, layout):
-        name = str(getattr(self, "gk_image", "") or "").strip()
-        row = layout.row(align=True)
-        row.prop(self, "gk_image", text="", icon="IMAGE_DATA")
-        picker = row.operator("gk.pick_image", text="", icon="VIEWZOOM")
-        picker.node_name = self.name
-        picker.image_prop = "gk_image"
-        if not name:
-            layout.label(text="还没选图片", icon="INFO")
-            return
-        image = None
-        try:
-            import bpy
-            image = bpy.data.images.get(name)
-        except Exception:                                 # noqa: BLE001
-            image = None
-        if image is None:
-            layout.label(text="工程里找不到这张图片了(检查是否被删)",
-                         icon="ERROR")
-        else:
-            size = getattr(image, "size", None)
-            if size and int(size[0]):
-                layout.label(text=f"{int(size[0])}×{int(size[1])}",
-                             icon="CHECKMARK")
-            else:
-                layout.label(text="没有像素数据(图片可能丢了)", icon="ERROR")
-        _draw_asset_users(layout, "image", name)
-
-
-@N
-class GKNodeAssetCurve(B.GKStatementNode):
-    bl_idname = "GKNodeAssetCurve"
-    bl_label = "资产_曲线卡"
-    bl_icon = "CURVE_DATA"
-    gk_category = "资产"
-    gk_hidden = True          # 旧卡:保留兼容,不进菜单(见 GKNodeAssetCard)
-    gk_tree_type = "GKAssetTree"
-    gk_inputs = ()
-    gk_outputs = ()
-    gk_prop_defs = (
-        ("gk_curve", "string", "", "曲线",
-         "场景里那条曲线物体的名字(运镜轨道 / 时间轴曲线)"),
-    )
-    gk_doc = ("**一条曲线资产**(相机运镜轨道 / 时间轴曲线)。\n"
-              "导出时采样成 `curves/xxx.tres` 带进 Godot。\n"
-              "卡上写的是**谁在用**(哪个节点的哪个栏位选了它);"
-              "曲线一多很容易忘了哪条在用、哪条能删,这里一眼看清。")
-
-    def draw_buttons(self, context, layout):
-        name = str(getattr(self, "gk_curve", "") or "").strip()
-        row = layout.row(align=True)
-        row.prop(self, "gk_curve", text="", icon="CURVE_DATA")
-        focus = row.operator("gk.focus_object", text="", icon="VIEWZOOM")
-        focus.object_name = name
-        if not name:
-            layout.label(text="还没选曲线", icon="INFO")
-            return
-        try:
-            import bpy
-            found = bpy.data.objects.get(name) is not None
-        except Exception:                                 # noqa: BLE001
-            found = False
-        if not found:
-            layout.label(text="工程里找不到这条曲线了(检查是否被删)",
-                         icon="ERROR")
-        _draw_asset_users(layout, "curve", name)
-
-
-@N
-class GKNodeAssetSound(B.GKStatementNode):
-    bl_idname = "GKNodeAssetSound"
-    bl_label = "资产_声音卡"
-    bl_icon = "SOUND"
-    gk_category = "资产"
-    gk_hidden = True          # 旧卡:保留兼容,不进菜单(见 GKNodeAssetCard)
-    gk_tree_type = "GKAssetTree"
-    gk_inputs = ()
-    gk_outputs = ()
-    gk_prop_defs = (
-        ("gk_name", "string", "", "名字",
-         "资产库里显示的名字(留空 = 用文件名)"),
-        ("gk_file", "string", "", "本地文件",
-         "挑一个本地音频(wav / ogg / mp3);导出时复制进项目的 audio/"),
-        ("gk_res", "string", "", "游戏里的路径",
-         "挑文件后自动写好;音效节点用『从资产库挑』引用它"),
-    )
-    gk_doc = ("**一个音频资产**(音效 / BGM)。\n"
-              "点『浏览』挑一个本地文件(wav / ogg / mp3),导出时它会被"
-              "复制进 Godot 项目的 `audio/` 目录 —— 不用自己拷文件、"
-              "也不会因为路径写错而在运行时找不到。\n"
-              "音效节点(『音效_播放』『音效_音乐』)卡上点『从资产库挑』"
-              "即可引用这份资产。\n"
-              "只有路径、没有本地文件的卡(比如从老图收进来的 "
-              "`res://art/xxx.wav`)只做登记,导出不会复制。")
-
-    def draw_buttons(self, context, layout):
-        row = layout.row(align=True)
-        row.prop(self, "gk_name", text="", icon="SOUND")
-        browse = row.operator("gk.asset_pick_sound", text="", icon="FILEBROWSER")
-        browse.node_name = self.name
-        layout.prop(self, "gk_file", text="", icon="FILE_SOUND")
-        res = str(getattr(self, "gk_res", "") or "").strip()
-        if res:
-            layout.label(text=res, icon="LINKED")
-        path = str(getattr(self, "gk_file", "") or "").strip()
-        if path:
-            import os
-            if os.path.isfile(path):
-                layout.label(text="导出会复制进 audio/(推荐)", icon="CHECKMARK")
-            else:
-                layout.label(text=f"本地文件找不到了:{path}", icon="ERROR")
-        elif res:
-            layout.label(text="只登记路径:导出不复制(自己放进项目)", icon="INFO")
-        if res:
-            _draw_asset_users(layout, "sound", res)
 
 
 def _draw_asset_users(layout, kind, value):

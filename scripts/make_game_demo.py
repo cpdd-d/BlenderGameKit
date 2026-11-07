@@ -932,13 +932,12 @@ def build_asset_tree(wav_path):
     from BlenderGameKit import ui as gk_ui
     tree = gk_ui._asset_tree_or_new()
     counts = gk_ui._fill_asset_cards(tree)
-    # 声音卡:音效节点里那个路径已经被收录成卡了(同一个函数算的),
-    # 这里把本地文件补上 —— 收录只看得到 res:// 路径
+    # 声音卡:统一卡(第六十六轮)—— 本地文件写进 gk_path,
+    # 导出时按 sound_res_path 算 res:// 并复制进 audio/
     card = gk_ui._ensure_asset_card(
-        tree, "GKNodeAssetSound", sound_assets.sound_res_path(wav_path))
+        tree, "sound", wav_path)
     if card is not None:
         card.gk_name = "叮"
-        card.gk_file = wav_path
     total = len([node for node in tree.nodes
                  if getattr(node, "bl_idname", "").startswith("GKNodeAsset")])
     log(f"资产图『{tree.name}』:收录 模型 {counts['model']} / 图片 "
