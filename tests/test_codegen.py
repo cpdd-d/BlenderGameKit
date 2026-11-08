@@ -20550,48 +20550,53 @@ class TestRound195MinecraftBlockSwitch(Base):
         for index in range(4):
             self.assertIn(f"res://blocks/B{index}.tscn", code)
 
-    def test_demo_project_registers_slot_keys_and_blocks(self):
-        demo = os.path.join(ROOT, "examples", "demo_minecraft")
-        with open(os.path.join(demo, "project.godot"), "r",
-                  encoding="utf-8", errors="replace") as handle:
-            project_text = handle.read()
-        for index in range(1, 5):
-            self.assertIn(f"slot_{index}={{", project_text)
-        for file_name in ("GrassBlock", "StoneBlock", "SandBlock", "WoodBlock"):
-            self.assertTrue(
-                os.path.isfile(os.path.join(demo, "blocks",
-                                            f"{file_name}.tscn")),
-                file_name)
-        self.assertFalse(os.path.isfile(os.path.join(demo, "Block.tscn")),
-                         "旧的单一 Block.tscn 应该已经删掉")
+    def test_number_keys_get_their_own_actions(self):
+        """数字键的自动动作名必须是 key_1 / key_2(不能全撞成 key_key)。"""
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "启动")
+        key = tree.new_node(NN.GKNodeKey, "选一档", gk_key="2",
+                            gk_trigger="JUST")
+        branch = tree.new_node(NN.GKNodeBranch, "按了吗")
+        gk_stub.connect(tree, ready, "执行", branch, "执行")
+        gk_stub.connect(tree, key, "结果", branch, "条件")
+        code, _ = gen(tree, V3)
+        self.assertIn('"key_2"', code)
+        self.assertIn("ACTION_KEY_2", code)
 
 
 class TestRound196MinecraftMonsters(Base):
     """第一百九十六轮:我的世界加"会追人并攻击"的小怪。
 
-    追击 = 『移动_朝向目标』(谁走 = `../Monsters/怪物N`,目标 = 自己);
-    攻击 = 三只的『到达』求或 ->『流程_冷却』->『变量_增减(生命)』。
-    这里锁的是**生成物真的长这样**(实时门禁由 check_minecraft_demo 跑)。
+    追击 = 『移动_朝向目标』(谁走 = 怪物名,目标 = 自己);
+    攻击 = 『到达』求或 ->『流程_冷却』->『变量_增减(生命)』。
     """
 
-    def test_demo_has_chasing_monsters_and_health(self):
-        demo = os.path.join(ROOT, "examples", "demo_minecraft")
-        with open(os.path.join(demo, "scripts", "game_logic.gd"), "r",
-                  encoding="utf-8", errors="replace") as handle:
-            code = handle.read()
-        self.assertIn('"../Monsters/怪物1"', code)
-        self.assertIn(".move_and_slide()", code)
+    def test_chase_cooldown_and_damage_chain(self):
+        tree = make_tree()
+        var = tree.gk_vars.add()
+        var.var_name = "生命"
+        var.var_type = "float"
+        var.default_value = "100"
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        chase = tree.new_node(NN.GKNodeMoveToward, "追怪物",
+                              gk_target="怪物1", gk_goal="__self__",
+                              gk_speed=2.6, gk_stop_distance=1.3,
+                              gk_turn=True, gk_accel=6.0)
+        branch = tree.new_node(NN.GKNodeBranch, "贴上了吗")
+        cooldown = tree.new_node(NN.GKNodeCooldown, "每口间隔", gk_seconds=1.0)
+        hurt = tree.new_node(NN.GKNodeAddVar, "扣血",
+                             gk_var_name="生命", gk_amount=-8.0)
+        gk_stub.connect(tree, physics, "执行", chase, "执行")
+        gk_stub.connect(tree, physics, "执行", branch, "执行")
+        gk_stub.connect(tree, chase, "到达", branch, "条件")
+        gk_stub.connect(tree, branch, "是", cooldown, "执行")
+        gk_stub.connect(tree, cooldown, "可以", hurt, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("move_and_slide()", code)
+        self.assertIn("_gk_cd_ticks", code)
         self.assertIn("生命 = (生命 + -8.0)", code)
-        self.assertIn("_gk_float_text_3d", code)
-        with open(os.path.join(demo, "Main.tscn"), "r",
-                  encoding="utf-8", errors="replace") as handle:
-            scene = handle.read()
-        for name in ("怪物1", "怪物2", "怪物3"):
-            self.assertIn(f'name="{name}"', scene)
-        with open(os.path.join(demo, "project.godot"), "r",
-                  encoding="utf-8", errors="replace") as handle:
-            project_text = handle.read()
-        self.assertIn('layer_3="mobs"', project_text)
+        self.assertIn("var 生命: float = 100", code)
 
 
 class TestRound99Occluder(Base):

@@ -1073,17 +1073,21 @@ if ($SkipGodot) {
         }
     }
 
-    # 5s-4. 我的世界示例(第一百九十三轮)—— 真 Godot 无头跑:
-    #       玩家落地 / move_right 真的走 / 跳跃真的起跳 / E 真的拆掉方块。
+    # 5s-4. 我的世界示例(第一百九十三轮;第一百九十七轮改成 .blend 工程)——
+    #       先用真 Blender 重建 .blend 并导出 Godot 工程,再真跑:
+    #       开始界面(创建 / 取消 / 开始)/ 玩家落地 / 移动 / 跳跃 /
+    #       挖方块 / 四档方块切换 / 怪物追击扣血。
     Write-Output ""
     $mcChecker = Join-Path $Root "scripts\check_minecraft_demo.py"
     if ($godotSkipped) {
         Write-Output "跳过我的世界示例:本机找不到 Godot"
+    } elseif (-not (Test-Path $Blender)) {
+        Write-Output "跳过我的世界示例:找不到 Blender(示例要先重建 .blend)"
     } elseif (-not (Test-Path $mcChecker)) {
         Write-Output "跳过我的世界示例:没有 scripts\check_minecraft_demo.py"
     } else {
         $env:GK_GODOT = $Godot
-        $mcOut = & $Py $mcChecker 2>&1 | Out-String
+        $mcOut = & $Py $mcChecker --blender $Blender 2>&1 | Out-String
         $mcOut -split "`n" | Where-Object {
             $_ -match "^(MINECRAFT|跳过)"
         } | ForEach-Object { Write-Host $_.TrimEnd() }

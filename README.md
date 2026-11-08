@@ -57,7 +57,7 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 | **按键在 Godot 里要手工加输入映射** | **自动写进 `project.godot`** —— 节点图用了哪些动作就登记哪些,并绑好默认键(A/D/W/S、空格、J、E) |
 | 角色移动成了性能热点 | **节点图 → C++ 热路径**(可选):把『输入 → 移动 → 跳跃』这条每物理帧的链生成 GDExtension 伴随节点;C++ 只接管移动,规则仍由 GDScript 负责 |
 | 已有 GDScript 想改回节点图 | **从 GDScript 导入**:识别事件 / 移动链 / 打印 / 等待 / 条件;不认识的语句带行号告警,不静默丢 |
-| 想直接看一个能跑的 3D 示例 | **demo_minecraft**:10×10 方块世界 + 第一人称移动/跳跃 + 准星挖放方块 + 数字键 1~4 切草/石/沙/木 + 会追人扣血的怪物 |
+| 想直接看一个能跑的 3D 示例 | **demo_minecraft**:`.blend` 源工程 + 开始界面(开始 / 创建 / 退出)+ 第一人称移动/跳跃 + 准星挖放方块 + 数字键 1~4 切草/石/沙/木 + 会追人扣血的怪物 |
 | 二次元游戏 | **3 个 NPR 卡通着色器**(描边/边缘光/三阶明暗/面部 SDF) + 手绘线条抖动 |
 | 做恐怖游戏 | **氛围套件**:心跳随危险变快变响(『氛围_紧张度』『氛围_心跳』,**被看见时还能更紧张**)、一键**惊吓三连**(震屏 + 闪白 + 音效)、总线音量压低;配上**听觉 AI** 就是"扔石头把怪物引开"那套 |
 | 动作过渡生硬(走↔跑硬切) | **动画混合树** —— 几段动画按一个参数**连续混合**(走↔跑步↔冲刺),不是"啪"地换过去;**2D 混合树**再按"前后 / 左右"两个参数混(八个方向的走跑过渡),混合点从下拉里挑动画,不用手打 |
@@ -282,9 +282,9 @@ scripts/
 ├── check_render_demo.py        ★ NPR 渲染自检:**真开窗口**扫光出图,断言"不黑 / 明暗随光角度滑动 / 四张两两不同 / 三色调档数 / 补光亮度差"(门禁 5s;没 GPU 自动跳过)
 ├── check_camera_far.py         ★ 相机远裁真机验证:环境脚本把 `Camera3D.far` 设对 + 小于 near 时兜底(无头即可)
 ├── check_cpp_hot_path.py       ★ C++ 热路径真编译 + Godot 加载验证(要 SCons + godot-cpp;缺了自动跳过)
-├── check_minecraft_demo.py     ★ 我的世界示例真机检查:落地 / 移动 / 跳跃 / 挖方块 / 四种方块切换 / 怪物追击扣血(无头 Godot)
+├── check_minecraft_demo.py     ★ 我的世界示例真机检查:真 Blender 重建 .blend → 导出 → 无头 Godot 跑(开始界面 / 移动 / 挖放 / 四档方块 / 怪物追击扣血)
 ├── check_shichise.py           ★《七色》闯关真机检查:对话拿火把 → 三座火盆 → 塔门升起 → BOSS → 赤色回归;Godot 用户目录隔离到 _dist,不碰真实存档
-├── make_minecraft_demo.py      ★ 生成 3D"我的世界"示例(节点图 + 方块场景)
+├── make_minecraft_demo.py      ★ 用 Blender 生成"我的世界"示例(.blend 源文件 + 导出 Godot 工程)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
 ├── make_horror_demo.py         ★ 生成恐怖示例(氛围套件 + 听觉怪物 + 结局分支;现生成音频)
@@ -325,7 +325,7 @@ examples/
 ├── demo_anim_tree/             动画状态机示例 .blend(旧示例,仅存档)
 ├── demo_2d_blend/              2.5D 示例 .blend(旧示例,仅存档)
 ├── demo_platformer/            ★ 可玩的 2D 平台跳跃示例(相机跟随/金币/HUD/存档)
-├── demo_minecraft/             ★ 可玩的 3D"我的世界"示例(第一人称/跳跃/挖放方块/四档方块切换/怪物追击 + 生命 HUD)
+├── demo_minecraft/             ★ 可玩的 3D"我的世界"示例(`我的世界.blend` 源工程 + `我的世界_godot/` 导出;开始界面/第一人称/挖放方块/四档方块切换/怪物追击 + 生命 HUD)
 ├── demo_2d/                    可直接用 Godot 打开的 2D 横版示例
 ├── demo_render/                NPR 渲染出图工程(扫光验证面部阴影)
 └── gdextension_cpp/            C++ GDExtension 手写骨架(GKCharacter;节点图生成器见侧栏『C++ 热路径』)
