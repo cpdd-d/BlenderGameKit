@@ -180,9 +180,9 @@ def _build_movement(tree, p):
     physics = _add(tree, "GKNodeOnPhysicsProcess", "每当_物理帧", -1500.0, 0.0)
 
     direction = _add(tree, "GKNodeInputDirection", "输入_方向", -1500.0, -260.0,
-                     gk_up="W", gk_down="S", gk_left="A", gk_right="D",
-                     gk_left_action="key_a", gk_right_action="key_d",
-                     gk_up_action="key_w", gk_down_action="key_s")
+                     gk_key_up="W", gk_key_down="S", gk_key_left="A", gk_key_right="D",
+                     gk_action_up="key_w", gk_action_down="key_s",
+                     gk_action_left="key_a", gk_action_right="key_d")
     # ── 勾『随相机朝向』(踩过的坑)──────────────────────────────────
     # 不勾的话方向写死在世界轴上:鼠标转过视角后"按 W"还是往原来的方向走,
     # 方向感立刻错位。勾上 = 『方向』按**当前相机**的水平朝向变换。
