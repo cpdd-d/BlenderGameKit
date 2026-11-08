@@ -5695,6 +5695,40 @@ def main():
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百九十轮:相机远裁(每台相机一个属性 + 环境脚本表)--------
+    try:
+        r190_scene = bpy.context.scene
+        r190_data = bpy.data.cameras.new("远裁探针相机数据")
+        r190_cam = bpy.data.objects.new("远裁探针相机", r190_data)
+        r190_scene.collection.objects.link(r190_cam)
+
+        check("第一百九十轮:相机有『远裁距离』属性",
+              hasattr(r190_cam.gk_physics, "camera_far"))
+        check("第一百九十轮:默认 0 = 不导出",
+              abs(float(r190_cam.gk_physics.camera_far)) < 1e-6
+              and asset_export.camera_far_table(r190_scene) == '""')
+        r190_cam.gk_physics.camera_far = 150.0
+        r190_table = asset_export.camera_far_table(r190_scene)
+        check("第一百九十轮:相机远裁表写对了",
+              "远裁探针相机=150.0" in r190_table, r190_table)
+        r190_code = asset_export.render_env_script(camera_fars=r190_table)
+        check("第一百九十轮:环境脚本带上表 + 运行时应用函数",
+              f"var camera_fars: String = {r190_table}" in r190_code
+              and "func _apply_camera_far() -> void:" in r190_code
+              and "_apply_camera_far.call_deferred()" in r190_code
+              and "cam.far = maxf(distance, cam.near + 0.01)" in r190_code)
+
+        r190_cam.gk_physics.camera_far = 0.0
+        check("第一百九十轮:清空 -> 空表(老场景行为不变)",
+              asset_export.camera_far_table(r190_scene) == '""')
+
+        bpy.data.objects.remove(r190_cam, do_unlink=True)
+        bpy.data.cameras.remove(r190_data)
+    except Exception as exc:
+        check("第一百九十轮(相机远裁)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)----
     # 真 Blender 才能验:属性在真物体上,而且导出要落成 .tscn 节点 + 改
     # project.godot。两条硬事实(都在真机标定过):

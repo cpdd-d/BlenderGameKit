@@ -1267,6 +1267,11 @@ class TestLightNodes(Base):
         # 多光近似:亮灯收集 + 按影响挑一盏
         self.assertIn("func _gk_lights_on() -> Array:", text)
         self.assertIn("func _gk_pick_light(", text)
+        # 主光 + 补光:第二盏只加亮,不压暗主光色阶
+        self.assertIn("func _gk_pick_lights(", text)
+        self.assertIn('set_shader_parameter("light_dir_2"', text)
+        self.assertIn('set_shader_parameter("light_color_2"', text)
+        self.assertIn('set_shader_parameter("light_energy_2"', text)
 
     def test_light_energy_mapping(self):
         """能量连续映射，极暗与极亮的灯都不被静默截断。"""
@@ -20217,6 +20222,63 @@ class TestRound98RenderTuning(Base):
         self.assertIn("directional_shadow_max_distance", text)
 
 
+class TestRound190CameraFar(Base):
+    """第一百九十轮:相机远裁(Camera3D.far)。
+
+    只在用户显式填了 > 0 时导出;空表 = 老场景(用 Godot 默认 4000 米)。
+    走环境脚本运行时应用 —— 相机也常在 glb 实例内部,外部覆盖会被丢掉。
+    """
+
+    class _Obj:
+        def __init__(self, name, kind="CAMERA", far=None):
+            self.name = name
+            self.type = kind
+            self.data = types.SimpleNamespace(type="CAMERA")
+            self.gk_physics = (types.SimpleNamespace(camera_far=far)
+                               if far is not None else None)
+
+    def _scene(self, *objs):
+        return types.SimpleNamespace(objects=list(objs))
+
+    def test_only_cameras_with_positive_far(self):
+        from BlenderGameKit import asset_export as ae
+        table = ae.camera_far_table(self._scene(
+            self._Obj("主相机", far=150.0),
+            self._Obj("副相机", far=0.0),
+            self._Obj("网格", kind="MESH", far=150.0),
+        ))
+        self.assertIn("主相机=150.0", table)
+        self.assertNotIn("副相机", table)
+        self.assertNotIn("网格", table)
+
+    def test_empty_table_is_old_behavior(self):
+        from BlenderGameKit import asset_export as ae
+        self.assertEqual(ae.camera_far_table(self._scene()), '""')
+
+    def test_name_is_sanitized_like_the_scene_node(self):
+        from BlenderGameKit import asset_export as ae
+        table = ae.camera_far_table(self._scene(self._Obj("A.B:C", far=80.0)))
+        self.assertIn("A_B_C=80.0", table)
+
+    def test_env_script_gets_camera_far(self):
+        from BlenderGameKit import asset_export as ae
+        fields = ae._env_fields(self._scene(), camera_name="", fov=0.0)
+        text = ae.ENVIRONMENT_SCRIPT.format(**fields)
+        self.assertIn('var camera_fars: String = ""', text)
+        self.assertIn("func _apply_camera_far() -> void:", text)
+        self.assertIn("_apply_camera_far.call_deferred()", text)
+        self.assertIn("cam.far = maxf(distance, cam.near + 0.01)", text)
+
+    def test_env_fields_include_camera_table(self):
+        """导出这一端也要把表喂进去(不只 render_env_script 的工具路)。"""
+        from BlenderGameKit import asset_export as ae
+        scene = self._scene(self._Obj("主相机", far=150.0))
+        fields = ae._env_fields(scene, camera_name="主相机", fov=60.0)
+        self.assertEqual(fields["camera_fars"], '"主相机=150.0"')
+        self.assertIn('var camera_fars: String = "主相机=150.0"',
+                      ae.ENVIRONMENT_SCRIPT.format(**fields))
+
+
 class TestRound99Occluder(Base):
     """第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)。
 
@@ -20546,6 +20608,14 @@ class TestRound101SpecTexture(Base):
 
     def test_mask_texture_uses_uv(self):
         self.assertIn("texture(specular_mask_texture, UV).r", self._shader_text())
+
+    def test_second_light_is_fill_only(self):
+        text = self._shader_text()
+        self.assertIn("uniform vec3 light_dir_2", text)
+        self.assertIn("uniform vec4 light_color_2", text)
+        self.assertIn("uniform float light_energy_2", text)
+        # 补光只允许提亮,不能把主光的阴影色阶压掉
+        self.assertIn("cel = mix(cel, max(cel, fill_lit), lit_2);", text)
 
     def test_highlight_knobs_are_real_uniforms_and_params(self):
         from BlenderGameKit import npr_preview as npr

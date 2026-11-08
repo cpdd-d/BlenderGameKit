@@ -16,6 +16,8 @@
      * capture.gd 的像素统计里 dark 随角度**变化**(至少 3 种取值)——
        这就是"面部阴影 SDF 随光角度滑动"的证据(单张静态图证明不了);
      * 没有 SCRIPT / SHADER / Parse 错误;
+     * 三色调真的比两色调多一档(tone 探针);
+     * 打开补光后球左侧**真的变亮**(fill 探针);
   4. 出 `CHECK_RENDER_DEMO=OK` / `FAILED`。
 
 ── 没有 GPU 时**跳过**,不判红 ──────────────────────────────────────
@@ -57,6 +59,9 @@ SWEEP_STEP = "90"
 MIN_NON_BLACK_RATIO = 0.30     # 画面不能是一片黑
 MIN_LIT = 200                  # 得有亮的地方(角色/舞台真的被照到了)
 MIN_DISTINCT_DARK = 3          # dark 至少 3 种取值 = 阴影随角度在动
+# 补光:打开后球左侧的平均亮度必须比关掉时高这么多。
+# 实测 off≈0.355、on≈0.741(补光能量按真实量级 0.25 给),0.05 的余量足够宽。
+MIN_FILL_GAIN = 0.05
 
 
 def log(message):
@@ -120,6 +125,15 @@ def run_tone_render(godot):
     """两色调 / 三色调分档探针:一颗球,数中线上的明暗档数。"""
     run = subprocess.run(
         [godot, "--path", DEMO, "res://tone.tscn", "--resolution", "480x480"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=180)
+    return (run.stdout or "") + (run.stderr or "")
+
+
+def run_fill_render(godot):
+    """主光 + 补光探针:同一颗球只改补光强度,比较左侧平均亮度。"""
+    run = subprocess.run(
+        [godot, "--path", DEMO, "res://fill.tscn", "--resolution", "480x480"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=180)
     return (run.stdout or "") + (run.stderr or "")
@@ -400,6 +414,46 @@ def main():
 
     if tone_problems:
         for problem in tone_problems:
+            log("✗ " + problem)
+        print("CHECK_RENDER_DEMO=FAILED")
+        return 1
+
+    # ---- 主光 + 补光:打开补光后球左侧必须真的变亮 ----
+    # 静态 grep 能证明 uniform 和赋值都在,但证明不了"第二盏灯参与了着色"
+    # —— 以前补光借用主光的 shadow_step 当阈值,只点亮极窄一圈边缘,
+    # 肉眼看不出差别。只有比较同一块区域的亮度才能抓住这种问题。
+    fill_problems = []
+    if len(files) >= 1:
+        try:
+            fill_text = run_fill_render(godot)
+        except subprocess.TimeoutExpired:
+            fill_text = ""
+            fill_problems.append("补光探针超时")
+        for line in fill_text.splitlines():
+            if "GK_FILL" in line:
+                log(line.strip())
+        left = {}
+        for name in ("off", "on"):
+            found = re.search(rf"GK_FILL name={name} left=([-\d.]+)", fill_text)
+            if found:
+                left[name] = float(found.group(1))
+        if "GK_FILL=DONE" not in fill_text:
+            fill_problems.append("补光探针没跑完(开得出窗口却挂了?)")
+        elif len(left) < 2:
+            fill_problems.append(f"补光亮度统计不全:{left}")
+        else:
+            gain = left["on"] - left["off"]
+            if gain < MIN_FILL_GAIN:
+                fill_problems.append(
+                    f"补光没起作用(左侧 off={left['off']:.4f} "
+                    f"on={left['on']:.4f},差值 {gain:+.4f})")
+            log(f"补光左侧亮度:关={left['off']:.4f} 开={left['on']:.4f} "
+                f"(+{gain:.4f})")
+    else:
+        log("跳过补光探针:开不出窗口 / 没有 GPU")
+
+    if fill_problems:
+        for problem in fill_problems:
             log("✗ " + problem)
         print("CHECK_RENDER_DEMO=FAILED")
         return 1

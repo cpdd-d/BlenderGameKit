@@ -1,0 +1,31 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="sh_toon"]
+[ext_resource type="Script" path="res://fill_probe.gd" id="sh_fill"]
+[ext_resource type="ShaderMaterial" path="res://materials/Fill_off.tres" id="m_fill"]
+
+[sub_resource type="SphereMesh" id="fill_sphere"]
+radius = 0.9
+height = 1.8
+radial_segments = 64
+rings = 32
+[sub_resource type="Environment" id="fill_env"]
+background_mode = 1
+background_color = Color(0.01, 0.01, 0.02, 1)
+ambient_light_source = 3
+ambient_light_energy = 0.0
+tonemap_mode = 2
+
+[node name="FillRoot" type="Node3D"]
+script = ExtResource("sh_fill")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("fill_env")
+
+[node name="Camera" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3.2)
+fov = 45.0
+
+[node name="FillBall" type="MeshInstance3D" parent="."]
+mesh = SubResource("fill_sphere")
+material_override = ExtResource("m_fill")

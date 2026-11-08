@@ -122,6 +122,18 @@ uniform float light_energy : hint_range(0.0, 4.0) = 1.0;
 // tinted, not black, so this stays fairly high.
 uniform float ambient : hint_range(0.0, 1.0) = 0.55;
 
+// Second (fill) light. The environment script fills the two strongest lights;
+// the fill only ADDS light where it hits, so it never erases the primary
+// cel bands (which is what made the old "just add all lights" approach grey).
+group_uniforms light_source_2;
+uniform vec3 light_dir_2 = vec3(0.0);
+uniform vec4 light_color_2 : source_color = vec4(1.0, 0.98, 0.95, 1.0);
+uniform float light_energy_2 : hint_range(0.0, 4.0) = 0.0;
+// Where the fill light's own terminator sits. 0 = light the whole hemisphere
+// facing the fill (the usual choice for a fill); raise it to make the fill
+// narrower.
+uniform float light_step_2 : hint_range(-1.0, 1.0) = 0.0;
+
 group_uniforms shadow_bands;
 // Where the lit/shadow border sits. -1 = fully lit, 1 = fully shadowed.
 uniform float shadow_step : hint_range(-1.0, 1.0) = 0.05;
@@ -323,12 +335,35 @@ void fragment() {
 			cel = mix(shadow_col, lit_col, lit_factor);
 		}
 
-		// Floor: never let a texel go completely black. Fully shadowed anime
-		// characters are still readable, not silhouettes. The floor tint must
-		// follow the active mode: in two-tone the shadow colour is
-		// shadow_tint, so using shadow_tint_2 here would let a brighter
-		// deep-shadow colour leak into the two-tone look.
+		// The floor tint must follow the active mode: in two-tone the shadow
+		// colour is shadow_tint, so using shadow_tint_2 here would let a
+		// brighter deep-shadow colour leak into the two-tone look.
 		vec3 floor_tint = three_tone > 0.5 ? shadow_tint_2.rgb : shadow_tint.rgb;
+
+		// ── Second light: fill only, never darken ────────────────────
+		// The primary light owns the cel bands. A real scene's fill is usually
+		// dimmer than the cel shadow floor (0.15-0.3 vs ~0.4), so
+		// `max(cel, base * energy)` would let the shadow swallow it. The fill
+		// therefore ADDS to the deepest tone of the active mode: a 0.25 fill
+		// lifts a 0.4 shadow to ~0.65, while lit areas (already brighter) are
+		// left untouched by the outer max().
+		if (dot(light_dir_2, light_dir_2) > 1e-6 && light_energy_2 > 0.001) {
+			vec3 l2 = normalize(light_dir_2);
+			float raw2 = dot(n_world, l2);
+			if (face_sdf_mix > 0.001) {
+				vec3 light_view_2 = normalize(mat3(VIEW_MATRIX) * l2);
+				vec2 base_uv_2 = face_sdf_use_uv2 > 0.5 ? gk_uv2 : UV;
+				float face2 = gk_face_shadow(light_view_2, normalize(VIEW), base_uv_2);
+				raw2 = mix(raw2, face2, face_sdf_mix);
+			}
+			float lit_2 = gk_band(raw2, light_step_2, shadow_smooth);
+			vec3 fill_lit = base.rgb * (floor_tint * shadow_keep
+				+ lit_tint.rgb * light_color_2.rgb * light_energy_2);
+			cel = mix(cel, max(cel, fill_lit), lit_2);
+		}
+
+		// Floor: never let a texel go completely black. Fully shadowed anime
+		// characters are still readable, not silhouettes.
 		cel = max(cel, base.rgb * floor_tint * shadow_keep * 0.85);
 		ALBEDO = cel;
 	}

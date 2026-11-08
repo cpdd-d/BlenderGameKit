@@ -4616,7 +4616,7 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
         box = layout.box()
         box.label(text=f"物体: {obj.name}", icon="OBJECT_DATAMODE")
         if obj.type != "MESH":
-            box.label(text="只有网格物体会被导出", icon="INFO")
+            box.label(text="只有网格 / 灯光 / 相机会被导出", icon="INFO")
 
         # ---- 灯光(第四十八轮:阶段①灯光扩展)─────────────────────────
         # 灯不参与物理 / 静态资产那几块,选中灯时就只画这一块。
@@ -4658,6 +4658,29 @@ class GK_PT_ObjectPhysics(bpy.types.Panel):
             if float(getattr(obj.data, "energy", 1.0) or 0.0) <= 0.0:
                 box.label(text="能量是 0:这盏灯不会导出(当作关着的灯)",
                           icon="INFO")
+            return
+
+        # ---- 相机(第一百九十轮:远裁) ----
+        # 只给相机物体画。Camera3D.far 默认 4000 米,调小会让远处物体
+        # 凭空消失 —— 所以默认 0 = 不导出,警告直接写在面板上。
+        if obj.type == "CAMERA":
+            box = layout.box()
+            box.label(text="相机", icon="CAMERA_DATA")
+            if is_3d:
+                box.label(text="位置 / 朝向 / 视场角按 Blender 相机导出",
+                          icon="INFO")
+                col = box.column(align=True)
+                col.prop(physics, "camera_far", text="远裁距离", slider=True)
+                if float(physics.camera_far) > 0.0:
+                    box.label(text="超过这个距离(米)的物体不画",
+                              icon="CHECKMARK")
+                    box.label(text="⚠ 调小会让远处物体凭空消失,是视觉 bug 不是优化",
+                              icon="ERROR")
+                else:
+                    box.label(text="0 = 不导出(用 Godot 默认 4000 米)",
+                              icon="INFO")
+            else:
+                box.label(text="2D 场景用 Camera2D:没有远裁", icon="INFO")
             return
 
         col = box.column(align=True)

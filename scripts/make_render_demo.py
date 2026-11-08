@@ -386,6 +386,51 @@ def make_tone_scene():
     return write(os.path.join(OUT, "tone.tscn"), "\n".join(parts) + "\n")
 
 
+def make_fill_scene():
+    """主光 + 补光的验证场景(一颗球,只换材质)。
+
+    主光从正面照,补光从左侧照。关掉补光时球的左侧是主光阴影;
+    打开补光后左侧应明显变亮 —— 这就是 light_dir_2 真的在工作的证据。
+    """
+    ext = [
+        '[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="sh_toon"]',
+        '[ext_resource type="Script" path="res://fill_probe.gd" id="sh_fill"]',
+        '[ext_resource type="ShaderMaterial" path="res://materials/Fill_off.tres" id="m_fill"]',
+    ]
+    subs = [
+        '[sub_resource type="SphereMesh" id="fill_sphere"]\n'
+        "radius = 0.9\n"
+        "height = 1.8\n"
+        "radial_segments = 64\n"
+        "rings = 32",
+        '[sub_resource type="Environment" id="fill_env"]\n'
+        "background_mode = 1\n"
+        "background_color = Color(0.01, 0.01, 0.02, 1)\n"
+        "ambient_light_source = 3\n"
+        "ambient_light_energy = 0.0\n"
+        "tonemap_mode = 2",
+    ]
+    parts = [f"[gd_scene load_steps={len(ext) + len(subs) + 1} format=3]", ""]
+    parts += ext
+    parts.append("")
+    parts += subs
+    parts.append("")
+    parts.append('[node name="FillRoot" type="Node3D"]')
+    parts.append('script = ExtResource("sh_fill")')
+    parts.append("")
+    parts.append('[node name="WorldEnvironment" type="WorldEnvironment" parent="."]')
+    parts.append('environment = SubResource("fill_env")')
+    parts.append("")
+    parts.append('[node name="Camera" type="Camera3D" parent="."]')
+    parts.append("transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3.2)")
+    parts.append("fov = 45.0")
+    parts.append("")
+    parts.append('[node name="FillBall" type="MeshInstance3D" parent="."]')
+    parts.append('mesh = SubResource("fill_sphere")')
+    parts.append('material_override = ExtResource("m_fill")')
+    return write(os.path.join(OUT, "fill.tscn"), "\n".join(parts) + "\n")
+
+
 def main():
     if not os.path.isdir(SHADER_SRC):
         print(f"找不到着色器目录: {SHADER_SRC}")
@@ -463,12 +508,39 @@ def main():
     make_material("Tone_three", (1.0, 1.0, 1.0), three, with_outline=False)
     make_tone_scene()
 
+    # 主光 + 补光:关掉补光时球的左侧应明显更暗。
+    # 参数按**真实场景量级**给(补光 0.25、环境底 0.55):如果补光只是
+    # `max(主光结果, base*能量)`,这点能量会被 0.4 左右的阴影底吞掉 ——
+    # 探针就是为了守住"弱补光也必须看得见"。
+    fill_common = {
+        "light_dir": "Vector3(0, 0, 1)",
+        "light_dir_2": "Vector3(-1, 0, 0)",
+        "light_energy": 1.0,
+        "light_color_2": "Color(1, 1, 1, 1)",
+        "ambient": 0.55,
+        "shadow_step": 0.85,
+        "shadow_smooth": 0.002,
+        "lit_tint": "Color(1, 1, 1, 1)",
+        "shadow_tint": "Color(0.30, 0.26, 0.45, 1)",
+        "shadow_tint_2": "Color(0.18, 0.15, 0.28, 1)",
+        "specular_amount": 0.0,
+        "rim_amount": 0.0,
+    }
+    fill_off = dict(fill_common)
+    fill_off.update({"light_energy_2": 0.0})
+    fill_on = dict(fill_common)
+    fill_on.update({"light_energy_2": 0.25})
+    make_material("Fill_off", (1.0, 1.0, 1.0), fill_off, with_outline=False)
+    make_material("Fill_on", (1.0, 1.0, 1.0), fill_on, with_outline=False)
+    make_fill_scene()
+
     print(f"已生成 NPR demo: {OUT}")
     print(f"  着色器: {', '.join(copied)}")
-    print(f"  材质变体: {len(MATERIAL_VARIANTS)} 个 + 高光贴图 3 份 + 分档 2 份")
+    print(f"  材质变体: {len(MATERIAL_VARIANTS)} 个 + 高光贴图 3 份 + 分档 2 份 + 补光 2 份")
     print("  场景: Main.tscn (4 个球对比 + 带描边的胶囊 + 面部 SDF 头像)")
     print("        spec.tscn (高光贴图探针:实心 / 空心环 / 被遮罩抹掉)")
     print("        tone.tscn (两色调 2 档 / 三色调 3 档)")
+    print("        fill.tscn (补光开 / 关:球左侧亮度差)")
     return 0
 
 

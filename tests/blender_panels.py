@@ -150,6 +150,11 @@ def main():
     material = bpy.data.materials.new("TestMat")
     mesh.materials.append(material)
 
+    # 相机(第一百九十轮):物体面板给相机画『远裁距离』,也要能画得出来
+    camera_data = bpy.data.cameras.new("CameraData")
+    camera = bpy.data.objects.new("Camera", camera_data)
+    scene.collection.objects.link(camera)
+
     # ---- 1. draw 引用的辅助函数必须都存在 ----
     print("=" * 72)
     print("1. 面板用到的模块级函数")
@@ -174,6 +179,8 @@ def main():
     cases = [
         ("GK_PT_Main", cube),
         ("GK_PT_ObjectPhysics", cube),
+        # 相机面板(第一百九十轮):远裁距离那一块不能一画就抛异常
+        ("GK_PT_ObjectPhysics", camera),
         # 视口侧栏的「Godot 观感」面板 —— 它读 context.scene,
         # 而且会去调 godot_look 的 describe(),少一个函数就整块消失。
         ("GK_PT_GodotLook", cube),

@@ -1050,6 +1050,29 @@ if ($SkipGodot) {
         }
     }
 
+    # 5s-2. 相机远裁(第一百九十轮)—— 无头即可,不需要 GPU。
+    #       验的是环境脚本把 Camera3D.far 设对,以及小于 near 时按 near 兜底。
+    Write-Output ""
+    $camFarChecker = Join-Path $Root "scripts\check_camera_far.py"
+    if ($godotSkipped) {
+        Write-Output "跳过相机远裁:本机找不到 Godot"
+    } elseif (-not (Test-Path $camFarChecker)) {
+        Write-Output "跳过相机远裁:没有 scripts\check_camera_far.py"
+    } else {
+        $env:GK_GODOT = $Godot
+        $camFarOut = & $Py $camFarChecker 2>&1 | Out-String
+        $camFarOut -split "`n" | Where-Object {
+            $_ -match "^(CAMERA_FAR|跳过)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($camFarOut -match "CAMERA_FAR=OK") {
+            $godotRan += "相机远裁"
+        } elseif ($camFarOut -match "跳过") {
+            Write-Output "（相机远裁跳过:本机没有 Godot）"
+        } else {
+            $godotOk = $false
+        }
+    }
+
     # 5t. 网络联机示例(第一百轮:房间 + 自定义消息)—— **同机起两个 Godot
     #     进程真连一次**:一个开房、一个加入,互相收发消息再断开。
     #     ── 为什么必须两个进程 ────────────────────────────────────────

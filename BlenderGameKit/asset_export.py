@@ -370,6 +370,11 @@ var visibility_ranges: String = {visibility_ranges}
 var no_shadow_nodes: String = {no_shadow_nodes}
 var light_shadows: String = {light_shadows}
 
+## ── 相机远裁(第一百九十轮)──────────────────────────────────────
+## "相机名=距离|..."。空 = 老场景行为(用 Godot 默认 4000 米)。
+## ⚠ 调小会让远处物体凭空消失 —— 这是视觉 bug 不是优化,只填确实想裁的相机。
+var camera_fars: String = {camera_fars}
+
 ## GeometryInstance3D.SHADOW_CASTING_SETTING_OFF(不往阴影贴图里画)
 const _GK_SHADOW_OFF := 0
 
@@ -431,6 +436,8 @@ func _ready() -> void:
 	# 可见距离 / 阴影开销(第九十八轮)同理:网格在 glb 实例内部,
 	# 现在搜不到它 —— 一样推到帧末(表空时那个函数直接跳过,没有开销)。
 	_apply_render_tuning.call_deferred()
+	# 相机远裁(第一百九十轮):相机也常常在 glb 实例内部,同样等帧末。
+	_apply_camera_far.call_deferred()
 	# 灯的父子关系(第一百五十轮):灯与父节点都要等整棵树建好才找得到,
 	# 同样推到帧末;表空 = 老场景,什么都不做。
 	_gk_link_light_parents.call_deferred()
@@ -725,6 +732,38 @@ func _apply_render_tuning() -> void:
 		print("[GK] 渲染优化:设了 ", tuned, " 处(可见距离 / 不投阴影 / 阴影距离)")
 
 
+## 相机远裁(第一百九十轮)。
+##
+## 相机节点也常在 glb 实例内部,所以和材质 / 渲染优化一样推到帧末按名字找。
+## 表空就直接返回 —— 老场景一台相机都不遍历。
+func _apply_camera_far() -> void:
+	if camera_fars.strip_edges().is_empty():
+		return
+	var root := _scene_root()
+	if root == null:
+		return
+	var tuned := 0
+	for line in camera_fars.split("|", false):
+		var text := line.strip_edges()
+		if text.is_empty() or not text.contains("="):
+			continue
+		var parts := text.split("=", true, 1)
+		var distance := float(parts[1].strip_edges())
+		if distance <= 0.0:
+			continue
+		for node in root.find_children(parts[0].strip_edges(),
+				"Camera3D", true, false):
+			var cam := node as Camera3D
+			if cam == null:
+				continue
+			# Godot 要求 far > near;填得比 near 还小时按 near 兜底,
+			# 免得"整台相机什么都画不出来"。
+			cam.far = maxf(distance, cam.near + 0.01)
+			tuned += 1
+	if tuned > 0:
+		print("[GK] 相机远裁:设了 ", tuned, " 台")
+
+
 ## 按名字找**所有**同名网格(静态资产在场景里可能摆了好几份)。
 ## 先在所有 MeshInstance3D 里按名字找,找不到再退回 find_child ——
 ## 和 _apply_material_table 同一套(同名节点里先被找到的往往是碰撞代理,
@@ -879,14 +918,15 @@ func _gk_apply_light_projectors() -> void:
 ## 参数名带下划线前缀 = "故意不用":取值走 get_physics_process_delta_time(),
 ## 而 Godot 会把没用上的参数报成 UNUSED_PARAMETER(调试器里一条错误)。
 ##
-## 主光怎么选:每帧对**每个材质**算一遍"哪盏亮着的灯对它影响最大" ——
+## 主光怎么选:每帧对**每个材质**按影响给亮灯排序,取**前两盏** ——
 ##   * 平行光:按 light_energy(打了 0.8 折,见 _gk_pick_light 的说明);
 ##   * 点光 / 聚光:按距离衰减(聚光还要"照在锥里"),方向 = 灯照向材质。
-## 挑中的那盏按"主光"喂给 shader(色阶 / 阴影方向 / 亮度都跟着它)。
+## 第一盏当主光(色阶 / 阴影方向 / 亮度),第二盏当补光:只叠加到阴影底、
+## 提亮,不压暗主光色阶(见 gk_toon.gdshader 的 light_dir_2)。
 ##
-## ⚠ 这是**近似**,不是真实多光源:shader 的色阶是硬边的,多盏叠加会糊成
-## 一片灰,所以"多盏同时照"只取影响最大的那盏。要逐像素一致得改 shader,
-## 不值当 —— 这里保证的是"手电筒照到谁,谁就跟着手电筒变化"这个体感。
+## ⚠ 这是**近似**,不是逐像素多光源:超过两盏时第三盏起不参与 ——
+## 每多一盏都要多一组 uniform 和一段 band 计算,而第三盏对卡通分档的
+## 贡献通常会被前两盏盖住。
 func _update_light(_delta: float) -> void:
 	if not follow_scene_light or _gk_mats.is_empty():
 		return
@@ -911,25 +951,37 @@ func _update_light(_delta: float) -> void:
 			var sm_off := pair[1] as ShaderMaterial
 			if sm_off != null:
 				sm_off.set_shader_parameter("light_dir", Vector3.ZERO)
+				sm_off.set_shader_parameter("light_dir_2", Vector3.ZERO)
+				sm_off.set_shader_parameter("light_energy_2", 0.0)
 		return
 	for pair in _gk_mats:
 		var sm := pair[1] as ShaderMaterial
 		if sm == null:
 			continue
 		var skip: Array = []
-		if not follow_names.is_empty() and cam_host != null \\
+		if not follow_names.is_empty() and cam_host != null \
 				and _gk_scene_top(pair[0]) == cam_host:
 			for light in lights:
 				if (light as Light3D).name in follow_names:
 					skip.append(light)
-		var pick := _gk_pick_light(lights, pair[0] as Node3D, skip)
-		if pick.is_empty():
+		var picks := _gk_pick_lights(lights, pair[0] as Node3D, skip, 2)
+		if picks.is_empty():
 			continue
+		var pick: Array = picks[0]
 		sm.set_shader_parameter("light_dir", pick[0])
 		sm.set_shader_parameter("light_color", pick[1])
 		# 亮度夹到 shader 的 0~8;手电筒需要能盖过低环境光,
 		# 仍保留上限避免近距离点光把整张卡通材质冲成纯白。
 		sm.set_shader_parameter("light_energy", pick[2])
+		# 第二盏只当补光:shader 那边只在它照到的地方提亮,不压暗主光色阶。
+		if picks.size() > 1:
+			var fill: Array = picks[1]
+			sm.set_shader_parameter("light_dir_2", fill[0])
+			sm.set_shader_parameter("light_color_2", fill[1])
+			sm.set_shader_parameter("light_energy_2", fill[2])
+		else:
+			sm.set_shader_parameter("light_dir_2", Vector3.ZERO)
+			sm.set_shader_parameter("light_energy_2", 0.0)
 
 
 ## 节点在场景树里的"顶层宿主"(current_scene 的直接子节点)。
@@ -979,8 +1031,15 @@ func _gk_lights_on() -> Array:
 ## 用同一套材质做了对照实验(dir=(0,1,0) 明显变亮 / (0,-1,0) 变暗),
 ## 确认 shader 侧没问题 —— 错的是这里的符号。
 func _gk_pick_light(lights: Array, node: Node3D, exclude: Array = []) -> Array:
-	var best: Array = []
-	var best_score := -1.0
+	var picks := _gk_pick_lights(lights, node, exclude, 1)
+	return picks[0] if not picks.is_empty() else []
+
+
+## 每帧按"影响最大"排前 N 盏灯(默认 2:主光 + 补光)。
+## 补光只加亮、不压暗主光的色阶,见 gk_toon.gdshader 的 light_dir_2。
+func _gk_pick_lights(lights: Array, node: Node3D, exclude: Array = [],
+		count: int = 2) -> Array:
+	var picks: Array = []  # [score, dir, color, energy] —— 按 score 从大到小
 	var here := Vector3.ZERO
 	if node != null:
 		here = node.global_position
@@ -1034,11 +1093,22 @@ func _gk_pick_light(lights: Array, node: Node3D, exclude: Array = []) -> Array:
 					score *= pow(cone, maxf(cone_soft, 0.01))
 			else:
 				dir = l.global_transform.basis.z.normalized()
-		if score > best_score:
-			best_score = score
-			best = [dir, l.light_color,
-					clampf(l.light_energy * reach, 0.0, 8.0)]
-	return best
+		if score <= 0.0001:
+			continue
+		var entry := [score, dir, l.light_color,
+				clampf(l.light_energy * reach, 0.0, 8.0)]
+		var insert_at := picks.size()
+		for i in range(picks.size()):
+			if score > picks[i][0]:
+				insert_at = i
+				break
+		picks.insert(insert_at, entry)
+		if picks.size() > count:
+			picks.pop_back()
+	var out: Array = []
+	for item in picks:
+		out.append([item[1], item[2], item[3]])
+	return out
 
 
 ## 这盏灯**现在是否在发光**。
@@ -2480,6 +2550,8 @@ ENV_SCRIPT_DEFAULTS = dict(
     # 可见距离 / 阴影开销(第九十八轮):三张表,空串 = 老场景行为
     # (值是**带引号的 GDScript 字符串字面量**,见 render_tuning_tables)
     visibility_ranges='""', no_shadow_nodes='""', light_shadows='""',
+    # 相机远裁(第一百九十轮):空 = 老场景(用 Godot 默认 4000 米)
+    camera_fars='""',
     follow_lights="",
     # 灯的父子关系(第一百五十轮):空 = 没有挂父级的灯
     light_parents="",
@@ -5136,6 +5208,9 @@ def _env_fields(scene, camera_name="", fov=0.0, material_files=None,
         visibility_ranges=visibility_ranges,
         no_shadow_nodes=no_shadow_nodes,
         light_shadows=light_shadows,
+        # 相机远裁(第一百九十轮):"相机名=距离",运行时由 _apply_camera_far 应用。
+        # 2D 场景是 Camera2D,没有 far —— 表留空,免得生成无意义的行。
+        camera_fars=camera_far_table(scene) if is_3d else '""',
         # 游戏环境与后期(第一百二十五轮):从『游戏环境与后期』图编出来的
         # 那一整块 GDScript。图里没卡就是空串 -> 模板里那一行变空行,
         # 产物与改动前**逐字节一致**(老工程不受影响)。
@@ -6018,6 +6093,46 @@ def render_tuning_tables(scene):
         return json.dumps("|".join(parts), ensure_ascii=False)
 
     return literal(vis_parts), literal(shadow_off), literal(light_parts)
+
+
+def camera_far_of(obj):
+    """相机『远裁距离』;没填 / <= 0 / 不是相机 -> None(不导出)。
+
+    Godot 默认 far = 4000 米。调小会让远处物体凭空消失(是视觉 bug 不是
+    优化),所以必须显式填才导出 —— 和可见距离 / 阴影距离同一个约定。
+    """
+    if obj is None or str(getattr(obj, "type", "") or "") != "CAMERA":
+        return None
+    raw = getattr(getattr(obj, "gk_physics", None), "camera_far", None)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0.0:
+        return None
+    return value
+
+
+def camera_far_table(scene):
+    """相机远裁表 -> GDScript 字符串字面量("相机名=距离|...")。
+
+    空表返回 `""`(老场景一字不变)。名字用 `_sanitize_node_name` 处理,
+    和导出 .tscn 时写进 `[node name=...]` 的名字是同一套 —— 运行时按名字
+    找得到。
+    """
+    import json
+
+    parts = []
+    for obj in (getattr(scene, "objects", None) or ()):
+        if str(getattr(obj, "type", "") or "") != "CAMERA":
+            continue
+        value = camera_far_of(obj)
+        if value is not None:
+            parts.append(
+                f"{_sanitize_node_name(obj.name)}={_gd_float(value)}")
+    return json.dumps("|".join(parts), ensure_ascii=False)
 
 
 def render_occluder_of(physics):
