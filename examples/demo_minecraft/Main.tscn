@@ -1,4 +1,4 @@
-[gd_scene load_steps=12 format=3]
+[gd_scene load_steps=15 format=3]
 
 [ext_resource type="Script" path="res://scripts/game_logic.gd" id="script"]
 
@@ -30,6 +30,15 @@ roughness = 0.9
 albedo_color = Color(0.8, 0.72, 0.46, 1)
 roughness = 0.9
 
+[sub_resource type="StandardMaterial3D" id="mat_monster"]
+albedo_color = Color(0.58, 0.12, 0.12, 1)
+roughness = 0.9
+
+[sub_resource type="BoxMesh" id="monster_mesh"]
+size = Vector3(0.7, 1.4, 0.7)
+[sub_resource type="CapsuleShape3D" id="monster_shape"]
+radius = 0.35
+height = 1.5
 [sub_resource type="CapsuleShape3D" id="player_shape"]
 radius = 0.35
 height = 1.7
@@ -1483,6 +1492,50 @@ shape = SubResource("block_shape")
 mesh = SubResource("block_mesh")
 material_override = SubResource("mat_wood")
 
+[node name="Monsters" type="Node3D" parent="."]
+
+[node name="怪物1" type="CharacterBody3D" parent="Monsters"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2.0, 1.0, -3.0)
+collision_layer = 4
+collision_mask = 1
+
+[node name="Shape" type="CollisionShape3D" parent="Monsters/怪物1"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.75, 0)
+shape = SubResource("monster_shape")
+
+[node name="Mesh" type="MeshInstance3D" parent="Monsters/怪物1"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.75, 0)
+mesh = SubResource("monster_mesh")
+material_override = SubResource("mat_monster")
+
+[node name="怪物2" type="CharacterBody3D" parent="Monsters"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.0, 1.0, -5.0)
+collision_layer = 4
+collision_mask = 1
+
+[node name="Shape" type="CollisionShape3D" parent="Monsters/怪物2"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.75, 0)
+shape = SubResource("monster_shape")
+
+[node name="Mesh" type="MeshInstance3D" parent="Monsters/怪物2"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.75, 0)
+mesh = SubResource("monster_mesh")
+material_override = SubResource("mat_monster")
+
+[node name="怪物3" type="CharacterBody3D" parent="Monsters"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.5, 1.0, -4.0)
+collision_layer = 4
+collision_mask = 1
+
+[node name="Shape" type="CollisionShape3D" parent="Monsters/怪物3"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.75, 0)
+shape = SubResource("monster_shape")
+
+[node name="Mesh" type="MeshInstance3D" parent="Monsters/怪物3"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.75, 0)
+mesh = SubResource("monster_mesh")
+material_override = SubResource("mat_monster")
+
 [node name="Player" type="CharacterBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.5, 1, 0.5)
 collision_layer = 2
@@ -1506,7 +1559,7 @@ current = true
 offset_left = 16.0
 offset_top = 12.0
 theme_override_font_sizes/font_size = 16
-text = "我的世界 · BlenderGameKit 示例    WASD 移动 / 空格 跳 / 鼠标 转视角 / 左键或 E 挖 / 右键或 Q 放 / ESC 退出"
+text = "我的世界 · BlenderGameKit 示例    WASD 移动 / 空格 跳 / 鼠标 转视角 / 1 草 2 石 3 沙 4 木 / 左键或 E 挖 / 右键或 Q 放 / ESC 退出 · 小心红皮怪"
 
 [node name="Crosshair" type="Label" parent="UI"]
 anchors_preset = 8

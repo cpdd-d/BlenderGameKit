@@ -20508,6 +20508,92 @@ class TestRound193MinecraftHooks(Base):
         self.assertIn("rotation.y = lerp_angle", code2)
 
 
+class TestRound195MinecraftBlockSwitch(Base):
+    """第一百九十五轮:我的世界按数字键切四种方块。
+
+    节点侧是『变量_读取』+『多路分支』(Switch on Int)+ 四个
+    『资产_创建实例』。这里锁住两件事:
+      * 出口 0~3 各自真的生成了自己的资产路径(不是全都放同一种);
+      * 示例工程本身登记了 slot_1~slot_4 和四个 blocks/*.tscn。
+    """
+
+    def test_switch_dispatches_four_assets(self):
+        tree = make_tree()
+        var = tree.gk_vars.add()
+        var.var_name = "方块序号"
+        var.var_type = "float"
+        var.default_value = "0"
+        ready = tree.new_node(NN.GKNodeOnReady, "启动")
+        read = tree.new_node(NN.GKNodeGetVar, "读档", gk_var_name="方块序号")
+        switch = tree.new_node(NN.GKNodeSwitch, "放哪种", gk_case_count=4)
+        gk_stub.connect(tree, ready, "执行", switch, "执行")
+        gk_stub.connect(tree, read, "值", switch, "值")
+        names = ("草方块", "石头方块", "沙子方块", "木头方块")
+        assets = {}
+        for index, name in enumerate(names):
+            spawn = tree.new_node(NN.GKNodeAssetSpawn, "放" + name,
+                                  gk_asset=name)
+            gk_stub.connect(tree, switch, str(index), spawn, "执行")
+            assets[name] = {
+                "path": f"res://blocks/B{index}.tscn",
+                "shape": 0,
+                "shapes": [{"kind": 0, "dims": (1.0, 1.0, 1.0),
+                            "offset": (0.0, 0.0, 0.0)}],
+                "layer": 1,
+                "mask": 1,
+            }
+        code, warnings = gen(tree, dict(V3, assets=assets))
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("var 方块序号: float = 0", code)
+        self.assertIn("int(方块序号)", code)
+        self.assertIn("match _sw", code)
+        for index in range(4):
+            self.assertIn(f"res://blocks/B{index}.tscn", code)
+
+    def test_demo_project_registers_slot_keys_and_blocks(self):
+        demo = os.path.join(ROOT, "examples", "demo_minecraft")
+        with open(os.path.join(demo, "project.godot"), "r",
+                  encoding="utf-8", errors="replace") as handle:
+            project_text = handle.read()
+        for index in range(1, 5):
+            self.assertIn(f"slot_{index}={{", project_text)
+        for file_name in ("GrassBlock", "StoneBlock", "SandBlock", "WoodBlock"):
+            self.assertTrue(
+                os.path.isfile(os.path.join(demo, "blocks",
+                                            f"{file_name}.tscn")),
+                file_name)
+        self.assertFalse(os.path.isfile(os.path.join(demo, "Block.tscn")),
+                         "旧的单一 Block.tscn 应该已经删掉")
+
+
+class TestRound196MinecraftMonsters(Base):
+    """第一百九十六轮:我的世界加"会追人并攻击"的小怪。
+
+    追击 = 『移动_朝向目标』(谁走 = `../Monsters/怪物N`,目标 = 自己);
+    攻击 = 三只的『到达』求或 ->『流程_冷却』->『变量_增减(生命)』。
+    这里锁的是**生成物真的长这样**(实时门禁由 check_minecraft_demo 跑)。
+    """
+
+    def test_demo_has_chasing_monsters_and_health(self):
+        demo = os.path.join(ROOT, "examples", "demo_minecraft")
+        with open(os.path.join(demo, "scripts", "game_logic.gd"), "r",
+                  encoding="utf-8", errors="replace") as handle:
+            code = handle.read()
+        self.assertIn('"../Monsters/怪物1"', code)
+        self.assertIn(".move_and_slide()", code)
+        self.assertIn("生命 = (生命 + -8.0)", code)
+        self.assertIn("_gk_float_text_3d", code)
+        with open(os.path.join(demo, "Main.tscn"), "r",
+                  encoding="utf-8", errors="replace") as handle:
+            scene = handle.read()
+        for name in ("怪物1", "怪物2", "怪物3"):
+            self.assertIn(f'name="{name}"', scene)
+        with open(os.path.join(demo, "project.godot"), "r",
+                  encoding="utf-8", errors="replace") as handle:
+            project_text = handle.read()
+        self.assertIn('layer_3="mobs"', project_text)
+
+
 class TestRound99Occluder(Base):
     """第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)。
 

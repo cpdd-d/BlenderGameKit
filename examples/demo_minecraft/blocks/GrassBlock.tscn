@@ -4,7 +4,7 @@
 size = Vector3(1, 1, 1)
 
 [sub_resource type="StandardMaterial3D" id="mat"]
-albedo_color = Color(0.55, 0.42, 0.22, 1)
+albedo_color = Color(0.24, 0.6, 0.22, 1)
 roughness = 0.9
 
 [node name="Block" type="Node3D"]
