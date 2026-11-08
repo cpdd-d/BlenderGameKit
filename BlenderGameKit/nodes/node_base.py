@@ -268,6 +268,8 @@ def node_items_for(node, prop="gk_target"):
         obj_type = "ARMATURE"
     elif prop == "gk_light":
         obj_type = "LIGHT"
+    elif prop == "gk_player":
+        obj_type = "MESH"
     items = list(node_candidates(tree, prop, obj_type))
     if bpy is not None and tree is not None:
         slots = set()
