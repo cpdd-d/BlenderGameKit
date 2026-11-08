@@ -35,11 +35,48 @@ uniform float emission_amount = 0.0;
 // 现在颜色和强度分开:EMISSION = emission_color × amount,和 albedo 无关。
 uniform vec4 emission_color : source_color = vec4(1.0);
 uniform float eye_highlight_boost = 0.0;
+
+// Anime face shading: one clean shadow line looked up from a texture instead
+// of the blotchy geometric terminator. Same strip layout as gk_toon.gdshader.
+uniform sampler2D face_sdf : hint_default_white, filter_linear, repeat_disable;
+uniform float face_sdf_mix : hint_range(0.0, 1.0) = 0.0;
+uniform float face_sdf_split : hint_range(0.05, 0.95) = 0.5;
+uniform float face_sdf_neutral : hint_range(0.0, 1.0) = 0.5;
+uniform float face_sdf_angle_scale : hint_range(0.25, 4.0) = 1.6;
+uniform float face_sdf_smooth : hint_range(0.001, 0.5) = 0.03;
+uniform float face_sdf_v_offset : hint_range(-0.5, 0.5) = 0.0;
+uniform float face_sdf_use_uv2 : hint_range(0.0, 1.0) = 0.0;
+
 varying vec2 gk_uv;
+varying vec2 gk_uv2;
 
 float gk_band(float x, float edge, float width) {
 	float half_w = max(width, 0.0005) * 0.5;
 	return smoothstep(edge - half_w, edge + half_w, x);
+}
+
+float gk_face_shadow(vec3 light_view, vec3 view_dir, vec2 base_uv) {
+	float side = cross(view_dir, light_view).y;
+	float behind = clamp(dot(view_dir, light_view) * 1.5, 0.0, 1.0);
+	float amount = clamp(abs(side) * face_sdf_angle_scale, 0.0, 1.0);
+
+	float line = face_sdf_neutral;
+	if (side >= 0.0) {
+		line = mix(face_sdf_neutral, 0.0, amount);
+	} else {
+		line = mix(face_sdf_neutral, 1.0, amount);
+	}
+
+	vec2 sdf_uv = vec2(base_uv.x + (line - face_sdf_neutral),
+		base_uv.y + face_sdf_v_offset);
+	float mask = texture(face_sdf, sdf_uv).r;
+	mask *= 1.0 - behind;
+	float raw = mask * 2.0 - 1.0;
+	return gk_band(raw, -0.5 + shadow_smooth, face_sdf_smooth) * 2.0 - 1.0;
+}
+
+void vertex() {
+	gk_uv2 = UV2;
 }
 
 void fragment() {
@@ -64,6 +101,11 @@ void fragment() {
 
 void light() {
 	float raw = dot(NORMAL, LIGHT);
+	if (face_sdf_mix > 0.001) {
+		vec2 base_uv = face_sdf_use_uv2 > 0.5 ? gk_uv2 : gk_uv;
+		raw = mix(raw, gk_face_shadow(normalize(LIGHT), normalize(VIEW), base_uv),
+			face_sdf_mix);
+	}
 	vec3 dark = shadow_tint.rgb;
 	if (three_tone > 0.5) {
 		dark = mix(shadow_tint_2.rgb, dark,

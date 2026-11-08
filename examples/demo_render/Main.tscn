@@ -31,6 +31,7 @@ size = Vector2(1.0, 1.0)
 shader = ExtResource("sh_toon")
 shader_parameter/albedo_color = Color(1, 1, 1, 1)
 shader_parameter/albedo_texture = ExtResource("tex_face")
+shader_parameter/use_albedo_texture = 1.0
 shader_parameter/alpha_cut = 0.4
 shader_parameter/three_tone = 0.0
 shader_parameter/shadow_step = 0.1

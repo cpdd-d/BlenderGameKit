@@ -2226,8 +2226,8 @@ class GK_OT_PickMaterialImage(bpy.types.Operator):
     """
 
     bl_idname = "gk.pick_material_image"
-    bl_label = "选高光贴图"
-    bl_description = "把这张图设为该材质的高光贴图(导出时带进 Godot)"
+    bl_label = "选材质贴图"
+    bl_description = "把这张图设为该材质的贴图(高光 / 面部 SDF,导出时带进 Godot)"
     bl_property = "image_name"
 
     material_name: StringProperty(name="材质", default="")
@@ -2246,7 +2246,7 @@ class GK_OT_PickMaterialImage(bpy.types.Operator):
             _report(self, "WARNING", "找不到那个材质(可能刚被删了)")
             return {"CANCELLED"}
         if self.uniform not in npr_preview.TEXTURE_KEYS:
-            _report(self, "WARNING", "不认识这个高光贴图槽位")
+            _report(self, "WARNING", "不认识这个材质贴图槽位")
             return {"CANCELLED"}
         if not self.image_name:
             _report(self, "WARNING", "工程里还没有可选的图片(先导入一张图)")
@@ -2258,10 +2258,10 @@ class GK_OT_PickMaterialImage(bpy.types.Operator):
 
 
 class GK_OT_ClearMaterialImage(bpy.types.Operator):
-    """清掉某个材质的高光贴图(退回"只用高光参数"的老行为)。"""
+    """清掉某个材质的一张材质贴图(高光 / 面部 SDF)。"""
 
     bl_idname = "gk.clear_material_image"
-    bl_label = "清掉高光贴图"
+    bl_label = "清材质贴图"
     bl_description = "不再用这张贴图(导出时也不带它进 Godot)"
     bl_options = {"REGISTER", "UNDO"}
 

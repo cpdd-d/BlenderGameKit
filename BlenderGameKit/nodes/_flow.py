@@ -145,6 +145,60 @@ class GKNodeMultiGate(B.GKStatementNode):
 
 
 @N
+class GKNodeWhile(B.GKStatementNode):
+    bl_idname = "GKNodeWhile"
+    bl_label = "流程_当条件"
+    bl_icon = "FILE_REFRESH"
+    gk_category = "流程"
+    gk_doc = ("照 UE5 的 WhileLoop:条件为真就一直执行『循环体』,"
+              "为假走『结束后』。\n"
+              "条件可以是变量比较 / 布尔运算 / 输入查询 —— 每转一圈都会重新求值。\n"
+              "⚠ 条件永远为真会把游戏卡死:请在循环体里改变条件依赖的变量。")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(BOOL, "条件", False),)
+    gk_outputs = (S.pin(FLOW, "循环体"), S.pin(FLOW, "结束后"),)
+    gk_owns_flow = True
+
+
+@N
+class GKNodeSwitchText(B.GKStatementNode):
+    bl_idname = "GKNodeSwitchText"
+    bl_label = "流程_多路文本"
+    bl_icon = "SORT_ASC"
+    gk_category = "流程"
+    gk_doc = ("照 UE5 的 Switch on String:按文本走不同出口。\n"
+              "『分支文本』用 `|` 隔开(例:红|绿|蓝),出口按顺序编号 1..N;"
+              "都不匹配时走『默认』。出口数量可调(1~8),改数字引脚立刻长出来。")
+    gk_inputs = (S.pin(FLOW, "执行"), S.pin(TEXT, "值", ""),)
+    # 出口在 build_sockets 里按 gk_case_count 动态生成
+    gk_outputs = (S.pin(FLOW, "1"), S.pin(FLOW, "2"), S.pin(FLOW, "默认"),)
+    gk_prop_defs = (
+        ("gk_case_count", "int", 2, "出口数量", "1~8 条分支",
+         None, {"min": 1, "max": 8}),
+        ("gk_cases", "string", "红|绿|蓝", "分支文本",
+         "用 | 隔开;不够的自动补『选项N』"),
+    )
+    gk_owns_flow = True
+
+    def build_sockets(self):
+        count = max(1, min(8, int(getattr(self, "gk_case_count", 2) or 2)))
+        self.inputs.clear()
+        for spec in self.gk_inputs:
+            socket = self.inputs.new(spec["kind"][0], spec["name"])
+            if spec["default"] is not None:
+                socket.default_value = spec["default"]
+        self.outputs.clear()
+        for index in range(count):
+            self.outputs.new(S.FLOW[0], str(index + 1))
+        self.outputs.new(S.FLOW[0], "默认")
+        self.gk_socket_cache = (len(self.inputs), len(self.outputs))
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, "gk_case_count", text="出口")
+        layout.prop(self, "gk_cases", text="")
+
+
+@N
 class GKNodeRetriggerableDelay(B.GKStatementNode):
     bl_idname = "GKNodeRetriggerableDelay"
     bl_label = "等待_可重触发"

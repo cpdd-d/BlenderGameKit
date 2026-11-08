@@ -10431,9 +10431,11 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders",
         # 开关**每次都写**(和 use_albedo_texture 同一个理由:着色器里
         # hint_default_white 让"没贴图"和"白贴图"在 texture() 上一样,
         # 只能靠这个开关区分)。有图 = 1,没有 = 0。
-        spec_lines.append(
-            f"shader_parameter/use_{uniform} = "
-            f"{1.0 if res_id else 0.0:.1f}")
+        # 面部 SDF 例外:它用 `face_sdf_mix` 当开关,没有 use_ 这个 uniform。
+        if uniform not in npr_preview.TEXTURE_NO_USE_SWITCH:
+            spec_lines.append(
+                f"shader_parameter/use_{uniform} = "
+                f"{1.0 if res_id else 0.0:.1f}")
         if res_id:
             spec_lines.append(
                 f'shader_parameter/{uniform} = ExtResource("{res_id}")')
@@ -10459,6 +10461,8 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders",
     lines.extend(spec_lines)
 
     for uniform, value in params.items():
+        if uniform in npr_preview.PREVIEW_ONLY_UNIFORMS:
+            continue
         if isinstance(value, (tuple, list)):
             r, g, b = float(value[0]), float(value[1]), float(value[2])
             if scene_lit:

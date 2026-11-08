@@ -84,6 +84,8 @@ PARAM_MAP = (
     ("face_sdf_angle_scale", "face_sdf_angle_scale", "VALUE", 1.6, "面部角度倍率"),
     ("face_sdf_smooth", "face_sdf_smooth", "VALUE", 0.03, "面部边界软硬"),
     ("face_sdf_split", "face_sdf_split", "VALUE", 0.5, "面部左右分界"),
+    ("face_sdf_v_offset", "face_sdf_v_offset", "VALUE", 0.0, "面部上下微调"),
+    ("face_sdf_use_uv2", "face_sdf_use_uv2", "VALUE", 0.0, "面部用 UV2"),
 )
 
 PARAM_LIMITS = {
@@ -105,10 +107,15 @@ PARAM_LIMITS = {
     "face_sdf_angle_scale": (0.25, 4.0),
     "face_sdf_smooth": (0.001, 0.5),
     "face_sdf_split": (0.05, 0.95),
+    "face_sdf_v_offset": (-0.5, 0.5),
+    "face_sdf_use_uv2": (0.0, 1.0),
 }
 
 # 不需要导出到 Godot 的参数(纯粹是 Blender 侧的工具)
 LOCAL_ONLY_PARAMS = ("face_sdf_auto",)
+# 只给 Blender 预览用、运行时着色器里没有同名 uniform 的参数。
+# 导出时必须跳过,否则 Godot 每次加载材质都刷 "shader parameter not found"。
+PREVIEW_ONLY_UNIFORMS = ("face_sdf_angle",)
 
 DEFAULT_TUNING = {name: default for name, _u, _k, default, _l in PARAM_MAP}
 
@@ -126,6 +133,10 @@ DEFAULT_TUNING = {name: default for name, _u, _k, default, _l in PARAM_MAP}
 # `use_<uniform>` 开关**不存**在材质上 —— 它由"有没有填图"算出来,
 # 免得出现"开关是 1 但图被删了"这种自相矛盾的状态。
 TEXTURE_KEYS = {
+    "face_sdf": (
+        "面部阴影贴图",
+        "面部 SDF 条带:左半=光从左来,右半=镜像;白=受光,黑=阴影。"
+        "必须开『面部 SDF 混合』才生效"),
     "specular_shape_texture": (
         "高光形状贴图",
         "横向渐变:0(左)=高光外缘,1(右)=正中心。"
@@ -140,6 +151,11 @@ TEXTURE_KEYS = {
 def texture_key(uniform):
     """uniform 名 -> 材质上那个自定义属性的键名(中文,面板里一眼看得懂)。"""
     return TEXTURE_KEYS[uniform][0]
+
+
+# 这些纹理没有 `use_<名字>` 开关 —— 着色器用别的参数决定是否采样,
+# 多写一行 use_xxx 只会让 Godot 报 "shader parameter not found"。
+TEXTURE_NO_USE_SWITCH = ("face_sdf",)
 
 
 def texture_hint(uniform):
@@ -608,6 +624,9 @@ def build_toon_material(name, params=None, base_texture=None, uv_layer="UVMap",
         if image is not None:
             spec_images[uniform] = image
             set_texture(material, uniform, getattr(image, "name", ""))
+            if uniform == "face_sdf":
+                # 预览与导出用**同一张**面部贴图(不再只靠文件名猜)。
+                values["face_sdf_image"] = image
 
     b = NodeBuilder(tree)
 

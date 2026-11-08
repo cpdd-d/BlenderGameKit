@@ -26,7 +26,7 @@ class TestNodeSchema(unittest.TestCase):
     def test_all_registered_nodes_pass(self):
         issues, count = node_schema.validate_all()
         self.assertEqual(issues, [], "节点声明有问题:\n" + "\n".join(issues))
-        self.assertEqual(count, 265,
+        self.assertEqual(count, 267,
                          "节点总数变了 —— 新增/删除节点时请同步更新这条断言")
 
     def test_broken_input_mapping_is_reported(self):

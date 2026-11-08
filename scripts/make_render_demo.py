@@ -162,6 +162,7 @@ def make_scene():
         'shader = ExtResource("sh_toon")\n'
         "shader_parameter/albedo_color = Color(1, 1, 1, 1)\n"
         'shader_parameter/albedo_texture = ExtResource("tex_face")\n'
+        "shader_parameter/use_albedo_texture = 1.0\n"
         "shader_parameter/alpha_cut = 0.4\n"
         "shader_parameter/three_tone = 0.0\n"
         "shader_parameter/shadow_step = 0.1\n"

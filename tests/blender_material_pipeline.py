@@ -133,7 +133,7 @@ def main():
         bpy.data.materials.remove(material)
 
     # 一个球 + 地面,各给一个材质
-    def make(name, kind, location):
+    def make(name, kind, location, color):
         mesh = bpy.data.meshes.new(name + "Mesh")
         obj = bpy.data.objects.new(name, mesh)
         scene.collection.objects.link(obj)
@@ -149,12 +149,14 @@ def main():
         material.use_nodes = True
         for node in material.node_tree.nodes:
             if node.bl_idname == "ShaderNodeBsdfPrincipled":
-                node.inputs["Base Color"].default_value = (0.9, 0.4, 0.4, 1.0)
+                node.inputs["Base Color"].default_value = color
         mesh.materials.append(material)
         return obj
 
-    ball = make("Ball", "sphere", (0.0, 0.0, 1.0))
-    floor = make("Floor", "grid", (0.0, 0.0, 0.0))
+    # 球和地面**故意用不同颜色**:导出会把"内容完全相同"的材质去重成
+    # 一个 .tres(轮 174),同色的话这里只剩 1 个文件,断言 >=2 会假红。
+    ball = make("Ball", "sphere", (0.0, 0.0, 1.0), (0.9, 0.4, 0.4, 1.0))
+    floor = make("Floor", "grid", (0.0, 0.0, 0.0), (0.22, 0.28, 0.34, 1.0))
 
     # 相机 + 太阳
     #

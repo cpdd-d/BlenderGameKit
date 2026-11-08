@@ -1850,8 +1850,8 @@ def _stmt_list_get(ctx, node, indent):
     ctx.add_line(indent + 1, f"{target} = {default}")
 
 
-def _foreach_vars(ctx, node):
-    """『列表_遍历』的"当前项 / 下标"成员变量(处理器与输出共用)。"""
+def _foreach_member_vars(ctx, node):
+    """『列表_遍历』的"最后一项 / 最后下标"成员变量(循环体外读取用)。"""
     tag = ctx.node_tag(node, "foreach")
     item = ctx.declare_var(f"_gk_item{tag}", "Variant")
     index = ctx.declare_var(f"_gk_idx{tag}", "int", initial="-1")
@@ -1862,22 +1862,38 @@ def _foreach_vars(ctx, node):
 def _stmt_list_foreach(ctx, node, indent):
     """『列表_遍历』(UE5 ForEachLoop):逐项执行『循环体』,完了走『结束后』。
 
-    ── 为什么用成员变量存当前项 / 下标 ──────────────────────────────
-    循环体里的卡片(打印 / 设置变量 / 比较)要对"当前这一项"求值,
-    而表达式是**按变量名**生成的。局部变量在 `for` 里声明,跨卡片引用
-    会出作用域;所以用 ctx.declare_var 变成脚本成员,循环体里随时可读。
+    ── 为什么循环体里用**局部变量**而不是成员变量(重入修复)────────
+    第一版把当前项/下标放在成员变量里。同一个遍历节点如果在循环体里
+    被再次触发(或循环体里有 await、另一条链又跑了一遍),后一次会把
+    当前项覆盖掉,前一次醒来后读到的是别人那一项。
+    现在:
+      * 循环体里读的是**本次遍历的局部变量**(协程各自一份,互不干扰);
+      * 同时每轮把值抄进成员变量,供"循环结束后还想读最后一项"的
+        卡片使用(这种用法在循环体外,拿到的就是最后一次的值)。
     """
     var = _list_var(ctx, node)
     if var is None:
         ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
         _chain(ctx, node, indent, "结束后")
         return
-    item, index = _foreach_vars(ctx, node)
-    loop_var = ctx.new_temp("each")
-    ctx.add_line(indent, f"{index} = -1")
+    item_member, index_member = _foreach_member_vars(ctx, node)
+    local_item = ctx.new_temp("each_item")
+    local_index = ctx.new_temp("each_idx")
+    loop_var = ctx.new_temp("each_value")
+    # 记录"循环体从哪一层开始、写在哪一段",供输出表达式判断
+    # 自己是在循环体内(用局部变量)还是循环体外(用成员镜像)。
+    locals_table = getattr(ctx, "_foreach_locals", None)
+    if locals_table is None:
+        locals_table = {}
+        ctx._foreach_locals = locals_table
+    locals_table[node] = (local_item, local_index, ctx.sink, indent + 1)
+
+    ctx.add_line(indent, f"var {local_index} := -1")
     ctx.add_line(indent, f"for {loop_var} in {var}:")
-    ctx.add_line(indent + 1, f"{item} = {loop_var}")
-    ctx.add_line(indent + 1, f"{index} += 1")
+    ctx.add_line(indent + 1, f"{local_index} += 1")
+    ctx.add_line(indent + 1, f"var {local_item}: Variant = {loop_var}")
+    ctx.add_line(indent + 1, f"{item_member} = {local_item}")
+    ctx.add_line(indent + 1, f"{index_member} = {local_index}")
     before = len(ctx.sink)
     _chain(ctx, node, indent + 1, "循环体")
     if len(ctx.sink) == before:
@@ -1887,8 +1903,16 @@ def _stmt_list_foreach(ctx, node, indent):
 
 @multi_output("GKNodeListForEach")
 def _expr_list_foreach(ctx, node):
-    item, index = _foreach_vars(ctx, node)
-    return {"当前项": item, "下标": index}
+    item_member, index_member = _foreach_member_vars(ctx, node)
+    info = getattr(ctx, "_foreach_locals", {}).get(node)
+    if info is not None:
+        local_item, local_index, body_sink, body_indent = info
+        same_section = getattr(ctx, "sink", None) is body_sink
+        if same_section and getattr(ctx, "_current_indent", 0) >= body_indent:
+            return {"当前项": local_item, "下标": local_index}
+        ctx.note(f"『{node.bl_label}』的『当前项 / 下标』在循环体外使用 —— "
+                 f"读到的是最后一次遍历的值")
+    return {"当前项": item_member, "下标": index_member}
 
 
 @stmt_node("GKNodeDictSet")
@@ -2884,6 +2908,67 @@ def _stmt_multi_gate(ctx, node, indent):
         _chain(ctx, node, indent + 2, str(index + 1))
         if len(ctx.sink) == before:
             ctx.add_line(indent + 2, "pass")
+
+
+@stmt_node("GKNodeWhile")
+def _stmt_while(ctx, node, indent):
+    """『流程_当条件』(UE5 WhileLoop):条件为真就一直跑循环体。"""
+    before = len(ctx.sink)
+    condition = ctx.input_bool_expr(node, "条件", "false")
+    if len(ctx.sink) != before:
+        ctx.warn("『流程_当条件』的条件里含有需要『就地』执行的语句(射线等);"
+                 "它们只会在循环开始前执行一次,不会每圈重新发射")
+    if condition.replace(" ", "") in ("true", "(true)"):
+        ctx.warn("『流程_当条件』的条件是常量 true —— 游戏会卡死,"
+                 "请改成会变化的变量比较")
+    ctx.add_line(indent, f"while {condition}:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "循环体")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    _chain(ctx, node, indent, "结束后")
+
+
+def _switch_text_cases(ctx, node):
+    """把『分支文本』按 | 拆成 N 条;不够的补『选项N』。"""
+    try:
+        count = max(1, min(8, int(getattr(node, "gk_case_count", 2) or 2)))
+    except (TypeError, ValueError):
+        count = 2
+    raw = str(getattr(node, "gk_cases", "") or "").replace("｜", "|")
+    parts = [part.strip() for part in raw.split("|")]
+    while len(parts) < count:
+        parts.append(f"选项{len(parts) + 1}")
+    parts = parts[:count]
+    parts = [part or f"选项{index + 1}" for index, part in enumerate(parts)]
+    if len(set(parts)) < len(parts):
+        ctx.warn(f"『流程_多路文本』有重复的分支文本:{parts} —— 后面的重复项永远不会命中")
+    return parts
+
+
+@stmt_node("GKNodeSwitchText")
+def _stmt_switch_text(ctx, node, indent):
+    """『流程_多路文本』(UE5 Switch on String):按文本走不同出口。
+
+    用 if / elif 而不是 match:文本重复时 match 会直接编译失败,
+    if 只是"后面的永远不命中",不会拖垮整份脚本(而且会给告警)。
+    """
+    value = ctx.input_string(node, "值", "")
+    temp = ctx.new_temp("swt")
+    ctx.add_line(indent, f"var {temp} := String({value})")
+    cases = _switch_text_cases(ctx, node)
+    for index, case in enumerate(cases):
+        keyword = "if" if index == 0 else "elif"
+        ctx.add_line(indent, f"{keyword} {temp} == {gd_string(case)}:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 1, str(index + 1))
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 1, "pass")
+    ctx.add_line(indent, "else:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "默认")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
 
 
 @stmt_node("GKNodeRetriggerableDelay")

@@ -591,12 +591,78 @@ class TestFlow(Base):
         code, warnings = gen(tree, V3)
         self.assertEqual(warnings, [], warnings)
         self.assert_indent_sane(code)
-        self.assertIn("for _each", code)
-        self.assertRegex(code, r"_gk_item\w* = _each\d+")
-        self.assertRegex(code, r"print\(_gk_item\w*\)")
-        self.assertRegex(code, r"print\(_gk_idx\w*\)")
+        self.assertRegex(code, r"for _each_value\d+ in 背包:")
+        self.assertRegex(code, r"var _each_item\d+: Variant = _each_value\d+")
+        self.assertRegex(code, r"print\(_each_item\d+\)")
+        self.assertRegex(code, r"print\(_each_idx\d+\)")
+        self.assertRegex(code, r"_gk_item\w* = _each_item\d+")
         self.assertIn('print("完")', code)
-        self.assertLess(code.index("for _each"), code.index('print("完")'))
+        self.assertLess(code.index("for _each_value"), code.index('print("完")'))
+
+    def test_list_foreach_outside_body_uses_member_mirror(self):
+        """循环体外读『当前项』要能编译:回退到成员镜像(最后一次的值)。"""
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        new_list = tree.new_node(NN.GKNodeListNew, "新建", gk_var="背包")
+        each = tree.new_node(NN.GKNodeListForEach, "遍历", gk_var="背包")
+        done = tree.new_node(NN.GKNodePrint, "结束")
+        gk_stub.connect(tree, event, "执行", new_list, "执行")
+        gk_stub.connect(tree, new_list, "完成", each, "执行")
+        gk_stub.connect(tree, each, "结束后", done, "执行")
+        gk_stub.connect(tree, each, "当前项", done, "内容")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(code, r"print\(_gk_item\w*\)")
+
+    def test_while_loop(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        loop = tree.new_node(NN.GKNodeWhile, "当条件")
+        compare = tree.new_node(NN.GKNodeCompare, "条件",
+                                gk_op="GT", gk_a="10", gk_b="0.0")
+        body = tree.new_node(NN.GKNodePrint, "体", gk_text="体")
+        after = tree.new_node(NN.GKNodePrint, "完", gk_text="完")
+        gk_stub.connect(tree, event, "执行", loop, "执行")
+        gk_stub.connect(tree, compare, "结果", loop, "条件")
+        gk_stub.connect(tree, loop, "循环体", body, "执行")
+        gk_stub.connect(tree, loop, "结束后", after, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertIn("while (10 > 0.0):", code)
+        self.assertLess(code.index('print("体")'), code.index('print("完")'))
+
+    def test_while_constant_true_warns(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        loop = tree.new_node(NN.GKNodeWhile, "当条件")
+        cond = tree.new_node(NN.GKNodeConstBool, "恒真", gk_value=True)
+        body = tree.new_node(NN.GKNodePrint, "体", gk_text="体")
+        gk_stub.connect(tree, event, "执行", loop, "执行")
+        gk_stub.connect(tree, cond, "值", loop, "条件")
+        gk_stub.connect(tree, loop, "循环体", body, "执行")
+        _code, warnings = gen(tree, V3)
+        self.assertTrue(any("卡死" in warning for warning in warnings), warnings)
+
+    def test_switch_text_cases(self):
+        tree = make_tree()
+        event = tree.new_node(NN.GKNodeOnReady, "启动")
+        switch = tree.new_node(NN.GKNodeSwitchText, "文本分支", gk_cases="红|绿")
+        value = tree.new_node(NN.GKNodeConstText, "值", gk_value="绿")
+        first = tree.new_node(NN.GKNodePrint, "一", gk_text="红出口")
+        second = tree.new_node(NN.GKNodePrint, "二", gk_text="绿出口")
+        other = tree.new_node(NN.GKNodePrint, "默认", gk_text="默认出口")
+        gk_stub.connect(tree, event, "执行", switch, "执行")
+        gk_stub.connect(tree, value, "值", switch, "值")
+        gk_stub.connect(tree, switch, "1", first, "执行")
+        gk_stub.connect(tree, switch, "2", second, "执行")
+        gk_stub.connect(tree, switch, "默认", other, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assertRegex(code, r'if _swt\d+ == "红":')
+        self.assertRegex(code, r'elif _swt\d+ == "绿":')
+        self.assertRegex(code, r"else:\n\s+print\(\"默认出口\"\)")
 
 
 class TestVariablesAndSignals(Base):
@@ -20552,13 +20618,53 @@ class TestRound101SpecTexture(Base):
                     text = handle.read()
         file_name = curve_assets.image_file_name("形状图")
         self.assertIn("shader_parameter/use_specular_shape_texture = 1.0", text)
-        # sorted(TEXTURE_KEYS):mask 先(0)、shape 后(1)—— id 跟着这个顺序
-        self.assertIn(f'path="res://art/{file_name}" id="spec_1"', text)
-        self.assertIn('shader_parameter/specular_shape_texture = '
-                      'ExtResource("spec_1")', text)
+        # id 跟着 sorted(TEXTURE_KEYS) 的顺序走 —— 不写死 spec_1,
+        # 以后再加纹理槽位(比如 face_sdf)不会让这条测试变成假红。
+        found = re.search(
+            rf'path="res://art/{re.escape(file_name)}" id="(spec_\d+)"', text)
+        self.assertIsNotNone(found, text)
+        self.assertIn(f'shader_parameter/specular_shape_texture = '
+                      f'ExtResource("{found.group(1)}")', text)
         self.assertIn("shader_parameter/use_specular_mask_texture = 0.0", text)
         # load_steps 必须跟着多出来的 ext_resource 涨(少了 Godot 不认)
         self.assertIn("load_steps=3", text)
+
+    def test_face_sdf_shader_is_wired_in_both_toon_shaders(self):
+        root = os.path.join(ROOT, "BlenderGameKit", "shaders")
+        for name in ("gk_toon.gdshader", "gk_toon_lit.gdshader"):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("uniform sampler2D face_sdf", text, name)
+            self.assertIn("uniform float face_sdf_mix", text, name)
+            self.assertIn("uniform float face_sdf_use_uv2", text, name)
+            self.assertIn("float gk_face_shadow(", text, name)
+            # 采样必须是"UV.x 加偏移",不能把 UV.x 换成线位置
+            self.assertIn("base_uv.x + (line - face_sdf_neutral)", text, name)
+            self.assertNotIn("clamp(-dot(view_dir, light_view)", text, name)
+
+    def test_face_sdf_texture_exports_without_use_switch(self):
+        from BlenderGameKit import asset_export as ae
+        from BlenderGameKit import npr_preview as npr
+
+        class _Image:
+            name = "面部图"
+            size = (4, 4)
+
+        mat = self.FakeMat()
+        npr.set_texture(mat, "face_sdf", "面部图")
+        mat[npr.material_key("face_sdf_mix")] = 1.0
+        mat[npr.material_key("face_sdf_angle")] = 0.25
+        with mock.patch.object(ae, "_find_image", return_value=_Image()), \
+                mock.patch.object(ae, "_save_image"):
+            with tempfile.TemporaryDirectory() as folder:
+                path, _count = ae.write_npr_material(folder, mat)
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+        self.assertIn("shader_parameter/face_sdf = ExtResource(", text)
+        self.assertNotIn("use_face_sdf", text)
+        self.assertIn("shader_parameter/face_sdf_mix = 1.000000", text)
+        # 面部角度是 Blender 预览专用系数,运行时着色器没有这个 uniform
+        self.assertNotIn("shader_parameter/face_sdf_angle =", text)
 
     def test_missing_image_warns_and_keeps_switch_off(self):
         from BlenderGameKit import asset_export as ae

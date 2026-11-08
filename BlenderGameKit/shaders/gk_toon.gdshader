@@ -169,6 +169,22 @@ uniform float rim_amount : hint_range(0.0, 4.0) = 0.0;
 uniform float rim_width : hint_range(0.0, 1.0) = 0.55;
 uniform float rim_front : hint_range(0.0, 1.0) = 0.15;
 
+group_uniforms face_sdf;
+// Anime face shading: one clean shadow line looked up from a texture instead
+// of the blotchy geometric terminator. The texture is a horizontal strip:
+// left half = light from screen-left, right half = its mirror. White = lit,
+// black = shadow. Draw it on a second UV map (UV2) in Blender.
+uniform sampler2D face_sdf : hint_default_white, filter_linear, repeat_disable;
+uniform float face_sdf_mix : hint_range(0.0, 1.0) = 0.0;
+uniform float face_sdf_split : hint_range(0.05, 0.95) = 0.5;
+uniform float face_sdf_neutral : hint_range(0.0, 1.0) = 0.5;
+uniform float face_sdf_angle_scale : hint_range(0.25, 4.0) = 1.6;
+uniform float face_sdf_smooth : hint_range(0.001, 0.5) = 0.03;
+uniform float face_sdf_v_offset : hint_range(-0.5, 0.5) = 0.0;
+// 0 = use UV, 1 = use UV2. Simple face quads have no UV2 at all, and the
+// engine's fallback value for a missing UV2 is not something to rely on.
+uniform float face_sdf_use_uv2 : hint_range(0.0, 1.0) = 0.0;
+
 group_uniforms misc;
 uniform float alpha_cut : hint_range(0.0, 1.0) = 0.5;
 uniform float emission_amount : hint_range(0.0, 8.0) = 0.0;
@@ -176,6 +192,8 @@ uniform float eye_highlight_boost : hint_range(0.0, 8.0) = 0.0;
 
 // World position, used by the outline pass (next_pass) to keep width constant.
 varying vec3 gk_world_pos;
+// UV2 is not available in every stage; carry it so the face SDF can use it.
+varying vec2 gk_uv2;
 
 // A near-hard step that still antialiases. This is the heart of cel shading:
 // a smooth function squeezed into a very narrow band.
@@ -184,8 +202,42 @@ float gk_band(float x, float edge, float width) {
 	return smoothstep(edge - half_w, edge + half_w, x);
 }
 
+// Face shadow from the SDF strip. Returns -1 (full shadow) .. 1 (full lit).
+// light_view / view_dir are both in view space, so the line slides with the
+// light relative to the camera, not with the model's normals.
+float gk_face_shadow(vec3 light_view, vec3 view_dir, vec2 base_uv) {
+	float side = cross(view_dir, light_view).y;
+	// Godot's VIEW points from the camera toward the fragment, so a light
+	// BEHIND the head has a positive dot product here. (The old negative
+	// version darkened every face to full shadow -- fixed 2026-11-08.)
+	float behind = clamp(dot(view_dir, light_view) * 1.5, 0.0, 1.0);
+	float amount = clamp(abs(side) * face_sdf_angle_scale, 0.0, 1.0);
+
+	// Line position inside the strip: light from screen-right slides left,
+	// light from screen-left slides right.
+	float line = face_sdf_neutral;
+	if (side >= 0.0) {
+		line = mix(face_sdf_neutral, 0.0, amount);
+	} else {
+		line = mix(face_sdf_neutral, 1.0, amount);
+	}
+
+	// Sample the SDF with the face's own UV shifted by (line - neutral).
+	// Do NOT replace U with the line position: that samples a single column
+	// and the whole face becomes one flat colour (the mistake the Blender
+	// preview documents in npr_preview.py).
+	vec2 sdf_uv = vec2(base_uv.x + (line - face_sdf_neutral),
+		base_uv.y + face_sdf_v_offset);
+	float mask = texture(face_sdf, sdf_uv).r;
+	mask *= 1.0 - behind;
+
+	float raw = mask * 2.0 - 1.0;
+	return gk_band(raw, -0.5 + shadow_smooth, face_sdf_smooth) * 2.0 - 1.0;
+}
+
 void vertex() {
 	gk_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	gk_uv2 = UV2;
 }
 
 void fragment() {
@@ -238,6 +290,12 @@ void fragment() {
 		// A plain dot keeps the terminator crisp, which is the whole point of
 		// a cel look. (A half-lambert wrap would smear it out.)
 		float raw = dot(n_world, l_world);
+		if (face_sdf_mix > 0.001) {
+			vec3 light_view = normalize(mat3(VIEW_MATRIX) * l_world);
+			vec2 base_uv = face_sdf_use_uv2 > 0.5 ? gk_uv2 : UV;
+			float face = gk_face_shadow(light_view, normalize(VIEW), base_uv);
+			raw = mix(raw, face, face_sdf_mix);
+		}
 
 		float lit_factor = gk_band(raw, shadow_step, shadow_smooth);
 		vec3 shadow_col = base.rgb * shadow_tint.rgb * shadow_keep;
