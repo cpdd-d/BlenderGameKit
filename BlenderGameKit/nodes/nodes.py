@@ -73,6 +73,8 @@ ANIM_TREE_VALUE_NODES = (
     "GKNodeVectorMake", "GKNodeVectorSplit", "GKNodeVectorLength",
     "GKNodeVectorNormalize",
     "GKNodeCompare", "GKNodeLogic", "GKNodeConvert",
+    # 按条件挑一个值 —— 动画/AI/界面图里也能就地用
+    "GKNodeSelect",
     # 输入 / 手柄 —— "按住 A 且在地面"这类条件不用回玩法图拼
     "GKNodeKey", "GKNodeInputDirection",
     "GKNodeJoyAxis", "GKNodeJoyVector",
@@ -279,6 +281,8 @@ SUBCATEGORY_OF = {
     # 逻辑
     "GKNodeCompare": "逻辑",
     "GKNodeLogic": "逻辑",
+    # 选择 = "按条件挑一个值",和比较 / 布尔同属"加工数据"
+    "GKNodeSelect": "逻辑",
     # 转换
     "GKNodeConvert": "转换",
     # 把数值收拾成"给人看的文字"(整数不要 .0)—— 和类型转换是一族活

@@ -184,18 +184,6 @@ float gk_band(float x, float edge, float width) {
 	return smoothstep(edge - half_w, edge + half_w, x);
 }
 
-// Map raw lighting (-1..1) to the tint ramp (shadow2 -> shadow -> lit).
-vec3 gk_ramp(float raw) {
-	float band_lit = gk_band(raw, shadow_step, shadow_smooth);
-	if (three_tone > 0.5) {
-		float band_mid = gk_band(raw, shadow_step_2, shadow_smooth);
-		vec3 three = mix(shadow_tint_2.rgb, shadow_tint.rgb, band_mid);
-		return mix(three, lit_tint.rgb, band_lit);
-	}
-	vec3 mid = mix(shadow_tint_2.rgb, shadow_tint.rgb, band_lit);
-	return mix(mid, lit_tint.rgb, band_lit);
-}
-
 void vertex() {
 	gk_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 }
@@ -252,20 +240,38 @@ void fragment() {
 		float raw = dot(n_world, l_world);
 
 		float lit_factor = gk_band(raw, shadow_step, shadow_smooth);
-		vec3 ramp = gk_ramp(raw);
+		vec3 shadow_col = base.rgb * shadow_tint.rgb * shadow_keep;
+		vec3 lit_col = base.rgb * lit_tint.rgb * light_color.rgb * light_energy;
 
-		// Anime shadows are a TINT, not a darkening: shadowed areas keep
-		// `ambient` of the texture colour, pulled toward shadow_tint. Lit
-		// areas get the full banded ramp. Mixing the two by lit_factor keeps
-		// the transition exactly as hard as shadow_smooth says -- no ambient
-		// wash leaking over the band edge.
-		vec3 shadow_col = base.rgb * shadow_tint.rgb;
-		vec3 lit_col = base.rgb * ramp * light_color.rgb * light_energy;
-		vec3 cel = mix(shadow_col * shadow_keep, lit_col, lit_factor);
+		// ── Real 2 / 3 band shading ──────────────────────────────────
+		// The previous version mixed in gk_ramp() but then used lit_factor
+		// to pick between shadow_col and lit_col. Because lit_factor is
+		// 0 in the whole shadow region, the middle band was never selected:
+		// "three_tone" produced exactly the same two bands as two-tone.
+		// Here every band is its own colour, chosen by its own threshold:
+		//   raw < shadow_step_2  -> shadow_tint_2 (deepest)
+		//   shadow_step_2 .. shadow_step -> shadow_tint
+		//   raw > shadow_step    -> lit_tint * light
+		vec3 cel;
+		if (three_tone > 0.5) {
+			// Keep the second split strictly below the first one. If an artist
+			// sets shadow_step_2 above shadow_step, the "deepest" band would
+			// cover the lit area and the lit colour would disappear entirely.
+			float step2 = min(shadow_step_2, shadow_step - 0.001);
+			float deep_factor = gk_band(raw, step2, shadow_smooth);
+			vec3 deep_col = base.rgb * shadow_tint_2.rgb * shadow_keep;
+			cel = mix(deep_col, mix(shadow_col, lit_col, lit_factor), deep_factor);
+		} else {
+			cel = mix(shadow_col, lit_col, lit_factor);
+		}
 
 		// Floor: never let a texel go completely black. Fully shadowed anime
-		// characters are still readable, not silhouettes.
-		cel = max(cel, base.rgb * shadow_tint.rgb * shadow_keep * 0.85);
+		// characters are still readable, not silhouettes. The floor tint must
+		// follow the active mode: in two-tone the shadow colour is
+		// shadow_tint, so using shadow_tint_2 here would let a brighter
+		// deep-shadow colour leak into the two-tone look.
+		vec3 floor_tint = three_tone > 0.5 ? shadow_tint_2.rgb : shadow_tint.rgb;
+		cel = max(cel, base.rgb * floor_tint * shadow_keep * 0.85);
 		ALBEDO = cel;
 	}
 	// ── 绝对不要在这里写 ALPHA ────────────────────────────────────────

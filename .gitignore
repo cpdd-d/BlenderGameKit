@@ -25,6 +25,8 @@ _testrepo/
 # Local scratch
 .audit/
 *.log
+# 工具导出的运行时状态快照(和项目无关,单份十几 MB)
+state*.json
 # 脚本误用 %SystemDrive% 字面量时落进仓库的 Windows 缓存副本 —— 垃圾,不提交
 %SystemDrive%/
 # AI 助手的工作记忆(不是项目内容,只是本地会话记录)——别让它进公共仓库

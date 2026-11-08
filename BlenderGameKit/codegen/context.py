@@ -123,6 +123,10 @@ class GenContext:
         self._active = set()       # 沿执行流的递归栈，用于断环
         self._claimed = {}         # 节点 -> {入口引脚名: 哪个事件函数已经"拥有"它}
         self._current_event = ""   # 当前正在生成的事件标签(用于告警文案)
+        # 本次是从目标节点的哪个**执行入口**进来的。
+        # 单入口节点永远是『执行』;『流程_门』『流程_多路门』这类
+        # 多入口节点要靠它区分"打开 / 关闭 / 重置 / 执行"。
+        self.current_entry = "执行"
         self._expr_refs = {}       # "节点::输出名" -> 被引用次数(判断要不要抽临时变量)
         # 需要在 _process 里每帧执行的"后台行为"。
         # 相机震动这类效果不是一次性语句:它要跨帧衰减。
@@ -345,7 +349,11 @@ class GenContext:
                     self.warn(f"节点『{node.bl_label}』还没有实现代码生成，已跳过")
             else:
                 handler(self, node, indent)
-            _chain(self, node, indent, output)
+            # 少数节点自己管执行流(『等待_可重触发』要把下游放进
+            # "还是最后一次触发吗"的分支里)。它们声明 gk_owns_flow,
+            # 这里就不要再无条件续接一次 —— 否则下游会执行两遍。
+            if not getattr(node, "gk_owns_flow", False):
+                _chain(self, node, indent, output)
         finally:
             (self._expr_cache, self._current_indent, self._expr_indent) = saved
 

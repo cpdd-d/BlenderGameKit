@@ -203,6 +203,140 @@ def _expr_compare(ctx, node):
     return f"({left} {symbol} {right})"
 
 
+def _select_helper(ctx, kind):
+    """『运算_选择』的类型转换辅助函数(每种类型只生成一份)。
+
+    ── 为什么不能直接写 float(A) / bool(A) ────────────────────────
+    这两者只接受特定类型:实测 `bool("abc")` / `bool(Vector3)` /
+    `float(Vector3)` 都是 **Parse Error**,会让整份脚本加载失败。
+    A/B 是"任意值"引脚,用户完全可能接错;所以统一走一个 Variant 参数
+    的辅助函数,在里面按 `is` 判断后再转换,任何来源都能安全落地。
+    """
+    cache = getattr(ctx, "_gk_select_helpers", None)
+    if cache is None:
+        cache = {}
+        ctx._gk_select_helpers = cache
+    if kind in cache:
+        return cache[kind]
+
+    if kind == "text":
+        name = ctx.declare_func_name("_gk_select_text", key="select_text")
+        lines = ["    return str(a if cond else b)"]
+        returns = "String"
+    elif kind == "bool":
+        name = ctx.declare_func_name("_gk_select_bool", key="select_bool")
+        lines = [
+            "    var v: Variant = a if cond else b",
+            "    if v is bool:",
+            "        return bool(v)",
+            "    if v is int:",
+            "        return v != 0",
+            "    if v is float:",
+            "        return v != 0.0",
+            "    if v is String:",
+            "        return not String(v).is_empty()",
+            "    if v is Vector2:",
+            "        return v != Vector2.ZERO",
+            "    if v is Vector3:",
+            "        return v != Vector3.ZERO",
+            "    return v != null",
+        ]
+        returns = "bool"
+    elif kind == "vector":
+        name = ctx.declare_func_name("_gk_select_vec", key="select_vector")
+        if ctx.dim == 2:
+            lines = [
+                "    var v: Variant = a if cond else b",
+                "    if v is Vector2:",
+                "        return Vector2(v.x, v.y)",
+                "    if v is Vector3:",
+                "        return Vector2(v.x, v.y)",
+                "    if v is float:",
+                "        return Vector2(v, 0.0)",
+                "    if v is int:",
+                "        return Vector2(float(v), 0.0)",
+                "    return Vector2.ZERO",
+            ]
+            returns = "Vector2"
+        else:
+            lines = [
+                "    var v: Variant = a if cond else b",
+                "    if v is Vector3:",
+                "        return Vector3(v.x, v.y, v.z)",
+                "    if v is Vector2:",
+                "        return Vector3(v.x, v.y, 0.0)",
+                "    if v is float:",
+                "        return Vector3(v, 0.0, 0.0)",
+                "    if v is int:",
+                "        return Vector3(float(v), 0.0, 0.0)",
+                "    return Vector3.ZERO",
+            ]
+            returns = "Vector3"
+    else:
+        name = ctx.declare_func_name("_gk_select_float", key="select_float")
+        lines = [
+            "    var v: Variant = a if cond else b",
+            "    if v is float:",
+            "        return float(v)",
+            "    if v is int:",
+            "        return float(v)",
+            "    if v is bool:",
+            "        return 1.0 if v else 0.0",
+            "    if v is String:",
+            "        return float(v)",
+            "    if v is Vector2:",
+            "        return v.x",
+            "    if v is Vector3:",
+            "        return v.x",
+            "    return 0.0",
+        ]
+        returns = "float"
+
+    empty_returns = {
+        "String": '    return ""',
+        "bool": "    return false",
+        "float": "    return 0.0",
+        "Vector2": "    return Vector2.ZERO",
+        "Vector3": "    return Vector3.ZERO",
+    }
+    ctx.extra_sections.append({
+        "signature": f"func {name}(cond: bool, a: Variant, b: Variant) -> {returns}:",
+        "lines": lines,
+        "empty_body": empty_returns.get(returns, "    return null"),
+        "separator": True,
+    })
+    cache[kind] = name
+    return name
+
+
+@expr_node("GKNodeSelect")
+def _expr_select(ctx, node):
+    """『运算_选择』(UE5 Select):三元表达式 + 类型安全转换。
+
+    未接线时给对应类型的零值;已接线但类型不匹配时由辅助函数兜底,
+    不会生成 `bool("abc")` / `float(Vector3)` 这类 Parse Error。
+    """
+    condition = ctx.input_bool_expr(node, "条件", "false")
+    kind = str(getattr(node, "gk_value_type", "FLOAT") or "FLOAT").lower()
+    if kind == "text":
+        helper = _select_helper(ctx, "text")
+        a = ctx.input_string(node, "A", "")
+        b = ctx.input_string(node, "B", "")
+    elif kind == "bool":
+        helper = _select_helper(ctx, "bool")
+        a = ctx.input_bool_expr(node, "A", "false")
+        b = ctx.input_bool_expr(node, "B", "false")
+    elif kind == "vector":
+        helper = _select_helper(ctx, "vector")
+        a = ctx.input_vector(node, "A")
+        b = ctx.input_vector(node, "B")
+    else:
+        helper = _select_helper(ctx, "float")
+        a = ctx.input_number(node, "A", "0.0")
+        b = ctx.input_number(node, "B", "0.0")
+    return f"{helper}({condition}, {a}, {b})"
+
+
 @expr_node("GKNodeLogic")
 def _expr_logic(ctx, node):
     """与 / 或 / 非 / 异或 —— 输入引脚数量由节点自己长(见 nodes.GKNodeLogic)。

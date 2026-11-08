@@ -10,7 +10,7 @@
    写 `// 基础颜色` 会直接报 `Tokenizer: Unknown character #22522`。
    所以所有 `.gdshader` 都只有英文注释,中文说明就在本文件里。
 
-2. **`light()` 里没有 `LIGHT_ENERGY`,也没有 `SPECULAR_LIGHT`。**
+2. **`light()` 里没有 `LIGHT_ENERGY`，但有 `SPECULAR_LIGHT`。**
    实测(Godot 4.7.2,用 `scripts/verify_shaders.py` 逐个探测)：
 
    | 内置量 | 是否存在 |
@@ -18,11 +18,12 @@
    | `LIGHT_COLOR` / `LIGHT` / `NORMAL` / `VIEW` | 存在 |
    | `ATTENUATION` / `LIGHT_IS_DIRECTIONAL` / `BACKLIGHT` | 存在 |
    | `DIFFUSE_LIGHT` | 存在(可累加) |
-   | `SPECULAR_LIGHT` | **不存在** |
+   | `SPECULAR_LIGHT` | 存在(可累加,`gk_toon_lit.gdshader` 在用) |
    | `LIGHT_ENERGY` / `LIGHT_SIZE` / `LIGHT_ATTENUATION` / `LIGHT_BACKLIGHT` | **不存在** |
 
-   光源能量已经折进 `LIGHT_COLOR` 了。所以卡通高光**必须**在 `fragment()` 里
-   算,再通过 `EMISSION` 推出去。
+   光源能量已经折进 `LIGHT_COLOR` 了。卡通高光有两条路:
+   `gk_toon.gdshader`(unshaded)在 `fragment()` 里算进 `ALBEDO`;
+   `gk_toon_lit.gdshader`(跟随场景光照)在 `light()` 里累加 `SPECULAR_LIGHT`。
 
 3. **`fragment()` 里没有 `SPECULAR_LIGHT`,但有 `SPECULAR` / `ROUGHNESS` / `METALLIC`。**
    所以要关掉引擎自带的柔和高光,就把 `ROUGHNESS = 1.0` 且 `SPECULAR = 0.0`。
@@ -61,15 +62,20 @@ $Model.material_override = mat
 |---|---|---|
 | `shadow_step` | 明暗分界的位置 | 调大 → 亮部变小(更"背光");调小 → 亮部变大 |
 | `shadow_smooth` | 分界边的软硬 | `0.004` 硬得能割手;`0.15` 偏柔;默认 `0.02` |
-| `three_tone` | 打开三阶明暗 | 配合 `shadow_step_2`(第二道分界) |
+| `three_tone` | 打开三阶明暗 | 配合 `shadow_step_2`(第二道分界)与 `shadow_tint_2`(最深一档) |
 | `shadow_tint` | **暗部颜色** | 二次元的暗部不是灰的,是**蓝紫**。默认 `(0.706, 0.627, 0.902)` |
+| `shadow_tint_2` | **最深一档阴影色** | 只在 `three_tone` 打开时占 `shadow_step_2` 以下那一档 |
 | `lit_tint` | 亮部颜色 | 默认带一点暖色 `(1.0, 0.976, 0.914)` |
 | `specular_amount` / `specular_size` / `specular_smooth` / `specular_color` | 硬边高光斑(强度/大小/边缘软硬/颜色) | 二次元里通常 `0.2~0.6`,不要给大 |
 | `specular_shape_texture` | **用贴图控制高光的剖面(形状)** | 见下 · 第一百零一轮 |
 | `specular_mask_texture` | **用贴图控制高光长在哪儿** | 见下 · 第一百零一轮 |
 | `rim_amount` / `rim_width` | 边缘光 | 把角色从背景里"抠"出来,`0.5~1.0` |
-| `backlight_amount` | 背光轮廓 | 光从背后来时的一圈暖色,`0~0.8` |
-| `light_map` + `light_map_mix` | **用贴图控制阴影形状** | 见下 |
+| `emission_amount` | 自发光强度 | 在 `unshaded` 下是加到 `ALBEDO` 上的,不是 `EMISSION` |
+| `eye_highlight_boost` | 眼睛高光 | 贴图里亮像素越多,眼睛越"亮" |
+
+> 早期的 `backlight_amount` / `light_map` / `light_map_mix` /
+> `shadow_strength` / `toon_exposure` 已经从着色器里移除;现在写进 `.tres`
+> 只会让 Godot 刷 "shader parameter not found" 警告。导出模板也已经清掉了。
 
 ### ⚠ `unshaded` 下 `EMISSION` 是**死的**(第一百零一轮真机标定)
 
@@ -141,16 +147,14 @@ $Model.material_override = mat
 `write_cull_shader`;真机对照见 `scripts/check_lights_demo.py`(地面勾了、
 角色没勾,探针断言两块材质的着色器不一样)。
 
-### `light_map`:让美术控制阴影,而不是让光角度控制
+### `light_map`（已移除，别再照旧文档写）
 
-这是二次元角色最关键的开关之一。做法:
+早期版本有过 `light_map` + `light_map_mix`：用第二套 UV 上的灰度图控制
+阴影形状。这个方案已经**从着色器里整段删掉**——现在写进材质只会得到
+"shader parameter not found"，画面不会有任何变化。
 
-1. 在 Blender 里给模型加**第二套 UV**(`UV2`)
-2. 在那套 UV 上画一张灰度图:白 = 该处受光,黑 = 该处永远在阴影里
-   (典型用法:刘海的投影、鼻子的投影、裙子内侧)
-3. 导出后把它设成材质的 `light_map`,`light_map_mix` 拉到 `0.6~1.0`
-
-这样打光角度变化时,脸上的阴影**不会乱跑**——这正是日式动画的做法。
+想固定脸上的阴影形状，用下一节的 **面部阴影 SDF**（`face_sdf` 系列），
+那是现在唯一的、真正被着色器读取的方案。
 
 ---
 
@@ -629,7 +633,6 @@ demo 里是 4 个球 + 1 个胶囊,分别演示:基础两阶 / 超硬边 / 三�
 - [x] **Blender 端预览** —— 已实现,见第三节
 - [x] **面部 SDF 的 Blender 预览** —— 已实现(直接给角度的近似版),见第三节
 - [x] **卡通描边动画(手绘抖动)** —— 已实现,见第四节
-- [x] **导出 .tres 的完整参数映射** —— 已实现,23 个参数全部透传
+- [x] **导出 .tres 的完整参数映射** —— 已实现,24 个参数全部透传
 - [ ] **高光形状贴图**:用一张贴图决定高光形状(圆形/星形/条形)
-- [ ] **在 Blender 里预览 light_map**:给节点加第二套 UV 的选择与预览
 - [ ] **多光源的面部 SDF**:目前只取场景里第一盏太阳光

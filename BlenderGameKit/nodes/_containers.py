@@ -89,6 +89,38 @@ class GKNodeListGet(B.GKStatementNode):
 
 
 # ==========================================================================
+# 列表(续):遍历
+# ==========================================================================
+@N
+class GKNodeListForEach(B.GKStatementNode):
+    bl_idname = "GKNodeListForEach"
+    bl_label = "列表_遍历"
+    bl_icon = "FILE_REFRESH"
+    gk_category = "列表"
+    gk_doc = ("照 UE5 的 ForEachLoop:把列表里的每一项依次交给『循环体』,"
+              "全部走完再走『结束后』。\n"
+              "『当前项』和『下标』(从 0 开始)可以直接接到循环体里的卡片上;"
+              "列表为空时『循环体』一次都不跑,但『结束后』照样会走。\n"
+              "⚠ 当前项/下标是脚本成员变量:同一个遍历节点不要同时跑两份"
+              "(循环体里又触发同一个遍历会互相覆盖)。")
+    gk_inputs = (S.pin(FLOW, "执行"),)
+    gk_outputs = (
+        S.pin(FLOW, "循环体"),
+        S.pin(FLOW, "结束后"),
+        S.pin(ANY, "当前项", 0),
+        S.pin(INT, "下标", 0),
+    )
+    gk_prop_defs = (
+        ("gk_var", "string", "items", "列表变量名", "要遍历哪个列表变量"),
+    )
+    # 执行流由处理器自己接管(循环体 / 结束后两条出口)
+    gk_owns_flow = True
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_var", text="")
+
+
+# ==========================================================================
 # 字典
 # ==========================================================================
 @N

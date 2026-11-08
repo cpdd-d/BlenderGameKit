@@ -41,13 +41,16 @@ MATERIAL_VARIANTS = [
         "specular_amount": 0.0, "rim_amount": 0.0,
     }),
     ("Albedo03_three_tone", (0.90, 0.80, 0.98), {
-        "shadow_step": 0.22, "shadow_step_2": -0.15, "shadow_smooth": 0.02,
+        # 正对相机的光 + 两道分界,让三档变成可见的"中心亮 / 中间环 / 边缘深"。
+        # 光从斜上方来时三档挤在球顶一小块,肉眼根本看不出第三档。
+        "light_dir": "Vector3(0, 0, 1)",
+        "shadow_step": 0.86, "shadow_step_2": 0.36, "shadow_smooth": 0.02,
         "three_tone": 1.0, "specular_amount": 0.0, "rim_amount": 0.0,
     }),
     ("Albedo04_full", (0.98, 0.86, 0.84), {
         "shadow_step": 0.14, "shadow_smooth": 0.02, "three_tone": 0.0,
         "specular_amount": 0.55, "specular_size": 0.82,
-        "rim_amount": 0.85, "rim_width": 0.45, "backlight_amount": 0.5,
+        "rim_amount": 0.85, "rim_width": 0.45,
     }),
 ]
 
@@ -83,14 +86,15 @@ def make_material(name, albedo, params, with_outline, textures=None,
         "shader_parameter/albedo_color = Color({:.3f}, {:.3f}, {:.3f}, 1)".format(*albedo)
     )
     lines.append("shader_parameter/albedo_strength = 1.0")
-    lines.append("shader_parameter/light_map_mix = 0.0")
-    lines.append("shader_parameter/lit_tint = Color(1, 0.976, 0.914, 1)")
-    lines.append("shader_parameter/shadow_tint = Color(0.706, 0.627, 0.902, 1)")
-    lines.append("shader_parameter/shadow_tint_2 = Color(0.478, 0.42, 0.722, 1)")
-    lines.append("shader_parameter/shadow_strength = 1.0")
+    for key, default in (
+        ("lit_tint", "Color(1, 0.976, 0.914, 1)"),
+        ("shadow_tint", "Color(0.706, 0.627, 0.902, 1)"),
+        ("shadow_tint_2", "Color(0.478, 0.42, 0.722, 1)"),
+    ):
+        if key not in params:
+            lines.append(f"shader_parameter/{key} = {default}")
     lines.append("shader_parameter/rim_color = Color(0.75, 0.85, 1, 1)")
     lines.append("shader_parameter/rim_front = 0.15")
-    lines.append("shader_parameter/backlight_color = Color(1, 0.75, 0.55, 1)")
     lines.append("shader_parameter/emission_amount = 0.0")
     lines.append("shader_parameter/alpha_cut = 0.5")
     lines.append("shader_parameter/eye_highlight_boost = 0.0")
@@ -166,7 +170,6 @@ def make_scene():
         "shader_parameter/shadow_tint = Color(0.706, 0.627, 0.902, 1)\n"
         "shader_parameter/specular_amount = 0.0\n"
         "shader_parameter/rim_amount = 0.0\n"
-        "shader_parameter/backlight_amount = 0.0\n"
         "shader_parameter/face_sdf_mix = 1.0\n"
         'shader_parameter/face_sdf = ExtResource("tex_sdf")\n'
         "shader_parameter/face_sdf_angle_scale = 1.6\n"
@@ -188,7 +191,6 @@ def make_scene():
         "shader_parameter/specular_size = 0.8\n"
         "shader_parameter/rim_amount = 0.9\n"
         "shader_parameter/rim_width = 0.45\n"
-        "shader_parameter/backlight_amount = 0.6\n"
         'next_pass = SubResource("outline_pass")',
         '[sub_resource type="Environment" id="env"]\n'
         "background_mode = 1\n"
@@ -337,6 +339,52 @@ def make_spec_scene():
     return write(os.path.join(OUT, "spec.tscn"), "\n".join(parts) + "\n")
 
 
+def make_tone_scene():
+    """两色调 vs 三色调的分档探针场景(一颗球,只换材质)。
+
+    为什么单独开一个场景、而不是在 Main 里数像素:
+    Main 有地板 / 胶囊 / 背景,颜色统计会被环境和抗锯齿污染;
+    这里只有一颗球 + 纯色背景,扫描中线就能数出"几档颜色"。
+    """
+    ext = [
+        '[ext_resource type="Shader" path="res://shaders/gk_toon.gdshader" id="sh_toon"]',
+        '[ext_resource type="Script" path="res://tone_probe.gd" id="sh_tone"]',
+        '[ext_resource type="ShaderMaterial" path="res://materials/Tone_two.tres" id="m_tone"]',
+    ]
+    subs = [
+        '[sub_resource type="SphereMesh" id="tone_sphere"]\n'
+        "radius = 0.9\n"
+        "height = 1.8\n"
+        "radial_segments = 64\n"
+        "rings = 32",
+        '[sub_resource type="Environment" id="tone_env"]\n'
+        "background_mode = 1\n"
+        "background_color = Color(0.01, 0.01, 0.02, 1)\n"
+        "ambient_light_source = 3\n"
+        "ambient_light_energy = 0.0\n"
+        "tonemap_mode = 2",
+    ]
+    parts = [f"[gd_scene load_steps={len(ext) + len(subs) + 1} format=3]", ""]
+    parts += ext
+    parts.append("")
+    parts += subs
+    parts.append("")
+    parts.append('[node name="ToneRoot" type="Node3D"]')
+    parts.append('script = ExtResource("sh_tone")')
+    parts.append("")
+    parts.append('[node name="WorldEnvironment" type="WorldEnvironment" parent="."]')
+    parts.append('environment = SubResource("tone_env")')
+    parts.append("")
+    parts.append('[node name="Camera" type="Camera3D" parent="."]')
+    parts.append("transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3.2)")
+    parts.append("fov = 45.0")
+    parts.append("")
+    parts.append('[node name="ToneBall" type="MeshInstance3D" parent="."]')
+    parts.append('mesh = SubResource("tone_sphere")')
+    parts.append('material_override = ExtResource("m_tone")')
+    return write(os.path.join(OUT, "tone.tscn"), "\n".join(parts) + "\n")
+
+
 def main():
     if not os.path.isdir(SHADER_SRC):
         print(f"找不到着色器目录: {SHADER_SRC}")
@@ -390,11 +438,36 @@ def main():
     make_scene()
     make_spec_scene()
 
+    # 两色调 / 三色调分档探针(三色调必须真的出现第三档,不能被当成两档糊过去)
+    tone_common = {
+        "light_dir": "Vector3(0, 0, 1)",
+        "ambient": 1.0,
+        "specular_amount": 0.0,
+        "rim_amount": 0.0,
+        "shadow_smooth": 0.002,
+        "lit_tint": "Color(1, 1, 1, 1)",
+        "shadow_tint": "Color(0.72, 0.66, 0.90, 1)",
+        "shadow_tint_2": "Color(0.35, 0.30, 0.55, 1)",
+    }
+    two = dict(tone_common)
+    two.update({"shadow_step": 0.85, "three_tone": 0.0})
+    three = dict(tone_common)
+    # ⚠ 阈值不能贴着 0 附近:透视投影下**可见表面**的法线最多只到
+    # R/d ≈ 0.28,所以第二道分界放 -0.15 时"深阴影环"只有几个像素宽,
+    # 会被抗锯齿抹掉 —— 探针就会误报成"只有两档"。0.70 / 0.90 能让
+    # 三档在屏幕上都有足够宽的可见面积。
+    three.update({"shadow_step": 0.90, "shadow_step_2": 0.70,
+                  "three_tone": 1.0})
+    make_material("Tone_two", (1.0, 1.0, 1.0), two, with_outline=False)
+    make_material("Tone_three", (1.0, 1.0, 1.0), three, with_outline=False)
+    make_tone_scene()
+
     print(f"已生成 NPR demo: {OUT}")
     print(f"  着色器: {', '.join(copied)}")
-    print(f"  材质变体: {len(MATERIAL_VARIANTS)} 个 + 高光贴图 3 份")
+    print(f"  材质变体: {len(MATERIAL_VARIANTS)} 个 + 高光贴图 3 份 + 分档 2 份")
     print("  场景: Main.tscn (4 个球对比 + 带描边的胶囊 + 面部 SDF 头像)")
     print("        spec.tscn (高光贴图探针:实心 / 空心环 / 被遮罩抹掉)")
+    print("        tone.tscn (两色调 2 档 / 三色调 3 档)")
     return 0
 
 

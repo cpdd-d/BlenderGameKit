@@ -92,7 +92,12 @@ def _emit_body(ctx, node, indent, output="完成", entry="执行"):
     #    可能拿到同一个 id，于是新节点被误判成"已被别的节点占用"，
     #    冒出一条莫名其妙的"同时被两个事件引用"告警(实测)。
     #    用对象当键还能顺带把它们**保持存活**，id 复用问题自然消失。
-    if node in ctx._active:
+    # 断环用「节点 + 入口」当键,不是只用节点。
+    # 多入口节点(『流程_门』的打开/关闭/切换、『流程_多路门』的重置)
+    # 合法地会在一条链里以**另一个入口**再次出现 —— 只按节点记账会把它
+    # 误判成回路,整段丢掉,还报一句"游戏里会无限循环"。
+    active_key = (node, entry)
+    if active_key in ctx._active:
         ctx.warn(f"检测到执行流回路，已在『{node.bl_label}』处断开(游戏里会无限循环)")
         return
     # Blender 的输入引脚只允许一条连线，所以**同一个入口**不可能真的被两个
@@ -113,11 +118,14 @@ def _emit_body(ctx, node, indent, output="完成", entry="执行"):
         )
         return
     owners[entry] = ctx._current_event
-    ctx._active.add(node)
+    ctx._active.add(active_key)
+    previous_entry = getattr(ctx, "current_entry", "执行")
+    ctx.current_entry = entry
     try:
         ctx.emit_statement(node, indent, output)
     finally:
-        ctx._active.discard(node)
+        ctx.current_entry = previous_entry
+        ctx._active.discard(active_key)
 
 
 def _next_nodes(node, output="完成"):

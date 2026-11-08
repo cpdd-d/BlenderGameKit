@@ -241,6 +241,36 @@ class GKNodeLogic(B.GKExpressionNode):
 
 
 @N
+class GKNodeSelect(B.GKExpressionNode):
+    bl_idname = "GKNodeSelect"
+    bl_label = "运算_选择"
+    bl_icon = "ARROW_LEFTRIGHT"
+    gk_category = "运算"
+    gk_doc = ("照 UE5 的 Select:条件为真取 A,为假取 B。\n"
+              "先在『类型』里选数值 / 文本 / 布尔 / 向量,A 和 B 会按那个类型"
+              "统一转换 —— 两边类型不一致也能生成**类型稳定**的 GDScript"
+              "(不会变成 Variant 让下游 `var :=` 推断失败)。\n"
+              "一张卡替掉『如果_否则』两张分支卡。")
+    gk_inputs = (
+        S.pin(BOOL, "条件", True),
+        S.pin(ANY, "A", 0),
+        S.pin(ANY, "B", 0),
+    )
+    gk_outputs = (S.pin(ANY, "结果", 0),)
+    gk_prop_defs = (
+        ("gk_value_type", "enum", "FLOAT", "类型", "A/B 按哪种类型输出", (
+            ("FLOAT", "数值", ""),
+            ("TEXT", "文本", ""),
+            ("BOOL", "布尔", ""),
+            ("VECTOR", "向量", ""),
+        )),
+    )
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, "gk_value_type", text="")
+
+
+@N
 class GKNodeRandomRange(B.GKExpressionNode):
     bl_idname = "GKNodeRandomRange"
     bl_label = "数学_随机整数"

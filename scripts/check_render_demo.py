@@ -116,6 +116,15 @@ def run_spec_render(godot):
     return (run.stdout or "") + (run.stderr or "")
 
 
+def run_tone_render(godot):
+    """两色调 / 三色调分档探针:一颗球,数中线上的明暗档数。"""
+    run = subprocess.run(
+        [godot, "--path", DEMO, "res://tone.tscn", "--resolution", "480x480"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=180)
+    return (run.stdout or "") + (run.stderr or "")
+
+
 def run_sweep(godot):
     """真窗口跑扫光。返回 (stdout+stderr, 是否开得起来)。"""
     if os.path.isdir(OUT):
@@ -347,6 +356,50 @@ def main():
 
     if spec_problems:
         for problem in spec_problems:
+            log("✗ " + problem)
+        print("CHECK_RENDER_DEMO=FAILED")
+        return 1
+
+    # ---- 两色调 / 三色调:三色调必须真的多出一档 ----
+    # 这一层专治"参数写了、着色器也编译了,但三色调画出来还是两档"——
+    # 静态 grep 和单张图都看不出来,只有数中线颜色能证明。
+    tone_problems = []
+    if len(files) >= 1:
+        try:
+            tone_text = run_tone_render(godot)
+        except subprocess.TimeoutExpired:
+            tone_text = ""
+            tone_problems.append("分档探针超时")
+        for line in tone_text.splitlines():
+            if "GK_TONE" in line:
+                log(line.strip())
+        bands = {}
+        for name in ("two", "three"):
+            found = re.search(rf"GK_TONE name={name} bands=(\d+)", tone_text)
+            if found:
+                bands[name] = int(found.group(1))
+        if "GK_TONE=DONE" not in tone_text:
+            tone_problems.append("分档探针没跑完(开得出窗口却挂了?)")
+        elif len(bands) < 2:
+            tone_problems.append(f"分档统计不全:{bands}")
+        else:
+            if bands["two"] != 2:
+                tone_problems.append(
+                    f"两色调出现了 {bands['two']} 档(期望 2 档)")
+            if bands["three"] < 3:
+                tone_problems.append(
+                    f"三色调只有 {bands['three']} 档(期望 ≥3 —— "
+                    f"阴影_tint_2 那一档没画出来)")
+            if bands["three"] <= bands["two"]:
+                tone_problems.append(
+                    f"三色调没有比两色调多一档(two={bands['two']} "
+                    f"three={bands['three']})")
+            log(f"分档数:两色调={bands['two']} 三色调={bands['three']}")
+    else:
+        log("跳过分档探针:开不出窗口 / 没有 GPU")
+
+    if tone_problems:
+        for problem in tone_problems:
             log("✗ " + problem)
         print("CHECK_RENDER_DEMO=FAILED")
         return 1

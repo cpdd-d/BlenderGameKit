@@ -54,7 +54,6 @@ PARAM_MAP = (
     ("lit_tint", "lit_tint", "COLOR", (1.0, 0.976, 0.914), "受光颜色"),
     ("shadow_tint", "shadow_tint", "COLOR", (0.706, 0.627, 0.902), "阴影颜色"),
     ("shadow_tint_2", "shadow_tint_2", "COLOR", (0.478, 0.420, 0.722), "深阴影颜色"),
-    ("shadow_strength", "shadow_strength", "VALUE", 1.0, "阴影强度"),
     ("specular_amount", "specular_amount", "VALUE", 0.25, "高光强度"),
     # 第一百零一轮:高光大小 / 边缘软硬 / 颜色本来只在着色器里有默认值,
     # **从来没被导出过**(Blender 侧根本没有这三个参数)—— 这一轮补齐。
@@ -66,7 +65,6 @@ PARAM_MAP = (
     ("rim_width", "rim_width", "VALUE", 0.55, "边缘光宽度"),
     ("emission_amount", "emission_amount", "VALUE", 0.0, "自发光强度"),
     ("alpha_cut", "alpha_cut", "VALUE", 0.5, "透明裁剪"),
-    ("light_map_mix", "light_map_mix", "VALUE", 0.0, "光照贴图混合"),
     # ---- 面部阴影 SDF ----
     # 参数**直接对应 Godot 的同名 uniform**,但语义上有一处刻意的差异:
     #   Godot 的 face_sdf_angle_scale 是"光照方向与相机夹角"的放大倍率;
@@ -94,7 +92,6 @@ PARAM_LIMITS = {
     "shadow_step_2": (-1.0, 1.0),
     "three_tone": (0.0, 1.0),
     "shadow_smooth": (0.001, 0.6),
-    "shadow_strength": (0.0, 4.0),
     "specular_amount": (0.0, 4.0),
     "specular_size": (0.0, 1.0),
     "specular_smooth": (0.005, 0.5),
@@ -102,7 +99,6 @@ PARAM_LIMITS = {
     "rim_width": (0.0, 1.0),
     "emission_amount": (0.0, 8.0),
     "alpha_cut": (0.0, 1.0),
-    "light_map_mix": (0.0, 1.0),
     "face_sdf_mix": (0.0, 1.0),
     "face_sdf_angle": (-1.0, 1.0),
     "face_sdf_neutral": (0.0, 1.0),
@@ -300,7 +296,9 @@ def _configure_ramp(ramp_node, params, soft=False):
     """把参数写进 ColorRamp。
 
     色标顺序对应 Godot 的三段:深阴影 / 阴影 / 受光。
-    three_tone 关闭时把中间色标压到与深阴影同一位置,等于只有两段。
+    两色调时**底部用 shadow_tint(不是 shadow_tint_2)** —— 运行时
+    gk_toon.gdshader 的两色调阴影就是 shadow_tint,预览必须一致;
+    三色调时中间色标放在第二道分界 shadow_step_2 上,才是真正的三段。
     """
     ramp = ramp_node.color_ramp
     ramp.interpolation = "LINEAR" if soft else "CONSTANT"
@@ -311,17 +309,21 @@ def _configure_ramp(ramp_node, params, soft=False):
     pos_b = to_pos(params.get("shadow_step_2", -0.45))
     three = float(params.get("three_tone", 0.0)) > 0.5
 
-    ramp.elements[0].position = min(pos_b, pos_a - 0.01)
-    ramp.elements[0].color = to_linear_rgb(
-        params.get("shadow_tint_2", (0.478, 0.420, 0.722))) + (1.0,)
+    # 第一道分界(受光 / 阴影)永远落在 pos_a。
     ramp.elements[1].position = pos_a
     ramp.elements[1].color = to_linear_rgb(
         params.get("lit_tint", (1.0, 0.976, 0.914))) + (1.0,)
-    mid = ramp.elements.new((pos_a + pos_b) * 0.5)
-    mid.color = to_linear_rgb(
+
+    # 第二道分界之前是阴影区。三色调时把"最深"给 shadow_tint_2,
+    # 中间一道给 shadow_tint;两色调时整个阴影区都是 shadow_tint。
+    deepest = to_linear_rgb(
+        params.get("shadow_tint_2", (0.478, 0.420, 0.722))) + (1.0,)
+    shadow = to_linear_rgb(
         params.get("shadow_tint", (0.706, 0.627, 0.902))) + (1.0,)
-    if not three:
-        mid.position = ramp.elements[0].position
+    ramp.elements[0].position = min(pos_b, pos_a - 0.01)
+    ramp.elements[0].color = deepest if three else shadow
+    mid = ramp.elements.new(pos_b if three else ramp.elements[0].position)
+    mid.color = shadow
 
 
 def build_face_sdf_nodes(b, tree, values, uv_out, shaded):

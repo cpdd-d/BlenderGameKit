@@ -39,7 +39,6 @@ shader_parameter/lit_tint = Color(1, 0.976, 0.914, 1)
 shader_parameter/shadow_tint = Color(0.706, 0.627, 0.902, 1)
 shader_parameter/specular_amount = 0.0
 shader_parameter/rim_amount = 0.0
-shader_parameter/backlight_amount = 0.0
 shader_parameter/face_sdf_mix = 1.0
 shader_parameter/face_sdf = ExtResource("tex_sdf")
 shader_parameter/face_sdf_angle_scale = 1.6
@@ -58,7 +57,6 @@ shader_parameter/specular_amount = 0.5
 shader_parameter/specular_size = 0.8
 shader_parameter/rim_amount = 0.9
 shader_parameter/rim_width = 0.45
-shader_parameter/backlight_amount = 0.6
 next_pass = SubResource("outline_pass")
 [sub_resource type="Environment" id="env"]
 background_mode = 1

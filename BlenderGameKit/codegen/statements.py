@@ -1850,6 +1850,47 @@ def _stmt_list_get(ctx, node, indent):
     ctx.add_line(indent + 1, f"{target} = {default}")
 
 
+def _foreach_vars(ctx, node):
+    """『列表_遍历』的"当前项 / 下标"成员变量(处理器与输出共用)。"""
+    tag = ctx.node_tag(node, "foreach")
+    item = ctx.declare_var(f"_gk_item{tag}", "Variant")
+    index = ctx.declare_var(f"_gk_idx{tag}", "int", initial="-1")
+    return item, index
+
+
+@stmt_node("GKNodeListForEach")
+def _stmt_list_foreach(ctx, node, indent):
+    """『列表_遍历』(UE5 ForEachLoop):逐项执行『循环体』,完了走『结束后』。
+
+    ── 为什么用成员变量存当前项 / 下标 ──────────────────────────────
+    循环体里的卡片(打印 / 设置变量 / 比较)要对"当前这一项"求值,
+    而表达式是**按变量名**生成的。局部变量在 `for` 里声明,跨卡片引用
+    会出作用域;所以用 ctx.declare_var 变成脚本成员,循环体里随时可读。
+    """
+    var = _list_var(ctx, node)
+    if var is None:
+        ctx.warn(f"『{node.bl_label}』没有填变量名，这一句被跳过了")
+        _chain(ctx, node, indent, "结束后")
+        return
+    item, index = _foreach_vars(ctx, node)
+    loop_var = ctx.new_temp("each")
+    ctx.add_line(indent, f"{index} = -1")
+    ctx.add_line(indent, f"for {loop_var} in {var}:")
+    ctx.add_line(indent + 1, f"{item} = {loop_var}")
+    ctx.add_line(indent + 1, f"{index} += 1")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "循环体")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    _chain(ctx, node, indent, "结束后")
+
+
+@multi_output("GKNodeListForEach")
+def _expr_list_foreach(ctx, node):
+    item, index = _foreach_vars(ctx, node)
+    return {"当前项": item, "下标": index}
+
+
 @stmt_node("GKNodeDictSet")
 def _stmt_dict_set(ctx, node, indent):
     var = _list_var(ctx, node, "Dictionary")
@@ -2731,10 +2772,145 @@ def _stmt_branch(ctx, node, indent):
 @stmt_node("GKNodeDoOnce")
 def _stmt_do_once(ctx, node, indent):
     var_name = ctx.declare_var(f"done_{node.name}", "bool")
+    # 『重置』(UE5 DoOnce 的 Reset):以前这个引脚声明了却**从来没被读过**,
+    # 用户接上"重置"也照样只执行一次 —— 静默失效。
+    # 现在只在**真的接了线**时才生成重置语句:
+    #   * 老图就算把这个布尔默认值改成 True,产物也一字不变(旧行为是忽略);
+    #   * 想要"一直重置"就接『常量_布尔 真』,语义在图上看得见。
+    reset_socket = node.inputs.get("重置") if hasattr(node, "inputs") else None
+    if reset_socket is not None and getattr(reset_socket, "is_linked", False):
+        ctx.add_line(indent, f"if {ctx.input_bool_expr(node, '重置')}:")
+        ctx.add_line(indent + 1, f"{var_name} = false")
     ctx.add_line(indent, f"if not {var_name}:")
     ctx.add_line(indent + 1, f"{var_name} = true")
     before = len(ctx.sink)
     _chain(ctx, node, indent + 1, "首次")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+
+
+@stmt_node("GKNodeGate")
+def _stmt_gate(ctx, node, indent):
+    """『流程_门』(UE5 Gate):只有『执行』入口按门状态放行。
+
+    ── 三个控制入口为什么不往下走 ──────────────────────────────────
+    UE5 的 Gate 里 Open / Close / Toggle 是"改状态"的入口,不产生输出。
+    照抄这个语义,玩家按键时只拨门、不立刻触发门后的逻辑;
+    真正的"过门"由『执行』入口决定。
+    """
+    state = ctx.declare_var(
+        f"_gk_gate{ctx.node_tag(node, 'gate')}", "bool",
+        initial="true" if getattr(node, "gk_start_open", False) else "false")
+    entry = getattr(ctx, "current_entry", "执行")
+    if entry == "打开":
+        ctx.add_line(indent, f"{state} = true")
+        return
+    if entry == "关闭":
+        ctx.add_line(indent, f"{state} = false")
+        return
+    if entry == "切换":
+        ctx.add_line(indent, f"{state} = not {state}")
+        return
+    ctx.add_line(indent, f"if {state}:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "开")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    ctx.add_line(indent, "else:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "关")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+
+
+@stmt_node("GKNodeFlipFlop")
+def _stmt_flip_flop(ctx, node, indent):
+    """『流程_翻转』(UE5 FlipFlop):A / B 交替。
+
+    状态变量表示"下一次是不是该走 B" —— 这样第一次默认走 A,
+    和 UE5 的行为一致;勾了『先走 B』就把初值反过来。
+    """
+    state = ctx.declare_var(
+        f"_gk_ff{ctx.node_tag(node, 'flipflop')}", "bool",
+        initial="true" if getattr(node, "gk_start_b", False) else "false")
+    # ⚠ 先取号、立刻翻转,再进分支。
+    # 如果写成"先走分支、末尾再翻转",分支里遇到 await(等待 / 可重触发)时,
+    # 第二次触发会在 await 结束前读到**旧状态** —— 表现是连续两次都走同一支。
+    ticket = ctx.new_temp("ff")
+    ctx.add_line(indent, f"var {ticket} := {state}")
+    ctx.add_line(indent, f"{state} = not {state}")
+    ctx.add_line(indent, f"if {ticket}:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "B")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+    ctx.add_line(indent, "else:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "A")
+    if len(ctx.sink) == before:
+        ctx.add_line(indent + 1, "pass")
+
+
+@stmt_node("GKNodeMultiGate")
+def _stmt_multi_gate(ctx, node, indent):
+    """『流程_多路门』(UE5 MultiGate):每次执行走下一个出口。
+
+    ── 为什么用 match 而不是一长串 if ──────────────────────────────
+    出口数量是动态的(1~8)。`match` 的每个 case 正好对应一个出口,
+    生成出来和执行流顺序一一对应,读起来也比嵌套 if 清楚。
+    """
+    state = ctx.declare_var(
+        f"_gk_mg{ctx.node_tag(node, 'multigate')}", "int", initial="0")
+    try:
+        count = max(1, min(8, int(getattr(node, "gk_out_count", 2) or 2)))
+    except (TypeError, ValueError):
+        count = 2
+    entry = getattr(ctx, "current_entry", "执行")
+    if entry == "重置":
+        ctx.add_line(indent, f"{state} = 0")
+        return
+    if getattr(node, "gk_loop", True):
+        ctx.add_line(indent, f"if {state} >= {count}:")
+        ctx.add_line(indent + 1, f"{state} = 0")
+    # 先把"这次走哪个出口"取走并推进计数,再进 match。
+    # 否则出口链里遇到 await 时,第二次触发会读到旧下标,重复同一个出口。
+    ticket = ctx.new_temp("mg")
+    ctx.add_line(indent, f"var {ticket} := {state}")
+    ctx.add_line(indent, f"{state} += 1")
+    ctx.add_line(indent, f"match {ticket}:")
+    for index in range(count):
+        ctx.add_line(indent + 1, f"{index}:")
+        before = len(ctx.sink)
+        _chain(ctx, node, indent + 2, str(index + 1))
+        if len(ctx.sink) == before:
+            ctx.add_line(indent + 2, "pass")
+
+
+@stmt_node("GKNodeRetriggerableDelay")
+def _stmt_retriggerable_delay(ctx, node, indent):
+    """『等待_可重触发』(UE5 Retriggerable Delay):只让最后一次计时通过。
+
+    ── 计时代数(generation)──── ────────────────────────────────────
+    每次触发先 `_gen += 1` 并记下本次的代号,等完再看"代号还是最新的吗"。
+    中途又触发一次 -> 代号变了 -> 前一次的 await 醒来后什么都不做。
+    这样不需要取消 Timer(create_timer 拿不到句柄),也不会让旧链继续跑。
+    """
+    seconds = ctx.input_number(node, "秒", "1.0")
+    use_process = bool(getattr(node, "gk_use_process", False))
+    generation = ctx.declare_var(
+        f"_gk_rd_gen{ctx.node_tag(node, 'retrigger')}", "int", initial="0")
+    ticket = ctx.new_temp("rd")
+    ctx.add_line(indent, f"{generation} += 1")
+    ctx.add_line(indent, f"var {ticket} := {generation}")
+    if use_process:
+        ctx.add_line(indent,
+                     f"await get_tree().create_timer({seconds}, true, false, true).timeout")
+    else:
+        ctx.add_line(indent,
+                     f"await get_tree().create_timer({seconds}, false).timeout")
+    ctx.add_line(indent, f"if {ticket} == {generation}:")
+    before = len(ctx.sink)
+    _chain(ctx, node, indent + 1, "完成")
     if len(ctx.sink) == before:
         ctx.add_line(indent + 1, "pass")
 
