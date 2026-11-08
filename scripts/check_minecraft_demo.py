@@ -253,6 +253,35 @@ func run() -> void:
 		"怪物*", "CharacterBody3D", true, false).size()
 	var sword_ok := monsters_before > 0 and monsters_after < monsters_before
 
+	# ---- 天气:晴 / 雨 / 雪 能切换(雾 + 粒子)----
+	var weather: Node = null
+	for child in player.get_children():
+		if child.has_method("set_weather"):
+			weather = child
+	var world_env: WorldEnvironment = null
+	var envs: Array = scene.find_children("*", "WorldEnvironment", true, false)
+	if envs.size() > 0:
+		world_env = envs[0] as WorldEnvironment
+	var weather_ok := false
+	if weather != null and world_env != null and world_env.environment != null:
+		weather.set_weather(1)
+		var rainy: bool = world_env.environment.fog_enabled
+		weather.set_weather(0)
+		var clear: bool = not world_env.environment.fog_enabled
+		weather.set_weather(2)
+		var snowy: bool = world_env.environment.fog_enabled
+		weather_ok = rainy and clear and snowy
+
+	# ---- 羊会自己溜达 ----
+	var sheep: Node3D = scene.get_node_or_null("Colliders/羊1") as Node3D
+	var sheep_from := Vector3.ZERO
+	if sheep != null:
+		sheep_from = sheep.global_position
+	for i in range(120):
+		await physics_frame
+	var sheep_moved: bool = (sheep != null
+		and sheep.global_position.distance_to(sheep_from) > 0.2)
+
 	# ---- 无限地形:走远之后重新铺、原点卸载 ----
 	player.global_position = Vector3(60.0, 1.2, 0.0)
 	for i in range(30):
@@ -266,7 +295,7 @@ func run() -> void:
 		and grass_color_ok and switched and menu_ok and frozen
 		and create_ok and cancel_ok and started and terrain_ok
 		and hotbar_ok and view_ok and mode_ok and ate and sword_ok
-		and infinite_ok)
+		and weather_ok and sheep_moved and infinite_ok)
 	print("MINECRAFT on_floor=", on_floor, " moved=", moved,
 		" jumped=", jumped, " tiles=", tiles_before_mine, "->",
 		tiles_after_mine, " broke=", broke, " placed=", placed,
@@ -278,6 +307,7 @@ func run() -> void:
 		" hud=", hud_text, " view=", view_ok,
 		" mode=", mode_ok, " hp=", hp_surv0, "->", hp_surv1,
 		" ate=", ate, " sword=", sword_ok,
+		" weather=", weather_ok, " sheep=", sheep_moved,
 		" tiles_far=", tiles_far, " unload=", old_tile.size() == 0,
 		" infinite=", infinite_ok)
 	print("MINECRAFT_CHECK=", "OK" if ok else "FAIL")

@@ -56,6 +56,7 @@ BLOCK_COLORS = {
     "sand": (0.80, 0.72, 0.46),
     "monster": (0.58, 0.12, 0.12),
     "player": (0.25, 0.45, 0.85),
+    "sheep": (0.92, 0.92, 0.88),
 }
 
 # 手上能拿的档位:显示名 / 颜色(None = 不是方块,只有功能)
@@ -83,6 +84,12 @@ MONSTER_SPEED = 2.6
 MONSTER_REACH = 1.3
 PLAYER_SPAWN = (0.5, 1.0, 0.5)
 THIRD_CAMERA = "第三人称相机"
+
+# 被动生物:羊(名字 / 出生点)
+SHEEP = (
+    ("羊1", (6.0, 1.0, 2.0)),
+    ("羊2", (-6.0, 1.0, 3.0)),
+)
 
 # ── 无限区块(自定义脚本,存在 .blend 的文本块里)──────────────────────
 # 为什么用『脚本_加载』而不是纯节点:每帧要维护 15x15 块地形的增删,
@@ -170,6 +177,153 @@ func _make_tile(cell: Vector2i) -> Node3D:
 		world = get_parent()
 	world.add_child(body)
 	return body
+"""
+
+# ── 天气:晴 / 雨 / 雪(同样存在 .blend 文本块里)──────────────────────
+WEATHER_SCRIPT = """extends Node3D
+
+## 天气循环:每 20 秒换一次(晴 → 雨 → 雪),也能被 set_weather() 指定。
+## 雨 / 雪用挂在玩家身上的 CPUParticles3D,换天气只改参数不重建。
+
+const NAMES := ["晴", "雨", "雪"]
+
+var index := 0
+var _timer := 0.0
+var _env: Environment
+var _rain: CPUParticles3D
+
+
+func _ready() -> void:
+	_build_rain()
+	_apply(0)
+
+
+func _physics_process(delta: float) -> void:
+	_timer += delta
+	if _timer >= 20.0:
+		_timer = 0.0
+		set_weather(index + 1)
+
+
+func set_weather(value: int) -> void:
+	index = posmod(value, 3)
+	_apply(index)
+
+
+func _apply(value: int) -> void:
+	_find_environment()
+	_timer = 0.0
+	match value:
+		0:
+			if _env != null:
+				_env.fog_enabled = false
+				_env.background_energy_multiplier = 1.0
+			if _rain != null:
+				_rain.emitting = false
+		1:
+			if _env != null:
+				_env.fog_enabled = true
+				_env.fog_light_color = Color(0.62, 0.68, 0.78)
+				_env.fog_density = 0.03
+				_env.background_energy_multiplier = 0.55
+			if _rain != null:
+				_rain.emitting = true
+				_rain.color = Color(0.65, 0.75, 0.95)
+				_rain.initial_velocity_min = 14.0
+				_rain.initial_velocity_max = 20.0
+		2:
+			if _env != null:
+				_env.fog_enabled = true
+				_env.fog_light_color = Color(0.88, 0.92, 0.98)
+				_env.fog_density = 0.05
+				_env.background_energy_multiplier = 0.75
+			if _rain != null:
+				_rain.emitting = true
+				_rain.color = Color(1.0, 1.0, 1.0)
+				_rain.initial_velocity_min = 2.0
+				_rain.initial_velocity_max = 4.0
+
+
+func _find_environment() -> void:
+	if _env != null:
+		return
+	for found in get_tree().root.find_children("*", "WorldEnvironment", true, false):
+		var world := found as WorldEnvironment
+		if world != null and world.environment != null:
+			_env = world.environment
+			return
+
+
+func _build_rain() -> void:
+	_rain = CPUParticles3D.new()
+	_rain.name = "天气粒子"
+	_rain.amount = 220
+	_rain.lifetime = 1.2
+	_rain.emitting = false
+	_rain.local_coords = false
+	_rain.emission_shape = CPUParticles3D.EMISSION_SHAPE_BOX
+	_rain.emission_box_extents = Vector3(9.0, 0.5, 9.0)
+	_rain.direction = Vector3(0.0, -1.0, 0.0)
+	_rain.spread = 6.0
+	_rain.gravity = Vector3(0.0, -9.8, 0.0)
+	_rain.initial_velocity_min = 14.0
+	_rain.initial_velocity_max = 20.0
+	_rain.scale_amount_min = 0.05
+	_rain.scale_amount_max = 0.09
+	var mesh := BoxMesh.new()
+	mesh.size = Vector3(1.0, 1.0, 1.0)
+	_rain.mesh = mesh
+	var material := StandardMaterial3D.new()
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.albedo_color = Color(0.65, 0.75, 0.95)
+	_rain.material_override = material
+	_rain.position = Vector3(0.0, 8.0, 0.0)
+	add_child(_rain)
+"""
+
+# ── 羊:自己溜达的被动生物(同样存在 .blend 文本块里)────────────────
+SHEEP_SCRIPT = """extends Node3D
+
+## 羊:每 2~5 秒换个方向慢慢走,不追人、不造成伤害。
+## 脚本挂在玩家身上(和无限地形同一套『脚本_加载』),控制场景里的羊节点。
+
+const SPEED := 1.2
+
+var _sheep: CharacterBody3D
+var _dir := Vector3.ZERO
+var _timer := 0.0
+
+
+func _ready() -> void:
+	_find_sheep()
+
+
+func _physics_process(delta: float) -> void:
+	if not is_instance_valid(_sheep):
+		_find_sheep()
+		return
+	_timer -= delta
+	if _timer <= 0.0:
+		_timer = randf_range(2.0, 5.0)
+		_dir = Vector3(randf_range(-1.0, 1.0), 0.0,
+			randf_range(-1.0, 1.0)).normalized()
+	_sheep.velocity.x = _dir.x * SPEED
+	_sheep.velocity.z = _dir.z * SPEED
+	_sheep.velocity.y -= 9.8 * delta
+	_sheep.move_and_slide()
+	if _dir.length() > 0.01:
+		_sheep.look_at(_sheep.global_position + _dir, Vector3.UP)
+
+
+func _find_sheep() -> void:
+	_sheep = null
+	var scene := get_tree().current_scene
+	if scene == null:
+		return
+	for found in scene.find_children("羊*", "CharacterBody3D", true, false):
+		_sheep = found as CharacterBody3D
+		if _sheep != null:
+			return
 """
 
 
@@ -360,6 +514,15 @@ def build_world(scene):
                              parent=monsters_root)
         set_physics(monster, "CharacterBody3D", layer="4", mask="1")
 
+    # 羊:被动生物(白盒子),逻辑由『我的世界羊』脚本驱动
+    sheep_mesh = make_box_mesh("羊网格", (0.8, 0.9, 1.2),
+                               materials["sheep"], z0=0.0)
+    for name, position in SHEEP:
+        sheep = add_object(scene, name, sheep_mesh,
+                           godot_to_blender(*position),
+                           parent=monsters_root)
+        set_physics(sheep, "CharacterBody3D", layer="8", mask="1")
+
     # 可放置方块:前 PLACE_SLOTS 档(草 / 石 / 沙 / 木 / 叶)各造一份资产源,
     # 摆在远处(不进玩法区域);苹果 / 剑没有颜色,不是方块。
     asset_root = add_empty(scene, "资产源", godot_to_blender(0.0, -40.0, 0.0))
@@ -520,7 +683,7 @@ def build_ui(tree):
     }
 
 
-def build_tree(scene, chunk_text=None):
+def build_tree(scene, chunk_text=None, weather_text=None, sheep_text=None):
     tree = bpy.data.node_groups.new(TREE_NAME, "GKGameLogicTree")
     tree.gk_scope = "ROLE"
     tree.use_fake_user = True
@@ -575,6 +738,16 @@ def build_tree(scene, chunk_text=None):
         chunk_loader = _add(tree, "GKNodeScriptLoad", "加载无限地形",
                             -950.0, 700.0, gk_script_text=chunk_text,
                             gk_instance="", gk_start_method="")
+    weather_loader = None
+    if weather_text is not None:
+        weather_loader = _add(tree, "GKNodeScriptLoad", "加载天气",
+                              -700.0, 700.0, gk_script_text=weather_text,
+                              gk_instance="", gk_start_method="")
+    sheep_loader = None
+    if sheep_text is not None:
+        sheep_loader = _add(tree, "GKNodeScriptLoad", "加载羊",
+                            -450.0, 700.0, gk_script_text=sheep_text,
+                            gk_instance="", gk_start_method="")
     _link(tree, ready, "执行", mouse_mode, "执行")
     _link(tree, mouse_mode, "完成", hint, "执行")
     _link(tree, hint, "完成", ui["panel"], "执行")
@@ -599,9 +772,11 @@ def build_tree(scene, chunk_text=None):
     _link(tree, ui["respawn"], "完成", ui["quit_pause"], "执行")
     _link(tree, ui["quit_pause"], "完成", hide_self, "执行")
     tail = hide_self
-    if chunk_loader is not None:
-        _link(tree, hide_self, "完成", chunk_loader, "执行")
-        tail = chunk_loader
+    for loader in (chunk_loader, weather_loader, sheep_loader):
+        if loader is None:
+            continue
+        _link(tree, tail, "完成", loader, "执行")
+        tail = loader
     _link(tree, tail, "完成", pause_menu, "执行")
 
     resume = _add(tree, "GKNodeUiPauseGame", "开始游戏", -450.0, 1150.0,
@@ -1040,12 +1215,18 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
     scene = clear_all()
-    # 无限地形脚本:存在 .blend 的文本块里,由『脚本_加载』运行
+    # 无限地形 / 天气 / 羊:都存在 .blend 的文本块里,由『脚本_加载』运行
     chunk_text = bpy.data.texts.new("我的世界区块")
     chunk_text.use_fake_user = True
     chunk_text.write(CHUNK_SCRIPT)
+    weather_text = bpy.data.texts.new("我的世界天气")
+    weather_text.use_fake_user = True
+    weather_text.write(WEATHER_SCRIPT)
+    sheep_text = bpy.data.texts.new("我的世界羊")
+    sheep_text.use_fake_user = True
+    sheep_text.write(SHEEP_SCRIPT)
     build_world(scene)
-    build_tree(scene, chunk_text)
+    build_tree(scene, chunk_text, weather_text, sheep_text)
     apply_scene_settings(scene)
 
     project.create_project(GODOT_DIR, title="我的世界",
