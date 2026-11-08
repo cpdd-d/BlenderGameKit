@@ -151,6 +151,8 @@ _COLOR_PIN = ("NodeSocketColor", "颜色")
 _OBJECT_PIN = ("NodeSocketObject", "节点")
 # 相机引用引脚(第一百八十八轮)—— 只能接相机引用,不能接普通节点
 _CAMERA_REF_PIN = ("GKSocketCameraRef", "相机引用")
+_ANIM_REF_PIN = ("GKSocketAnimRef", "动画引用")
+_UI_REF_PIN = ("GKSocketUiRef", "控件引用")
 
 class GKSocketCameraRef(GKSocketBase, bpy.types.NodeSocket):
     """相机引用引脚:只能接相机引用(第一百八十八轮)。"""

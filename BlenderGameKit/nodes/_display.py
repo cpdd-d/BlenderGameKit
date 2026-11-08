@@ -3672,7 +3672,7 @@ class GKNodeUiWidgetRef(B.GKExpressionNode):
               "引脚(用引用拼层级)。\n"
               "填设计图里那个控件的**节点名**。")
     gk_tree_type = UI_REF_TREES
-    gk_outputs = (S.pin(OBJECT, "控件", None),)
+    gk_outputs = (S.pin(S._UI_REF_PIN, "控件", None),)
     gk_prop_defs = (
         ("gk_widget", "string", "", "控件名", "设计图里那个控件的节点名"),
     )
@@ -3694,7 +3694,7 @@ class GKNodeUiDesignRef(B.GKExpressionNode):
               "『界面_画布』。\n"
               "『设计图』留空 = 用文件里第一张设计图。")
     gk_tree_type = UI_REF_TREES
-    gk_outputs = (S.pin(OBJECT, "界面", None),)
+    gk_outputs = (S.pin(S._UI_REF_PIN, "界面", None),)
     gk_prop_defs = (
         ("gk_design", "string", "", "设计图",
          "留空 = 用文件里第一张『游戏界面』设计图"),

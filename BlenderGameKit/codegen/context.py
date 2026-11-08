@@ -864,6 +864,20 @@ ew_temp() 拿的是局部变量 -- 在 _ready() 里声明,
             # 事件节点的数据输出是"直通"的:帧间隔 -> delta、输入事件 -> event
             if getattr(source_node, "gk_is_event", False) and source is not None:
                 return self.socket_default(source)
+            # ── 语义分组校验(第一百八十八轮)────────────────────
+            # 引脚语义不匹配时给出可读告警,而不是等到 Godot 里报错
+            # (比如把动画引用接到相机引用上)。
+            target_sem = getattr(socket, "gk_semantic", None)
+            source_sem = getattr(source, "gk_semantic", None)
+            if callable(target_sem) and callable(source_sem):
+                target_sem = target_sem()
+                source_sem = source_sem()
+                if (target_sem != source_sem and target_sem != S.SEMANTIC_ANY
+                            and source_sem != S.SEMANTIC_ANY):
+                    if (target_sem in (S.SEMANTIC_CAMERA_REF, S.SEMANTIC_ANIM_REF, S.SEMANTIC_UI_REF)
+                            or source_sem in (S.SEMANTIC_CAMERA_REF, S.SEMANTIC_ANIM_REF, S.SEMANTIC_UI_REF)):
+                            pin_name = getattr(socket, "name", "")
+                            self.warn(f"引脚『{pin_name}』({target_sem}) 不能接 {source_sem} 类型的引脚")
             return self.node_expression(source_node, getattr(source, "name", None))
         # 未连线:直接算出字面量，不写缓存
         # (生成过程中 ctx.dim 等因素会变，缓存会串味)

@@ -260,12 +260,14 @@ def node_items_for(node, prop="gk_target"):
     """
     tree = getattr(node, "id_data", None)
     # 目标类型过滤(第一百八十八轮)—— 引用只列对类型的物体,
-    # 用户不用在一堆网格里翻相机/骨架。
+    # 用户不用在一堆网格里翻相机/骨架/灯光。
     obj_type = None
     if prop == "gk_camera":
         obj_type = "CAMERA"
     elif prop == "gk_skeleton_node":
         obj_type = "ARMATURE"
+    elif prop == "gk_light":
+        obj_type = "LIGHT"
     items = list(node_candidates(tree, prop, obj_type))
     if bpy is not None and tree is not None:
         slots = set()
