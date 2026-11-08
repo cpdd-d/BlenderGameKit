@@ -1,0 +1,16 @@
+[gd_scene load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://scripts/coin.gd" id="1_script"]
+[ext_resource type="Texture2D" path="res://art/coin.png" id="2_art"]
+
+[sub_resource type="CircleShape2D" id="Circle_coin"]
+radius = 11.0
+
+[node name="Coin" type="Area2D" groups=["coin"]]
+script = ExtResource("1_script")
+
+[node name="Sprite" type="Sprite2D" parent="."]
+texture = ExtResource("2_art")
+
+[node name="Collision" type="CollisionShape2D" parent="."]
+shape = SubResource("Circle_coin")
