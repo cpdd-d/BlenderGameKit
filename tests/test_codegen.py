@@ -20279,6 +20279,104 @@ class TestRound190CameraFar(Base):
                       ae.ENVIRONMENT_SCRIPT.format(**fields))
 
 
+class TestRound191CppHotPath(Base):
+    """第一百九十一轮:节点图 -> GDExtension C++ 热路径。
+
+    生成的是"伴随节点"(extends Node):C++ 只接管每物理帧的移动,
+    其它事件仍由节点图导出的 GDScript 负责。移动链里出现不支持的
+    节点时必须**拒绝**,不生成半成品。
+    """
+
+    def _graph(self, dimension="2", speed=260.0, jump=560.0,
+               with_flip=True, branch_output="是"):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向输入")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=speed)
+        move.gk_keep_y = True
+        flip = tree.new_node(NN.GKNodeFlip, "翻转")
+        flip.gk_mode = "AUTO"
+        onfloor = tree.new_node(NN.GKNodeIsOnFloor, "在地面")
+        key = tree.new_node(NN.GKNodeKey, "跳跃键", gk_action="jump",
+                            gk_trigger="JUST")
+        logic = tree.new_node(NN.GKNodeLogic, "与", gk_op="AND")
+        branch = tree.new_node(NN.GKNodeBranch, "能跳吗")
+        jump_node = tree.new_node(NN.GKNodeJump, "起跳", gk_jump_force=jump)
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        gk_stub.connect(tree, direction, "方向", move, "方向")
+        if with_flip:
+            gk_stub.connect(tree, move, "完成", flip, "执行")
+            gk_stub.connect(tree, flip, "完成", branch, "执行")
+        else:
+            gk_stub.connect(tree, move, "完成", branch, "执行")
+        gk_stub.connect(tree, onfloor, "在地面", logic, "A")
+        gk_stub.connect(tree, key, "结果", logic, "B")
+        gk_stub.connect(tree, logic, "结果", branch, "条件")
+        gk_stub.connect(tree, branch, branch_output, jump_node, "执行")
+        return tree
+
+    def test_2d_generates_character_hot_path(self):
+        from BlenderGameKit import cpp_hot_path
+        files, spec = cpp_hot_path.generate(self._graph("2"), "2")
+        self.assertEqual(spec["dimension"], "2")
+        header = files["native/gk_hot_path.h"]
+        cpp = files["native/gk_hot_path.cpp"]
+        self.assertIn("class GKHotPath2D : public Node", header)
+        self.assertIn("double speed = 260.0;", header)
+        self.assertIn("double jump_force = 560.0;", header)
+        self.assertIn('String action_jump = "jump";', header)
+        self.assertIn("Vector2 dir(x, y);", cpp)
+        self.assertIn("jump_velocity.y = -jump_force;", cpp)
+        self.assertIn("body->move_and_slide();", cpp)
+        self.assertIn("flip_target->set_scale(Vector2(sx,",
+                      cpp)
+        self.assertIn('"gk_hot_path_init"',
+                      files["native/gk_hot_path.gdextension"])
+        self.assertIn("GKHotPath2D", files["native/register_types.cpp"])
+        self.assertIn("移动", files["native/README.md"])
+        self.assertIn("起跳", files["native/README.md"])
+
+    def test_3d_uses_vector3_and_clamps_speed(self):
+        from BlenderGameKit import cpp_hot_path
+        files, spec = cpp_hot_path.generate(
+            self._graph("3", speed=300.0), "3")
+        header = files["native/gk_hot_path.h"]
+        cpp = files["native/gk_hot_path.cpp"]
+        self.assertIn("class GKHotPath3D : public Node", header)
+        self.assertIn("double speed = 6.0;", header)
+        self.assertIn("Vector3 dir(0.0, 0.0, 0.0);", cpp)
+        self.assertIn("dir.z = - y;", cpp)
+        self.assertIn("jump_velocity.y = jump_force;", cpp)
+        self.assertIn("Math::atan2(-dir.x, -dir.z)", cpp)
+        # real_t / double 混用会让 MSVC 在 lerp_angle 的两个重载之间报
+        # C2666;这里锁住显式转换(3D 真编译时踩到)
+        self.assertIn("(real_t)Math::min(1.0, 12.0 * delta)", cpp)
+        self.assertTrue(any("3D 速度" in item for item in spec["warnings"]),
+                        spec["warnings"])
+
+    def test_rejects_camera_relative_movement(self):
+        from BlenderGameKit import cpp_hot_path
+        tree = self._graph("2")
+        move = next(node for node in tree.nodes
+                    if node.bl_idname == "GKNodeMoveDirection")
+        move.gk_follow_camera = True
+        with self.assertRaises(cpp_hot_path.HotPathError) as caught:
+            cpp_hot_path.generate(tree, "2")
+        self.assertIn("随相机朝向", str(caught.exception))
+
+    def test_rejects_jump_on_false_branch(self):
+        from BlenderGameKit import cpp_hot_path
+        with self.assertRaises(cpp_hot_path.HotPathError) as caught:
+            cpp_hot_path.generate(self._graph("2", branch_output="否"), "2")
+        self.assertIn("『否』出口", str(caught.exception))
+
+    def test_rejects_without_physics_event(self):
+        from BlenderGameKit import cpp_hot_path
+        with self.assertRaises(cpp_hot_path.HotPathError) as caught:
+            cpp_hot_path.generate(make_tree(), "2")
+        self.assertIn("物理帧", str(caught.exception))
+
+
 class TestRound99Occluder(Base):
     """第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)。
 

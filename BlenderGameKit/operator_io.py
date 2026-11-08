@@ -10,9 +10,9 @@ import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        FloatProperty, IntProperty, StringProperty)
 
-from . import (advisor, advisor_tools, asset_export, codegen, curve_assets,
-               export_report, exporter, gk_log, levels, node_groups,
-               npr_preview, packaging, project)
+from . import (advisor, advisor_tools, asset_export, codegen, cpp_hot_path,
+               curve_assets, export_report, exporter, gk_log, levels,
+               node_groups, npr_preview, packaging, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -1453,6 +1453,51 @@ class GK_OT_Export(bpy.types.Operator):
     def execute(self, context):
         ok, _info = run_export_script(context, self)
         return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class GK_OT_ExportCppHotPath(bpy.types.Operator):
+    """把节点图里的移动热路径生成成 GDExtension C++(可选)。"""
+
+    bl_idname = "gk.export_cpp_hot_path"
+    bl_label = "生成 C++ 热路径"
+    bl_description = ("从当前节点图提取『输入 -> 移动 -> 跳跃』这条物理热路径,"
+                      "生成 native/ 下的 GDExtension C++ 源码 + 构建脚本。\n"
+                      "生成的是**伴随节点**:C++ 只接管移动,其它事件仍由 "
+                      "GDScript 负责;需要自己编译(见 native/README.md)")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        tree = _tree_of(self, context)
+        if tree is None:
+            return {"CANCELLED"}
+        settings = exporter.build_settings(context.scene)
+        dimension = str(settings.get("dimension", "3") or "3")
+        try:
+            files, spec = cpp_hot_path.generate(tree, dimension)
+        except cpp_hot_path.HotPathError as exc:
+            _report(self, "ERROR", str(exc))
+            return {"CANCELLED"}
+
+        directory, ok = _resolve_project(self, context, create=False)
+        if not ok:
+            return {"CANCELLED"}
+        transaction = exporter.FileTransaction()
+        try:
+            for relative, text in files.items():
+                path = os.path.join(directory, *relative.split("/"))
+                transaction.write(path, text)
+        except OSError as exc:
+            transaction.rollback()
+            _report(self, "ERROR", f"写 C++ 文件失败: {exc}")
+            return {"CANCELLED"}
+
+        for warning in spec["warnings"]:
+            _report(self, "WARNING", warning)
+        cls = "GKHotPath2D" if spec["dimension"] == "2" else "GKHotPath3D"
+        _report(self, "INFO",
+                f"已生成 {len(files)} 个文件 -> native/;"
+                f"编译后用 {cls}(见 native/README.md)")
+        return {"FINISHED"}
 
 
 class GK_OT_ReportCopy(bpy.types.Operator):
@@ -4301,6 +4346,8 @@ GK_CLASSES = (
     GK_OT_VarMakeNode,
     GK_OT_StarterGraph,
     GK_OT_AutoLink,
+    # 第一百九十一轮:节点图 -> GDExtension C++ 热路径(伴随节点,需自己编译)
+    GK_OT_ExportCppHotPath,
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
     GK_OT_PickAnimName,
     GK_OT_PickAnimTree,

@@ -55,6 +55,7 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 | 导出路径每次都要填 | **跟着 `.blend` 走**,一个文件一个项目,自动建好目录结构 |
 | 碰撞体要跑到 Godot 里配 | **在物体属性面板里设**(像 UPBGE),导出时自动生成 |
 | **按键在 Godot 里要手工加输入映射** | **自动写进 `project.godot`** —— 节点图用了哪些动作就登记哪些,并绑好默认键(A/D/W/S、空格、J、E) |
+| 角色移动成了性能热点 | **节点图 → C++ 热路径**(可选):把『输入 → 移动 → 跳跃』这条每物理帧的链生成 GDExtension 伴随节点;C++ 只接管移动,规则仍由 GDScript 负责 |
 | 二次元游戏 | **3 个 NPR 卡通着色器**(描边/边缘光/三阶明暗/面部 SDF) + 手绘线条抖动 |
 | 做恐怖游戏 | **氛围套件**:心跳随危险变快变响(『氛围_紧张度』『氛围_心跳』,**被看见时还能更紧张**)、一键**惊吓三连**(震屏 + 闪白 + 音效)、总线音量压低;配上**听觉 AI** 就是"扔石头把怪物引开"那套 |
 | 动作过渡生硬(走↔跑硬切) | **动画混合树** —— 几段动画按一个参数**连续混合**(走↔跑步↔冲刺),不是"啪"地换过去;**2D 混合树**再按"前后 / 左右"两个参数混(八个方向的走跑过渡),混合点从下拉里挑动画,不用手打 |
@@ -62,6 +63,7 @@ World       [instance glb]         ← 网格 + 层级 + 变换
 | 只能导出工程、出不了可执行文件 | 点一下**打包**(`文件 → 导出 → 打包游戏（GK）`里勾平台),在 Blender 里直接出 `.exe` / `.apk` / Linux / Web —— 自动补导出预设(**已有的一个字不动**,只在旁边留个 `.bak`) |
 
 不是运行时解释器，是**代码生成器**：节点图 → 标准 GDScript 4 → 随便改、随便读、Godot 原生调试。
+（可选）移动热路径还能再生成一份 GDExtension C++ 伴随节点。
 渲染也不是"通用 PBR 降级版"，而是按日式动画赛璐璐的做法写的。
 
 ---
@@ -272,10 +274,11 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端多层(含 NPR 渲染 / 相机远裁;NPR 渲染那层要真 GPU,没显卡自动跳过;-Deep 再加动画六层)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端多层(含 NPR 渲染 / 相机远裁;NPR 渲染那层要真 GPU,没显卡自动跳过;-Deep 再加动画六层 + C++ 热路径真编译)
 ├── check_release.py            ★ 打包自检:真 Godot 逐个平台跑 `--export-release`(Windows/Linux/Web;没装那个平台的导出模板则跳过)
 ├── check_render_demo.py        ★ NPR 渲染自检:**真开窗口**扫光出图,断言"不黑 / 明暗随光角度滑动 / 四张两两不同 / 三色调档数 / 补光亮度差"(门禁 5s;没 GPU 自动跳过)
 ├── check_camera_far.py         ★ 相机远裁真机验证:环境脚本把 `Camera3D.far` 设对 + 小于 near 时兜底(无头即可)
+├── check_cpp_hot_path.py       ★ C++ 热路径真编译 + Godot 加载验证(要 SCons + godot-cpp;缺了自动跳过)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
 ├── make_horror_demo.py         ★ 生成恐怖示例(氛围套件 + 听觉怪物 + 结局分支;现生成音频)
@@ -318,7 +321,7 @@ examples/
 ├── demo_platformer/            ★ 可玩的 2D 平台跳跃示例(相机跟随/金币/HUD/存档)
 ├── demo_2d/                    可直接用 Godot 打开的 2D 横版示例
 ├── demo_render/                NPR 渲染出图工程(扫光验证面部阴影)
-└── gdextension_cpp/            C++ GDExtension 骨架(GKCharacter)
+└── gdextension_cpp/            C++ GDExtension 手写骨架(GKCharacter;节点图生成器见侧栏『C++ 热路径』)
 ```
 
 ---
@@ -1186,8 +1189,11 @@ godot --headless --path _dist\anim_probe --quit-after 900
 
 ## 已知限制
 
-- 只支持导出 **GDScript**，不生成 C# 或 GDExtension(C++ 骨架见
-  [examples/gdextension_cpp](examples/gdextension_cpp/)，但没有做节点图 → C++ 的生成)。
+- 默认导出 **GDScript**，不生成 C#。C++ 只生成**移动热路径**的 GDExtension
+  伴随节点（`native/`，需要自己编译，见
+  [examples/gdextension_cpp](examples/gdextension_cpp/)），**不是**把整张图
+  转译成 C++；移动链里出现寻路 / 推开刚体 / 台阶 / 相机相对方向等节点时
+  会直接拒绝并点名。
 - 节点图是**单向执行流**，没有做"数据类型推导"的完整类型系统；
   把标量接到向量引脚时会自动包装并告警，而不是报错。
 - 一个输入引脚只能接一条线(Blender 限制)，想多处触发请复制节点。
@@ -1360,8 +1366,6 @@ godot --headless --path _dist\anim_probe --quit-after 900
 
 **还没做的**（对着代码核过）：
 
-- [ ] **节点图 → C++ 生成** —— 把热点逻辑直接生成 GDExtension 类
-      （`examples/gdextension_cpp` 只有手写示例，没有生成器）
 - [ ] **反向能力:解析已有 `.gd` 生成节点图**
 
 > 想接着做的话，从这里挑一条在 [docs/待办清单.md](docs/待办清单.md) 里

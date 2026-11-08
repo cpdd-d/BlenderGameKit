@@ -74,6 +74,10 @@ func _physics_process(_delta: float) -> void:
 
 推荐分工:**C++ 写每帧的热点计算,节点图/GDScript 写游戏规则**。
 
+> 第一百九十一轮起,侧栏导出按钮旁的 **『C++ 热路径』** 可以直接从节点图
+> 生成一份这样的移动热路径(`native/` 下的 `GKHotPath2D` / `GKHotPath3D`
+> 伴随节点 + 构建脚本),不用手写 `GKCharacter`。
+
 | 谁 | 负责 |
 |---|---|
 | `GKCharacter`(C++) | 重力、碰撞移动、击退这些每帧都跑的 |

@@ -7934,6 +7934,8 @@ class GK_PT_Main(bpy.types.Panel):
 
         row = layout.row(align=True)
         row.operator("gk.export_godot", text="导出到 Godot", icon="FILE_TICK")
+        # 第一百九十一轮:C++ 热路径是**可选**的额外产物,不混进正常导出
+        row.operator("gk.export_cpp_hot_path", text="C++ 热路径", icon="SCRIPT")
         # 运行(用户第一百四十轮:"运行按钮给误删了")
         row.operator("gk.open_godot", text="运行", icon="PLAY").editor = False
 

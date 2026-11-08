@@ -1073,6 +1073,36 @@ if ($SkipGodot) {
         }
     }
 
+    # 5s-3. C++ 热路径(第一百九十一轮;仅 -Deep)—— 从节点图生成 C++,
+    #       用本仓库的 godot-cpp 真编译,再让 Godot 加载并检查类 / 属性。
+    #       ⚠ 第一次会编译 godot-cpp(几分钟),所以不放进默认门禁;
+    #       缺 SCons / godot-cpp / Godot 时探针自己跳过。
+    if ($Deep) {
+        Write-Output ""
+        $cppChecker = Join-Path $Root "scripts\check_cpp_hot_path.py"
+        if ($godotSkipped) {
+            Write-Output "跳过 C++ 热路径:本机找不到 Godot"
+        } elseif (-not (Test-Path $cppChecker)) {
+            Write-Output "跳过 C++ 热路径:没有 scripts\check_cpp_hot_path.py"
+        } else {
+            $env:GK_GODOT = $Godot
+            $cppOut = & $Py $cppChecker 2>&1 | Out-String
+            $cppOut -split "`n" | Where-Object {
+                $_ -match "^(CPP_HOT_PATH|跳过)"
+            } | ForEach-Object { Write-Host $_.TrimEnd() }
+            if ($cppOut -match "CPP_HOT_PATH=OK") {
+                $godotRan += "C++ 热路径"
+            } elseif ($cppOut -match "跳过") {
+                Write-Output "（C++ 热路径跳过:缺 SCons / godot-cpp / Godot）"
+            } else {
+                Write-Output "C++ 热路径失败,尾部输出:"
+                ($cppOut -split "`n" | Select-Object -Last 15) |
+                    ForEach-Object { Write-Host ("  " + $_.TrimEnd()) }
+                $godotOk = $false
+            }
+        }
+    }
+
     # 5t. 网络联机示例(第一百轮:房间 + 自定义消息)—— **同机起两个 Godot
     #     进程真连一次**:一个开房、一个加入,互相收发消息再断开。
     #     ── 为什么必须两个进程 ────────────────────────────────────────

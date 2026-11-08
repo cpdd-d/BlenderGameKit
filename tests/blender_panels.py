@@ -301,6 +301,10 @@ def main():
                   "gk.character_preset" not in layout.operator_names,
                   str(sorted(set(layout.operator_names))))
 
+    # 第一百九十一轮:节点图 -> GDExtension C++ 热路径(可选导出)
+    check("算子 gk.export_cpp_hot_path 注册上了",
+          hasattr(bpy.ops.gk, "export_cpp_hot_path"))
+
     # ---- 4. 『游戏显示』设置图的面板(第四十二轮)----
     # 带真树时才画按钮:缺卡 -> 『补齐』;补齐后 -> 『回到游戏逻辑』。
     # 顺便把"卡片的 draw_buttons 也要能画完"一起验了 —— 设置卡就是这张图的

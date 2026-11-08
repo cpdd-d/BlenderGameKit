@@ -367,6 +367,44 @@ C++ 类的属性可以被 GDScript / 场景文件设置,所以可以:
 
 这就是"脚本写逻辑、C++ 写热点"的分工。
 
+### 从节点图生成 C++ 热路径(第一百九十一轮)
+
+侧栏导出按钮旁边的 **『C++ 热路径』** 会从当前节点图里提取这条链:
+
+```
+每当_物理帧 -> 输入_方向 -> 移动_按方向 [-> 移动_水平翻转]
+            -> 分支(在地面 且 跳跃键) -> 移动_跳跃
+```
+
+然后在 Godot 项目的 `native/` 下生成:
+
+```
+native/
+├── gk_hot_path.h / gk_hot_path.cpp   C++ 伴随节点(GKHotPath2D / GKHotPath3D)
+├── register_types.cpp                注册入口
+├── gk_hot_path.gdextension           Godot 加载声明
+├── SConstruct / CMakeLists.txt       构建脚本
+├── build.ps1                         一键构建
+└── README.md                         参数、用法、要拆掉的节点清单
+```
+
+编译(需要 SCons + godot-cpp 4.5):
+
+```powershell
+$env:GODOT_CPP_PATH = "D:\godot-cpp"
+powershell -ExecutionPolicy Bypass -File native\build.ps1
+```
+
+用法:**伴随节点**,不是整图替代品:
+
+1. 在角色下面加一个 `GKHotPath2D` / `GKHotPath3D` 子节点;
+2. `body_path` 保持 `..`(父节点 = 角色),`flip_path` 填精灵路径(可选);
+3. 把节点图里的移动链拆掉(生成的 `native/README.md` 会列出节点名),
+   再重新导出 GDScript —— 移动由 C++ 跑,其它事件仍由 GDScript 负责。
+
+⚠ 移动链里出现寻路 / 推开刚体 / 上台阶 / 相机相对方向等节点时,生成器
+**直接拒绝并点名**,不会生成"只搬了一半"的 C++。
+
 ---
 
 ## 五、节点怎么用(和 UPBGE 逻辑砖不一样)
