@@ -7938,6 +7938,10 @@ class GK_PT_Main(bpy.types.Panel):
         row.operator("gk.export_cpp_hot_path", text="C++ 热路径", icon="SCRIPT")
         # 运行(用户第一百四十轮:"运行按钮给误删了")
         row.operator("gk.open_godot", text="运行", icon="PLAY").editor = False
+        # 第一百九十二轮:把已有 .gd 反向导入成一张新节点图
+        import_row = layout.row(align=True)
+        import_row.operator("gk.import_gdscript", text="从 GDScript 导入",
+                            icon="IMPORT")
 
         # ---- 空节点树时,先教怎么开始 ----
         # 47 个节点摆在那里但"该从哪开始"完全看不出来,这是新用户最大的坎。

@@ -6974,6 +6974,79 @@ def main():
         check("待办①(按类型刷灯)", False, f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
 
+    # ---- 第一百九十二轮:GDScript -> 节点图(反向导入)--------------------
+    # 真 Blender 才能验 `tree.nodes.new` / RNA 属性 / 动态引脚;离线桩只
+    # 能验算法。这里先在真树里搭标准移动链 -> 生成代码 -> 导入新树,再查
+    # 导回来的速度和跳跃力。
+    try:
+        gd_import = import_module(f"{module_name}.gd_import")
+        r192_src = bpy.data.node_groups.new("导入探针源", "GKGameLogicTree")
+        r192_physics = r192_src.nodes.new("GKNodeOnPhysicsProcess")
+        r192_dir = r192_src.nodes.new("GKNodeInputDirection")
+        r192_move = r192_src.nodes.new("GKNodeMoveDirection")
+        r192_move.gk_speed = 260.0
+        r192_move.gk_keep_y = True
+        r192_flip = r192_src.nodes.new("GKNodeFlip")
+        r192_flip.gk_mode = "AUTO"
+        r192_floor = r192_src.nodes.new("GKNodeIsOnFloor")
+        r192_key = r192_src.nodes.new("GKNodeKey")
+        r192_key.gk_action = "jump"
+        r192_key.gk_trigger = "JUST"
+        r192_logic = r192_src.nodes.new("GKNodeLogic")
+        r192_logic.gk_op = "AND"
+        r192_branch = r192_src.nodes.new("GKNodeBranch")
+        r192_jump = r192_src.nodes.new("GKNodeJump")
+        r192_jump.gk_jump_force = 560.0
+
+        def _r192_link(src, out_name, dst, in_name):
+            out = src.outputs.get(out_name)
+            inp = dst.inputs.get(in_name)
+            if out is not None and inp is not None:
+                r192_src.links.new(out, inp)
+
+        _r192_link(r192_physics, "执行", r192_move, "执行")
+        _r192_link(r192_dir, "方向", r192_move, "方向")
+        _r192_link(r192_move, "完成", r192_flip, "执行")
+        _r192_link(r192_flip, "完成", r192_branch, "执行")
+        _r192_link(r192_floor, "在地面", r192_logic, "A")
+        _r192_link(r192_key, "结果", r192_logic, "B")
+        _r192_link(r192_logic, "结果", r192_branch, "条件")
+        _r192_link(r192_branch, "是", r192_jump, "执行")
+
+        r192_code, _w = codegen.generate(
+            r192_src, {"dimension": "2", "base_class": "CharacterBody2D"})
+        r192_dst = bpy.data.node_groups.new("导入探针目标", "GKGameLogicTree")
+        r192_result = gd_import.import_script(r192_dst, r192_code, "2")
+        r192_ids = {node.bl_idname for node in r192_dst.nodes}
+        r192_move2 = next((node for node in r192_dst.nodes
+                           if node.bl_idname == "GKNodeMoveDirection"), None)
+        r192_jump2 = next((node for node in r192_dst.nodes
+                           if node.bl_idname == "GKNodeJump"), None)
+        check("第一百九十二轮:导入生成了移动链",
+              {"GKNodeOnPhysicsProcess", "GKNodeInputDirection",
+               "GKNodeMoveDirection", "GKNodeFlip", "GKNodeBranch",
+               "GKNodeJump"} <= r192_ids, sorted(r192_ids))
+        check("第一百九十二轮:速度和跳跃力导回来了",
+              r192_move2 is not None and r192_jump2 is not None
+              and abs(float(r192_move2.gk_speed) - 260.0) < 1e-6
+              and abs(float(r192_jump2.gk_jump_force) - 560.0) < 1e-6,
+              f"speed={getattr(r192_move2, 'gk_speed', None)} "
+              f"jump={getattr(r192_jump2, 'gk_jump_force', None)}")
+        check("第一百九十二轮:创建节点数对得上",
+              r192_result["created"] >= 8, str(r192_result["created"]))
+        r192_code2, r192_warnings2 = codegen.generate(
+            r192_dst, {"dimension": "2", "base_class": "CharacterBody2D"})
+        check("第一百九十二轮:导入后还能再生成脚本",
+              not r192_warnings2 and "move_and_slide()" in r192_code2,
+              str(r192_warnings2))
+
+        bpy.data.node_groups.remove(r192_src)
+        bpy.data.node_groups.remove(r192_dst)
+    except Exception as exc:
+        check("第一百九十二轮(GDScript 反向导入)", False,
+              f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+
     # ---- 卸载不报错 ----
     try:
         addon_utils.disable(module_name, default_set=True)

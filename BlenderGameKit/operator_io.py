@@ -9,10 +9,11 @@ import time
 import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        FloatProperty, IntProperty, StringProperty)
+from bpy_extras.io_utils import ImportHelper
 
 from . import (advisor, advisor_tools, asset_export, codegen, cpp_hot_path,
-               curve_assets, export_report, exporter, gk_log, levels,
-               node_groups, npr_preview, packaging, project)
+               curve_assets, export_report, exporter, gd_import, gk_log,
+               levels, node_groups, npr_preview, packaging, project)
 from . import properties as props
 from .nodes import nodes as node_lib
 
@@ -1453,6 +1454,57 @@ class GK_OT_Export(bpy.types.Operator):
     def execute(self, context):
         ok, _info = run_export_script(context, self)
         return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class GK_OT_ImportGdScript(bpy.types.Operator, ImportHelper):
+    """把已有的 GDScript 导入成一张新的游戏逻辑节点图。"""
+
+    bl_idname = "gk.import_gdscript"
+    bl_label = "从 GDScript 导入节点图"
+    bl_description = ("读取一个 .gd 文件,把能认出来的事件 / 移动链 / 打印 / "
+                      "等待 / 条件还原成节点图;不认识的语句会带行号告警")
+    bl_options = {"REGISTER"}
+    filename_ext = ".gd"
+    filter_glob: StringProperty(default="*.gd", options={"HIDDEN"})
+
+    def execute(self, context):
+        path = str(getattr(self, "filepath", "") or "")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            _report(self, "ERROR", f"读不了 {path}: {exc}")
+            return {"CANCELLED"}
+
+        name = os.path.splitext(os.path.basename(path))[0] or "导入的逻辑"
+        tree = bpy.data.node_groups.new(name, "GKGameLogicTree")
+        settings = exporter.build_settings(context.scene)
+        try:
+            result = gd_import.import_script(
+                tree, text, str(settings.get("dimension", "3") or "3"))
+        except gd_import.GDScriptImportError as exc:
+            bpy.data.node_groups.remove(tree)
+            _report(self, "ERROR", str(exc))
+            return {"CANCELLED"}
+        if not result["created"]:
+            bpy.data.node_groups.remove(tree)
+            _report(self, "ERROR", "这份脚本没有导入任何节点")
+            return {"CANCELLED"}
+
+        for warning in result["warnings"]:
+            print(f"[GK] {warning}")
+        for warning in result["warnings"][:5]:
+            _report(self, "WARNING", warning)
+        _report(self, "INFO",
+                f"已导入 {result['created']} 个节点 -> 节点图『{tree.name}』;"
+                f"基类 {result['base_class'] or '(未声明)'}")
+        space = getattr(context, "space_data", None)
+        if space is not None and hasattr(space, "node_tree"):
+            try:
+                space.node_tree = tree
+            except Exception:                                # noqa: BLE001
+                pass
+        return {"FINISHED"}
 
 
 class GK_OT_ExportCppHotPath(bpy.types.Operator):
@@ -4348,6 +4400,8 @@ GK_CLASSES = (
     GK_OT_AutoLink,
     # 第一百九十一轮:节点图 -> GDExtension C++ 热路径(伴随节点,需自己编译)
     GK_OT_ExportCppHotPath,
+    # 第一百九十二轮:已有 GDScript -> 节点图(反向导入)
+    GK_OT_ImportGdScript,
     # 动画名选择器(动作归属分析,带 ★ 的排前面)
     GK_OT_PickAnimName,
     GK_OT_PickAnimTree,

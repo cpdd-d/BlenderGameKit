@@ -42,7 +42,6 @@ _COMMENT = "GKNodeComment"
 _PHYSICS = "GKNodeOnPhysicsProcess"
 
 MAX_3D_SPEED = 50.0
-DEFAULT_3D_SPEED = 6.0
 
 
 class HotPathError(ValueError):
@@ -281,9 +280,9 @@ def _extract_move(spec, dimension):
     speed = _number_input(move, "速度", getattr(move, "gk_speed", 300.0), "速度")
     if dimension == "3" and speed > MAX_3D_SPEED:
         spec["warnings"].append(
-            f"3D 速度 {speed:g} 米/秒太快,已按 {DEFAULT_3D_SPEED:g} 生成"
+            f"3D 速度 {speed:g} 米/秒太快,已按 {MAX_3D_SPEED:g} 生成"
             f"(和 GDScript 那条路的 3D 夹取一致)")
-        speed = DEFAULT_3D_SPEED
+        speed = MAX_3D_SPEED
 
     spec.update({
         "dimension": dimension,

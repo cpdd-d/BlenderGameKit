@@ -304,6 +304,19 @@ def install():
     sys.modules["bpy.types"] = bpy.types
     sys.modules["bpy.props"] = bpy.props
     sys.modules["bpy.utils"] = bpy.utils
+    # operator_io 用 ImportHelper 做文件选择;离线桩只需要一个空基类,
+    # 否则 import bpy_extras 直接 ModuleNotFoundError(第一百九十二轮)
+    extras = types.ModuleType("bpy_extras")
+    io_utils = types.ModuleType("bpy_extras.io_utils")
+
+    class _FileHelper:
+        pass
+
+    io_utils.ImportHelper = _FileHelper
+    io_utils.ExportHelper = _FileHelper
+    extras.io_utils = io_utils
+    sys.modules["bpy_extras"] = extras
+    sys.modules["bpy_extras.io_utils"] = io_utils
     return bpy
 
 

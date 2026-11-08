@@ -405,6 +405,24 @@ powershell -ExecutionPolicy Bypass -File native\build.ps1
 ⚠ 移动链里出现寻路 / 推开刚体 / 上台阶 / 相机相对方向等节点时,生成器
 **直接拒绝并点名**,不会生成"只搬了一半"的 C++。
 
+### 从已有 GDScript 反向导入节点图(第一百九十二轮)
+
+侧栏导出按钮下面有 **『从 GDScript 导入』**,选一个 `.gd` 会新建一张
+『游戏逻辑』图,把能认出来的东西还原成节点:
+
+- `extends CharacterBody2D / CharacterBody3D` → 决定 2D/3D 和基类;
+- `const ACTION_*` / `@export var move_speed` / `jump_force` → 动作名和参数;
+- `_ready` / `_process` / `_physics_process` → 三个事件节点;
+- 物理帧里的
+  `输入 -> 移动 -> 翻转 -> 在地面且跳跃键 -> 跳跃` → 整条移动链;
+- `print(...)` / `await get_tree().create_timer(...)` / `queue_free()` /
+  `if <条件>:` → 打印 / 等待 / 销毁 / 分支(条件支持按键、在地面、
+  与 / 或 / 非、数值或变量比较)。
+
+⚠ 它**不是完整 GDScript 解析器**:不认识的语句会带行号进告警并跳过,
+不会为了"看起来导入成功"而生成行为不对的图。插件自动生成的
+`_gk_*` 辅助函数也会被跳过。
+
 ---
 
 ## 五、节点怎么用(和 UPBGE 逻辑砖不一样)

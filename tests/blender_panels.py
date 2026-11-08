@@ -304,6 +304,9 @@ def main():
     # 第一百九十一轮:节点图 -> GDExtension C++ 热路径(可选导出)
     check("算子 gk.export_cpp_hot_path 注册上了",
           hasattr(bpy.ops.gk, "export_cpp_hot_path"))
+    # 第一百九十二轮:GDScript -> 节点图(反向导入)
+    check("算子 gk.import_gdscript 注册上了",
+          hasattr(bpy.ops.gk, "import_gdscript"))
 
     # ---- 4. 『游戏显示』设置图的面板(第四十二轮)----
     # 带真树时才画按钮:缺卡 -> 『补齐』;补齐后 -> 『回到游戏逻辑』。

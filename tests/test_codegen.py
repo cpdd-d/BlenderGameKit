@@ -20343,7 +20343,7 @@ class TestRound191CppHotPath(Base):
         header = files["native/gk_hot_path.h"]
         cpp = files["native/gk_hot_path.cpp"]
         self.assertIn("class GKHotPath3D : public Node", header)
-        self.assertIn("double speed = 6.0;", header)
+        self.assertIn("double speed = 50.0;", header)
         self.assertIn("Vector3 dir(0.0, 0.0, 0.0);", cpp)
         self.assertIn("dir.z = - y;", cpp)
         self.assertIn("jump_velocity.y = jump_force;", cpp)
@@ -20375,6 +20375,96 @@ class TestRound191CppHotPath(Base):
         with self.assertRaises(cpp_hot_path.HotPathError) as caught:
             cpp_hot_path.generate(make_tree(), "2")
         self.assertIn("物理帧", str(caught.exception))
+
+
+class TestRound192GdImport(Base):
+    """第一百九十二轮:GDScript -> 节点图(反向导入)。
+
+    先保证**插件自己导出的脚本**能导回来(移动链 / 事件 / 打印 / 等待),
+    再保证不认识的语句会带行号告警,而不是静默生成一张行为不对的图。
+    """
+
+    def _canonical(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向输入")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动", gk_speed=260.0)
+        move.gk_keep_y = True
+        flip = tree.new_node(NN.GKNodeFlip, "翻转")
+        flip.gk_mode = "AUTO"
+        onfloor = tree.new_node(NN.GKNodeIsOnFloor, "在地面")
+        key = tree.new_node(NN.GKNodeKey, "跳跃键", gk_action="jump",
+                            gk_trigger="JUST")
+        logic = tree.new_node(NN.GKNodeLogic, "与", gk_op="AND")
+        branch = tree.new_node(NN.GKNodeBranch, "能跳吗")
+        jump = tree.new_node(NN.GKNodeJump, "起跳", gk_jump_force=560.0)
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        gk_stub.connect(tree, direction, "方向", move, "方向")
+        gk_stub.connect(tree, move, "完成", flip, "执行")
+        gk_stub.connect(tree, flip, "完成", branch, "执行")
+        gk_stub.connect(tree, onfloor, "在地面", logic, "A")
+        gk_stub.connect(tree, key, "结果", logic, "B")
+        gk_stub.connect(tree, logic, "结果", branch, "条件")
+        gk_stub.connect(tree, branch, "是", jump, "执行")
+        return tree
+
+    def test_generated_movement_round_trip(self):
+        from BlenderGameKit import gd_import
+        source = self._canonical()
+        code, _ = codegen.generate(source, V2)
+        tree = make_tree()
+        result = gd_import.import_script(tree, code, "2")
+        self.assertGreaterEqual(result["created"], 8, result)
+        by_id = {}
+        for node in tree.nodes:
+            by_id.setdefault(node.bl_idname, node)
+        for bl_id in ("GKNodeOnPhysicsProcess", "GKNodeInputDirection",
+                      "GKNodeMoveDirection", "GKNodeFlip", "GKNodeBranch",
+                      "GKNodeIsOnFloor", "GKNodeKey", "GKNodeLogic",
+                      "GKNodeJump"):
+            self.assertIn(bl_id, by_id, result["warnings"])
+        self.assertAlmostEqual(by_id["GKNodeMoveDirection"].gk_speed, 260.0)
+        self.assertTrue(by_id["GKNodeMoveDirection"].gk_keep_y)
+        self.assertAlmostEqual(by_id["GKNodeJump"].gk_jump_force, 560.0)
+        self.assertEqual(by_id["GKNodeKey"].gk_action, "jump")
+        self.assertEqual(by_id["GKNodeKey"].gk_trigger, "JUST")
+
+        regenerated, warnings = codegen.generate(tree, V2)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("Input.get_action_strength", regenerated)
+        self.assertIn("move_and_slide()", regenerated)
+        self.assertIn("jump_force", regenerated)
+
+    def test_simple_statements_and_wait(self):
+        from BlenderGameKit import gd_import
+        text = (
+            "extends Node2D\n\n"
+            "func _ready() -> void:\n"
+            "    print(\"开始\")\n"
+            "    await get_tree().create_timer(1.5).timeout\n"
+            "    print(\"结束\")\n"
+        )
+        tree = make_tree()
+        result = gd_import.import_script(tree, text)
+        self.assertEqual(result["warnings"], [])
+        ids = [node.bl_idname for node in tree.nodes]
+        self.assertEqual(ids.count("GKNodePrint"), 2)
+        self.assertIn("GKNodeWait", ids)
+        ready = next(node for node in tree.nodes
+                     if node.bl_idname == "GKNodeOnReady")
+        self.assertTrue(ready.outputs.get("执行").is_linked)
+        wait = next(node for node in tree.nodes
+                    if node.bl_idname == "GKNodeWait")
+        self.assertAlmostEqual(float(wait.inputs.get("秒").default_value), 1.5)
+
+    def test_unknown_statement_warns_with_line_number(self):
+        from BlenderGameKit import gd_import
+        text = "extends Node\nfunc _ready():\n    health -= 1\n"
+        tree = make_tree()
+        result = gd_import.import_script(tree, text)
+        self.assertTrue(any("第 3 行" in item for item in result["warnings"]),
+                        result["warnings"])
+        self.assertTrue(result["skipped"])
 
 
 class TestRound99Occluder(Base):
