@@ -11255,7 +11255,7 @@ class TestRound25GameplayPieces(Base):
         self.assert_indent_sane(code)
         self.assert_no_chinese_identifiers(code)
         # 位置读取复用『取值_位置』那个 helper(Node3D 才有的成员不能直接调)
-        self.assertIn("func _gk_global_position_3d(host: Node) -> Vector3:", code)
+        self.assertIn("func _gk_global_position_3d(host) -> Vector3:", code)
         # 『谁走』用 **CharacterBody** 类型取 —— 取成 Node 的话
         # `.velocity` / `.move_and_slide()` 会被 Godot 静态检查拒绝
         self.assertIn(': CharacterBody3D = _gk_ref_typed(self, "追击者", "CharacterBody3D")',
@@ -11585,10 +11585,12 @@ class TestRound26CommonPieces(Base):
         self.assert_indent_sane(code)
         self.assertRegex(
             code,
-            r"if \(\(_gk_global_position_3d\(节点_小玩家\) - "
-            r"_gk_global_position_3d\(节点_追击者\)\)\.length\(\) <= 1\.5\):")
+            r"if \(is_instance_valid\(节点_追击者\) and "
+            r"\(\(_gk_global_position_3d\(节点_小玩家\) - "
+            r"_gk_global_position_3d\(节点_追击者\)\)\.length\(\) <= 1\.5\)\):")
         # 条件那句必须是自包含的(不能出现语句里那个临时变量)
-        condition = [line for line in code.splitlines() if "<= 1.5):" in line]
+        condition = [line for line in code.splitlines()
+                     if "is_instance_valid(节点_追击者) and" in line]
         self.assertTrue(condition, code)
         self.assertNotIn("_goal_dist", condition[0])
 
@@ -15277,7 +15279,7 @@ class TestRound59Horror(Base):
         code, warnings = gen(tree, V3)
         self.assertEqual(warnings, [], warnings)
         # 位置 reader(和『取值_位置』共用的那个)
-        self.assertIn("func _gk_global_position_3d(host: Node)", code)
+        self.assertIn("func _gk_global_position_3d(host)", code)
         self.assertIn("_gk_global_position_3d(", code)
         # 0~1 夹取 + near/far 线性
         self.assertIn("clampf(", code)
@@ -20597,6 +20599,27 @@ class TestRound196MinecraftMonsters(Base):
         self.assertIn("_gk_cd_ticks", code)
         self.assertIn("生命 = (生命 + -8.0)", code)
         self.assertIn("var 生命: float = 100", code)
+
+
+class TestRound198MinecraftSurvival(Base):
+    """第一百九十八轮:怪物可以被剑打死;死后追击链不能每帧刷脚本错误。
+
+    生成物要做两件事:移动语句包 `if is_instance_valid(目标)`,
+    位置 helper 接受 freed 实例(参数不再强类型化)。
+    """
+
+    def test_move_toward_skips_freed_target(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        chase = tree.new_node(NN.GKNodeMoveToward, "追怪物",
+                              gk_target="怪物1", gk_goal="__self__",
+                              gk_speed=2.6, gk_stop_distance=1.3)
+        gk_stub.connect(tree, physics, "执行", chase, "执行")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("if is_instance_valid(节点_怪物1):", code)
+        self.assertIn("func _gk_global_position_3d(host) -> Vector3:", code)
+        self.assertIn("if host == null or not is_instance_valid(host):", code)
 
 
 class TestRound99Occluder(Base):

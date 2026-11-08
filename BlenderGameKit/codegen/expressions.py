@@ -434,6 +434,8 @@ def ensure_position_helper(ctx, prop="global_position"):
         made.add(key)
         if ctx.dim == 2:
             body = [
+                "    if host == null or not is_instance_valid(host):",
+                "        return Vector2.ZERO",
                 "    if host is Node2D:",
                 f"        return (host as Node2D).{prop}",
                 "    # ⚠ 兜底(第三十六轮,真 Godot 实测):2D 场景里引用可能命中",
@@ -448,13 +450,15 @@ def ensure_position_helper(ctx, prop="global_position"):
             ret = "Vector2"
         else:
             body = [
+                "    if host == null or not is_instance_valid(host):",
+                "        return Vector3.ZERO",
                 f"    if host is Node3D:",
                 f"        return (host as Node3D).{prop}",
                 "    return Vector3.ZERO",
             ]
             ret = "Vector3"
         ctx.extra_sections.append({
-            "signature": f"func _gk_{key}(host: Node) -> {ret}:",
+            "signature": f"func _gk_{key}(host) -> {ret}:",
             "lines": body,
             "empty_body": "    pass",
             "separator": True,

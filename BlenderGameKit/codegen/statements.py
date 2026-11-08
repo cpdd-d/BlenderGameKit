@@ -652,8 +652,13 @@ def _stmt_move_toward(ctx, node, indent):
     """
     body_type = "CharacterBody2D" if ctx.dim == 2 else "CharacterBody3D"
     target = ctx.target_expr(node, "gk_target", hint="节点", node_type=body_type)
+    # 目标可能已经被销毁(怪物被剑打死)——移动语句包一层有效性判断,
+    # 否则 freed 实例传给 .velocity / move_and_slide() 每帧刷一条脚本错误。
+    ctx.add_line(indent, f"if is_instance_valid({target}):")
+    indent += 1
     goal = _move_toward_goal(ctx, node)
     if goal is None:
+        ctx.add_line(indent, "pass")
         ctx.warn("『移动_朝向目标』不知道往哪走 —— 在『目标』里选一个物体,"
                  "或者把『目标』引脚接到一个节点引用上。这一句跳过")
         return
@@ -761,7 +766,8 @@ def _expr_move_toward_outputs(ctx, node):
     stop = gd_number(float(getattr(node, "gk_stop_distance", 0.0) or 0.0))
     from .expressions import ensure_position_helper
     reader = ensure_position_helper(ctx)
-    return {"到达": f"(({reader}({goal}) - {reader}({target})).length() <= {stop})"}
+    return {"到达": f"(is_instance_valid({target}) and "
+                    f"(({reader}({goal}) - {reader}({target})).length() <= {stop}))"}
 
 
 # ==========================================================================

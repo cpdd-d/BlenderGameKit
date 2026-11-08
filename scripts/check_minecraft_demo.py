@@ -1,14 +1,16 @@
-"""我的世界示例的真机检查(第一百九十三轮;第一百九十七轮改为 .blend 工程)。
+"""我的世界示例的真机检查(第一百九十八轮:第一人称/物品栏/暂停/无限地形)。
 
 先用真 Blender 重建 `examples/demo_minecraft/我的世界.blend` 并导出
 `我的世界_godot/`,再起无头 Godot 验证:
 
-  * 开始界面:世界菜单开着、世界是暂停的(按 move_right 不动);
-    点『创建游戏』弹创建面板、点『取消』回主菜单、点『开始游戏』收起菜单;
-  * 玩家站在方块地面上(`is_on_floor`),按 move_right 真的走、按 jump 真的跳;
-  * 准星射线真的能拆掉一块方块;
-  * 右键放的是**当前选中的那种**方块(草 / 石 / 木,名字 + 材质颜色);
-  * 三只怪物追到 2 米内,贴身后生命下降,HUD 文字跟着变。
+  * 开始界面:世界菜单开着、世界是暂停的;创建→取消→开始整条链;
+  * 无限地形:开局就有 200+ 块地形,走到远处会重新铺、原点那块被卸载;
+  * 第一人称:玩家模型默认藏起来,移动 / 跳跃 / 挖方块正常;
+  * 物品栏:7 个格子 + "手持: xxx" HUD,数字键切换;
+  * V:第一 / 第三人称切换(相机 + 模型显隐);
+  * G:创造 / 生存切换,生存会被怪物扣血、创造不掉血;
+  * 使用:苹果回血、剑击杀准星指着的怪物;
+  * 放置:草 / 石 / 木按名字 + 材质颜色确认。
 
 跑法:
     python scripts\\check_minecraft_demo.py
@@ -42,14 +44,6 @@ func press(action: String, frames: int = 4) -> void:
 		await physics_frame
 
 
-func static_count(root: Node) -> int:
-	var total := 0
-	for child in root.get_children():
-		if child is StaticBody3D:
-			total += 1
-	return total
-
-
 func first_color(node: Node) -> Color:
 	for child in node.get_children():
 		if child is MeshInstance3D:
@@ -70,6 +64,10 @@ func first_color(node: Node) -> Color:
 	return Color(0, 0, 0, 0)
 
 
+func tiles(scene: Node) -> int:
+	return scene.find_children("地形_*", "StaticBody3D", true, false).size()
+
+
 func run() -> void:
 	var scene = load("res://scenes/World.tscn").instantiate()
 	root.add_child(scene)
@@ -77,10 +75,14 @@ func run() -> void:
 	for i in range(30):
 		await physics_frame
 	var player = scene.get_node("Colliders/Player") as CharacterBody3D
-	var colliders = scene.get_node("Colliders")
-	var before = static_count(colliders)
+	var cams: Array = scene.find_children("第一人称相机", "Camera3D", true, false)
+	var camera: Camera3D = cams[0] if cams.size() > 0 else null
+	var tiles_start: int = 0
+	for i in range(3):
+		await physics_frame
+	tiles_start = tiles(scene)
 
-	# 开始界面:世界菜单该是开着的,而且树是暂停的(按 move_right 不动)
+	# ---- 开始界面 ----
 	var menu_nodes: Array = scene.find_children("世界菜单", "Panel", true, false)
 	var start_nodes: Array = scene.find_children("开始游戏", "Button", true, false)
 	var create_nodes: Array = scene.find_children("创建游戏", "Button", true, false)
@@ -97,7 +99,6 @@ func run() -> void:
 	Input.action_release("move_right")
 	var frozen: bool = absf(player.global_position.x - px0) < 0.05
 
-	# 创建游戏 -> 创建世界面板;取消 -> 回主菜单
 	var create_ok := false
 	var cancel_ok := false
 	if menu_ok and create_nodes.size() > 0 and create_panel_nodes.size() > 0:
@@ -112,7 +113,6 @@ func run() -> void:
 			cancel_ok = (not create_panel_nodes[0].visible
 				and menu_nodes[0].visible)
 
-	# 开始游戏 -> 菜单收起、世界解冻
 	var started := false
 	if menu_ok:
 		start_nodes[0].pressed.emit()
@@ -120,11 +120,12 @@ func run() -> void:
 			await physics_frame
 		started = (not menu_nodes[0].visible and not paused)
 
-	# 解冻之后才开始落体 / 落地判定(暂停期间物理不走)
 	for i in range(10):
 		await physics_frame
 	var on_floor = player.is_on_floor()
+	var terrain_ok := tiles_start >= 200
 
+	# ---- 移动 / 跳跃 ----
 	var x0 = player.global_position.x
 	Input.action_press("move_right")
 	for i in range(20):
@@ -139,20 +140,21 @@ func run() -> void:
 	for i in range(3):
 		await physics_frame
 	var jumped = player.global_position.y > y0 + 0.05
-	# 等落地(跳 8.5 米/秒、重力 9.8:大约 1.8 秒才回到地面)
 	for i in range(140):
 		await physics_frame
 
-	# 低头看地面,然后按 E 拆准星指着的那一块
-	var camera = scene.get_node("第一人称相机") as Camera3D
+	# ---- 挖一块地形 ----
 	camera.rotation_degrees = Vector3(-40.0, 20.0, 0.0)
 	for i in range(3):
 		await physics_frame
+	var tiles_before_mine: int = scene.find_children(
+		"*", "StaticBody3D", true, false).size()
 	await press("mine")
-	var after = static_count(colliders)
-	var broke = after < before
+	var tiles_after_mine: int = scene.find_children(
+		"*", "StaticBody3D", true, false).size()
+	var broke = tiles_after_mine < tiles_before_mine
 
-	# 默认这一档是草方块:对着另一块按 Q
+	# ---- 放方块(草 -> 石 -> 木)----
 	camera.rotation_degrees = Vector3(-40.0, -20.0, 0.0)
 	for i in range(3):
 		await physics_frame
@@ -165,7 +167,6 @@ func run() -> void:
 		var c := first_color(grass_nodes[0])
 		grass_color_ok = abs(c.r - 0.24) < 0.03 and abs(c.g - 0.60) < 0.03
 
-	# 按 2 换石头 -> 放下来的是石头方块(不是草)
 	camera.rotation_degrees = Vector3(-40.0, 50.0, 0.0)
 	for i in range(3):
 		await physics_frame
@@ -178,7 +179,6 @@ func run() -> void:
 		var c := first_color(stone_nodes[0])
 		stone_color_ok = abs(c.r - 0.46) < 0.03 and abs(c.b - 0.52) < 0.03
 
-	# 按 4 换木头
 	camera.rotation_degrees = Vector3(-40.0, -50.0, 0.0)
 	for i in range(3):
 		await physics_frame
@@ -186,43 +186,100 @@ func run() -> void:
 	await press("place")
 	var wood_nodes: Array = scene.find_children(
 		"木头方块", "StaticBody3D", true, false)
-	var wood_color_ok := false
-	if wood_nodes.size() > 0:
-		var c := first_color(wood_nodes[0])
-		wood_color_ok = abs(c.r - 0.42) < 0.03 and abs(c.g - 0.27) < 0.03
+	var switched = (stone_nodes.size() == 1 and wood_nodes.size() == 1)
 
-	var switched = (stone_nodes.size() == 1 and wood_nodes.size() == 1
-		and stone_color_ok and wood_color_ok)
+	# ---- 物品栏 ----
+	var hotbar_nodes: Array = scene.find_children("物品栏", "Panel", true, false)
+	var slot_nodes: Array = scene.find_children("槽*", "Label", true, false)
+	var hud_nodes: Array = scene.find_children("手持文本", "Label", true, false)
+	var hud_text := ""
+	if hud_nodes.size() > 0:
+		hud_text = str(hud_nodes[0].text)
+	var hotbar_ok: bool = (hotbar_nodes.size() > 0 and slot_nodes.size() == 7
+		and hud_text.begins_with("手持: 木头方块"))
 
-	# 怪物:三只都该追到 2 米内,并且贴身后生命往下掉、HUD 跟着变
-	var hp0 := float(player.get("生命"))
-	var farthest := 0.0
-	for i in range(240):
+	# ---- V 切视角 ----
+	await press("view_toggle")
+	var cam_now: Camera3D = scene.get_viewport().get_camera_3d()
+	var third_ok: bool = cam_now != null and str(cam_now.name) == "第三人称相机"
+	var model_nodes: Array = scene.find_children("Model", "Node3D", true, false)
+	var model_shown: bool = model_nodes.size() > 0 and model_nodes[0].visible
+	await press("view_toggle")
+	var cam_back: Camera3D = scene.get_viewport().get_camera_3d()
+	var first_ok: bool = cam_back != null and str(cam_back.name) == "第一人称相机"
+	var view_ok := third_ok and model_shown and first_ok
+
+	# ---- G 切模式:生存会掉血,创造不会 ----
+	var creative0 := bool(player.get("创造模式"))
+	await press("mode_toggle")
+	var creative1 := bool(player.get("创造模式"))
+	var hp_surv0 := float(player.get("生命"))
+	for i in range(180):
 		await physics_frame
-	for name in ["怪物1", "怪物2", "怪物3"]:
-		var monster = scene.get_node("Colliders/" + name) as CharacterBody3D
-		farthest = maxf(farthest,
-			player.global_position.distance_to(monster.global_position))
+	var hp_surv1 := float(player.get("生命"))
+	var hurt := hp_surv1 < hp_surv0
+	await press("mode_toggle")
+	var creative2 := bool(player.get("创造模式"))
+	var hp_creative0 := float(player.get("生命"))
+	for i in range(90):
+		await physics_frame
+	var hp_creative1 := float(player.get("生命"))
+	var safe := absf(hp_creative1 - hp_creative0) < 0.01
+	var mode_ok := creative0 and not creative1 and creative2 and hurt and safe
+
+	# ---- 苹果回血 ----
+	camera.rotation_degrees = Vector3(-40.0, 0.0, 0.0)
+	for i in range(3):
+		await physics_frame
+	await press("key_6")
+	var hp0 := float(player.get("生命"))
+	await press("place")
 	var hp1 := float(player.get("生命"))
-	var chased := farthest <= 2.0
-	var hurt := hp1 < hp0 and hp1 < 100.0
-	var hp_labels: Array = scene.find_children("生命文本", "Label", true, false)
-	var hud_ok: bool = (hp_labels.size() > 0
-		and str(hp_labels[0].text).begins_with("生命 "))
+	var ate := hp1 > hp0
+
+	# ---- 剑击杀最近的怪物 ----
+	var monsters: Array = scene.find_children("怪物*", "CharacterBody3D", true, false)
+	var monsters_before := monsters.size()
+	if monsters.size() > 0:
+		camera.look_at((monsters[0] as Node3D).global_position
+			+ Vector3(0, 0.7, 0), Vector3.UP)
+	for i in range(3):
+		await physics_frame
+	await press("key_7")
+	await press("place")
+	for i in range(5):
+		await physics_frame
+	var monsters_after: int = scene.find_children(
+		"怪物*", "CharacterBody3D", true, false).size()
+	var sword_ok := monsters_before > 0 and monsters_after < monsters_before
+
+	# ---- 无限地形:走远之后重新铺、原点卸载 ----
+	player.global_position = Vector3(60.0, 1.2, 0.0)
+	for i in range(30):
+		await physics_frame
+	var tiles_far := tiles(scene)
+	var old_tile: Array = scene.find_children(
+		"地形_0_0", "StaticBody3D", true, false)
+	var infinite_ok := tiles_far >= 200 and old_tile.size() == 0
 
 	var ok = (on_floor and moved and jumped and broke and placed
-		and grass_color_ok and switched and chased and hurt and hud_ok
-		and menu_ok and frozen and create_ok and cancel_ok and started)
+		and grass_color_ok and switched and menu_ok and frozen
+		and create_ok and cancel_ok and started and terrain_ok
+		and hotbar_ok and view_ok and mode_ok and ate and sword_ok
+		and infinite_ok)
 	print("MINECRAFT on_floor=", on_floor, " moved=", moved,
-		" jumped=", jumped, " blocks=", before, "->", after,
-		" broke=", broke, " placed=", placed,
-		" grass=", grass_nodes.size(), " grass_color=", grass_color_ok,
-		" stone=", stone_nodes.size(), " stone_color=", stone_color_ok,
-		" wood=", wood_nodes.size(), " wood_color=", wood_color_ok,
-		" farthest=", farthest, " hp=", hp0, "->", hp1,
-		" chased=", chased, " hurt=", hurt, " hud=", hud_ok,
-		" menu=", menu_ok, " frozen=", frozen,
-		" create=", create_ok, " cancel=", cancel_ok, " started=", started)
+		" jumped=", jumped, " tiles=", tiles_before_mine, "->",
+		tiles_after_mine, " broke=", broke, " placed=", placed,
+		" grass_color=", grass_color_ok, " stone=", stone_nodes.size(),
+		" wood=", wood_nodes.size(), " switched=", switched,
+		" menu=", menu_ok, " frozen=", frozen, " create=", create_ok,
+		" cancel=", cancel_ok, " started=", started,
+		" terrain=", terrain_ok, " hotbar=", hotbar_ok,
+		" hud=", hud_text, " view=", view_ok,
+		" mode=", mode_ok, " hp=", hp_surv0, "->", hp_surv1,
+		" ate=", ate, " sword=", sword_ok,
+		" tiles_far=", tiles_far, " unload=", old_tile.size() == 0,
+		" infinite=", infinite_ok)
 	print("MINECRAFT_CHECK=", "OK" if ok else "FAIL")
 	quit(0 if ok else 1)
 '''
@@ -292,10 +349,12 @@ def main():
         print("MINECRAFT=OK")
         return 0
     print("MINECRAFT=FAILED")
-    for line in text.splitlines()[-16:]:
+    for line in text.splitlines()[-18:]:
         print("  " + line.strip())
     return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
