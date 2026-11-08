@@ -1073,6 +1073,32 @@ if ($SkipGodot) {
         }
     }
 
+    # 5s-4. 我的世界示例(第一百九十三轮)—— 真 Godot 无头跑:
+    #       玩家落地 / move_right 真的走 / 跳跃真的起跳 / E 真的拆掉方块。
+    Write-Output ""
+    $mcChecker = Join-Path $Root "scripts\check_minecraft_demo.py"
+    if ($godotSkipped) {
+        Write-Output "跳过我的世界示例:本机找不到 Godot"
+    } elseif (-not (Test-Path $mcChecker)) {
+        Write-Output "跳过我的世界示例:没有 scripts\check_minecraft_demo.py"
+    } else {
+        $env:GK_GODOT = $Godot
+        $mcOut = & $Py $mcChecker 2>&1 | Out-String
+        $mcOut -split "`n" | Where-Object {
+            $_ -match "^(MINECRAFT|跳过)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($mcOut -match "MINECRAFT=OK") {
+            $godotRan += "我的世界示例"
+        } elseif ($mcOut -match "跳过") {
+            Write-Output "（我的世界示例跳过:本机没有 Godot）"
+        } else {
+            Write-Output "我的世界示例失败,尾部输出:"
+            ($mcOut -split "`n" | Select-Object -Last 15) |
+                ForEach-Object { Write-Host ("  " + $_.TrimEnd()) }
+            $godotOk = $false
+        }
+    }
+
     # 5s-3. C++ 热路径(第一百九十一轮;仅 -Deep)—— 从节点图生成 C++,
     #       用本仓库的 godot-cpp 真编译,再让 Godot 加载并检查类 / 属性。
     #       ⚠ 第一次会编译 godot-cpp(几分钟),所以不放进默认门禁;

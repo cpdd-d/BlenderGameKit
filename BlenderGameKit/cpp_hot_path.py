@@ -288,6 +288,7 @@ def _extract_move(spec, dimension):
         "dimension": dimension,
         "speed": speed,
         "gravity_mode": bool(getattr(move, "gk_keep_y", False)),
+        "face_move": bool(getattr(move, "gk_face_move", True)),
         "axis_h": str(getattr(move, "gk_axis_h", "X") or "X").upper(),
         "axis_v": str(getattr(move, "gk_axis_v", "Z") or "Z").upper(),
         "forward_neg": str(getattr(move, "gk_forward_sign", "NEG")) == "NEG",
@@ -456,7 +457,8 @@ def _movement_lines(spec):
         "        rot.y = Math::lerp_angle(rot.y, face_yaw,\n"
         "                (real_t)Math::min(1.0, 12.0 * delta));\n"
         "        body->set_rotation(rot);\n"
-        "    }")
+        "    }"
+    ) if spec.get("face_move", True) else ""
     return dir_decl, velocity, rotate
 
 

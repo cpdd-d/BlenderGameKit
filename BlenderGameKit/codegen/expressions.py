@@ -28,6 +28,25 @@ def _expr_get_bone(ctx, node):
     }
 
 
+@multi_output("GKNodeRaycast")
+def _expr_raycast(ctx, node):
+    """『射线_检测』的『打到的东西』/『命中点』给下游节点用。
+
+    语句处理器把命中结果存进成员变量(`gk_ray_*` / `gk_ray_point_*`);
+    这里返回**同一组变量名**。以前只在语句里 declare、没登记成表达式,
+    下游接『实例_销毁』的目标时会告警"不能作为取值使用" —— 第一人称
+    挖方块的示例就是这么撞到的。
+    """
+    tag = snake_case(node.name, "hit")
+    target = ctx.declare_var(f"gk_ray_{tag}", "Variant",
+                             key=node_lib.node_key(node))
+    point = ctx.declare_var(f"gk_ray_point_{tag}", "Variant",
+                            key=node_lib.node_key(node))
+    ctx.read_vars.add(target)
+    ctx.read_vars.add(point)
+    return {"打到的东西": target, "命中点": point}
+
+
 @multi_output("GKNodeInputDirection")
 def _expr_input_direction(ctx, node):
     """『输入_方向』:上下左右四个键 -> 二维方向向量 + 左右/前后分量。

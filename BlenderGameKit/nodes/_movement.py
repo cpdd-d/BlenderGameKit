@@ -108,6 +108,12 @@ class GKNodeMoveDirection(B.GKStatementNode):
         # 如果『参考系』引脚接了东西,以引脚为准(这个勾选作兜底)。
         ("gk_follow_camera", "bool", False, "随相机朝向",
          "3D 第三人称:移动方向按当前相机的水平朝向变换(转视角后方向感正确)"),
+        # ── 第一人称:身体别跟着移动方向转(第一百九十三轮)────────────
+        # 3D 移动默认会让角色身体转向移动方向(第三人称看起来自然);
+        # 但第一人称相机常常是角色的子节点 —— 身体一转,相机也跟着转,
+        # 视角会自己打转。勾掉这个开关 = 只写 velocity,不转身体。
+        ("gk_face_move", "bool", True, "身体转向移动方向",
+         "第一人称(相机挂在角色下面)请取消:否则身体一转相机也跟着转"),
         # ── 推开刚体(用户 2026-10-05 第二十八轮)────────────────────
         # Godot 的 CharacterBody 是**运动学体**:撞到刚体时只会"贴着它滑走",
         # 不会给刚体任何力 —— 表现就是"箱子焊在地上,推不动"。
@@ -137,6 +143,8 @@ class GKNodeMoveDirection(B.GKStatementNode):
         layout.prop(self, "gk_keep_y", text="重力模式(平台游戏勾上)", toggle=True)
         row = layout.row(align=True)
         row.prop(self, "gk_follow_camera", text="随相机朝向", toggle=True)
+        row.prop(self, "gk_face_move", text="身体转向移动", toggle=True)
+        row = layout.row(align=True)
         row.prop(self, "gk_push_bodies", text="推开刚体", toggle=True)
         if getattr(self, "gk_push_bodies", False):
             layout.prop(self, "gk_push_force", text="推力")

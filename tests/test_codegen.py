@@ -20467,6 +20467,47 @@ class TestRound192GdImport(Base):
         self.assertTrue(result["skipped"])
 
 
+class TestRound193MinecraftHooks(Base):
+    """第一百九十三轮:我的世界示例撞出来的两个代码生成缺口。
+
+    1. `射线_检测` 的『打到的东西』以前只能被语句内部用,下游接
+       『实例_销毁』会告警"不能作为取值使用" —— 现在登记成表达式;
+    2. 3D 移动默认会把身体转向移动方向;第一人称相机挂在角色下面时
+       身体一转相机也跟着转,现在可以用 `gk_face_move=False` 关掉。
+    """
+
+    def test_raycast_object_output_is_usable_downstream(self):
+        tree = make_tree()
+        ready = tree.new_node(NN.GKNodeOnReady, "启动")
+        ray = tree.new_node(NN.GKNodeRaycast, "准星", gk_distance=6.0)
+        free = tree.new_node(NN.GKNodeQueueFree, "挖掉")
+        gk_stub.connect(tree, ready, "执行", ray, "执行")
+        gk_stub.connect(tree, ray, "命中", free, "执行")
+        gk_stub.connect(tree, ray, "打到的东西", free, "目标")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertIn("gk_ray_", code)
+        self.assertIn(".queue_free()", code)
+
+    def test_face_move_can_be_disabled_for_first_person(self):
+        tree = make_tree()
+        physics = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+        direction = tree.new_node(NN.GKNodeInputDirection, "方向")
+        move = tree.new_node(NN.GKNodeMoveDirection, "移动",
+                             gk_speed=6.0, gk_keep_y=True,
+                             gk_follow_camera=True, gk_face_move=False)
+        gk_stub.connect(tree, physics, "执行", move, "执行")
+        gk_stub.connect(tree, direction, "方向", move, "方向")
+        code, _ = gen(tree, V3)
+        self.assertNotIn("face_yaw", code)
+        self.assertNotIn("rotation.y = lerp_angle", code)
+
+        move.gk_face_move = True
+        code2, _ = gen(tree, V3)
+        self.assertIn("face_yaw", code2)
+        self.assertIn("rotation.y = lerp_angle", code2)
+
+
 class TestRound99Occluder(Base):
     """第九十九轮:遮挡体(导出 OccluderInstance3D + 打开项目总开关)。
 

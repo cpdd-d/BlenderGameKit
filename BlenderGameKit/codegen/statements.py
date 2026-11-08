@@ -333,7 +333,10 @@ def _stmt_move_direction(ctx, node, indent):
     # 3D 第三人称:移动 codegen 之前只写 velocity —— 人物模型永远面朝
     # 初始朝向,相机一转就"横着走/倒着走"。有移动输入时把宿主的 yaw
     # 转向移动方向(lerp_angle 平滑,不瞬跳;上帝相机把方向抹零,不转)。
-    if ctx.dim == 3:
+    # ── 第一人称可以关掉(第一百九十三轮)──────────────────────────
+    # 相机挂在角色下面时,身体一转相机也跟着转 —— 视角会自己打转。
+    # 『身体转向移动方向』取消勾选就只写 velocity,不碰 rotation。
+    if ctx.dim == 3 and bool(getattr(node, "gk_face_move", True)):
         face_dir = world_dir if world_dir is not None else f"({temp})"
         face_yaw = ctx.new_temp("face_yaw")
         ctx.add_line(indent, f"if ({face_dir}).length_squared() > 0.0001:")
