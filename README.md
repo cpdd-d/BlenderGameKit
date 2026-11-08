@@ -277,12 +277,13 @@ tests/
 
 scripts/
 ├── install.ps1                 构建 + 安装到 Blender
-├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端多层(含 NPR 渲染 / 相机远裁 / 我的世界示例;NPR 渲染那层要真 GPU,没显卡自动跳过;-Deep 再加动画六层 + C++ 热路径真编译)
+├── build_and_test.ps1          一键门禁:着色器编译 + 构建 + 重装 + 冒烟 + 面板 draw() + 示例体检 + 节点手册新鲜度 + Godot 端到端多层(含 NPR 渲染 / 相机远裁 / 我的世界示例 / 七色闯关;NPR 渲染那层要真 GPU,没显卡自动跳过;-Deep 再加动画六层 + C++ 热路径真编译)
 ├── check_release.py            ★ 打包自检:真 Godot 逐个平台跑 `--export-release`(Windows/Linux/Web;没装那个平台的导出模板则跳过)
 ├── check_render_demo.py        ★ NPR 渲染自检:**真开窗口**扫光出图,断言"不黑 / 明暗随光角度滑动 / 四张两两不同 / 三色调档数 / 补光亮度差"(门禁 5s;没 GPU 自动跳过)
 ├── check_camera_far.py         ★ 相机远裁真机验证:环境脚本把 `Camera3D.far` 设对 + 小于 near 时兜底(无头即可)
 ├── check_cpp_hot_path.py       ★ C++ 热路径真编译 + Godot 加载验证(要 SCons + godot-cpp;缺了自动跳过)
 ├── check_minecraft_demo.py     ★ 我的世界示例真机检查:落地 / 移动 / 跳跃 / 挖方块 / 放方块(无头 Godot)
+├── check_shichise.py           ★《七色》闯关真机检查:对话拿火把 → 三座火盆 → 塔门升起 → BOSS → 赤色回归;Godot 用户目录隔离到 _dist,不碰真实存档
 ├── make_minecraft_demo.py      ★ 生成 3D"我的世界"示例(节点图 + 方块场景)
 ├── check_advisor_api.py        ★ AI 顾问自检:用**真实 API** 验 tools 协议/Agent 循环/提议卡片(要 Key、会花钱 → 故意不进守则)
 ├── make_node_docs.py           ★ 从节点类生成 docs/节点手册.md(离线;--check 进守则,防手册过期)
@@ -1375,8 +1376,8 @@ godot --headless --path _dist\anim_probe --quit-after 900
 
 **还没做的**（对着代码核过）：
 
-- 暂无新的（反向导入已完成；`docs/待办清单.md` 里还有一条
-  "验证脚本隔离存档"的小项）
+- 暂无新的（反向导入、验证脚本隔离存档都已完成；剩下的见
+  `docs/待办清单.md` 顶部的"别重复做已完成的"那节）
 
 > 想接着做的话，去 [docs/待办清单.md](docs/待办清单.md) 里挑一条立成一轮
 > —— 那份是**活的**清单，做完一项划一项。

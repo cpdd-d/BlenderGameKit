@@ -1099,6 +1099,37 @@ if ($SkipGodot) {
         }
     }
 
+    # 5s-5. 七色剧情闯关(第 194 轮)—— "七色"工程是**本地生成**的
+    #       (games/**/_godot/ 全在 .gitignore 里),所以没有工程就跳过、不判红;
+    #       有工程才真跑完整链路:对话拿火把 → 三座火盆 → 塔门升起 →
+    #       砍敌人 → BOSS 现身 → 击杀 → 赤色回归(饱和度 1.5)。
+    #       ⚠ 探针会删 user://gk_shichise.json:脚本把 APPDATA/LOCALAPPDATA
+    #         指到 _dist/shichise_probe_profile 再跑,真实存档不受影响。
+    Write-Output ""
+    $shichiseChecker = Join-Path $Root "scripts\check_shichise.py"
+    $shichiseGame = Join-Path $Root "games\七色\七色_godot\project.godot"
+    if ($godotSkipped) {
+        Write-Output "跳过七色闯关:本机找不到 Godot"
+    } elseif (-not (Test-Path $shichiseChecker)) {
+        Write-Output "跳过七色闯关:没有 scripts\check_shichise.py"
+    } elseif (-not (Test-Path $shichiseGame)) {
+        Write-Output "跳过七色闯关:还没有 games\七色\七色_godot(先跑 make_shichise.py)"
+    } else {
+        $env:GODOT = $Godot
+        $shichiseOut = & $Py $shichiseChecker 2>&1 | Out-String
+        $shichiseOut -split "`n" | Where-Object {
+            $_ -match "^(CHECK_SHICHISE|\[FAIL\]|结果:|跳过)"
+        } | ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($shichiseOut -match "CHECK_SHICHISE=OK") {
+            $godotRan += "七色闯关"
+        } else {
+            Write-Output "七色闯关失败,尾部输出:"
+            ($shichiseOut -split "`n" | Select-Object -Last 20) |
+                ForEach-Object { Write-Host ("  " + $_.TrimEnd()) }
+            $godotOk = $false
+        }
+    }
+
     # 5s-3. C++ 热路径(第一百九十一轮;仅 -Deep)—— 从节点图生成 C++,
     #       用本仓库的 godot-cpp 真编译,再让 Godot 加载并检查类 / 属性。
     #       ⚠ 第一次会编译 godot-cpp(几分钟),所以不放进默认门禁;

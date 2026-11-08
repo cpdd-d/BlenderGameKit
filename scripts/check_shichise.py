@@ -10,9 +10,13 @@
 
 没有装 Godot 时只做静态检查,并打印 SKIP(不判红)。
 
-⚠ 这个探针会**删掉**开发用的 user://gk_shichise.json(开始和结束各一次),
-   不会污染你自己的存档。要在 Godot 里手动玩,请先跑 make_shichise.py,
-   然后按 F5 —— 不要跑这个自检。
+── 存档隔离(第 194 轮)────────────────────────────────────────────
+探针要删 user://gk_shichise.json 才能"从零开始"(开始和结束各一次)。
+以前删的是**开发用的真实存档**,所以这个脚本一直没敢进常规回归。
+现在跑 Godot 时把 APPDATA / LOCALAPPDATA(Godot 在 Windows 上按这两个
+定位 user://)指到 _dist/shichise_probe_profile —— 删的只是那份临时存档,
+你自己在 Godot 里的进度一点不受影响。要在 Godot 里手动玩,照旧跑
+make_shichise.py 然后按 F5。
 """
 
 import glob
@@ -27,6 +31,8 @@ GAME_DIR = os.path.join(ROOT, "games", "七色")
 GODOT_DIR = os.path.join(GAME_DIR, "七色_godot")
 BLEND_PATH = os.path.join(GAME_DIR, "七色.blend")
 PROBE_NAME = "_gk_check_gameplay.gd"
+# Godot 的 user:// 在这个进程里指向这里,而不是真实 %APPDATA%
+PROFILE_DIR = os.path.join(ROOT, "_dist", "shichise_probe_profile")
 
 RESULTS = []
 
@@ -195,21 +201,49 @@ def static_checks():
         check("玩家脚本有色技", "func _use_skill" in text)
 
 
+def _isolated_user_dirs():
+    """隔离 profile 下 Godot 给 user:// 建的目录(Windows 大小写两种都看)。"""
+    found = []
+    for vendor in ("Godot", "godot"):
+        base = os.path.join(PROFILE_DIR, vendor, "app_userdata")
+        if os.path.isdir(base):
+            found.append(base)
+    return found
+
+
 def run_godot_check(godot):
     probe_path = os.path.join(GODOT_DIR, PROBE_NAME)
     with open(probe_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(PROBE)
+    # ── 存档隔离(第 194 轮)────────────────────────────────────────
+    # 探针会删 user://gk_shichise.json。Godot 的 user:// 在 Windows 上落在
+    # %APPDATA%\Godot\app_userdata\<工程名>,所以只要把 APPDATA 换掉,
+    # 删的就是 _dist 下这份临时存档 —— 开发用的真实存档完全碰不到。
+    # Linux / macOS 走 XDG_DATA_HOME / HOME,一并指过去(跨平台不漏)。
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    env = dict(os.environ)
+    env["APPDATA"] = PROFILE_DIR
+    env["LOCALAPPDATA"] = PROFILE_DIR
+    env["XDG_DATA_HOME"] = PROFILE_DIR
+    env["HOME"] = PROFILE_DIR
+    print(f"[INFO] 用户数据目录: {PROFILE_DIR}")
     try:
         result = subprocess.run(
             [godot, "--headless", "--path", GODOT_DIR,
              "--script", f"res://{PROBE_NAME}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=300,
+            timeout=300, env=env,
         )
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         for line in output.splitlines():
             if line.startswith("CHECK_"):
                 print("    " + line.strip())
+        # 这条防的是"隔离悄悄没生效":万一以后 Godot 换了 user:// 的定位变量,
+        # 探针删的又会是真实存档 —— 而所有行为断言照样全绿,没人发现。
+        # 只要隔离目录真的被建出来了,就说明这次跑的是临时存档。
+        user_dirs = _isolated_user_dirs()
+        check("user:// 已隔离到 _dist(真实存档未被删)", bool(user_dirs),
+              str(PROFILE_DIR))
         check("Godot 进程正常退出", result.returncode == 0,
               f"exit={result.returncode}")
         check("三个脚本都加载", "CHECK_LOADED=true,true,true" in output)
