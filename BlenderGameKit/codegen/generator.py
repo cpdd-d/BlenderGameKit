@@ -60,7 +60,14 @@ class Generator:
         # 要不要加守卫。**必须在遍历节点之前设好**(语句是按图生成的)。
         # 上帝机本身由环境脚本生成(见 asset_export.ENVIRONMENT_SCRIPT),
         # 不再进角色脚本 —— 这样没有角色的场景也能飞着看。
-        self.ctx.god_camera_enabled = bool(self.options.get("god_camera", False))
+        #
+        # ⚠ 必须带维度门:上帝机守卫只在 3D 生成(见上限那段说明)。
+        #   这里如果只按开关赋值,2D 工程勾了『上帝摄像机』时,上面那些
+        #   调用点会写出 `_gk_god_camera_active()`,而定义被 3D 门挡住
+        #   —— Godot 报 "Function '_gk_god_camera_active()' not found in
+        #   base self",整个角色脚本加载不了(游戏里角色完全不动)。
+        self.ctx.god_camera_enabled = (
+            self.ctx.dim == 3 and bool(self.options.get("god_camera", False)))
 
         # ── 主界面模式(第一百一十二轮)────────────────────────────────
         # 『主界面』不走事件那套:整张设计图(控件 + 自带行为)就是
