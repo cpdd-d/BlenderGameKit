@@ -9550,6 +9550,36 @@ class TestEnvironmentGodCamera(Base):
         self.assertNotIn("_gk_god_camera_active", code)
         self.assertNotIn("get_camera_3d()", code)
 
+    def test_god_guard_call_sites_only_in_3d(self):
+        """2D 里**调用点**也不能引用 `_gk_god_camera_active()`。
+
+        上一条只钉了"空图不带 helper";真正致命的是**图里有节点**时:
+        鼠标模式 / 移动 / 跳跃 / 相机过渡这些调用点各自只看
+        `god_camera_enabled`,不看维度 —— 2D 工程勾了『上帝摄像机』就会
+        写出 `if not _gk_god_camera_active():`,而 helper 定义被维度门挡住。
+        Godot 报 "Function '_gk_god_camera_active()' not found in base self",
+        整个角色脚本加载不了(角色完全不动)。
+
+        3D 侧必须照旧带守卫 —— 别把维度门做成"哪里都不生成"。
+        """
+        from BlenderGameKit import codegen
+        cases = [
+            (NN.GKNodeMouseMode, {}),
+            (NN.GKNodeMoveDirection, {"gk_speed": 300.0}),
+            (NN.GKNodeJump, {}),
+            (NN.GKNodeCameraSetCurrent, {"gk_target": "特写机位",
+                                         "gk_blend": 1.5}),
+        ]
+        for cls, kwargs in cases:
+            tree = make_tree()
+            event = tree.new_node(NN.GKNodeOnPhysicsProcess, "物理帧")
+            action = tree.new_node(cls, "节点", **kwargs)
+            gk_stub.connect(tree, event, "执行", action, "执行")
+            code_2d, _ = codegen.generate(tree, dict(V2, god_camera=True))
+            self.assertNotIn("_gk_god_camera_active", code_2d, cls.__name__)
+            code_3d, _ = codegen.generate(tree, dict(V3, god_camera=True))
+            self.assertIn("_gk_god_camera_active", code_3d, cls.__name__)
+
     def test_god_camera_forces_environment_node(self):
         """开关开着时,即使场景里没相机/灯/材质,也要生成 Environment 节点。
 
