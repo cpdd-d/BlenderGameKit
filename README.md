@@ -31,7 +31,6 @@ Body        [CharacterBody3D]      ← 挂着节点图生成的脚本
   Collision [CollisionShape3D]     ← 碰撞体从 Blender 的物理面板自动生成
 Environment [Node]                 ← 相机 / 灯光 / 卡通材质
 World       [instance glb]         ← 网格 + 层级 + 变换
-```
 
 实测:相机 1 个、灯光 1 个、碰撞体 3 个全部带过去,Godot 里跑 90 帧无报错。
 
