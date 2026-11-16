@@ -123,6 +123,16 @@ class GenContext:
         self._active = set()       # 沿执行流的递归栈，用于断环
         self._claimed = {}         # 节点 -> {入口引脚名: 哪个事件函数已经"拥有"它}
         self._current_event = ""   # 当前正在生成的事件标签(用于告警文案)
+        # 当前这条链是不是在 `_physics_process` 里生成 ——
+        # 物理步进中往场景树里 add_child(带碰撞体的节点)会让 Godot
+        # 偶尔卡 200~400ms(示例线实测)。创建实例的两个节点据此
+        # 挪到下一个渲染帧再加树,代价见 statements 里的说明。
+        self.in_physics_process = False
+        # 物理帧里创建实例时,要不要生成"下一渲染帧再加树"的小工具。
+        self.need_idle_add_helper = False
+        # 图里有没有"按住才为真"的轮询输入(方向 / 按键按住 / 鼠标按住)。
+        # 有才生成失焦清键的 `_notification`,没有连产物都不变。
+        self.need_focus_guard = False
         # 本次是从目标节点的哪个**执行入口**进来的。
         # 单入口节点永远是『执行』;『流程_门』『流程_多路门』这类
         # 多入口节点要靠它区分"打开 / 关闭 / 重置 / 执行"。

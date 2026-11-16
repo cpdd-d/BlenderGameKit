@@ -675,6 +675,10 @@ def _stmt_move_toward(ctx, node, indent):
     stop = gd_number(float(getattr(node, "gk_stop_distance", 0.0) or 0.0))
     turn = bool(getattr(node, "gk_turn", False))
     accel = float(getattr(node, "gk_accel", 0.0) or 0.0)
+    # ── 重力模式(第两百零一轮,真机反馈)────────────────────────────
+    # 不勾:整条三维向量写进 velocity —— 目标跳起来,追击者跟着飞。
+    # 勾上:竖直方向交给重力,只写水平分量(和『移动_按方向』同一套)。
+    keep_y = bool(getattr(node, "gk_keep_y", False)) and ctx.dim == 3
     vector = "Vector2" if ctx.dim == 2 else "Vector3"
     # ── 读位置复用『取值_位置』那个 helper(函数内导入)──────────────
     # 为什么不在文件顶端导入:`statements` <-> `expressions` 通过 `camera`
@@ -689,7 +693,13 @@ def _stmt_move_toward(ctx, node, indent):
     distance = ctx.new_temp("goal_dist")
     ctx.add_line(indent, f"var {here} := {reader}({target})")
     ctx.add_line(indent, f"var {diff} := {reader}({goal}) - {here}")
+    if keep_y:
+        # 高度差不算进"追到了没有" —— 不然怪物停在头顶 0.7 米也算到了
+        ctx.add_line(indent, f"{diff}.y = 0.0")
     ctx.add_line(indent, f"var {distance} := {diff}.length()")
+    if keep_y:
+        ctx.add_line(indent, f"{target}.velocity += {target}.get_gravity() * "
+                             f"get_physics_process_delta_time()")
     if accel > 0.0:
         # ── 平滑加减速(用户 2026-10-05 第二十六轮)──────────────────
         # 直接写 `velocity = 方向 * 速度` 是**瞬起瞬停** —— 追人的敌人
@@ -699,9 +709,30 @@ def _stmt_move_toward(ctx, node, indent):
         ctx.add_line(indent, f"var {wanted} := {vector}.ZERO")
         ctx.add_line(indent, f"if {distance} > {stop}:")
         ctx.add_line(indent + 1, f"{wanted} = {diff}.normalized() * {speed}")
-        ctx.add_line(indent, f"{target}.velocity = {target}.velocity.move_toward("
-                             f"{wanted}, {gd_number(accel)} "
-                             f"* get_physics_process_delta_time())")
+        if keep_y:
+            # move_toward 会把 y 一起拉向 0(把刚加上去的重力抹掉),
+            # 所以先把竖直速度扣下来,写完水平再放回去。
+            fall = ctx.new_temp("fall_y")
+            ctx.add_line(indent, f"var {fall} := {target}.velocity.y")
+            ctx.add_line(indent, f"{target}.velocity = "
+                                 f"{target}.velocity.move_toward("
+                                 f"{wanted}, {gd_number(accel)} "
+                                 f"* get_physics_process_delta_time())")
+            ctx.add_line(indent, f"{target}.velocity.y = {fall}")
+        else:
+            ctx.add_line(indent, f"{target}.velocity = "
+                                 f"{target}.velocity.move_toward("
+                                 f"{wanted}, {gd_number(accel)} "
+                                 f"* get_physics_process_delta_time())")
+    elif keep_y:
+        # 竖直速度刚加上重力,这里只写水平分量(写整条会把重力抹掉)
+        ctx.add_line(indent, f"if {distance} <= {stop}:")
+        ctx.add_line(indent + 1, f"{target}.velocity.x = 0.0")
+        ctx.add_line(indent + 1, f"{target}.velocity.z = 0.0")
+        ctx.add_line(indent, "else:")
+        ctx.add_line(indent + 1, f"{diff} = {diff}.normalized()")
+        ctx.add_line(indent + 1, f"{target}.velocity.x = {diff}.x * {speed}")
+        ctx.add_line(indent + 1, f"{target}.velocity.z = {diff}.z * {speed}")
     else:
         ctx.add_line(indent, f"if {distance} <= {stop}:")
         ctx.add_line(indent + 1, f"{target}.velocity = {vector}.ZERO")
@@ -766,6 +797,12 @@ def _expr_move_toward_outputs(ctx, node):
     stop = gd_number(float(getattr(node, "gk_stop_distance", 0.0) or 0.0))
     from .expressions import ensure_position_helper
     reader = ensure_position_helper(ctx)
+    if bool(getattr(node, "gk_keep_y", False)) and ctx.dim == 3:
+        # 重力模式下语句那边把高度差抹掉了 —— 这里也得只算水平距离,
+        # 否则"输出说到了、实际还在走"
+        rel = f"({reader}({goal}) - {reader}({target}))"
+        return {"到达": f"(is_instance_valid({target}) and "
+                        f"(Vector2({rel}.x, {rel}.z).length() <= {stop}))"}
     return {"到达": f"(is_instance_valid({target}) and "
                     f"(({reader}({goal}) - {reader}({target})).length() <= {stop}))"}
 
@@ -1333,11 +1370,17 @@ def _stmt_spawn(ctx, node, indent):
     ctx.add_line(indent + 1, f"if {inst} is Node3D or {inst} is Node2D:")
     ctx.add_line(indent + 2, f"{inst}.position = {position}")
     parent = (getattr(node, "gk_parent", "") or "").strip()
+    # 同 _stmt_asset_spawn:物理步进里加树会卡长帧,挪到下一个渲染帧。
+    if ctx.in_physics_process:
+        ctx.need_idle_add_helper = True
     if parent and parent != TARGET_SELF:
-        parent_expr = ctx.target_expr(node, "gk_parent", hint="parent")
-        ctx.add_line(indent + 1, f"{parent_expr}.add_child({inst})")
+        target = ctx.target_expr(node, "gk_parent", hint="parent")
     else:
-        ctx.add_line(indent + 1, f"get_tree().current_scene.add_child({inst})")
+        target = "get_tree().current_scene"
+    if ctx.in_physics_process:
+        ctx.add_line(indent + 1, f"_gk_add_on_idle({target}, {inst})")
+    else:
+        ctx.add_line(indent + 1, f"{target}.add_child({inst})")
 
 
 # ==========================================================================
@@ -1698,12 +1741,16 @@ def _stmt_raycast(ctx, node, indent):
                                  key=node_lib.node_key(node))
     point_var = ctx.declare_var(f"gk_ray_point_{snake_case(node.name, 'hit')}", "Variant",
                                 key=node_lib.node_key(node))
+    normal_var = ctx.declare_var(f"gk_ray_normal_{snake_case(node.name, 'hit')}", "Variant",
+                                 key=node_lib.node_key(node))
     ctx.read_vars.add(target_var)
     ctx.read_vars.add(point_var)
+    ctx.read_vars.add(normal_var)
 
     ctx.add_line(indent, f"if not {hit_var}.is_empty():")
     ctx.add_line(indent + 1, f"{target_var} = {hit_var}[\"collider\"]")
     ctx.add_line(indent + 1, f"{point_var} = {hit_var}[\"position\"]")
+    ctx.add_line(indent + 1, f"{normal_var} = {hit_var}[\"normal\"]")
     before = len(ctx.sink)
     _chain(ctx, node, indent + 1, "命中")
     if len(ctx.sink) == before:
@@ -2201,19 +2248,39 @@ def _stmt_function_call(ctx, node, indent):
     """
     from .. import properties as props
     from ..nodes.node_base import safe_function_name
+    from .interface_audit import typed_call_diagnostics
 
     raw = str(getattr(node, "gk_func_name", "") or "").strip()
+    issues = typed_call_diagnostics(ctx.tree, node, ctx.options)
+    for issue in issues:
+        ctx.warn(issue)
     if not raw:
         ctx.warn("『函数_调用』没填『函数』—— 这一句被跳过了"
                  "(旁边放大镜可以从侧栏声明里挑)")
         return
-    tree = getattr(ctx, "tree", None)
+    tree = props.function_call_tree(node, getattr(ctx, "tree", None))
     spec = props.tree_functions(tree).get(raw) if tree is not None else None
     if spec is None:
         ctx.warn(f"『函数_调用』填的『{raw}』没有在侧栏『函数』框里声明过 —— "
                  f"这一句被跳过了")
         return
 
+    key = node_lib.node_key(node)
+    success = ctx.new_temp("fok")
+    if not hasattr(ctx, "function_success"):
+        ctx.function_success = {}
+    ctx.function_success[key] = success
+    ctx.add_line(indent, f"var {success}: bool = false")
+    returns = spec.get("return")
+    result = None
+    if returns:
+        result = ctx.new_temp("fres")
+        ctx.function_results[key] = result
+        initial = {"bool": "false", "int": "0", "float": "0.0", "String": '\"\"',
+                   "Vector3": "Vector3.ZERO", "Vector2": "Vector2.ZERO"}.get(returns, "null")
+        ctx.add_line(indent, f"var {result}: {returns} = {initial}")
+    if issues:
+        return
     args = []
     for param_name, param_type in (spec.get("params") or ()):
         socket = ctx._socket(node, param_name)
@@ -2222,30 +2289,35 @@ def _stmt_function_call(ctx, node, indent):
             continue
         # 没接线:用引脚上填的值;引脚都没有(声明改过还没重建)时给兜底
         if socket is not None:
-            args.append(ctx.socket_default(socket))
+            if param_type in ("Vector2", "Vector3"):
+                args.append(gd_vector(socket.default_value, 2 if param_type == "Vector2" else 3))
+            else:
+                args.append(ctx.socket_default(socket))
         else:
-            args.append("0" if param_type in ("int", "float") else
-                        ("false" if param_type == "bool" else "null"))
-    call = f"{safe_function_name(raw)}({', '.join(args)})"
-    if not spec.get("return"):
-        ctx.add_line(indent, call)
-        return
-    # 有返回值 -> 存一个临时变量,『结果』输出引用它(见下面的多输出处理器)
-    result = ctx.new_temp("fres")
-    ctx.function_results[node_lib.node_key(node)] = result
-    ctx.add_line(indent, f"var {result} = {call}")
+            args.append({"int": "0", "float": "0.0", "bool": "false", "String": '\"\"',
+                         "Vector3": "Vector3.ZERO", "Vector2": "Vector2.ZERO"}.get(param_type, "null"))
+    method = safe_function_name(raw)
+    target = ctx.target_expr(node)
+    body = indent
+    if target != "self":
+        ctx.add_line(indent, f"if is_instance_valid({target}) and {target}.has_method({gd_string(method)}):")
+        body += 1
+    call = f"{method}({', '.join(args)})" if target == "self" else f"{target}.{method}({', '.join(args)})"
+    ctx.add_line(body, f"{result} = {call}" if result else call)
+    ctx.add_line(body, f"{success} = true")
 
 
 @multi_output("GKNodeFunctionCall")
 def _expr_function_call_outputs(ctx, node):
     """『函数_调用』的『结果』输出 = 上面那句 `var _fres1 = ...`。"""
     result = ctx.function_results.get(node_lib.node_key(node))
-    if not result:
+    output = node.outputs.get("结果")
+    if not result and output is not None and getattr(output, "is_linked", False):
         ctx.warn("『函数_调用』的『结果』被引用了,但这个函数声明的是**无返回** "
                  "—— 已按 null 处理。要取返回值,去侧栏『函数』框把它的"
                  "『返回』改成对应类型")
-        return {"结果": "null"}
-    return {"结果": result}
+        return {"结果": "null", "成功": getattr(ctx, "function_success", {}).get(node_lib.node_key(node), "false")}
+    return {"结果": result or "null", "成功": getattr(ctx, "function_success", {}).get(node_lib.node_key(node), "false")}
 
 
 @stmt_node("GKNodeQueueFree")
@@ -2343,11 +2415,28 @@ def _stmt_asset_spawn(ctx, node, indent):
         f"{int(info.get('layer') or 1)}, {int(info.get('mask') or 1)})")
     ctx.add_line(indent, f"if {inst} != null:")
     parent = (getattr(node, "gk_parent", "") or "").strip()
+    # ── 物理帧里必须挪到渲染帧再加树(示例线实测 200~400ms 长帧)──────
+    # Godot 在物理步进(`_physics_process`)期间往树里加 StaticBody3D /
+    # CollisionShape3D,会踩物理服务器的刷新,偶发几百毫秒的卡顿。
+    # ⚠ `add_child.call_deferred` **不够**:实测它仍在同一个物理帧里
+    #   刷新(`Engine.is_in_physics_frame()` 为 true),所以这里挂到
+    #   `process_frame` 一次性回调,真正离开物理步进。
+    # 渲染帧(`_process` / `_ready` / 输入回调)没这个问题,保持同步添加,
+    # 免得改变"当帧就能用"的语义。
+    #
+    # 代价(用户需要知道):物理帧里这份实例**当帧还没进树** ——
+    # `_ready` 要到下一次空闲帧才跑,`get_parent()` / 全局坐标 / 物理查询
+    # 当帧拿不到;设置 position、queue_free 这类不依赖树的操作仍然正常。
+    if ctx.in_physics_process:
+        ctx.need_idle_add_helper = True
     if parent and parent != TARGET_SELF:
-        parent_expr = ctx.target_expr(node, "gk_parent", hint="parent")
-        ctx.add_line(indent + 1, f"{parent_expr}.add_child({inst})")
+        target = ctx.target_expr(node, "gk_parent", hint="parent")
     else:
-        ctx.add_line(indent + 1, f"get_tree().current_scene.add_child({inst})")
+        target = "get_tree().current_scene"
+    if ctx.in_physics_process:
+        ctx.add_line(indent + 1, f"_gk_add_on_idle({target}, {inst})")
+    else:
+        ctx.add_line(indent + 1, f"{target}.add_child({inst})")
 
 
 @multi_output("GKNodeAssetSpawn")
@@ -2767,16 +2856,19 @@ def _stmt_emit_signal(ctx, node, indent):
 
 @stmt_node("GKNodeConnect")
 def _stmt_connect(ctx, node, indent):
+    from .interface_audit import emitted_function_name
     target = ctx.target_expr(node)
     signal_name = snake_case(getattr(node, "gk_signal_name", "pressed"), "pressed")
-    handler = snake_case(getattr(node, "gk_handler", "on_signal"), "on_signal")
+    handler = emitted_function_name(ctx.tree, getattr(node, "gk_handler", "on_signal"), "on_signal")
     ctx.add_line(indent, f"if not {target}.{signal_name}.is_connected({handler}):")
     ctx.add_line(indent + 1, f"{target}.{signal_name}.connect({handler})")
 
 
 @stmt_node("GKNodeCallFunction")
 def _stmt_call_function(ctx, node, indent):
-    func_name = snake_case(getattr(node, "gk_func_name", "my_function"), "my_function")
+    from .interface_audit import emitted_function_name, target_tree
+    owner, _label = target_tree(ctx.tree, node, ctx.options)
+    func_name = emitted_function_name(owner, getattr(node, "gk_func_name", "my_function"))
     raw = getattr(node, "gk_target", TARGET_SELF)
     if raw == TARGET_SELF:
         ctx.add_line(indent, f"{func_name}()")

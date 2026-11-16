@@ -56,10 +56,19 @@ def build(result):
 
     items = []
     seen_texts = set()
+    seen_diagnostics = set()
 
-    def add(level, message, hint="", node_name="", code=""):
+    def add(level, message, hint="", node_name="", code="", tree_name="", structured=False):
         text = str(message or "").strip()
-        if not text or text in seen_texts:
+        if not text:
+            return
+        # 不同图的同名节点也可以报同一句话，必须保留各自的定位入口。
+        key = (level, code, text, hint, tree_name, node_name)
+        if structured:
+            if key in seen_diagnostics:
+                return
+            seen_diagnostics.add(key)
+        elif text in seen_texts:
             return
         seen_texts.add(text)
         items.append({
@@ -67,7 +76,10 @@ def build(result):
             "code": str(code or ""),
             "message": text,
             "hint": str(hint or "").strip(),
-            "node_name": str(node_name or "").strip(),
+            # Blender identifiers may deliberately contain leading/trailing
+            # spaces. Keep exact names; only human-readable prose is stripped.
+            "node_name": str(node_name or ""),
+            "tree_name": str(tree_name or ""),
         })
 
     for diagnostic in (result.get("diagnostics") or ()):
@@ -75,9 +87,11 @@ def build(result):
         hint = str(getattr(diagnostic, "hint", "") or "")
         # 摊平后的写法(见 models.Diagnostic.render)也要认,否则
         # warnings 里那条一模一样的会再进一次
-        seen_texts.add(f"{message} —— {hint}" if hint else message)
         add(getattr(diagnostic, "level", "warning"), message, hint,
-            getattr(diagnostic, "node_name", ""), getattr(diagnostic, "code", ""))
+            getattr(diagnostic, "node_name", ""), getattr(diagnostic, "code", ""),
+            getattr(diagnostic, "tree_name", ""),
+            structured=True)
+        seen_texts.add((f"{message} —— {hint}" if hint else message).strip())
     for warning in (result.get("warnings") or ()):
         add("warning", warning)
     for note in (result.get("notes") or ()):
@@ -178,6 +192,41 @@ def load(scene):
 def clear():
     """清掉内存那份(测试 / 打开新文件时用)。"""
     LAST_REPORT.clear()
+
+
+def resolve_node_target(groups, node_name, tree_name=""):
+    """Resolve a report location without depending on the currently open graph.
+
+    Returns (tree, node, error). Explicit graph names never fall back to another
+    graph. Legacy reports without a graph name only resolve an unambiguous node.
+    This function does not change selection or editor state.
+    """
+    wanted = str(node_name or "")
+    graph_name = str(tree_name or "")
+    if not wanted:
+        return None, None, "报告里这条没说节点名"
+    if graph_name:
+        tree = next((group for group in groups if group.name == graph_name), None)
+        if tree is None:
+            return None, None, f"找不到报告中的节点图『{graph_name}』，可能已改名或删除；请重新导出。"
+        node = tree.nodes.get(wanted)
+        if node is None:
+            return None, None, f"节点图『{graph_name}』里找不到『{wanted}』，可能已改名或删除；请重新导出。"
+        return tree, node, ""
+    matches = []
+    for tree in groups:
+        if not str(getattr(tree, "bl_idname", "")).startswith("GK"):
+            continue
+        node = tree.nodes.get(wanted)
+        if node is not None:
+            matches.append((tree, node))
+    if len(matches) == 1:
+        return matches[0][0], matches[0][1], ""
+    if len(matches) > 1:
+        names = "、".join(tree.name for tree, _node in matches)
+        return None, None, (f"旧报告没有记录节点图，『{wanted}』同时存在于『{names}』；"
+                            "请重新导出后定位。")
+    return None, None, f"找不到节点『{wanted}』，可能已改名或删除；请重新导出。"
 
 
 # ==========================================================================
@@ -396,6 +445,8 @@ def report_text(report):
             lines.append(f"    怎么修: {item['hint']}")
         if item.get("node_name"):
             lines.append(f"    相关节点: {item['node_name']}")
+        if item.get("tree_name"):
+            lines.append(f"    相关节点图: {item['tree_name']}")
         if item.get("code"):
             lines.append(f"    代码: {item['code']}")
     if report.get("dropped"):

@@ -30,7 +30,7 @@ def _expr_get_bone(ctx, node):
 
 @multi_output("GKNodeRaycast")
 def _expr_raycast(ctx, node):
-    """『射线_检测』的『打到的东西』/『命中点』给下游节点用。
+    """『射线_检测』的『打到的东西』/『命中点』/『法线』给下游节点用。
 
     语句处理器把命中结果存进成员变量(`gk_ray_*` / `gk_ray_point_*`);
     这里返回**同一组变量名**。以前只在语句里 declare、没登记成表达式,
@@ -42,9 +42,12 @@ def _expr_raycast(ctx, node):
                              key=node_lib.node_key(node))
     point = ctx.declare_var(f"gk_ray_point_{tag}", "Variant",
                             key=node_lib.node_key(node))
+    normal = ctx.declare_var(f"gk_ray_normal_{tag}", "Variant",
+                             key=node_lib.node_key(node))
     ctx.read_vars.add(target)
     ctx.read_vars.add(point)
-    return {"打到的东西": target, "命中点": point}
+    ctx.read_vars.add(normal)
+    return {"打到的东西": target, "命中点": point, "法线": normal}
 
 
 @multi_output("GKNodeInputDirection")
@@ -60,6 +63,9 @@ def _expr_input_direction(ctx, node):
     (多输出节点在多个地方被引用也只求值一次 —— 和『动画判断_移动状态』
     同一个做法,靠 multi_output 注册。)
     """
+    # 方向是"按住才为真"的轮询:窗口失焦时松开会话收不到,值会一直挂着。
+    # 生成失焦清键的 `_notification`(见 generator._emit_input_focus_guard)。
+    ctx.need_focus_guard = True
     expr = {}
     deadzone = float(getattr(node, "gk_deadzone", 0.2) or 0.0)
     for direction in ("up", "down", "left", "right"):
@@ -843,6 +849,9 @@ def _expr_key(ctx, node):
                   or str(getattr(node, "gk_action", "jump")))
     const = ctx.add_action(action, getattr(node, "gk_key", ""))
     trigger = str(getattr(node, "gk_trigger", "PRESSED"))
+    if trigger == "PRESSED":
+        # 只有"按住"是持续轮询;刚按下/松开是单帧沿,失焦不会卡住。
+        ctx.need_focus_guard = True
     # 修饰键在 Windows 上经常不会以普通 action 状态送到 Godot(尤其当
     # 鼠标处于 CAPTURED 时)。Alt 是系统级修饰键,直接查物理键状态更可靠;
     # 输入映射仍然照常写出,这样项目设置和旧图仍可追踪这条动作。
@@ -875,6 +884,8 @@ def _mouse_button_const(button):
 
 @expr_node("GKNodeMouseButton")
 def _expr_mouse_button(ctx, node):
+    # 鼠标按住同样是持续轮询:失焦后收不到松开事件就会"一直在挖"。
+    ctx.need_focus_guard = True
     button = _mouse_button_const(getattr(node, "gk_button", "LEFT"))
     return f"Input.is_mouse_button_pressed({button})"
 

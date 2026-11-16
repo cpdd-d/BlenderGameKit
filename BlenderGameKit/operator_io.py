@@ -1415,10 +1415,14 @@ def run_export_script(context, operator):
 
     # 同时写进 .blend,这样关掉再打开还能看到"上次导出"
     remember_export(context.scene, result)
-    for warning in result["warnings"]:
+    for warning in result.get("warnings", []):
         _report(operator, "WARNING", warning)
 
-    _open_in_text_editor(context, result["code"], result["script_name"])
+    if result.get("code") is not None and result.get("script_name"):
+        _open_in_text_editor(context, result["code"], result["script_name"])
+    if result.get("ok") is not True:
+        _report(operator, "ERROR", result.get("error") or "脚本导出未成功")
+        return False, result
     if settings.get("write_scene"):
         try:
             scene_path = exporter.write_scene_file(
@@ -1591,45 +1595,35 @@ class GK_OT_ReportFocus(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     node_name: StringProperty(name="节点名", default="")
+    tree_name: StringProperty(name="节点图", default="")
 
     def execute(self, context):
-        wanted = str(self.node_name or "").strip()
-        if not wanted:
-            self.report({"WARNING"}, "报告里这条没说节点名")
+        tree, node, error = export_report.resolve_node_target(
+            bpy.data.node_groups, self.node_name, self.tree_name)
+        if error:
+            self.report({"WARNING"}, error)
             return {"CANCELLED"}
-        # ── 在哪张图里找 ────────────────────────────────────────────────
-        # 先看用户正开着的那张,找不到就在**所有**游戏逻辑图里找 ——
-        # 报告可能是上一次会话导的,那时开着的图不一定是现在这张。
-        # 比较用**名字**(Blender 的 ID 包装对象别拿 in / == 当可靠判断)。
-        trees = []
-        current = _tree_of(self, context)
-        if current is not None:
-            trees.append(current)
-        seen = {tree.name for tree in trees}
-        for group in bpy.data.node_groups:
-            if group.name in seen:
-                continue
-            if getattr(group, "bl_idname", "") != "GKGameLogicTree":
-                continue
-            trees.append(group)
-        for tree in trees:
-            node = tree.nodes.get(wanted)
-            if node is None:
-                continue
-            for other in tree.nodes:
-                other.select = False
-            node.select = True
-            tree.nodes.active = node
+        # The report can belong to another character's graph. Switch the editor
+        # before framing selection; otherwise view_selected frames the old graph.
+        space = getattr(context, "space_data", None)
+        if space is not None and hasattr(space, "node_tree"):
             try:
-                bpy.ops.node.view_selected()
-            except Exception:                             # noqa: BLE001
-                pass          # 无头 / 不在节点编辑器里:选中就够了
-            self.report({"INFO"}, f"已定位到节点『{wanted}』")
-            return {"FINISHED"}
-        self.report({"WARNING"},
-                    f"图里找不到节点『{wanted}』—— 可能改名或删掉了"
-                    f"(报告是那次导出时记的)")
-        return {"CANCELLED"}
+                space.tree_type = tree.bl_idname
+                space.pin = True
+                space.node_tree = tree
+            except Exception:
+                self.report({"WARNING"}, f"当前编辑器打不开节点图『{tree.name}』")
+                return {"CANCELLED"}
+        for other in tree.nodes:
+            other.select = False
+        node.select = True
+        tree.nodes.active = node
+        try:
+            bpy.ops.node.view_selected()
+        except Exception:                                 # noqa: BLE001
+            pass  # Background mode has no node editor to frame.
+        self.report({"INFO"}, f"已定位到『{tree.name}』中的节点『{node.name}』")
+        return {"FINISHED"}
 
 
 class GK_OT_Preview(bpy.types.Operator):
@@ -3010,11 +3004,8 @@ def run_export_assets(context, operator):
     要把两半串成**一次点击**,而老算子 `gk.export_assets` 的 idname、
     报告文案、告警都不能变(顾问动作表、冒烟测试在用)。
 
-    ⚠ 合并后**必须一次点击就通**:下面那段"还没有导出过脚本,先点
-    『导出为 Godot 脚本』"的守卫判断的是 `LAST_EXPORT["script_name"]`,
-    而合并流程会**先**跑 `run_export_script`(它内部 `remember_export`
-    已经把脚本名记下了),所以那条告警在合并路径上不会再出现 ——
-    这正是这次合并要解决的问题(用户点错顺序就会看见它)。
+    Each asset export checks the current scene/role graphs. A remembered script
+    filename is not proof that the graph still compiles or belongs to this scene.
 
     返回 `(是否成功, 结果字典)`。成功时结果字典里有 `outcome` / `written`
     / `objects` / `elapsed`,合并导出的收尾报告要用。
@@ -3056,7 +3047,6 @@ def run_export_assets(context, operator):
             directory,
             # dimension=None = 逐场景用各自的设置(第八十七轮,同下)
             dimension=None,
-            script_name=LAST_EXPORT.get("script_name") or None,
         )
     except Exception as exc:
         _finish_export_progress(context)
@@ -3065,6 +3055,8 @@ def run_export_assets(context, operator):
 
     if outcome.get("error"):
         _finish_export_progress(context)
+        remember_export(scene, dict(outcome, ok=False, directory=directory,
+                                    stage="pipeline"))
         _report(operator, "ERROR", outcome["error"])
         return False, {"stage": "pipeline"}
 
@@ -3085,13 +3077,10 @@ def run_export_assets(context, operator):
     except Exception as exc:                              # noqa: BLE001
         gk_log.warn(f"资产清单记录失败(不影响导出): {exc}")
 
-    if not outcome.get("single") and not LAST_EXPORT.get("script_name"):
-        # 多场景时可能看到"还没导出过脚本"的告警 —— 那不算问题:
-        # 每个场景的逻辑图是这次导出时**自动**导出的。
-        pass
-    elif not LAST_EXPORT.get("script_name"):
+    if not any(entry.get("script_name") or entry.get("role_scripts")
+               for entry in outcome.get("scenes", [])):
         _report(operator, "WARNING",
-                "还没有导出过脚本，先点『导出为 Godot 脚本』才能把逻辑挂到模型上")
+                "场景没有配置可用的逻辑图；请在场景或角色设置里选择逻辑图")
 
     bounds = asset_export.object_bounds(objects)
     size = bounds["size"] if bounds else (0, 0, 0)
@@ -3181,15 +3170,11 @@ class GK_OT_ExportGodot(bpy.types.Operator):
     def execute(self, context):
         script_ok, script_info = run_export_script(context, self)
 
-        # ── 为什么"脚本那半停在开头"就不跑模型那半 ───────────────────
-        # `tree` / `project` 这两类失败说明连节点图或项目目录都没拿到 ——
-        # 模型那一半用的**是同一个项目目录**,再跑一次只会把同一句错误
-        # 报两遍(用户看到两遍"推不出项目目录",还以为出了两个问题)。
-        # 其余失败(图里有错、写盘失败)无关紧要,模型照导:
-        # 用户改完图再点一次,"模型这半"不用重来。
-        if not script_ok and script_info.get("stage") in ("tree", "project"):
+        # Failed code must not be assembled with new assets or a stale script
+        # left over from the previous export.
+        if not script_ok:
             _report(self, "ERROR",
-                    "导出到 Godot 没成功:『脚本』那一半没能开始"
+                    "导出到 Godot 没成功:『脚本』导出失败"
                     "(先按上面那条修好,再点一次)")
             return {"CANCELLED"}
 
@@ -3420,7 +3405,8 @@ class GK_OT_OpenGodot(bpy.types.Operator):
         prefs = project.preferences(context)
         pref_on = bool(getattr(prefs, "auto_export_on_run", True)) if prefs else True
         if not self.editor and self.auto_export and pref_on:
-            _auto_prepare(self, context, directory)
+            if not _auto_prepare(self, context, directory):
+                return {"CANCELLED"}
 
         # ── 启动前先说一句"要等几秒"(用户 2026-10-03:"打开的有点慢")────
         # 导出本身只要几毫秒(日志里有),慢的是 **Godot 引擎自己启动**
@@ -3484,7 +3470,8 @@ class GK_OT_ExportRelease(bpy.types.Operator):
         prefs = project.preferences(context)
         pref_on = bool(getattr(prefs, "auto_export_on_run", True)) if prefs else True
         if self.auto_export and pref_on:
-            _auto_prepare(self, context, directory)
+            if not _auto_prepare(self, context, directory):
+                return {"CANCELLED"}
 
         # 2) 找 Godot
         executable = project.find_godot_executable(context)
@@ -3623,19 +3610,11 @@ class GK_OT_OpenReleaseFolder(bpy.types.Operator):
 
 
 def _auto_prepare(operator, context, directory):
-    """保存 .blend 并导出脚本 + 模型。失败只警告,不阻止后续动作。
-    (参数名就叫 operator,避开了与 bpy.types.Operator 的混淆——这里收的
-     是**算子实例**,用它上报消息。)
+    """Save and export the current project; False prevents running or packaging.
 
-    注意:这一步刻意**不抛异常打断流程** —— 用户点的是"运行"/"打包",
-    因为导出出了点问题就不让跑(不让打包)会很恼人。警告写进日志就够了。
-
-    ── 为什么抽成模块级函数 ────────────────────────────────────────
-    『直接运行游戏』和『打包成可执行文件』都要这一步,逻辑必须**完全一致**
-    (以前只有前者用,后者接进来时把它提出来共用,免得两处各写一份、改一处
-    漏一处)。
+    Both callers use the same all-scene preflight. Exporting an arbitrary first
+    graph here could overwrite a valid script before a later graph fails.
     """
-    # 1) 保存 .blend —— 素材和节点图都在文件里,不保存的话导出的是旧内容
     if bpy.data.filepath and bpy.data.is_dirty:
         try:
             bpy.ops.wm.save_mainfile()
@@ -3643,53 +3622,35 @@ def _auto_prepare(operator, context, directory):
         except Exception as exc:
             _report(operator, "WARNING", f"自动保存失败(继续): {exc}")
 
-    # 2) 导出脚本(节点图)
-    tree = None
-    for group in bpy.data.node_groups:
-        if getattr(group, "bl_idname", "") == "GKGameLogicTree" and len(group.nodes):
-            tree = group
-            break
-    script_name = None
-    if tree is not None:
-        try:
-            settings = exporter.build_settings(context.scene)
-            settings["output_dir"] = directory
-            result = exporter.export_tree(tree, settings, write_scene=False)
-            remember_export(context.scene, result)
-            script_name = result["script_name"]
-            for warning in result["warnings"]:
-                operator.report({"WARNING"}, warning)
-        except Exception as exc:
-            _report(operator, "WARNING", f"自动导出脚本失败(继续): {exc}")
-
-    # 3) 导出场景 / 模型 / 材质(多场景时每个 Blender 场景各导一张 .tscn)
     try:
-        outcome = asset_export.export_all_scenes(
-            directory,
-            # dimension=None = **逐场景**用各自的设置(第八十七轮)——
-            # 『关卡预设』可以建出 2D / 3D 混在一个 .blend 里的工程,
-            # 各导各的维度;单一维度的工程行为和以前完全一样。
-            dimension=None,
-            script_name=script_name,
-        )
-        if outcome.get("error"):
-            _report(operator, "WARNING", f"自动导出模型失败: {outcome['error']}")
-        else:
-            for warning in outcome.get("warnings", []):
-                _report(operator, "WARNING", warning)
-            _report(operator, "INFO",
-                    f"已自动导出:{outcome['materials']} 个材质、"
-                    f"{outcome['bodies']} 个碰撞体、"
-                    f"{outcome['cameras']} 个相机、{outcome['lights']} 盏灯")
-            # 资产清单同样记进报告(第八十九轮):这条路上用户按的是
-            # "运行游戏",但资产已经落盘了,清单该和『导出场景与模型』一致。
-            try:
-                export_report.note_assets(context.scene, directory,
-                                          outcome.get("written", []))
-            except Exception as exc:                      # noqa: BLE001
-                gk_log.warn(f"资产清单记录失败(不影响运行): {exc}")
+        outcome = asset_export.export_all_scenes(directory, dimension=None)
     except Exception as exc:
-        _report(operator, "WARNING", f"自动导出模型失败(继续): {exc}")
+        outcome = {"error": f"{type(exc).__name__}: {exc}", "written": [],
+                   "warnings": [], "diagnostics": []}
+    scenes = outcome.get("scenes") or []
+    ok = not outcome.get("error") and bool(scenes) and all(
+        entry.get("ok") is True for entry in scenes)
+    if not ok and not outcome.get("error"):
+        outcome["error"] = "场景导出未成功"
+    report = dict(outcome, ok=ok, directory=directory, stage="自动导出")
+    if len(scenes) == 1:
+        report["script_name"] = scenes[0].get("script_name", "")
+    remember_export(context.scene, report)
+    for warning in outcome.get("warnings", []):
+        _report(operator, "WARNING", warning)
+    if not ok:
+        _report(operator, "ERROR", f"自动导出失败，已停止运行/打包: {outcome['error']}")
+        return False
+
+    _report(operator, "INFO",
+            f"已自动导出:{outcome.get('materials', 0)} 个材质、"
+            f"{outcome.get('bodies', 0)} 个碰撞体、"
+            f"{outcome.get('cameras', 0)} 个相机、{outcome.get('lights', 0)} 盏灯")
+    try:
+        export_report.note_assets(context.scene, directory, outcome.get("written", []))
+    except Exception as exc:                              # noqa: BLE001
+        gk_log.warn(f"资产清单记录失败(不影响运行): {exc}")
+    return True
 
 
 # 项目顾问的界面状态(侧栏显示用)。**对话内容**在 advisor.HISTORY 里,

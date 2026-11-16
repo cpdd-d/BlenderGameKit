@@ -4034,7 +4034,9 @@ class GKNodeRaycast(B.GKStatementNode):
               "FPS 的准星命中不用自己再算方向。2D 项目取相机旋转后的『上』"
               "(2D 相机是俯视的，没有 3D 那种看向屏幕里的方向)。\n"
               "两个开关都默认时，生成的代码和以前**逐字一致**；"
-              "取不到相机(视口里没有 / 不在树里)时退回『自身』，不会崩")
+              "取不到相机(视口里没有 / 不在树里)时退回『自身』，不会崩。\n"
+              "『法线』= 打中的那个面朝哪(单位向量)。放置方块要贴着被"
+              "打中的面往外长，就靠它判断是顶面还是侧面。")
     gk_inputs = (
         S.pin(FLOW, "执行"),
         S.pin(VECTOR, "方向", (1.0, 0.0, 0.0)),
@@ -4062,6 +4064,7 @@ class GKNodeRaycast(B.GKStatementNode):
         S.pin(FLOW, "没打中"),
         S.pin(OBJECT, "打到的东西", None),
         S.pin(VECTOR, "命中点", (0.0, 0.0, 0.0)),
+        S.pin(VECTOR, "法线", (0.0, 1.0, 0.0)),
     )
 
     def draw_buttons(self, context, layout):

@@ -2684,9 +2684,6 @@ def _asset_thumb_draw():
                     continue
                 kind = node_lib.card_kind(node)
                 path = node_lib.card_path(node)
-                data = asset_thumbs.cached_preview(kind, path)
-                if data is None:
-                    continue
                 dims = getattr(node, "dimensions", None)
                 if dims is None or float(dims[0]) <= 1.0:
                     continue
@@ -2704,6 +2701,17 @@ def _asset_thumb_draw():
                 node_w = right - left
                 node_h = top - bottom
                 if node_w < 40.0 or node_h < 40.0:
+                    continue
+                # ── 屏幕外的卡直接跳过(第一百八十九轮:大资产库)────────
+                # 缩略图叠加是**每个重绘都跑**的:滚到画布另一头时,视野外的
+                # 卡片原来也会取预览、建 2~3 个 GPU batch。资产一多,滚动就会
+                # 拖。这里先用已经算好的屏幕矩形做一次裁剪,视野外直接 continue
+                # —— 不影响任何可见卡片,也不改缓存。
+                if (right < 0.0 or left > float(region.width)
+                        or top < 0.0 or bottom > float(region.height)):
+                    continue
+                data = asset_thumbs.cached_preview(kind, path)
+                if data is None:
                     continue
                 zoom = node_w / max(1e-6, float(dims[0]))
                 pad = 8.0
@@ -6492,6 +6500,14 @@ class GK_OT_MakeFunctionNode(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _function_picker_specs(operator, context):
+    tree = props.current_tree(context)
+    node = tree.nodes.get(operator.node_name) if tree is not None else None
+    if node is not None and getattr(node, "bl_idname", "") == "GKNodeFunctionCall":
+        tree = props.function_call_tree(node, tree)
+    return props.tree_functions(tree)
+
+
 class GK_OT_PickFunction(bpy.types.Operator):
     """在函数节点上挑一个**已声明**的函数(和『选变量』同一套搜索弹窗)。"""
 
@@ -6507,7 +6523,7 @@ class GK_OT_PickFunction(bpy.types.Operator):
          + (f" -> {spec['return']}" if spec["return"] else ""),
          spec.get("comment") or "这个函数", "FILE_SCRIPT", 0)
         for name, spec in sorted(
-            props.tree_functions(props.current_tree(context) or object())
+            _function_picker_specs(self, context)
             .items())] or [("", "(还没有函数)", "先在侧栏『函数』框声明", "ERROR", 0)])
 
     def invoke(self, context, _event):
@@ -6524,7 +6540,7 @@ class GK_OT_PickFunction(bpy.types.Operator):
             return {"CANCELLED"}
         setattr(node, self.func_prop, self.func_name)
         # 换了函数 -> 参数引脚要跟着重长(不然还是上一个函数的参数框)
-        builder = getattr(node, "build_sockets", None)
+        builder = getattr(node, "rebuild_sockets", None) or getattr(node, "build_sockets", None)
         if callable(builder):
             builder()
         self.report({"INFO"}, f"函数 -> {self.func_name}")
@@ -7887,6 +7903,7 @@ def _draw_export_report(box, report):
             op = row.operator("gk.export_report_focus", text=item["node_name"],
                               icon="TRACKER")
             op.node_name = item["node_name"]
+            op.tree_name = item.get("tree_name", "")
             row.label(text=str(item.get("message", ""))[:18])
 
     row = box.row(align=True)

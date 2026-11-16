@@ -10,9 +10,13 @@
 这两个全局变量仍然会被回写,只为兼容尚未迁移的脚本/测试。
 """
 
+from dataclasses import replace
+
 from ..models import CodegenResult, Diagnostic, render_warnings
 from .context import CodegenAbort
 from .generator import Generator
+from .graph_audit import audit_execution_flow
+from .interface_audit import audit_interfaces
 from .validation import (_check_animation_targets,
                          _check_base_class_supports_graph,
                          _check_display_switch,
@@ -21,6 +25,13 @@ from .validation import (_check_animation_targets,
 # 上一次生成用到的输入动作 [(动作名, 捕获的键), ...] 与提示(兼容用)
 last_used_actions = []
 last_notes = []
+
+
+def _diagnostics_for_tree(items, tree):
+    """Keep source graph identity when per-graph results are merged for export."""
+    tree_name = str(getattr(tree, "name", "") or "")
+    return [replace(item, tree_name=item.tree_name or tree_name)
+            for item in items if isinstance(item, Diagnostic)]
 
 
 def generate_result(tree, options=None):
@@ -41,8 +52,11 @@ def generate_result(tree, options=None):
     _check_animation_targets(tree, collected)
     _check_display_switch(tree, collected)
     _check_suspending_flow_fanout(tree, collected)
+    if not (options or {}).get("ui_main", False):
+        collected.extend(audit_execution_flow(tree))
+    collected.extend(audit_interfaces(tree, options, emitted_nodes=set(generator.ctx._claimed)))
     warnings = render_warnings(collected)
-    diagnostics = [item for item in collected if isinstance(item, Diagnostic)]
+    diagnostics = _diagnostics_for_tree(collected, tree)
     # 登记本次用到的输入动作，供导出流程写进 project.godot
     # 同时把用户在『输入_按键』里**捕获的键**一起带上(动作名, 键)——
     # 他在 Blender 里按 W,Godot 里 W 就该真的能用,而不是又绑回默认的 D。
@@ -108,8 +122,9 @@ def generate_main_ui(tree, options=None):
     generator = Generator(tree, merged)
     code = generator.generate()
     collected = list(generator.ctx.warnings)
+    collected.extend(audit_interfaces(tree, merged, emitted_nodes=set(generator.ctx._claimed)))
     warnings = render_warnings(collected)
-    diagnostics = [item for item in collected if isinstance(item, Diagnostic)]
+    diagnostics = _diagnostics_for_tree(collected, tree)
     # 注意:**不回写** last_used_actions / last_notes —— 那两个全局变量
     # 是"玩法图生成"的兼容包袱,主界面只是顺带生成的一份别动它,
     # 否则紧接着读它们的老调用方会拿到主界面的(空)结果。

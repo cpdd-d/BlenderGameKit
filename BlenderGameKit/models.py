@@ -80,7 +80,8 @@ class Diagnostic:
 
     `level` 取 "error" / "warning" / "info"。`code` 是一个稳定的短标识
     (如 `MISSING_INPUT_ACTION`),方便测试和以后做"按代码过滤"。
-    `hint` 是给用户的**修复建议**。
+    `hint` 是给用户的**修复建议**。`tree_name` 与 `node_name` 一起定位节点；
+    旧诊断未记录图名时保持空串，不能据此猜测同名节点属于哪张图。
     """
 
     level: str = "warning"
@@ -88,6 +89,7 @@ class Diagnostic:
     message: str = ""
     hint: str = ""
     node_name: str = ""
+    tree_name: str = ""
 
     def render(self):
         """摊平成一行字符串(导出报告/日志仍按字符串展示)。"""

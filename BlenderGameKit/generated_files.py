@@ -167,7 +167,7 @@ _RES_EXTS = (".gd", ".tscn", ".tres", ".glb", ".png", ".gdshader",
 _REF_READ_LIMIT = 400000
 
 
-def referenced_files(directory, relatives):
+def referenced_files(directory, relatives, cache=None):
     """这些文件里 `res://` 引用到的、项目内的文件(相对路径)。
 
     ── 为什么清理要看"引用"而不只看"写过"(真的踩过一次)────────────
@@ -177,17 +177,27 @@ def referenced_files(directory, relatives):
     自毁。所以再加一条判据:**被这次导出的东西引用到的文件,一律保留**。
     引用的链条是天然的:场景 -> 脚本 / 环境脚本 / 模型,
     脚本 -> 曲线资源,材质 -> 着色器 / 贴图。
+
+    `cache` 是可选的 {相对路径: 文本} 复用表,给 `reachable_files` 的
+    多轮迭代用 —— 否则同一条链每轮都会把已经读过的文件**再读一遍**。
     """
     found = set()
+    missing = object()
     for rel in relatives or ():
-        path = os.path.join(directory, str(rel).replace("/", os.sep))
-        try:
-            if os.path.getsize(path) > _REF_READ_LIMIT:
-                continue
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                text = handle.read(_REF_READ_LIMIT)
-        except OSError:
-            continue
+        text = cache.get(rel, missing) if cache is not None else missing
+        if text is missing:
+            path = os.path.join(directory, str(rel).replace("/", os.sep))
+            try:
+                if os.path.getsize(path) > _REF_READ_LIMIT:
+                    text = ""
+                else:
+                    with open(path, "r", encoding="utf-8",
+                              errors="replace") as handle:
+                        text = handle.read(_REF_READ_LIMIT)
+            except OSError:
+                text = ""
+            if cache is not None:
+                cache[rel] = text
         for match in _RES_REF_RE.findall(text):
             item = match.strip().replace("\\", "/").lstrip("/")
             if not item or not item.lower().endswith(_RES_EXTS):
@@ -210,10 +220,11 @@ def reachable_files(directory, written, passes=3):
     而旧脚本正是 `class_name` 冲突的来源)。
     """
     keep = {str(item).replace("\\", "/") for item in (written or ())}
+    cache = {}          # 同一个文件多轮只读一次(见 referenced_files 的 cache)
     for _round in range(max(1, passes)):
         if not keep:
             break
-        grown = keep | referenced_files(directory, sorted(keep))
+        grown = keep | referenced_files(directory, sorted(keep), cache=cache)
         if grown == keep:
             break
         keep = grown
@@ -396,6 +407,14 @@ def cleanup_after_export(directory, written_paths):
     keep = reachable_files(directory, relative_files(directory, written_paths))
     removed = remove_files(directory, stale_files(directory, keep, previous))
     # 新清单 = 现在还在的插件文件 + 这一轮保留的东西(下次导出就按它比)
-    write_manifest(directory, sorted(set(scan_generated_files(directory))
-                                     | keep))
+    #
+    # ── 不再重新扫一遍(优化)──────────────────────────────────────
+    # `marked` 就是清理前那次扫描的结果;清理只删文件、不新增,所以
+    # "清理后还剩什么" = `marked` 里仍然存在的那些。重新 scan 会把
+    # 每个文件头**再读一遍**(大工程里是纯浪费),而这里只做一次 stat。
+    # 删除失败的旧文件仍然存在 -> 仍然进清单,下次还能再清。
+    remaining = [rel for rel in marked
+                 if os.path.isfile(os.path.join(directory,
+                                                rel.replace("/", os.sep)))]
+    write_manifest(directory, sorted(set(remaining) | keep))
     return removed

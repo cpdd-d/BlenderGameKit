@@ -41,6 +41,7 @@ _SUBMODULES = (
     # 纯工具层:paths 不依赖 bpy;blender_adapter 集中 bpy 访问,供
     # project.layout / exporter 复用(必须在它们之前)
     "paths",
+    "file_io",
     "blender_adapter",
     # project 也是包:子模块按依赖顺序排在包前面,保证重载时逐个刷新
     "project.layout",
@@ -125,6 +126,8 @@ _SUBMODULES = (
     "codegen.context",
     "codegen.generator",
     "codegen.validation",
+    "codegen.graph_audit",
+    "codegen.interface_audit",
     "codegen.api",
     "codegen",
     # 导出物清单 / 旧文件清理(纯标准库,离线可测)
@@ -147,6 +150,12 @@ _SUBMODULES = (
     # advisor.tools_payload() 会 import 它,顺序错了重载时拿到的是上一版
     "advisor_tools",
     "exporter",
+    # 资源包 / 数据包(用户 2026-11-10):纯标准库,asset_export 会 import
+    # 它;排在 asset_export 之前,开发期重载时先刷新运行时模板。
+    "packs",
+    # UV 空间换算(第一百九十八轮,C7):纯标准库,不依赖 bpy。
+    # 贴图/图集按图片左上角数像素,这里换成 Blender 的左下原点 UV。
+    "uv",
     "npr_preview",
     "asset_export",
     # 资产缩略图(第六十六轮:资产卡上的小图 —— 真图 / 渲染 / 波形 / 折线)。

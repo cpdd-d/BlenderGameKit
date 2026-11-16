@@ -1,4 +1,4 @@
-﻿﻿﻿﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
+﻿# 一键:构建扩展 -> 干净重装 -> 在真实 Blender 里跑冒烟测试
 #
 # 用法:
 #   pwsh -File scripts\build_and_test.ps1
@@ -209,6 +209,14 @@ Step "1a2/6 射线方向回退测试 (不需要 Blender)"
 & $Py (Join-Path $Root "tests\test_raycast_direction.py") 2>&1 | Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
 if ($LASTEXITCODE -ne 0) { Write-Error "射线方向回退测试失败"; exit 1 }
 
+# 蓝图集成回归：独立运行各模块，避免 bpy 测试桩的导入顺序互相影响。
+Step "1a3/6 蓝图诊断 / 音效生命周期 / 增量导出"
+foreach ($case in @("test_graph_audit.py", "test_audio_lifecycle.py", "test_export_iteration.py", "test_asset_io.py", "test_diagnostic_locations.py", "test_multi_role_export.py", "test_glb_publication.py", "test_interface_audit.py", "test_typed_function_calls.py", "test_compile_failure_publication.py", "test_operator_export_failures.py")) {
+    & $Py (Join-Path $Root "tests\$case") 2>&1 |
+        Select-String -Pattern "^(Ran |OK|FAILED|ERROR:|FAIL:)" | ForEach-Object { $_.Line }
+    if ($LASTEXITCODE -ne 0) { Write-Error "蓝图集成回归失败: $case"; exit 1 }
+}
+
 # ---------- 1b. 示例完整性体检 ----------
 # 第四十五轮固化:目录改名打断脚本路径(ANIM_VERIFY 那次)、示例缺 README、
 # 新示例有探针却没接进门禁 —— 这三类问题都在这里判红。
@@ -323,6 +331,18 @@ if ($LASTEXITCODE -ne 0 -or $blueprintOut -notmatch "BLUEPRINT=OK") {
     $smokeOk = $false
 } else {
     Write-Output "BLUEPRINT=OK"
+}
+
+# ---------- 4c2. glTF 导出的 UV 方向(C7)---------------------------------
+# 方向标记地板:四象限四色,导出后按 GLB 的 UV 采样。断言"只翻一次"
+# —— 再加一层翻转会立刻让颜色和位置上下错位。
+Step "4c2/6 glTF 导出 UV 方向(方向标记模型)"
+$uvOut = & $Blender -b --factory-startup --python-exit-code 1 --python (Join-Path $Root "tests\blender_uv_export.py") 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or $uvOut -notmatch "UV_EXPORT=OK") {
+    Write-Output $uvOut
+    $smokeOk = $false
+} else {
+    Write-Output "UV_EXPORT=OK"
 }
 
 # ---------- 4g. 图标名必须真实存在(第一百二十三轮:用户实测抓到的崩溃)------
@@ -1069,6 +1089,46 @@ if ($SkipGodot) {
         } elseif ($camFarOut -match "跳过") {
             Write-Output "（相机远裁跳过:本机没有 Godot）"
         } else {
+            $godotOk = $false
+        }
+    }
+
+    # 蓝图实验室：用工作区插件构建独立工程，不覆盖现有游戏示例。
+    $blueprintChecker = Join-Path $Root "scripts\check_blueprint_lab.py"
+    if ($godotSkipped -or -not (Test-Path $Blender)) {
+        Write-Output "跳过蓝图实验室:需要 Blender 和 Godot"
+    } else {
+        $blueprintOut = & $Py $blueprintChecker --blender $Blender --godot $Godot --ui-matrix 2>&1 | Out-String
+        $blueprintExit = $LASTEXITCODE
+        $blueprintOut -split "`n" | Where-Object { $_ -match "^BLUEPRINT" } |
+            ForEach-Object { Write-Host $_.TrimEnd() }
+        if ($blueprintExit -eq 0 -and $blueprintOut -match "BLUEPRINT_LAB=OK") {
+            $godotRan += "蓝图实验室"
+        } else {
+            Write-Output $blueprintOut
+            $godotOk = $false
+        }
+        foreach ($probe in @("blender_asset_iteration.py", "blender_diagnostic_locations.py", "blender_blueprint_roundtrip.py", "blender_glb_changes.py", "blender_interface_audit.py", "blender_typed_function_calls.py", "blender_compile_failure.py")) {
+            $integrationOut = & $Blender --background --factory-startup --python-exit-code 1 --python (Join-Path $Root "tests\$probe") 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0 -or $integrationOut -notmatch "(?:ASSET_ITERATION|DIAGNOSTIC_LOCATIONS|BLUEPRINT_ROUNDTRIP|GLB_CHANGES|INTERFACE_AUDIT|TYPED_EDITOR|COMPILE_FAILURE)=OK") {
+                Write-Output $integrationOut
+                $godotOk = $false
+            }
+        }
+        $env:GK_GODOT = $Godot
+        foreach ($runtimeCase in @("test_audio_lifecycle_godot.py", "test_static_role_collision_godot.py", "test_animation_playback_godot.py", "test_pause_inheritance_godot.py")) {
+            & $Py (Join-Path $Root "tests\$runtimeCase") 2>&1 |
+                ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) { $godotOk = $false }
+        }
+        $interfaceOut = & $Godot --headless --path (Join-Path $Root ".audit\interface_runtime") --quit-after 120 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $interfaceOut -notmatch "INTERFACE_RUNTIME=OK" -or $interfaceOut -match "(?m)^(?:SCRIPT ERROR:|ERROR:)") {
+            Write-Output $interfaceOut
+            $godotOk = $false
+        }
+        $typedOut = & $Godot --headless --path (Join-Path $Root ".audit\typed_interface_runtime") --quit-after 120 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $typedOut -notmatch "TYPED_RUNTIME=OK" -or $typedOut -match "(?m)^(?:SCRIPT ERROR:|ERROR:)") {
+            Write-Output $typedOut
             $godotOk = $false
         }
     }

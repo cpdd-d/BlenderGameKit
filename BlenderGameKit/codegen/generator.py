@@ -169,11 +169,15 @@ class Generator:
                     lines.add(1, "# ---- 另一个同类事件 ----")
                 self.ctx._active.clear()
                 self.ctx._current_event = node.name
+                # 物理步进中创建带碰撞体的节点会卡长帧;创建实例的语句
+                # 据此改用 `add_child.call_deferred`(见 _stmt_asset_spawn)。
+                self.ctx.in_physics_process = func_name == "_physics_process"
                 if (delta_name and not declared_unused
                         and self._delta_missing(node)):
                     lines.add(1, f"var _unused_{delta_name} := {delta_name}")
                     declared_unused = True
                 self._emit_event_body(node, 1)
+            self.ctx.in_physics_process = False
             sections.append({
                 "signature": signature,
                 "lines": list(lines.lines),
@@ -445,8 +449,23 @@ class Generator:
                 or self.ctx.need_choice_helpers):
             self._append_block(
                 sections, "_ready", "func _ready() -> void:",
-                ["    process_mode = Node.PROCESS_MODE_ALWAYS"],
+                ["    for child in get_children():",
+                 "        _gk_pause_child_mode(child)",
+                 "    if not child_entered_tree.is_connected(_gk_pause_child_mode):",
+                 "        child_entered_tree.connect(_gk_pause_child_mode)",
+                 "    process_mode = Node.PROCESS_MODE_ALWAYS"],
                 at_front=True)
+            # Only the dialogue/menu host needs ALWAYS. Its inherited gameplay
+            # children (including native AnimationPlayers) must still pause.
+            # Explicit modes such as a UI CanvasLayer's ALWAYS are preserved.
+            sections.append({
+                "signature": "func _gk_pause_child_mode(child: Node) -> void:",
+                "lines": [
+                    "    if child.process_mode == Node.PROCESS_MODE_INHERIT:",
+                    "        child.process_mode = Node.PROCESS_MODE_PAUSABLE",
+                ],
+                "empty_body": "    pass", "separator": True,
+            })
             for func_name in ("_process", "_physics_process"):
                 section = self._section_for(sections, func_name)
                 if section is not None:
@@ -586,6 +605,36 @@ class Generator:
                                  "Node2D" if self.ctx.dim == 2 else "Node3D"),
                 "lines": self._asset_spawn_lines(),
                 "empty_body": "    return null",
+                "separator": True,
+            })
+
+        # ---- 物理帧里创建的实例:挪到下一个渲染帧再加树 ----
+        # 见 statements._stmt_asset_spawn。`add_child.call_deferred` 实测
+        # 仍在这个物理帧里刷新(Engine.is_in_physics_frame() 为 true),
+        # 挡不住那一两百毫秒的物理服务器抖动;`process_frame` 是真正
+        # 离开物理步进之后再挂。
+        if getattr(self.ctx, "need_idle_add_helper", False):
+            sections.append({
+                "signature": "func _gk_add_on_idle(parent: Node, node: Node) -> void:",
+                "lines": [
+                    "    if node == null:",
+                    "        return",
+                    "    if parent == null:",
+                    "        node.queue_free()",
+                    "        return",
+                    "    get_tree().process_frame.connect(",
+                    "        _gk_add_child_idle.bind(parent, node), CONNECT_ONE_SHOT)",
+                ],
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                "signature": "func _gk_add_child_idle(parent: Node, node: Node) -> void:",
+                "lines": [
+                    "    if is_instance_valid(parent) and is_instance_valid(node):",
+                    "        parent.add_child(node)",
+                ],
+                "empty_body": "    pass",
                 "separator": True,
             })
 
@@ -1567,6 +1616,9 @@ class Generator:
         # "人已经走出去了状态还没切"的一帧延迟(和相机跟随同一个道理)。
         if (self.ctx.need_anim_state_process or self.ctx.need_anim_tree_process
                 or self.ctx.need_anim_start_process or self.ctx.need_ai_process):
+            # 这一整段都并进 `_physics_process`,里面若展开『创建实例』,
+            # 也要走延迟添加(和用户自己的『每当_物理帧』同一处理)。
+            self.ctx.in_physics_process = True
             lines = self.ctx.new_section()
             # ── 开始口:条件成立才开演(每物理帧判一次)────────────────
             for starter in self.ctx.anim_starts:
@@ -1639,6 +1691,7 @@ class Generator:
             self._append_block(sections, "_physics_process",
                                "func _physics_process(delta: float) -> void:",
                                list(lines.lines))
+            self.ctx.in_physics_process = False
 
         # ---- "每帧"动画事件出口需要的那段 _process 代码 ----
         # `is_playing()` + `current_animation`。
@@ -1661,11 +1714,18 @@ class Generator:
                 # 拿到 _process 里用就是 "Identifier not declared"。
                 # 表达式本身在哪儿都算得出(而且自带缓存,不重复查找)。
                 holder = self.ctx.new_temp("ap")
-                lines.add(1, f"var {holder} := {event['player_expr']}")
-                lines.add(1, f"if {holder} != null "
-                             f"and not {event['name_expr']}.is_empty():")
+                playback = event.get("playback")
+                clip = event['name_expr']
+                if playback:
+                    clip = f'String({playback}.get("name", ""))'
+                    lines.add(1, f'var {holder}: AnimationPlayer = {playback}.get("player") '
+                              f'if is_instance_valid({playback}.get("player")) else null')
+                    lines.add(1, f'if {playback}.get("active", false) and {holder} != null:')
+                else:
+                    lines.add(1, f"var {holder} := {event['player_expr']}")
+                    lines.add(1, f"if {holder} != null and not {clip}.is_empty():")
                 lines.add(2, f"var {var}: bool = "
-                             f"{holder}.current_animation == {event['name_expr']} "
+                             f"{holder}.current_animation == {clip} "
                              f"and {holder}.is_playing()")
                 lines.add(2, f"if {var}:")
                 self.ctx._active.clear()
@@ -1724,13 +1784,24 @@ class Generator:
                 # 比对名字,避免"别的代码播了同一个播放器上的另一个动画"
                 # 时误触发这段逻辑。
                 # ⚠ 这里同样是**表达式**不是 _ready 的局部变量(第七十六轮)。
-                lines.add(1, f"if {event['name_expr']} != _name:")
+                playback = event.get("playback")
+                if playback:
+                    lines.add(1, 'if not __playback.get("active", false) or '
+                              'String(__playback.get("name", "")) != _name:')
+                else:
+                    lines.add(1, f"if {event['name_expr']} != _name:")
                 lines.add(2, "return")
+                if playback and event.get("signal") == "animation_finished":
+                    # Cancel before downstream code: that code may start the
+                    # next animation and must retain its new subscriptions.
+                    lines.add(1, '_gk_anim_cancel(__playback.get("player"))')
                 self.ctx._active.clear()
                 self.ctx._current_event = event["func"]
                 _chain(self.ctx, event["node"], 1, event["output"])
                 sections.append({
-                    "signature": f"func {event['func']}(__name: StringName) -> void:",
+                    "signature": (f"func {event['func']}(__name: StringName"
+                                  + (", __playback: Dictionary" if playback else "")
+                                  + ") -> void:"),
                     "lines": list(lines.lines),
                     "empty_body": "    pass",
                     "separator": True,
@@ -2223,6 +2294,8 @@ class Generator:
         sections.extend(self.ctx.extra_sections)
 
         # ---- 界面容器辅助函数 ----
+        if self.ctx.need_pause_dim and not ui_main:
+            sections.extend(self._emit_pause_dim())
         if self.ctx.need_ui_helpers:
             # A role can update a permanent HUD without creating any local widgets.
             self.ctx.declare_var("_gk_ui_layer", "CanvasLayer")
@@ -2659,7 +2732,9 @@ class Generator:
             # 为什么单独一个函数:剧情冻着的时候,玩家按 Esc 只该开关**这一层**
             # (世界继续冻着),『继续游戏』也只该收这一层 —— 两处都不该动
             # `tree.paused`。所以"世界冻不冻"和"菜单这一层开不开"必须能分开叫。
-            menu_lines = []
+            menu_lines = [
+                "    var widget: Control = _gk_find_widget(menu) if menu != \"\" else null",
+            ]
             if getattr(self.ctx, "_pause_transient", False):
                 if self.ctx.need_transient_helper:
                     menu_lines += [
@@ -2674,13 +2749,15 @@ class Generator:
                     ]
                 if self.ctx.need_pause_dim:
                     menu_lines += [
+                        "    _gk_pause_dim_init()",
                         "    if _gk_pause_dim != null:",
                         "        _gk_pause_dim.visible = open",
+                        "        _gk_pause_dim.mouse_filter = Control.MOUSE_FILTER_STOP if widget != null else Control.MOUSE_FILTER_IGNORE",
+                        "        if open and widget != null:",
+                        "            _gk_pause_dim.move_to_front()",
                     ]
             menu_lines += [
-                "    var widget: Control = null",
                 "    if menu != \"\":",
-                "        widget = _gk_find_widget(menu)",
                 "        if widget != null:",
                 "            widget.visible = open",
             ]
@@ -2693,6 +2770,8 @@ class Generator:
                     "                _gk_ui_raise(widget)",
                 ]
             menu_lines += [
+                "            if open:",
+                "                _gk_pause_focus_scope(widget)",
                 "        else:",
                 "            push_warning(\"找不到暂停菜单控件: \" + menu)",
                 "    _gk_pause_menu_open = open",
@@ -2704,6 +2783,36 @@ class Generator:
                 "signature": ("func _gk_pause_menu_show(open: bool, "
                               "menu: String) -> void:"),
                 "lines": menu_lines,
+                "empty_body": "    pass",
+                "separator": True,
+            })
+            sections.append({
+                # 暂停是模态界面:首尾焦点闭环,不能从菜单 Tab 到背后的交互按钮。
+                "signature": "func _gk_pause_focus_scope(panel: Control) -> void:",
+                "lines": [
+                    "    var items: Array[Control] = []",
+                    "    for child in panel.find_children(\"*\", \"Control\", true, false):",
+                    "        if child.is_visible_in_tree() and child.focus_mode != Control.FOCUS_NONE:",
+                    "            if child is BaseButton and child.disabled:",
+                    "                continue",
+                    "            items.append(child)",
+                    "    items.sort_custom(func(a: Control, b: Control) -> bool:",
+                    "        if absf(a.global_position.y - b.global_position.y) > 2.0:",
+                    "            return a.global_position.y < b.global_position.y",
+                    "        return a.global_position.x < b.global_position.x)",
+                    "    for index in items.size():",
+                    "        var item: Control = items[index]",
+                    "        var previous := items[(index - 1 + items.size()) % items.size()].get_path()",
+                    "        var following := items[(index + 1) % items.size()].get_path()",
+                    "        item.focus_neighbor_top = previous",
+                    "        item.focus_neighbor_left = previous",
+                    "        item.focus_previous = previous",
+                    "        item.focus_neighbor_bottom = following",
+                    "        item.focus_neighbor_right = following",
+                    "        item.focus_next = following",
+                    "    if not items.is_empty():",
+                    "        items[0].grab_focus()",
+                ],
                 "empty_body": "    pass",
                 "separator": True,
             })
@@ -3456,7 +3565,64 @@ class Generator:
         # (方法里有守卫,重复调用不会生成两份。)
         self._emit_reference_helpers(sections)
 
+        # ---- 失焦清键(第一百九十八轮,B2)----------------------------
+        # 只有图里出现"按住才为真"的轮询输入才生成；没有轮询的产物
+        # 一字不变。放在最后:前面所有发射点都已经把标志置好了。
+        sections.extend(self._emit_input_focus_guard())
+
         return self._assemble(sections)
+
+    def _emit_input_focus_guard(self):
+        """生成失焦清键:窗口失去焦点时把"按住"状态全部松开(B2)。
+
+        ── 为什么需要 ────────────────────────────────────────────────
+        『输入_方向』『输入_按键(按住)』『鼠标_按键按住』都是**轮询**
+        `Input` 的当前状态。切到别的窗口时系统不会再送"松开"事件,
+        这个状态就永远停在按下 —— 切回来角色自己走、鼠标一直在挖。
+        示例线实测到的就是这一类。
+
+        ── 为什么按脚本生成、不做 autoload ──────────────────────────
+        autoload 会改 `project.godot`,所有工程的产物都变;按脚本生成
+        只在**真有轮询**的图里多两个函数,没有轮询的产物逐字不变。
+
+        ── 清哪些状态 ───────────────────────────────────────────────
+          * 所有输入动作:覆盖方向 / 按键按住 / 手柄映射;
+          * 鼠标 5 个键:Godot 没有"松开全部鼠标键"的接口,补发 released;
+          * `KEY_ALT`:本体唯一直接查物理键的地方(Alt 特例),动作释放
+            管不到 `Input.is_key_pressed`。
+        """
+        if not self.ctx.need_focus_guard:
+            return []
+        return [{
+            "signature": "func _gk_clear_input() -> void:",
+            "lines": [
+                "    for _gk_action in InputMap.get_actions():",
+                "        Input.action_release(_gk_action)",
+                "    for _gk_button in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, "
+                "MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_XBUTTON1, "
+                "MOUSE_BUTTON_XBUTTON2]:",
+                "        var _gk_mouse := InputEventMouseButton.new()",
+                "        _gk_mouse.button_index = _gk_button",
+                "        _gk_mouse.pressed = false",
+                "        Input.parse_input_event(_gk_mouse)",
+                "    var _gk_alt := InputEventKey.new()",
+                "    _gk_alt.keycode = KEY_ALT",
+                "    _gk_alt.physical_keycode = KEY_ALT",
+                "    _gk_alt.pressed = false",
+                "    Input.parse_input_event(_gk_alt)",
+            ],
+            "empty_body": "    pass",
+            "separator": True,
+        }, {
+            "signature": "func _notification(what: int) -> void:",
+            "lines": [
+                "    if what == NOTIFICATION_APPLICATION_FOCUS_OUT "
+                "or what == NOTIFICATION_WM_WINDOW_FOCUS_OUT:",
+                "        _gk_clear_input()",
+            ],
+            "empty_body": "    pass",
+            "separator": True,
+        }]
 
     def _emit_reference_helpers(self, sections):
         """生成 `_gk_ref` / `_gk_ref_typed`(带兜底查找的节点引用工具)。
@@ -3909,11 +4075,8 @@ class Generator:
         (layer 92)抢同一张后备缓冲**。所以这里取轻的那条路:一个 ColorRect。
         以后真要做磨砂玻璃,替换这一个节点的材质即可,接口不用动。
 
-        ── 为什么"作为根的第一个孩子"= 在最底层 ────────────────────────
-        同一个 CanvasLayer 里的 Control 按**兄弟顺序**画(后加的画在上面),
-        所以压暗底必须是 `_gk_ui_root` 的第一个孩子;暂停菜单由
-        `_gk_ui_raise()` 的 `move_to_front()` 挪到最后一个孩子,永远压在
-        这块底上面 —— "先压暗、再画面板",不会反过来把面板也压暗。
+        暂停时先将遮罩置顶,再把菜单置顶。遮罩拦住旧 HUD 的点击,
+        菜单继续接收输入;关闭时隐藏遮罩,恢复原有交互。
         """
         self.ctx.declare_var("_gk_pause_dim", "ColorRect")
         return [{
@@ -3926,12 +4089,11 @@ class Generator:
                 '    _gk_pause_dim.name = "暂停压暗"',
                 "    _gk_pause_dim.color = Color(0.0, 0.0, 0.0, 0.45)",
                 "    _gk_pause_dim.set_anchors_preset(Control.PRESET_FULL_RECT)",
-                "    # 不吃鼠标:菜单照点,也不会挡住游戏里的点击判定",
-                "    _gk_pause_dim.mouse_filter = Control.MOUSE_FILTER_IGNORE",
+                "    # 暂停菜单下方的模态屏障:拦住旧 HUD 与世界点击",
+                "    _gk_pause_dim.mouse_filter = Control.MOUSE_FILTER_STOP",
                 "    _gk_pause_dim.visible = false",
                 "    _gk_ui_root.add_child(_gk_pause_dim)",
-                "    # 提到根的第一个孩子 = 同层最底(见函数说明):菜单等会儿还会",
-                "    # 被 move_to_front 挪到最后,正好压在它上面",
+                "    # 初始隐藏;打开时依次置顶遮罩和菜单",
                 "    _gk_ui_root.move_child(_gk_pause_dim, 0)",
             ],
             "empty_body": "    pass",

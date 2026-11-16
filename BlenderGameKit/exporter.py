@@ -466,9 +466,11 @@ def object_logic_trees(scene):
         default_char = getattr(world_settings(), "default_character", None)
     except Exception:                                     # noqa: BLE001
         default_char = None
+    # 默认角色解析一次:逐目标调用 `owns()` 会各自重扫全场(O(目标数²))。
+    from .persistent_player import default_player, owns
+    player = default_player() if targets else None
     for obj in targets:
-        from .persistent_player import owns
-        if owns(obj):
+        if owns(obj, player):
             continue
         physics = getattr(obj, "gk_physics", None)
         wanted = str(getattr(physics, "logic_tree", "") or "").strip()
@@ -576,6 +578,10 @@ def _generate_code_full(tree, settings=None):
     wanted, why = codegen.required_base_class(tree, options)
     chosen = str(options.get("base_class") or "")
     if wanted and not _class_provides(chosen, wanted):
+        if options.get("per_object_scripts", False):
+            raise codegen.CodegenAbort(
+                f"宿主『{options.get('node_name', '')}』的类型是 {chosen}，"
+                f"逻辑图需要 {wanted}；请调整该宿主的物理类型或逻辑图，避免脚本与场景节点类型不匹配。")
         options["base_class"] = wanted
         warnings_extra = (
             f"基类已从『{chosen}』改为『{wanted}』:{why}。"
@@ -642,6 +648,16 @@ def atomic_write_text(path, text):
     `os.replace` 在同一文件系统内是**原子**操作:目标要么还是旧内容,
     要么完整变成新内容,不存在"写了一半"的中间态。
     """
+    # Godot 根据文件变化触发重新导入；内容完全一致时保留时间戳。
+    # 按字节比较，避免通用换行读取把 CRLF/BOM 的差异隐藏掉。
+    payload = text.encode("utf-8")
+    try:
+        if os.path.getsize(path) == len(payload):
+            with open(path, "rb") as existing:
+                if existing.read() == payload:
+                    return path
+    except OSError:
+        pass  # 保留原先的写入/报错语义，不把读取失败当成成功。
     folder = os.path.dirname(path)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder, exist_ok=True)
@@ -949,6 +965,22 @@ def export_tree(tree, settings=None, write_scene=None):
     warnings = list(warnings)          # 已在 codegen 出口摊平成字符串
     diagnostics = list(diagnostics)    # 结构化诊断(level / code / message / hint)
 
+    errors = [item for item in diagnostics if item.is_error()]
+    if errors:
+        # A generated preview may be useful for diagnosis, but an error is not
+        # publishable code. Stop before directory creation or resource planning;
+        # a failed dry-run must have exactly the same acceptance criteria.
+        message = "逻辑图编译失败: " + "；".join(item.render() for item in errors)
+        gk_log.error(message)
+        return {
+            "ok": False, "error": message, "stage": "校验逻辑图",
+            "rolled_back": True, "dry_run": dry_run, "code": code,
+            "warnings": warnings, "diagnostics": diagnostics,
+            "script_name": script_name, "written": [], "manifest": [],
+            "directory": options.output_dir or "", "lines": len(code.splitlines()),
+            "elapsed_ms": (time.time() - started) * 1000.0,
+        }
+
     def _note(diagnostic):
         """登记一条结构化诊断:既保留对象(给程序化消费),又把摊平后的
         文本放进 warnings —— UI / 日志 / `self.report()` 一直吃字符串,
@@ -971,7 +1003,7 @@ def export_tree(tree, settings=None, write_scene=None):
     except Exception:
         gk_log.exception("检查『挂脚本物体』时出错(继续导出)")
         targets = []
-    if len(targets) > 1:
+    if len(targets) > 1 and not settings.get("per_object_scripts", False):
         names = "、".join(getattr(o, "name", "?") for o in targets[:4])
         _note(models.Diagnostic(
             level="warning", code="MULTIPLE_SCRIPT_TARGETS",

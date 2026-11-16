@@ -19,6 +19,13 @@
 from ._common import *  # noqa: F401,F403
 
 
+def _call_selection_changed(node, context):
+    # Renaming a declaration updates references before the declaration itself.
+    # Keep existing pins until that transaction can resolve the new signature.
+    if node.function_spec() is not None:
+        B._on_pin_count_changed(node, context)
+
+
 # ==========================================================================
 # 函数
 # ==========================================================================
@@ -74,13 +81,18 @@ class GKNodeFunctionCall(B.GKStatementNode):
               "有返回值时右侧多一个『结果』输出,可以直接接进别的节点。"
               "── 注意 ──"
               "『函数_定义』那个节点只是函数的起点,**不产生调用** —— "
-              "要让函数跑起来,得在某个执行流上接这个『函数_调用』节点")
+              "要让函数跑起来,得在某个执行流上接这个『函数_调用』节点。"
+              "跨对象时选择接口图与目标；『成功』表示方法已执行，结果是函数的业务返回值。"
+              "目标缺失时成功为假、结果为类型默认值，完成出口仍继续。返回值仅支持同步函数。")
     gk_inputs = (S.pin(FLOW, "执行"),)
     gk_prop_defs = (
         ("gk_func_name", "string", "", "函数",
-         "侧栏『函数』框里声明的名字"),
+         "接口图侧栏声明的名字", None, {"update": _call_selection_changed}),
+        ("gk_function_tree", "string", "", "接口图",
+         "空为本图；跨对象调用须选择声明函数的图", None, {"update": _call_selection_changed}),
+        ("gk_target", "string", TARGET_SELF, "目标", "自身、场景物体或 @角色引用"),
     )
-    gk_outputs = (S.pin(FLOW, "完成"), S.pin(ANY, "结果", None),)
+    gk_outputs = (S.pin(FLOW, "完成"), S.pin(ANY, "结果", None), S.pin(BOOL, "成功", False))
     # 引脚按**函数声明的参数名**生成(用户自己起的名字,比如「金额」)——
     # 名字既不在声明里、也不带动态前缀,所以"名字对不上"不能当陈旧判据
     # (否则加载迁移每次都重建它)。见 nodes/_containers.migrate_pin_names。
@@ -94,7 +106,7 @@ class GKNodeFunctionCall(B.GKStatementNode):
         (调用点会有一条明确的告警,而不是生成一个猜出来的调用)。
         """
         from .. import properties as props
-        tree = getattr(self, "id_data", None)
+        tree = props.function_call_tree(self)
         name = str(getattr(self, "gk_func_name", "") or "").strip()
         if tree is None or not name:
             return None
@@ -108,14 +120,37 @@ class GKNodeFunctionCall(B.GKStatementNode):
         """
         self.inputs.clear()
         self.outputs.clear()
-        B.build_declared_sockets(self)
+        self.inputs.new(FLOW[0], "执行")
+        self.outputs.new(FLOW[0], "完成")
         spec = self.function_spec()
+        self.outputs.new(S.idname_for_gd_type((spec or {}).get("return")), "结果")
+        self.outputs.new(S.idname_for_gd_type("bool"), "成功")
         if not spec:
             return
         for param_name, param_type in (spec.get("params") or ()):
             self.inputs.new(S.idname_for_gd_type(param_type), param_name)
 
+    def rebuild_sockets(self):
+        values = {}
+        for socket in self.inputs:
+            if hasattr(socket, "default_value"):
+                value = socket.default_value
+                if hasattr(value, "__iter__") and not isinstance(value, str):
+                    value = tuple(value)
+                values[(socket.name, socket.bl_idname)] = value
+        super().rebuild_sockets()
+        for socket in self.inputs:
+            key = (socket.name, socket.bl_idname)
+            if key in values:
+                try:
+                    socket.default_value = values[key]
+                except (TypeError, ValueError, AttributeError):
+                    pass
+
     def draw_buttons(self, context, layout):
+        import bpy
+        layout.prop_search(self, "gk_function_tree", bpy.data, "node_groups", text="接口图")
+        B.draw_target_picker(self, layout)
         row = layout.row(align=True)
         row.prop(self, "gk_func_name", text="", icon="FILE_SCRIPT")
         pick = row.operator("gk.pick_function", text="", icon="VIEWZOOM")
@@ -123,7 +158,7 @@ class GKNodeFunctionCall(B.GKStatementNode):
         pick.func_prop = "gk_func_name"
         spec = self.function_spec()
         if spec is None:
-            layout.label(text="先在侧栏『函数』框里声明它", icon="INFO")
+            layout.label(text="在接口图侧栏声明函数；接口图留空为本图", icon="INFO")
             return
         params = spec.get("params") or []
         if params:

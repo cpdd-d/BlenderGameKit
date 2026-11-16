@@ -54,8 +54,8 @@ def _audio_host(ctx, node):
     return "self"
 
 
-def _emit_stream_loop(ctx, indent, stream_var):
-    """给一条流打开"循环播放"—— **按流类型分别设**(第八十一轮抽出来)。
+def _emit_stream_loop(ctx, indent, stream_var, loop=True):
+    """为播放实例配置循环模式，保留 ResourceLoader 的源资源不变。
 
     Godot 没有一个统一点:Ogg / MP3 是 `.loop`,`wav` 是 `loop_mode`。
     只设一种的话换个格式就"播一遍就没了",而且不报错 —— 很难查。
@@ -70,18 +70,26 @@ def _emit_stream_loop(ctx, indent, stream_var):
 
     BGM(『音效_音乐』)和循环音效(『音效_播放』勾『循环』)共用这一份。
     """
+    # load() 返回缓存资源。播放实例才能拥有循环设置；直接修改缓存会让
+    # 同一路径的一次性音效也无限循环，finished 不再触发，播放器无法释放。
+    ctx.add_line(indent, f"if {stream_var} is AudioStreamOggVorbis or "
+                         f"{stream_var} is AudioStreamMP3 or {stream_var} is AudioStreamWAV:")
+    ctx.add_line(indent + 1, f"{stream_var} = {stream_var}.duplicate() as AudioStream")
+    enabled = "true" if loop else "false"
     ctx.add_line(indent, f"if {stream_var} is AudioStreamOggVorbis:")
     ctx.add_line(indent + 1,
-                 f"({stream_var} as AudioStreamOggVorbis).loop = true")
+                 f"({stream_var} as AudioStreamOggVorbis).loop = {enabled}")
     ctx.add_line(indent, f"elif {stream_var} is AudioStreamMP3:")
-    ctx.add_line(indent + 1, f"({stream_var} as AudioStreamMP3).loop = true")
+    ctx.add_line(indent + 1, f"({stream_var} as AudioStreamMP3).loop = {enabled}")
     ctx.add_line(indent, f"elif {stream_var} is AudioStreamWAV:")
     ctx.add_line(indent + 1,
                  f"({stream_var} as AudioStreamWAV).loop_mode = "
-                 f"AudioStreamWAV.LOOP_FORWARD")
-    ctx.add_line(indent + 1, f"({stream_var} as AudioStreamWAV).loop_end = "
-                 f"int(({stream_var} as AudioStreamWAV).get_length() * "
-                 f"float(({stream_var} as AudioStreamWAV).mix_rate))")
+                 f"AudioStreamWAV.{'LOOP_FORWARD' if loop else 'LOOP_DISABLED'}")
+    if loop:
+        ctx.add_line(indent + 1, f"({stream_var} as AudioStreamWAV).loop_begin = 0")
+        ctx.add_line(indent + 1, f"({stream_var} as AudioStreamWAV).loop_end = "
+                     f"int(({stream_var} as AudioStreamWAV).get_length() * "
+                     f"float(({stream_var} as AudioStreamWAV).mix_rate))")
 
 
 @stmt_node("GKNodePlaySound")
@@ -113,8 +121,8 @@ def _stmt_play_sound(ctx, node, indent):
     # 音频文件缺失时给出可读的报错，而不是让 load() 静默返回 null 后再炸在别处
     ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
     ctx.add_line(indent, f"if {stream_var} != null:")
+    _emit_stream_loop(ctx, indent + 1, stream_var, loop)
     if loop:
-        _emit_stream_loop(ctx, indent + 1, stream_var)
         key_var = ctx.new_temp("sfx_key")
         old_var = ctx.new_temp("sfx_old")
         ctx.add_line(indent + 1, f"var {key_var} := {gd_string(name)}")
@@ -150,29 +158,36 @@ def _stmt_play_music(ctx, node, indent):
     bus = str(getattr(node, "gk_bus", "Master") or "Master").strip() or "Master"
 
     music_var = ctx.declare_var("_gk_music", "AudioStreamPlayer")
+    fade_var = ctx.declare_var("_gk_music_fade", "Tween")
+    stopping = ctx.declare_var("_gk_music_stopping", "bool", initial="false")
     stream_var = ctx.new_temp("bgm_stream")
 
     ctx.add_line(indent, f"var {stream_var}: AudioStream = load({path}) as AudioStream")
-    if loop:
-        # ── 循环要**按流类型**分别设(第六十四轮)────────────────────
-        # (第八十一轮抽成 `_emit_stream_loop`:循环音效也用同一份)
-        _emit_stream_loop(ctx, indent, stream_var)
     ctx.add_line(indent, f"if {stream_var} != null:")
-    # 重复播放同一首时不要打断(主菜单返回游戏很常见)
-    ctx.add_line(indent + 1, f"if {music_var} != null and {music_var}.stream == {stream_var} and {music_var}.playing:")
+    # 实例流已复制，判重用缓存源资源 + 循环模式。淡出途中重播须撤销旧淡出。
+    ctx.add_line(indent + 1, f"if is_instance_valid({music_var}) and not {stopping} "
+                 f"and {music_var}.get_meta(\"gk_audio_source\", null) == {stream_var} "
+                 f"and {music_var}.get_meta(\"gk_audio_loop\", false) == {'true' if loop else 'false'} "
+                 f"and {music_var}.playing:")
     ctx.add_line(indent + 2, "pass")
     ctx.add_line(indent + 1, "else:")
-    ctx.add_line(indent + 2, f"if {music_var} != null:")
+    ctx.add_line(indent + 2, f"if {fade_var} != null:")
+    ctx.add_line(indent + 3, f"{fade_var}.kill()")
+    ctx.add_line(indent + 2, f"{stopping} = false")
+    ctx.add_line(indent + 2, f"if is_instance_valid({music_var}):")
+    ctx.add_line(indent + 3, f"{music_var}.stop()")
     ctx.add_line(indent + 3, f"{music_var}.queue_free()")
     ctx.add_line(indent + 2, f"{music_var} = AudioStreamPlayer.new()")
+    ctx.add_line(indent + 2, f'{music_var}.set_meta("gk_audio_source", {stream_var})')
+    ctx.add_line(indent + 2, f'{music_var}.set_meta("gk_audio_loop", {"true" if loop else "false"})')
+    _emit_stream_loop(ctx, indent + 2, stream_var, loop)
     ctx.add_line(indent + 2, f"{music_var}.stream = {stream_var}")
     ctx.add_line(indent + 2, f"{music_var}.bus = {gd_string(bus)}")
     ctx.add_line(indent + 2, f"self.add_child({music_var})")
     ctx.add_line(indent + 2, f"{music_var}.play()")
     if float(getattr(node, "gk_fade", 0.5) or 0.0) > 0.0:
         ctx.add_line(indent + 2, f"{music_var}.volume_db = -80.0")
-        fade_var = ctx.new_temp("fade")
-        ctx.add_line(indent + 2, f"var {fade_var} := create_tween()")
+        ctx.add_line(indent + 2, f"{fade_var} = create_tween()")
         ctx.add_line(indent + 2,
                      f"{fade_var}.tween_property({music_var}, \"volume_db\", {volume}, {fade})")
     else:
@@ -206,10 +221,14 @@ def _stmt_stop_sound(ctx, node, indent):
         return
     fade = gd_number(getattr(node, "gk_fade", 0.5))
     music_var = ctx.declare_var("_gk_music", "AudioStreamPlayer")
-    ctx.add_line(indent, f"if {music_var} != null:")
+    fade_var = ctx.declare_var("_gk_music_fade", "Tween")
+    stopping = ctx.declare_var("_gk_music_stopping", "bool", initial="false")
+    ctx.add_line(indent, f"if is_instance_valid({music_var}) and not {stopping}:")
+    ctx.add_line(indent + 1, f"{stopping} = true")
+    ctx.add_line(indent + 1, f"if {fade_var} != null:")
+    ctx.add_line(indent + 2, f"{fade_var}.kill()")
     if float(getattr(node, "gk_fade", 0.5) or 0.0) > 0.0:
-        fade_var = ctx.new_temp("fade")
-        ctx.add_line(indent + 1, f"var {fade_var} := create_tween()")
+        ctx.add_line(indent + 1, f"{fade_var} = create_tween()")
         ctx.add_line(indent + 1, f"{fade_var}.tween_property({music_var}, \"volume_db\", -80.0, {fade})")
         ctx.add_line(indent + 1, f"{fade_var}.tween_callback({music_var}.stop)")
     else:
@@ -362,6 +381,7 @@ def _stmt_heartbeat(ctx, node, indent):
     ctx.add_line(indent, f"if {player} == null:")
     ctx.add_line(indent + 1, f"var {stream}: AudioStream = load({gd_string(path_raw)}) as AudioStream")
     ctx.add_line(indent + 1, f"if {stream} != null:")
+    _emit_stream_loop(ctx, indent + 2, stream, False)
     ctx.add_line(indent + 2, f"{player} = AudioStreamPlayer.new()")
     ctx.add_line(indent + 2, f"{player}.stream = {stream}")
     ctx.add_line(indent + 2, f'{player}.bus = "Master"')
@@ -428,6 +448,7 @@ def _stmt_scare(ctx, node, indent):
     # 用普通 AudioStreamPlayer 就够,也不受『相机』那个引用干扰。
     ctx.add_line(indent, f"var {stream}: AudioStream = load({path}) as AudioStream")
     ctx.add_line(indent, f"if {stream} != null:")
+    _emit_stream_loop(ctx, indent + 1, stream, False)
     ctx.add_line(indent + 1, f"var {player} := AudioStreamPlayer.new()")
     ctx.add_line(indent + 1, f"{player}.stream = {stream}")
     ctx.add_line(indent + 1, f"{player}.volume_db = {volume}")
@@ -508,6 +529,7 @@ def _stmt_blackout(ctx, node, indent):
         ctx.add_line(indent, f"var {stream}: AudioStream = load("
                              f"{sound_expr}) as AudioStream")
         ctx.add_line(indent, f"if {stream} != null:")
+        _emit_stream_loop(ctx, indent + 1, stream, False)
         ctx.add_line(indent + 1, f"var {player} := AudioStreamPlayer.new()")
         ctx.add_line(indent + 1, f"{player}.stream = {stream}")
         ctx.add_line(indent + 1, f"{player}.volume_db = -2.0")
@@ -555,6 +577,7 @@ def _stmt_drop(ctx, node, indent):
     if stream is not None:
         player = ctx.new_temp("dr_sfx")
         ctx.add_line(indent + 2, f"if {stream} != null:")
+        _emit_stream_loop(ctx, indent + 3, stream, False)
         ctx.add_line(indent + 3, f"var {player} := AudioStreamPlayer3D.new()")
         ctx.add_line(indent + 3, f"{player}.stream = {stream}")
         ctx.add_line(indent + 3, f"{player}.volume_db = {volume}")
@@ -605,6 +628,7 @@ def _stmt_random_sfx(ctx, node, indent):
                  f"var {path}: String = {pool}[randi() % {pool}.size()].strip_edges()")
     ctx.add_line(indent + 1, f"var {stream}: AudioStream = load({path}) as AudioStream")
     ctx.add_line(indent + 1, f"if {stream} != null:")
+    _emit_stream_loop(ctx, indent + 2, stream, False)
     cls = "AudioStreamPlayer3D" if positional else "AudioStreamPlayer"
     ctx.add_line(indent + 2, f"var {player} := {cls}.new()")
     ctx.add_line(indent + 2, f"{player}.stream = {stream}")
@@ -1597,6 +1621,7 @@ def _stmt_ui_button(ctx, node, indent):
                      f"var {snd}: AudioStream = load({gd_string(_ui_image_res(click_sound))}) as AudioStream")
         ctx.add_line(indent + 2, f"if {snd} == null:")
         ctx.add_line(indent + 3, "return")
+        _emit_stream_loop(ctx, indent + 2, snd, False)
         ctx.add_line(indent + 2, f"var {plr} := AudioStreamPlayer.new()")
         ctx.add_line(indent + 2, f"{plr}.stream = {snd}")
         ctx.add_line(indent + 2, f"{plr}.volume_db = {click_db}")
@@ -2187,10 +2212,8 @@ def _stmt_ui_pause(ctx, node, indent):
         # 两个都只在**真填了菜单控件**时才要:没菜单就没有"压在菜单上的旧界面"
         # 这回事,生成了也是死代码。
         ctx._pause_transient = True
-        if getattr(ctx, "is_main_ui", False):
-            # 压暗底是主界面自己的东西(菜单住在主界面的 CanvasLayer 里)——
-            # 只有生成主界面那份脚本时才需要这块底色。
-            ctx.need_pause_dim = True
+        # 关卡自身也能创建暂停菜单,同样需要遮罩隔离背后的 HUD。
+        ctx.need_pause_dim = True
     action = "true" if paused else "false"
     mouse_literal = "true" if mouse else "false"
     ctx.add_line(indent, f"_gk_apply_pause({action}, {gd_string(menu)}, {mouse_literal})")

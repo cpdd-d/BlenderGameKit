@@ -26,16 +26,12 @@ foreach ($path in $targets) {
     $bytes = [System.IO.File]::ReadAllBytes($path)
     $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
                $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-    if ($hasBom) {
-        Write-Output "已有 BOM: $path"
-        continue
-    }
-    # 无 BOM -> 按 UTF-8 读出来,再带 BOM 写回(行尾统一 CRLF)
-    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    # 无 BOM 或重复 BOM 都归一为一个，避免多余字符破坏开头的 param 块。
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
     $text = $text.Replace("`r`n", "`n").Replace("`n", "`r`n")
     $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     [System.IO.File]::WriteAllText($path, $text, $utf8Bom)
-    Write-Output "已补上 BOM: $path"
+    Write-Output "已归一为单个 BOM: $path"
 }
 
 # 补完立刻验一遍能不能解析(能解析才说明真的修好了)

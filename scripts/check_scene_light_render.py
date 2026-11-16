@@ -1,4 +1,4 @@
-"""GPU regression: scene-lit toon must receive local light and real shadows.
+"""GPU regression: scene-lit toon receives real shadows and more than two lights.
 
 Runs an isolated Godot project under _dist. A real graphics device is required;
 --headless uses a dummy renderer and is not a valid substitute for this check.
@@ -16,6 +16,22 @@ PROBE = '''extends SceneTree
 var floor_mesh: MeshInstance3D
 var box: MeshInstance3D
 var lamp: SpotLight3D
+var metrics := {}
+
+func brighter_pixels(before: Image, after: Image, threshold: float) -> int:
+	var count := 0
+	for y in range(before.get_height()):
+		for x in range(before.get_width()):
+			if after.get_pixel(x, y).get_luminance() - before.get_pixel(x, y).get_luminance() > threshold:
+				count += 1
+	return count
+
+func patch_energy(img: Image, center: Vector2) -> float:
+	var total := 0.0
+	for y in range(-3, 4):
+		for x in range(-3, 4):
+			total += img.get_pixel(int(center.x) + x, int(center.y) + y).get_luminance()
+	return total / 49.0
 
 func shot(label: String) -> Image:
 	for i in range(6):
@@ -31,6 +47,92 @@ func brightness(img: Image) -> float:
 		for x in range(img.get_width()):
 			total += img.get_pixel(x, y).get_luminance()
 	return total
+
+func check_three_tone(mat: ShaderMaterial) -> bool:
+	mat.set_shader_parameter("three_tone", 1.0)
+	lamp.position = Vector3(-2, 5, 2)
+	lamp.look_at(Vector3.ZERO)
+	lamp.shadow_enabled = true
+	var shadow := await shot("three_tone_shadow")
+	lamp.shadow_enabled = false
+	var clear := await shot("three_tone_no_shadow")
+	lamp.visible = false
+	var off := await shot("three_tone_off")
+	var changed := brighter_pixels(shadow, clear, 0.04)
+	var energy := brightness(shadow)
+	var off_energy := brightness(off)
+	metrics["three_tone"] = {"shadow_pixels": changed, "on_energy": energy, "off_energy": off_energy}
+	print("SCENE_LIGHT_THREE_TONE shadow_pixels=", changed, " on=", energy, " off=", off_energy)
+	return changed > 100 and energy > 1000.0 and off_energy < energy * 0.01
+
+func check_multiple_lights(world: Node3D, mat: ShaderMaterial, camera: Camera3D) -> bool:
+	# The large floor must receive all four lights, so a per-mesh two-light
+	# cap cannot accidentally pass. A small second mesh shares its material.
+	lamp.visible = false
+	box.visible = false
+	var right := MeshInstance3D.new()
+	var patch := PlaneMesh.new()
+	patch.size = Vector2(2, 2)
+	right.mesh = patch
+	right.material_override = mat
+	right.position = Vector3(3, 0.01, 3)
+	world.add_child(right)
+	camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+	camera.size = 13
+	camera.position = Vector3(0, 10, 0.01)
+	camera.look_at(Vector3.ZERO)
+	mat.set_shader_parameter("albedo_color", Color(0.5, 0.5, 0.5))
+	var positions := [Vector3(-3, 4, 3), Vector3(3, 4, 3), Vector3(-3, 4, -3), Vector3(3, 4, -3)]
+	var colors := [Color(1, 0.3, 0.3), Color(0.3, 1, 0.3), Color(0.3, 0.3, 1), Color(1, 1, 1)]
+	var lights: Array[SpotLight3D] = []
+	for index in range(positions.size()):
+		var light := SpotLight3D.new()
+		world.add_child(light)
+		light.position = positions[index]
+		# Offset target avoids look_at's collinear-up degeneracy.
+		light.look_at(Vector3(positions[index].x, 0, positions[index].z + 0.01))
+		light.spot_angle = 25
+		light.spot_range = 9
+		light.light_energy = 2.0
+		light.light_color = colors[index]
+		light.visible = false
+		lights.append(light)
+	var ok := true
+	for tone in [0, 1]:
+		mat.set_shader_parameter("three_tone", float(tone))
+		for light in lights:
+			light.visible = false
+		var before := await shot("multi_" + str(tone) + "_0")
+		var base_energy := brightness(before)
+		var counts: Array[int] = []
+		var energies: Array[float] = []
+		for index in range(lights.size()):
+			lights[index].visible = true
+			var after := await shot("multi_" + str(tone) + "_" + str(index + 1))
+			var changed := brighter_pixels(before, after, 0.02)
+			counts.append(changed)
+			energies.append(brightness(after))
+			ok = ok and changed > 500
+			before = after
+		# Turn off the third light while retaining first, second and fourth.
+		# Every other light's pool must stay unchanged on the shared material.
+		lights[2].visible = false
+		var removed := await shot("multi_" + str(tone) + "_third_off")
+		var third_removed := brighter_pixels(removed, before, 0.02)
+		var unrelated_change := brighter_pixels(before, removed, 0.02)
+		var other_pool_delta := 0.0
+		for index in [0, 1, 3]:
+			var center := camera.unproject_position(Vector3(positions[index].x, 0, positions[index].z))
+			other_pool_delta = maxf(other_pool_delta, absf(patch_energy(before, center) - patch_energy(removed, center)))
+		ok = ok and third_removed > 500 and unrelated_change == 0 and base_energy < 1.0 and other_pool_delta < 0.005
+		metrics["multi_tone_" + str(tone)] = {"added_light_pixels": counts,
+			"energy": energies, "off_energy": base_energy,
+			"third_removed_pixels": third_removed, "unrelated_brighter_pixels": unrelated_change,
+			"other_pool_max_delta": other_pool_delta}
+		print("SCENE_LIGHT_MULTI tone=", tone, " added=", counts,
+			" third_removed=", third_removed, " unrelated=", unrelated_change,
+			" other_pool_delta=", other_pool_delta, " energy=", energies)
+	return ok
 
 func _initialize() -> void:
 	call_deferred("run")
@@ -108,6 +210,17 @@ func run() -> void:
 		and brightness(off) < brightness(shadow) * 0.01
 	print("SCENE_LIGHT shadow_pixels=", changed_shadow, " moved_pixels=", changed_position,
 		" lit=", lit_pixels, " dark=", dark_pixels, " off=", brightness(off))
+	metrics["single_light"] = {"shadow_pixels": changed_shadow, "moved_pixels": changed_position,
+		"lit_pixels": lit_pixels, "dark_pixels": dark_pixels, "off_energy": brightness(off)}
+	var three_tone_ok := await check_three_tone(mat)
+	var multi_ok := await check_multiple_lights(world, mat, camera)
+	ok = ok and three_tone_ok and multi_ok
+	metrics["ok"] = ok
+	metrics["engine"] = Engine.get_version_info()["string"]
+	metrics["renderer"] = ProjectSettings.get_setting("rendering/renderer/rendering_method")
+	var report := FileAccess.open("res://metrics.json", FileAccess.WRITE)
+	report.store_string(JSON.stringify(metrics, "  "))
+	report.close()
 	print("SCENE_LIGHT_RENDER=", "OK" if ok else "FAIL")
 	quit(0 if ok else 1)
 '''
@@ -160,17 +273,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--godot', default=r'D:\godot\Godot_v4.7.2-stable_win64_console.exe')
     parser.add_argument('--prepare-only', action='store_true')
+    parser.add_argument('--renderer', choices=('gl_compatibility', 'forward_plus', 'mobile'),
+                        default='gl_compatibility', help='Actual GPU rendering backend to verify')
     parser.add_argument('--story', action='store_true')
     parser.add_argument('--project', type=Path, default=ROOT / 'examples/demo_story/恐怖闯关示例_godot')
     args = parser.parse_args()
     if args.story:
         OUT = ROOT / '_dist' / 'story_render_probe'
+    elif args.renderer != 'gl_compatibility':
+        OUT = ROOT / '_dist' / ('scene_light_probe_' + args.renderer)
     OUT.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / 'BlenderGameKit/shaders/gk_toon_lit.gdshader', OUT)
     (OUT / 'project.godot').write_text(
         'config_version=5\n[application]\nconfig/name="GK Scene Light Probe"\n'
         '[display]\nwindow/size/viewport_width=640\nwindow/size/viewport_height=480\n'
-        '[rendering]\nrenderer/rendering_method="gl_compatibility"\n', encoding='utf-8')
+        f'[rendering]\nrenderer/rendering_method="{args.renderer}"\n', encoding='utf-8')
     (OUT / 'probe.gd').write_text(PROBE, encoding='utf-8')
     if args.story:
         shutil.copytree(args.project, OUT,
@@ -190,6 +307,7 @@ def main():
             raise RuntimeError(imported.stderr.decode('utf-8', errors='replace'))
     result = subprocess.run(
         [args.godot, '--path', str(OUT), '--script', 'res://probe.gd',
+         '--rendering-method', args.renderer,
          '--resolution', '1152x648' if args.story else '640x480', '--audio-driver', 'Dummy'],
         capture_output=True, text=True, encoding='utf-8', errors='replace',
         timeout=60, env=env)

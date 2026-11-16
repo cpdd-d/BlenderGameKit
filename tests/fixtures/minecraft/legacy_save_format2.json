@@ -1,0 +1,128 @@
+{
+	"chests": {
+		"7,2,7": [
+			[
+				"apple",
+				9
+			],
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			null
+		]
+	},
+	"format": 2,
+	"inventory": [
+		[
+			"grass",
+			64
+		],
+		[
+			"stone",
+			64
+		],
+		[
+			"sand",
+			64
+		],
+		[
+			"wood",
+			64
+		],
+		[
+			"leaves",
+			64
+		],
+		[
+			"apple",
+			8
+		],
+		[
+			"sword",
+			1
+		],
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null,
+		null
+	],
+	"name": "探针存档",
+	"player": {
+		"creative": true,
+		"health": 42.0,
+		"slot": 1,
+		"third": false,
+		"x": 1.5,
+		"y": 14.0001001358032,
+		"z": 7.5
+	},
+	"time": "2026-11-12 22:47:42",
+	"world": {
+		"placed": {
+			"0,-1,2": "grass",
+			"0,0,1": "stone"
+		},
+		"removed": {
+			"0,-1,2": true,
+			"0,0,1": true,
+			"1,0,1": true
+		},
+		"trees": {}
+	},
+	"world_settings": {
+		"name": "新的世界",
+		"radius": 3,
+		"seed": "",
+		"size": 1,
+		"terrain": 2,
+		"time": 1,
+		"vegetation": 3
+	}
+}

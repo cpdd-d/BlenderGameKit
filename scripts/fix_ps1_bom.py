@@ -26,7 +26,8 @@ def fix(path):
     with io.open(path, "rb") as handle:
         raw = handle.read()
     had = raw.startswith(BOM)
-    if had:
+    # 历史编辑可能累积多个 BOM；只删一个会让 param 块被当成普通语句。
+    while raw.startswith(BOM):
         raw = raw[len(BOM):]
     try:
         text = raw.decode("utf-8")

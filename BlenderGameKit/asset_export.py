@@ -26,6 +26,8 @@ import os
 import re
 
 from . import curve_assets
+from . import exporter
+from . import file_io
 from . import generated_files
 from . import gk_log
 from . import godot_look
@@ -444,6 +446,9 @@ func _ready() -> void:
 	# 灯光光斑形状(第一百五十一轮):灯节点建好后才能挂 light_projector。
 	_gk_apply_light_projectors.call_deferred()
 	# 碰撞代理配对同理:glb 实例内部的网格节点现在还没进树,搜不到。
+	# Bind animated static Model shapes before AnimationPlayer's first tick.
+	# Deferred retry still covers nested instances not yet present at _ready.
+	_gk_link_colliders()
 	_gk_link_colliders.call_deferred()
 	# ── 运行时**新加**进场景的网格也要补材质(用户 2026-10-05)────────
 	# 『资产_创建实例』建出来的那一份,网格是 glb 实例内部的**新**节点,
@@ -1171,6 +1176,44 @@ func _physics_process(delta: float) -> void:
 ## 所以每物理帧比上一帧的变换:**谁变了就让另一边跟过去**。两边都没动
 ## 就什么都不做(地面、墙这些从来不动的完全零开销)。
 var _gk_body_links: Array = []      # [网格, 代理, 上帧网格变换, 上帧代理变换]
+var _gk_model_shape_links: Array = []  # [source, static body, shape, bind offset]
+
+
+func _gk_link_model_shapes(body: CollisionObject3D) -> void:
+	# Character/Rigid/Animatable bodies already own their motion. Only the
+	# exported static role layout may drive shapes from its animated Model.
+	if not (body is StaticBody3D) or body is AnimatableBody3D:
+		return
+	var model := body.get_node_or_null("Model") as Node3D
+	if model == null or model.find_children("*", "AnimationPlayer", true, false).is_empty():
+		return
+	var matches := model.find_children(String(body.name), "Node3D", true, false)
+	if matches.size() != 1:
+		return
+	var source := matches[0] as Node3D
+	if source == null or not source.is_inside_tree() or source is CollisionObject3D:
+		return
+	var relative := body.global_transform.affine_inverse() * source.global_transform
+	if absf(relative.basis.determinant()) < 0.000001:
+		return
+	for child in body.get_children():
+		if not (child is CollisionShape3D):
+			continue
+		var shape := child as CollisionShape3D
+		var already_linked := false
+		for pair in _gk_model_shape_links:
+			if is_instance_valid(pair[2]) and pair[2] == shape:
+				already_linked = true
+				break
+		if already_linked:
+			continue
+		# A second environment instance must reuse the same rest pose instead
+		# of rebasing after the source animation has already started moving.
+		var bind: Array = shape.get_meta("gk_model_shape_bind", [])
+		if bind.size() != 2 or not is_instance_valid(bind[0]) or bind[0] != source:
+			bind = [source, relative.affine_inverse() * shape.transform]
+			shape.set_meta("gk_model_shape_bind", bind)
+		_gk_model_shape_links.append([source, body, shape, bind[1]])
 
 
 func _gk_link_colliders() -> void:
@@ -1188,12 +1231,15 @@ func _gk_link_colliders() -> void:
 		return
 	for holder in holders:
 		for body in holder.get_children():
-			if not (body is CollisionObject3D):
+			if not (body is CollisionObject3D) or not body.is_inside_tree():
 				continue
+			_gk_link_model_shapes(body)
 			# 找**同名**的网格节点:不能在容器子树里(那里只有代理),
 			# 也不能是代理自己的祖先 / 后代(角色的网格挂在代理下面,自己会动)。
 			var mesh: Node3D = null
 			for found in tree_root.find_children(String(body.name), "Node3D", true, false):
+				if not found.is_inside_tree():
+					continue
 				if found == holder or holder.is_ancestor_of(found):
 					continue
 				if found == body or body.is_ancestor_of(found) \
@@ -1202,12 +1248,33 @@ func _gk_link_colliders() -> void:
 				mesh = found
 				break
 			if mesh != null:
+				var already_linked := false
+				for pair in _gk_body_links:
+					if is_instance_valid(pair[0]) and is_instance_valid(pair[1]) \
+							and pair[0] == mesh and pair[1] == body:
+						already_linked = true
+						break
+				if already_linked:
+					continue
 				# 后两个是"上一帧的变换":第一帧拿来和当前比,判断谁动过
 				_gk_body_links.append([mesh, body as Node3D,
 					mesh.global_transform, body.global_transform])
 
 
 func _gk_sync_colliders() -> void:
+	for pair in _gk_model_shape_links:
+		if not is_instance_valid(pair[0]) or not is_instance_valid(pair[1]) \
+				or not is_instance_valid(pair[2]):
+			continue
+		var source: Node3D = pair[0]
+		var static_body: StaticBody3D = pair[1]
+		var shape: CollisionShape3D = pair[2]
+		var relative := static_body.global_transform.affine_inverse() * source.global_transform
+		var wanted: Transform3D = relative * pair[3]
+		if not shape.transform.is_equal_approx(wanted):
+			shape.transform = wanted
+		# Leave the body and the Model hierarchy untouched: moving the body
+		# would also move its visual child and apply the animation twice.
 	for pair in _gk_body_links:
 		# ── 先查有效性,再赋给**带类型**的局部变量(用户 2026-10-05 第二十四轮)──
 		# 踩过:写成
@@ -5623,6 +5690,10 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
     restore_hidden = []
     hidden_armatures = []
     skipped = []
+    # 默认角色只解析一次:`owns()` 不传 player 时会重新扫全场找出生点标记,
+    # 逐物体调用就是 O(物体数²)(大工程 profile 里这一项占了两成)。
+    from .persistent_player import default_player, owns
+    player = default_player()
     for obj in scene.objects:
         # ── 预览物体:按**标记**和**名字前缀**双重排除(用户 2026-10-03)──
         # 用户导出后的 Godot 场景里出现了 `__GK碰撞预览__示例角色` ——
@@ -5638,7 +5709,6 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         is_marker = is_marker_object(obj)
         # 子物体碰撞块是**纯辅助物**:网格不进 glb(它在游戏里只是
         # "看不见的碰撞形状",由宿主的碰撞节点代它出现)。
-        from .persistent_player import owns
         # ── 不渲染网格(第一百五十六轮)──────────────────────────
         # `gk_physics.hide_mesh` = "这块只是判定体":网格不进 glb,
         # 但 build_scene / 碰撞体生成那条路照旧走 —— 于是它在 Godot 里
@@ -5664,7 +5734,7 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
                 obj.select_set(False)
             continue
         if (is_preview or is_marker or obj in excluded
-                or is_collision_piece(obj) or owns(obj)):
+                or is_collision_piece(obj) or owns(obj, player)):
             if not is_marker:
                 skipped.append(obj.name)
             obj.select_set(False)
@@ -5732,7 +5802,22 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
             kwargs["use_active_scene"] = True
     except Exception:                                     # noqa: BLE001
         pass
-    result = _run_gltf_export(kwargs, path)
+    # Finish collection normalization in staging, before comparing/publishing.
+    # Otherwise each unchanged export would replace the normalized destination
+    # with Blender's raw bytes, and then rewrite it a second time.
+    def finish_scene(staged):
+        _changed, kept, note = flatten_scene_glb(
+            staged, str(getattr(scene.collection, "name", "") or ""))
+        if note:
+            raise RuntimeError(note)
+        if kept:
+            export_scene_glb.last_notes.append(
+                "有集合和导出生成的分组重名,已保留『Scene Collection』前缀:"
+                + "、".join(f"『{name}』" for name in kept)
+                + "(重名的就是碰撞 / 粒子 / 环境 / 导航 / 遮挡这几类节点;"
+                "想让它们也直接出现在场景根下,把集合改个名再导出即可)")
+
+    result = _run_gltf_export(kwargs, path, postprocess=finish_scene)
 
     # 隐藏骨架 -> 明确告警(同 export_subtree_glb)
     note = _hidden_armature_warning(hidden_armatures)
@@ -5766,22 +5851,6 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
         except Exception:
             pass
 
-    # ── 集合层级(第一百零二轮):把 glb 里"场景根集合"那一层展平 ───────
-    # 只在导出成功时做。`scene.collection.name` 就是 Blender 场景根集合的
-    # 数据名(不随界面语言变),按它找那一层 —— 找不到(老版本 Blender
-    # 降级成了扁平导出)就什么都不做,不会有任何误伤。
-    if result[1]:
-        _changed, kept, note = flatten_scene_glb(
-            path, str(getattr(scene.collection, "name", "") or ""))
-        if note:
-            export_scene_glb.last_notes.append(note)
-        if kept:
-            export_scene_glb.last_notes.append(
-                "有集合和导出生成的分组重名,已保留『Scene Collection』前缀:"
-                + "、".join(f"『{name}』" for name in kept)
-                + "(重名的就是碰撞 / 粒子 / 环境 / 导航 / 遮挡这几类节点;"
-                "想让它们也直接出现在场景根下,把集合改个名再导出即可)")
-
     if result[1] and skipped:
         return result[0], True, (f"已导出 {os.path.basename(path)}"
                                  f"（已排除 {len(skipped)} 个碰撞预览）")
@@ -5789,14 +5858,79 @@ def export_scene_glb(export_dir, name="World", scene=None, exclude=None):
 
 
 @godot_material_preview.suspend()
-def _run_gltf_export(kwargs, path):
+def _run_gltf_export(kwargs, path, postprocess=None):
+    """Publish a complete GLB only when its final bytes changed.
+
+    Keep the last usable model if Blender cancels, fails or writes an incomplete
+    file. The postprocessor runs before publication so normalized scene GLBs
+    receive the same no-write guarantee as standalone models.
+    """
+    try:
+        with file_io.staged_output(path) as staged:
+            working = dict(kwargs, filepath=staged)
+            _file, ok, message = _invoke_gltf_export(working, staged)
+            if not ok:
+                raise RuntimeError(message)
+            _validate_glb_output(staged)
+            if postprocess is not None:
+                postprocess(staged)
+                _validate_glb_output(staged)
+        return path, True, f"已导出 {os.path.basename(path)}"
+    except Exception as exc:
+        return path, False, f"导出失败: {exc}"
+
+
+def _validate_glb_output(path):
+    """Check container boundaries before replacing a previously valid model."""
+    import json
+    import struct
+
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        header = handle.read(12)
+        if len(header) != 12:
+            raise ValueError("GLB 文件不完整:缺少文件头")
+        magic, version, total = struct.unpack("<III", header)
+        if magic != 0x46546C67 or version != 2 or total != size:
+            raise ValueError("GLB 文件头或长度无效")
+        offset = 12
+        chunks = 0
+        while offset < size:
+            chunk_header = handle.read(8)
+            if len(chunk_header) != 8:
+                raise ValueError("GLB 块头不完整")
+            length, kind = struct.unpack("<II", chunk_header)
+            offset += 8
+            if length % 4 or offset + length > size:
+                raise ValueError("GLB 块长度无效")
+            if chunks == 0:
+                if kind != 0x4E4F534A:
+                    raise ValueError("GLB 缺少首个 JSON 块")
+                payload = json.loads(handle.read(length).decode("utf-8"))
+                if not isinstance(payload, dict) or payload.get("asset", {}).get("version") != "2.0":
+                    raise ValueError("GLB 资产版本无效")
+            else:
+                handle.seek(length, os.SEEK_CUR)
+            offset += length
+            chunks += 1
+        if not chunks:
+            raise ValueError("GLB 没有资产数据")
+
+
+def _invoke_gltf_export(kwargs, path):
     """跑 glTF 导出,参数名不兼容时逐个降级重试。"""
     import bpy
 
     working = dict(kwargs)
     for _ in range(12):
         try:
-            bpy.ops.export_scene.gltf(**working)
+            # A prior failed attempt may have left a partial file. An operator
+            # returning FINISHED without writing must never reuse that file.
+            if os.path.isfile(path):
+                os.unlink(path)
+            status = bpy.ops.export_scene.gltf(**working)
+            if status != {"FINISHED"}:
+                return path, False, "导出命令未完成或已取消"
             if os.path.isfile(path):
                 return path, True, f"已导出 {os.path.basename(path)}"
             return path, False, "导出命令执行了，但文件没生成"
@@ -5832,7 +5966,7 @@ def _run_gltf_export(kwargs, path):
                 dropped = "export_animations"
             if dropped is None:
                 return path, False, f"导出失败: {message}"
-            working.pop(dropped, None)
+            working[dropped] = False
             notes = getattr(_run_gltf_export, "_notes", None)
             if notes is None:
                 notes = []
@@ -6374,8 +6508,7 @@ def export_main_ui(directory, dimension="3"):
     scripts_dir = os.path.join(directory, project.SCRIPTS_DIR)
     os.makedirs(scripts_dir, exist_ok=True)
     path = os.path.join(scripts_dir, node_lib.MAIN_UI_SCRIPT)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(generated.code)
+    exporter.write_text(path, generated.code)
     result["written"].append(path)
     result["script_name"] = node_lib.MAIN_UI_SCRIPT
 
@@ -7012,7 +7145,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                       dimension="3", script_name=None, script_target_name=None,
                       materials_map=None, character_model=None, file_names=None,
                       character_object=None, asset_models=None,
-                      world_script_name=None):
+                      world_script_name=None, role_scripts=None, role_models=None):
     """生成主场景:模型 + 卡通材质 + 碰撞体 + 相机灯光。返回 (路径, 碰撞体数量)。
 
     结构(3D):
@@ -7049,6 +7182,9 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
 
     materials_map: {对象名: (材质资源名, materials/ 下的文件名)}
 
+    role_scripts / role_models: 多宿主模式下的 {Blender 对象名: 文件名}。
+        每个宿主只引用自己的脚本与模型；共享逻辑图仍按各实例绑定分别编译。
+
     character_model: 角色自己的 glb 名(不含 .glb)。给了的话,脚本挂载目标
         会在场景里生成一个**自带网格**的节点:
 
@@ -7080,8 +7216,14 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     mesh_info = info.get("meshes", {})
     has_character_model = bool(character_model) and os.path.isfile(
         os.path.join(export_dir, project.ART_DIR, f"{character_model}.glb"))
+    role_scripts = dict(role_scripts or {})
+    role_models = dict(role_models or {})
+    available_role_models = {
+        name: model for name, model in role_models.items()
+        if os.path.isfile(os.path.join(export_dir, project.ART_DIR, f"{model}.glb"))}
     from .persistent_player import default_player
-    if not mesh_info and not has_character_model and default_player() is None:
+    if (not mesh_info and not has_character_model and not available_role_models
+            and default_player() is None):
         return None, 0
 
     # glb 实例本身
@@ -7097,6 +7239,19 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         ext_lines.append(f'[ext_resource type="Script" '
                          f'path="res://{project.SCRIPTS_DIR}/{script_name}" '
                          f'id="{script_id}"]')
+
+    role_script_ids = {}
+    role_model_ids = {}
+    for index, (object_name, filename) in enumerate(sorted(role_scripts.items())):
+        resource_id = f"gk_role_script_{index}"
+        role_script_ids[object_name] = resource_id
+        ext_lines.append(f'[ext_resource type="Script" '
+                         f'path="res://{project.SCRIPTS_DIR}/{filename}" id="{resource_id}"]')
+    for index, (object_name, model) in enumerate(sorted(available_role_models.items())):
+        resource_id = f"gk_role_model_{index}"
+        role_model_ids[object_name] = resource_id
+        ext_lines.append(f'[ext_resource type="PackedScene" '
+                         f'path="res://{project.ART_DIR}/{model}.glb" id="{resource_id}"]')
 
     # 世界/关卡逻辑脚本(第一百一十九轮):挂在场景根节点上,和角色脚本分开。
     use_world_script = bool(world_script_name)
@@ -7367,6 +7522,18 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                 if entry:
                     material_files[node_name] = entry[1]
 
+    # Each role owns a separate model subtree; include all its surfaces in the
+    # runtime material map even though they were removed from the world GLB.
+    for object_name, model in available_role_models.items():
+        model_meshes = glb_scene_nodes(export_dir, model).get("meshes", {})
+        for obj in getattr(scene, "objects", ()):
+            if obj.name in model_meshes or _sanitize_node_name(obj.name) in model_meshes:
+                per_surface = surface_material_files(obj, file_names)
+                if per_surface:
+                    material_files.update(per_surface)
+                elif obj.name in (materials_map or {}):
+                    material_files[_sanitize_node_name(obj.name)] = materials_map[obj.name][1]
+
     # ── 静态资产的材质(用户 2026-10-05;实测漏过一次,别再删)─────────
     # 资产的网格在**自己的 glb** 里(世界 glb 刻意不含它们 —— 否则网格
     # 会出现两份),所以上面那个按 `obj.name in mesh_info` 过滤的循环
@@ -7394,8 +7561,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
     for relative, content in (env_files or {}).items():
         target = os.path.join(export_dir, relative)
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
+        exporter.write_text(target, content)
 
     # ---- 关卡父级(第一百二十四轮):分组节点必须先声明,子节点才挂得上 ----
     # 组节点**不写 transform**(留单位变换):下面每个物理体的 transform 是
@@ -7438,7 +7604,13 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             # 网格跟着节点动(碰撞代理不再是"孤儿"),而且**一个模型只导一次**。
             model_glb = None
             model_id = ""
-            if use_script and use_character_model \
+            body_script_id = role_script_ids.get(obj.name)
+            if body_script_id is None and use_script and getattr(physics, "script_target", False):
+                body_script_id = script_id
+            if obj.name in role_model_ids:
+                model_glb = available_role_models[obj.name]
+                model_id = role_model_ids[obj.name]
+            elif use_script and use_character_model \
                     and getattr(physics, "script_target", False):
                 model_glb = character_model
                 model_id = "1_character"
@@ -7478,7 +7650,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                              f"{_fmt(position[0])}, {_fmt(position[1])}, "
                              f"{_fmt(position[2])})")
                 # 脚本只挂在**脚本挂载目标**上(资产实例不挂游戏逻辑脚本)
-                if use_script and getattr(physics, "script_target", False):
+                if body_script_id:
                     # ── 脚本**必须挂在这里**(血泪教训,别删)────────────────
                     # 角色场景(胡桃_mesh.tscn)的根节点上也挂着同一个脚本,
                     # 看起来像"挂了两遍",所以曾经把这一行删掉过 ——
@@ -7501,7 +7673,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
                     # 并在生成物里说明。要彻底解决得让角色场景不再挂脚本
                     # (那样角色场景单独打开就不能跑了)——
                     # 取舍见 docs/蓝图化总清单.md。
-                    lines.append(f'script = ExtResource("{script_id}")')
+                    lines.append(f'script = ExtResource("{body_script_id}")')
                 # ── 碰撞层/掩码属于 **body**(不是 shape)──────────────────
                 # 以前写在 Collision 子节点上 —— CollisionShape3D 根本没这
                 # 两个属性,Godot 会忽略:用户设的『第 2 层』从来没生效过。
@@ -7569,8 +7741,8 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
             lines.append(f"transform = Transform3D({basis}, "
                          f"{_fmt(position[0])}, {_fmt(position[1])}, "
                          f"{_fmt(position[2])})")
-            if use_script and getattr(physics, "script_target", False):
-                lines.append(f'script = ExtResource("{script_id}")')
+            if body_script_id:
+                lines.append(f'script = ExtResource("{body_script_id}")')
             # 碰撞层/掩码属于 **body**(不是 shape,写在 shape 上会被 Godot
             # 忽略 —— 用户设的层从来没生效过;本轮修掉)
             layer = built["layer"]
@@ -7646,8 +7818,7 @@ def write_world_scene(export_dir, scene_name="World", scene=None,
         lines.append(occ_node)
         lines.append("")
 
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines))
+    exporter.write_text(path, "\n".join(lines))
 
     project.set_main_scene(export_dir, f"{project.SCENES_DIR}/{scene_name}.tscn")
     return path, len(bodies)
@@ -7915,11 +8086,12 @@ def build_environment_nodes(scene, is_3d=True, skip=None, scene_name="World",
     fov_for_env = 0.0
     from .exporter import resolve_main_camera
     main_camera, _reason = resolve_main_camera(scene)
+    from .persistent_player import default_player, owns
+    player = default_player()
     for obj in scene.objects:
         if obj.type != "CAMERA" or obj.hide_get():
             continue
-        from .persistent_player import owns
-        if owns(obj):
+        if owns(obj, player):
             continue
         position = _godot_position(obj, True)
         # 换算成垂直视场角(失败时退回 70 —— 至少别把画面弄坏;
@@ -8313,11 +8485,17 @@ def _collect_lights(scene):
     的类型(面积光等)也不导 —— 面板上会红字提示换太阳 / 点光 / 聚光。
     """
     lights = []
+    from .persistent_player import default_player, owns
+    player = None
+    resolved = False
     for obj in getattr(scene, "objects", ()) or ():
         if getattr(obj, "type", "") != "LIGHT" or obj.hide_get():
             continue
-        from .persistent_player import owns
-        if owns(obj):
+        # 没有灯的场景不该为了这个函数白扫一遍默认角色(2D 关卡常见)。
+        if not resolved:
+            player = default_player()
+            resolved = True
+        if owns(obj, player):
             continue
         if _light_node_text(obj) is None:
             continue
@@ -9767,8 +9945,20 @@ def _png_rgba_bytes(size, raw):
             + chunk(b"IEND", b""))
 
 
+_MOON_TEXTURE_CACHE = []
+
+
 def moon_texture_png():
-    """一张带月海 / 环形山的月面纹理(确定性,每次导出同一张图)。"""
+    """一张带月海 / 环形山的月面纹理(确定性,每次导出同一张图)。
+
+    ── 缓存(实测热点)──────────────────────────────────────────────
+    一次导出会分几个阶段各要一次月面纹理(天空盒 / 环境脚本 / 预览),
+    但内容是**确定性**的:同样的 128×128、同样的环形山。原来每次调用
+    都重算 + 重压缩,真机 profile 里占了导出总时长的 45%。这里和
+    `cloud_texture_pixels` 一样缓存 PNG 字节,进程内只生成一次。
+    """
+    if _MOON_TEXTURE_CACHE:
+        return _MOON_TEXTURE_CACHE[0]
     size = 128
     raw = bytearray()
     for y in range(size):
@@ -9782,9 +9972,12 @@ def moon_texture_png():
             value = 0.88 - 0.16 * _cookie_smooth(0.52, 0.78, n)
             # 环形山:深色坑底 + 一圈略亮的坑缘
             for cx, cy, radius, depth in _MOON_CRATERS:
-                dist = math.hypot(u - cx, v - cy)
-                if dist >= radius:
+                dx, dy = u - cx, v - cy
+                # 先用平方距离排除坑外像素 —— 坑外本来就不改 value,
+                # 结果与逐个开方完全一致,只是省掉绝大多数 hypot。
+                if dx * dx + dy * dy >= radius * radius:
                     continue
+                dist = math.hypot(dx, dy)
                 inner = 1.0 - dist / radius
                 value -= depth * inner * inner
                 rim = abs(dist - radius * 0.86) / max(radius * 0.14, 0.001)
@@ -9793,7 +9986,9 @@ def moon_texture_png():
             value = max(0.20, min(1.0, value))
             level = int(round(255 * value))
             raw += bytes((level, level, min(255, level + 6), 255))
-    return _png_rgba_bytes(size, raw)
+    png = _png_rgba_bytes(size, raw)
+    _MOON_TEXTURE_CACHE.append(png)
+    return _MOON_TEXTURE_CACHE[0]
 
 
 def ensure_moon_texture(export_dir):
@@ -10451,9 +10646,8 @@ def write_cull_shader(export_dir, shader_res_dir="shaders", scene_lit=False):
     target = os.path.join(export_dir, shader_res_dir,
                           "gk_toon_lit_cull.gdshader" if scene_lit else CULL_SHADER_NAME)
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text.replace("cull_disabled;", "cull_back;", 1)
-                     if scene_lit else cull_shader_source(text))
+    exporter.write_text(target, text.replace("cull_disabled;", "cull_back;", 1)
+                        if scene_lit else cull_shader_source(text))
     return target
 
 
@@ -10590,8 +10784,7 @@ def write_npr_material(export_dir, material, shader_res_dir="shaders",
 
     path = os.path.join(export_dir, "materials", f"{name}.tres")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines) + "\n")
+    exporter.write_text(path, "\n".join(lines) + "\n")
     return path, len(params)
 
 
@@ -10792,8 +10985,7 @@ def write_materials(export_dir, objects, shader_res_dir="shaders", prefix=""):
                 continue
             path = os.path.join(export_dir, project.MATERIALS_DIR, f"{name}.tres")
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(text)
+            exporter.write_text(path, text)
             text_cache[key] = path
             written.append((material.name, path, bool(texture)))
     return written
@@ -10975,21 +11167,26 @@ def _save_image(image, path):
     """
     import bpy
 
-    try:
-        image.save_render(path)
-        return
-    except Exception:
-        pass
     scene = getattr(bpy.context, "scene", None)
     settings = scene.render.image_settings if scene is not None else None
     old_format = getattr(settings, "file_format", None)
-    if settings is not None:
-        settings.file_format = "PNG"
+    old_image_path = image.filepath_raw
+    old_image_format = image.file_format
     try:
-        image.filepath_raw = path
-        image.file_format = "PNG"
-        image.save()
+        # save_render uses the scene's output format, even for a .png filename.
+        # Set it before both paths, and never leave an image pointing at output.
+        if settings is not None:
+            settings.file_format = "PNG"
+        with file_io.staged_output(path) as staged:
+            try:
+                image.save_render(staged)
+            except Exception:
+                image.filepath_raw = staged
+                image.file_format = "PNG"
+                image.save()
     finally:
+        image.filepath_raw = old_image_path
+        image.file_format = old_image_format
         if settings is not None and old_format is not None:
             settings.file_format = old_format
 
@@ -11542,7 +11739,8 @@ def _base_class_for(scene, obj, dimension="3"):
 
 @godot_material_preview.suspend()
 def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
-                           scene_name="World", world_script_name=None):
+                           scene_name="World", world_script_name=None,
+                           role_scripts=None, role_models=None):
     """完整的资产导出流程:整场景 glb -> 材质 -> 包装场景 -> 角色场景。
 
     返回一个结果字典,不抛异常(出错时把错误放进 "error"),
@@ -11571,13 +11769,27 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         return result
 
     is_3d = str(dimension) != "2"
+    per_object = role_scripts is not None
+    role_scripts = dict(role_scripts or {})
+    role_models = dict(role_models or {})
+    role_objects = {obj.name: obj for obj in getattr(scene, "objects", ())
+                    if obj.name in role_scripts}
+    if per_object:
+        for name in role_scripts:
+            obj = role_objects.get(name)
+            physics = getattr(obj, "gk_physics", None)
+            if (obj is None or getattr(obj, "type", "") != "MESH"
+                    or physics is None or not getattr(physics, "enabled", True)
+                    or build_collision(obj, is_3d, physics) is None):
+                result["error"] = f"角色脚本宿主『{name}』没有可导出的网格碰撞体"
+                return result
 
     # ---- 0) 先找脚本挂载目标 ----
     # 必须最先做:它决定"角色是谁",而角色的网格要从 World.glb 里排除掉
     # (否则两份网格重叠 -> 深度冲突 -> 模型一闪一闪)。
     script_target = None
     for obj, physics, enabled in collect_physics(scene):
-        if enabled and physics is not None and \
+        if not per_object and enabled and physics is not None and \
                 getattr(physics, "script_target", False):
             script_target = obj
             break
@@ -11586,7 +11798,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     # 不勾的话导出的场景**一个脚本都不会挂** —— 用户按 F5 看到角色不动,
     # 会以为插件坏了。实测踩过:导出看起来全成功(文件都写了、无报错),
     # 但 .tscn 里根本没有 script = 那一行。
-    if script_name and script_target is None:
+    if script_name and script_target is None and not per_object:
         result["warnings"].append(
             "脚本没有挂到任何节点上:请在物体的『游戏物理 (BlenderGameKit)』"
             "面板里勾上『脚本挂载目标』(一般选角色身体那一个),再导出一次。"
@@ -11611,6 +11823,17 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         return _scene_prefix(scene_name) + base
 
     char_model = None
+    for name, obj in role_objects.items():
+        # The hash distinguishes names that normalize to the same ASCII stem.
+        token = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+        model = role_models.get(name) or (
+            f"{_scene_prefix(scene_name)}role_{safe_name(name, 'object')}_{token}")
+        path, ok, message = export_subtree_glb(directory, model, [obj], scene=scene)
+        if not ok or not path:
+            result["error"] = f"角色『{name}』模型导出失败: {message}"
+            return result
+        role_models[name] = model
+        result["written"].append(path)
     if script_target is not None:
         char_model = _char_glb_name()
         char_path, char_ok, char_msg = export_subtree_glb(
@@ -11647,7 +11870,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         model = asset_model_name(name, scene_name)
         path, ok, message = export_subtree_glb(directory, model,
                                                [entry["source"]],
-                                               scene=scene)
+                                               scene=scene,
+                                               root_at_origin=True)
         if ok:
             result["written"].append(path)
             asset_models[name] = model
@@ -11662,6 +11886,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     # 排除表 = 角色(有自己的 glb)+ 全部资产物体(本体和实例都有 Model 子节点)
     #          + 勾了『不显示本体网格』的粒子发射器(它只当标记,网格不该出现)
     excluded = []
+    excluded.extend(role_objects.values())
     if script_target is not None and char_model:
         excluded.append(script_target)
     excluded.extend(asset_objects)
@@ -11679,6 +11904,9 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
         # 结果是"导出失败"这件事本身又把插件搞崩一次,用户看到的是
         # 一堆看不懂的 Python traceback,而不是"导出失败了,原因是…"。
         result["warnings"].append(f"整场景导出失败: {world_message}")
+        if per_object:
+            result["error"] = f"整场景导出失败: {world_message}"
+            return result
 
     # ── 集合层级的提示(第一百零二轮)────────────────────────────────
     # 整场景导出会把 Blender 的集合树写进 glb,再把"场景根集合"那一层
@@ -11697,6 +11925,7 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     # scene_materials —— 两边各算一次的话,重名材质(M MD 模型动辄几十个
     # 槽)会算出互相对不上的文件名,运行时按名字找不到文件。
     materials_map = scene_materials(scene)
+    by_material = {}
     try:
         # 多场景导出:材质文件名带场景前缀 —— 不带的话两关都写
         # `material_4.tres` 之类,后导的把前一份覆盖掉,用户看到的是
@@ -11756,6 +11985,9 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     except OSError as exc:
         result["warnings"].append(f"材质生成失败: {exc}")
         materials_map = {}
+        if per_object:
+            result["error"] = f"材质生成失败: {exc}"
+            return result
 
     # ── 调试面板只支持 3D(第二十二轮)──────────────────────────────────
     # 面板在**环境脚本**里,而环境脚本目前只给 3D 项目生成(见
@@ -11810,6 +12042,8 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
             character_object=script_target,
             asset_models=asset_models,
             world_script_name=world_script_name,
+            **({"role_scripts": role_scripts, "role_models": role_models}
+               if per_object else {}),
         )
         result["written"].append(world_scene)
         # 环境脚本也是这次导出的产物(写在 write_world_scene 里),
@@ -11843,8 +12077,13 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
             result["warnings"].append(
                 "场景里除了角色没有别的网格 —— 没生成主场景 .tscn"
                 "(放个地面 / 场景道具再导出,Godot 里按 F5 才有东西可看)")
+            if per_object:
+                result["error"] = "多宿主场景未生成主场景 .tscn"
+                return result
     except OSError as exc:
         result["warnings"].append(f"包装场景生成失败: {exc}")
+        if per_object:
+            result["error"] = f"包装场景生成失败: {exc}"
         return result
 
     # ---- 3b) 开局 BGM 的音频文件(第七十七轮)--------------------------
@@ -11888,6 +12127,27 @@ def export_assets_pipeline(scene, directory, dimension="3", script_name=None,
     # 所以主场景回到 World —— 打开就能看到地面和整个场景。
     #
     # 角色场景保留:它的用途是"只调试角色一个人",不再抢主场景。
+    if per_object:
+        result["role_models"] = role_models
+        result["role_scenes"] = {}
+        for name, obj in role_objects.items():
+            model = role_models[name]
+            try:
+                role_scene, _cam, _light = write_character_scene(
+                    directory, root_name=model,
+                    base_class=_base_class_for(scene, obj, dimension),
+                    model_name=model, script_name=role_scripts[name],
+                    bounds=object_bounds([obj]), dimension=dimension, scene=scene,
+                    materials_map=materials_map, file_names=by_material,
+                    character_object=obj, set_as_main=False)
+                result["role_scenes"][name] = role_scene
+                result["written"].append(role_scene)
+                role_env = os.path.join(directory, env_script_rel(model))
+                if os.path.isfile(role_env):
+                    result["written"].append(role_env)
+            except OSError as exc:
+                result["error"] = f"角色『{name}』场景生成失败: {exc}"
+                return result
     if script_name and script_target is not None:
         bounds = object_bounds([script_target])
         try:
@@ -12074,14 +12334,10 @@ def export_all_scenes(directory, dimension=None, script_name=None):
     used_class_names = {}
 
     from . import persistent_player
-    try:
-        player_result = persistent_player.export(directory)
-        merged["written"].extend(player_result.get("written", []))
-        merged["warnings"].extend(player_result.get("warnings", []))
-    except Exception as exc:
-        merged["error"] = f"默认角色导出失败: {exc}"
-        return merged
-
+    # Compile every planned script before publishing any scene. A valid role
+    # must not overwrite its previous script when a later role/level has errors.
+    # Store the exact settings used by preflight for the publication pass.
+    plans = []
     for scene in scenes:
         # 见 _activate_scene:不切的话第二关的物体会选不中,glTF 算子也
         # 会去导"当前这一关"的东西。
@@ -12111,13 +12367,74 @@ def export_all_scenes(directory, dimension=None, script_name=None):
         entry["tree_reason"] = why
         # ── 物体级"角色逻辑图"(第一百一十九轮)────────────────────────
         # 勾了『挂游戏逻辑脚本』又填了『角色逻辑图』的物体,各导一份独立
-        # 脚本挂自己 —— 和场景图(关卡/世界逻辑)分开。这里只取**第一个**
-        # 脚本宿主(script_target 本来就是"唯一挂脚本的物体"这个约定)。
+        # 脚本挂自己 —— 和场景图(关卡/世界逻辑)分开。
+        # 多宿主走对象名映射；零/单宿主继续使用原有导出路径。
         object_trees = exporter.object_logic_trees(scene)
+        multi_roles = len(object_trees) > 1
+        role_scripts = {} if multi_roles else None
+        role_error = ""
         char_obj, char_tree, _char_reason = (
             object_trees[0] if object_trees else (None, None, ""))
         world_script_name = None
-        if char_tree is not None:
+        jobs = []
+
+        def plan_script(logic_tree, options, write_scene=False):
+            preview_options = dict(options, dry_run=True)
+            result = exporter.export_tree(logic_tree, preview_options, write_scene=False)
+            preview = {key: list(result.get(key) or [])
+                       for key in ("warnings", "diagnostics", "notes")}
+            jobs.append((logic_tree, dict(options), preview))
+            return result
+
+        def collect_role_result(outcome):
+            entry["warnings"].extend(outcome.get("warnings", []))
+            entry.setdefault("input_actions", []).extend(outcome.get("input_actions") or [])
+            entry.setdefault("diagnostics", []).extend(outcome.get("diagnostics") or [])
+            entry.setdefault("notes", []).extend(outcome.get("notes") or [])
+            if outcome.get("ok") is not True:
+                raise RuntimeError(outcome.get("error") or "脚本导出未成功")
+            filename = outcome.get("script_name")
+            if not filename:
+                raise RuntimeError("脚本导出没有返回文件名")
+            return filename
+
+        if multi_roles:
+            tree_script = None
+            role_settings = exporter.build_settings(scene)
+            role_settings.update(output_dir=directory, dimension=scene_dimension,
+                                 class_name="", per_object_scripts=True)
+
+            for obj, role_tree, reason in sorted(object_trees, key=lambda item: item[0].name):
+                try:
+                    if role_tree is None:
+                        raise ValueError(reason or "未找到角色逻辑图")
+                    local_settings = dict(role_settings)
+                    token = hashlib.sha1(obj.name.encode("utf-8")).hexdigest()[:10]
+                    local_settings.update(
+                        base_class=_base_class_for(scene, obj, scene_dimension),
+                        node_name=obj.name,
+                        reference_bindings=exporter.object_reference_bindings(obj, scene),
+                        script_name=f"game_logic_{scene_name}_role_{safe_name(obj.name, 'object')}_{token}.gd")
+                    role_scripts[obj.name] = collect_role_result(plan_script(
+                        role_tree, local_settings, write_scene=False))
+                except Exception as exc:
+                    role_error = f"角色『{obj.name}』导出失败: {type(exc).__name__}: {exc}"
+                    break
+            if not role_error and tree is not None:
+                try:
+                    level_settings = dict(role_settings)
+                    level_settings.update(
+                        base_class="Node2D" if scene_dimension == "2" else "Node3D",
+                        reference_bindings={},
+                        script_name=f"game_logic_{scene_name}_level.gd")
+                    world_script_name = collect_role_result(plan_script(
+                        tree, level_settings, write_scene=False))
+                except Exception as exc:
+                    role_error = f"关卡『{scene.name}』导出失败: {type(exc).__name__}: {exc}"
+            entry["role_scripts"] = dict(role_scripts)
+            entry["world_script_name"] = world_script_name or ""
+            entry["script_name"] = world_script_name or ""
+        elif char_tree is not None:
             entry.setdefault("notes", []).append(
                 f"『{char_obj.name}』挂了角色逻辑图『{char_tree.name}』;"
                 f"场景图退居关卡/世界逻辑(挂场景根)")
@@ -12126,7 +12443,7 @@ def export_all_scenes(directory, dimension=None, script_name=None):
         # Godot 打开就报 "Failed loading resource"(实测踩过)。
         script_missing = bool(tree_script) and not os.path.isfile(
             os.path.join(directory, project.SCRIPTS_DIR, str(tree_script)))
-        if tree is None and char_tree is not None and char_obj is not None:
+        if not multi_roles and tree is None and char_tree is not None and char_obj is not None:
             char_settings = exporter.build_settings(scene)
             char_settings["output_dir"] = directory
             char_settings["dimension"] = scene_dimension
@@ -12135,20 +12452,14 @@ def export_all_scenes(directory, dimension=None, script_name=None):
             char_settings["script_name"] = (
                 f"game_logic_{scene_name}_{safe_name(char_obj.name, 'char')}.gd")
             try:
-                char_result = exporter.export_tree(
+                char_result = plan_script(
                     char_tree, char_settings, write_scene=False)
-                tree_script = char_result.get("script_name") or None
-                entry["script_name"] = tree_script or ""
-                entry["input_actions"] = list(
-                    char_result.get("input_actions") or [])
-                entry["warnings"].extend(char_result.get("warnings", []))
-                entry.setdefault("written", []).extend(
-                    p for p in char_result.get("written", []) if p)
+                tree_script = collect_role_result(char_result)
+                entry["script_name"] = tree_script
             except Exception as exc:                    # noqa: BLE001
-                entry["warnings"].append(
-                    f"『{char_obj.name}』的角色逻辑图导出失败:"
-                    f"{type(exc).__name__}: {exc}")
-        if tree is not None and (multi or not tree_script or script_missing
+                role_error = (f"『{char_obj.name}』的角色逻辑图导出失败:"
+                              f"{type(exc).__name__}: {exc}")
+        if not multi_roles and tree is not None and (multi or not tree_script or script_missing
                                  or char_tree is not None):
             scene_settings = exporter.build_settings(scene)
             scene_settings["output_dir"] = directory
@@ -12183,19 +12494,13 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                     f"game_logic_{scene_name}_"
                     f"{safe_name(char_obj.name, 'char')}.gd")
                 try:
-                    char_result = exporter.export_tree(
+                    char_result = plan_script(
                         char_tree, char_settings, write_scene=False)
-                    tree_script = char_result.get("script_name") or None
-                    entry["script_name"] = tree_script or ""
-                    for actions in (char_result.get("input_actions") or []):
-                        entry.setdefault("input_actions", []).append(actions)
-                    entry["warnings"].extend(char_result.get("warnings", []))
-                    entry.setdefault("written", []).extend(
-                        p for p in char_result.get("written", []) if p)
+                    tree_script = collect_role_result(char_result)
+                    entry["script_name"] = tree_script
                 except Exception as exc:                    # noqa: BLE001
-                    entry["warnings"].append(
-                        f"『{char_obj.name}』的角色逻辑图导出失败:"
-                        f"{type(exc).__name__}: {exc}")
+                    role_error = (f"『{char_obj.name}』的角色逻辑图导出失败:"
+                                  f"{type(exc).__name__}: {exc}")
                 # ── 场景图:关卡/世界逻辑,挂场景根(extends Node3D)──────
                 # ⚠ `tree` **可能是 None**(这一关的场景图没解析出来 ——
                 #   比如它被认成了角色图)。这时绝不能照样 `export_tree(None)`:
@@ -12205,7 +12510,7 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                 #   打开一看头部写着"节点树: 标题逻辑" —— 三关的场景根都挂着
                 #   标题页的逻辑,而那三关真正的逻辑在各自的 `_char.gd` 里
                 #   (角色图)。没图的这一路**什么都不导**才是对的。
-                if tree is not None:
+                if not role_error and tree is not None:
                     level_settings = dict(scene_settings)
                     level_settings["base_class"] = (
                         "Node2D" if scene_dimension == "2" else "Node3D")
@@ -12214,21 +12519,12 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                         f"game_logic_{scene_name}.gd"
                         if multi else f"game_logic_{scene_name}_level.gd")
                     try:
-                        level_result = exporter.export_tree(
+                        level_result = plan_script(
                             tree, level_settings, write_scene=False)
-                        world_script_name = level_result.get("script_name") or None
-                        entry["warnings"].extend(level_result.get("warnings", []))
-                        # 输入映射也要并(第一百二十轮踩到):关卡图里的 F 键等动作
-                        # 不并进来,project.godot 的 [input] 就没有这个 action,
-                        # Godot 每帧报 "action doesn't exist"(手电开关直接失效)。
-                        for actions in (level_result.get("input_actions") or []):
-                            entry.setdefault("input_actions", []).append(actions)
-                        entry.setdefault("written", []).extend(
-                            p for p in level_result.get("written", []) if p)
+                        world_script_name = collect_role_result(level_result)
                     except Exception as exc:                    # noqa: BLE001
-                        entry["warnings"].append(
-                            f"『{scene.name}』的关卡逻辑图导出失败:"
-                            f"{type(exc).__name__}: {exc}")
+                        role_error = (f"『{scene.name}』的关卡逻辑图导出失败:"
+                                      f"{type(exc).__name__}: {exc}")
             else:
                 level_only = (exporter.logic_tree_scope(tree) == "LEVEL"
                               and callable(getattr(tree, "is_property_set", None))
@@ -12237,36 +12533,90 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                     scene_settings["base_class"] = (
                         "Node2D" if scene_dimension == "2" else "Node3D")
                 try:
-                    tree_result = exporter.export_tree(tree, scene_settings,
+                    tree_result = plan_script(tree, scene_settings,
                                                        write_scene=False)
-                    tree_script = tree_result.get("script_name") or None
+                    tree_script = collect_role_result(tree_result)
                     if level_only:
                         world_script_name, tree_script = tree_script, None
                         entry["script_name"] = world_script_name or ""
                     else:
                         entry["script_name"] = tree_script or ""
-                    entry["input_actions"] = list(
-                        tree_result.get("input_actions", []) or [])
-                    entry["warnings"].extend(tree_result.get("warnings", []))
-                    # 这次导出写出来的东西(脚本 / 曲线资源)也要记账:
-                    # 详见 generated_files —— 脚本漏记的话,下一轮清理会把它
-                    # 当成"旧文件"删掉(自毁)。
-                    # ⚠ `entry` 这时还没有 "written" 键(它在下面流水线之后才建),
-                    # 直接 entry["written"].extend 会 KeyError:'written' ——
-                    # 而且被外面的 except 吞成一句"逻辑图导出失败"(实测踩过)。
-                    entry.setdefault("written", []).extend(
-                        p for p in tree_result.get("written", []) if p)
                 except Exception as exc:                    # noqa: BLE001
-                    entry["warnings"].append(
-                        f"『{scene.name}』的逻辑图导出失败:"
-                        f"{type(exc).__name__}: {exc}")
+                    role_error = (f"『{scene.name}』的逻辑图导出失败:"
+                                  f"{type(exc).__name__}: {exc}")
         elif multi and tree is None and char_tree is None:
             entry["warnings"].append(
                 f"『{scene.name}』没有可用的游戏逻辑图:{why}")
 
-        outcome = export_assets_pipeline(
-            scene, directory, dimension=scene_dimension, script_name=tree_script,
-            scene_name=scene_name, world_script_name=world_script_name)
+        if role_error:
+            entry["error"] = role_error
+            entry["warnings"].append(role_error)
+            merged["error"] = merged["error"] or role_error
+        plans.append((scene, scene_dimension, scene_name, entry, jobs,
+                      tree_script, world_script_name, role_scripts))
+
+    if merged["error"]:
+        for _scene, _dimension, _name, entry, *_rest in plans:
+            merged["scenes"].append(entry)
+            merged["warnings"].extend(entry["warnings"])
+            merged.setdefault("diagnostics", []).extend(entry.get("diagnostics") or [])
+            merged["notes"].extend(entry.get("notes") or [])
+        if original_active is not None:
+            _activate_scene(original_active)
+        return merged
+
+    try:
+        if original_active is not None:
+            _activate_scene(original_active)
+        player_result = persistent_player.export(directory)
+        merged["written"].extend(player_result.get("written", []))
+        merged["warnings"].extend(player_result.get("warnings", []))
+    except Exception as exc:
+        merged["error"] = f"默认角色导出失败: {exc}"
+        if original_active is not None:
+            _activate_scene(original_active)
+        return merged
+
+    for (scene, scene_dimension, scene_name, entry, jobs, tree_script,
+         world_script_name, role_scripts) in plans:
+        _activate_scene(scene)
+        multi_roles = role_scripts is not None
+        role_error = ""
+        entry["input_actions"] = []
+        for logic_tree, options, preview in jobs:
+            try:
+                result = exporter.export_tree(logic_tree, options, write_scene=False)
+                for key in ("warnings", "diagnostics", "notes"):
+                    existing = entry.setdefault(key, [])
+                    # Remove only this job's repeated preview diagnostics. Two
+                    # hosts sharing a graph must retain their separate results.
+                    existing.extend(item for item in result.get(key, [])
+                                    if item not in preview[key])
+                entry.setdefault("written", []).extend(p for p in result.get("written", []) if p)
+                entry["input_actions"].extend(result.get("input_actions") or [])
+                if result.get("ok") is not True:
+                    raise RuntimeError(result.get("error") or "脚本导出未成功")
+            except Exception as exc:
+                role_error = f"『{scene.name}』的逻辑图发布失败: {type(exc).__name__}: {exc}"
+                break
+
+        if role_error:
+            outcome = {"error": role_error}
+        else:
+            try:
+                outcome = export_assets_pipeline(
+                    scene, directory, dimension=scene_dimension, script_name=tree_script,
+                    scene_name=scene_name, world_script_name=world_script_name,
+                    **({"role_scripts": role_scripts} if multi_roles else {}))
+            except Exception as exc:
+                if not multi_roles:
+                    raise
+                outcome = {"error": f"多宿主资产导出失败: {type(exc).__name__}: {exc}"}
+        if outcome.get("error"):
+            merged["error"] = merged["error"] or outcome["error"]
+            entry["error"] = outcome["error"]
+        if multi_roles:
+            entry["role_models"] = dict(outcome.get("role_models") or {})
         entry["warnings"].extend(outcome.get("warnings", []))
         # 累加,不能覆盖:上面『逻辑图导出』那一步可能已经记了脚本 / 曲线
         entry["written"] = list(entry.get("written", [])) + [
@@ -12288,7 +12638,10 @@ def export_all_scenes(directory, dimension=None, script_name=None):
                 directory, project.SCENES_DIR, f"{scene_name}.tscn")
 
         merged["written"].extend(entry["written"])
+        merged.setdefault("diagnostics", []).extend(entry.get("diagnostics") or [])
         merged["warnings"].extend(entry["warnings"])
+        if multi_roles:
+            merged["notes"].extend(entry.get("notes") or [])
         merged["notes"].extend(outcome.get("notes", []) or [])
         merged["materials"] += int(outcome.get("materials", 0) or 0)
         merged["bodies"] += int(outcome.get("bodies", 0) or 0)
@@ -12352,6 +12705,22 @@ def export_all_scenes(directory, dimension=None, script_name=None):
         merged["warnings"].extend(prefs_outcome.get("warnings", []))
         merged["notes"].extend(prefs_outcome.get("notes", []))
 
+    # ②⑥ 资源包 / 数据包(用户 2026-11-10):项目里放了 `resourcepacks/` 或
+    #    `datapacks/` 才安装运行时 autoload;没有包时一个文件都不写,
+    #    保证未使用该能力的工程产物逐字节不变。
+    #    ⚠ 必须排在"③ 旧文件清理"之前:写出的运行时脚本要进 written 清单,
+    #      否则下一轮清理会把它们当成旧文件删掉(自毁)。
+    try:
+        from . import packs as content_packs
+        pack_outcome = content_packs.export_packs(directory)
+    except Exception as exc:                              # noqa: BLE001
+        merged["warnings"].append(
+            f"资源包/数据包安装失败:{type(exc).__name__}: {exc}")
+    else:
+        merged["written"].extend(pack_outcome.get("written", []))
+        merged["warnings"].extend(pack_outcome.get("warnings", []))
+        merged["notes"].extend(pack_outcome.get("notes", []))
+
     # ② 输入映射:**合并**写一次(第三十一轮)────────────────────────────
     # 每个场景的 export_tree 会各写一次 [input] 标记块,而 set_input_actions
     # 是"替换标记块"—— 两个场景就会**后写的赢**:关卡1 的动作(比如新加的
@@ -12400,7 +12769,8 @@ def export_all_scenes(directory, dimension=None, script_name=None):
 _ROOT_GLB = None
 
 
-def export_subtree_glb(export_dir, name, roots, scene=None, include_cameras=False):
+def export_subtree_glb(export_dir, name, roots, scene=None, include_cameras=False,
+                       root_at_origin=False):
     """把若干物体**及其全部子级**导出成一个独立的 .glb。
 
     ── 为什么角色必须有自己的 glb ──────────────────────────────────
@@ -12416,6 +12786,14 @@ def export_subtree_glb(export_dir, name, roots, scene=None, include_cameras=Fals
 
     正确做法:角色自己一个 glb,里面只有角色网格。
 
+    ── root_at_origin(静态资产用)────────────────────────────────────
+    True 时先把本体的**世界变换归零、并临时断开父级**,再导出:
+    glb 里剩下的全是"相对本体原点"的局部变换。静态资产是**模型**不是
+    "摆放",根节点一旦带着本体在 Blender 里的位置(尤其是父级空物体的
+    位移被烘进来),运行时『资产_创建实例』把这份 glb 挂到目标点上就会
+    整体偏走 —— 实测:可放置方块被埋到地下 40 格,看起来就是"放不下去"。
+    角色不走这条路(它的 glb 根变换由 .tscn 的 Model 逆变换抵消)。
+
     返回 (路径, 是否成功, 消息)。
     """
     import bpy
@@ -12423,6 +12801,20 @@ def export_subtree_glb(export_dir, name, roots, scene=None, include_cameras=Fals
     scene = scene or bpy.context.scene
     if scene is None or not roots:
         return None, False, "没有可导出的角色物体"
+
+    # ── 静态资产:先把本体的世界变换归零(见文档里的 root_at_origin)────
+    # 只动"导出这一瞬间"的摆放,导完原样还回去 —— 用户在 Blender 里
+    # 看到的位置一个字都不变。
+    restore_roots = []
+    if root_at_origin:
+        from mathutils import Matrix
+        for obj in [item for item in roots if item is not None]:
+            try:
+                restore_roots.append((obj, obj.parent, obj.matrix_world.copy()))
+                obj.parent = None
+                obj.matrix_world = Matrix.Identity(4)
+            except Exception:                             # noqa: BLE001
+                pass
 
     # 收集:根 + 全部后代 + **蒙皮用的骨架**
     #
@@ -12572,6 +12964,13 @@ def export_subtree_glb(export_dir, name, roots, scene=None, include_cameras=Fals
             obj.hide_set(True)
         except Exception:
             pass
+    # 静态资产:把本体原来的父级 / 世界变换放回去(导出的只是模型)
+    for obj, parent, matrix in restore_roots:
+        try:
+            obj.parent = parent
+            obj.matrix_world = matrix
+        except Exception:                                 # noqa: BLE001
+            pass
     return result
 
 
@@ -12691,13 +13090,11 @@ def write_character_scene(export_dir, root_name, base_class, model_name, script_
     path = os.path.join(export_dir, project.SCENES_DIR,
                         f"{root_name or 'Character'}.tscn")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
+    exporter.write_text(path, text)
     for relative, content in (env_files or {}).items():
         target = os.path.join(export_dir, relative)
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
+        exporter.write_text(target, content)
     if set_as_main:
         # 顺手设成主场景,否则 Godot 里按 F5 会弹"没有设置主场景"
         project.set_main_scene(export_dir,
@@ -12728,8 +13125,7 @@ def copy_shaders(export_dir):
             continue
         with open(os.path.join(source, name), "r", encoding="utf-8") as src:
             text = src.read()
-        with open(os.path.join(target, name), "w", encoding="utf-8", newline="\n") as dst:
-            dst.write(text)
+        exporter.write_text(os.path.join(target, name), text)
         written.append(os.path.join(target, name))
     return written
 

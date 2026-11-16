@@ -80,6 +80,71 @@ def _anim_category_table():
     return table
 
 
+def _ensure_playback_events(ctx, cancel_only=False):
+    """A playback owns its subscriptions; replacing/stopping it cancels them."""
+    flag = "_playback_cancel_added" if cancel_only else "_playback_events_added"
+    if getattr(ctx, flag, False):
+        return
+    if not cancel_only:
+        ctx._playback_events_added = True
+    helpers = {
+        "func _gk_anim_cancel(player: AnimationPlayer) -> void:": [
+            "if not is_instance_valid(player) or not player.has_meta(\"gk_playback_events\"):",
+            "    return",
+            "var playback: Dictionary = player.get_meta(\"gk_playback_events\")",
+            "playback[\"active\"] = false",
+            "player.remove_meta(\"gk_playback_events\")",
+            "for connection in playback.get(\"connections\", []):",
+            "    var source: Signal = connection[0]",
+            "    var callback: Callable = connection[1]",
+            "    if callback.is_valid() and source.is_connected(callback):",
+            "        source.disconnect(callback)",
+            "playback[\"connections\"] = []",
+        ],
+        "func _gk_anim_watch(player: AnimationPlayer, clip: String) -> Dictionary:": [
+            "_gk_anim_cancel(player)",
+            "var playback := {\"active\": true, \"player\": player, \"name\": clip, \"connections\": []}",
+            "player.set_meta(\"gk_playback_events\", playback)",
+            "return playback",
+        ],
+        "func _gk_anim_interrupted(clip: StringName, playback: Dictionary) -> void:": [
+            "# Resuming the same paused clip is not an interruption.",
+            "if playback.get(\"active\", false) and String(clip) != playback.get(\"name\", \"\"):",
+            "    _gk_anim_cancel(playback.get(\"player\"))",
+        ],
+        "func _gk_anim_ended(clip: StringName, playback: Dictionary) -> void:": [
+            "if playback.get(\"active\", false) and String(clip) == playback.get(\"name\", \"\"):",
+            "    _gk_anim_cancel(playback.get(\"player\"))",
+        ],
+        "func _gk_anim_arm(playback: Dictionary) -> void:": [
+            "var candidate = playback.get(\"player\")",
+            "if not playback.get(\"active\", false) or not is_instance_valid(candidate):",
+            "    return",
+            "var player: AnimationPlayer = candidate",
+            "if player.current_animation != playback.get(\"name\", \"\"):",
+            "    _gk_anim_cancel(player)",
+            "    return",
+            "var interrupted := _gk_anim_interrupted.bind(playback)",
+            "player.animation_started.connect(interrupted)",
+            "playback[\"connections\"].append([player.animation_started, interrupted])",
+            "var ended := _gk_anim_ended.bind(playback)",
+            "player.animation_finished.connect(ended)",
+            "playback[\"connections\"].append([player.animation_finished, ended])",
+        ],
+    }
+    for signature, lines in helpers.items():
+        is_cancel = signature.startswith("func _gk_anim_cancel(")
+        if cancel_only and not is_cancel:
+            continue
+        if is_cancel:
+            if getattr(ctx, "_playback_cancel_added", False):
+                continue
+            ctx._playback_cancel_added = True
+        ctx.extra_sections.append({"signature": signature,
+                                   "lines": ["    " + line for line in lines],
+                                   "empty_body": "    pass", "separator": True})
+
+
 @stmt_node("GKNodePlayAnim")
 def _stmt_play_anim(ctx, node, indent):
     """播动画 + 三个事件出口(Started / Running / On Finish)。
@@ -151,6 +216,11 @@ def _stmt_play_anim(ctx, node, indent):
                                 ("结束时", "finished")):
         if _next_nodes(node, output_name):
             wanted.append((output_name, suffix))
+    playback = None
+    _ensure_playback_events(ctx, cancel_only=not bool(wanted))
+    if wanted:
+        playback = ctx.declare_var("_gk_playback" + ctx.node_tag(node, "playback"),
+                                   "Dictionary", initial="{}")
     # 每个出口一个**独立**编号 —— 曾经两个出口共用一个编号,
     # 生成出两个同名函数(一个覆盖另一个,用户的"结束时"逻辑直接消失)。
     numbered = []
@@ -175,6 +245,7 @@ def _stmt_play_anim(ctx, node, indent):
             # 整份脚本加载不了(第七十六轮修)。表达式在哪个函数里都算得出:
             # 播放器那一串自带缓存(_gk_find_animation_player 查过就记下)。
             "player_expr": player, "name_expr": anim,
+            "playback": playback,
             "func": handler, "node": node, "output": output_name,
             "indent": indent,
             "kind": "running" if suffix == "running" else "signal",
@@ -205,13 +276,26 @@ def _stmt_play_anim(ctx, node, indent):
     #       先 play 再 connect 就漏掉这一次。而『动画_播放』接在
     #       每当_准备 后面时,**那就是唯一的一次** —— 于是『开始时』永远不响
     #       (真 Godot 探针:开始=0,结束=1,每帧=48)。
-    # 用 CONNECT_ONE_SHOT:触发一次自动断开,重复播放不会累积连接。
+    if playback:
+        token = ctx.new_temp("anim_token")
+        ctx.add_line(body, f"var {token} := _gk_anim_watch({player_temp}, {name_temp})")
+        ctx.add_line(body, f"{playback} = {token}")
+    else:
+        ctx.add_line(body, f"_gk_anim_cancel({player_temp})")
+    # play(same_name) resumes at the current position in Godot. REPLACE is
+    # explicitly labelled 'restart' in Blender, so reset before playing.
+    if not keep_playing:
+        ctx.add_line(body, f"{player_temp}.stop()")
     for _suffix, handler, signal_name, _var in numbered:
         if signal_name is None:
             continue
+        callback = ctx.new_temp("anim_cb")
+        ctx.add_line(body, f"var {callback} := {handler}.bind({token})")
         ctx.add_line(body,
-                     f"{player_temp}.{signal_name}.connect({handler}, "
+                     f"{player_temp}.{signal_name}.connect({callback}, "
                      f"CONNECT_ONE_SHOT)")
+        ctx.add_line(body, f'{token}["connections"].append('
+                     f'[{player_temp}.{signal_name}, {callback}])')
     if end_sec > 0:
         # 有结束帧 -> 用 play_section 一次把 起始/结束/Blend-In/速度 全给它。
         # (Godot 4.3+ 的 API:`play_section(名, 起, 止, 混合, 速度)`)
@@ -227,6 +311,8 @@ def _stmt_play_anim(ctx, node, indent):
             # 第二个参数 true = 立刻刷新姿势,不然要等下一帧才跳过去。
             ctx.add_line(body,
                          f"{player_temp}.seek({gd_number(start_sec)}, true)")
+    if playback:
+        ctx.add_line(body, f"_gk_anim_arm({token})")
     ctx.add_line(indent, "else:")
 
     # 动画不存在时的警告
@@ -687,6 +773,9 @@ def _start_condition(ctx, graph, node_lib):
             ctx.warn("『动画_开始』选了按键开始但没填输入动作")
             return None
         const = ctx.add_action(action)
+        if mode == "ACTION_PRESSED":
+            # 动画图的"按住某键开始"也是持续轮询,和玩法图共用失焦守卫。
+            ctx.need_focus_guard = True
         func = ("is_action_just_pressed" if mode == "ACTION_JUST"
                 else "is_action_pressed")
         return f"Input.{func}({const})"
@@ -1838,44 +1927,32 @@ def _expr_anim_playing(ctx, node):
 
 @stmt_node("GKNodeAnimPause")
 def _stmt_anim_pause(ctx, node, indent):
-    """暂停 / 继续当前动画。
+    """暂停/继续由播放器自己保存进度，避免同脚本多个播放器串用暂停位置。
 
-    ── API 是实测出来的,不是猜的(踩过的坑)────────────────────────
-    Godot 4.7 的 `AnimationPlayer` **没有 `paused` 属性** ——
-    写了会报 "Invalid assignment of property 'paused'"。
-    真实可用的是:
-        pause()                 暂停(停在当前位置)
-        play(name)              从当前位置继续(不再传名字就得重播)
-        active / set_active()   开关整个播放器
-
-    所以这里:
-      * 暂停 -> `pause()`(位置保持不变)
-      * 继续 -> 用 `current_animation` 重新 `play()`,从当前位置接着放
-        (不能用 stop(),那会回到静止姿势)
+    真 Godot 4.7.2：pause 后 current_animation 为空，assigned_animation
+    仍是原片段；无参 play() 恢复原位置。不能用 current_animation 作守卫。
     """
     player = ctx.animation_player(node)
     temp = ctx.new_temp("ap")
-    pos_var = ctx.declare_var("_gk_anim_pause_pos", "float")
     ctx.add_line(indent, f"var {temp} := {player}")
     ctx.add_line(indent, f"if {temp} != null:")
     if getattr(node, "gk_paused", True):
-        # 记下当前位置 —— 恢复时要 seek 回来
-        ctx.add_line(indent + 1, f"{pos_var} = {temp}.current_animation_position")
         ctx.add_line(indent + 1, f"{temp}.pause()")
     else:
-        # 恢复:`play()` 会把动画**从头开始**,所以要用 seek 回到暂停时的位置。
-        # (实测:只调 play() 不 seek,动画会跳回开头)
-        ctx.add_line(indent + 1, f"if not {temp}.current_animation.is_empty():")
-        ctx.add_line(indent + 2, f"{temp}.play({temp}.current_animation)")
-        ctx.add_line(indent + 2, f"{temp}.seek({pos_var}, true)")
+        # pause() clears current_animation, but assigned_animation and the
+        # playback position remain owned by this specific player.
+        ctx.add_line(indent + 1, f"if not {temp}.assigned_animation.is_empty():")
+        ctx.add_line(indent + 2, f"{temp}.play()")
 
 
 @stmt_node("GKNodeAnimStop")
 def _stmt_anim_stop(ctx, node, indent):
+    _ensure_playback_events(ctx, cancel_only=True)
     player = ctx.animation_player(node)
     temp = ctx.new_temp("ap")
     ctx.add_line(indent, f"var {temp} := {player}")
     ctx.add_line(indent, f"if {temp} != null:")
+    ctx.add_line(indent + 1, f"_gk_anim_cancel({temp})")
     ctx.add_line(indent + 1, f"{temp}.stop()")
 
 

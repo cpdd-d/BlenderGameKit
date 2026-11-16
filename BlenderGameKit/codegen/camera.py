@@ -1395,9 +1395,20 @@ def _stmt_camera_follow(ctx, node, indent):
     offset_y = gd_number(getattr(node, "gk_offset_y", 0.0))
     vec_ctor = "Vector2" if ctx.dim == 2 else "Vector3"
 
-    cam_var = ctx.declare_var("_gk_follow_cam", "Node")
-    look_var = ctx.declare_var("_gk_follow_look", "Node")
+    # ── 每个『相机_跟随』节点各用一套变量(第两百零四轮,真机反馈)─────────
+    # 按名字共享会串台:图里有两个跟随节点(第一人称相机 / 第三人称相机)时,
+    # 第二个节点的 `if cam == null` 永远是假 —— 第一个节点已经把变量填上了。
+    # 结果第二台相机从头到尾没人推,人物走远了它还在原地(用户看到的是
+    # "摄像机没有跟随模型移动")。所以这里必须传 key,一节点一套。
+    cam_var = ctx.declare_var("_gk_follow_cam", "Node", key=node)
+    look_var = ctx.declare_var("_gk_follow_look", "Node", key=node)
 
+    dist = getattr(node, "gk_distance", 0.0) or 0.0
+    setup_var = None
+    delta_var = None
+    if ctx.dim != 2 and not dist:
+        setup_var = ctx.declare_var("_gk_follow_setup", "bool", key=node)
+        delta_var = ctx.declare_var("_gk_follow_delta", vec_ctor, key=node)
     if ctx.dim == 2:
         # 2D:相机就在同一平面上，直接跟到目标位置(+偏移)
         target_vec = (f"{vec_ctor}({look_var}.global_position.x + {offset_x}, "
@@ -1408,7 +1419,6 @@ def _stmt_camera_follow(ctx, node, indent):
         # 画面上只剩一片模型的背面(用户看到的是"一片色块")。
         # 正确做法是记下"相机相对角色的偏移"，然后保持这个偏移跟随:
         # 相机在哪儿一开始由你在 Blender 里摆好，跟随过程中不改变视角。
-        dist = getattr(node, "gk_distance", 0.0) or 0.0
         if dist:
             # 用户指定了距离:相机站在角色背后 dist 处、抬高 offset_y
             target_vec = (f"{look_var}.global_position "
@@ -1416,7 +1426,7 @@ def _stmt_camera_follow(ctx, node, indent):
         else:
             # 没指定距离:沿用"一开始的相对位置"，只跟着目标平移。
             # 这样"相机在 Blender 里摆在哪儿"就决定了看角色的角度。
-            target_vec = (f"{look_var}.global_position + _gk_follow_delta "
+            target_vec = (f"{look_var}.global_position + {delta_var} "
                           f"+ {vec_ctor}({offset_x}, {offset_y}, 0.0)")
 
     # ── 跟随逻辑挂到**物理帧**,不挂在 _process(踩过的坑)────────────
@@ -1432,9 +1442,7 @@ def _stmt_camera_follow(ctx, node, indent):
     hook_lines.append(f"    {cam_var} = {camera}")
     hook_lines.append(f"{look_var} = {target}")
     hook_lines.append(f"if {cam_var} != null and {look_var} != null:")
-    if ctx.dim != 2 and not (getattr(node, "gk_distance", 0.0) or 0.0):
-        setup_var = ctx.declare_var("_gk_follow_setup", "bool")
-        delta_var = ctx.declare_var("_gk_follow_delta", vec_ctor)
+    if setup_var is not None:
         hook_lines.append(f"    if not {setup_var}:")
         hook_lines.append(f"        {setup_var} = true")
         hook_lines.append(f"        {delta_var} = {cam_var}.global_position "

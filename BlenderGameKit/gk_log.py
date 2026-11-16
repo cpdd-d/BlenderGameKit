@@ -5,9 +5,12 @@
 
 import time
 import traceback
+from collections import deque
 
 MAX_RECORDS = 200
-_records = []
+# 用 deque 而不是 list:超过上限时 list 要 `del _records[:n]` 整体前移
+# (O(n) 拷贝),deque 的 maxlen 由 C 层直接丢头部 —— 写日志是热路径。
+_records = deque(maxlen=MAX_RECORDS)
 
 
 def _stamp():
@@ -16,9 +19,7 @@ def _stamp():
 
 def log(message, level="INFO"):
     line = f"[{_stamp()}] [{level}] {message}"
-    _records.append((level, line))
-    if len(_records) > MAX_RECORDS:
-        del _records[: len(_records) - MAX_RECORDS]
+    _records.append((level, line))       # maxlen 自动丢最旧的一条
     try:
         print(f"[BlenderGameKit] {message}")
     except Exception:

@@ -1,0 +1,55 @@
+{
+  "source": "BlueprintLab.blend",
+  "trees": [
+    {
+      "name": "角色·只负责移动",
+      "nodes": 3,
+      "links": 2
+    },
+    {
+      "name": "组件·可复用能源门",
+      "nodes": 22,
+      "links": 20
+    },
+    {
+      "name": "关卡·双门协作与通关",
+      "nodes": 43,
+      "links": 42
+    },
+    {
+      "name": "界面·实验室HUD",
+      "nodes": 4,
+      "links": 0
+    },
+    {
+      "name": "游戏资产",
+      "nodes": 2,
+      "links": 0
+    }
+  ],
+  "shared_instances": [
+    {
+      "object": "EnergyGateA",
+      "tree": "组件·可复用能源门",
+      "bindings": {
+        "玩家": "Player",
+        "控制台": "TerminalA"
+      }
+    },
+    {
+      "object": "EnergyGateB",
+      "tree": "组件·可复用能源门",
+      "bindings": {
+        "玩家": "Player",
+        "控制台": "TerminalB"
+      }
+    }
+  ],
+  "warnings": [],
+  "scenes": [
+    {
+      "name": "BlueprintLab",
+      "scene_name": "World"
+    }
+  ]
+}

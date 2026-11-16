@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minecraft 像素素材 · 预览</title>
+<style>
+  :root {
+    --bg: #14161b; --panel: #1d2027; --panel-2: #232831;
+    --line: #2f3540; --text: #e7ecf3; --dim: #96a1b2; --accent: #7fd15a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; color: var(--text);
+    background: radial-gradient(1200px 600px at 50% -10%, #1e2530 0%, var(--bg) 55%) fixed;
+    font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  body.checker .card .thumb, body.checker .mview, .mview.checker {
+    background-color: #2a2f39;
+    background-image:
+      linear-gradient(45deg, #242832 25%, transparent 25%),
+      linear-gradient(-45deg, #242832 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #242832 75%),
+      linear-gradient(-45deg, transparent 75%, #242832 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  }
+  img { image-rendering: pixelated; image-rendering: crisp-edges; }
+  header { max-width: 1280px; margin: 0 auto; padding: 34px 20px 10px; }
+  h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: .5px; }
+  h1 em { color: var(--accent); font-style: normal; }
+  .sub { margin: 0; color: var(--dim); }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .stats span {
+    padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px;
+    color: var(--dim); background: #191c22;
+  }
+  .stats b { color: var(--text); }
+  main { max-width: 1280px; margin: 0 auto; padding: 6px 20px 60px; }
+  h2 { font-size: 16px; margin: 26px 0 12px; color: #cfd8e6; }
+  .hud-stage {
+    position: relative; height: 300px; overflow: hidden; border-radius: 10px;
+    border: 1px solid var(--line);
+    background: linear-gradient(#5c93d6 0%, #7bb6ed 48%, #a9d5f3 66%, #3c6b22 66%, #2f561a 100%);
+  }
+  .hud-sun {
+    position: absolute; left: 78%; top: 22px; width: 54px; height: 54px;
+    background: #fff7d6; box-shadow: 0 0 0 4px #ffe9a8;
+  }
+  .hud-cloud { position: absolute; background: #f7fbff; height: 18px; opacity: .95; }
+  .hud-cloud.b { background: #e2edf7; height: 18px; }
+  .hud-ground {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 102px;
+    background-image: url(blocks/grass_top.png);
+    background-size: 51px 51px;
+    box-shadow: inset 0 0 0 2000px rgba(0, 0, 0, .06);
+  }
+  .hud-dirt {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 17px;
+    background-image: url(blocks/dirt.png);
+    background-size: 51px 51px;
+    opacity: .95;
+  }
+  .hud-center { position: absolute; left: 50%; top: 44%; transform: translate(-50%, -50%); }
+  .hud-center img { width: 48px; height: 48px; display: block; opacity: .9; }
+  .hud-bottom {
+    position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  .hud-hearts { display: flex; gap: 3px; filter: drop-shadow(0 1px 0 rgba(0,0,0,.6)); }
+  .hud-hearts img { width: 27px; height: 27px; }
+  .hud-bar { position: relative; width: 546px; height: 66px; }
+  .hud-bar > img.hotbar { width: 546px; height: 66px; display: block; }
+  .hud-bar > img.selector {
+    position: absolute; width: 72px; height: 72px;
+    left: 168px; top: -3px; pointer-events: none;
+  }
+  .hud-bar > img.icon {
+    position: absolute; width: 48px; height: 48px; top: 9px;
+  }
+  .controls {
+    position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap;
+    gap: 14px; align-items: center; padding: 12px; margin: 22px 0 14px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: rgba(20, 22, 27, .92); backdrop-filter: blur(6px);
+  }
+  .filters { display: flex; flex-wrap: wrap; gap: 6px; }
+  .filters button {
+    padding: 5px 11px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--dim); font: inherit;
+  }
+  .filters button.on { color: #10130f; background: var(--accent); border-color: var(--accent); }
+  .controls label { display: flex; align-items: center; gap: 7px; color: var(--dim); }
+  input[type=range] { width: 120px; accent-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); }
+  #zoomOut { color: var(--text); min-width: 34px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 14px; }
+  .card {
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: var(--panel); cursor: zoom-in; transition: transform .12s, border-color .12s;
+  }
+  .card:hover { transform: translateY(-2px); border-color: #46505f; }
+  .thumb {
+    display: flex; align-items: center; justify-content: center;
+    height: 168px; overflow: hidden; padding: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .thumb img { max-width: 100%; max-height: 168px; }
+  .thumb.tiling { background-repeat: repeat; background-position: center; }
+  .card-body { padding: 9px 11px 12px; }
+  .card-title { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+  code { font: 12px/1.4 "Cascadia Code", Consolas, monospace; color: #cfe3ff; }
+  .badge {
+    font-size: 11px; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 5px; padding: 0 5px; white-space: nowrap;
+  }
+  .usage { margin: 6px 0 4px; color: var(--dim); font-size: 12.5px; min-height: 36px; }
+  .facts { font-size: 11.5px; color: #6f7b8d; }
+  .facts b { color: #9fb0c7; font-weight: 500; }
+  .modal {
+    position: fixed; inset: 0; z-index: 20; display: flex; align-items: center;
+    justify-content: center; padding: 24px; background: rgba(5, 7, 10, .82);
+  }
+  .modal[hidden] { display: none; }
+  .modal-card {
+    width: min(720px, 100%); max-height: 90vh; overflow: auto;
+    background: var(--panel); border: 1px solid #3a424f; border-radius: 12px;
+    padding: 20px; position: relative;
+  }
+  .modal-card h3 { margin: 0 40px 4px 0; font-size: 18px; }
+  .modal-card .close {
+    position: absolute; right: 10px; top: 8px; width: 34px; height: 34px;
+    border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--text); font-size: 20px; cursor: pointer;
+  }
+  .mview {
+    margin: 14px auto; overflow: auto; max-width: 100%;
+    background-repeat: repeat; background-position: center;
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .modal-card .mview { box-shadow: inset 0 0 0 1px rgba(255,255,255,.03); }
+  .modal-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px 18px; color: var(--dim); font-size: 13px; }
+  .modal-info b { color: var(--text); font-weight: 500; }
+  footer { text-align: center; color: #5f6b7d; padding: 0 20px 34px; font-size: 12px; }
+</style>
+</head>
+<body class="checker">
+<header>
+  <h1>Minecraft <em>16×16</em> 像素素材</h1>
+  <p class="sub">有限调色 · 无抗锯齿 · 方块贴图无缝平铺 · 与 demo 工程隔离</p>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <h2>HUD 组合预览</h2>
+  <div class="hud-stage">
+    <div class="hud-sun"></div>
+    <div class="hud-cloud" style="left:8%;top:44px;width:120px"></div>
+    <div class="hud-cloud b" style="left:8%;top:62px;width:96px;height:9px"></div>
+    <div class="hud-cloud" style="left:58%;top:80px;width:150px"></div>
+    <div class="hud-cloud b" style="left:58%;top:98px;width:118px;height:9px"></div>
+    <div class="hud-ground"></div>
+    <div class="hud-dirt"></div>
+    <div class="hud-center"><img src="ui/crosshair.png" alt="准星"></div>
+    <div class="hud-bottom">
+      <div class="hud-hearts" id="hudHearts"></div>
+      <div class="hud-bar" id="hudBar">
+        <img class="hotbar" src="ui/hotbar.png" alt="快捷栏">
+        <img class="selector" src="ui/hotbar_selector.png" alt="选中框">
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div class="filters" id="filters"></div>
+    <label>缩放 <input id="zoom" type="range" min="3" max="16" value="7"><output id="zoomOut">7×</output></label>
+    <label><input id="tile" type="checkbox"> 3×3 平铺（看接缝）</label>
+    <label><input id="checker" type="checkbox" checked> 透明棋盘</label>
+  </div>
+
+  <section class="grid" id="grid"></section>
+</main>
+<footer>点击任意贴图查看 3×3 平铺大图 · 按 Esc 关闭</footer>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-card">
+    <button class="close" id="close" aria-label="关闭">×</button>
+    <h3 id="mTitle"></h3>
+    <div class="mview" id="mView"></div>
+    <div class="modal-info" id="mInfo"></div>
+    <p class="usage" id="mUsage" style="min-height:0"></p>
+  </div>
+</div>
+
+<script>
+const ASSETS = [{"p":"blocks/grass_top.png","g":"blocks","n":"grass_top.png","w":16,"h":16,"s":"16×16","c":6,"u":"草方块顶面（主绿，比侧面草缘更亮）","t":true,"opaque":true,"alpha":false,"seam_v":0.9375,"seam_h":1.4825581395348837},{"p":"blocks/grass_side.png","g":"blocks","n":"grass_side.png","w":16,"h":16,"s":"16×16","c":12,"u":"草方块侧面（不规则草缘 + 泥土下沿）；底面复用 dirt.png","t":true,"opaque":true,"alpha":false,"seam_v":1.2559282573079245,"seam_h":2.0923574807069953},{"p":"blocks/dirt.png","g":"blocks","n":"dirt.png","w":16,"h":16,"s":"16×16","c":6,"u":"泥土方块六面；也是草方块的底面","t":true,"opaque":true,"alpha":false,"seam_v":1.1384820239680427,"seam_h":0.8900064593522192},{"p":"blocks/stone.png","g":"blocks","n":"stone.png","w":16,"h":16,"s":"16×16","c":6,"u":"石头方块六面","t":true,"opaque":true,"alpha":false,"seam_v":0.7223796033994334,"seam_h":1.4133738601823709},{"p":"blocks/cobblestone.png","g":"blocks","n":"cobblestone.png","w":16,"h":16,"s":"16×16","c":6,"u":"圆石方块（墙体 / 路面 / 建造）","t":true,"opaque":true,"alpha":false,"seam_v":0.8940397350993378,"seam_h":0.8385093167701864},{"p":"blocks/sand.png","g":"blocks","n":"sand.png","w":16,"h":16,"s":"16×16","c":6,"u":"沙子方块（地表、水边、沙丘）","t":true,"opaque":true,"alpha":false,"seam_v":1.1746987951807228,"seam_h":0.7407407407407407},{"p":"blocks/gravel.png","g":"blocks","n":"gravel.png","w":16,"h":16,"s":"16×16","c":6,"u":"砂砾方块（小路 / 河床）","t":true,"opaque":true,"alpha":false,"seam_v":0.533303925893251,"seam_h":0.6285926200630446},{"p":"blocks/oak_log_side.png","g":"blocks","n":"oak_log_side.png","w":16,"h":16,"s":"16×16","c":6,"u":"橡木原木侧面（树皮竖纹）","t":true,"opaque":true,"alpha":false,"seam_v":1.0266806173162437,"seam_h":1.0020397756246815},{"p":"blocks/oak_log_top.png","g":"blocks","n":"oak_log_top.png","w":16,"h":16,"s":"16×16","c":6,"u":"橡木原木顶/底面（年轮，单面贴图，不做跨块平铺）","t":false,"opaque":true,"alpha":false},{"p":"blocks/oak_planks.png","g":"blocks","n":"oak_planks.png","w":16,"h":16,"s":"16×16","c":6,"u":"橡木板（建造、地板）","t":true,"opaque":true,"alpha":false,"seam_v":1.2825278810408922,"seam_h":1.1953727506426737},{"p":"blocks/leaves.png","g":"blocks","n":"leaves.png","w":16,"h":16,"s":"16×16","c":6,"u":"树叶方块（不透明版，带暗缝）","t":true,"opaque":true,"alpha":false,"seam_v":0.7222752694039012,"seam_h":0.6145920690068287},{"p":"blocks/leaves_transparent.png","g":"blocks","n":"leaves_transparent.png","w":16,"h":16,"s":"16×16","c":6,"u":"树叶方块（半透明版：叶缝 alpha=0，需材质 alpha 裁剪）","t":true,"opaque":false,"alpha":true,"seam_v":1.7672648178357802,"seam_h":0.4361265838281202},{"p":"blocks/water.png","g":"blocks","n":"water.png","w":16,"h":16,"s":"16×16","c":6,"u":"水面（贴图不透明，透明度建议由材质设为 0.7~0.8）","t":true,"opaque":true,"alpha":false,"seam_v":1.0557392536608408,"seam_h":0.8946212952799122},{"p":"blocks/snow.png","g":"blocks","n":"snow.png","w":16,"h":16,"s":"16×16","c":5,"u":"雪块六面（雪地地形）","t":true,"opaque":true,"alpha":false,"seam_v":0.766338924233661,"seam_h":0.8051341890315052},{"p":"blocks/snow_grass_side.png","g":"blocks","n":"snow_grass_side.png","w":16,"h":16,"s":"16×16","c":11,"u":"积雪草方块侧面（雪缘 + 泥土下沿）","t":true,"opaque":true,"alpha":false,"seam_v":0.5917322114505212,"seam_h":6.424232837709585},{"p":"blocks/bedrock.png","g":"blocks","n":"bedrock.png","w":16,"h":16,"s":"16×16","c":5,"u":"基岩（世界底部、不可挖）","t":true,"opaque":true,"alpha":false,"seam_v":1.1253041362530414,"seam_h":0.6781079949769777},{"p":"blocks/coal_ore.png","g":"blocks","n":"coal_ore.png","w":16,"h":16,"s":"16×16","c":9,"u":"煤矿石（石头底 + 黑色矿点）","t":true,"opaque":true,"alpha":false,"seam_v":0.4335260115606936,"seam_h":0.7740539340805682},{"p":"blocks/iron_ore.png","g":"blocks","n":"iron_ore.png","w":16,"h":16,"s":"16×16","c":9,"u":"铁矿石（石头底 + 米黄矿点）","t":true,"opaque":true,"alpha":false,"seam_v":0.570554892601432,"seam_h":1.125},{"p":"blocks/gold_ore.png","g":"blocks","n":"gold_ore.png","w":16,"h":16,"s":"16×16","c":9,"u":"金矿石（石头底 + 金黄矿点）","t":true,"opaque":true,"alpha":false,"seam_v":0.4815560871207353,"seam_h":0.8678611422172453},{"p":"blocks/diamond_ore.png","g":"blocks","n":"diamond_ore.png","w":16,"h":16,"s":"16×16","c":9,"u":"钻石矿石（石头底 + 青色矿点）","t":true,"opaque":true,"alpha":false,"seam_v":0.5257009345794392,"seam_h":0.9282672344956082},{"p":"blocks/destroy_stage_0.png","g":"break","n":"destroy_stage_0.png","w":16,"h":16,"s":"16×16","c":1,"u":"方块破坏叠加层 · 阶段 0/9：全透明，无裂纹","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_1.png","g":"break","n":"destroy_stage_1.png","w":16,"h":16,"s":"16×16","c":3,"u":"方块破坏叠加层 · 阶段 1/9：裂纹逐级加密（可见 5 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_2.png","g":"break","n":"destroy_stage_2.png","w":16,"h":16,"s":"16×16","c":3,"u":"方块破坏叠加层 · 阶段 2/9：裂纹逐级加密（可见 9 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_3.png","g":"break","n":"destroy_stage_3.png","w":16,"h":16,"s":"16×16","c":3,"u":"方块破坏叠加层 · 阶段 3/9：裂纹逐级加密（可见 13 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_4.png","g":"break","n":"destroy_stage_4.png","w":16,"h":16,"s":"16×16","c":3,"u":"方块破坏叠加层 · 阶段 4/9：裂纹逐级加密（可见 20 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_5.png","g":"break","n":"destroy_stage_5.png","w":16,"h":16,"s":"16×16","c":4,"u":"方块破坏叠加层 · 阶段 5/9：裂纹逐级加密（可见 28 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_6.png","g":"break","n":"destroy_stage_6.png","w":16,"h":16,"s":"16×16","c":4,"u":"方块破坏叠加层 · 阶段 6/9：裂纹逐级加密（可见 38 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_7.png","g":"break","n":"destroy_stage_7.png","w":16,"h":16,"s":"16×16","c":4,"u":"方块破坏叠加层 · 阶段 7/9：裂纹逐级加密（可见 47 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_8.png","g":"break","n":"destroy_stage_8.png","w":16,"h":16,"s":"16×16","c":4,"u":"方块破坏叠加层 · 阶段 8/9：裂纹逐级加密（可见 56 px）","t":false,"opaque":false,"alpha":true},{"p":"blocks/destroy_stage_9.png","g":"break","n":"destroy_stage_9.png","w":16,"h":16,"s":"16×16","c":4,"u":"方块破坏叠加层 · 阶段 9/9：裂纹逐级加密（可见 70 px）","t":false,"opaque":false,"alpha":true},{"p":"mobs/zombie_skin.png","g":"mobs","n":"zombie_skin.png","w":16,"h":16,"s":"16×16","c":5,"u":"僵尸皮肤（头其余五面 / 手臂共用），可平铺","t":true,"opaque":true,"alpha":false,"seam_v":0.6521739130434783,"seam_h":1.3356164383561644},{"p":"mobs/zombie_face.png","g":"mobs","n":"zombie_face.png","w":16,"h":16,"s":"16×16","c":8,"u":"僵尸头正面（眼窝 + 龇牙已画进贴图）","t":false,"opaque":true,"alpha":false},{"p":"mobs/zombie_shirt.png","g":"mobs","n":"zombie_shirt.png","w":16,"h":16,"s":"16×16","c":4,"u":"僵尸躯干衣服（青绿布纹，破损下摆）","t":true,"opaque":true,"alpha":false,"seam_v":0.8904109589041096,"seam_h":1.5420560747663552},{"p":"mobs/zombie_pants.png","g":"mobs","n":"zombie_pants.png","w":16,"h":16,"s":"16×16","c":4,"u":"僵尸腿裤子（蓝紫牛仔布）","t":true,"opaque":true,"alpha":false,"seam_v":1.455223880597015,"seam_h":1.1440677966101693},{"p":"mobs/sheep_wool.png","g":"mobs","n":"sheep_wool.png","w":16,"h":16,"s":"16×16","c":6,"u":"羊身体羊毛（可平铺）","t":true,"opaque":true,"alpha":false,"seam_v":0.8024691358024691,"seam_h":1.3416437067401383},{"p":"mobs/sheep_face.png","g":"mobs","n":"sheep_face.png","w":16,"h":16,"s":"16×16","c":5,"u":"羊脸（模型当前只有羊毛盒子，需先补头部）","t":false,"opaque":true,"alpha":false},{"p":"mobs/player_arm.png","g":"mobs","n":"player_arm.png","w":16,"h":16,"s":"16×16","c":10,"u":"玩家手臂（V=0 肩部袖子 / V=1 手；四周肤色可环绕）","t":false,"opaque":true,"alpha":false},{"p":"items/block_grass.png","g":"items","n":"block_grass.png","w":16,"h":16,"s":"16×16","c":27,"u":"草方块物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_grass.png","g":"items_2x","n":"block_grass.png","w":32,"h":32,"s":"32×32","c":27,"u":"block_grass.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_dirt.png","g":"items","n":"block_dirt.png","w":16,"h":16,"s":"16×16","c":17,"u":"泥土方块物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_dirt.png","g":"items_2x","n":"block_dirt.png","w":32,"h":32,"s":"32×32","c":17,"u":"block_dirt.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_stone.png","g":"items","n":"block_stone.png","w":16,"h":16,"s":"16×16","c":17,"u":"石头方块物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_stone.png","g":"items_2x","n":"block_stone.png","w":32,"h":32,"s":"32×32","c":17,"u":"block_stone.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_sand.png","g":"items","n":"block_sand.png","w":16,"h":16,"s":"16×16","c":19,"u":"沙子方块物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_sand.png","g":"items_2x","n":"block_sand.png","w":32,"h":32,"s":"32×32","c":19,"u":"block_sand.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_oak_log.png","g":"items","n":"block_oak_log.png","w":16,"h":16,"s":"16×16","c":18,"u":"橡木原木物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_oak_log.png","g":"items_2x","n":"block_oak_log.png","w":32,"h":32,"s":"32×32","c":18,"u":"block_oak_log.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_oak_planks.png","g":"items","n":"block_oak_planks.png","w":16,"h":16,"s":"16×16","c":19,"u":"橡木板物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_oak_planks.png","g":"items_2x","n":"block_oak_planks.png","w":32,"h":32,"s":"32×32","c":19,"u":"block_oak_planks.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_leaves.png","g":"items","n":"block_leaves.png","w":16,"h":16,"s":"16×16","c":18,"u":"树叶方块物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_leaves.png","g":"items_2x","n":"block_leaves.png","w":32,"h":32,"s":"32×32","c":18,"u":"block_leaves.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/block_snow.png","g":"items","n":"block_snow.png","w":16,"h":16,"s":"16×16","c":26,"u":"雪块物品图标（等距立方体）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/block_snow.png","g":"items_2x","n":"block_snow.png","w":32,"h":32,"s":"32×32","c":26,"u":"block_snow.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/apple.png","g":"items","n":"apple.png","w":16,"h":16,"s":"16×16","c":6,"u":"苹果（回血食物）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/apple.png","g":"items_2x","n":"apple.png","w":32,"h":32,"s":"32×32","c":6,"u":"apple.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/bread.png","g":"items","n":"bread.png","w":16,"h":16,"s":"16×16","c":4,"u":"面包（食物）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/bread.png","g":"items_2x","n":"bread.png","w":32,"h":32,"s":"32×32","c":4,"u":"bread.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/stick.png","g":"items","n":"stick.png","w":16,"h":16,"s":"16×16","c":3,"u":"木棍（合成材料）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/stick.png","g":"items_2x","n":"stick.png","w":32,"h":32,"s":"32×32","c":3,"u":"stick.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/torch.png","g":"items","n":"torch.png","w":16,"h":16,"s":"16×16","c":5,"u":"火把（照明）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/torch.png","g":"items_2x","n":"torch.png","w":32,"h":32,"s":"32×32","c":5,"u":"torch.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/iron_ingot.png","g":"items","n":"iron_ingot.png","w":16,"h":16,"s":"16×16","c":5,"u":"铁锭（合成材料）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/iron_ingot.png","g":"items_2x","n":"iron_ingot.png","w":32,"h":32,"s":"32×32","c":5,"u":"iron_ingot.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/coal_lump.png","g":"items","n":"coal_lump.png","w":16,"h":16,"s":"16×16","c":4,"u":"煤炭（燃料 / 合成材料）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/coal_lump.png","g":"items_2x","n":"coal_lump.png","w":32,"h":32,"s":"32×32","c":4,"u":"coal_lump.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/iron_sword.png","g":"items","n":"iron_sword.png","w":16,"h":16,"s":"16×16","c":6,"u":"铁剑（近战武器，手持 / 快捷栏）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/iron_sword.png","g":"items_2x","n":"iron_sword.png","w":32,"h":32,"s":"32×32","c":6,"u":"iron_sword.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/iron_pickaxe.png","g":"items","n":"iron_pickaxe.png","w":16,"h":16,"s":"16×16","c":6,"u":"铁镐（挖掘石头 / 矿石）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/iron_pickaxe.png","g":"items_2x","n":"iron_pickaxe.png","w":32,"h":32,"s":"32×32","c":6,"u":"iron_pickaxe.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/iron_axe.png","g":"items","n":"iron_axe.png","w":16,"h":16,"s":"16×16","c":6,"u":"铁斧（砍树 / 近战）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/iron_axe.png","g":"items_2x","n":"iron_axe.png","w":32,"h":32,"s":"32×32","c":6,"u":"iron_axe.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"items/iron_shovel.png","g":"items","n":"iron_shovel.png","w":16,"h":16,"s":"16×16","c":6,"u":"铁铲（挖土 / 沙）","t":false,"opaque":false,"alpha":false},{"p":"items/2x/iron_shovel.png","g":"items_2x","n":"iron_shovel.png","w":32,"h":32,"s":"32×32","c":6,"u":"iron_shovel.png 的 2× 最近邻放大（第一人称手持 / 大图标）","t":false,"opaque":false,"alpha":false},{"p":"ui/crosshair.png","g":"ui","n":"crosshair.png","w":16,"h":16,"s":"16×16","c":2,"u":"第一人称准星（16×16，建议按屏幕比例整数放大）","t":false,"opaque":false,"alpha":false},{"p":"ui/hotbar.png","g":"ui","n":"hotbar.png","w":182,"h":22,"s":"182×22","c":4,"u":"9 格快捷栏底框（182×22，原版尺寸，含半透明槽位）","t":false,"opaque":false,"alpha":false},{"p":"ui/hotbar_selector.png","g":"ui","n":"hotbar_selector.png","w":24,"h":24,"s":"24×24","c":2,"u":"快捷栏选中框（24×24，白色 2 px 边框）","t":false,"opaque":false,"alpha":false},{"p":"ui/slot.png","g":"ui","n":"slot.png","w":20,"h":20,"s":"20×20","c":4,"u":"通用物品槽（20×20，背包 / 箱子界面复用）","t":false,"opaque":false,"alpha":false},{"p":"ui/button.png","g":"ui","n":"button.png","w":64,"h":20,"s":"64×20","c":4,"u":"按钮常态（64×20，9-slice 中心拉伸，文字由引擎绘制）","t":false,"opaque":true,"alpha":false},{"p":"ui/button_hover.png","g":"ui","n":"button_hover.png","w":64,"h":20,"s":"64×20","c":4,"u":"按钮悬停态（比常态更亮）","t":false,"opaque":true,"alpha":false},{"p":"ui/button_pressed.png","g":"ui","n":"button_pressed.png","w":64,"h":20,"s":"64×20","c":4,"u":"按钮按下态（高光与阴影反转）","t":false,"opaque":true,"alpha":false},{"p":"ui/panel_light.png","g":"ui","n":"panel_light.png","w":48,"h":48,"s":"48×48","c":4,"u":"浅色面板（48×48，9-slice；原版背包 / 菜单底板）","t":false,"opaque":true,"alpha":false},{"p":"ui/panel_dark.png","g":"ui","n":"panel_dark.png","w":64,"h":64,"s":"64×64","c":4,"u":"深色半透明面板（64×64，9-slice；开始菜单 / 暂停面板）","t":false,"opaque":false,"alpha":false},{"p":"ui/inventory_bg.png","g":"ui","n":"inventory_bg.png","w":16,"h":16,"s":"16×16","c":6,"u":"背包底色（压暗的泥土，16×16 可平铺）","t":true,"opaque":true,"alpha":false,"seam_v":1.1575233325745504,"seam_h":0.8909574468085106},{"p":"ui/heart_full.png","g":"ui","n":"heart_full.png","w":9,"h":9,"s":"9×9","c":5,"u":"满心（9×9，生命值 HUD）","t":false,"opaque":false,"alpha":false},{"p":"ui/heart_half.png","g":"ui","n":"heart_half.png","w":9,"h":9,"s":"9×9","c":5,"u":"半心（9×9，生命值 HUD）","t":false,"opaque":false,"alpha":false},{"p":"ui/heart_empty.png","g":"ui","n":"heart_empty.png","w":9,"h":9,"s":"9×9","c":4,"u":"空心（9×9，生命值 HUD）","t":false,"opaque":false,"alpha":false},{"p":"ui/menu_background.png","g":"ui","n":"menu_background.png","w":320,"h":180,"s":"320×180","c":23,"u":"开始菜单背景（320×180 像素画，按 2× 最近邻铺满屏幕）","t":false,"opaque":true,"alpha":false}];
+const GROUPS = { blocks: '方块贴图', break: '破坏裂纹', mobs: '生物皮肤',
+                 items: '物品图标', items_2x: '物品 2×', ui: '界面纹理' };
+const HUD_SLOTS = ['block_grass', 'block_stone', 'block_sand', 'block_oak_log',
+                   'block_oak_planks', 'block_leaves', 'apple', 'iron_sword', 'torch'];
+const SELECTED = 1;
+let zoom = 7, group = 'all', tiling = false;
+
+const $ = (id) => document.getElementById(id);
+
+function buildStats() {
+  const blocks = ASSETS.filter(a => a.g === 'blocks').length;
+  const brk = ASSETS.filter(a => a.g === 'break').length;
+  const mobs = ASSETS.filter(a => a.g === 'mobs').length;
+  const items = ASSETS.filter(a => a.g === 'items').length;
+  const ui = ASSETS.filter(a => a.g === 'ui').length;
+  $('stats').innerHTML = [
+    `<span><b>${ASSETS.length}</b> 个文件</span>`,
+    `<span>方块 <b>${blocks}</b></span>`,
+    `<span>裂纹 <b>${brk}</b></span>`,
+    `<span>生物 <b>${mobs}</b></span>`,
+    `<span>物品 <b>${items}</b>（+ 2×）</span>`,
+    `<span>界面 <b>${ui}</b></span>`,
+    `<span>主网格 <b>16×16</b></span>`
+  ].join('');
+}
+
+function buildFilters() {
+  const entries = [['all', '全部'], ...Object.entries(GROUPS)];
+  $('filters').innerHTML = entries.map(([key, label]) => {
+    const n = key === 'all' ? ASSETS.length : ASSETS.filter(a => a.g === key).length;
+    return `<button data-g="${key}" class="${key === group ? 'on' : ''}">${label} ${n}</button>`;
+  }).join('');
+  $('filters').querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => { group = btn.dataset.g; buildFilters(); renderGrid(); };
+  });
+}
+
+function renderGrid() {
+  const grid = $('grid');
+  grid.innerHTML = '';
+  const list = ASSETS.filter(a => group === 'all' || a.g === group);
+  for (const a of list) {
+    const card = document.createElement('article');
+    card.className = 'card';
+    const w = a.w * zoom, h = a.h * zoom;
+    card.innerHTML = `
+      <div class="thumb"><img src="${a.p}" width="${w}" height="${h}" alt="${a.n}" loading="lazy"></div>
+      <div class="card-body">
+        <div class="card-title"><code>${a.n}</code><span class="badge">${a.s}</span></div>
+        <p class="usage">${a.u}</p>
+        <div class="facts"><b>${a.c}</b> 色 · ${a.t ? '<b>可平铺</b>' : '单面图'}</div>
+      </div>`;
+    const thumb = card.querySelector('.thumb');
+    if (tiling && a.t) {
+      thumb.classList.add('tiling');
+      thumb.style.backgroundImage = `url(${a.p})`;
+      thumb.style.backgroundSize = `${w}px ${h}px`;
+      thumb.querySelector('img').style.visibility = 'hidden';
+    }
+    card.onclick = () => openModal(a);
+    grid.appendChild(card);
+  }
+  document.body.classList.toggle('checker', $('checker').checked);
+}
+
+function openModal(a) {
+  const z = a.w > 64 ? 1 : 10;
+  const reps = a.t ? 3 : 1;
+  $('mTitle').textContent = a.n;
+  const view = $('mView');
+  view.style.width = (a.w * z * reps) + 'px';
+  view.style.height = (a.h * z * reps) + 'px';
+  view.style.backgroundImage = `url(${a.p})`;
+  view.style.backgroundSize = `${a.w * z}px ${a.h * z}px`;
+  view.style.backgroundRepeat = 'repeat';
+  view.classList.toggle('checker', $('checker').checked);
+  $('mInfo').innerHTML = [
+    ['路径', `<b>${a.p}</b>`],
+    ['尺寸', `<b>${a.s}</b>`],
+    ['色数', `<b>${a.c}</b>`],
+    ['平铺', `<b>${a.t ? '可无缝平铺' : '单面 / 控件'}</b>`]
+  ].map(([k, v]) => `<div>${k}：${v}</div>`).join('');
+  $('mUsage').textContent = a.u;
+  $('modal').hidden = false;
+}
+
+function buildHud() {
+  const bar = $('hudBar');
+  HUD_SLOTS.forEach((name, i) => {
+    const img = document.createElement('img');
+    img.className = 'icon';
+    img.src = `items/${name}.png`;
+    img.alt = name;
+    img.style.left = (9 + i * 60) + 'px';
+    bar.appendChild(img);
+  });
+  const sel = bar.querySelector('.selector');
+  sel.style.left = (60 * SELECTED - 3) + 'px';
+  const hearts = $('hudHearts');
+  for (let i = 0; i < 8; i++) {
+    const img = document.createElement('img');
+    img.src = i < 6 ? 'ui/heart_full.png' : (i === 6 ? 'ui/heart_half.png' : 'ui/heart_empty.png');
+    img.alt = '心';
+    hearts.appendChild(img);
+  }
+}
+
+$('zoom').oninput = (e) => {
+  zoom = Number(e.target.value);
+  $('zoomOut').value = zoom + '×';
+  renderGrid();
+};
+$('tile').onchange = (e) => { tiling = e.target.checked; renderGrid(); };
+$('checker').onchange = () => renderGrid();
+$('close').onclick = () => { $('modal').hidden = true; };
+$('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true; };
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('modal').hidden = true; });
+
+buildStats();
+buildFilters();
+buildHud();
+renderGrid();
+</script>
+</body>
+</html>

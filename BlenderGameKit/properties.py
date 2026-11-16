@@ -1962,7 +1962,7 @@ def _on_function_decl_changed(self, _context):
     名字没变,已经接好的实参线不会断(见 node_base.rebuild_sockets 的说明)。
     """
     tree = getattr(self, "id_data", None)
-    for node in getattr(tree, "nodes", ()) or ():
+    for node in function_reference_nodes(tree):
         if getattr(node, "bl_idname", "") not in ("GKNodeFunctionCall",
                                                   "GKNodeFunctionDefine"):
             continue
@@ -1973,6 +1973,30 @@ def _on_function_decl_changed(self, _context):
                 builder()
             except Exception:                             # noqa: BLE001
                 pass
+
+
+def function_call_tree(node, owner=None):
+    """The explicit interface source; an empty source retains legacy self calls."""
+    name = str(getattr(node, "gk_function_tree", "") or "")
+    if not name:
+        return owner if owner is not None else getattr(node, "id_data", None)
+    groups = getattr(getattr(bpy, "data", None), "node_groups", None)
+    return groups.get(name) if groups is not None else None
+
+
+def function_reference_nodes(tree):
+    """Local definitions plus calls whose interface belongs to this tree."""
+    if tree is None:
+        return
+    groups = list(getattr(getattr(bpy, "data", None), "node_groups", ()) or ())
+    if tree not in groups:
+        groups.append(tree)
+    for group in groups:
+        for node in getattr(group, "nodes", ()):
+            kind = getattr(node, "bl_idname", "")
+            if (kind == "GKNodeFunctionDefine" and group == tree) or (
+                    kind == "GKNodeFunctionCall" and function_call_tree(node, group) == tree):
+                yield node
 
 
 class GKLogicFunction(bpy.types.PropertyGroup):
@@ -2117,7 +2141,7 @@ def function_usages(tree):
     的名字去比对,就能发现"引用了但没声明"(改名 / 拼错的遗留)。
     """
     table = {}
-    for node in getattr(tree, "nodes", ()) or ():
+    for node in function_reference_nodes(tree):
         kind = getattr(node, "bl_idname", "")
         if kind not in FUNCTION_NODE_IDS:
             continue
@@ -2149,7 +2173,7 @@ def rename_function_refs(tree, old, new):
     if not old or not new or old == new:
         return 0
     changed = 0
-    for node in getattr(tree, "nodes", ()) or ():
+    for node in function_reference_nodes(tree):
         if getattr(node, "bl_idname", "") not in FUNCTION_NODE_IDS:
             continue
         if str(getattr(node, "gk_func_name", "") or "").strip() != old:

@@ -2884,15 +2884,19 @@ class TestUiDesignTree(Base):
         self.assertLess(call_at, next(i for i, line in enumerate(lines)
                                       if line.startswith("func show_main")), code)
 
-    def test_no_pause_dim_for_level_script(self):
-        """关卡脚本不该引用压暗底(它在主界面那份 autoload 里)。"""
+    def test_pause_dim_for_level_owned_menu(self):
+        """关卡自身创建的菜单也要隔离旧 HUD,不能只保护 autoload 菜单。"""
         tree = make_tree()
         event = self._ready(tree)
         node = tree.new_node(NN.GKNodeUiPauseGame, "暂停", gk_pause=True,
                              gk_menu="暂停菜单", gk_hotkey=True)
         gk_stub.connect(tree, event, "执行", node, "执行")
         code, _ = gen(tree, V2)
-        self.assertNotIn("_gk_pause_dim", code)
+        self.assertIn("func _gk_pause_dim_init() -> void:", code)
+        menu = self.functions(code)["_gk_pause_menu_show"]
+        self.assertIn("_gk_pause_dim_init()", menu)
+        self.assertIn("MOUSE_FILTER_STOP if widget != null", menu)
+        self.assertLess(menu.index("_gk_pause_dim.move_to_front()"), menu.index("_gk_ui_raise(widget)"))
 
     def test_ui_main_without_pause_menu_still_defines_dim(self):
         """主界面里没有『界面_暂停游戏』时,压暗底的**定义**也必须发。
@@ -4775,12 +4779,17 @@ class TestAnimationNodes(Base):
         self.assertIn(".pause()", code)
         self.assertNotIn(".paused = ", code)
 
-    def test_resume_plays_and_seeks_back(self):
-        """恢复要用 play + seek —— play() 会把动画从头放。"""
+    def test_resume_uses_player_owned_position(self):
+        """Godot pause 清空 current_animation；play() 原生恢复各播放器进度。
+
+        真实位置恢复及完成事件由 test_animation_playback_godot 验证。
+        """
         tree = self._ready_chain([(NN.GKNodeAnimPause, {"gk_paused": False})])
         code, _ = gen(tree, V3)
-        self.assertIn(".play(", code)
-        self.assertIn(".seek(", code)
+        self.assertIn(".assigned_animation.is_empty()", code)
+        self.assertIn(".play()", code)
+        self.assertNotIn(".seek(", code)
+        self.assertNotIn("_gk_anim_pause_pos", code)
 
     def test_stop(self):
         tree = self._ready_chain([(NN.GKNodeAnimStop, {})])
@@ -8286,6 +8295,53 @@ class TestOldFileCleanup(Base):
                                                   ".glb", ".png")), bad)
             self.assertNotIn("路径", bad)
 
+    def test_reachable_files_reads_each_file_once(self):
+        """引用链要迭代几轮,但**同一个文件只读一次**。
+
+        `reachable_files` 会从"写过的文件"往外找引用,一轮不够(场景 ->
+        脚本 -> 曲线)。第一版每轮都把已读过的文件重新读一遍 —— 大工程里
+        纯属浪费。这里用 open 计数把"只读一次"钉住。
+        """
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        scene = self._write(directory, "scenes/World.tscn",
+                            '[ext_resource path="res://scripts/a.gd"]\n')
+        script = self._write(directory, "scripts/a.gd",
+                             'const C := preload("res://curves/c_1a2b3c4d.tres")\n')
+        curve = self._write(directory, "curves/c_1a2b3c4d.tres", "x")
+        with mock.patch("builtins.open", wraps=open) as spy:
+            keep = gf.reachable_files(directory, [scene], passes=3)
+        self.assertIn("scripts/a.gd", keep)
+        self.assertIn("curves/c_1a2b3c4d.tres", keep)
+        counts = {}
+        for call in spy.call_args_list:
+            path = str(call.args[0]) if call.args else ""
+            counts[path] = counts.get(path, 0) + 1
+        for path in (scene, script, curve):
+            self.assertEqual(counts.get(path, 0), 1, (path, counts))
+
+    def test_cleanup_scans_generated_files_once(self):
+        """清理只扫一遍插件目录(清理前后各扫一次是白读盘)。
+
+        旧的实现最后还会 `scan_generated_files()` 一次,只为算"还剩哪些";
+        清理只删不增,用第一次的扫描结果 + 一次 stat 就能得出同样的清单。
+        """
+        from BlenderGameKit import generated_files as gf
+        directory = self._project()
+        stale = self._write(directory, "materials/旧.tres",
+                            '[ext_resource path="res://shaders/gk_toon.gdshader"]')
+        fresh = self._write(directory, "scripts/game_logic.gd",
+                            "# 由 BlenderGameKit 自动生成\n")
+        gf.write_manifest(directory, gf.relative_files(directory, [stale]))
+        with mock.patch.object(gf, "scan_generated_files",
+                               wraps=gf.scan_generated_files) as spy:
+            removed = gf.cleanup_after_export(directory, [fresh])
+        self.assertEqual(removed, ["materials/旧.tres"])
+        self.assertEqual(spy.call_count, 1)
+        manifest = gf.read_manifest(directory)
+        self.assertNotIn("materials/旧.tres", manifest)
+        self.assertIn("scripts/game_logic.gd", manifest)
+
     def test_collider_dims_ignore_vector3_prefix(self):
         """碰撞体尺寸要从 `Vector3(...)` 里读 —— "Vector3" 的 3 不算数。
 
@@ -8570,8 +8626,9 @@ class TestOldFileCleanup(Base):
         seen = []
 
         def fake_export_tree(tree, settings=None, write_scene=None):
-            seen.append((tree, (settings or {}).get("class_name", "")))
-            return {"script_name": f"game_logic_{tree}.gd", "written": [],
+            if not (settings or {}).get("dry_run"):
+                seen.append((tree, (settings or {}).get("class_name", "")))
+            return {"ok": True, "script_name": f"game_logic_{tree}.gd", "written": [],
                     "warnings": [], "input_actions": []}
 
         def fake_pipeline(scene, directory, dimension="3", script_name=None,
@@ -11296,6 +11353,31 @@ class TestRound25GameplayPieces(Base):
             code, r"if absf\(_to_goal\d+\.x\) \+ absf\(_to_goal\d+\.z\) > 0\.001:")
         self.assertRegex(code, r"\.look_at\(_here\d+ \+ Vector3\(")
         self.assertIn("Vector3.UP", code)
+
+    def test_chase_3d_keep_height_follows_on_the_ground(self):
+        """重力模式:竖直方向交给重力、只写水平速度 —— 目标跳起来怪物不跟着飞。"""
+        tree, _move = self._chase_tree(gk_keep_y=True, gk_stop_distance=1.3)
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assert_indent_sane(code)
+        self.assert_no_chinese_identifiers(code)
+        # 高度差抹掉(『到达』只看水平距离),再累加重力
+        self.assertRegex(code, r"_to_goal\d+\.y = 0\.0")
+        self.assertIn(".get_gravity() * get_physics_process_delta_time()", code)
+        # 竖直速度不能被追击覆盖 —— 写的是 velocity.x / velocity.z
+        self.assertRegex(code, r"\.velocity\.x = _to_goal\d+\.x \* chase_speed")
+        self.assertRegex(code, r"\.velocity\.z = _to_goal\d+\.z \* chase_speed")
+        self.assertNotRegex(code, r"\.velocity = _to_goal\d+\.normalized\(\)")
+
+    def test_chase_3d_keep_height_arrive_uses_horizontal_distance(self):
+        """重力模式下的『到达』只算水平距离(和语句里抹掉高度差保持一致)。"""
+        tree, move = self._chase_tree(gk_keep_y=True, gk_stop_distance=1.3)
+        branch = tree.new_node(NN.GKNodeBranch, "到了吗")
+        gk_stub.connect(tree, move, "完成", branch, "执行")
+        gk_stub.connect(tree, move, "到达", branch, "条件")
+        code, warnings = gen(tree, V3)
+        self.assertEqual(warnings, [], warnings)
+        self.assertRegex(code, r"Vector2\(\(_gk_global_position_3d\(.+?\)\.x")
 
     def test_chase_goal_pin_beats_the_property(self):
         """『目标』引脚接了东西就以引脚为准(运行时实例走这条)。"""
@@ -24502,10 +24584,13 @@ class TestRound151LightShape(unittest.TestCase):
 
     def test_moon_texture_is_deterministic_png(self):
         from BlenderGameKit import asset_export as ae
+        ae._MOON_TEXTURE_CACHE.clear()
         first = ae.moon_texture_png()
         second = ae.moon_texture_png()
         self.assertTrue(first.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual(first, second)
+        # 确定性 + 缓存:第二次必须直接拿到同一份字节(不再重算 128×128)
+        self.assertIs(first, second)
         self.assertGreater(len(first), 2000)
 
     def test_moon_phase_animation_constants(self):
@@ -24635,6 +24720,60 @@ class TestRound151ScriptNodes(unittest.TestCase):
         self.assertIn("func _gk_env_alt_tick(", block)
         self.assertIn("_gk_env_alt_tick(delta)", block)
         self.assertIn("func _gk_hour_lerp(", block)
+
+
+class TestOwnsPlayerReuse(unittest.TestCase):
+    """`owns(obj, player)` 必须复用已解析结果,包括"解析结果就是 None"。"""
+
+    def test_explicit_none_skips_resolution(self):
+        from BlenderGameKit import persistent_player as pp
+        obj = types.SimpleNamespace(name="物体", parent=None)
+        with mock.patch.object(pp, "default_player", return_value=None) as spy:
+            self.assertFalse(pp.owns(obj, None))
+            self.assertEqual(spy.call_count, 0)
+        # 显式 None 的语义是"调用方已经解析过,结果就是没有",不是"帮我解析"
+        with mock.patch.object(pp, "default_player", return_value=obj) as spy:
+            self.assertFalse(pp.owns(obj, None))
+            self.assertEqual(spy.call_count, 0)
+
+    def test_no_player_still_resolves(self):
+        from BlenderGameKit import persistent_player as pp
+        obj = types.SimpleNamespace(name="物体", parent=None)
+        with mock.patch.object(pp, "default_player", return_value=obj) as spy:
+            self.assertTrue(pp.owns(obj))
+            self.assertEqual(spy.call_count, 1)
+
+
+class TestLogRing(unittest.TestCase):
+    """GK_LOG 的环形缓冲:只留最近 MAX_RECORDS 条,且顺序不能乱。"""
+
+    def setUp(self):
+        from BlenderGameKit import gk_log
+        self.log = gk_log
+        gk_log.clear()
+
+    def tearDown(self):
+        self.log.clear()
+
+    def test_ring_keeps_latest_in_order(self):
+        total = self.log.MAX_RECORDS + 50
+        with mock.patch("builtins.print"):
+            for index in range(total):
+                self.log.info(f"第{index}条")
+        records = self.log.records()
+        self.assertEqual(len(records), self.log.MAX_RECORDS)
+        self.assertIn("第50条", records[0][1])
+        self.assertIn(f"第{total - 1}条", records[-1][1])
+
+    def test_last_error_and_clear(self):
+        with mock.patch("builtins.print"):
+            self.log.info("正常")
+            self.log.error("坏了")
+            self.log.warn("警告")
+        self.assertIn("坏了", self.log.last_error())
+        self.log.clear()
+        self.assertEqual(self.log.records(), ())
+        self.assertEqual(self.log.last_error(), "")
 
 
 if __name__ == "__main__":

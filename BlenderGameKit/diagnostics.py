@@ -137,6 +137,11 @@ def build_report(context=None):
         for node in group.nodes:
             add(f"      - {getattr(node, 'bl_idname', '?')} 「{node.name}」"
                 f" @({int(node.location.x)},{int(node.location.y)})")
+        # Check every logic tree, including ones other than the first tree used
+        # by the trial compilation below. This also works on an unfinished graph.
+        from .codegen.graph_audit import audit_execution_flow
+        for diagnostic in audit_execution_flow(group):
+            add(f"      ! [{diagnostic.code}] {diagnostic.render()}")
 
     # ---- 6. 导出一遍看结果 ----
     add("")

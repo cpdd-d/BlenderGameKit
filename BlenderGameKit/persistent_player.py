@@ -10,6 +10,11 @@ import re
 # 收进 result["warnings"](取完清空,不会重复报)。
 _INFER_WARNINGS = []
 
+# `owns()` 的"没传 player"哨兵。不能拿 None 当默认值:解析结果本身就可能
+# 是 None(本关没有默认角色),那样每次调用又会重新扫全场 —— 正是
+# O(物体数²) 的来源。显式传 None = "已经解析过,结果就是没有"。
+_UNSET_PLAYER = object()
+
 
 def take_infer_warnings():
     """取走"自动识别默认角色"期间攒下的告警(取完清空)。"""
@@ -147,14 +152,15 @@ def default_player():
         return None
 
 
-def owns(obj, player=None):
+def owns(obj, player=_UNSET_PLAYER):
     """这个物体属不属于默认角色(它自己 / 它的某一级祖先)。
 
     `player` 可以由调用方传进来复用:导出流程会**逐个物体**问这个问题,
     每次重新解析一遍"默认角色是谁"在几百个物体的场景里是纯浪费
-    (而且是 O(物体数²))。
+    (而且是 O(物体数²))。不传 = 自己解析;显式传 None = 已解析且没有
+    默认角色,同样不再重扫。
     """
-    if player is None:
+    if player is _UNSET_PLAYER:
         player = default_player()
     while obj is not None and player is not None:
         if obj == player:

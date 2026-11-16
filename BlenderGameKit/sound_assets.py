@@ -20,7 +20,7 @@ Godot 项目 —— 敲错一个字母,运行时就是一句 "找不到音频文
 """
 
 import os
-import shutil
+from .file_io import copy_if_changed
 
 # 摘要 / ASCII 压缩和曲线、图片共用同一套(名字压完会撞,必须挂摘要)。
 # 从 curve_assets 借而不是再抄一份 —— 抄一份迟早两处不一致。
@@ -40,8 +40,21 @@ def is_sound_file(path):
     return os.path.splitext(str(path or ""))[1].lower() in AUDIO_EXTS
 
 
+def local_clip_path(path):
+    """Resolve Blender's // paths identically for code generation and copying."""
+    text = str(path or "").strip()
+    if text.startswith("//"):
+        from . import blender_adapter
+        try:
+            return blender_adapter.abs_path(text)
+        except (ImportError, AttributeError):
+            pass  # Offline callers without bpy retain the original path.
+    return text
+
+
 def sound_file_name(local_path):
     """目标文件名:ASCII 名字 + 路径摘要(见模块头)。"""
+    local_path = local_clip_path(local_path)
     base = os.path.basename(str(local_path or ""))
     stem, ext = os.path.splitext(base)
     digest = _crc(os.path.normcase(os.path.abspath(str(local_path or ""))))
@@ -74,7 +87,8 @@ def resolve_clip(path):
         return text, ""
     if not is_sound_file(text):
         return text, ""
-    return sound_res_path(text), text
+    local = local_clip_path(text)
+    return sound_res_path(local), local
 
 
 def sound_files(directory, cards):
@@ -87,7 +101,7 @@ def sound_files(directory, cards):
     out = []
     seen = set()
     for name, path in cards or ():
-        path = str(path or "").strip()
+        path = local_clip_path(path)
         if not path or not is_sound_file(path):
             continue
         target = os.path.join(str(directory or ""), AUDIO_DIR,
@@ -116,7 +130,7 @@ def copy_sounds(directory, cards):
             continue
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copyfile(path, target)
+            copy_if_changed(path, target)
         except OSError:
             missing.append((name, path))
             continue
